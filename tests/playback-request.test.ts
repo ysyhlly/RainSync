@@ -1,6 +1,8 @@
 import { afterEach, expect, it, vi } from "vitest";
 import {
   PlaybackRequests,
+  PlaybackCancelled,
+  PlaybackTimeout,
   requestPlayback,
 } from "../apps/web/src/playback-request";
 import { RequestFailure } from "../apps/web/src/errors";
@@ -89,9 +91,9 @@ it("bounds transport retries and preparation waiting", async () => {
   const timeout = expect(requestPlayback(pending, input)).rejects.toThrow(
     "播放准备超时",
   );
-  await vi.advanceTimersByTimeAsync(66000);
+  await vi.advanceTimersByTimeAsync(201000);
   await timeout;
-  expect(pending.mock.calls.length).toBeLessThanOrEqual(65);
+  expect(pending.mock.calls.length).toBeLessThanOrEqual(200);
 });
 
 function storage() {
@@ -196,7 +198,7 @@ it("revokes timed out or superseded preparation even without a session response"
   const failure = expect(requests.prepare(input)).rejects.toThrow(
     "播放准备超时",
   );
-  await vi.advanceTimersByTimeAsync(66000);
+  await vi.advanceTimersByTimeAsync(201000);
   await failure;
   expect(cancel).toHaveBeenCalledWith(
     send.mock.calls[0][0].idempotency_key,
@@ -216,4 +218,126 @@ it("revokes timed out or superseded preparation even without a session response"
   await requests.stop();
   finish({ session_id: "late" } as PlaybackPlan);
   await obsolete;
+});
+
+it("distinguishes external cancellation during fetch and backoff from timeout", async () => {
+  vi.useFakeTimers();
+  const controller = new AbortController();
+  const send = vi.fn(
+    (_body, signal: AbortSignal) =>
+      new Promise<PlaybackPlan>((_resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => reject(new DOMException("aborted", "AbortError")),
+          { once: true },
+        );
+      }),
+  );
+  const result = requestPlayback(send, input, controller.signal);
+  const cancelled = expect(result).rejects.toBeInstanceOf(PlaybackCancelled);
+  controller.abort();
+  await cancelled;
+  expect(send).toHaveBeenCalledTimes(1);
+  const backoff = new AbortController();
+  const failing = vi.fn().mockRejectedValue(new TypeError("lost"));
+  const waiting = expect(
+    requestPlayback(failing, input, backoff.signal),
+  ).rejects.toThrow("播放准备已取消");
+  await vi.advanceTimersByTimeAsync(0);
+  backoff.abort();
+  await waiting;
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(failing).toHaveBeenCalledTimes(1);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it("allows all three 45-second server attempts under one key without revocation", async () => {
+  vi.useFakeTimers();
+  const cancel = vi.fn().mockResolvedValue(undefined);
+  let count = 0;
+  const send = vi.fn(
+    (_body, signal: AbortSignal) =>
+      new Promise<PlaybackPlan>((resolve, reject) => {
+        const attempt = ++count;
+        const timer = setTimeout(
+          () =>
+            attempt < 3
+              ? reject(
+                  new RequestFailure({
+                    error: {
+                      code: "PLAYBACK_REQUEST_INTERRUPTED",
+                      retryable: true,
+                    },
+                  }),
+                )
+              : resolve({ session_id: "slow-success" } as PlaybackPlan),
+          45000,
+        );
+        signal.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+            reject(signal.reason);
+          },
+          { once: true },
+        );
+      }),
+  );
+  const requests = new PlaybackRequests(send, cancel, storage(), "user");
+  const pending = requests.prepare(input);
+  await vi.advanceTimersByTimeAsync(65000);
+  expect(send).toHaveBeenCalledTimes(2);
+  expect(send.mock.calls[1][1].aborted).toBe(false);
+  expect(cancel).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(72000);
+  expect((await pending).session_id).toBe("slow-success");
+  expect(send).toHaveBeenCalledTimes(3);
+  expect(send.mock.calls[1][0]).toEqual(send.mock.calls[0][0]);
+  expect(send.mock.calls[2][0]).toEqual(send.mock.calls[0][0]);
+  expect(cancel).not.toHaveBeenCalled();
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it("bounds individually stalled HTTP attempts and reports a real timeout", async () => {
+  vi.useFakeTimers();
+  const send = vi.fn(
+    (_body, signal: AbortSignal) =>
+      new Promise<PlaybackPlan>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), {
+          once: true,
+        });
+      }),
+  );
+  const failure = expect(requestPlayback(send, input)).rejects.toBeInstanceOf(
+    PlaybackTimeout,
+  );
+  await vi.advanceTimersByTimeAsync(197000);
+  await failure;
+  expect(send).toHaveBeenCalledTimes(3);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it("keeps superseded failures silent even when their cleanup fails late", async () => {
+  vi.useFakeTimers();
+  let rejectOld!: (error: Error) => void;
+  const send = vi
+    .fn()
+    .mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectOld = reject;
+        }),
+    )
+    .mockResolvedValue({ session_id: "new-success" });
+  const cancel = vi.fn().mockResolvedValue(undefined);
+  const requests = new PlaybackRequests(send, cancel, storage(), "user");
+  const old = expect(requests.prepare(input)).rejects.toBeInstanceOf(
+    PlaybackCancelled,
+  );
+  await vi.advanceTimersByTimeAsync(0);
+  const next = await requests.prepare({ ...input, media_generation: 2 });
+  expect(next.session_id).toBe("new-success");
+  cancel.mockRejectedValue(new TypeError("old cleanup lost"));
+  rejectOld(new TypeError("old response lost"));
+  await old;
 });

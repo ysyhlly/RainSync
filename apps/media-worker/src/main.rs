@@ -359,7 +359,7 @@ fn rewrite_manifest(input: &str, mut uri: impl FnMut(&str) -> String) -> String 
                 String::new()
             } else if !line.starts_with('#') {
                 uri(line.trim())
-            } else if line.starts_with("#EXT") && line.contains(':') {
+            } else if line.starts_with("#EXT-X-") && line.contains(':') {
                 let (tag, attributes) = line.split_once(':').unwrap();
                 let mut output = format!("{tag}:");
                 let mut quoted = false;
@@ -549,6 +549,10 @@ mod tests {
         assert_eq!(
             rewrite_manifest("#EXT-X-MAP:URI=\"unfinished", |v| v.to_owned()),
             "#EXT-X-MAP:URI=\"unfinished\n"
+        );
+        assert_eq!(
+            rewrite_manifest("#EXTINF:4,URI=\"title\"", |_| "changed".into()),
+            "#EXTINF:4,URI=\"title\"\n"
         );
     }
     #[test]

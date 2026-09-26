@@ -239,10 +239,18 @@ test("playback retries a lost HTTP response with the same operation key", async 
   const revoked: string[] = [];
   let loseResponses = false;
   let cleanupOffline = false;
+  let holdNext = false;
+  let releaseHeld: (() => void) | undefined;
+  await page.addInitScript(() => {
+    (window as any).unhandledPlayback = [];
+    window.addEventListener("unhandledrejection", (event) =>
+      (window as any).unhandledPlayback.push(String(event.reason)),
+    );
+  });
   await page.route("**/test-media", (route) =>
     route.fulfill({ contentType: "video/mp4", body: "" }),
   );
-  await page.route("**/api/v1/**", (route) => {
+  await page.route("**/api/v1/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/me"))
       return route.fulfill({
@@ -273,6 +281,14 @@ test("playback retries a lost HTTP response with the same operation key", async 
     }
     if (path.endsWith("/playback-sessions")) {
       requests.push(route.request().postDataJSON());
+      if (holdNext) {
+        holdNext = false;
+        await new Promise<void>((resolve) => {
+          releaseHeld = resolve;
+        });
+        await route.abort("failed").catch(() => {});
+        return;
+      }
       if (loseResponses) return route.abort("failed");
       if (requests.length === 1) return route.abort("failed");
       if (requests.length === 2)
@@ -375,5 +391,17 @@ test("playback retries a lost HTTP response with the same operation key", async 
   expect(revoked).toContain(abandoned);
   expect(requests[7].idempotency_key).not.toBe(abandoned);
   await expect(page.locator("video")).toHaveAttribute("src", "/test-media");
+  holdNext = true;
+  await page.getByRole("button", { name: "重新加载", exact: true }).click();
+  await expect.poll(() => requests.length).toBe(9);
+  await page.getByRole("button", { name: "重新加载", exact: true }).click();
+  await expect.poll(() => requests.length).toBe(10);
+  await expect(page.locator("video")).toHaveAttribute("src", "/test-media");
+  releaseHeld!();
+  await expect(page.getByRole("alert")).not.toContainText("播放准备超时");
+  await expect(page.getByRole("alert")).not.toContainText("播放准备已取消");
+  expect(await page.evaluate(() => (window as any).unhandledPlayback)).toEqual(
+    [],
+  );
   expect(pageErrors).toEqual([]);
 });

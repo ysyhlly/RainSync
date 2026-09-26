@@ -4,7 +4,7 @@ import Hls from "hls.js";
 import { detectCapabilities } from "../../../packages/player-core";
 import { useSession } from "./api";
 import { RequestFailure, stopsReconnect } from "./errors";
-import { PlaybackRequests } from "./playback-request";
+import { PlaybackCancelled, PlaybackRequests } from "./playback-request";
 import {
   Clock,
   Corrector,
@@ -100,15 +100,18 @@ const currentTitle = computed(
     media.value.find((m) => m.id === state.value?.media_id)?.title ??
     "选择一部影片，让此刻相连",
 );
+let actionSerial = 0;
 async function run(action: () => Promise<void>) {
+  const serial = ++actionSerial;
   error.value = "";
   busy.value = true;
   try {
     await action();
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
+    if (serial === actionSerial && !(e instanceof PlaybackCancelled))
+      error.value = e instanceof Error ? e.message : String(e);
   } finally {
-    busy.value = false;
+    if (serial === actionSerial) busy.value = false;
   }
 }
 async function refresh() {
@@ -230,7 +233,13 @@ function connect() {
         audioIndex.value = undefined;
         void run(() => loadMedia());
       } else if (v.action?.type === "SEEK") void run(() => applyState(true));
-      else void applyState();
+      else {
+        const serial = loadSerial;
+        void applyState().catch((e) => {
+          if (serial === loadSerial && !(e instanceof PlaybackCancelled))
+            error.value = e instanceof Error ? e.message : String(e);
+        });
+      }
     }
   };
 }
@@ -272,53 +281,59 @@ async function loadMedia() {
   const s = state.value;
   if (!s?.media_id) return;
   const serial = ++loadSerial;
-  await stopPlayback();
-  await nextTick();
-  if (serial !== loadSerial || !video.value) return;
-  const request: PlaybackRequest = {
-    room_id: s.room_id,
-    media_generation: s.media_generation,
-    mode: mode.value,
-    audio_index: audioIndex.value ?? null,
-    position_ms: target(s, clock.now()),
-    capabilities: detectCapabilities(
-      video.value,
-      Hls.isSupported() ? window.MediaSource : undefined,
-    ),
-  };
-  const p = await requests().prepare(request);
-  if (serial !== loadSerial) {
-    await session.api(`/playback-sessions/${p.session_id}`, "DELETE");
-    return;
+  try {
+    await stopPlayback();
+    await nextTick();
+    if (serial !== loadSerial || !video.value) return;
+    const request: PlaybackRequest = {
+      room_id: s.room_id,
+      media_generation: s.media_generation,
+      mode: mode.value,
+      audio_index: audioIndex.value ?? null,
+      position_ms: target(s, clock.now()),
+      capabilities: detectCapabilities(
+        video.value,
+        Hls.isSupported() ? window.MediaSource : undefined,
+      ),
+    };
+    const p = await requests().prepare(request);
+    if (serial !== loadSerial) {
+      await session.api(`/playback-sessions/${p.session_id}`, "DELETE");
+      return;
+    }
+    plan = p;
+    tracks.value = p.audio_tracks;
+    subtitles.value = p.subtitle_tracks;
+    const el = video.value;
+    waiting.value = true;
+    if (
+      p.transport === "hls" &&
+      !el.canPlayType("application/vnd.apple.mpegurl") &&
+      Hls.isSupported()
+    ) {
+      hls = new Hls({
+        maxBufferLength: 20,
+        maxMaxBufferLength: 60,
+        backBufferLength: 30,
+      });
+      hls.loadSource(p.playback_url);
+      hls.attachMedia(el);
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (serial === loadSerial && data.fatal) {
+          error.value = "媒体加载失败：" + data.details;
+          waiting.value = false;
+        }
+      });
+    } else el.src = p.playback_url;
+    el.onloadedmetadata = () => {
+      if (serial !== loadSerial) return;
+      duration.value = p.duration_ms ? p.duration_ms / 1000 : el.duration;
+      void run(() => applyState(true));
+    };
+  } catch (e) {
+    if (serial !== loadSerial || e instanceof PlaybackCancelled) return;
+    throw e;
   }
-  plan = p;
-  tracks.value = p.audio_tracks;
-  subtitles.value = p.subtitle_tracks;
-  const el = video.value;
-  waiting.value = true;
-  if (
-    p.transport === "hls" &&
-    !el.canPlayType("application/vnd.apple.mpegurl") &&
-    Hls.isSupported()
-  ) {
-    hls = new Hls({
-      maxBufferLength: 20,
-      maxMaxBufferLength: 60,
-      backBufferLength: 30,
-    });
-    hls.loadSource(p.playback_url);
-    hls.attachMedia(el);
-    hls.on(Hls.Events.ERROR, (_, data) => {
-      if (data.fatal) {
-        error.value = "媒体加载失败：" + data.details;
-        waiting.value = false;
-      }
-    });
-  } else el.src = p.playback_url;
-  el.onloadedmetadata = () => {
-    duration.value = p.duration_ms ? p.duration_ms / 1000 : el.duration;
-    void applyState(true);
-  };
 }
 async function applyState(force = false) {
   const s = state.value,
@@ -373,7 +388,7 @@ function tick() {
       plan.rebuild_on_seek &&
       (expected < -0.5 || expected > el.duration + 1)
     ) {
-      void loadMedia();
+      void run(loadMedia);
     } else el.currentTime = Math.max(0, expected);
   }
 }
@@ -453,7 +468,7 @@ function wake() {
   if (document.visibilityState === "visible") {
     clock.reset();
     sampleClock();
-    void applyState(true);
+    void run(() => applyState(true));
   }
 }
 onMounted(() => {

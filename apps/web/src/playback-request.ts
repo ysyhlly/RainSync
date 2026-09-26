@@ -1,8 +1,36 @@
 import type { PlaybackPlan, PlaybackRequest } from "../../../packages/protocol";
 import { RequestFailure } from "./errors";
 
+export class PlaybackCancelled extends Error {
+  constructor() {
+    super("播放准备已取消");
+    this.name = "PlaybackCancelled";
+  }
+}
+export class PlaybackTimeout extends Error {
+  constructor() {
+    super("播放准备超时，请重新发起播放");
+    this.name = "PlaybackTimeout";
+  }
+}
+function retryDelay(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }, 1000);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
 /** Retry uncertain results and transient preparation failures with one identity.
- * Both the client deadline and the server attempt limit bound recovery. */
+ * Each HTTP attempt gets 65s (server preparation: 45s, lease: 60s).
+ * A 200s operation cap covers three full attempts plus retry delays. */
 export async function requestPlayback(
   send: (
     request: PlaybackRequest,
@@ -16,24 +44,43 @@ export async function requestPlayback(
     idempotency_key: input.idempotency_key ?? crypto.randomUUID(),
   };
   const controller = new AbortController();
-  const abort = () => controller.abort();
+  const abort = () => controller.abort(new PlaybackCancelled());
   signal?.addEventListener("abort", abort, { once: true });
-  if (signal?.aborted) controller.abort();
-  const timeout = setTimeout(() => controller.abort(), 65000);
+  if (signal?.aborted) abort();
+  const timeout = setTimeout(
+    () => controller.abort(new PlaybackTimeout()),
+    200000,
+  );
   let networkFailures = 0;
   try {
     for (;;) {
-      if (controller.signal.aborted)
-        throw new Error("播放准备超时，请重新发起播放");
+      if (controller.signal.aborted) throw controller.signal.reason;
       try {
-        return await send(request, controller.signal);
+        const attempt = new AbortController();
+        const cancel = () => attempt.abort(controller.signal.reason);
+        controller.signal.addEventListener("abort", cancel, { once: true });
+        const deadline = setTimeout(
+          () => attempt.abort(new PlaybackTimeout()),
+          65000,
+        );
+        try {
+          const plan = await send(request, attempt.signal);
+          if (attempt.signal.aborted) throw attempt.signal.reason;
+          return plan;
+        } catch (error) {
+          if (attempt.signal.aborted) throw attempt.signal.reason;
+          throw error;
+        } finally {
+          clearTimeout(deadline);
+          controller.signal.removeEventListener("abort", cancel);
+        }
       } catch (error) {
-        if (controller.signal.aborted)
-          throw new Error("播放准备超时，请重新发起播放");
+        if (controller.signal.aborted) throw controller.signal.reason;
         const pending =
           error instanceof RequestFailure &&
           error.code === "PLAYBACK_REQUEST_IN_PROGRESS";
         const uncertain =
+          error instanceof PlaybackTimeout ||
           error instanceof TypeError ||
           (error instanceof RequestFailure &&
             error.code === "INVALID_RESPONSE");
@@ -55,7 +102,7 @@ export async function requestPlayback(
           ].includes(error.code);
         if (!pending && (!(uncertain || recoverable) || ++networkFailures >= 3))
           throw error;
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await retryDelay(controller.signal);
       }
     }
   } finally {
@@ -108,8 +155,13 @@ export class PlaybackRequests {
     const serial = ++this.serial;
     this.controller?.abort();
     // Never consume another quota slot while an older result is uncertain.
-    await this.cleanup();
-    if (serial !== this.serial) throw new Error("播放准备已取消");
+    try {
+      await this.cleanup();
+    } catch (error) {
+      if (serial !== this.serial) throw new PlaybackCancelled();
+      throw error;
+    }
+    if (serial !== this.serial) throw new PlaybackCancelled();
     const key = input.idempotency_key ?? crypto.randomUUID();
     this.keys.add(key);
     this.save();
@@ -121,17 +173,21 @@ export class PlaybackRequests {
         { ...input, idempotency_key: key },
         controller.signal,
       );
-      if (serial !== this.serial) throw new Error("播放准备已取消");
+      if (serial !== this.serial) throw new PlaybackCancelled();
       return plan;
     } catch (error) {
       // Failed revocation remains in storage and blocks the next preparation.
       try {
         await this.revoke(key);
       } catch {
+        if (serial !== this.serial || error instanceof PlaybackCancelled)
+          throw new PlaybackCancelled();
         throw new Error(
           `${error instanceof Error ? error.message : String(error)}；旧播放请求尚待清理，恢复连接后重试`,
         );
       }
+      if (serial !== this.serial || error instanceof PlaybackCancelled)
+        throw new PlaybackCancelled();
       throw error;
     }
   }
