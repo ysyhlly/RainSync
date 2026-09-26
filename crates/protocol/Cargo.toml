@@ -1,0 +1,10 @@
+[package]
+name = "protocol"
+version.workspace = true
+edition.workspace = true
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+schemars = { version = "1", features = ["uuid1"] }
+ts-rs = { version = "11", features = ["uuid-impl"] }

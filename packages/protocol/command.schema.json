@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Command",
+  "type": "object",
+  "properties": {
+    "command_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "expected_revision": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "media_generation": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "protocol_version": {
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
+    "room_id": {
+      "type": "string",
+      "format": "uuid"
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "PLAY"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "PAUSE"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "properties": {
+            "position_ms": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "required": [
+            "position_ms"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "SEEK"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "properties": {
+            "rate": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "required": [
+            "rate"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "SET_RATE"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "properties": {
+            "media_id": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "required": [
+            "media_id"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "CHANGE_MEDIA"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    }
+  ],
+  "required": [
+    "protocol_version",
+    "room_id",
+    "command_id",
+    "expected_revision",
+    "media_generation"
+  ]
+}

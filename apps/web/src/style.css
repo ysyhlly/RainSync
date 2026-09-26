@@ -1,0 +1,740 @@
+:root {
+  font-family: "Noto Sans SC", system-ui, sans-serif;
+  color: #e7ece8;
+  background: #101518;
+  font-synthesis: none;
+  font-size: 14px;
+  color-scheme: dark;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+button {
+  cursor: pointer;
+  border: 1px solid #35403e;
+  border-radius: 7px;
+  padding: 9px 15px;
+  background: #202a2b;
+  color: #e5eee9;
+  transition: 0.15s;
+}
+button:hover:not(:disabled) {
+  background: #334a40;
+  border-color: #a0c9ae;
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+input,
+select,
+textarea {
+  background: #121a1d;
+  color: #e7ece8;
+  border: 1px solid #35403e;
+  border-radius: 6px;
+  padding: 10px 12px;
+  min-width: 0;
+}
+input:focus,
+select:focus,
+textarea:focus {
+  outline: 2px solid #a5c8ac;
+  outline-offset: 2px;
+}
+input[type="range"] {
+  accent-color: #b6d2a5;
+  padding: 0;
+}
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: #b7c1bd;
+  font-size: 12px;
+}
+form {
+  display: flex;
+  gap: 13px;
+}
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+h1 {
+  font-size: 32px;
+  letter-spacing: -1px;
+  font-weight: 600;
+  margin: 12px 0;
+}
+h2 {
+  font-size: 18px;
+  font-weight: 500;
+}
+h3 {
+  font-size: 14px;
+}
+p {
+  color: #8f9c99;
+  line-height: 1.8;
+}
+.shell {
+  display: flex;
+  min-height: 100vh;
+}
+.rail {
+  width: 194px;
+  position: fixed;
+  inset: 0 auto 0 0;
+  background: #151d20;
+  border-right: 1px solid #283133;
+  padding: 36px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.brand {
+  text-decoration: none;
+  color: #c8dfb4;
+  font-size: 28px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.brand span {
+  font-size: 19px;
+  letter-spacing: -0.6px;
+  font-weight: 600;
+}
+.rail-line {
+  height: 1px;
+  background: #2c3535;
+  margin: 25px 0;
+}
+.rail button {
+  text-align: left;
+  border: none;
+  background: none;
+  color: #8f9c99;
+  padding: 13px 12px;
+}
+.rail button span {
+  margin-left: 10px;
+}
+.rail button.active {
+  background: #26352f;
+  color: #c9e2b9;
+}
+.rail-bottom {
+  margin-top: auto;
+  font-size: 12px;
+  color: #a6b3ac;
+}
+.rail-bottom small {
+  display: block;
+  font-size: 8px;
+  letter-spacing: 1px;
+  margin-top: 10px;
+  color: #667671;
+}
+main {
+  margin-left: 194px;
+  padding: 0 40px;
+  max-width: 1800px;
+  flex: 1;
+  min-width: 0;
+}
+header {
+  height: 92px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid #293235;
+}
+.breadcrumb {
+  font-size: 10px;
+  letter-spacing: 1.4px;
+  color: #899892;
+}
+.breadcrumb span {
+  margin: 0 18px;
+  color: #45524d;
+}
+.identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: #b9c5bd;
+}
+.identity i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #777;
+}
+.identity i.online {
+  background: #b8d4a8;
+}
+.text {
+  padding: 3px 7px;
+  background: transparent;
+  border: 0;
+  color: #aac49d;
+  font-size: 12px;
+}
+.heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 35px 0 28px;
+}
+.eyebrow {
+  font-size: 9px;
+  letter-spacing: 2.1px;
+  color: #9aaa9d;
+}
+.heading p {
+  font-size: 12px;
+}
+.card {
+  border: 1px solid #2e393a;
+  border-radius: 10px;
+  background: #192225;
+}
+.room-picker {
+  padding: 13px 16px;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 24px;
+  flex-wrap: wrap;
+}
+.room-picker form {
+  flex: 1;
+}
+.room-picker form input {
+  flex: 1;
+}
+.room-picker details {
+  font-size: 12px;
+  color: #a0b3a5;
+}
+.room-picker details form {
+  margin-top: 12px;
+}
+.watch-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 22px;
+}
+.screen {
+  aspect-ratio: 16/9;
+  background: #080e11;
+  position: relative;
+  overflow: hidden;
+  border-radius: 10px 10px 0 0;
+  border: 1px solid #2a3535;
+}
+.screen video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.empty-screen {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  background: radial-gradient(ellipse at 50% 80%, #203433 0, transparent 68%);
+}
+.film-icon {
+  border: 1px solid #46645a;
+  border-radius: 50%;
+  padding: 16px 23px;
+  font-size: 28px;
+  color: #b6d2a5;
+  margin-bottom: 22px;
+}
+.empty-screen h2 {
+  font-size: 19px;
+  color: #bdccbf;
+}
+.empty-screen p {
+  font-size: 11px;
+  margin-top: 10px;
+}
+.transport {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: #1c2527;
+  padding: 12px;
+  border-radius: 0 0 10px 10px;
+}
+.transport span {
+  white-space: nowrap;
+  font-size: 10px;
+  color: #9ca9a1;
+}
+.transport input {
+  flex: 1;
+  width: 40px;
+}
+.transport select {
+  padding: 6px;
+  width: 65px;
+}
+.transport button {
+  font-size: 12px;
+}
+.now-playing {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 22px 0;
+}
+.now-playing small {
+  font-size: 8px;
+  color: #799083;
+  letter-spacing: 2px;
+  display: block;
+  margin-bottom: 8px;
+}
+.now-playing h2 {
+  font-size: 18px;
+}
+.status {
+  font-size: 10px;
+  color: #a39174;
+  border: 1px solid #454333;
+  padding: 5px 8px;
+  border-radius: 5px;
+}
+.status.live {
+  color: #b0cea1;
+  border-color: #3c4f3b;
+}
+.playback-options {
+  display: flex;
+  gap: 12px;
+  align-items: end;
+  flex-wrap: wrap;
+}
+.playback-options label {
+  font-size: 10px;
+}
+.playback-options label:last-child {
+  max-width: 100px;
+}
+.chat {
+  display: flex;
+  flex-direction: column;
+  max-height: 580px;
+  min-height: 320px;
+}
+.chat-title {
+  padding: 20px;
+  border-bottom: 1px solid #2c3738;
+  display: flex;
+  justify-content: space-between;
+}
+.chat-title span {
+  font-size: 9px;
+  letter-spacing: 1px;
+  color: #9cb99d;
+}
+.chat-log {
+  flex: 1;
+  overflow: auto;
+  padding: 20px;
+}
+.chat-welcome {
+  font-size: 17px;
+  color: #7b9186;
+  line-height: 1.8;
+  margin: 26px 0 36px;
+}
+.chat-welcome small {
+  display: block;
+  font-size: 10px;
+  margin-top: 15px;
+  color: #60766b;
+}
+.chat article {
+  margin-bottom: 16px;
+}
+.chat article b {
+  font-size: 11px;
+  color: #b4c99f;
+}
+.chat article p {
+  font-size: 12px;
+  color: #c5ceca;
+  overflow-wrap: anywhere;
+}
+.chat form {
+  border-top: 1px solid #2c3738;
+  padding: 12px;
+  gap: 8px;
+}
+.chat form input {
+  width: 100%;
+  font-size: 11px;
+}
+.chat form button {
+  padding: 8px 13px;
+}
+.library {
+  margin-top: 34px;
+}
+.section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+.section-title h2 span {
+  font-size: 11px;
+  color: #91a286;
+  margin-left: 9px;
+}
+.section-title input {
+  font-size: 11px;
+  max-width: 200px;
+}
+.media-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(145px, 1fr));
+  gap: 22px;
+}
+.poster {
+  aspect-ratio: 3/4;
+  width: 100%;
+  padding: 15px;
+  display: flex;
+  flex-direction: column;
+  align-items: start;
+  justify-content: space-between;
+  text-align: left;
+  border: 0;
+  border-radius: 8px;
+  background: linear-gradient(160deg, #40524b, #182522);
+  overflow: hidden;
+}
+.poster small {
+  font-size: 8px;
+  letter-spacing: 2px;
+  color: #d5ddd1;
+}
+.poster span {
+  align-self: center;
+  font-size: 36px;
+  color: #e0e7d4;
+}
+.poster strong {
+  font-size: 17px;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+.poster-1 {
+  background: linear-gradient(160deg, #645044, #272322);
+}
+.poster-2 {
+  background: linear-gradient(160deg, #374963, #17202c);
+}
+.poster-3 {
+  background: linear-gradient(160deg, #665c36, #25291c);
+}
+.poster:disabled {
+  opacity: 0.85;
+}
+.media-card h3 {
+  margin-top: 13px;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.media-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 10px;
+  color: #82948a;
+  margin-top: 6px;
+}
+.empty-library {
+  padding: 40px;
+  text-align: center;
+  color: #8d9e92;
+}
+.primary {
+  background: #bdd3a6;
+  border-color: #bdd3a6;
+  color: #1c3023;
+  font-weight: 600;
+}
+.notice {
+  padding: 15px 20px;
+  margin: 15px 0;
+  background: #27372d;
+  border: 1px solid #45604a;
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+.notice label input {
+  width: 100%;
+}
+.error {
+  background: #38292a;
+  border-color: #784749;
+  color: #ebc4bc;
+  display: flex;
+  justify-content: space-between;
+}
+.login {
+  max-width: 550px;
+  margin: 65px auto;
+  padding: 45px;
+}
+.login h1 {
+  font-size: 36px;
+  line-height: 1.55;
+}
+.login form {
+  flex-direction: column;
+  margin-top: 30px;
+}
+.login .primary {
+  margin-top: 10px;
+}
+.settings {
+  padding: 38px 0;
+}
+.settings-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  margin-top: 28px;
+}
+.settings .card {
+  padding: 26px;
+}
+.settings form {
+  flex-direction: column;
+  margin: 20px 0;
+}
+.settings h2 {
+  margin: 15px 0;
+}
+.settings p {
+  font-size: 12px;
+}
+.settings textarea {
+  width: 100%;
+  overflow-wrap: anywhere;
+}
+.source-row {
+  padding: 15px 0;
+  border-top: 1px solid #303b3b;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.source-row small {
+  display: block;
+  color: #7e9285;
+  font-size: 10px;
+  margin-top: 5px;
+}
+.queue {
+  padding: 24px;
+  margin-top: 30px;
+}
+.queue > div {
+  display: flex;
+  gap: 12px;
+  margin-top: 15px;
+}
+.queue > div span {
+  flex: 1;
+}
+.autoplay {
+  position: absolute;
+  top: 45%;
+  left: 35%;
+}
+.buffering {
+  position: absolute;
+  bottom: 20px;
+  left: 20px;
+  font-size: 12px;
+  background: #192225;
+  padding: 7px 12px;
+  border-radius: 5px;
+}
+footer {
+  padding: 35px 0;
+  margin-top: 35px;
+  border-top: 1px solid #283233;
+  font-size: 12px;
+  color: #90a38f;
+  display: flex;
+  gap: 20px;
+  align-items: center;
+}
+footer span {
+  font-size: 10px;
+  color: #64796d;
+}
+footer small {
+  margin-left: auto;
+  font-size: 8px;
+  letter-spacing: 1.5px;
+  color: #587062;
+}
+@media (min-width: 1500px) {
+  main {
+    padding: 0 64px;
+  }
+  .watch-grid {
+    grid-template-columns: minmax(0, 1fr) 320px;
+  }
+}
+@media (max-width: 1000px) {
+  .rail {
+    width: 74px;
+    padding: 28px 12px;
+  }
+  .brand span,
+  .rail button span,
+  .rail-bottom {
+    display: none;
+  }
+  .brand {
+    justify-content: center;
+  }
+  .rail button {
+    text-align: center;
+  }
+  main {
+    margin-left: 74px;
+    padding: 0 22px;
+  }
+  .watch-grid {
+    grid-template-columns: 1fr;
+  }
+  .chat {
+    height: 300px;
+  }
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 600px) {
+  .rail {
+    position: static;
+    width: 100%;
+    height: 64px;
+    flex-direction: row;
+    align-items: center;
+    padding: 12px 18px;
+    border-bottom: 1px solid #293235;
+  }
+  .brand {
+    font-size: 23px;
+    margin-right: auto;
+  }
+  .brand span {
+    display: block;
+    font-size: 16px;
+  }
+  .rail-line {
+    display: none;
+  }
+  .shell {
+    display: block;
+  }
+  main {
+    margin-left: 0;
+    padding: 0 16px;
+  }
+  header {
+    height: 62px;
+  }
+  .breadcrumb {
+    font-size: 8px;
+  }
+  .breadcrumb span {
+    margin: 0 6px;
+  }
+  .heading {
+    padding: 25px 0;
+  }
+  h1 {
+    font-size: 25px;
+  }
+  .heading button {
+    font-size: 11px;
+    padding: 8px;
+  }
+  .room-picker {
+    padding: 12px;
+  }
+  .room-picker form {
+    flex-wrap: wrap;
+  }
+  .room-picker input {
+    width: 100px;
+  }
+  .transport {
+    gap: 7px;
+  }
+  .transport button {
+    padding: 7px;
+  }
+  .transport span {
+    font-size: 9px;
+  }
+  .now-playing {
+    gap: 10px;
+  }
+  .now-playing h2 {
+    font-size: 14px;
+  }
+  .status {
+    white-space: nowrap;
+  }
+  .media-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 15px;
+  }
+  .login {
+    padding: 25px;
+    margin: 30px 0;
+  }
+  .login h1 {
+    font-size: 28px;
+  }
+  footer small {
+    display: none;
+  }
+  .settings .card {
+    padding: 18px;
+  }
+}

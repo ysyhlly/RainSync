@@ -1,0 +1,7 @@
+export type PlaybackStatus = "playing" | "paused" | "ended";
+export type RoomState = { room_id: string, revision: number, media_id: string | null, media_generation: number, playback_status: PlaybackStatus, anchor_position_ms: number, anchor_server_time_ms: number, playback_rate: number, controller_user_id: string, duration_ms: number | null, clock_epoch: string, };
+export type Action = { "type": "PLAY" } | { "type": "PAUSE" } | { "type": "SEEK", "payload": { position_ms: number, } } | { "type": "SET_RATE", "payload": { rate: number, } } | { "type": "CHANGE_MEDIA", "payload": { media_id: string, } };
+export type Command = { protocol_version: number, room_id: string, command_id: string, expected_revision: number, media_generation: number, } & ({ "type": "PLAY" } | { "type": "PAUSE" } | { "type": "SEEK", "payload": { position_ms: number, } } | { "type": "SET_RATE", "payload": { rate: number, } } | { "type": "CHANGE_MEDIA", "payload": { media_id: string, } });
+export type MediaTrack = { index: number, label: string, language: string, url: string | null, };
+export type PlaybackPlan = { session_id: string, media_id: string, media_generation: number, delivery_mode: string, transport: string, playback_url: string, timeline_origin_ms: number, duration_ms: number | null, expires_in_seconds: number, rebuild_on_seek: boolean, audio_tracks: Array<MediaTrack>, subtitle_tracks: Array<MediaTrack>, };
+export type PlaybackCapabilities = { progressive_h264_aac: boolean, native_hls: boolean, mse_h264_aac: boolean, };

@@ -1,0 +1,21 @@
+{
+  "name": "rainsync",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w apps/web",
+    "build": "npm run build -w apps/web",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "prettier": "^3.9.9",
+    "typescript": "^5.9.0",
+    "vitest": "^5.0.2",
+    "ws": "^8.22.0"
+  }
+}

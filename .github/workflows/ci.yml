@@ -1,0 +1,21 @@
+name: checks
+on: [push, pull_request]
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo run -p protocol --example export && git diff --exit-code packages/protocol
+      - run: npm ci && npm test && npm run build
+      - run: cargo build --workspace --locked && node tests/integration.mjs
+      - run: npx playwright install --with-deps chromium && npm run test:e2e

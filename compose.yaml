@@ -1,0 +1,52 @@
+name: rainsync
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: rainsync
+      POSTGRES_DB: rainsync
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes: ["database:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rainsync"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+  server:
+    image: rainsync-server:dev
+    build: { context: ., dockerfile: deploy/Dockerfile }
+    environment: &backend
+      DATABASE_URL: postgres://rainsync:${POSTGRES_PASSWORD}@db/rainsync
+      SOURCE_ENCRYPTION_KEY: ${SOURCE_ENCRYPTION_KEY:?Set SOURCE_ENCRYPTION_KEY}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:8088}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD}
+      WORKER_URL: http://worker:8081
+      MEDIA_ROOT: /media
+      CACHE_ROOT: /cache
+      RUST_LOG: info
+    volumes: ["${MEDIA_PATH:-./media}:/media:ro"]
+    depends_on:
+      db: { condition: service_healthy }
+    restart: unless-stopped
+  worker:
+    image: rainsync-server:dev
+    build: { context: ., dockerfile: deploy/Dockerfile }
+    command: ["rainsync-media-worker"]
+    environment: *backend
+    volumes: ["${MEDIA_PATH:-./media}:/media:ro", "cache:/cache"]
+    depends_on: [server]
+    restart: unless-stopped
+  web:
+    image: rainsync-web:dev
+    build: { context: ., dockerfile: deploy/Dockerfile.web }
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports: ["${HTTP_PORT:-8088}:80", "${HTTPS_PORT:-8443}:443"]
+    volumes: ["caddy_data:/data", "caddy_config:/config"]
+    depends_on: [server, worker]
+    restart: unless-stopped
+volumes:
+  database:
+  cache:
+  caddy_data:
+  caddy_config:

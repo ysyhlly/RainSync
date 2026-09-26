@@ -1,0 +1,21 @@
+{$SITE_ADDRESS:localhost} {
+    handle /api/* {
+        reverse_proxy server:8080
+    }
+    handle /media-delivery/* {
+        reverse_proxy worker:8081
+    }
+    handle /agent-data/* {
+        reverse_proxy worker:8081
+    }
+    handle {
+        root * /srv
+        try_files {path} /index.html
+        file_server
+    }
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy no-referrer
+        X-Frame-Options DENY
+    }
+}
