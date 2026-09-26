@@ -23,7 +23,7 @@ pub fn reduce(
         return Err("protocol_version");
     }
     if actor != state.controller_user_id && !admin {
-        return Err("forbidden");
+        return Err("controller_required");
     }
     if command.room_id != state.room_id {
         return Err("wrong_room");
@@ -109,7 +109,7 @@ mod tests {
         let (s, mut c) = fixture();
         assert_eq!(
             reduce(&s, &c, Uuid::new_v4(), false, 600.0),
-            Err("forbidden")
+            Err("controller_required")
         );
         c.expected_revision = 3;
         assert_eq!(

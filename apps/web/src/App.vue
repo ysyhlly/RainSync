@@ -3,15 +3,37 @@ import { ref, computed, onMounted, onBeforeUnmount, nextTick } from "vue";
 import Hls from "hls.js";
 import { detectCapabilities } from "../../../packages/player-core";
 import { useSession } from "./api";
+import { RequestFailure, stopsReconnect } from "./errors";
+import { PlaybackRequests } from "./playback-request";
 import {
   Clock,
   Corrector,
   target,
   reconnectDelay,
 } from "../../../packages/sync-engine";
-import type { RoomState, PlaybackPlan } from "../../../packages/protocol";
+import type {
+  RoomState,
+  PlaybackPlan,
+  PlaybackRequest,
+} from "../../../packages/protocol";
 const reload = () => window.location.reload();
 const session = useSession();
+let playbackRequests: PlaybackRequests | undefined;
+let playbackUser: string | undefined;
+function requests() {
+  const user = session.user!.id;
+  if (!playbackRequests || playbackUser !== user) {
+    playbackUser = user;
+    playbackRequests = new PlaybackRequests(
+      (body, signal) => session.api("/playback-sessions", "POST", body, signal),
+      (key, signal) =>
+        session.api(`/playback-requests/${key}`, "DELETE", undefined, signal),
+      sessionStorage,
+      `rainsync:playback:${user}`,
+    );
+  }
+  return playbackRequests;
+}
 const error = ref("");
 const busy = ref(false);
 const username = ref("admin");
@@ -25,6 +47,7 @@ const rooms = ref<any[]>([]),
 const room = ref<any>(null),
   state = ref<RoomState | null>(null),
   connected = ref(false),
+  connectionStopped = ref(false),
   tab = ref("watch"),
   video = ref<HTMLVideoElement>(),
   waiting = ref(false),
@@ -127,8 +150,10 @@ function connect() {
   clearTimeout(retry);
   connectionSerial++;
   const serial = connectionSerial;
+  let retryAllowed = true;
   socket?.close();
   connected.value = false;
+  connectionStopped.value = false;
   if (!room.value) return;
   socket = new WebSocket(
     `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/v1/ws`,
@@ -151,10 +176,25 @@ function connect() {
         if (serial === connectionSerial) sampleClock();
       }, i * 150);
   };
-  socket.onclose = () => {
+  socket.onclose = async () => {
     if (serial !== connectionSerial) return;
     connected.value = false;
-    retry = setTimeout(connect, reconnectDelay(attempt++));
+    if (retryAllowed) {
+      // Browsers do not expose a rejected upgrade's HTTP status. Check the
+      // login session before reconnecting so expired cookies cannot loop.
+      try {
+        await session.load();
+      } catch (failure) {
+        if (serial !== connectionSerial) return;
+        if (failure instanceof RequestFailure && stopsReconnect(failure)) {
+          retryAllowed = false;
+          error.value = failure.message;
+        }
+      }
+    }
+    if (serial !== connectionSerial) return;
+    connectionStopped.value = !retryAllowed;
+    if (retryAllowed) retry = setTimeout(connect, reconnectDelay(attempt++));
   };
   socket.onmessage = (event) => {
     if (serial !== connectionSerial) return;
@@ -167,7 +207,14 @@ function connect() {
       messages.value.push(v);
       return;
     }
-    if (v.type === "ERROR") error.value = v.error;
+    if (v.type === "ERROR") {
+      const failure = new RequestFailure(v);
+      error.value = failure.message;
+      if (stopsReconnect(failure)) {
+        retryAllowed = false;
+        socket?.close();
+      }
+    }
     if (v.state) {
       const old = state.value;
       const next = v.state as RoomState;
@@ -219,6 +266,7 @@ async function stopPlayback() {
     await session
       .api(`/playback-sessions/${old.session_id}`, "DELETE")
       .catch(() => {});
+  if (session.user) await requests().stop();
 }
 async function loadMedia() {
   const s = state.value;
@@ -227,17 +275,18 @@ async function loadMedia() {
   await stopPlayback();
   await nextTick();
   if (serial !== loadSerial || !video.value) return;
-  const p: PlaybackPlan = await session.api("/playback-sessions", "POST", {
+  const request: PlaybackRequest = {
     room_id: s.room_id,
     media_generation: s.media_generation,
     mode: mode.value,
-    audio_index: audioIndex.value,
+    audio_index: audioIndex.value ?? null,
     position_ms: target(s, clock.now()),
     capabilities: detectCapabilities(
       video.value,
       Hls.isSupported() ? window.MediaSource : undefined,
     ),
-  });
+  };
+  const p = await requests().prepare(request);
   if (serial !== loadSerial) {
     await session.api(`/playback-sessions/${p.session_id}`, "DELETE");
     return;
@@ -427,7 +476,7 @@ onBeforeUnmount(() => {
   clearInterval(clockTimer);
   clearInterval(renewTimer);
   document.removeEventListener("visibilitychange", wake);
-  void stopPlayback();
+  void stopPlayback().catch(() => {});
 });
 </script>
 
@@ -637,7 +686,11 @@ onBeforeUnmount(() => {
                 <h2>{{ currentTitle }}</h2>
               </div>
               <span class="status" :class="{ live: connected }">{{
-                connected ? "● 已连接" : "○ 正在重连"
+                connected
+                  ? "● 已连接"
+                  : connectionStopped
+                    ? "○ 连接已停止"
+                    : "○ 正在重连"
               }}</span>
             </div>
             <div class="playback-options">

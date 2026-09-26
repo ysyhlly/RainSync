@@ -15,6 +15,24 @@ struct Request {
     reply: oneshot::Sender<Value>,
 }
 
+fn socket_error(reason: &str, command_id: Option<Uuid>) -> Value {
+    let code = protocol::ErrorCode::from_reason(reason, 400);
+    let error = protocol::ApiError::new(code, Uuid::new_v4());
+    tracing::warn!(request_id = %error.request_id, ?code, "room request failed");
+    json!({"type":"ERROR", "command_id":command_id, "error":error})
+}
+
+async fn reject_socket(
+    out: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    reason: &str,
+) {
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        out.send(Message::Text(socket_error(reason, None).to_string().into())),
+    )
+    .await;
+}
+
 async fn handle(app: &App, id: Uuid) -> Result<Handle> {
     let mut map = app.rooms.lock().await;
     if let Some(h) = map.get(&id) {
@@ -45,10 +63,22 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                     }
                 };
             let result: std::result::Result<(RoomState, bool), String> = async {
+                if req.command.room_id != id {
+                    return Err("room_mismatch".to_string());
+                }
                 if let Some(previous) =
-                    persistence::previous(&app.db, id, req.command.command_id, req.user.id)
+                    persistence::previous(&app.db, id, &req.command, req.user.id)
                         .await
-                        .map_err(|_| "database_error".to_string())?
+                        .map_err(|error| match error.to_string().as_str() {
+                            "command_owned_by_another_user" => {
+                                "command_owned_by_another_user".to_string()
+                            }
+                            "command_payload_conflict" => "command_payload_conflict".to_string(),
+                            "command_replay_unverifiable" => {
+                                "command_replay_unverifiable".to_string()
+                            }
+                            _ => "database_error".to_string(),
+                        })?
                 {
                     return Ok((
                         if previous.clock_epoch == state.clock_epoch {
@@ -71,15 +101,9 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                         .ok_or("media_not_found")?;
                     next.duration_ms = duration.get("duration_ms");
                 }
-                persistence::commit(
-                    &app.db,
-                    &next,
-                    req.command.command_id,
-                    req.user.id,
-                    state.revision,
-                )
-                .await
-                .map_err(|_| "commit_failed".to_string())?;
+                persistence::commit(&app.db, &next, &req.command, req.user.id, state.revision)
+                    .await
+                    .map_err(|_| "commit_failed".to_string())?;
                 state = next.clone();
                 Ok((next, true))
             }
@@ -93,7 +117,9 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                     json!({"type":"ACK","command_id":req.command.command_id,"state":s,"action":req.command.action})
                 }
                 Err(error) => {
-                    json!({"type":"ERROR","command_id":req.command.command_id,"error":error,"state":state})
+                    let mut message = socket_error(&error, Some(req.command.command_id));
+                    message["state"] = json!(state);
+                    message
                 }
             };
             let _ = req.reply.send(value);
@@ -154,27 +180,38 @@ pub async fn create(
     tx.commit().await?;
     Ok(Json(json!({"id":id})))
 }
-async fn controller(app: &App, h: &HeaderMap, id: Uuid) -> Result<User> {
+async fn controller<'a>(
+    app: &'a App,
+    h: &HeaderMap,
+    id: Uuid,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
     let u = auth(app, h, true).await?;
     member(app, &u, id).await?;
-    let s = persistence::snapshot(&app.db, id).await?;
+    let mut tx = app.db.begin().await?;
+    let value: Value =
+        sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let s: RoomState = serde_json::from_value(value).map_err(anyhow::Error::from)?;
     if !u.admin && s.controller_user_id != u.id {
         return Err(err(StatusCode::FORBIDDEN, "controller_required"));
     };
-    Ok(u)
+    Ok(tx)
 }
 pub async fn invite(
     State(app): State<App>,
     h: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
-    controller(&app, &h, id).await?;
+    let mut tx = controller(&app, &h, id).await?;
     let t = token();
     sqlx::query("INSERT INTO invites VALUES($1,$2,now()+interval '24 hours',false)")
         .bind(hash(&t))
         .bind(id)
-        .execute(&app.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(Json(json!({"token":t,"room_id":id})))
 }
 pub async fn revoke_invite(
@@ -182,12 +219,13 @@ pub async fn revoke_invite(
     h: HeaderMap,
     Path((id, t)): Path<(Uuid, String)>,
 ) -> Result<Json<Value>> {
-    controller(&app, &h, id).await?;
+    let mut tx = controller(&app, &h, id).await?;
     sqlx::query("UPDATE invites SET revoked=true WHERE room_id=$1 AND token_hash=$2")
         .bind(id)
         .bind(hash(&t))
-        .execute(&app.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }
 #[derive(Deserialize)]
@@ -247,9 +285,10 @@ pub async fn add_playlist(
     Path(id): Path<Uuid>,
     Json(body): Json<Add>,
 ) -> Result<Json<Value>> {
-    controller(&app, &h, id).await?;
+    let mut tx = controller(&app, &h, id).await?;
     let item = Uuid::new_v4();
-    sqlx::query("INSERT INTO playlist_items SELECT $1,$2,$3,COALESCE(max(sort_order),0)+1 FROM playlist_items WHERE room_id=$2").bind(item).bind(id).bind(body.media_id).execute(&app.db).await?;
+    sqlx::query("INSERT INTO playlist_items SELECT $1,$2,$3,COALESCE(max(sort_order),0)+1 FROM playlist_items WHERE room_id=$2").bind(item).bind(id).bind(body.media_id).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(Json(json!({"id":item})))
 }
 pub async fn remove_playlist(
@@ -257,12 +296,13 @@ pub async fn remove_playlist(
     h: HeaderMap,
     Path((id, item)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>> {
-    controller(&app, &h, id).await?;
+    let mut tx = controller(&app, &h, id).await?;
     sqlx::query("DELETE FROM playlist_items WHERE room_id=$1 AND id=$2")
         .bind(id)
         .bind(item)
-        .execute(&app.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }
 pub async fn messages(
@@ -283,19 +323,28 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
         return;
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        reject_socket(&mut out, "invalid_request").await;
         return;
     };
+    if !matches!(v["type"].as_str(), Some("JOIN" | "RESUME")) {
+        reject_socket(&mut out, "invalid_request").await;
+        return;
+    }
     let Some(id) = v["room_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) else {
+        reject_socket(&mut out, "invalid_request").await;
         return;
     };
     if member(&app, &user, id).await.is_err() {
+        reject_socket(&mut out, "not_a_member").await;
         return;
     };
     let Ok(handle) = handle(&app, id).await else {
+        reject_socket(&mut out, "database_error").await;
         return;
     };
     let mut events = handle.events.subscribe();
     let Ok(s) = persistence::snapshot(&app.db, id).await else {
+        reject_socket(&mut out, "database_error").await;
         return;
     };
     let mut recovery = "snapshot";
@@ -331,28 +380,37 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
         let value = tokio::select! {
             _=heartbeat.tick()=>{
                 if last_seen.elapsed().as_secs()>45 {break};
-                let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND expires_at>now())").bind(&session_hash).fetch_one(&app.db).await.unwrap_or(false);
-                if !valid{break}
+                let valid=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND expires_at>now())").bind(&session_hash).fetch_one(&app.db).await;
+                match valid {
+                    Ok(true) => {},
+                    Ok(false) => {reject_socket(&mut out,"session_expired").await;break},
+                    Err(_) => {reject_socket(&mut out,"service_unavailable").await;break},
+                }
                 let _=out.send(Message::Ping(Vec::new().into())).await;continue;
             }
             event=events.recv()=>match event {Ok(v)=>v,Err(broadcast::error::RecvError::Lagged(_))=>{match persistence::snapshot(&app.db,id).await{Ok(s)=>json!({"type":"SNAPSHOT","state":s}),Err(_)=>break}},Err(_)=>break},
             message=input.next()=>{
                 let Some(Ok(message))=message else{break};last_seen=Instant::now();
                 let Message::Text(text)=message else{continue};
-                if window.elapsed().as_secs()>=1{window=Instant::now();count=0} count+=1;if count>30{break}
-                let Ok(v)=serde_json::from_str::<Value>(&text)else{continue};
+                if window.elapsed().as_secs()>=1{window=Instant::now();count=0} count+=1;if count>30{reject_socket(&mut out,"rate_limited").await;break}
+                let Ok(v)=serde_json::from_str::<Value>(&text)else{reject_socket(&mut out,"invalid_request").await;continue};
                 match v["type"].as_str().unwrap_or("") {
                     "CLOCK_SYNC"=>{let t2=app.now();json!({"type":"CLOCK_SYNC_REPLY","t1":v["t1"],"t2":t2,"t3":app.now(),"clock_epoch":app.epoch})},
                     "CLIENT_STATUS"=>{app.metrics.report(&v["status"]);let _=handle.events.send(json!({"type":"CLIENT_STATUS","user_id":user.id,"status":v["status"]}));continue},
                     "CHAT"=>{
-                        let Some(body)=v["body"].as_str().filter(|b|!b.trim().is_empty()&&b.len()<=2000)else{continue};let cid=Uuid::new_v4();
-                        if sqlx::query("INSERT INTO chat_messages(id,room_id,user_id,body) VALUES($1,$2,$3,$4)").bind(cid).bind(id).bind(user.id).bind(body).execute(&app.db).await.is_err(){break}
+                        let Some(body)=v["body"].as_str().filter(|b|!b.trim().is_empty()&&b.len()<=2000)else{reject_socket(&mut out,"invalid_request").await;continue};let cid=Uuid::new_v4();
+                        if sqlx::query("INSERT INTO chat_messages(id,room_id,user_id,body) VALUES($1,$2,$3,$4)").bind(cid).bind(id).bind(user.id).bind(body).execute(&app.db).await.is_err(){reject_socket(&mut out,"database_error").await;break}
                         let name:String=sqlx::query_scalar("SELECT username FROM users WHERE id=$1").bind(user.id).fetch_one(&app.db).await.unwrap_or_default();
                         let _=handle.events.send(json!({"type":"CHAT","id":cid,"username":name,"body":body}));continue
                     }
                     _=>{
-                        let Ok(command)=serde_json::from_value::<Command>(v)else{continue};let(tx,rx)=oneshot::channel();
-                        if handle.tx.try_send(Request{user:user.clone(),command,reply:tx}).is_err(){json!({"type":"ERROR","error":"room_busy"})}else{match rx.await{Ok(v)=>v,Err(_)=>break}}
+                        let command_id = v["command_id"].as_str().and_then(|s|Uuid::parse_str(s).ok());
+                        let Ok(command)=serde_json::from_value::<Command>(v)else{
+                            let message = socket_error("invalid_request",command_id);
+                            let _ = tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Text(message.to_string().into()))).await;
+                            continue
+                        };let(tx,rx)=oneshot::channel();
+                        if handle.tx.try_send(Request{user:user.clone(),command,reply:tx}).is_err(){socket_error("room_busy",command_id)}else{match rx.await{Ok(v)=>v,Err(_)=>break}}
                     }
                 }
             }

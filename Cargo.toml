@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/server", "apps/media-worker", "apps/nas-agent", "crates/protocol", "crates/room-core", "crates/media-core", "crates/providers", "crates/persistence"]
+members = ["apps/server", "apps/media-worker", "apps/nas-agent", "crates/protocol", "crates/room-core", "crates/media-core", "crates/providers", "crates/persistence", "crates/http-api"]
 resolver = "2"
 
 [workspace.package]
@@ -25,3 +25,4 @@ room-core = { path = "crates/room-core" }
 media-core = { path = "crates/media-core" }
 providers = { path = "crates/providers" }
 persistence = { path = "crates/persistence" }
+http-api = { path = "crates/http-api" }

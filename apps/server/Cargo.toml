@@ -16,6 +16,7 @@ tracing-subscriber.workspace = true
 protocol.workspace = true
 room-core.workspace = true
 persistence.workspace = true
+http-api.workspace = true
 providers.workspace = true
 media-core.workspace = true
 reqwest.workspace = true

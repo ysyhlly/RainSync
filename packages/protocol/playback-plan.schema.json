@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaybackPlan",
+  "type": "object",
+  "properties": {
+    "audio_tracks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MediaTrack"
+      }
+    },
+    "delivery_mode": {
+      "type": "string"
+    },
+    "duration_ms": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "expires_in_seconds": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "media_generation": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "media_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "playback_url": {
+      "type": "string"
+    },
+    "rebuild_on_seek": {
+      "type": "boolean"
+    },
+    "session_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "subtitle_tracks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MediaTrack"
+      }
+    },
+    "timeline_origin_ms": {
+      "type": "number",
+      "format": "double"
+    },
+    "transport": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "media_id",
+    "media_generation",
+    "delivery_mode",
+    "transport",
+    "playback_url",
+    "timeline_origin_ms",
+    "expires_in_seconds",
+    "rebuild_on_seek",
+    "audio_tracks",
+    "subtitle_tracks"
+  ],
+  "$defs": {
+    "MediaTrack": {
+      "type": "object",
+      "properties": {
+        "index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "label": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "index",
+        "label",
+        "language"
+      ]
+    }
+  }
+}

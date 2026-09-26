@@ -19,7 +19,7 @@ let state=(await wait('SNAPSHOT')).state;
 ws.send(JSON.stringify({protocol_version:1,room_id:room.id,command_id:randomUUID(),expected_revision:state.revision,media_generation:state.media_generation,type:'CHANGE_MEDIA',payload:{media_id:media.id}}));state=(await wait('ACK')).state;
 const unsupported=await fetch(base+'/api/v1/playback-sessions',{method:'POST',headers:{Origin:base,Cookie:cookie,'Content-Type':'application/json','x-csrf-token':csrf},body:JSON.stringify({room_id:room.id,media_generation:state.media_generation,mode:'transcode',capabilities:{progressive_h264_aac:true,native_hls:false,mse_h264_aac:false}})});
 assert.equal(unsupported.status,422,'reject HLS output on a progressive-only device');
-assert.equal((await unsupported.json()).error,'device_has_no_compatible_playback_transport');
+assert.equal((await unsupported.json()).error.code,'DEVICE_HAS_NO_COMPATIBLE_PLAYBACK_TRANSPORT');
 for(const mode of ['direct','remux','transcode']){
  const plan=await api('/playback-sessions','POST',{room_id:room.id,media_generation:state.media_generation,mode,position_ms:mode==='direct'?0:4000});
  const response=await fetch(base+plan.playback_url);assert.equal(response.status,200,mode);

@@ -1,0 +1,62 @@
+[
+  {
+    "id": "h264-high-aac",
+    "extension": "mp4",
+    "video": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"],
+    "audio": ["-c:a", "aac"],
+    "expected_mode": "direct"
+  },
+  {
+    "id": "h264-no-audio",
+    "extension": "mp4",
+    "video": ["-c:v", "libx264", "-pix_fmt", "yuv420p"],
+    "audio": null,
+    "expected_mode": "direct"
+  },
+  {
+    "id": "h264-ac3",
+    "extension": "mkv",
+    "video": ["-c:v", "libx264", "-pix_fmt", "yuv420p"],
+    "audio": ["-c:a", "ac3"],
+    "expected_mode": "remux"
+  },
+  {
+    "id": "mpeg4-aac",
+    "extension": "mp4",
+    "video": ["-c:v", "mpeg4", "-pix_fmt", "yuv420p"],
+    "audio": ["-c:a", "aac"],
+    "expected_mode": "transcode"
+  },
+  {
+    "id": "h264-high10",
+    "extension": "mp4",
+    "video": [
+      "-c:v",
+      "libx264",
+      "-profile:v",
+      "high10",
+      "-pix_fmt",
+      "yuv420p10le"
+    ],
+    "audio": ["-c:a", "aac"],
+    "expected_mode": "transcode"
+  },
+  {
+    "id": "pq-tagged-video",
+    "extension": "mp4",
+    "video": [
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p10le",
+      "-color_trc",
+      "smpte2084",
+      "-color_primaries",
+      "bt2020",
+      "-colorspace",
+      "bt2020nc"
+    ],
+    "audio": ["-c:a", "aac"],
+    "expected_error": "hdr_unsupported"
+  }
+]

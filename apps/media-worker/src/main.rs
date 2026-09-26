@@ -359,18 +359,37 @@ fn rewrite_manifest(input: &str, mut uri: impl FnMut(&str) -> String) -> String 
                 String::new()
             } else if !line.starts_with('#') {
                 uri(line.trim())
-            } else if let Some(start) = line.find("URI=\"") {
-                let pos = start + 5;
-                if let Some(end) = line[pos..].find('"') {
-                    format!(
-                        "{}{}{}",
-                        &line[..pos],
-                        uri(&line[pos..pos + end]),
-                        &line[pos + end..]
-                    )
-                } else {
-                    line.into()
+            } else if line.starts_with("#EXT") && line.contains(':') {
+                let (tag, attributes) = line.split_once(':').unwrap();
+                let mut output = format!("{tag}:");
+                let mut quoted = false;
+                let mut start = 0;
+                // Commas inside quoted strings are not attribute separators.
+                for (i, byte) in attributes.bytes().chain(std::iter::once(b',')).enumerate() {
+                    if byte == b'"' {
+                        quoted = !quoted;
+                    }
+                    if byte == b',' && !quoted {
+                        let field = &attributes[start..i];
+                        if let Some((key, value)) = field.split_once('=')
+                            && key == "URI"
+                            && let Some(value) =
+                                value.strip_prefix('"').and_then(|v| v.strip_suffix('"'))
+                        {
+                            output.push_str(&format!("URI=\"{}\"", uri(value)));
+                        } else {
+                            output.push_str(field);
+                        }
+                        if i < attributes.len() {
+                            output.push(',');
+                        }
+                        start = i + 1;
+                    }
                 }
+                if start <= attributes.len() {
+                    output.push_str(&attributes[start..]);
+                }
+                output
             } else {
                 line.into()
             }
@@ -424,11 +443,17 @@ fn source_url(id: Uuid, token: &str) -> anyhow::Result<String> {
     let bind = std::env::var("WORKER_BIND")
         .unwrap_or("0.0.0.0:8081".into())
         .parse::<std::net::SocketAddr>()?;
-    let host = if bind.is_ipv6() { "[::1]" } else { "127.0.0.1" };
-    Ok(format!(
-        "http://{host}:{}/media-delivery/{id}/source?token={token}",
-        bind.port()
-    ))
+    Ok(source_url_for_bind(bind, id, token))
+}
+fn source_url_for_bind(mut bind: std::net::SocketAddr, id: Uuid, token: &str) -> String {
+    if bind.ip().is_unspecified() {
+        bind.set_ip(if bind.is_ipv6() {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        });
+    }
+    format!("http://{bind}/media-delivery/{id}/source?token={token}")
 }
 async fn jobs(app: App) {
     let worker = Uuid::new_v4();
@@ -492,7 +517,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { "ok" }))
         .route("/media-delivery/{id}/{path}", get(delivery).head(delivery))
         .route("/agent-data/{id}", get(relay::connect))
-        .with_state(app);
+        .with_state(app)
+        .layer(axum::middleware::from_fn(http_api::errors));
     let listener = tokio::net::TcpListener::bind(
         std::env::var("WORKER_BIND").unwrap_or("0.0.0.0:8081".into()),
     )
@@ -511,5 +537,36 @@ mod tests {
         });
         assert!(s.contains("URI=\"signed/init.mp4\""));
         assert!(s.contains("signed/a.m4s"));
+    }
+    #[test]
+    fn rewrites_each_exact_uri_without_touching_quoted_text_or_similar_keys() {
+        let input = "# comment URI=\"keep\"\n#EXT-X-MEDIA:NAME=\"a,URI=not-an-attribute\",X-URI=\"keep\",URI=\"音频,a.m3u8\",URI=\"b.m3u8\"\n";
+        let output = rewrite_manifest(input, |v| format!("signed/{v}"));
+        assert_eq!(
+            output,
+            "# comment URI=\"keep\"\n#EXT-X-MEDIA:NAME=\"a,URI=not-an-attribute\",X-URI=\"keep\",URI=\"signed/音频,a.m3u8\",URI=\"signed/b.m3u8\"\n"
+        );
+        assert_eq!(
+            rewrite_manifest("#EXT-X-MAP:URI=\"unfinished", |v| v.to_owned()),
+            "#EXT-X-MAP:URI=\"unfinished\n"
+        );
+    }
+    #[test]
+    fn source_urls_follow_wildcard_loopback_and_concrete_bind_addresses() {
+        for (bind, expected) in [
+            ("0.0.0.0:8081", "127.0.0.1:8081"),
+            ("127.0.0.2:8082", "127.0.0.2:8082"),
+            ("192.0.2.10:8081", "192.0.2.10:8081"),
+            ("[::]:8081", "[::1]:8081"),
+            ("[2001:db8::1]:8082", "[2001:db8::1]:8082"),
+        ] {
+            assert_eq!(
+                source_url_for_bind(bind.parse().unwrap(), Uuid::nil(), "test"),
+                format!(
+                    "http://{expected}/media-delivery/{}/source?token=test",
+                    Uuid::nil()
+                )
+            );
+        }
     }
 }

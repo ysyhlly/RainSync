@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use protocol::RoomState;
+use protocol::{Command, RoomState};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use uuid::Uuid;
 
@@ -24,13 +24,13 @@ pub async fn snapshot(pool: &PgPool, id: Uuid) -> Result<RoomState> {
 pub async fn previous(
     pool: &PgPool,
     room: Uuid,
-    command: Uuid,
+    command: &Command,
     user: Uuid,
 ) -> Result<Option<RoomState>> {
     let row =
-        sqlx::query("SELECT state,user_id FROM command_results WHERE room_id=$1 AND command_id=$2")
+        sqlx::query("SELECT state,user_id,request_payload FROM command_results WHERE room_id=$1 AND command_id=$2")
             .bind(room)
-            .bind(command)
+            .bind(command.command_id)
             .fetch_optional(pool)
             .await?;
     match row {
@@ -39,6 +39,14 @@ pub async fn previous(
             if row.get::<Uuid, _>("user_id") != user {
                 bail!("command_owned_by_another_user")
             };
+            let saved: Option<serde_json::Value> = row.get("request_payload");
+            match saved {
+                None => bail!("command_replay_unverifiable"),
+                Some(saved) if saved != serde_json::to_value(command)? => {
+                    bail!("command_payload_conflict")
+                }
+                Some(_) => {}
+            }
             Ok(Some(serde_json::from_value(row.get("state"))?))
         }
     }
@@ -46,7 +54,7 @@ pub async fn previous(
 pub async fn commit(
     pool: &PgPool,
     state: &RoomState,
-    command: Uuid,
+    command: &Command,
     user: Uuid,
     previous_revision: u32,
 ) -> Result<()> {
@@ -70,12 +78,13 @@ pub async fn commit(
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "INSERT INTO command_results(room_id,command_id,user_id,state) VALUES($1,$2,$3,$4)",
+        "INSERT INTO command_results(room_id,command_id,user_id,state,request_payload) VALUES($1,$2,$3,$4,$5)",
     )
     .bind(state.room_id)
-    .bind(command)
+    .bind(command.command_id)
     .bind(user)
     .bind(value)
+    .bind(serde_json::to_value(command)?)
     .execute(&mut *tx)
     .await?;
     sqlx::query("UPDATE playback_sessions SET stopped=true WHERE room_id=$1 AND generation<>$2 AND NOT stopped").bind(state.room_id).bind(i64::from(state.media_generation)).execute(&mut *tx).await?;

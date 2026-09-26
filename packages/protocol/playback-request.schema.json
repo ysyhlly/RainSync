@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaybackRequest",
+  "description": "Missing optional fields preserve the original v1 playback request defaults.",
+  "type": "object",
+  "properties": {
+    "audio_index": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "capabilities": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PlaybackCapabilities"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "idempotency_key": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null
+    },
+    "media_generation": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "mode": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "position_ms": {
+      "type": "number",
+      "format": "double",
+      "default": 0.0
+    },
+    "room_id": {
+      "type": "string",
+      "format": "uuid"
+    }
+  },
+  "required": [
+    "room_id",
+    "media_generation"
+  ],
+  "$defs": {
+    "PlaybackCapabilities": {
+      "description": "Independently detected transports; MSE support does not imply progressive support.",
+      "type": "object",
+      "properties": {
+        "mse_h264_aac": {
+          "type": "boolean"
+        },
+        "native_hls": {
+          "type": "boolean"
+        },
+        "progressive_h264_aac": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "progressive_h264_aac",
+        "native_hls",
+        "mse_h264_aac"
+      ]
+    }
+  }
+}

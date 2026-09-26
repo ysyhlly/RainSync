@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
+mod errors;
+pub use errors::{ApiError, ErrorCode, ErrorResponse};
+
 pub const VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
@@ -81,6 +84,24 @@ pub struct PlaybackCapabilities {
     pub mse_h264_aac: bool,
 }
 
+/// Missing optional fields preserve the original v1 playback request defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PlaybackRequest {
+    #[serde(default)]
+    #[ts(optional)]
+    pub idempotency_key: Option<Uuid>,
+    pub room_id: Uuid,
+    pub media_generation: u32,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub position_ms: f64,
+    #[serde(default)]
+    pub audio_index: Option<u32>,
+    #[serde(default)]
+    pub capabilities: Option<PlaybackCapabilities>,
+}
+
 impl PlaybackCapabilities {
     pub fn supports_hls(&self) -> bool {
         self.native_hls || self.mse_h264_aac
@@ -100,6 +121,17 @@ impl PlaybackCapabilities {
 #[cfg(test)]
 mod capability_tests {
     use super::*;
+    #[test]
+    fn legacy_playback_requests_keep_defaults() {
+        let request: PlaybackRequest = serde_json::from_value(serde_json::json!({
+            "room_id": Uuid::nil(), "media_generation": 1
+        }))
+        .unwrap();
+        assert_eq!(request.position_ms, 0.0);
+        assert!(request.mode.is_none());
+        assert!(request.audio_index.is_none());
+        assert!(request.capabilities.is_none());
+    }
     #[test]
     fn refuses_unplayable_output_and_distinguishes_transports() {
         let mut caps = PlaybackCapabilities {

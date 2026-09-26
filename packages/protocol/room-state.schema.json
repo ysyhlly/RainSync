@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RoomState",
+  "type": "object",
+  "properties": {
+    "anchor_position_ms": {
+      "type": "number",
+      "format": "double"
+    },
+    "anchor_server_time_ms": {
+      "type": "number",
+      "format": "double"
+    },
+    "clock_epoch": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "controller_user_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "duration_ms": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "media_generation": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "media_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "playback_rate": {
+      "type": "number",
+      "format": "double"
+    },
+    "playback_status": {
+      "$ref": "#/$defs/PlaybackStatus"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "room_id": {
+      "type": "string",
+      "format": "uuid"
+    }
+  },
+  "required": [
+    "room_id",
+    "revision",
+    "media_generation",
+    "playback_status",
+    "anchor_position_ms",
+    "anchor_server_time_ms",
+    "playback_rate",
+    "controller_user_id",
+    "clock_epoch"
+  ],
+  "$defs": {
+    "PlaybackStatus": {
+      "type": "string",
+      "enum": [
+        "playing",
+        "paused",
+        "ended"
+      ]
+    }
+  }
+}

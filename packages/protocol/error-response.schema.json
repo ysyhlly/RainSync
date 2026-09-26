@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ErrorResponse",
+  "type": "object",
+  "properties": {
+    "error": {
+      "$ref": "#/$defs/ApiError"
+    }
+  },
+  "required": [
+    "error"
+  ],
+  "$defs": {
+    "ApiError": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable",
+        "request_id"
+      ]
+    },
+    "ErrorCode": {
+      "description": "Public codes are an allowlist. Raw framework, database and upstream errors\nmust never be copied into the wire response.",
+      "type": "string",
+      "enum": [
+        "INVALID_REQUEST",
+        "LOGIN_REQUIRED",
+        "SESSION_EXPIRED",
+        "FORBIDDEN",
+        "NOT_FOUND",
+        "METHOD_NOT_ALLOWED",
+        "PAYLOAD_TOO_LARGE",
+        "UNSUPPORTED_MEDIA_TYPE",
+        "RANGE_NOT_SATISFIABLE",
+        "RATE_LIMITED",
+        "INTERNAL_ERROR",
+        "UPSTREAM_FAILED",
+        "SERVICE_UNAVAILABLE",
+        "REQUEST_TIMEOUT",
+        "INVALID_CREDENTIALS",
+        "ORIGIN_REJECTED",
+        "CSRF_REJECTED",
+        "NOT_A_MEMBER",
+        "ADMIN_REQUIRED",
+        "CONTROLLER_REQUIRED",
+        "INVALID_NAME",
+        "USERNAME_OR_PASSWORD_INVALID",
+        "INVALID_INVITE",
+        "ROOM_FULL",
+        "PAIR_CODE_INVALID",
+        "AGENT_TOKEN_REQUIRED",
+        "INVALID_AGENT",
+        "INVALID_SOURCE",
+        "MEDIA_ROOT_UNAVAILABLE",
+        "SOURCE_ROOT_UNAVAILABLE",
+        "OUTSIDE_MEDIA_ROOT",
+        "INVALID_SOURCE_URL",
+        "SOURCE_SCAN_FAILED",
+        "TOO_MANY_PLAYBACK_SESSIONS",
+        "PLAYBACK_REQUEST_CONFLICT",
+        "PLAYBACK_REQUEST_IN_PROGRESS",
+        "PLAYBACK_REQUEST_INTERRUPTED",
+        "PLAYBACK_REQUEST_EXPIRED",
+        "PLAYBACK_REQUEST_RETRY_EXHAUSTED",
+        "PLAYBACK_REQUEST_CANCELLED",
+        "STALE_MEDIA",
+        "INVALID_POSITION",
+        "INVALID_RATE",
+        "NO_MEDIA",
+        "INVALID_MODE",
+        "UNSUPPORTED_VIDEO_OR_HDR",
+        "UPSTREAM_PLAYBACK_FAILED",
+        "NO_MEDIA_SOURCE",
+        "INVALID_UPSTREAM_BASE",
+        "UPSTREAM_NO_COMPATIBLE_STREAM",
+        "SOURCE_PROBE_FAILED",
+        "INVALID_AUDIO_TRACK",
+        "DEVICE_HAS_NO_COMPATIBLE_PLAYBACK_TRANSPORT",
+        "UPSTREAM_DEVICE_PROFILE_REQUIRED",
+        "PROTOCOL_VERSION",
+        "ROOM_MISMATCH",
+        "REVISION_CONFLICT",
+        "COMMAND_OWNED_BY_ANOTHER_USER",
+        "COMMAND_PAYLOAD_CONFLICT",
+        "COMMAND_REPLAY_UNVERIFIABLE",
+        "DATABASE_ERROR",
+        "COMMIT_FAILED",
+        "ROOM_BUSY",
+        "MEDIA_NOT_FOUND",
+        "MEDIA_UNAVAILABLE",
+        "INVALID_PLAYBACK_SESSION",
+        "PROBE_BUSY",
+        "INVALID_SUBTITLE",
+        "CROSS_ORIGIN_SUBTITLE",
+        "INVALID_RESOURCE",
+        "MEDIA_JOB_FAILED",
+        "INVALID_RESOURCE_SIGNATURE",
+        "WRONG_RESOURCE_SESSION",
+        "CROSS_ORIGIN_MEDIA_REJECTED",
+        "UPSTREAM_MEDIA_ERROR",
+        "MANIFEST_TOO_LARGE",
+        "AGENT_OFFLINE",
+        "AGENT_TIMEOUT",
+        "INVALID_TRANSFER",
+        "TRANSFER_EXPIRED"
+      ]
+    }
+  }
+}

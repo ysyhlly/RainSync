@@ -1,6 +1,7 @@
 mod agents;
 mod media;
 mod metrics;
+mod playback_requests;
 mod rooms;
 mod upstream;
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
@@ -35,7 +36,6 @@ pub struct App {
     epoch: Uuid,
     start: Instant,
     rooms: Arc<Mutex<HashMap<Uuid, rooms::Handle>>>,
-    attempts: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
 }
 impl App {
     fn now(&self) -> f64 {
@@ -43,7 +43,7 @@ impl App {
     }
     fn encrypt(&self, value: &Value) -> anyhow::Result<String> {
         let mut nonce = [0; 12];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
         let cipher = self
             .key
             .encrypt((&nonce).into(), serde_json::to_vec(value)?.as_slice())
@@ -92,7 +92,7 @@ fn hash(v: &str) -> String {
 }
 fn token() -> String {
     let mut v = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut v);
+    rand::rngs::OsRng.fill_bytes(&mut v);
     hex::encode(v)
 }
 fn cookie(h: &HeaderMap) -> Option<String> {
@@ -154,20 +154,7 @@ async fn login(State(app): State<App>, h: HeaderMap, Json(body): Json<Login>) ->
     if body.username.len() > 80 || body.password.len() > 1024 {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_credentials"));
     }
-    {
-        let mut limits = app.attempts.lock().await;
-        limits.retain(|_, (t, _)| t.elapsed().as_secs() < 60);
-        if limits.len() > 1000 {
-            return Err(err(StatusCode::TOO_MANY_REQUESTS, "try_later"));
-        }
-        let entry = limits
-            .entry(body.username.clone())
-            .or_insert((Instant::now(), 0));
-        entry.1 += 1;
-        if entry.1 > 10 {
-            return Err(err(StatusCode::TOO_MANY_REQUESTS, "try_later"));
-        }
-    }
+    login_attempt(&app.db, &body.username).await?;
     let row = sqlx::query("SELECT id,password_hash FROM users WHERE username=$1")
         .bind(&body.username)
         .fetch_optional(&app.db)
@@ -199,6 +186,30 @@ async fn login(State(app): State<App>, h: HeaderMap, Json(body): Json<Login>) ->
         if app.secure { "; Secure" } else { "" }
     );
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({"csrf":csrf}))).into_response())
+}
+async fn login_attempt(db: &PgPool, username: &str) -> Result<()> {
+    let mut tx = db.begin().await?;
+    // Serialize only the small bounded bookkeeping transaction, never Argon2.
+    sqlx::query("LOCK TABLE login_attempts IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM login_attempts WHERE window_started<=now()-interval '60 seconds'")
+        .execute(&mut *tx)
+        .await?;
+    let key = hash(username);
+    let full: bool = sqlx::query_scalar("SELECT (SELECT count(*) FROM login_attempts)>=1000 AND NOT EXISTS(SELECT 1 FROM login_attempts WHERE username_hash=$1)")
+        .bind(&key).fetch_one(&mut *tx).await?;
+    if full {
+        tx.commit().await?;
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "try_later"));
+    }
+    let attempts: i32 = sqlx::query_scalar("INSERT INTO login_attempts(username_hash,attempts) VALUES($1,1) ON CONFLICT(username_hash) DO UPDATE SET attempts=LEAST(login_attempts.attempts+1,11) RETURNING attempts")
+        .bind(key).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    if attempts > 10 {
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "try_later"));
+    }
+    Ok(())
 }
 async fn me(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     let u = auth(&app, &h, false).await?;
@@ -324,8 +335,15 @@ async fn main() -> anyhow::Result<()> {
         epoch: Uuid::new_v4(),
         start: Instant::now(),
         rooms: Default::default(),
-        attempts: Default::default(),
     };
+    // A previous process cannot still own preparations after the instance lock
+    // has been acquired. Retire their grants before same-key recovery.
+    let mut recovery = db.begin().await?;
+    sqlx::query("UPDATE playback_requests SET status='failed',error_status=409,error_code='playback_request_interrupted' WHERE status='pending'")
+        .execute(&mut *recovery).await?;
+    sqlx::query("UPDATE playback_sessions SET stopped=true WHERE id IN(SELECT session_id FROM playback_requests WHERE status='failed' AND error_code='playback_request_interrupted')")
+        .execute(&mut *recovery).await?;
+    recovery.commit().await?;
     for row in sqlx::query("SELECT state FROM room_snapshots")
         .fetch_all(&db)
         .await?
@@ -350,7 +368,9 @@ async fn main() -> anyhow::Result<()> {
                 "DELETE FROM command_results WHERE created_at<now()-interval '24 hours'",
                 "DELETE FROM chat_messages WHERE created_at<now()-interval '7 days'",
                 "DELETE FROM sessions WHERE expires_at<now()",
+                "DELETE FROM login_attempts WHERE window_started<=now()-interval '60 seconds'",
                 "DELETE FROM agent_transfers WHERE expires_at<now()",
+                "DELETE FROM playback_requests r WHERE r.expires_at<now() AND NOT EXISTS(SELECT 1 FROM playback_sessions p WHERE p.id=r.session_id AND NOT p.stopped AND p.expires_at>now())",
             ] {
                 let _ = sqlx::query(query).execute(&cleanup).await;
             }
@@ -387,6 +407,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/media", get(media::library))
         .route("/api/v1/playback-sessions", post(media::playback))
         .route(
+            "/api/v1/playback-requests/{key}",
+            delete(playback_requests::cancel),
+        )
+        .route(
             "/api/v1/playback-sessions/{id}",
             delete(media::stop).post(media::renew),
         )
@@ -397,7 +421,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/ws", get(ws))
         .route("/api/v1/metrics", get(metrics::endpoint))
         .with_state(app)
-        .layer(axum::extract::DefaultBodyLimit::max(65536));
+        .layer(axum::extract::DefaultBodyLimit::max(65536))
+        .layer(axum::middleware::from_fn(http_api::errors));
     let listener =
         tokio::net::TcpListener::bind(std::env::var("BIND").unwrap_or("0.0.0.0:8080".into()))
             .await?;

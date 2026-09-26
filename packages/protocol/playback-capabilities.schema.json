@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaybackCapabilities",
+  "description": "Independently detected transports; MSE support does not imply progressive support.",
+  "type": "object",
+  "properties": {
+    "mse_h264_aac": {
+      "type": "boolean"
+    },
+    "native_hls": {
+      "type": "boolean"
+    },
+    "progressive_h264_aac": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "progressive_h264_aac",
+    "native_hls",
+    "mse_h264_aac"
+  ]
+}

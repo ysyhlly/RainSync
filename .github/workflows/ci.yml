@@ -15,7 +15,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      - run: cargo run -p protocol --example export && git diff --exit-code packages/protocol
+      - run: cargo run -p protocol --example export -- --check
       - run: npm ci && npm test && npm run build
       - run: cargo build --workspace --locked && node tests/integration.mjs
       - run: npx playwright install --with-deps chromium && npm run test:e2e

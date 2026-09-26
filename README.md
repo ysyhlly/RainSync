@@ -54,6 +54,9 @@ Windows 本地后端开发需 PostgreSQL、FFmpeg/ffprobe；运行二进制前�
 - [部署、备份与验证](docs/OPERATIONS.md)
 - [本轮验证记录](docs/VALIDATION.md)
 - [完整计划验收台账](docs/ACCEPTANCE.md)
+- [后续详细计划](docs/NEXT_PLAN.md) / [全计划实施进度](docs/PROGRESS.md)
+- [错误契约与客户端升级](docs/API_ERRORS.md)
+- [播放请求幂等与恢复](docs/PLAYBACK_REQUESTS.md)
 - [开发贡献指南](CONTRIBUTING.md)
 
 媒体源凭据采用 AES-256-GCM 加密。**数据库备份必须与 SOURCE_ENCRYPTION_KEY 一起保存**，否则无法恢复已配置的片源凭据。原始媒体和缓存不进入数据库。

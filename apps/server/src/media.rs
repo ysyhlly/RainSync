@@ -101,33 +101,39 @@ pub async fn library(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>
     let rows=sqlx::query("SELECT m.id,m.title,m.duration_ms,s.kind FROM media_items m JOIN sources s ON s.id=m.source_id ORDER BY m.title LIMIT 10000").fetch_all(&app.db).await?;
     Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"title":r.get::<String,_>("title"),"duration_ms":r.get::<Option<f64>,_>("duration_ms"),"kind":r.get::<String,_>("kind")})).collect())))
 }
-#[derive(Deserialize)]
-pub struct Start {
-    room_id: Uuid,
-    media_generation: u32,
-    #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
-    position_ms: f64,
-    #[serde(default)]
-    audio_index: Option<u32>,
-    #[serde(default)]
-    capabilities: Option<protocol::PlaybackCapabilities>,
-}
 pub async fn playback(
     State(app): State<App>,
     h: HeaderMap,
-    Json(body): Json<Start>,
+    Json(body): Json<protocol::PlaybackRequest>,
 ) -> Result<Json<Value>> {
     let u = auth(&app, &h, true).await?;
     member(&app, &u, body.room_id).await?;
-    let active:i64=sqlx::query_scalar("SELECT count(*) FROM playback_sessions WHERE user_id=$1 AND NOT stopped AND expires_at>now()").bind(u.id).fetch_one(&app.db).await?;
-    if active >= 8 {
-        return Err(err(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too_many_playback_sessions",
-        ));
+    let reservation = match playback_requests::begin(&app, u.id, &body).await? {
+        playback_requests::Start::Replay(plan) => return Ok(Json(plan)),
+        playback_requests::Start::Reserved(reservation) => reservation,
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        prepare_playback(&app, &u, &body, &reservation),
+    )
+    .await;
+    let error = match result {
+        Ok(Ok(plan)) => return Ok(Json(plan)),
+        Ok(Err(error)) => error,
+        Err(_) => err(StatusCode::GATEWAY_TIMEOUT, "playback_request_interrupted"),
+    };
+    if let Some(plan) = playback_requests::fail(&app, &reservation, &error).await? {
+        return Ok(Json(plan));
     }
+    Err(error)
+}
+
+async fn prepare_playback(
+    app: &App,
+    u: &User,
+    body: &protocol::PlaybackRequest,
+    reservation: &playback_requests::Reservation,
+) -> Result<Value> {
     let state = persistence::snapshot(&app.db, body.room_id).await?;
     if state.media_generation != body.media_generation {
         return Err(err(StatusCode::CONFLICT, "stale_media"));
@@ -282,15 +288,18 @@ pub async fn playback(
         }
         _ => {}
     }
-    let id = Uuid::new_v4();
+    let id = reservation.session;
     let t = token();
     let mut timeline = 0.0;
     if matches!(kind.as_str(), "http" | "agent")
         && body.mode.as_deref().unwrap_or("auto") != "direct"
     {
         // A short-lived session lets the worker probe through the same authorized relay as playback.
+        let mut preparation = app.db.begin().await?;
+        playback_requests::guard(app, &mut preparation, reservation).await?;
         sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '1 minute')")
-            .bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":app.encrypt(&resource)?})).execute(&app.db).await?;
+            .bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":app.encrypt(&resource)?})).execute(&mut *preparation).await?;
+        preparation.commit().await?;
         let probe = async {
             let base = std::env::var("WORKER_URL").unwrap_or("http://127.0.0.1:8081".into());
             let response = reqwest::Client::new()
@@ -412,28 +421,6 @@ pub async fn playback(
     resource["transport"] = json!(transport);
     resource["timeline_origin_ms"] = json!(timeline);
     let encrypted = app.encrypt(&resource)?;
-    let mut tx = app.db.begin().await?;
-    let current: Value =
-        sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
-            .bind(body.room_id)
-            .fetch_one(&mut *tx)
-            .await?;
-    if current["media_generation"].as_u64() != Some(u64::from(body.media_generation)) {
-        return Err(err(StatusCode::CONFLICT, "stale_media"));
-    }
-    sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '30 minutes') ON CONFLICT(id) DO UPDATE SET resource=EXCLUDED.resource,expires_at=EXCLUDED.expires_at,stopped=false").bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":encrypted})).execute(&mut *tx).await?;
-    if local_job {
-        let input_ticket = if kind != "local" {
-            Some(app.encrypt(&json!({"token":t}))?)
-        } else {
-            None
-        };
-        sqlx::query("INSERT INTO media_jobs(id,session_id,status,spec) VALUES($1,$1,'queued',$2)").bind(id).bind(json!({"root":config.root,"resource":item,"input_ticket":input_ticket,"start_seconds":timeline/1000.0,"transcode":mode=="transcode","audio_index":body.audio_index})).execute(&mut *tx).await?;
-    }
-    tx.commit().await?;
-    if matches!(kind.as_str(), "jellyfin" | "emby") {
-        let _ = upstream::report(&app, id, "start").await;
-    }
     let plan = protocol::PlaybackPlan {
         session_id: id,
         media_id: media,
@@ -455,7 +442,33 @@ pub async fn playback(
         audio_tracks,
         subtitle_tracks,
     };
-    Ok(Json(serde_json::to_value(plan).unwrap()))
+    let plan = serde_json::to_value(plan).map_err(anyhow::Error::from)?;
+    let mut tx = app.db.begin().await?;
+    playback_requests::guard(app, &mut tx, reservation).await?;
+    let current: Value =
+        sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
+            .bind(body.room_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if current["media_generation"].as_u64() != Some(u64::from(body.media_generation)) {
+        return Err(err(StatusCode::CONFLICT, "stale_media"));
+    }
+    sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '30 minutes') ON CONFLICT(id) DO UPDATE SET resource=EXCLUDED.resource,expires_at=EXCLUDED.expires_at,stopped=false").bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":encrypted})).execute(&mut *tx).await?;
+    if local_job {
+        let input_ticket = if kind != "local" {
+            Some(app.encrypt(&json!({"token":t}))?)
+        } else {
+            None
+        };
+        sqlx::query("INSERT INTO media_jobs(id,session_id,status,spec) VALUES($1,$1,'queued',$2)").bind(id).bind(json!({"root":config.root,"resource":item,"input_ticket":input_ticket,"start_seconds":timeline/1000.0,"transcode":mode=="transcode","audio_index":body.audio_index})).execute(&mut *tx).await?;
+    }
+    playback_requests::complete(app, &mut tx, reservation, &plan).await?;
+    tx.commit().await?;
+    if matches!(kind.as_str(), "jellyfin" | "emby") {
+        let _ = upstream::report(app, id, "start").await;
+    }
+
+    Ok(plan)
 }
 pub async fn stop(
     State(app): State<App>,
@@ -477,9 +490,13 @@ pub async fn renew(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
     let u = auth(&app, &h, true).await?;
-    let r=sqlx::query("UPDATE playback_sessions p SET expires_at=now()+interval '30 minutes' FROM room_snapshots s WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND p.expires_at>now() AND s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation").bind(id).bind(u.id).execute(&app.db).await?;
+    let mut tx = app.db.begin().await?;
+    sqlx::query("UPDATE playback_requests SET expires_at=GREATEST(expires_at,now()+interval '48 hours') WHERE session_id=$1 AND user_id=$2")
+        .bind(id).bind(u.id).execute(&mut *tx).await?;
+    let r=sqlx::query("UPDATE playback_sessions p SET expires_at=now()+interval '30 minutes' FROM room_snapshots s WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND p.expires_at>now() AND s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation").bind(id).bind(u.id).execute(&mut *tx).await?;
     if r.rows_affected() == 0 {
         return Err(err(StatusCode::GONE, "session_expired"));
     };
+    tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }
