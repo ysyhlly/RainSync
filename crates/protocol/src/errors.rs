@@ -68,6 +68,8 @@ pub enum ErrorCode {
     CommandOwnedByAnotherUser,
     CommandPayloadConflict,
     CommandReplayUnverifiable,
+    ControlEpochRequired,
+    ControlEpochExpired,
     DatabaseError,
     CommitFailed,
     RoomBusy,
@@ -164,6 +166,9 @@ impl ErrorCode {
             }
             Self::CommandPayloadConflict => "命令编号已用于其他请求，请同步状态后重新操作",
             Self::CommandReplayUnverifiable => "旧命令无法验证，请同步状态后重新操作",
+            Self::ControlEpochRequired | Self::ControlEpochExpired => {
+                "控制凭据需要更新，请同步房间后重新操作；旧命令不会自动重试"
+            }
             Self::RoomBusy | Self::ProbeBusy | Self::ServiceUnavailable => {
                 "服务资源正忙，请稍后重试"
             }

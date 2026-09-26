@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "cgraphy": {
+      "command": "C:\\Users\\ysyhly\\scoop\\apps\\python\\current\\Scripts\\cgraphy.exe",
+      "args": [
+        "serve",
+        "C:\\rainsync"
+      ]
+    }
+  }
+}

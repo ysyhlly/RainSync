@@ -22,6 +22,7 @@ let cookie = "",
   socket,
   room,
   original,
+  controlEpoch,
   state;
 const sessions = [];
 const compatibleFixture = await readFile("media/rainsync-demo.mp4");
@@ -110,6 +111,7 @@ async function change(media_id) {
   socket.send(
     JSON.stringify({
       protocol_version: 1,
+      control_epoch: controlEpoch,
       room_id: room.id,
       command_id: randomUUID(),
       expected_revision: state.revision,
@@ -141,7 +143,9 @@ try {
     socket.once("error", j);
   });
   socket.send(JSON.stringify({ type: "JOIN", room_id: room.id }));
-  state = (await wait("SNAPSHOT")).state;
+  const snapshot = await wait("SNAPSHOT");
+  state = snapshot.state;
+  controlEpoch = snapshot.control_epoch.id;
   original = state.media_id;
   let httpSource = (await api("/sources")).find(
     (s) => s.name === "Remote HTTP verification",

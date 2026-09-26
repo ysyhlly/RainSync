@@ -82,6 +82,7 @@ let socket: WebSocket | undefined,
 let attempt = 0,
   connectionSerial = 0,
   loadSerial = 0;
+let controlEpoch: string | undefined;
 const clock = new Clock(),
   corrector = new Corrector();
 const owner = computed(
@@ -150,6 +151,7 @@ async function enter(r: any) {
   messages.value = await session.api(`/rooms/${r.id}/messages`);
 }
 function connect() {
+  controlEpoch = undefined;
   clearTimeout(retry);
   connectionSerial++;
   const serial = connectionSerial;
@@ -202,6 +204,8 @@ function connect() {
   socket.onmessage = (event) => {
     if (serial !== connectionSerial) return;
     const v = JSON.parse(event.data);
+    if (typeof v.control_epoch?.id === "string")
+      controlEpoch = v.control_epoch.id;
     if (v.type === "CLOCK_SYNC_REPLY") {
       clock.sample(v.t1, v.t2, v.t3, performance.now());
       return;
@@ -248,7 +252,7 @@ function sampleClock() {
     socket.send(JSON.stringify({ type: "CLOCK_SYNC", t1: performance.now() }));
 }
 function send(type: string, payload?: unknown) {
-  if (!connected.value || !owner.value || !state.value) return;
+  if (!connected.value || !owner.value || !state.value || !controlEpoch) return;
   socket?.send(
     JSON.stringify({
       protocol_version: 1,
@@ -256,6 +260,7 @@ function send(type: string, payload?: unknown) {
       payload,
       room_id: room.value.id,
       command_id: crypto.randomUUID(),
+      control_epoch: controlEpoch,
       expected_revision: state.value.revision,
       media_generation: state.value.media_generation,
     }),

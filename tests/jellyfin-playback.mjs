@@ -81,11 +81,13 @@ try {
     throw Error("missing " + type);
   }
   socket.send(JSON.stringify({ type: "JOIN", room_id: room.id }));
-  let state = (await wait("SNAPSHOT")).state;
+  const snapshot = await wait("SNAPSHOT");
+  let state = snapshot.state;
   for (const item of media) {
     socket.send(
       JSON.stringify({
         protocol_version: 1,
+        control_epoch: snapshot.control_epoch.id,
         room_id: room.id,
         command_id: randomUUID(),
         expected_revision: state.revision,

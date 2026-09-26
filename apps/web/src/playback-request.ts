@@ -30,7 +30,8 @@ function retryDelay(signal: AbortSignal): Promise<void> {
 
 /** Retry uncertain results and transient preparation failures with one identity.
  * Each HTTP attempt gets 65s (server preparation: 45s, lease: 60s).
- * A 200s operation cap covers three full attempts plus retry delays. */
+ * Transport failures and preparation failures have separate budgets of three.
+ * 335s covers two uncertain waits plus three full attempts and retry delays. */
 export async function requestPlayback(
   send: (
     request: PlaybackRequest,
@@ -49,9 +50,10 @@ export async function requestPlayback(
   if (signal?.aborted) abort();
   const timeout = setTimeout(
     () => controller.abort(new PlaybackTimeout()),
-    200000,
+    335000,
   );
   let networkFailures = 0;
+  let preparationFailures = 0;
   try {
     for (;;) {
       if (controller.signal.aborted) throw controller.signal.reason;
@@ -100,8 +102,15 @@ export async function requestPlayback(
             "AGENT_OFFLINE",
             "AGENT_TIMEOUT",
           ].includes(error.code);
-        if (!pending && (!(uncertain || recoverable) || ++networkFailures >= 3))
-          throw error;
+        if (!pending) {
+          if (uncertain) {
+            if (++networkFailures >= 3) throw error;
+          } else if (recoverable) {
+            if (++preparationFailures >= 3) throw error;
+          } else {
+            throw error;
+          }
+        }
         await retryDelay(controller.signal);
       }
     }

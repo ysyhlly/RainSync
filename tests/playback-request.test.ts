@@ -91,9 +91,9 @@ it("bounds transport retries and preparation waiting", async () => {
   const timeout = expect(requestPlayback(pending, input)).rejects.toThrow(
     "播放准备超时",
   );
-  await vi.advanceTimersByTimeAsync(201000);
+  await vi.advanceTimersByTimeAsync(336000);
   await timeout;
-  expect(pending.mock.calls.length).toBeLessThanOrEqual(200);
+  expect(pending.mock.calls.length).toBeLessThanOrEqual(335);
 });
 
 function storage() {
@@ -198,7 +198,7 @@ it("revokes timed out or superseded preparation even without a session response"
   const failure = expect(requests.prepare(input)).rejects.toThrow(
     "播放准备超时",
   );
-  await vi.advanceTimersByTimeAsync(201000);
+  await vi.advanceTimersByTimeAsync(336000);
   await failure;
   expect(cancel).toHaveBeenCalledWith(
     send.mock.calls[0][0].idempotency_key,
@@ -341,3 +341,47 @@ it("keeps superseded failures silent even when their cleanup fails late", async 
   rejectOld(new TypeError("old response lost"));
   await old;
 });
+
+for (const transport of ["lost", "timeout"]) {
+  it(`preserves three preparation attempts after ${transport} transport failures`, async () => {
+    vi.useFakeTimers();
+    let count = 0;
+    const send = vi.fn((_body: PlaybackRequest, signal: AbortSignal) => {
+      const attempt = ++count;
+      if (attempt <= 2) {
+        if (transport === "lost") return Promise.reject(new TypeError("lost"));
+        return new Promise<PlaybackPlan>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        });
+      }
+      return new Promise<PlaybackPlan>((resolve, reject) => {
+        setTimeout(
+          () =>
+            attempt < 5
+              ? reject(
+                  new RequestFailure({
+                    error: {
+                      code: "PLAYBACK_REQUEST_INTERRUPTED",
+                      retryable: true,
+                    },
+                  }),
+                )
+              : resolve({ session_id: "third-preparation" } as PlaybackPlan),
+          45000,
+        );
+      });
+    });
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const requests = new PlaybackRequests(send, cancel, storage(), "user");
+    const result = requests.prepare(input);
+    await vi.advanceTimersByTimeAsync(269000);
+    expect((await result).session_id).toBe("third-preparation");
+    expect(send).toHaveBeenCalledTimes(5);
+    for (const [body] of send.mock.calls)
+      expect(body).toEqual(send.mock.calls[0][0]);
+    expect(cancel).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+}

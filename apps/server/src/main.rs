@@ -365,7 +365,6 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             for query in [
                 "DELETE FROM room_events WHERE created_at<now()-interval '24 hours'",
-                "DELETE FROM command_results WHERE created_at<now()-interval '24 hours'",
                 "DELETE FROM chat_messages WHERE created_at<now()-interval '7 days'",
                 "DELETE FROM sessions WHERE expires_at<now()",
                 "DELETE FROM login_attempts WHERE window_started<=now()-interval '60 seconds'",
@@ -374,6 +373,7 @@ async fn main() -> anyhow::Result<()> {
             ] {
                 let _ = sqlx::query(query).execute(&cleanup).await;
             }
+            let _ = persistence::cleanup_control_history(&cleanup).await;
         }
     });
     tokio::spawn(upstream::maintenance(app.clone()));

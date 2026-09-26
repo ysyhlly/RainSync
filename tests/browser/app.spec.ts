@@ -18,6 +18,9 @@ test("room, library, invitation and settings are usable", async ({
   const errors: string[] = [];
   let controlSocket: WebSocketRoute;
   let connectionCount = 0;
+  const commands: Record<string, unknown>[] = [];
+  const firstEpoch = "11111111-1111-4111-8111-111111111111";
+  const nextEpoch = "22222222-2222-4222-8222-222222222222";
   await page.clock.install();
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/api/v1/**", async (route) => {
@@ -57,6 +60,10 @@ test("room, library, invitation and settings are usable", async ({
         ws.send(
           JSON.stringify({
             type: "SNAPSHOT",
+            control_epoch: {
+              id: firstEpoch,
+              expires_at_ms: Date.now() + 86400000,
+            },
             state: {
               room_id: "room",
               revision: 0,
@@ -82,6 +89,25 @@ test("room, library, invitation and settings are usable", async ({
             clock_epoch: "epoch",
           }),
         );
+      if (v.command_id) {
+        commands.push(v);
+        if (commands.length === 1)
+          ws.send(
+            JSON.stringify({
+              type: "ERROR",
+              command_id: v.command_id,
+              error: {
+                code: "CONTROL_EPOCH_EXPIRED",
+                message: "控制凭据已更新，请重新操作",
+                retryable: false,
+              },
+              control_epoch: {
+                id: nextEpoch,
+                expires_at_ms: Date.now() + 86400000,
+              },
+            }),
+          );
+      }
       if (v.type === "CHAT")
         ws.send(
           JSON.stringify({
@@ -97,6 +123,15 @@ test("room, library, invitation and settings are usable", async ({
   await expect(page.getByText("今晚，一起看什么？")).toBeVisible();
   await page.getByLabel("选择房间").selectOption("room");
   await expect(page.getByText("已连接", { exact: false })).toBeVisible();
+  await page.getByRole("button", { name: /山海之间/ }).click();
+  await expect(page.getByRole("alert")).toContainText("控制凭据已更新");
+  await page.clock.fastForward(3000);
+  expect(commands.length).toBe(1);
+  expect(commands[0].control_epoch).toBe(firstEpoch);
+  await page.getByRole("button", { name: /山海之间/ }).click();
+  await expect.poll(() => commands.length).toBe(2);
+  expect(commands[1].control_epoch).toBe(nextEpoch);
+  expect(commands[1].command_id).not.toBe(commands[0].command_id);
   await page.getByLabel("聊天消息").fill("今晚一起看");
   await page.getByLabel("聊天消息").press("Enter");
   await expect(page.getByText("今晚一起看")).toBeVisible();

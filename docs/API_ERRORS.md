@@ -28,6 +28,7 @@ HTTP 状态仍表达请求结果。响应中的 `request_id` 由服务端生成�
 | `REVISION_CONFLICT` / `STALE_MEDIA` | 使用当前状态或重新取快照，不盲目重放旧操作 |
 | `COMMAND_PAYLOAD_CONFLICT` | 同一编号对应另一请求，新操作使用新编号 |
 | `COMMAND_REPLAY_UNVERIFIABLE` | 旧数据没有可验证请求，取快照并重新操作 |
+| `CONTROL_EPOCH_REQUIRED` / `CONTROL_EPOCH_EXPIRED` | 接收当前状态和新控制凭据，等待用户以新 command_id 重新操作；不自动重发旧命令、不关闭观看连接 |
 | `RANGE_NOT_SATISFIABLE` | 根据 Content-Range 重新确认资源长度 |
 | 不兼容媒体/设备 | 展示具体原因；不能把认证或网络失败当作解码失败 |
 | `retryable: true` | 允许调用者按有界策略重试，不代表 UI 已自动重试，也不替代请求幂等 |

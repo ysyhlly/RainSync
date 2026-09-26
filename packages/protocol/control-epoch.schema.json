@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ControlEpoch",
+  "type": "object",
+  "properties": {
+    "expires_at_ms": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    }
+  },
+  "required": [
+    "id",
+    "expires_at_ms"
+  ]
+}

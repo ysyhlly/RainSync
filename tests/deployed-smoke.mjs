@@ -15,8 +15,8 @@ const media=(await api('/media')).find(m=>m.title==='rainsync-demo' && m.kind===
 let room=(await api('/rooms')).find(r=>r.name==='RainSync 验证放映室');if(!room)room=await api('/rooms','POST',{name:'RainSync 验证放映室'});
 const ws=new WS(base.replace('http','ws')+'/api/v1/ws',{headers:{Origin:base,Cookie:cookie}});const inbox=[];ws.on('message',b=>inbox.push(JSON.parse(b)));await new Promise((r,j)=>{ws.once('open',r);ws.once('error',j)});ws.send(JSON.stringify({type:'JOIN',room_id:room.id}));
 async function wait(type){for(let i=0;i<100;i++){const n=inbox.findIndex(v=>v.type===type);if(n>=0)return inbox.splice(n,1)[0];await new Promise(r=>setTimeout(r,100))}throw Error('missing '+type)}
-let state=(await wait('SNAPSHOT')).state;
-ws.send(JSON.stringify({protocol_version:1,room_id:room.id,command_id:randomUUID(),expected_revision:state.revision,media_generation:state.media_generation,type:'CHANGE_MEDIA',payload:{media_id:media.id}}));state=(await wait('ACK')).state;
+const snapshot=await wait('SNAPSHOT');let state=snapshot.state;
+ws.send(JSON.stringify({protocol_version:1,control_epoch:snapshot.control_epoch.id,room_id:room.id,command_id:randomUUID(),expected_revision:state.revision,media_generation:state.media_generation,type:'CHANGE_MEDIA',payload:{media_id:media.id}}));state=(await wait('ACK')).state;
 const unsupported=await fetch(base+'/api/v1/playback-sessions',{method:'POST',headers:{Origin:base,Cookie:cookie,'Content-Type':'application/json','x-csrf-token':csrf},body:JSON.stringify({room_id:room.id,media_generation:state.media_generation,mode:'transcode',capabilities:{progressive_h264_aac:true,native_hls:false,mse_h264_aac:false}})});
 assert.equal(unsupported.status,422,'reject HLS output on a progressive-only device');
 assert.equal((await unsupported.json()).error.code,'DEVICE_HAS_NO_COMPATIBLE_PLAYBACK_TRANSPORT');

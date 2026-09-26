@@ -21,6 +21,40 @@ pub async fn snapshot(pool: &PgPool, id: Uuid) -> Result<RoomState> {
             .await?;
     Ok(serde_json::from_value(state)?)
 }
+pub async fn issue_control_epoch(
+    pool: &PgPool,
+    room: Uuid,
+    user: Uuid,
+) -> Result<protocol::ControlEpoch> {
+    let id = Uuid::new_v4();
+    let expires_at_ms: i64 = sqlx::query_scalar("INSERT INTO control_epochs(id,user_id,room_id) VALUES($1,$2,$3) RETURNING floor(extract(epoch FROM expires_at)*1000)::bigint")
+        .bind(id).bind(user).bind(room).fetch_one(pool).await?;
+    Ok(protocol::ControlEpoch { id, expires_at_ms })
+}
+pub async fn check_control_epoch<'e, E: sqlx::Executor<'e, Database = sqlx::Postgres>>(
+    executor: E,
+    room: Uuid,
+    user: Uuid,
+    epoch: Option<Uuid>,
+) -> Result<()> {
+    let epoch = epoch.ok_or_else(|| anyhow::anyhow!("control_epoch_required"))?;
+    let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM control_epochs WHERE id=$1 AND room_id=$2 AND user_id=$3 AND expires_at>clock_timestamp())")
+        .bind(epoch).bind(room).bind(user).fetch_one(executor).await?;
+    if !valid {
+        bail!("control_epoch_expired");
+    }
+    Ok(())
+}
+pub async fn cleanup_control_history(pool: &PgPool) -> Result<()> {
+    // The replay window is independent of the shorter event/delta window.
+    sqlx::query("DELETE FROM command_results WHERE created_at<now()-interval '48 hours'")
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM control_epochs WHERE expires_at<=now()")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
 pub async fn previous(
     pool: &PgPool,
     room: Uuid,
@@ -59,6 +93,13 @@ pub async fn commit(
     previous_revision: u32,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
+    // Validate wall-clock expiry after acquiring the state lock, so a command
+    // that expired while waiting cannot execute when that lock is released.
+    sqlx::query("SELECT room_id FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
+        .bind(state.room_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    check_control_epoch(&mut *tx, state.room_id, user, command.control_epoch).await?;
     let value = serde_json::to_value(state)?;
     let result = sqlx::query(
         "UPDATE room_snapshots SET state=$2 WHERE room_id=$1 AND (state->>'revision')::bigint=$3",

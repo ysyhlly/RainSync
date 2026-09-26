@@ -4,6 +4,7 @@ import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { controlEpochs } from "./control-epochs.mjs";
 import {
   playbackIdempotency,
   preparePlaybackRestart,
@@ -28,6 +29,8 @@ const env = {
   PUBLIC_ORIGIN: origin,
   BIND: "127.0.0.1:18080",
   WORKER_BIND: "127.0.0.1:18081",
+  // Controlled probe response below; delivery tests still use the real worker.
+  WORKER_URL: "http://127.0.0.1:18082",
   MEDIA_ROOT: root,
   CACHE_ROOT: resolve(root, "cache"),
   RUST_LOG: "warn",
@@ -86,6 +89,9 @@ function launch(name, extra = {}) {
     },
   );
   children.push(child);
+  // Drain structured logs even when tests only inspect HTTP/WS results. An
+  // unread stdout pipe can block error reporting after many fault injections.
+  child.stdout.resume();
   child.stderr.on("data", (b) => process.stderr.write(b));
   return child;
 }
@@ -140,6 +146,7 @@ class Client {
 // Node's native WebSocket cannot set headers: ws package comes from Playwright.
 const { default: WS } = await import("ws");
 async function connect(client, room) {
+  let controlEpoch;
   const ws = new WS(origin.replace("http", "ws") + "/api/v1/ws", {
     headers: { Origin: origin, Cookie: client.cookie },
   });
@@ -147,6 +154,7 @@ async function connect(client, room) {
   const waiters = [];
   ws.on("message", (data) => {
     const v = JSON.parse(data);
+    if (v.control_epoch) controlEpoch = v.control_epoch.id;
     const w = waiters.find((w) => w.p(v));
     if (w) {
       waiters.splice(waiters.indexOf(w), 1);
@@ -181,7 +189,13 @@ async function connect(client, room) {
       waiters.push(w);
     });
   };
-  return { ws, wait };
+  return {
+    ws,
+    wait,
+    get controlEpoch() {
+      return controlEpoch;
+    },
+  };
 }
 let mock;
 try {
@@ -400,6 +414,7 @@ try {
     protocol_version: 1,
     room_id: room.id,
     command_id: randomUUID(),
+    control_epoch: a.controlEpoch,
     expected_revision: state.revision,
     media_generation: state.media_generation,
     type: "CHANGE_MEDIA",
@@ -434,7 +449,7 @@ try {
     (await a.wait((v) => v.type === "ERROR")).error.code,
     "ROOM_MISMATCH",
   );
-  b.ws.send(JSON.stringify(command));
+  b.ws.send(JSON.stringify({ ...command, control_epoch: b.controlEpoch }));
   assert.equal(
     (await b.wait((v) => v.type === "ERROR")).error.code,
     "COMMAND_OWNED_BY_ANOTHER_USER",
@@ -442,6 +457,7 @@ try {
   b.ws.send(
     JSON.stringify({
       ...command,
+      control_epoch: b.controlEpoch,
       command_id: randomUUID(),
       expected_revision: state.revision,
       media_generation: state.media_generation,
@@ -570,9 +586,15 @@ try {
   const upstreamReports = [];
   let negotiations = 0;
   let failNegotiations = 0;
+  let probeResponse;
   mock = http
     .createServer((req, res) => {
-      if (req.url.startsWith("/Users/test-user/Items")) {
+      if (
+        req.url.startsWith("/media-delivery/") &&
+        req.url.includes("/probe?")
+      ) {
+        probeResponse = res;
+      } else if (req.url.startsWith("/Users/test-user/Items")) {
         const kind = req.headers["x-emby-token"] ? "emby" : "jellyfin";
         assert.ok(
           req.headers["x-emby-token"] === "mock-token" ||
@@ -595,7 +617,7 @@ try {
         negotiations++;
         if (failNegotiations > 0) {
           failNegotiations--;
-          res.writeHead(502).end();
+          setTimeout(() => res.writeHead(502).end(), 1000);
           return;
         }
         res.setHeader("Content-Type", "application/json");
@@ -663,6 +685,53 @@ try {
     Buffer.from("http://127.0.0.1:18082/private").toString("base64url"),
   );
   assert.equal((await fetch(forged)).status, 403);
+  const probeRequest = {
+    idempotency_key: randomUUID(),
+    room_id: room.id,
+    media_generation: state.media_generation,
+    mode: "auto",
+  };
+  const abortProbe = new AbortController();
+  const probeFetch = fetch(origin + "/api/v1/playback-sessions", {
+    method: "POST",
+    headers: {
+      Origin: origin,
+      "Content-Type": "application/json",
+      Cookie: admin.cookie,
+      "x-csrf-token": admin.csrf,
+    },
+    body: JSON.stringify(probeRequest),
+    signal: abortProbe.signal,
+  });
+  const probeRejected = assert.rejects(probeFetch, { name: "AbortError" });
+  for (let i = 0; i < 100 && !probeResponse; i++) await delay(10);
+  assert.ok(probeResponse, "probe grant must be committed before disconnect");
+  const probeSession = sql(
+    `SELECT session_id FROM playback_requests WHERE idempotency_key='${probeRequest.idempotency_key}'`,
+  );
+  assert.equal(
+    sql(`SELECT stopped FROM playback_sessions WHERE id='${probeSession}'`),
+    "f",
+  );
+  abortProbe.abort();
+  await probeRejected;
+  probeResponse.writeHead(502).end();
+  let probeStatus;
+  for (let i = 0; i < 30; i++) {
+    probeStatus = sql(
+      `SELECT status FROM playback_requests WHERE session_id='${probeSession}'`,
+    );
+    if (probeStatus === "failed") break;
+    await delay(100);
+  }
+  assert.equal(probeStatus, "failed");
+  assert.equal(
+    sql(`SELECT stopped FROM playback_sessions WHERE id='${probeSession}'`),
+    "t",
+  );
+  console.log(
+    "PASS: disconnected probe records failure and releases committed grant before lease expiry",
+  );
   for (const kind of ["jellyfin", "emby"]) {
     const source = await admin.request("/sources", "POST", {
       name: kind,
@@ -725,6 +794,67 @@ try {
       bytes,
     );
     await admin.request(`/playback-sessions/${p.session_id}`, "DELETE");
+    // Observe settlement after disconnect, without another POST or lease expiry.
+    for (const failure of [false, true]) {
+      const disconnected = {
+        ...playbackRequest,
+        idempotency_key: randomUUID(),
+      };
+      const count = negotiations;
+      failNegotiations = failure ? 1 : 0;
+      const abort = new AbortController();
+      const response = fetch(origin + "/api/v1/playback-sessions", {
+        method: "POST",
+        headers: {
+          Origin: origin,
+          "Content-Type": "application/json",
+          Cookie: admin.cookie,
+          "x-csrf-token": admin.csrf,
+        },
+        body: JSON.stringify(disconnected),
+        signal: abort.signal,
+      });
+      const rejected = assert.rejects(response, { name: "AbortError" });
+      for (let i = 0; i < 100 && negotiations === count; i++) await delay(10);
+      assert.equal(negotiations, count + 1);
+      abort.abort();
+      await rejected;
+      const where = `idempotency_key='${disconnected.idempotency_key}'`;
+      const session = sql(
+        `SELECT session_id FROM playback_requests WHERE ${where}`,
+      );
+      const expected = failure ? "failed" : "completed";
+      let settled;
+      for (let i = 0; i < 30; i++) {
+        settled = sql(`SELECT status FROM playback_requests WHERE ${where}`);
+        if (settled === expected) break;
+        await delay(100);
+      }
+      assert.equal(
+        settled,
+        expected,
+        "disconnected owner must settle before lease expiry",
+      );
+      if (failure)
+        assert.equal(
+          sql(
+            `SELECT count(*) FROM playback_sessions WHERE id='${session}' AND NOT stopped`,
+          ),
+          "0",
+        );
+      const resumed = await admin.request(
+        "/playback-sessions",
+        "POST",
+        disconnected,
+      );
+      assert.equal(
+        sql(`SELECT attempt FROM playback_requests WHERE ${where}`),
+        failure ? "2" : "1",
+      );
+      assert.equal(negotiations, count + (failure ? 2 : 1));
+      if (!failure) assert.equal(resumed.session_id, session);
+      await admin.request(`/playback-sessions/${resumed.session_id}`, "DELETE");
+    }
     const retry = { ...playbackRequest, idempotency_key: randomUUID() };
     failNegotiations = 1;
     const transient = await admin.request(
@@ -970,6 +1100,17 @@ try {
   const legacyReplay = await recovered.wait((v) => v.type === "ERROR");
   assertError(legacyReplay, "COMMAND_REPLAY_UNVERIFIABLE");
   assert.deepEqual(legacyReplay.state, recoveredState);
+  await controlEpochs({
+    socket: recovered,
+    command,
+    state: recoveredState,
+    room,
+    admin,
+    friend,
+    sql,
+    container,
+    env,
+  });
   recovered.ws.close();
   const limited = await connect(admin, room.id);
   await limited.wait((v) => v.type === "SNAPSHOT");

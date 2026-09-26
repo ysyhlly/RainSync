@@ -66,6 +66,14 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                 if req.command.room_id != id {
                     return Err("room_mismatch".to_string());
                 }
+                persistence::check_control_epoch(
+                    &app.db,
+                    id,
+                    req.user.id,
+                    req.command.control_epoch,
+                )
+                .await
+                .map_err(|error| control_error(error, "database_error"))?;
                 if let Some(previous) =
                     persistence::previous(&app.db, id, &req.command, req.user.id)
                         .await
@@ -103,7 +111,7 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                 }
                 persistence::commit(&app.db, &next, &req.command, req.user.id, state.revision)
                     .await
-                    .map_err(|_| "commit_failed".to_string())?;
+                    .map_err(|error| control_error(error, "commit_failed"))?;
                 state = next.clone();
                 Ok((next, true))
             }
@@ -126,6 +134,14 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
         }
     });
     Ok(h)
+}
+
+fn control_error(error: anyhow::Error, fallback: &str) -> String {
+    match error.to_string().as_str() {
+        "control_epoch_required" => "control_epoch_required".into(),
+        "control_epoch_expired" => "control_epoch_expired".into(),
+        _ => fallback.into(),
+    }
 }
 
 pub async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
@@ -361,9 +377,13 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
             missing = rows.iter().map(|r| r.get("state")).collect();
         }
     }
+    let Ok(control_epoch) = persistence::issue_control_epoch(&app.db, id, user.id).await else {
+        reject_socket(&mut out, "database_error").await;
+        return;
+    };
     if out
         .send(Message::Text(
-            json!({"type":"SNAPSHOT","state":s,"recovery":recovery,"events":missing})
+            json!({"type":"SNAPSHOT","state":s,"recovery":recovery,"events":missing,"control_epoch":control_epoch})
                 .to_string()
                 .into(),
         ))
@@ -377,7 +397,7 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
     let mut window = Instant::now();
     let mut count = 0;
     loop {
-        let value = tokio::select! {
+        let mut value = tokio::select! {
             _=heartbeat.tick()=>{
                 if last_seen.elapsed().as_secs()>45 {break};
                 let valid=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND expires_at>now())").bind(&session_hash).fetch_one(&app.db).await;
@@ -415,6 +435,13 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                 }
             }
         };
+        if matches!(
+            value["error"]["code"].as_str(),
+            Some("CONTROL_EPOCH_REQUIRED" | "CONTROL_EPOCH_EXPIRED")
+        ) && let Ok(epoch) = persistence::issue_control_epoch(&app.db, id, user.id).await
+        {
+            value["control_epoch"] = json!(epoch);
+        }
         if !matches!(
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),

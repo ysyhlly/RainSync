@@ -22,6 +22,7 @@ fn main() {
         RoomState::decl(),
         Action::decl(),
         Command::decl(),
+        ControlEpoch::decl(),
         MediaTrack::decl(),
         PlaybackPlan::decl(),
         PlaybackCapabilities::decl(),
@@ -39,6 +40,7 @@ fn main() {
     );
     for (name, schema) in [
         ("command", schemars::schema_for!(Command)),
+        ("control-epoch", schemars::schema_for!(ControlEpoch)),
         ("room-state", schemars::schema_for!(RoomState)),
         ("playback-request", schemars::schema_for!(PlaybackRequest)),
         ("error-response", schemars::schema_for!(ErrorResponse)),

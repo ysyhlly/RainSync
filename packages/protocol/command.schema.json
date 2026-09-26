@@ -7,6 +7,14 @@
       "type": "string",
       "format": "uuid"
     },
+    "control_epoch": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null
+    },
     "expected_revision": {
       "type": "integer",
       "format": "uint32",

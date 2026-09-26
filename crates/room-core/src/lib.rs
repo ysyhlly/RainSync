@@ -91,6 +91,7 @@ mod tests {
             protocol_version: VERSION,
             room_id: s.room_id,
             command_id: Uuid::new_v4(),
+            control_epoch: None,
             expected_revision: 4,
             media_generation: 2,
             action: Action::Pause,

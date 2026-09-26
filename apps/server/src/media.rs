@@ -108,6 +108,15 @@ pub async fn playback(
 ) -> Result<Json<Value>> {
     let u = auth(&app, &h, true).await?;
     member(&app, &u, body.room_id).await?;
+    // Dropping an HTTP waiter must not drop the reservation's executor. Start
+    // ownership before begin(), including its commit/acknowledgement window.
+    // Explicit cancellation still fences probe grants and final publication.
+    tokio::spawn(owned_playback(app, u, body))
+        .await
+        .map_err(anyhow::Error::from)?
+}
+
+async fn owned_playback(app: App, u: User, body: protocol::PlaybackRequest) -> Result<Json<Value>> {
     let reservation = match playback_requests::begin(&app, u.id, &body).await? {
         playback_requests::Start::Replay(plan) => return Ok(Json(plan)),
         playback_requests::Start::Reserved(reservation) => reservation,

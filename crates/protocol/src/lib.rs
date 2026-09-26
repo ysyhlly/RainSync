@@ -46,10 +46,21 @@ pub struct Command {
     pub protocol_version: u8,
     pub room_id: Uuid,
     pub command_id: Uuid,
+    // Optional on decode so legacy clients get a specific resynchronization error.
+    #[serde(default)]
+    #[ts(optional)]
+    pub control_epoch: Option<Uuid>,
     pub expected_revision: u32,
     pub media_generation: u32,
     #[serde(flatten)]
     pub action: Action,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+pub struct ControlEpoch {
+    pub id: Uuid,
+    #[ts(type = "number")]
+    pub expires_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
