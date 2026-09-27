@@ -9,6 +9,9 @@ import {
 } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import WebSocket from "ws";
+const nas = process.argv.includes("--nas");
+assert.ok(process.argv.slice(2).every((arg) => arg === "--nas"));
 const tag =
   process.env.WORKER_TEST_IMAGE ?? "rainsync-input-retry-validation:local";
 const docker = (...args) =>
@@ -27,6 +30,7 @@ const root = resolve(".runtime/input-retries", name);
 const password = randomBytes(20).toString("hex"),
   key = randomBytes(32);
 const report = {
+  transport: nas ? "NAS data WebSocket fixture" : "HTTP",
   image: docker("image", "inspect", "--format", "{{.Id}}", tag),
   cases: [],
 };
@@ -64,7 +68,99 @@ function encrypt(value) {
     cipher.getAuthTag(),
   ]).toString("base64");
 }
-let fixture, active;
+let fixture, active, transferPoll;
+const agentId = randomUUID();
+const dataSockets = new Set();
+const offered = new Set();
+async function transfer(request, attempt, workerBase) {
+  const original = new URL(request.data_url);
+  const socket = new WebSocket(
+    workerBase.replace("http:", "ws:") + original.pathname + original.search,
+  );
+  dataSockets.add(socket);
+  socket.on("error", () => {});
+  socket.on("close", () => dataSockets.delete(socket));
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  if (active.kind === "nas_reset" && attempt === 1) {
+    socket.terminate();
+    return;
+  }
+  const keepPinging = () => {
+    const timer = setInterval(() => {
+      if (socket.readyState === WebSocket.OPEN) socket.ping();
+    }, 250);
+    socket.once("close", () => clearInterval(timer));
+  };
+  if (active.kind === "nas_timeout" && attempt === 1) {
+    keepPinging();
+    return;
+  }
+  const send = (data) =>
+    new Promise((resolve, reject) =>
+      socket.send(data, (error) => (error ? reject(error) : resolve())),
+    );
+  if (active.kind === "nas_denied" || active.kind === "nas_exhausted") {
+    await send(
+      JSON.stringify({
+        status: active.kind === "nas_denied" ? 401 : 503,
+        "content-length": "0",
+      }),
+    );
+    socket.close();
+    return;
+  }
+  if (active.kind === "nas_malformed") {
+    await send('{"status":99999,"content-length":"0"}');
+    socket.close();
+    return;
+  }
+  const range = /^bytes=(\d+)-(\d*)$/.exec(request.range ?? "");
+  const start = range ? Number(range[1]) : 0;
+  const end = range?.[2]
+    ? Math.min(Number(range[2]), fixture.length - 1)
+    : fixture.length - 1;
+  if (start > end) {
+    await send(JSON.stringify({ status: 416, "content-length": "0" }));
+    socket.close();
+    return;
+  }
+  if (active.kind === "nas_ping") socket.ping();
+  const excess = active.kind === "nas_excess";
+  await send(
+    JSON.stringify({
+      status: range ? 206 : 200,
+      "content-length": String(excess ? 1 : end - start + 1),
+      "content-type": "video/mp4",
+      "accept-ranges": "bytes",
+      ...(range
+        ? { "content-range": `bytes ${start}-${end}/${fixture.length}` }
+        : {}),
+    }),
+  );
+  if (excess) {
+    await send(Buffer.from([1, 2]));
+    socket.close();
+    return;
+  }
+  if (active.kind === "nas_stalled" && attempt === 1) {
+    await send(fixture.subarray(start, Math.min(end + 1, start + 32768)));
+    keepPinging();
+    return;
+  }
+  const truncated = active.kind === "nas_truncated" && attempt === 1;
+  const stop = truncated
+    ? Math.min(end + 1, start + Math.floor(fixture.length / 2))
+    : end + 1;
+  for (let offset = start; !request.head && offset < stop; offset += 32768) {
+    if (active.kind === "nas_ping") socket.ping();
+    await send(fixture.subarray(offset, Math.min(stop, offset + 32768)));
+  }
+  if (truncated) socket.terminate();
+  else socket.close();
+}
 const hlsFiles = new Map();
 const upstream = createServer((req, res) => {
   if (!active || req.headers["x-test-source"] !== password) {
@@ -310,6 +406,10 @@ try {
     `SELECT user_id FROM room_members WHERE room_id='${room.id}'`,
   );
   assert.match(userId, /^[0-9a-f-]{36}$/);
+  if (nas)
+    sql(
+      `INSERT INTO agents(id,name,last_seen) VALUES('${agentId}','fault fixture',now())`,
+    );
   docker(
     "run",
     "-d",
@@ -328,28 +428,88 @@ try {
     "rainsync-media-worker",
   );
   const workerBase = `http://${docker("port", worker, "8081/tcp")}`;
+  if (nas)
+    transferPoll = setInterval(() => {
+      if (!active) return;
+      try {
+        // The fixture controls only the data peer; production Worker authenticates
+        // and consumes each real one-time transfer ticket.
+        const rows = JSON.parse(
+          sql(
+            `SELECT COALESCE(json_agg(json_build_object('id',t.id,'request',t.request,'attempt',j.attempt)),'[]'::json) FROM agent_transfers t CROSS JOIN media_jobs j WHERE t.agent_id='${agentId}' AND j.id='${active.id}'`,
+          ),
+        );
+        for (const row of rows) {
+          if (offered.has(row.id)) continue;
+          offered.add(row.id);
+          active.requests.push({
+            attempt: row.attempt,
+            elapsed_ms: Date.now() - active.began,
+            range: row.request.range,
+          });
+          void transfer(row.request, row.attempt, workerBase).catch(() => {});
+        }
+        if (
+          active.kind !== "nas_offline" ||
+          sql(
+            `SELECT (attempt>1 OR (attempt=1 AND status='queued'))::text FROM media_jobs WHERE id='${active.id}'`,
+          ) === "true"
+        ) {
+          sql(`UPDATE agents SET last_seen=now() WHERE id='${agentId}'`);
+        }
+      } catch (error) {
+        report.poll_error = String(error);
+      }
+    }, 200);
   for (const kind of process.env.INPUT_CASE
     ? [process.env.INPUT_CASE]
-    : [
-        "unavailable",
-        "truncated",
-        "reset",
-        "hls_unavailable",
-        "exhausted",
-        "denied",
-        "malformed",
-      ]) {
+    : nas
+      ? [
+          "nas_truncated",
+          "nas_reset",
+          "nas_timeout",
+          "nas_stalled",
+          "nas_offline",
+          "nas_exhausted",
+          "nas_denied",
+          "nas_excess",
+          "nas_malformed",
+          "nas_revoked",
+          "nas_ping",
+        ]
+      : [
+          "unavailable",
+          "truncated",
+          "reset",
+          "hls_unavailable",
+          "exhausted",
+          "denied",
+          "malformed",
+        ]) {
     const id = randomUUID(),
       token = randomBytes(32).toString("hex");
     active = { kind, id, began: Date.now(), requests: [] };
-    const resource = encrypt({
-      kind: "http",
-      job_id: id,
-      url:
-        upstreamBase +
-        `/${kind}.${kind === "hls_unavailable" ? "m3u8" : "mp4"}`,
-      headers: { "x-test-source": password },
-    });
+    if (nas)
+      sql(
+        `UPDATE agents SET revoked=${kind === "nas_revoked"},last_seen=${kind === "nas_offline" ? "now()-interval '1 minute'" : "now()"} WHERE id='${agentId}'`,
+      );
+    const resource = encrypt(
+      nas
+        ? {
+            kind: "agent",
+            job_id: id,
+            agent_id: agentId,
+            resource: "input.mp4",
+          }
+        : {
+            kind: "http",
+            job_id: id,
+            url:
+              upstreamBase +
+              `/${kind}.${kind === "hls_unavailable" ? "m3u8" : "mp4"}`,
+            headers: { "x-test-source": password },
+          },
+    );
     const ticket = encrypt({ token });
     sql(
       `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${resource}"}',now()+interval '1 hour'); INSERT INTO media_jobs(id,session_id,status,spec) VALUES('${id}','${id}','queued','{"input_ticket":"${ticket}","transcode":true,"estimated_output_bytes":1048576}')`,
@@ -374,6 +534,12 @@ try {
     active.state = state;
     active.outputs = outputs;
     const expected = [
+      "nas_truncated",
+      "nas_reset",
+      "nas_timeout",
+      "nas_stalled",
+      "nas_offline",
+      "nas_ping",
       "unavailable",
       "truncated",
       "reset",
@@ -384,7 +550,13 @@ try {
     assert.equal(state.status, expected, kind);
     assert.equal(
       state.attempt,
-      expected === "succeeded" ? 2 : kind === "exhausted" ? 3 : 1,
+      expected === "succeeded"
+        ? kind === "nas_ping"
+          ? 1
+          : 2
+        : kind.endsWith("exhausted")
+          ? 3
+          : 1,
       kind,
     );
     assert.ok(
@@ -393,9 +565,9 @@ try {
         .every((o) => o.status === "abandoned"),
       "old output never published",
     );
-    if (kind === "exhausted")
+    if (kind.endsWith("exhausted"))
       assert.equal(state.error, "upstream_transport_retry_exhausted");
-    if (kind === "denied" || kind === "malformed")
+    if (expected === "failed" && !kind.endsWith("exhausted"))
       assert.equal(state.error, "media_job_failed");
     const entry =
       workerBase + `/media-delivery/${id}/index.m3u8?token=${token}`;
@@ -404,7 +576,7 @@ try {
       assert.equal(response.status, 200);
       const text = await response.text();
       assert.ok(text.includes("#EXT-X-ENDLIST"));
-      assert.ok(text.includes("attempt=2"));
+      assert.ok(text.includes(`attempt=${state.attempt}`));
       // Decode through the authorized Worker output, not directly from its cache.
       const decoded = docker(
         "run",
@@ -431,7 +603,9 @@ try {
       const error = await response.json();
       assert.equal(
         error.error.code,
-        kind === "exhausted" ? "MEDIA_JOB_RETRY_EXHAUSTED" : "MEDIA_JOB_FAILED",
+        kind.endsWith("exhausted")
+          ? "MEDIA_JOB_RETRY_EXHAUSTED"
+          : "MEDIA_JOB_FAILED",
       );
       assert.equal(error.error.retryable, false);
     }
@@ -444,7 +618,7 @@ try {
         [...active.requests].reverse().map((r) => [r.attempt, r]),
       ),
     );
-    if (state.attempt > 1)
+    if (state.attempt > 1 && kind !== "nas_offline")
       assert.ok(
         firstByAttempt[1].elapsed_ms - firstByAttempt[0].elapsed_ms >= 1900,
         "first retry respects backoff",
@@ -454,12 +628,24 @@ try {
         firstByAttempt[2].elapsed_ms - firstByAttempt[1].elapsed_ms >= 4900,
         "second retry respects backoff",
       );
+    if (kind === "nas_timeout" || kind === "nas_stalled") {
+      assert.ok(
+        firstByAttempt[1].elapsed_ms - firstByAttempt[0].elapsed_ms >=
+          (kind === "nas_timeout" ? 10000 : 30000),
+        "Ping does not finish the stream or extend the no-progress deadline",
+      );
+    }
     report.cases.push({ kind, ...state, outputs, requests: active.requests });
     sql(`UPDATE playback_sessions SET stopped=true WHERE id='${id}'`);
     console.log(
       `PASS: ${kind}: ${state.status}, ${state.attempt} attempt(s), isolated outputs and released reservation`,
     );
   }
+  assert.equal(
+    report.poll_error,
+    undefined,
+    "fixture SQL polling remained healthy",
+  );
   await writeFile(
     resolve(root, "report.json"),
     JSON.stringify(report, null, 2) + "\n",
@@ -480,6 +666,8 @@ try {
   );
   throw e;
 } finally {
+  clearInterval(transferPoll);
+  for (const socket of dataSockets) socket.terminate();
   for (const c of [worker, server, db]) {
     try {
       docker("rm", "-f", "-v", c);

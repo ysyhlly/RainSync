@@ -47,13 +47,19 @@ impl Registry {
     }
 }
 impl Observation {
+    pub fn transient(&self) {
+        self.0.fetch_max(1, Ordering::Relaxed);
+    }
+    pub fn permanent(&self) {
+        self.0.store(2, Ordering::Relaxed);
+    }
     pub fn status(&self, status: reqwest::StatusCode) {
         if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
-            self.0.fetch_max(1, Ordering::Relaxed);
+            self.transient();
         } else if status.is_client_error() {
             // An authorization/not-found response is not made transient by an
             // unrelated simultaneous transport failure within this execution.
-            self.0.store(2, Ordering::Relaxed);
+            self.permanent();
         }
     }
     pub fn network(&self, error: &reqwest::Error) {
@@ -65,7 +71,7 @@ impl Observation {
             || error.is_body()
             || error.is_decode()
         {
-            self.0.fetch_max(1, Ordering::Relaxed);
+            self.transient();
         }
     }
 }

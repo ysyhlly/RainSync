@@ -358,7 +358,7 @@ async fn delivery(
         return file_response(&file, &h, head, Some(reader), opened).await;
     }
     if resource["kind"] == "agent" {
-        return relay::fetch(&app, &resource, &h, head).await;
+        return relay::fetch(&app, &resource, &h, head, input_failure).await;
     }
     if resource["kind"] == "local" {
         let p = media_core::safe_path(
