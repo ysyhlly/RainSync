@@ -11,6 +11,22 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest},
 };
 
+fn content_type(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "mov" => "video/quicktime",
+        _ => "application/octet-stream",
+    }
+}
+
 async fn transfer(root: PathBuf, request: Value) -> Result<()> {
     let url = request["data_url"].as_str().context("data_url")?;
     let (mut socket, _) = connect_async(url).await?;
@@ -27,10 +43,10 @@ async fn transfer(root: PathBuf, request: Value) -> Result<()> {
     }
     let result:Result<()>=async{
         let path=media_core::safe_path(&root,request["resource"].as_str().context("resource")?)?;
-        let mut file=tokio::fs::File::open(path).await?;let size=file.metadata().await?.len();
+        let mut file=tokio::fs::File::open(&path).await?;let size=file.metadata().await?.len();
         let range=match media_core::byte_range(request["range"].as_str(),size){Ok(v)=>v,Err(_)=>{socket.send(Message::Text(json!({"status":416,"content-range":format!("bytes */{size}"),"content-length":"0"}).to_string().into())).await?;return Ok(())}};
         let(start,len)=range.map(|(a,b)|(a,b-a+1)).unwrap_or((0,size));
-        let mut meta=json!({"status":if range.is_some(){206}else{200},"content-length":len.to_string(),"content-type":"video/mp4","accept-ranges":"bytes"});if let Some((a,b))=range{meta["content-range"]=json!(format!("bytes {a}-{b}/{size}"))}
+        let mut meta=json!({"status":if range.is_some(){206}else{200},"content-length":len.to_string(),"content-type":content_type(&path),"accept-ranges":"bytes"});if let Some((a,b))=range{meta["content-range"]=json!(format!("bytes {a}-{b}/{size}"))}
         socket.send(Message::Text(meta.to_string().into())).await?;
         if !request["head"].as_bool().unwrap_or(false){file.seek(std::io::SeekFrom::Start(start)).await?;let mut file=file.take(len);let mut buf=vec![0;65536];loop{let n=file.read(&mut buf).await?;if n==0{break}socket.send(Message::Binary(buf[..n].to_vec().into())).await?;}}
         Ok(())
@@ -198,6 +214,19 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mime_types_match_the_original_container() {
+        for (file, mime) in [
+            ("movie.MKV", "video/x-matroska"),
+            ("movie.webm", "video/webm"),
+            ("movie.mov", "video/quicktime"),
+            ("movie.mp4", "video/mp4"),
+            ("movie.m4v", "video/mp4"),
+            ("unknown", "application/octet-stream"),
+        ] {
+            assert_eq!(content_type(std::path::Path::new(file)), mime);
+        }
+    }
     #[test]
     fn index_streams_large_libraries_in_bounded_pages_and_reports_scan_errors() {
         let parent = std::env::temp_dir().canonicalize().unwrap();

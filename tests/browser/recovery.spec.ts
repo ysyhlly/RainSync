@@ -1,8 +1,9 @@
+import { readFileSync } from "node:fs";
 import { test, expect, type Page, type WebSocketRoute } from "@playwright/test";
 
 async function setup(
   page: Page,
-  opts: { holdClock?: boolean; holdRoom?: boolean } = {},
+  opts: { holdClock?: boolean; holdRoom?: boolean; validMedia?: boolean } = {},
 ) {
   await page.clock.install();
   await page.addInitScript(() => {
@@ -26,7 +27,15 @@ async function setup(
     rejectRenew = false;
   const history: any[] = [];
   await page.route("**/empty-video*", (r) =>
-    r.fulfill({ contentType: "video/mp4", body: "" }),
+    r.fulfill({
+      contentType: "video/mp4",
+      body: opts.validMedia
+        ? Buffer.from(
+            readFileSync("tests/fixtures/browser-video.base64", "utf8"),
+            "base64",
+          )
+        : "",
+    }),
   );
   await page.route("**/api/v1/**", async (r) => {
     const url = new URL(r.request().url()),
@@ -348,4 +357,33 @@ test("stale HLS attempt refetches entry manifest without a new playback session"
   expect(await page.evaluate(() => (window as any).hlsSources.length)).toBe(4);
   await expect(page.getByRole("alert")).toContainText("媒体加载失败");
   expect(h.preparations).toHaveLength(1);
+});
+
+test("teardown media errors are silent while an active unsupported resource is reported", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const load = HTMLMediaElement.prototype.load;
+    HTMLMediaElement.prototype.load = function () {
+      const empty = !this.getAttribute("src");
+      load.call(this);
+      if (empty) queueMicrotask(() => this.dispatchEvent(new Event("error")));
+    };
+  });
+  const h = await setup(page, { validMedia: true });
+  await expect.poll(() => h.preparations.length).toBe(1);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.getByRole("button", { name: "重新加载", exact: true }).click();
+  await expect.poll(() => h.preparations.length).toBe(2);
+  await page.clock.fastForward(500);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.getByLabel("选择房间").selectOption("c");
+  await expect.poll(() => h.preparations.length).toBe(3);
+  await page.clock.fastForward(500);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.locator("video").evaluate((el) => {
+    Object.defineProperty(el, "error", { get: () => ({ code: 4 }) });
+    el.dispatchEvent(new Event("error"));
+  });
+  await expect(page.getByRole("alert")).toContainText("无法播放此格式");
 });

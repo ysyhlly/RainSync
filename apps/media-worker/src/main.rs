@@ -251,25 +251,34 @@ async fn delivery(
             let manifest_digest: Option<String> = job.get("manifest_sha256");
             let file = persistence::media_jobs::output_dir(&app.cache, id, attempt).join(&path);
             if job.get::<Option<bool>, _>("readable").unwrap_or(false) && file.is_file() {
-                output = Some((file, attempt, status == "succeeded", manifest_digest));
+                let manifest = if path.ends_with(".m3u8") {
+                    match outputs::read_manifest(&file).await {
+                        Ok(text) if outputs::readable_manifest(&text) => Some(text),
+                        _ if status == "running" => {
+                            // Recheck the job/attempt on every retry; never serve a torn write.
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            continue;
+                        }
+                        _ => return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into())),
+                    }
+                } else {
+                    None
+                };
+                output = Some((
+                    file,
+                    attempt,
+                    status == "succeeded",
+                    manifest_digest,
+                    manifest,
+                ));
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-        let (file, attempt, complete, manifest_digest) =
+        let (file, attempt, complete, manifest_digest, manifest) =
             output.ok_or((StatusCode::SERVICE_UNAVAILABLE, "media_unavailable".into()))?;
-        if path.ends_with(".m3u8") {
-            let mut manifest = String::new();
-            tokio::fs::File::open(file)
-                .await
-                .map_err(failure)?
-                .take(2 * 1024 * 1024 + 1)
-                .read_to_string(&mut manifest)
-                .await
-                .map_err(failure)?;
-            if manifest.len() > 2 * 1024 * 1024
-                || (complete && manifest_digest.is_some_and(|digest| hash(&manifest) != digest))
-            {
+        if let Some(manifest) = manifest {
+            if complete && manifest_digest.is_some_and(|digest| hash(&manifest) != digest) {
                 return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
             }
             // ENDLIST is visible only after this attempt commits success.
@@ -595,26 +604,28 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 return result;
             }
             if !*stop.borrow() && execution_stopped {
-                match tokio::time::timeout(Duration::from_secs(3), cache::check_output_capacity(&app)).await {
-                    Ok(Ok(())) => {},
-                    Ok(Err(error)) => {
+                match process::finalization_deadline(Duration::from_secs(3), cache::check_output_capacity(&app)).await {
+                    Ok(()) => {},
+                    Err(error) if result.is_ok() && error.is::<process::LeaseInterrupted>() => return Err(error),
+                    Err(error) => {
                         if result.is_ok() || error.downcast_ref::<persistence::media_jobs::JobFailure>().is_some() {
                             result = Err(error);
                         }
                     },
-                    Err(_) if result.is_ok() => return Err(process::LeaseInterrupted.into()),
-                    Err(_) => {},
                 }
             }
             let mut publication = None;
             if result.is_ok() && !*stop.borrow() {
                 let directory = persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt);
-                result = match tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || outputs::validate(&directory))).await {
-                    Ok(Ok(Ok(proof))) => { publication = Some(proof); Ok(()) },
-                    Ok(Ok(Err(error))) => Err(error),
-                    Ok(Err(error)) => Err(error.into()),
-                    Err(error) => Err(error.into()),
+                result = match process::finalization_deadline(Duration::from_secs(10), async move {
+                    tokio::task::spawn_blocking(move || outputs::validate(&directory)).await?
+                }).await {
+                    Ok(proof) => { publication = Some(proof); Ok(()) },
+                    Err(error) => Err(error),
                 };
+            }
+            if result.as_ref().is_err_and(|e| e.is::<process::LeaseInterrupted>()) {
+                return result;
             }
             if *stop.borrow() && execution_stopped {
                 tokio::time::timeout(Duration::from_secs(3), persistence::media_jobs::release(&app.db, &claim)).await??;

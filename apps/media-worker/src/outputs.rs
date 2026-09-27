@@ -55,6 +55,77 @@ fn boxes(path: &Path, required: &[[u8; 4]]) -> Result<()> {
     Ok(())
 }
 
+/// Only serve a complete local EVENT playlist snapshot. A valid prefix ending
+/// at a segment boundary is playable; an unfinished tag/duration/URI is not.
+pub fn readable_manifest(text: &str) -> bool {
+    if !text.ends_with('\n') || text.contains('\0') {
+        return false;
+    }
+    let mut lines = text.lines();
+    if lines.next() != Some("#EXTM3U") {
+        return false;
+    }
+    let (mut init, mut pending, mut ended, mut segments) = (false, false, false, 0);
+    for line in lines.filter(|line| !line.is_empty()) {
+        if ended {
+            return false;
+        }
+        if line == "#EXT-X-MAP:URI=\"init.mp4\"" {
+            if init || pending || segments != 0 {
+                return false;
+            }
+            init = true;
+        } else if let Some(value) = line.strip_prefix("#EXTINF:") {
+            if !init
+                || pending
+                || !value.ends_with(',')
+                || !value
+                    .trim_end_matches(',')
+                    .parse::<f64>()
+                    .is_ok_and(|n| n.is_finite() && n > 0.0)
+            {
+                return false;
+            }
+            pending = true;
+        } else if line == "#EXT-X-ENDLIST" {
+            if pending {
+                return false;
+            }
+            ended = true;
+        } else if line == "#EXT-X-MEDIA-SEQUENCE:0" || line == "#EXT-X-PLAYLIST-TYPE:EVENT" {
+            if pending || segments != 0 {
+                return false;
+            }
+        } else if let Some(value) = line
+            .strip_prefix("#EXT-X-VERSION:")
+            .or_else(|| line.strip_prefix("#EXT-X-TARGETDURATION:"))
+        {
+            if pending || segments != 0 || !value.parse::<u32>().is_ok_and(|n| n > 0) {
+                return false;
+            }
+        } else {
+            if !pending || line != format!("index{segments}.m4s") {
+                return false;
+            }
+            pending = false;
+            segments += 1;
+        }
+    }
+    init && segments > 0 && !pending
+}
+
+pub async fn read_manifest(path: &Path) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut text = String::new();
+    tokio::fs::File::open(path)
+        .await?
+        .take(2 * 1024 * 1024 + 1)
+        .read_to_string(&mut text)
+        .await?;
+    ensure!(text.len() <= 2 * 1024 * 1024, "output_manifest_too_large");
+    Ok(text)
+}
+
 pub fn validate(directory: &Path) -> Result<persistence::media_jobs::Publication> {
     let path = directory.join("index.m3u8");
     let metadata = std::fs::symlink_metadata(&path)?;
@@ -120,6 +191,25 @@ pub fn validate(directory: &Path) -> Result<persistence::media_jobs::Publication
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incomplete_playlist_snapshots_are_not_readable() {
+        let full = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nindex0.m4s\n";
+        assert!(readable_manifest(full));
+        assert!(readable_manifest(&format!("{full}#EXT-X-ENDLIST\n")));
+        // Every prefix before the complete first segment is a torn write.
+        for end in 0..full.len() {
+            assert!(!readable_manifest(&full[..end]), "prefix {end}");
+        }
+        for suffix in [
+            "#EXTINF:4,\n",
+            "#EXTINF:NaN,\nindex1.m4s\n",
+            "#EXTINF:4,\nindex1.m4",
+            "#EXTINF:4,\n../index1.m4s\n",
+            "#EXT-X-ENDLIST\nindex1.m4s\n",
+        ] {
+            assert!(!readable_manifest(&format!("{full}{suffix}")));
+        }
+    }
     fn atom(kind: &[u8; 4]) -> Vec<u8> {
         [9u32.to_be_bytes().as_slice(), kind, &[0]].concat()
     }

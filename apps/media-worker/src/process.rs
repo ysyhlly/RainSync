@@ -10,6 +10,17 @@ impl std::fmt::Display for LeaseInterrupted {
 }
 impl std::error::Error for LeaseInterrupted {}
 
+/// Missing finalization evidence is recoverable; never turn a deadline into
+/// a permanent encoder failure or publish an unverified output.
+pub async fn finalization_deadline<T>(
+    duration: Duration,
+    work: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(duration, work)
+        .await
+        .map_err(|_| anyhow::Error::new(LeaseInterrupted))?
+}
+
 pub async fn stopped(stop: &mut watch::Receiver<bool>) {
     while !*stop.borrow_and_update() {
         if stop.changed().await.is_err() {
@@ -86,6 +97,28 @@ mod tests {
         command.spawn().unwrap()
     }
 
+    #[tokio::test]
+    async fn finalization_timeouts_remain_recoverable_without_hiding_invalid_output() {
+        let timeout = finalization_deadline(
+            Duration::from_millis(1),
+            std::future::pending::<anyhow::Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(timeout.is::<LeaseInterrupted>());
+        assert_eq!(
+            finalization_deadline(Duration::from_secs(1), async { Ok(42) })
+                .await
+                .unwrap(),
+            42
+        );
+        let invalid = finalization_deadline(Duration::from_secs(1), async {
+            Err::<(), _>(anyhow::anyhow!("truncated_output_box"))
+        })
+        .await
+        .unwrap_err();
+        assert!(!invalid.is::<LeaseInterrupted>());
+    }
     #[tokio::test]
     async fn shutdown_reaps_child_even_during_stalled_health_check() {
         let mut child = child();

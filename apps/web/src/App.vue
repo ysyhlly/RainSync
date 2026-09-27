@@ -359,6 +359,12 @@ function send(type: string, payload?: unknown) {
   );
 }
 async function stopPlayback() {
+  const old = plan;
+  plan = undefined;
+  if (video.value) {
+    video.value.onerror = null;
+    video.value.onloadedmetadata = null;
+  }
   hls?.destroy();
   hls = undefined;
   if (video.value) {
@@ -366,8 +372,6 @@ async function stopPlayback() {
     video.value.removeAttribute("src");
     video.value.load();
   }
-  const old = plan;
-  plan = undefined;
   // Capture and cancel this operation before the first asynchronous wait.
   // A late session DELETE must never call stop() on a newer preparation.
   const cancellation = session.user ? requests().stop() : Promise.resolve();
@@ -422,6 +426,24 @@ async function loadMedia() {
     applySubtitles();
     const el = video.value;
     waiting.value = true;
+    el.onerror = () => {
+      // load() during teardown and queued events from a previous resource are
+      // not failures of this plan. A real media error belongs to the active URL.
+      if (
+        serial !== loadSerial ||
+        plan !== p ||
+        video.value !== el ||
+        !el.getAttribute("src") ||
+        !el.error ||
+        el.error.code === 1
+      )
+        return;
+      error.value =
+        el.error.code === 2
+          ? "媒体加载中断，请检查连接后重新加载"
+          : "无法播放此格式，可切换兼容转码后重载";
+      waiting.value = false;
+    };
     if (
       p.transport === "hls" &&
       !el.canPlayType("application/vnd.apple.mpegurl") &&
@@ -795,7 +817,6 @@ onBeforeUnmount(() => {
                 @waiting="waiting = true"
                 @canplay="waiting = false"
                 @playing="waiting = false"
-                @error="error = '无法播放此格式，可切换兼容转码后重载'"
               >
                 <track
                   v-for="t in subtitles"

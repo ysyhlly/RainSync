@@ -178,7 +178,8 @@ async fn prepare_playback(
     let mut duration: Option<f64> = row.get("duration_ms");
     let mut position_ms = protocol::bounded_position(body.position_ms, duration);
     let mut transport = "progressive";
-    let mut mode = body.mode.as_deref().unwrap_or("auto");
+    let requested_mode = body.mode.as_deref().unwrap_or("auto");
+    let mut mode = requested_mode;
     if !["auto", "direct", "remux", "transcode"].contains(&mode) {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_mode"));
     }
@@ -315,9 +316,8 @@ async fn prepare_playback(
     let id = reservation.session;
     let t = token();
     let mut timeline = 0.0;
-    if matches!(kind.as_str(), "http" | "agent")
-        && body.mode.as_deref().unwrap_or("auto") != "direct"
-    {
+    if matches!(kind.as_str(), "http" | "agent") && requested_mode != "direct" {
+        // Auto HTTP/NAS must probe even when the provisional mode above is direct.
         // A short-lived session lets the worker probe through the same authorized relay as playback.
         let mut preparation = app.db.begin().await?;
         playback_requests::guard(app, &mut preparation, reservation).await?;
@@ -349,7 +349,7 @@ async fn prepare_playback(
             .map(|v| v * 1000.0);
         let detected = media_core::compatible_mode(&meta, body.audio_index.is_some())
             .map_err(|_| err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_video_or_hdr"))?;
-        if body.mode.as_deref().unwrap_or("auto") == "auto" {
+        if requested_mode == "auto" {
             mode = detected;
         }
         sqlx::query("UPDATE media_items SET metadata=$2,duration_ms=$3 WHERE id=$1")

@@ -50,7 +50,7 @@ fn formatted(ms: u64) -> String {
 fn cue_text(text: &str, origin: u64, start: u64, end: u64) -> Result<String> {
     let mut rest = text;
     let mut result = String::new();
-    let mut previous = start;
+    let mut previous = None;
     while let Some(open) = rest.find('<') {
         result.push_str(&rest[..open]);
         rest = &rest[open..];
@@ -61,10 +61,10 @@ fn cue_text(text: &str, origin: u64, start: u64, end: u64) -> Result<String> {
         if tag.as_bytes().first().is_some_and(u8::is_ascii_digit) {
             let time = timestamp(tag)?;
             ensure!(
-                time > previous && time < end,
+                time >= start && previous.is_none_or(|previous| time > previous) && time < end,
                 "invalid_inline_subtitle_timestamp"
             );
-            previous = time;
+            previous = Some(time);
             // Earlier karaoke markers no longer belong to the clipped cue.
             if time > origin {
                 result.push_str(&format!("<{}>", formatted(time - origin)));
@@ -174,6 +174,23 @@ mod tests {
         let result = String::from_utf8(shift_webvtt(input, 3000.0).unwrap()).unwrap();
         assert!(result.contains("NOTE hello"));
         assert!(result.contains("<v speaker>oldnow<00:00:01.000>next</v>"));
+    }
+    #[test]
+    fn first_inline_marker_may_equal_cue_start_but_later_markers_increase() {
+        let input = "WEBVTT\n\n00:01.000 --> 00:03.000\n<00:01.000>第一句<00:02.000>第二句\n";
+        let result = String::from_utf8(shift_webvtt(input.as_bytes(), 500.0).unwrap()).unwrap();
+        assert!(result.contains("<00:00:00.500>第一句<00:00:01.500>第二句"));
+        let clipped = String::from_utf8(shift_webvtt(input.as_bytes(), 1000.0).unwrap()).unwrap();
+        assert!(clipped.contains("第一句<00:00:01.000>第二句"));
+        for markers in [
+            "<00:00.999>early",
+            "<00:01.000>x<00:01.000>duplicate",
+            "<00:02.000>x<00:01.000>backwards",
+            "<00:03.000>end",
+        ] {
+            let input = format!("WEBVTT\n\n00:01.000 --> 00:03.000\n{markers}\n");
+            assert!(shift_webvtt(input.as_bytes(), 0.0).is_err());
+        }
     }
     #[test]
     fn rejects_malformed_unmapped_and_oversized_inputs() {

@@ -49,6 +49,12 @@ export async function subtitleDelivery({ plan, worker, sql, key, setBody }) {
   response = await fetch(url, { method: "HEAD" });
   assert.equal(response.status, 200);
   assert.equal(await response.text(), "");
+  setBody(
+    "WEBVTT\n\n00:03.000 --> 00:05.000\n<00:03.000>第一句<00:04.000>第二句\n",
+  );
+  response = await fetch(url);
+  assert.equal(response.status, 200);
+  assert.ok((await response.text()).includes("第一句<00:00:01.000>第二句"));
   setBody("WEBVTT\n\n00:99.000 --> 00:01.000\nbroken\n");
   assert.ok((await fetch(url)).status >= 400);
   setBody("WEBVTT\n\n" + "x".repeat(2 * 1024 * 1024));

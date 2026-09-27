@@ -669,13 +669,19 @@ try {
   let negotiations = 0;
   let failNegotiations = 0;
   let probeResponse;
+  let probeMetadata;
+  let probeCalls = 0;
   mock = http
     .createServer((req, res) => {
       if (
         req.url.startsWith("/media-delivery/") &&
         req.url.includes("/probe?")
       ) {
-        probeResponse = res;
+        probeCalls++;
+        if (probeMetadata) {
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify(probeMetadata));
+        } else probeResponse = res;
       } else if (req.url.startsWith("/Users/test-user/Items")) {
         const kind = req.headers["x-emby-token"] ? "emby" : "jellyfin";
         assert.ok(
@@ -835,6 +841,31 @@ try {
   console.log(
     "PASS: disconnected probe records failure and releases committed grant before lease expiry",
   );
+  // Controlled probe metadata exercises the real API decision and grant cleanup.
+  for (const [format, codec, expected] of [
+    ["mov,mp4", "h264", "direct"],
+    ["matroska,webm", "h264", "remux"],
+    ["matroska,webm", "mpeg4", "transcode"],
+  ]) {
+    probeMetadata = {
+      format: { format_name: format, duration: "20" },
+      streams: [
+        { codec_type: "video", codec_name: codec, pix_fmt: "yuv420p" },
+        { codec_type: "audio", codec_name: "aac" },
+      ],
+    };
+    const before = probeCalls;
+    const automatic = await admin.request("/playback-sessions", "POST", {
+      room_id: room.id,
+      media_generation: state.media_generation,
+      mode: "auto",
+    });
+    assert.equal(probeCalls, before + 1);
+    assert.equal(automatic.delivery_mode, expected);
+    await admin.request(`/playback-sessions/${automatic.session_id}`, "DELETE");
+  }
+  probeMetadata = undefined;
+  console.log("PASS: remote auto probes and selects direct/remux/transcode");
   for (const kind of ["jellyfin", "emby"]) {
     const source = await admin.request("/sources", "POST", {
       name: kind,

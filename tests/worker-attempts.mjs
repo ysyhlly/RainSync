@@ -65,6 +65,27 @@ export async function workerAttempts({ plan, worker, sql, key, cache }) {
       !(await (await fetch(playlist)).text()).includes("#EXT-X-ENDLIST"),
       "uncommitted output cannot advertise completion",
     );
+    for (const partial of [
+      "#EXTM",
+      '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:4,\n',
+    ]) {
+      await writeFile(resolve(cache, id, "1", "index.m3u8"), partial);
+      let answered = false;
+      const pending = fetch(playlist).then((response) => {
+        answered = true;
+        return response;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      assert.equal(
+        answered,
+        false,
+        "a torn playlist must not be returned as 200",
+      );
+      await writeFile(resolve(cache, id, "1", "index.m3u8"), saved);
+      const recovered = await pending;
+      assert.equal(recovered.status, 200);
+      assert.ok((await recovered.text()).includes("index0.m4s"));
+    }
     sql(
       `UPDATE media_jobs SET status='succeeded',lease_until=NULL WHERE id='${id}'; UPDATE media_outputs SET status='published' WHERE job_id='${id}' AND attempt=1`,
     );
