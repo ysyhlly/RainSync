@@ -1045,10 +1045,13 @@ name = "media-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "uuid",
+ "windows",
 ]
 
 [[package]]
@@ -1409,7 +1412,6 @@ dependencies = [
  "futures-util",
  "hex",
  "http-api",
- "libc",
  "media-core",
  "persistence",
  "reqwest",
@@ -1423,7 +1425,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "windows",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 mod cache;
 mod cache_outputs;
 mod cache_read;
-mod child_process;
+use media_core::child_process;
 mod output_decode;
 mod output_publish;
 mod output_read;
@@ -161,42 +161,31 @@ async fn delivery(
                 return Err(failure("subtitle_too_large"));
             }
         }
-        let output = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            use tokio::io::AsyncReadExt;
-            let mut child = tokio::process::Command::new("ffmpeg")
-                .args(["-v", "error", "-nostdin", "-i"])
-                .arg(input)
-                .args([
-                    "-map",
-                    &format!("0:{}", if sidecar.is_some() { 0 } else { index }),
-                    "-f",
-                    "webvtt",
-                    "pipe:1",
-                ])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()?;
-            let mut bytes = Vec::new();
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("subtitle_stdout"))?
-                .take(media_core::subtitles::MAX_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-                .await?;
-            anyhow::ensure!(
-                bytes.len() <= media_core::subtitles::MAX_BYTES,
-                "subtitle_too_large"
-            );
-            anyhow::ensure!(child.wait().await?.success(), "subtitle_failed");
-            media_core::subtitles::shift_webvtt(
-                &bytes,
-                resource["timeline_origin_ms"].as_f64().unwrap_or(0.0),
-            )
-        })
+        let mut command = tokio::process::Command::new("ffmpeg");
+        command
+            .args(["-v", "error", "-nostdin", "-i"])
+            .arg(input)
+            .args([
+                "-map",
+                &format!("0:{}", if sidecar.is_some() { 0 } else { index }),
+                "-f",
+                "webvtt",
+                "pipe:1",
+            ]);
+        let (status, bytes) = child_process::capture(
+            command,
+            std::time::Duration::from_secs(30),
+            media_core::subtitles::MAX_BYTES,
+        )
         .await
-        .map_err(failure)?
+        .map_err(failure)?;
+        if !status.success() {
+            return Err(failure("subtitle_failed"));
+        }
+        let output = media_core::subtitles::shift_webvtt(
+            &bytes,
+            resource["timeline_origin_ms"].as_f64().unwrap_or(0.0),
+        )
         .map_err(failure)?;
         return Ok((
             [

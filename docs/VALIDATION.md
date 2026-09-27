@@ -1,5 +1,15 @@
 # 本轮验证记录
 
+## 2026-09-27：探测与字幕有界输出及进程回收
+
+进程树所有者移到 media-core，探测和字幕转换接入同一生命周期。Windows 工作区 43 项测试通过，另有 2 个刻意忽略、由测试显式启动的子进程夹具入口。新增 capture 用例检查正常完成、输出超限、截止和取消 future 的后代回收；Windows 用进程句柄确认退出。Clippy 全目标且 warnings 视为错误、格式、工作区二进制/示例构建和生成契约一致性通过。
+
+对应 Linux build 镜像中，media-core 11 项和 Worker 15 项 release 测试通过，2 个子进程夹具入口忽略。最初直接测试缺少 verify_fixtures 示例引用的 JSON，随后只读挂载仓库 `tests/fixtures` 后完整重跑通过；没有改产品构建或下载新依赖。测试命令：`docker run --rm --network none --mount type=bind,source=C:/rainsync/tests/fixtures,target=/build/tests/fixtures,readonly rainsync-capture-build:local cargo test --release --frozen -p media-core -p rainsync-media-worker`。
+
+最终镜像 `sha256:b2756d191f5f3f0c33d6a83525468ba343d9befece41cbcc709f574efa0b72c7` 的完整 Worker 故障矩阵通过，报告 `.runtime/worker-processes/rainsync-process-940f0dfc/report.json`。新增两个真实 HTTP 接口各三个场景：正常调用实际 ffprobe/字幕 FFmpeg 返回 200，包装脚本注入超量输出和卡住则返回 502；六次响应返回后包装进程和遗留后代均已退出，Worker 保持运行。原编码进程树、首段解码、逐段/最终产物、ENOSPC、缓存权限、读租约、预算、数据库中断、SIGTERM 和旧 Worker 恢复矩阵同时通过。重跑用 `WORKER_TEST_IMAGE=rainsync-capture-validation:local node tests/worker-processes.mjs`（PowerShell 先设置该环境变量）。
+
+`node tests/integration.mjs` 完整通过，含远程自动探测、字幕交付、播放请求恢复、读租约、旧代次回收、NAS 万条索引及备份恢复；100 控制连接快照 314ms 仍仅为本机冒烟。本轮没有网页修改，未重复浏览器或前端测试。运行服务未部署更新；系统退出/runtime 排空、慢编码和完整计划其余门槛继续保留。
+
 ## 2026-09-27：编码与首段解码进程树
 
 Windows 原生 `cargo test --workspace --locked` 通过 42 项测试，另有 2 个刻意忽略的子进程夹具入口。新测试覆盖终止、Drop、正常主进程退出及取消等待，并检查后代真正退出。Clippy 全目标且 warnings 视为错误、格式检查、生成契约一致性、工作区二进制/示例构建均通过。完整隔离 PostgreSQL 集成通过，包含既有 NAS、读租约、队列、播放就绪、旧目录清理和备份恢复回归；100 连接快照 258ms 仅是本机冒烟。

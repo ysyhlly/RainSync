@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { processTrees } from "./process-trees.mjs";
+import { captureProcesses } from "./capture-processes.mjs";
 import { execFileSync } from "node:child_process";
 import {
   randomUUID,
@@ -482,7 +483,29 @@ try {
 
   await firstDecodeFaults();
   await cacheAccessFaults();
-  await processTrees({ docker, image, root, env, name, sql, children, until, report });
+  await processTrees({
+    docker,
+    image,
+    root,
+    env,
+    name,
+    sql,
+    children,
+    until,
+    report,
+  });
+  await captureProcesses({
+    docker,
+    image,
+    root,
+    env,
+    name,
+    sql,
+    children,
+    until,
+    report,
+    sourceKey,
+  });
 
   const evictionCache = resolve(root, "eviction-cache");
   const protectedId = randomUUID(),
@@ -1131,7 +1154,10 @@ try {
     "obsolete output reclaimed while replacement session remains active",
     15000,
   );
-  assert.deepEqual(await readFile(resolve(cache, old.id, "2", "init.mp4")), init);
+  assert.deepEqual(
+    await readFile(resolve(cache, old.id, "2", "init.mp4")),
+    init,
+  );
   report.cases.push({
     scenario: "expired_old_worker_resumed",
     elapsed_ms: Date.now() - started,

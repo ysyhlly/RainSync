@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
+pub mod child_process;
 pub mod subtitles;
 
 pub fn byte_range(value: Option<&str>, size: u64) -> Result<Option<(u64, u64)>> {
@@ -56,26 +57,23 @@ pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 pub async fn probe(path: &str) -> Result<serde_json::Value> {
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        tokio::process::Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-show_format",
-                "-show_streams",
-                "-of",
-                "json",
-                path,
-            ])
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await??;
-    if !output.status.success() {
+    let mut command = tokio::process::Command::new("ffprobe");
+    command.args([
+        "-v",
+        "error",
+        "-show_format",
+        "-show_streams",
+        "-of",
+        "json",
+        path,
+    ]);
+    let (status, bytes) =
+        child_process::capture(command, std::time::Duration::from_secs(30), 8 * 1024 * 1024)
+            .await?;
+    if !status.success() {
         bail!("probe_failed")
     }
-    Ok(serde_json::from_slice(&output.stdout)?)
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 /// Stream-copy HLS does not reliably preserve MP4 display matrices. Baking the

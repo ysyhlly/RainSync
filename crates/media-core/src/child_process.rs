@@ -8,6 +8,59 @@ use tokio::{
 
 type Outcome = Result<ExitStatus, (io::ErrorKind, String)>;
 
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    while !*stop.borrow_and_update() {
+        if stop.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Capture bounded stdout. Explicit failures wait for the entire tree to exit;
+/// cancelling this future instead requests cleanup from the independent owner.
+/// Stderr is discarded so credentials and unbounded diagnostics are not retained.
+pub async fn capture(
+    mut command: Command,
+    deadline: std::time::Duration,
+    max_bytes: usize,
+) -> io::Result<(ExitStatus, Vec<u8>)> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = spawn(command)?;
+    let result = tokio::time::timeout(deadline, async {
+        let mut bytes = Vec::new();
+        child
+            .stdout
+            .take()
+            .expect("piped stdout")
+            .take((max_bytes as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process output exceeds limit",
+            ));
+        }
+        Ok((child.wait().await?, bytes))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "process capture timed out",
+        ))
+    });
+    if result.is_err() {
+        child.kill().await?;
+    }
+    result
+}
+
 pub struct Child {
     stop: watch::Sender<bool>,
     status: watch::Receiver<Option<Outcome>>,
@@ -160,7 +213,7 @@ mod platform {
                 break;
             }
             tokio::select! {
-                _ = crate::process::stopped(&mut stop) => break,
+                _ = stopped(&mut stop) => break,
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {},
             }
         }
@@ -344,7 +397,7 @@ mod platform {
         // Wait only for the leader here. Then kill remaining descendants even
         // when it exited successfully, before waiting for the whole job.
         tokio::select! {
-            _ = crate::process::stopped(&mut stop) => {},
+            _ = stopped(&mut stop) => {},
             result = tree.child.wait() => { result?; },
         }
         let mut handles = process_handles(HANDLE(tree.job.as_raw_handle()))?;
@@ -409,6 +462,12 @@ mod tests {
         }
         let mut leaf = command.spawn().unwrap();
         for _ in 0..6000 {
+            if root.join("output").exists() {
+                use std::io::Write;
+                std::io::stdout().write_all(&[b'x'; 512]).unwrap();
+                std::io::stdout().flush().unwrap();
+                std::fs::remove_file(root.join("output")).unwrap();
+            }
             if root.join("exit").exists() {
                 return;
             }
@@ -449,6 +508,77 @@ mod tests {
         fn exited(&self) -> bool {
             (unsafe { libc::kill(self.0, 0) }) != 0
                 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_reaps_on_deadline_limit_success_and_cancellation() {
+        for mode in ["deadline", "limit", "success", "cancel"] {
+            let root =
+                std::env::temp_dir().join(format!("rainsync-capture-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "child_process::tests::tree_fixture",
+                    "--nocapture",
+                ])
+                .env("RAINSYNC_TREE_FIXTURE", &root)
+                .env_remove("RAINSYNC_TREE_LEAF");
+            let task = tokio::spawn(capture(
+                command,
+                Duration::from_secs(3),
+                if mode == "limit" { 256 } else { 4096 },
+            ));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !root.join("leaf.pid").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let witness = Witness::open(
+                std::fs::read_to_string(root.join("leaf.pid"))
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            );
+            assert!(!witness.exited());
+            match mode {
+                "limit" => {
+                    std::fs::write(root.join("output"), b"emit beyond the capture limit").unwrap()
+                }
+                "success" => {
+                    std::fs::write(root.join("exit"), b"leave a descendant running").unwrap()
+                }
+                "cancel" => task.abort(),
+                _ => {}
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap();
+            if mode == "cancel" {
+                assert!(result.unwrap_err().is_cancelled());
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !witness.exited() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            } else {
+                let result = result.unwrap();
+                match mode {
+                    "deadline" => assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut),
+                    "limit" => assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData),
+                    "success" => assert!(result.unwrap().0.success()),
+                    _ => unreachable!(),
+                }
+                assert!(witness.exited(), "capture must reap before returning");
+            }
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 

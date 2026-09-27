@@ -1,6 +1,8 @@
-# 编码与首段解码的进程树回收
+# 媒体子进程树回收
 
 编码器和首段验证解码器通过同一进程所有者启动。所有者任务持有操作系统进程及其组/Job 句柄；外部 wait 被取消只取消订阅，不取消实际回收。显式终止、丢弃外部句柄及主进程正常退出都会终止残留后代。只有确认整组退出之后，wait/kill 才完成；编码任务随后才能释放写入预算或继续发布。首段解码的截止和取消也使用该路径。
+
+实现位于 `crates/media-core/src/child_process.rs`，Server 的本地探测、Worker 的远程探测及字幕转换也使用同一所有者。探测标准输出最多 8 MiB，字幕沿用 2 MiB 限制；超过上限、读取错误或 30 秒执行截止都会先终止并回收整棵进程树，再返回错误。标准错误丢弃，不累计任意诊断内容。调用 future 被取消后，独立所有者继续回收，但依赖 Tokio runtime 仍运行；执行截止不限制操作系统回收时间，不能把截止误认为回收保证。
 
 Linux 启动独立进程组，并设置 subreaper 收养退出主进程留下的后代。使用 `waitid(WNOWAIT)` 观察主进程退出，保留其尚未回收的 PID，先向该组发送 SIGKILL，再 wait 主进程和本组被收养的后代；不在主进程回收后再次用旧 PGID 发终止信号。已完成的数字 PID 可能复用，因此这种顺序用于避免误杀无关组。语义依据：[wait/waitid](https://man7.org/linux/man-pages/man2/wait.2.html)。
 
@@ -12,4 +14,6 @@ Windows 实现使用 windows Rust 绑定直接调用 API；曾评估的 process-
 
 本轮网络下载缓慢，最终测试镜像使用 `cargo vendor --locked --respect-source-config` 生成的本地依赖副本，以 `cargo build --release --frozen --workspace` 构建；基础镜像、运行层和其余步骤沿用 deploy/Dockerfile。临时构建输入保存在 `.runtime/build-inputs/`，不提交 vendor，也不更改部署构建配置。Linux Worker 测试在对应 build 阶段容器内断网执行 `cargo test --release --frozen -p rainsync-media-worker`，真实 FFmpeg 矩阵使用 `WORKER_TEST_IMAGE=rainsync-worker-tree-validation:local` 指定镜像，具体摘要见 VALIDATION.md。
 
-这些机制覆盖留在编码进程组/Job 中的后代，不是任意第三方插件的隔离沙箱；Unix 主动 setsid 逃离组、强杀 Worker 本体、内核不可中断 I/O、Windows 控制台退出事件及探测/字幕的完整进程生命周期仍需单独验收。不能用当前测试宣称所有 Windows 系统退出信号或全部子进程调用链已覆盖。
+共享模块另有有界输出测试，覆盖正常完成、截止、超限和取消调用；真实 HTTP 场景见 `tests/capture-processes.mjs`，通过隔离 Worker 调用 ffprobe 与字幕 FFmpeg，响应返回后检查包装进程及遗留后代已消失，Worker 保持运行。
+
+这些机制覆盖留在媒体进程组/Job 中的后代，不是任意第三方插件的隔离沙箱；Unix 主动 setsid 逃离组、强杀 Worker 本体、内核不可中断 I/O、Windows 控制台退出事件及 runtime 退出时的所有者排空仍需单独验收。不能用当前测试宣称所有 Windows 系统退出信号或任意运行时终止路径已覆盖。
