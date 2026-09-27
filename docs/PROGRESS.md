@@ -1,5 +1,7 @@
 # 全计划实施进度
 
+2026-09-27 W05 Windows 控制台退出：Server/Worker 共用信号监听，新增 Ctrl+Break；隐藏独立控制台的四个真实服务场景覆盖 Ctrl+C/Break 与阻塞探测后代回收。关闭控制台、注销/关机、实例锁失联及其他计划项仍继续，证据见 VALIDATION.md。
+
 2026-09-27 W05 Server 正常退出：SIGTERM/SIGINT 接入有界 HTTP 等待及共享媒体进程回收；排空期间继续持有实例锁。实例锁连接丢失的强制退出、Windows 系统退出事件及其他计划项仍继续，验证入口见 [进程树](PROCESS_TREES.md)。
 
 2026-09-27 W05 Worker 退出排空：共享进程登记表关闭启动入口，并在 runtime 结束前等待所有媒体子进程所有者，包括已被请求取消而丢弃的外部句柄。Server 退出、Windows 系统退出事件和慢编码等仍继续；机制见 [进程树](PROCESS_TREES.md)。

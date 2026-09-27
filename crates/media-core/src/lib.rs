@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 pub mod child_process;
+pub mod process_signal;
 pub mod subtitles;
 
 pub fn byte_range(value: Option<&str>, size: u64) -> Result<Option<(u64, u64)>> {

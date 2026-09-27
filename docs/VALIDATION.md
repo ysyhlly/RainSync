@@ -1,5 +1,15 @@
 # 本轮验证记录
 
+## 2026-09-27：Windows 原生 Ctrl+C / Ctrl+Break
+
+Server/Worker 的普通退出监听合并到 media-core，Windows 新增 Ctrl+Break，Unix 保持 SIGTERM/SIGINT；注册错误返回前仍执行清理。Windows 工作区 44 项测试、Clippy 全目标且 warnings 视为错误、二进制/示例构建、格式与生成契约检查通过，2 个 ignored 子进程夹具入口保持原用途。
+
+`node tests/windows-shutdown.mjs` 使用真实 Windows 服务进程、隔离 PostgreSQL、各自独立的隐藏控制台与受控 ffprobe 后代。Server/Worker 各自收到真实 Ctrl+C、Ctrl+Break 后均正常退出，四次耗时分别 10.287、10.299、10.281、10.304 秒。发送前取得的后代进程句柄均确认退出；子进程以 CREATE_NO_WINDOW 启动，不依赖同一控制台广播来终止。收紧启动环境变量并在创建服务后移除临时配置之后，完整四场景再次通过。
+
+原生报告 `.runtime/windows-shutdown/60ec417e-ad44-458a-ae4e-792acec7b0ec/report.json` 保存二进制 SHA-256：Server `819f49e476669bec04fb320c1b341d3ab162b027afc26daacbaef7ff6fb51094`，Worker `4c240538441cf35b4faea6e588e28daaffbd14cab82cbc5a463acb8506f5f5b3`。Linux Server 的 SIGTERM/SIGINT 同样通过，约 11.045/11.130 秒退出，探测后代、房间连接和实例锁检查通过，报告 `.runtime/server-shutdown/rainsync-shutdown-935a8bfc/report.json`。本轮 Linux 镜像为 `sha256:cfb883a75c781cfa13945c2cf1992eebcbb653d5514be9794175dca8b50b0a64`。
+
+同一 Linux 镜像的完整 Worker 故障矩阵通过，报告 `.runtime/worker-processes/rainsync-process-6de6422a/report.json`：SIGTERM、并发探测/字幕排空、真实编码进程树、缓存权限与 ENOSPC、首段解码、逐段/最终 HTTP 解码、读租约、预算、数据库中断及旧 Worker 换代恢复均通过。完整隔离集成通过，含 NAS 万条索引与备份恢复；100 控制连接快照 359ms 仅为本机冒烟。cgraphy 差异审查未及时返回，改用 Git diff 审查。没有前端变化，未重复浏览器测试；未部署。关闭控制台、注销/关机、Server 实例锁失联立即退出及强杀路径仍未完成验收，不能用 Ctrl+C/Break 的证据代替。
+
 ## 2026-09-27：Server 正常信号退出与探测回收
 
 Server 接入 SIGTERM/SIGINT、有界 HTTP 等待和共享媒体进程排空。Windows 工作区 44 项测试通过，2 个子进程夹具入口按设计 ignored；Clippy 全目标且 warnings 视为错误、格式、二进制/示例构建及生成契约一致性通过。Linux 运行时镜像使用同一锁定依赖及离线构建方式完成构建，没有修改部署文件。

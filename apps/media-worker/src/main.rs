@@ -735,22 +735,6 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = terminate.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -794,9 +778,9 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(async move { process::stopped(&mut server_stop).await })
         .into_future();
     tokio::pin!(server);
-    let result = tokio::select! {
-        result = &mut server => Some(result),
-        _ = shutdown_signal() => None,
+    let (result, signal_result) = tokio::select! {
+        result = &mut server => (Some(result), Ok(())),
+        signal = media_core::process_signal::wait() => (None, signal),
     };
     let _ = stop.send(true);
     // Keep the runtime alive until the queue has reaped its child. HTTP
@@ -818,6 +802,7 @@ async fn main() -> anyhow::Result<()> {
     queue_result?;
     cleaner_result?;
     server_result?;
+    signal_result?;
     Ok(())
 }
 

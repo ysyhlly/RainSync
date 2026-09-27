@@ -283,22 +283,6 @@ async fn ws(State(app): State<App>, h: HeaderMap, upgrade: WebSocketUpgrade) -> 
         .on_upgrade(move |socket| rooms::socket(app, user, socket, session_hash)))
 }
 
-async fn shutdown_signal() -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = terminate.recv() => Ok(()),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -457,7 +441,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::pin!(server);
     let server_result = tokio::select! {
         result = &mut server => result,
-        signal = shutdown_signal() => {
+        signal = media_core::process_signal::wait() => {
             let _ = stop.send(());
             // A stalled request or long-lived connection cannot delay process
             // shutdown indefinitely. Keep the instance lock throughout draining.
