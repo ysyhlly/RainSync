@@ -10,8 +10,14 @@ import {
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import WebSocket from "ws";
-const nas = process.argv.includes("--nas");
-assert.ok(process.argv.slice(2).every((arg) => arg === "--nas"));
+import { relayCancellation } from "./relay-cancellation.mjs";
+const cancellation = process.argv.includes("--relay-cancel");
+const nas = process.argv.includes("--nas") || cancellation;
+assert.ok(
+  process.argv
+    .slice(2)
+    .every((arg) => ["--nas", "--relay-cancel"].includes(arg)),
+);
 const tag =
   process.env.WORKER_TEST_IMAGE ?? "rainsync-input-retry-validation:local";
 const docker = (...args) =>
@@ -428,7 +434,7 @@ try {
     "rainsync-media-worker",
   );
   const workerBase = `http://${docker("port", worker, "8081/tcp")}`;
-  if (nas)
+  if (nas && !cancellation)
     transferPoll = setInterval(() => {
       if (!active) return;
       try {
@@ -461,31 +467,44 @@ try {
         report.poll_error = String(error);
       }
     }, 200);
-  for (const kind of process.env.INPUT_CASE
-    ? [process.env.INPUT_CASE]
-    : nas
-      ? [
-          "nas_truncated",
-          "nas_reset",
-          "nas_timeout",
-          "nas_stalled",
-          "nas_offline",
-          "nas_exhausted",
-          "nas_denied",
-          "nas_excess",
-          "nas_malformed",
-          "nas_revoked",
-          "nas_ping",
-        ]
-      : [
-          "unavailable",
-          "truncated",
-          "reset",
-          "hls_unavailable",
-          "exhausted",
-          "denied",
-          "malformed",
-        ]) {
+  if (cancellation)
+    report.cases.push(
+      ...(await relayCancellation({
+        workerBase,
+        sql,
+        encrypt,
+        userId,
+        roomId: room.id,
+        agentId,
+      })),
+    );
+  for (const kind of cancellation
+    ? []
+    : process.env.INPUT_CASE
+      ? [process.env.INPUT_CASE]
+      : nas
+        ? [
+            "nas_truncated",
+            "nas_reset",
+            "nas_timeout",
+            "nas_stalled",
+            "nas_offline",
+            "nas_exhausted",
+            "nas_denied",
+            "nas_excess",
+            "nas_malformed",
+            "nas_revoked",
+            "nas_ping",
+          ]
+        : [
+            "unavailable",
+            "truncated",
+            "reset",
+            "hls_unavailable",
+            "exhausted",
+            "denied",
+            "malformed",
+          ]) {
     const id = randomUUID(),
       token = randomBytes(32).toString("hex");
     active = { kind, id, began: Date.now(), requests: [] };

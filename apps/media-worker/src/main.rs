@@ -23,11 +23,8 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
-    sync::Mutex,
-};
+use std::{path::PathBuf, sync::Arc};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -37,7 +34,7 @@ struct App {
     key: Arc<Aes256Gcm>,
     cache: PathBuf,
     client: reqwest::Client,
-    relay: Arc<Mutex<HashMap<Uuid, relay::Pending>>>,
+    relay: relay::Registry,
     public_url: String,
     probes: Arc<tokio::sync::Semaphore>,
     output_checks: Arc<output_read::Checks>,

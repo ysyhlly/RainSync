@@ -1,7 +1,23 @@
 use super::*;
 use axum::extract::ws::{Message, WebSocketUpgrade};
 use futures_util::StreamExt;
+use std::{collections::HashMap, sync::Mutex};
 use tokio::sync::{mpsc, oneshot};
+
+#[derive(Clone, Default)]
+pub struct Registry(Arc<Mutex<HashMap<Uuid, Pending>>>);
+struct Registration {
+    id: Uuid,
+    registry: Registry,
+    // Drop closes this channel after removing the pending connection. The
+    // database owner can then clean up even if INSERT finished after cancellation.
+    _cancel: oneshot::Sender<()>,
+}
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.registry.0.lock().unwrap().remove(&self.id);
+    }
+}
 pub struct Pending {
     pub headers: oneshot::Sender<Value>,
     pub chunks: mpsc::Sender<std::result::Result<Vec<u8>, std::io::Error>>,
@@ -28,7 +44,7 @@ pub async fn fetch(
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let (ht, hr) = oneshot::channel();
     let (ct, cr) = mpsc::channel(16);
-    app.relay.lock().await.insert(
+    app.relay.0.lock().unwrap().insert(
         id,
         Pending {
             headers: ht,
@@ -43,25 +59,39 @@ pub async fn fetch(
             .replace("http://", "ws://")
     );
     let request = json!({"data_url":data_url,"resource":resource["resource"],"range":h.get(header::RANGE).and_then(|v|v.to_str().ok()),"head":head});
-    if sqlx::query(
-        "INSERT INTO agent_transfers VALUES($1,$2,$3,$4,false,now()+interval '30 seconds')",
-    )
-    .bind(id)
-    .bind(agent)
-    .bind(hash(&token))
-    .bind(request)
-    .execute(&app.db)
-    .await
-    .is_err()
-    {
-        app.relay.lock().await.remove(&id);
-        return Err(failure("db"));
-    }
+    let (cancel, cancelled) = oneshot::channel();
+    let registration = Registration {
+        id,
+        registry: app.relay.clone(),
+        _cancel: cancel,
+    };
+    let (ready, offered) = oneshot::channel();
+    let db = app.db.clone();
+    tokio::spawn(async move {
+        let result = sqlx::query(
+            "INSERT INTO agent_transfers VALUES($1,$2,$3,$4,false,now()+interval '30 seconds')",
+        )
+        .bind(id)
+        .bind(agent)
+        .bind(hash(&token))
+        .bind(request)
+        .execute(&db)
+        .await
+        .map(|_| ());
+        let _ = ready.send(result);
+        let _ = cancelled.await;
+        // Always ordered after INSERT settles; a cancelled HTTP handler must
+        // not race a late insertion and leave a fresh usable ticket behind.
+        let _ = sqlx::query("DELETE FROM agent_transfers WHERE id=$1")
+            .bind(id)
+            .execute(&db)
+            .await;
+    });
+    offered.await.map_err(failure)?.map_err(failure)?;
     let meta = match tokio::time::timeout(std::time::Duration::from_secs(15), hr).await {
         Ok(Ok(v)) => v,
         _ => {
             input_failure.transient();
-            app.relay.lock().await.remove(&id);
             return Err((StatusCode::GATEWAY_TIMEOUT, "agent_timeout".into()));
         }
     };
@@ -76,8 +106,9 @@ pub async fn fetch(
             builder = builder.header(key, v)
         }
     }
-    let stream =
-        futures_util::stream::unfold(cr, |mut rx| async { rx.recv().await.map(|v| (v, rx)) });
+    let stream = futures_util::stream::unfold((cr, registration), |(mut rx, guard)| async {
+        rx.recv().await.map(|v| (v, (rx, guard)))
+    });
     builder
         .body(if head {
             Body::empty()
@@ -98,8 +129,9 @@ pub async fn connect(
     }
     let pending = app
         .relay
+        .0
         .lock()
-        .await
+        .unwrap()
         .remove(&id)
         .ok_or((StatusCode::GONE, "transfer_expired".into()))?;
     Ok(ws
@@ -193,4 +225,35 @@ fn metadata(meta: &Value) -> Option<(StatusCode, u64)> {
     }
     let expected = meta["content-length"].as_str()?.parse().ok()?;
     Some((StatusCode::from_u16(status).ok()?, expected))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn cancelled_registration_releases_pending_channels_before_database_cleanup() {
+        let registry = Registry::default();
+        let id = Uuid::new_v4();
+        let (headers, response) = oneshot::channel();
+        let (chunks, mut body) = mpsc::channel(16);
+        registry.0.lock().unwrap().insert(
+            id,
+            Pending {
+                headers,
+                chunks,
+                input_failure: Default::default(),
+            },
+        );
+        let (cancel, cancelled) = oneshot::channel();
+        let guard = Registration {
+            id,
+            registry: registry.clone(),
+            _cancel: cancel,
+        };
+        drop(guard);
+        assert!(registry.0.lock().unwrap().is_empty());
+        assert!(response.await.is_err());
+        assert!(body.recv().await.is_none());
+        assert!(cancelled.await.is_err());
+    }
 }

@@ -1,5 +1,17 @@
 # 本轮验证记录
 
+## 2026-09-27：NAS 等待登记与取消竞态
+
+新增 `node tests/input-retries.mjs --relay-cancel`。先在上一版镜像 `sha256:ac7801db2f42a41c352b5346acd0d3201f5cbfbb0356fba621ed6187b58e9bc0` 上复现：隔离数据库的测试触发器将 INSERT 延迟两秒，HTTP 已断开但 INSERT 完成后仍留下票据，测试在“late INSERT did not recreate a cancelled offer”断言失败。
+
+修复镜像 `sha256:5e2e2d099175386f1f9440603e6a9569203a4460bb4ddab2e75b671673861355` 通过十个场景：延迟 INSERT 取消、五次等待连接取消、等待首部取消、正文取消、HEAD 完成与正常正文完成。延迟场景 2403ms 清理，其余取消 192–460ms，均低于五秒；晚到数据连接返回 401/410，已连接 WebSocket 关闭。报告 `.runtime/input-retries/rainsync-input-71869792/report.json`。单元测试另确认内存登记及通道在数据库清理通知前已经释放。
+
+Worker 18 项测试通过，1 个子进程夹具入口 ignored；Clippy 全目标且 warnings 视为错误、二进制/示例构建、格式与生成契约检查通过。同步锁仅用于登记映射，不跨 await。cgraphy 差异审查未及时返回，终止后使用 Git diff 与源码复核。
+
+相同最终镜像的 NAS 十一类故障回归通过，报告 `.runtime/input-retries/rainsync-input-0f097533/report.json`，包括正文停滞及持续 Ping 的期限、有限重试、永久失败与实际产物解码。完整原生隔离集成通过，含真实 Agent relay、Range/HEAD、权限、幂等、分页索引及备份恢复；100 控制连接快照 266ms 仅为本机冒烟。本轮没有前端和编码/缓存改动，未重复这些独立矩阵。
+
+测试使用真实 HTTP、PostgreSQL 与 WebSocket 数据对端，未验证真实 Agent 在所有文件 I/O 状态下的文件句柄期限；数据库不可用时也不承诺物理行立即删除。完整传输状态机、撤销与持续运行验收继续。未部署。
+
 ## 2026-09-27：NAS 数据通道的任务重试与无进展期限
 
 NAS relay 将执行级故障观察值传到已授权的数据通道；未撤销设备离线、等待/正文超时和截断可有限重试，撤销、无权限、非法首部和超量数据不自动重试。Ping/Pong 不截断正文、不刷新无进展期限；队列背压不计入等待下一段上游正文的期限。沿用现有三次上限、退避、代次隔离及公开错误契约，无迁移。
