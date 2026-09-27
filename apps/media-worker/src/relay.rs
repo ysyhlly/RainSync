@@ -25,6 +25,7 @@ pub struct Pending {
     pub chunks: mpsc::Sender<std::result::Result<Vec<u8>, std::io::Error>>,
     pub input_failure: input_failure::Observation,
     pub state: transfer_state::State,
+    pub source_version: String,
 }
 pub async fn fetch(
     app: &App,
@@ -43,6 +44,14 @@ pub async fn fetch(
         }
         return Err((StatusCode::SERVICE_UNAVAILABLE, "agent_offline".into()));
     }
+    let source_version = resource["source_version"]
+        .as_str()
+        .filter(|v| media_core::file_version::valid_file_version(v))
+        .ok_or_else(|| {
+            input_failure.permanent();
+            (StatusCode::CONFLICT, "source_version_required".into())
+        })?
+        .to_owned();
     let id = Uuid::new_v4();
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let (ht, hr) = oneshot::channel();
@@ -55,6 +64,7 @@ pub async fn fetch(
             chunks: ct,
             input_failure: input_failure.clone(),
             state: state.clone(),
+            source_version: source_version.clone(),
         },
     );
     let data_url = format!(
@@ -63,7 +73,7 @@ pub async fn fetch(
             .replace("https://", "wss://")
             .replace("http://", "ws://")
     );
-    let request = json!({"data_url":data_url,"resource":resource["resource"],"range":h.get(header::RANGE).and_then(|v|v.to_str().ok()),"head":head});
+    let request = json!({"data_url":data_url,"resource":resource["resource"],"source_version":source_version,"range":h.get(header::RANGE).and_then(|v|v.to_str().ok()),"head":head});
     let (cancel, cancelled) = oneshot::channel();
     let registration = Registration {
         id,
@@ -99,6 +109,15 @@ pub async fn fetch(
             return Err((StatusCode::GATEWAY_TIMEOUT, "agent_timeout".into()));
         }
     };
+    if meta["status"] == 409 {
+        match meta["error"].as_str() {
+            Some("source_changed") => return Err((StatusCode::CONFLICT, "source_changed".into())),
+            Some("source_version_required") => {
+                return Err((StatusCode::CONFLICT, "source_version_required".into()));
+            }
+            _ => {}
+        }
+    }
     let mut builder = Response::builder().status(meta["status"].as_u64().unwrap_or(502) as u16);
     for key in [
         "content-length",
@@ -213,8 +232,15 @@ pub async fn connect(
                 return;
             };
             pending.input_failure.status(status);
+            if status.is_success() && meta["source_version"].as_str() != Some(pending.source_version.as_str()) {
+                let reason = if meta["source_version"].as_str().is_none() { "source_version_required" } else { "source_changed" };
+                pending.input_failure.permanent();
+                pending.state.fail(reason);
+                let _ = pending.headers.send(json!({"status":409,"content-length":"0","error":reason}));
+                return;
+            }
             if !status.is_success() {
-                pending.state.fail("agent_http_error");
+                pending.state.fail(if status == StatusCode::CONFLICT && meta["error"] == "source_changed" {"source_changed"}else{"agent_http_error"});
             }
             let streaming = tokio::time::timeout(std::time::Duration::from_secs(3), async {
                 let mut tx = app.db.begin().await?;
@@ -312,6 +338,7 @@ mod tests {
                 chunks,
                 input_failure: Default::default(),
                 state: Default::default(),
+                source_version: format!("stat-v1:{}", "0".repeat(64)),
             },
         );
         let (cancel, cancelled) = oneshot::channel();

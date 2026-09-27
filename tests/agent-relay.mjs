@@ -19,6 +19,7 @@ export async function agentRelay({
   const agent = `${worker}-agent`,
     volume = `${agent}-media`;
   const token = randomBytes(32).toString("hex");
+  let sourceVersion;
   const requests = new Set(),
     cases = [];
   const delay = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -48,6 +49,7 @@ export async function agentRelay({
       kind: "agent",
       agent_id: agentId,
       resource: "large.mp4",
+      source_version: sourceVersion,
     });
     sql(
       `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${userId}','${roomId}',0,'${createHash("sha256").update(ticket).digest("hex")}','{"encrypted":"${resource}"}',now()+interval '1 hour')`,
@@ -139,6 +141,16 @@ export async function agentRelay({
       "real Agent control",
       10000,
     );
+    await until(
+      () => {
+        sourceVersion = sql(
+          `SELECT source_version FROM media_items WHERE source_id='${agentId}' AND resource='large.mp4'`,
+        );
+        return sourceVersion.startsWith("stat-v1:");
+      },
+      "versioned Agent index",
+      10000,
+    );
     const active = await streaming(8);
     await until(() => handles() === 8, "eight real files");
     let began = Date.now();
@@ -167,6 +179,89 @@ export async function agentRelay({
       scenario: "Agent-restart-through-Worker",
       recovered_ms: Date.now() - began,
       range_bytes: range.bytes,
+    });
+
+    // Keep size and mtime identical: identity/change-time must still invalidate
+    // the old grant. Reads use real Agent descriptors, not fixture metadata.
+    const pinnedVersion = sourceVersion;
+    docker(
+      "exec",
+      "--user",
+      "0",
+      agent,
+      "sh",
+      "-c",
+      "truncate -s 1073741824 /media/replacement; touch -r /media/large.mp4 /media/replacement; chmod 644 /media/replacement; mv /media/replacement /media/large.mp4",
+    );
+    const replaced = start({ pause: false, range: "bytes=10-99" });
+    await until(() => replaced.ended, "replaced source refused");
+    assert.equal(replaced.response.statusCode, 409);
+    sql(
+      `UPDATE media_items SET metadata='{"container":"old"}',duration_ms=123 WHERE source_id='${agentId}' AND resource='large.mp4'`,
+    );
+    docker("restart", agent);
+    await until(
+      () => {
+        sourceVersion = sql(
+          `SELECT source_version FROM media_items WHERE source_id='${agentId}' AND resource='large.mp4'`,
+        );
+        return (
+          sourceVersion.startsWith("stat-v1:") &&
+          sourceVersion !== pinnedVersion
+        );
+      },
+      "replacement index version",
+      10000,
+    );
+    assert.equal(
+      sql(
+        `SELECT (metadata='{}'::jsonb AND duration_ms IS NULL)::text FROM media_items WHERE source_id='${agentId}' AND resource='large.mp4'`,
+      ),
+      "true",
+    );
+    const refreshed = start({ pause: false, range: "bytes=10-99" });
+    await until(() => refreshed.ended, "replacement new grant");
+    assert.equal(refreshed.response.statusCode, 206);
+    assert.equal(refreshed.bytes, 90);
+    cases.push({
+      scenario: "same-size-mtime-replacement",
+      old_status: 409,
+      new_status: 206,
+      metadata_invalidated: true,
+    });
+
+    const changing = (await streaming(1))[0];
+    const beforeEdit = sourceVersion;
+    docker(
+      "exec",
+      "--user",
+      "0",
+      agent,
+      "sh",
+      "-c",
+      "touch -r /media/large.mp4 /media/saved-time; printf x | dd of=/media/large.mp4 bs=1 seek=536870912 conv=notrunc status=none; touch -r /media/saved-time /media/large.mp4; rm /media/saved-time",
+    );
+    await aborted([changing], "same-size in-place edit truncates stream");
+    const edited = start({ pause: false, range: "bytes=10-99" });
+    await until(() => edited.ended, "edited old grant refused");
+    assert.equal(edited.response.statusCode, 409);
+    docker("restart", agent);
+    await until(
+      () => {
+        sourceVersion = sql(
+          `SELECT source_version FROM media_items WHERE source_id='${agentId}' AND resource='large.mp4'`,
+        );
+        return (
+          sourceVersion.startsWith("stat-v1:") && sourceVersion !== beforeEdit
+        );
+      },
+      "edited index version",
+      10000,
+    );
+    cases.push({
+      scenario: "same-size-mtime-in-place-edit",
+      old_stream_aborted: true,
+      old_status: 409,
     });
 
     const revoked = await streaming(8);
@@ -207,13 +302,13 @@ export async function agentRelay({
       ),
     );
     assert.equal(states.cancelled, 4);
-    assert.equal(states.failed, 16);
-    assert.equal(states.completed, 1);
+    assert.equal(states.failed, 19);
+    assert.equal(states.completed, 2);
     assert.equal(
       sql(
         `SELECT count(*) FROM agent_transfer_runs WHERE agent_id='${agentId}' AND status='completed' AND byte_range='bytes=10-99' AND bytes_delivered=90`,
       ),
-      "1",
+      "2",
     );
     cases.push({ scenario: "durable-real-Agent-outcomes", states });
     return cases;

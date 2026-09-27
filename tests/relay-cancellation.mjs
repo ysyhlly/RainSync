@@ -14,6 +14,7 @@ export async function relayCancellation({
   holdTransfer,
 }) {
   const cases = [];
+  const sourceVersion = `stat-v1:${"0".repeat(64)}`;
   const sockets = new Set();
   const requests = new Set();
   const delay = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -32,13 +33,19 @@ export async function relayCancellation({
       kind: "agent",
       agent_id: agentId,
       resource: id,
+      source_version: sourceVersion,
     });
     sql(
       `UPDATE agents SET last_seen=now() WHERE id='${agentId}'; INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${userId}','${roomId}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${resource}"}',now()+interval '1 hour')`,
     );
     const resourceHash = createHash("sha256")
       .update(
-        JSON.stringify({ agent_id: agentId, kind: "agent", resource: id }),
+        JSON.stringify({
+          agent_id: agentId,
+          kind: "agent",
+          resource: id,
+          source_version: sourceVersion,
+        }),
       )
       .digest("hex");
     const state = { id, resourceHash, body: [], ended: false };
@@ -202,6 +209,7 @@ export async function relayCancellation({
     bodySocket.send(
       JSON.stringify({
         status: 200,
+        source_version: sourceVersion,
         "content-length": "10485760",
         "content-type": "video/mp4",
       }),
@@ -216,7 +224,11 @@ export async function relayCancellation({
       headRow = await offered(head),
       headSocket = await connect(headRow);
     headSocket.send(
-      JSON.stringify({ status: 200, "content-length": "10485760" }),
+      JSON.stringify({
+        status: 200,
+        source_version: sourceVersion,
+        "content-length": "10485760",
+      }),
     );
     await until(
       () =>
@@ -232,7 +244,13 @@ export async function relayCancellation({
     const complete = start(),
       completeRow = await offered(complete),
       completeSocket = await connect(completeRow);
-    completeSocket.send(JSON.stringify({ status: 200, "content-length": "3" }));
+    completeSocket.send(
+      JSON.stringify({
+        status: 200,
+        source_version: sourceVersion,
+        "content-length": "3",
+      }),
+    );
     completeSocket.send(Buffer.from("abc"));
     completeSocket.close();
     await until(
@@ -280,6 +298,7 @@ export async function relayCancellation({
         ws.send(
           JSON.stringify({
             status: kind === "denied" ? 401 : 200,
+            source_version: sourceVersion,
             "content-length": kind === "denied" ? "0" : "100000",
           }),
         );
@@ -337,7 +356,11 @@ export async function relayCancellation({
       liveRow = await offered(live),
       liveSocket = await connect(liveRow);
     liveSocket.send(
-      JSON.stringify({ status: 200, "content-length": "10485760" }),
+      JSON.stringify({
+        status: 200,
+        source_version: sourceVersion,
+        "content-length": "10485760",
+      }),
     );
     const firstLease = run(live).lease_until;
     const keepAlive = setInterval(() => {
@@ -375,7 +398,11 @@ export async function relayCancellation({
       crashRow = await offered(crashed),
       crashSocket = await connect(crashRow);
     crashSocket.send(
-      JSON.stringify({ status: 200, "content-length": "10485760" }),
+      JSON.stringify({
+        status: 200,
+        source_version: sourceVersion,
+        "content-length": "10485760",
+      }),
     );
     crashSocket.send(Buffer.alloc(1024));
     await until(() => crashed.body.length > 0, "stream before Worker crash");

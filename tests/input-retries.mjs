@@ -150,6 +150,7 @@ async function transfer(request, attempt, workerBase) {
   await send(
     JSON.stringify({
       status: range ? 206 : 200,
+      source_version: request.source_version,
       "content-length": String(excess ? 1 : end - start + 1),
       "content-type": "video/mp4",
       "accept-ranges": "bytes",
@@ -570,6 +571,7 @@ try {
             job_id: id,
             agent_id: agentId,
             resource: "input.mp4",
+            source_version: `stat-v1:${"0".repeat(64)}`,
           }
         : {
             kind: "http",

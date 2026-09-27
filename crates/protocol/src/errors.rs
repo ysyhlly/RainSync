@@ -60,6 +60,8 @@ pub enum ErrorCode {
     InvalidUpstreamBase,
     UpstreamNoCompatibleStream,
     SourceProbeFailed,
+    SourceChanged,
+    SourceVersionRequired,
     InvalidAudioTrack,
     DeviceHasNoCompatiblePlaybackTransport,
     UpstreamDeviceProfileRequired,
@@ -151,6 +153,10 @@ impl ErrorCode {
 
     fn message(self) -> &'static str {
         match self {
+            Self::SourceChanged => "源文件已变化，请重新连接 NAS Agent 更新索引后重新播放",
+            Self::SourceVersionRequired => {
+                "NAS Agent 缺少文件版本信息，请升级 Agent 并重新连接以更新索引"
+            }
             Self::MediaQueueFull => "媒体处理队列已满，请稍后使用相同请求编号重试",
             Self::CacheCapacityExceeded => "媒体缓存空间不足，请联系管理员清理后重新发起播放",
             Self::CacheReadOnly => "媒体缓存为只读，请联系管理员调整挂载后重新发起播放",

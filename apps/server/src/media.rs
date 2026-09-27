@@ -213,12 +213,13 @@ async fn prepare_playback(
     let media = state
         .media_id
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no_media"))?;
-    let row=sqlx::query("SELECT m.resource,m.duration_ms,m.metadata,s.kind,s.config_encrypted FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND m.available").bind(media).fetch_optional(&app.db).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "media_not_found"))?;
+    let row=sqlx::query("SELECT m.resource,m.duration_ms,m.metadata,m.source_version,s.kind,s.config_encrypted FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND m.available").bind(media).fetch_optional(&app.db).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "media_not_found"))?;
     let kind: String = row.get("kind");
     let config: SourceConfig =
         serde_json::from_value(app.decrypt(&row.get::<String, _>("config_encrypted"))?)
             .map_err(anyhow::Error::from)?;
     let item: String = row.get("resource");
+    let source_version: Option<String> = row.get("source_version");
     let mut resource = json!({"kind":kind,"resource":item,"root":config.root,"headers":{}});
     let mut meta: Value = row.get("metadata");
     let mut duration: Option<f64> = row.get("duration_ms");
@@ -253,6 +254,11 @@ async fn prepare_playback(
         }
         "agent" => {
             resource["agent_id"] = json!(config.agent_id);
+            let version = source_version
+                .as_deref()
+                .filter(|v| media_core::file_version::valid_file_version(v))
+                .ok_or_else(|| err(StatusCode::CONFLICT, "source_version_required"))?;
+            resource["source_version"] = json!(version);
         }
         "jellyfin" | "emby" => {
             let info = providers::upstream_plan(
@@ -398,12 +404,16 @@ async fn prepare_playback(
         if requested_mode == "auto" {
             mode = detected;
         }
-        sqlx::query("UPDATE media_items SET metadata=$2,duration_ms=$3 WHERE id=$1")
+        let updated = sqlx::query("UPDATE media_items SET metadata=$2,duration_ms=$3 WHERE id=$1 AND source_version IS NOT DISTINCT FROM $4")
             .bind(media)
             .bind(&meta)
             .bind(duration)
+            .bind(&source_version)
             .execute(&app.db)
             .await?;
+        if updated.rows_affected() != 1 {
+            return Err(err(StatusCode::CONFLICT, "source_changed"));
+        }
     }
     let streams = meta["streams"].as_array();
     let audio_tracks = streams
@@ -535,6 +545,18 @@ async fn prepare_playback(
             .await?;
     if current["media_generation"].as_u64() != Some(u64::from(body.media_generation)) {
         return Err(err(StatusCode::CONFLICT, "stale_media"));
+    }
+    if kind == "agent"
+        && sqlx::query(
+            "SELECT id FROM media_items WHERE id=$1 AND available AND source_version=$2 FOR SHARE",
+        )
+        .bind(media)
+        .bind(&source_version)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
+        return Err(err(StatusCode::CONFLICT, "source_changed"));
     }
     sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '30 minutes') ON CONFLICT(id) DO UPDATE SET resource=EXCLUDED.resource,expires_at=EXCLUDED.expires_at,stopped=false").bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":encrypted})).execute(&mut *tx).await?;
     if local_job {

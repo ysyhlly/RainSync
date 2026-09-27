@@ -1,11 +1,18 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use std::io::{Read, Seek};
 use std::{path::PathBuf, sync::Arc};
-use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
-    sync::Semaphore,
-};
+use tokio::sync::Semaphore;
+
+#[derive(Debug)]
+struct SourceChanged;
+impl std::fmt::Display for SourceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("source_changed")
+    }
+}
+impl std::error::Error for SourceChanged {}
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest},
@@ -48,10 +55,18 @@ async fn transfer(root: PathBuf, request: Value) -> Result<()> {
             return Ok(());
         }
         let resource = request["resource"].as_str().context("resource")?.to_owned();
-        let path =
-            tokio::task::spawn_blocking(move || media_core::safe_path(&root, &resource)).await??;
-        let mut file = tokio::fs::File::open(&path).await?;
-        let size = file.metadata().await?.len();
+        let expected = request["source_version"].as_str().map(str::to_owned);
+        let (path, file, snapshot) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let path = media_core::safe_path(&root, &resource)?;
+            let file = std::fs::File::open(&path)?;
+            let snapshot = media_core::file_version::snapshot_file(&file)?;
+            if expected.as_ref().is_some_and(|v| *v != snapshot.version) {
+                return Err(SourceChanged.into());
+            }
+            Ok((path, Arc::new(file), snapshot))
+        })
+        .await??;
+        let size = snapshot.len;
         let range = match media_core::byte_range(request["range"].as_str(), size) {
             Ok(value) => value,
             Err(_) => {
@@ -61,7 +76,7 @@ async fn transfer(root: PathBuf, request: Value) -> Result<()> {
             }
         };
         let (start, len) = range.map(|(a, b)| (a, b - a + 1)).unwrap_or((0, size));
-        let mut meta = json!({"status":if range.is_some(){206}else{200},"content-length":len.to_string(),"content-type":content_type(&path),"accept-ranges":"bytes"});
+        let mut meta = json!({"status":if range.is_some(){206}else{200},"content-length":len.to_string(),"content-type":content_type(&path),"accept-ranges":"bytes","source_version":snapshot.version});
         if let Some((a, b)) = range {
             meta["content-range"] = json!(format!("bytes {a}-{b}/{size}"));
         }
@@ -73,16 +88,35 @@ async fn transfer(root: PathBuf, request: Value) -> Result<()> {
         )
         .await??;
         if !request["head"].as_bool().unwrap_or(false) {
-            file.seek(std::io::SeekFrom::Start(start)).await?;
+            let seek_file = file.clone();
+            tokio::task::spawn_blocking(move || {
+                (&*seek_file).seek(std::io::SeekFrom::Start(start))
+            })
+            .await??;
             let mut remaining = len;
-            let mut buf = vec![0; 65536];
             while remaining > 0 {
-                let wanted = remaining.min(buf.len() as u64) as usize;
-                let n = file.read(&mut buf[..wanted]).await?;
-                anyhow::ensure!(n > 0, "source_truncated");
+                let wanted = remaining.min(65536) as usize;
+                let read_file = file.clone();
+                let version = snapshot.version.clone();
+                let buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+                    if media_core::file_version::snapshot_file(&read_file)?.version != version {
+                        return Err(SourceChanged.into());
+                    }
+                    let mut bytes = vec![0; wanted];
+                    let n = (&*read_file).read(&mut bytes)?;
+                    if n == 0
+                        || media_core::file_version::snapshot_file(&read_file)?.version != version
+                    {
+                        return Err(SourceChanged.into());
+                    }
+                    bytes.truncate(n);
+                    Ok(bytes)
+                })
+                .await??;
+                let n = buf.len();
                 tokio::time::timeout(
                     std::time::Duration::from_secs(30),
-                    writer.send(Message::Binary(buf[..n].to_vec().into())),
+                    writer.send(Message::Binary(buf.into())),
                 )
                 .await??;
                 remaining -= n as u64;
@@ -99,10 +133,14 @@ async fn transfer(root: PathBuf, request: Value) -> Result<()> {
         } => Ok(()),
     };
     if result.is_err() && !headers_started {
+        let changed = result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.is::<SourceChanged>());
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             writer.send(Message::Text(
-                json!({"status":404,"content-length":"0"})
+                json!({"status":if changed {409}else{404},"error":if changed {"source_changed"}else{"media_not_found"},"content-length":"0"})
                     .to_string()
                     .into(),
             )),
@@ -133,6 +171,9 @@ fn index(
                 stack.push(e.path());
                 continue;
             }
+            if !ty.is_file() {
+                continue;
+            }
             let p = e.path();
             let ext = p
                 .extension()
@@ -148,7 +189,9 @@ fn index(
                 title.chars().count() <= 1024 && resource.chars().count() <= 16384,
                 "index_path_too_long"
             );
-            let item = json!({"title":title,"resource":resource});
+            let version =
+                media_core::file_version::snapshot_file(&std::fs::File::open(&p)?)?.version;
+            let item = json!({"title":title,"resource":resource,"source_version":version});
             let size = serde_json::to_vec(&item)?.len() + 1;
             if !items.is_empty() && (items.len() >= 128 || bytes + size > 128 * 1024) {
                 pages.blocking_send(Ok((std::mem::take(&mut items), false)))?;

@@ -144,7 +144,7 @@ async fn ingest_index(
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
-        sqlx::query("CREATE TEMP TABLE agent_index_page (resource text PRIMARY KEY, title text NOT NULL) ON COMMIT DROP").execute(&mut *tx).await?;
+        sqlx::query("CREATE TEMP TABLE agent_index_page (resource text PRIMARY KEY, title text NOT NULL, source_version text) ON COMMIT DROP").execute(&mut *tx).await?;
         loop {
             anyhow::ensure!(
                 page["snapshot"] == snapshot && page["sequence"].as_u64().unwrap_or(0) == sequence,
@@ -167,12 +167,20 @@ async fn ingest_index(
                         && title.chars().count() <= 1024,
                     "index_string_too_large"
                 );
+                if !item["source_version"].is_null() {
+                    anyhow::ensure!(
+                        item["source_version"]
+                            .as_str()
+                            .is_some_and(media_core::file_version::valid_file_version),
+                        "invalid_source_version"
+                    );
+                }
             }
-            sqlx::query("INSERT INTO agent_index_page SELECT resource,title FROM jsonb_to_recordset($1) AS x(resource text,title text) ON CONFLICT(resource) DO UPDATE SET title=EXCLUDED.title").bind(&page["items"]).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO agent_index_page SELECT resource,title,source_version FROM jsonb_to_recordset($1) AS x(resource text,title text,source_version text) ON CONFLICT(resource) DO UPDATE SET title=EXCLUDED.title,source_version=EXCLUDED.source_version").bind(&page["items"]).execute(&mut *tx).await?;
             let final_page = page["final"].as_bool().unwrap_or(snapshot.is_null());
             if final_page {
                 sqlx::query("UPDATE media_items SET available=false WHERE source_id=$1 AND NOT EXISTS(SELECT 1 FROM agent_index_page i WHERE i.resource=media_items.resource)").bind(id).execute(&mut *tx).await?;
-                sqlx::query("INSERT INTO media_items(id,source_id,title,resource) SELECT gen_random_uuid(),$1,title,resource FROM agent_index_page ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,available=true").bind(id).execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO media_items(id,source_id,title,resource,source_version) SELECT gen_random_uuid(),$1,title,resource,source_version FROM agent_index_page ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,available=true,source_version=EXCLUDED.source_version,metadata=CASE WHEN media_items.source_version IS DISTINCT FROM EXCLUDED.source_version THEN '{}'::jsonb ELSE media_items.metadata END,duration_ms=CASE WHEN media_items.source_version IS DISTINCT FROM EXCLUDED.source_version THEN NULL ELSE media_items.duration_ms END").bind(id).execute(&mut *tx).await?;
                 tx.commit().await?;
                 acks.send(json!({"type":"INDEX_ACK","sequence":sequence,"final":true}))
                     .await?;

@@ -7,12 +7,12 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-[dev-dependencies]
 sha2 = "0.10"
+[dev-dependencies]
 uuid.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_Security"] }
+windows = { version = "0.62", features = ["Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Storage_FileSystem"] }
