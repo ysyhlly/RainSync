@@ -73,23 +73,23 @@ pub async fn connect(
             ack = completed.recv() => {
                 let Some(ack) = ack else { break };
                 let failed = ack["type"] == "INDEX_ERROR";
-                if out.send(Message::Text(ack.to_string().into())).await.is_err() || failed { break }
+                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3), out.send(Message::Text(ack.to_string().into()))).await, Ok(Ok(()))) || failed { break }
             }
             _ = tick.tick() => {
                 let valid = sqlx::query("UPDATE agents SET last_seen=now() WHERE id=$1 AND NOT revoked RETURNING id").bind(id).fetch_optional(&app.db).await;
                 if !matches!(valid, Ok(Some(_))) { break }
                 // Lock only the next transfer. Unsent rows never become claimed.
                 let result: anyhow::Result<()> = async {
-                    for _ in 0..16 {
+                    // One bounded send per select iteration keeps heartbeats,
+                    // index acknowledgements and incoming frames responsive.
                         let mut tx = app.db.begin().await?;
                         let row = sqlx::query("SELECT id,request FROM agent_transfers WHERE agent_id=$1 AND NOT claimed AND expires_at>now() ORDER BY expires_at FOR UPDATE SKIP LOCKED LIMIT 1").bind(id).fetch_optional(&mut *tx).await?;
-                        let Some(row) = row else { break };
+                        let Some(row) = row else { return Ok(()) };
                         let transfer: Uuid = row.get("id");
                         let request: Value = row.get("request");
                         tokio::time::timeout(std::time::Duration::from_secs(3), out.send(Message::Text(json!({"type":"TRANSFER","id":transfer,"request":request}).to_string().into()))).await??;
                         sqlx::query("UPDATE agent_transfers SET claimed=true WHERE id=$1").bind(transfer).execute(&mut *tx).await?;
                         tx.commit().await?;
-                    }
                     Ok(())
                 }.await;
                 if result.is_err() { break }

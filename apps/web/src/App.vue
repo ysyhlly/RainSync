@@ -94,6 +94,33 @@ let controlEpoch: string | undefined;
 let roomSerial = 0;
 let clockAction: "load" | "apply" | undefined;
 const dragging = ref(false);
+let recoveringHls = false;
+const mediaCursors = ref<string[]>([""]);
+const mediaPage = ref(0),
+  mediaLoading = ref(false);
+let mediaSerial = 0;
+async function loadLibrary(page = 0) {
+  const serial = ++mediaSerial;
+  mediaLoading.value = true;
+  const after = page ? mediaCursors.value[page] : "";
+  const query = new URLSearchParams({ limit: "100", search: search.value });
+  if (after) query.set("after", after);
+  try {
+    const rows = await session.api(`/media?${query}`);
+    if (serial !== mediaSerial) return;
+    media.value = rows;
+    mediaPage.value = page;
+    mediaCursors.value = [
+      ...mediaCursors.value.slice(0, page + 1),
+      rows.at(-1)?.id ?? "",
+    ];
+  } finally {
+    if (serial === mediaSerial) mediaLoading.value = false;
+  }
+}
+watch(search, () => {
+  void run(() => loadLibrary());
+});
 let pendingChat: { id: string; body: string } | undefined;
 watch(
   () => session.user,
@@ -120,11 +147,7 @@ const owner = computed(
     (state.value.controller_user_id === session.user?.id ||
       session.user?.admin),
 );
-const library = computed(() =>
-  media.value.filter((m) =>
-    m.title.toLowerCase().includes(search.value.toLowerCase()),
-  ),
-);
+const library = computed(() => media.value);
 const currentTitle = computed(
   () =>
     media.value.find((m) => m.id === state.value?.media_id)?.title ??
@@ -145,9 +168,11 @@ async function run(action: () => Promise<void>) {
   }
 }
 async function refresh() {
-  [rooms.value, media.value] = await Promise.all([
-    session.api("/rooms"),
-    session.api("/media"),
+  await Promise.all([
+    session.api("/rooms").then((rows) => {
+      rooms.value = rows;
+    }),
+    loadLibrary(),
   ]);
   if (session.user?.admin)
     [sources.value, agents.value] = await Promise.all([
@@ -172,6 +197,7 @@ async function createRoom() {
   await enter(rooms.value.find((x) => x.id === r.id));
 }
 async function enter(r: any) {
+  if (!r?.id) return;
   const serial = ++roomSerial;
   ++connectionSerial;
   clearTimeout(retry);
@@ -193,6 +219,15 @@ async function enter(r: any) {
   connect();
   const items = await session.api(`/rooms/${r.id}/playlist`);
   if (serial === roomSerial) playlist.value = items;
+}
+async function selectRoom(event: Event) {
+  const select = event.target as HTMLSelectElement;
+  const selected = rooms.value.find((r) => r.id === select.value);
+  if (!selected) {
+    select.value = room.value?.id ?? "";
+    return;
+  }
+  await enter(selected);
 }
 async function catchUpChat(id: string, serial: number) {
   const before = [...messages.value];
@@ -359,6 +394,7 @@ function send(type: string, payload?: unknown) {
   );
 }
 async function stopPlayback() {
+  recoveringHls = false;
   const old = plan;
   plan = undefined;
   if (video.value) {
@@ -426,6 +462,44 @@ async function loadMedia() {
     applySubtitles();
     const el = video.value;
     waiting.value = true;
+    let recoveries = 0;
+    const mse =
+      p.transport === "hls" &&
+      !el.canPlayType("application/vnd.apple.mpegurl") &&
+      Hls.isSupported();
+    const playbackPosition = () =>
+      Math.max(
+        0,
+        (target(state.value!, clock.now()) - p.timeline_origin_ms) / 1000,
+      );
+    const recover = () => {
+      if (
+        serial !== loadSerial ||
+        plan !== p ||
+        !state.value ||
+        recoveries >= 3
+      )
+        return false;
+      recoveries++;
+      recoveringHls = true;
+      waiting.value = true;
+      const position = playbackPosition();
+      if (mse && hls) {
+        hls.stopLoad();
+        hls.config.startPosition = position;
+        hls.loadSource(p.playback_url);
+        hls.startLoad(position);
+      } else {
+        // Native media errors do not expose the failing HTTP status. Retry the
+        // unfenced entry with a bounded cache-busting URL and room-time fragment.
+        const url = new URL(p.playback_url, location.href);
+        url.searchParams.set("recovery", String(recoveries));
+        url.hash = `t=${position}`;
+        el.src = url.href;
+        el.load();
+      }
+      return true;
+    };
     el.onerror = () => {
       // load() during teardown and queued events from a previous resource are
       // not failures of this plan. A real media error belongs to the active URL.
@@ -438,34 +512,27 @@ async function loadMedia() {
         el.error.code === 1
       )
         return;
+      if (p.transport === "hls" && !mse && recover()) return;
+      recoveringHls = false;
       error.value =
         el.error.code === 2
           ? "媒体加载中断，请检查连接后重新加载"
           : "无法播放此格式，可切换兼容转码后重载";
       waiting.value = false;
     };
-    if (
-      p.transport === "hls" &&
-      !el.canPlayType("application/vnd.apple.mpegurl") &&
-      Hls.isSupported()
-    ) {
+    if (mse) {
       hls = new Hls({
+        startPosition: playbackPosition(),
         maxBufferLength: 20,
         maxMaxBufferLength: 60,
         backBufferLength: 30,
       });
       hls.loadSource(p.playback_url);
       hls.attachMedia(el);
-      let recoveries = 0;
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (serial === loadSerial && data.fatal) {
-          if (data.response?.code === 409 && recoveries++ < 3) {
-            // The entry URL resolves the new worker attempt without creating a session.
-            hls?.stopLoad();
-            hls?.loadSource(p.playback_url);
-            hls?.startLoad(-1);
-            return;
-          }
+          if (data.response?.code === 409 && recover()) return;
+          recoveringHls = false;
           error.value = "媒体加载失败：" + data.details;
           waiting.value = false;
         }
@@ -502,6 +569,19 @@ async function applyState(force = false) {
   }
   const relative = (target(s, clock.now()) - plan.timeline_origin_ms) / 1000;
   const expected = Math.max(0, relative);
+  if (recoveringHls) {
+    // A replacement EVENT playlist may still be growing toward the room time.
+    // Waiting here must not create another playback session or jump to its edge.
+    const seekable = Array.from(
+      { length: el.seekable.length },
+      (_, i) => i,
+    ).some(
+      (i) => expected >= el.seekable.start(i) && expected <= el.seekable.end(i),
+    );
+    if (!seekable && (!Number.isFinite(el.duration) || expected > el.duration))
+      return;
+    recoveringHls = false;
+  }
   if (
     force &&
     plan.rebuild_on_seek &&
@@ -534,6 +614,10 @@ function tick() {
   const s = state.value,
     el = video.value;
   if (!s || !el || !plan) return;
+  if (recoveringHls) {
+    void run(() => applyState(true));
+    return;
+  }
   if (!dragging.value)
     position.value = el.currentTime + plan.timeline_origin_ms / 1000;
   if (!clock.ready || !connected.value || s.playback_status !== "playing")
@@ -775,15 +859,8 @@ onBeforeUnmount(() => {
         <section class="room-picker card">
           <select
             aria-label="选择房间"
-            @change="
-              run(() =>
-                enter(
-                  rooms.find(
-                    (r) => r.id === ($event.target as HTMLSelectElement).value,
-                  ),
-                ),
-              )
-            "
+            :value="room?.id ?? ''"
+            @change="run(() => selectRoom($event))"
           >
             <option value="">选择放映室</option>
             <option v-for="r in rooms" :key="r.id" :value="r.id">
@@ -1012,6 +1089,21 @@ onBeforeUnmount(() => {
                 </button>
               </div>
             </article>
+          </div>
+          <div class="section-title">
+            <button
+              :disabled="mediaLoading || mediaPage === 0"
+              @click="run(() => loadLibrary(mediaPage - 1))"
+            >
+              上一页
+            </button>
+            <span>第 {{ mediaPage + 1 }} 页 · 本页 {{ media.length }} 部</span>
+            <button
+              :disabled="mediaLoading || media.length < 100"
+              @click="run(() => loadLibrary(mediaPage + 1))"
+            >
+              下一页
+            </button>
           </div>
         </section>
         <section v-if="room && playlist.length" class="card queue">

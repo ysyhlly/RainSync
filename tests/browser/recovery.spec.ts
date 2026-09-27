@@ -1,9 +1,46 @@
 import { readFileSync } from "node:fs";
 import { test, expect, type Page, type WebSocketRoute } from "@playwright/test";
 
+test("library navigation requests bounded pages and searches beyond the current page", async ({
+  page,
+}) => {
+  await setup(page, { validMedia: true });
+  const queries: URLSearchParams[] = [];
+  await page.route("**/api/v1/media?*", (r) => {
+    const q = new URL(r.request().url()).searchParams;
+    queries.push(q);
+    const start = q.get("after") ? 100 : 0;
+    const count = q.get("search") === "needle" ? 1 : start ? 50 : 100;
+    return r.fulfill({
+      json: Array.from({ length: count }, (_, n) => ({
+        id: `item-${start + n}`,
+        title: q.get("search") === "needle" ? "needle" : `entry-${start + n}`,
+        kind: "http",
+      })),
+    });
+  });
+  await page.getByLabel("搜索影片").fill("entry");
+  await expect(page.locator(".media-card")).toHaveCount(100);
+  await page.getByRole("button", { name: "下一页", exact: true }).click();
+  await expect(page.locator(".media-card")).toHaveCount(50);
+  expect(queries.at(-1)!.get("after")).toBe("item-99");
+  await page.getByRole("button", { name: "上一页", exact: true }).click();
+  await expect(page.locator(".media-card")).toHaveCount(100);
+  await page.getByLabel("搜索影片").fill("needle");
+  await expect(page.locator(".media-card")).toHaveCount(1);
+  expect(queries.at(-1)!.get("search")).toBe("needle");
+  expect(queries.at(-1)!.has("after")).toBe(false);
+  expect(queries.every((q) => q.get("limit") === "100")).toBe(true);
+});
+
 async function setup(
   page: Page,
-  opts: { holdClock?: boolean; holdRoom?: boolean; validMedia?: boolean } = {},
+  opts: {
+    holdClock?: boolean;
+    holdRoom?: boolean;
+    validMedia?: boolean;
+    nativeHls?: boolean;
+  } = {},
 ) {
   await page.clock.install();
   await page.addInitScript(() => {
@@ -78,12 +115,12 @@ async function setup(
           media_id: "movie",
           media_generation: 1,
           delivery_mode: "direct",
-          transport: "progressive",
+          transport: opts.nativeHls ? "hls" : "progressive",
           playback_url: `/empty-video?n=${preparations.length}`,
           timeline_origin_ms: 0,
           duration_ms: 3600000,
           expires_in_seconds: 1800,
-          rebuild_on_seek: false,
+          rebuild_on_seek: !!opts.nativeHls,
           audio_tracks: [],
           subtitle_tracks: [],
         },
@@ -297,8 +334,8 @@ test("stale HLS attempt refetches entry manifest without a new playback session"
       body: `
     export default class Hls {
       static Events={ERROR:'error'}; static isSupported(){return true}
-      constructor(){window.hlsTest=this;window.hlsSources=[]}
-      loadSource(url){window.hlsSources.push(url)} attachMedia(){} stopLoad(){} startLoad(){} destroy(){}
+      constructor(config){this.config=config;window.hlsTest=this;window.hlsSources=[];window.hlsStarts=[]}
+      loadSource(url){window.hlsSources.push(url)} attachMedia(){} stopLoad(){} startLoad(position){window.hlsStarts.push(position)} destroy(){}
       on(name,callback){this.error=callback}
     }`,
     }),
@@ -346,6 +383,9 @@ test("stale HLS attempt refetches entry manifest without a new playback session"
     Array(2).fill("/media-delivery/hls/index.m3u8?token=test"),
   );
   await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(
+    await page.evaluate(() => (window as any).hlsStarts[0]),
+  ).toBeGreaterThan(1700);
   for (let i = 0; i < 3; i++)
     await page.evaluate(() =>
       (window as any).hlsTest.error("error", {
@@ -357,6 +397,53 @@ test("stale HLS attempt refetches entry manifest without a new playback session"
   expect(await page.evaluate(() => (window as any).hlsSources.length)).toBe(4);
   await expect(page.getByRole("alert")).toContainText("媒体加载失败");
   expect(h.preparations).toHaveLength(1);
+});
+
+test("empty room option preserves the current viewing connection", async ({
+  page,
+}) => {
+  const h = await setup(page, { validMedia: true });
+  await expect.poll(() => h.preparations.length).toBe(1);
+  await page.getByLabel("选择房间").selectOption("");
+  await expect(page.getByLabel("选择房间")).toHaveValue("a");
+  await page.clock.fastForward(1000);
+  expect(h.sockets).toHaveLength(1);
+  expect(h.preparations).toHaveLength(1);
+  await expect(page.locator("video")).toHaveAttribute("src", /empty-video/);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("native HLS recovery keeps room time and waits for a growing replacement playlist", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    HTMLMediaElement.prototype.canPlayType = () => "probably";
+  });
+  const h = await setup(page, { validMedia: true, nativeHls: true });
+  await expect.poll(() => h.preparations.length).toBe(1);
+  await page.evaluate(() => {
+    const el = document.querySelector("video")!;
+    el.load = () => {};
+    Object.defineProperty(el, "duration", {
+      configurable: true,
+      get: () => 10,
+    });
+    Object.defineProperty(el, "error", {
+      configurable: true,
+      get: () => ({ code: 2 }),
+    });
+    el.dispatchEvent(new Event("error"));
+  });
+  await expect(page.locator("video")).toHaveAttribute(
+    "src",
+    /recovery=1#t=18\d\d/,
+  );
+  await page.evaluate(() =>
+    document.querySelector("video")!.dispatchEvent(new Event("loadedmetadata")),
+  );
+  await page.clock.fastForward(2000);
+  expect(h.preparations).toHaveLength(1);
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("teardown media errors are silent while an active unsupported resource is reported", async ({

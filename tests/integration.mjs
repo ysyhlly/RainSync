@@ -1,4 +1,5 @@
 import { reviewRegressions } from "./review-regressions.mjs";
+import { libraryScans } from "./library-scans.mjs";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir, writeFile, readFile } from "node:fs/promises";
@@ -342,6 +343,7 @@ try {
   await admin.request(`/sources/${source.id}/test`, "POST");
   const media = await admin.request("/media");
   assert.equal(media.length, 1);
+  await libraryScans({ admin, sql });
   const inv = await admin.request(`/rooms/${room.id}/invites`, "POST");
   await friend.request(`/rooms/${room.id}/join`, "POST", { token: inv.token });
   const lock = spawn(
@@ -629,7 +631,7 @@ try {
   let agentMedia;
   for (let i = 0; i < 40; i++) {
     agentMedia = (await admin.request("/media")).find(
-      (m) => m.kind === "agent",
+      (m) => m.kind === "agent" && m.title === "fixture",
     );
     if (agentMedia) break;
     await delay(250);

@@ -117,6 +117,7 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
             }
             let mut result = vec![];
             let mut start = 0;
+            let mut expected_total = None;
             loop {
                 let url = format!("{}/Users/{}/Items", base(config)?, config.user_id);
                 let mut req = client().get(url).query(&[
@@ -134,6 +135,14 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
                     req.header("X-Emby-Token", &config.token)
                 };
                 let value: Value = req.send().await?.error_for_status()?.json().await?;
+                let total = value["TotalRecordCount"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("invalid_library_total"))?;
+                anyhow::ensure!(
+                    expected_total.is_none_or(|n| n == total),
+                    "library_changed_during_scan"
+                );
+                expected_total = Some(total);
                 let rows = value["Items"]
                     .as_array()
                     .ok_or_else(|| anyhow::anyhow!("invalid_library_response"))?;
@@ -149,11 +158,11 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
                     });
                 }
                 start += rows.len();
-                if rows.is_empty()
-                    || start >= value["TotalRecordCount"].as_u64().unwrap_or(start as u64) as usize
-                {
+                anyhow::ensure!(start as u64 <= total, "invalid_library_total");
+                if start as u64 == total {
                     break;
                 };
+                anyhow::ensure!(!rows.is_empty(), "incomplete_library_response");
             }
             Ok(result)
         }

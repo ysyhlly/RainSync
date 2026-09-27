@@ -65,16 +65,15 @@ pub async fn scan(
     let config: SourceConfig =
         serde_json::from_value(app.decrypt(&row.get::<String, _>("config_encrypted"))?)
             .map_err(anyhow::Error::from)?;
+    let generation = Uuid::new_v4();
+    sqlx::query("INSERT INTO source_scans(source_id,generation) VALUES($1,$2) ON CONFLICT(source_id) DO UPDATE SET generation=EXCLUDED.generation")
+        .bind(id).bind(generation).execute(&app.db).await?;
     let items = providers::list_items(&row.get::<String, _>("kind"), &config)
         .await
         .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_scan_failed"))?;
     let count = items.len();
     let resources: Vec<String> = items.iter().map(|i| i.resource.clone()).collect();
-    let mut tx = app.db.begin().await?;
-    sqlx::query("SELECT id FROM sources WHERE id=$1 FOR UPDATE")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
+    let mut batch = Vec::with_capacity(32);
     for mut item in items {
         if row.get::<String, _>("kind") == "local"
             && let Ok(path) =
@@ -98,8 +97,14 @@ pub async fn scan(
             }
             item.metadata["sidecars"] = Value::Object(sidecars);
         }
-        sqlx::query("INSERT INTO media_items(id,source_id,title,resource,duration_ms,metadata) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,duration_ms=EXCLUDED.duration_ms,metadata=EXCLUDED.metadata,available=true").bind(Uuid::new_v4()).bind(id).bind(item.title).bind(item.resource).bind(item.duration_ms).bind(item.metadata).execute(&mut *tx).await?;
+        batch.push(item);
+        if batch.len() == 32 {
+            save_scan_batch(&app, id, generation, &mut batch).await?;
+        }
     }
+    save_scan_batch(&app, id, generation, &mut batch).await?;
+    let mut tx = app.db.begin().await?;
+    guard_scan(&mut tx, id, generation).await?;
     sqlx::query(
         "UPDATE media_items SET available=false WHERE source_id=$1 AND NOT(resource=ANY($2))",
     )
@@ -110,9 +115,50 @@ pub async fn scan(
     tx.commit().await?;
     Ok(Json(json!({"count":count})))
 }
-pub async fn library(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
+async fn guard_scan(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+    generation: Uuid,
+) -> Result<()> {
+    let current: Uuid =
+        sqlx::query_scalar("SELECT generation FROM source_scans WHERE source_id=$1 FOR UPDATE")
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if current != generation {
+        return Err(err(StatusCode::CONFLICT, "source_scan_failed"));
+    }
+    Ok(())
+}
+async fn save_scan_batch(
+    app: &App,
+    id: Uuid,
+    generation: Uuid,
+    batch: &mut Vec<providers::Item>,
+) -> Result<()> {
+    let mut tx = app.db.begin().await?;
+    guard_scan(&mut tx, id, generation).await?;
+    for item in batch.drain(..) {
+        sqlx::query("INSERT INTO media_items(id,source_id,title,resource,duration_ms,metadata) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,duration_ms=EXCLUDED.duration_ms,metadata=EXCLUDED.metadata,available=true").bind(Uuid::new_v4()).bind(id).bind(item.title).bind(item.resource).bind(item.duration_ms).bind(item.metadata).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+#[derive(Deserialize)]
+pub struct LibraryQuery {
+    after: Option<Uuid>,
+    limit: Option<i64>,
+    #[serde(default)]
+    search: String,
+}
+pub async fn library(
+    State(app): State<App>,
+    h: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<LibraryQuery>,
+) -> Result<Json<Value>> {
     auth(&app, &h, false).await?;
-    let rows=sqlx::query("SELECT m.id,m.title,m.duration_ms,s.kind FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.available ORDER BY m.title").fetch_all(&app.db).await?;
+    let rows=sqlx::query("SELECT m.id,m.title,m.duration_ms,s.kind FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.available AND ($1::uuid IS NULL OR m.id>$1) AND strpos(lower(m.title),lower($2))>0 ORDER BY m.id LIMIT $3")
+        .bind(query.after).bind(query.search).bind(query.limit.unwrap_or(100).clamp(1,200)).fetch_all(&app.db).await?;
     Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"title":r.get::<String,_>("title"),"duration_ms":r.get::<Option<f64>,_>("duration_ms"),"kind":r.get::<String,_>("kind")})).collect())))
 }
 pub async fn playback(
