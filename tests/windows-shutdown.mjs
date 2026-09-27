@@ -128,6 +128,7 @@ try {
     for (const [event, label] of [
       [0, "ctrl-c"],
       [1, "ctrl-break"],
+      ["close", "console-close"],
     ]) {
       const state = join(root, `${program}-${label}`),
         selectedPort = await port();
@@ -277,6 +278,11 @@ try {
       await until(() => witness.done, "descendants exited", 5000);
       assert.equal(witness.code, 0, witness.stderr);
       assert.ok(witness.events.some((e) => e.exited));
+      if (event === "close")
+        assert.ok(
+          Date.now() - started < 5000,
+          "console close must not spend the normal 10-second HTTP grace",
+        );
       report.cases.push({
         program,
         event: label,

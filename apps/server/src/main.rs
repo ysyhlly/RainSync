@@ -445,9 +445,10 @@ async fn main() -> anyhow::Result<()> {
             let _ = stop.send(());
             // A stalled request or long-lived connection cannot delay process
             // shutdown indefinitely. Keep the instance lock throughout draining.
-            let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut server)
+            let grace = signal.as_ref().map_or(std::time::Duration::ZERO, |reason| reason.http_grace());
+            let result = tokio::time::timeout(grace, &mut server)
                 .await.unwrap_or(Ok(()));
-            signal.and(result)
+            signal.map(|_| ()).and(result)
         },
     };
     // Also drain after listener failure: cancelling a request does not itself

@@ -779,16 +779,19 @@ async fn main() -> anyhow::Result<()> {
         .into_future();
     tokio::pin!(server);
     let (result, signal_result) = tokio::select! {
-        result = &mut server => (Some(result), Ok(())),
+        result = &mut server => (Some(result), Ok(media_core::process_signal::Reason::Normal)),
         signal = media_core::process_signal::wait() => (None, signal),
     };
     let _ = stop.send(true);
+    let grace = signal_result
+        .as_ref()
+        .map_or(std::time::Duration::ZERO, |reason| reason.http_grace());
     // Keep the runtime alive until the queue has reaped its child. HTTP
     // consumers get a bounded drain; they cannot hold process exit forever.
     let (queue_result, server_result) = tokio::join!(queue, async {
         match result {
             Some(result) => result,
-            None => tokio::time::timeout(std::time::Duration::from_secs(10), &mut server)
+            None => tokio::time::timeout(grace, &mut server)
                 .await
                 .unwrap_or(Ok(())),
         }

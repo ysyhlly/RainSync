@@ -1,5 +1,19 @@
 # 本轮验证记录
 
+## 2026-09-27：Windows 关闭控制台的退出期限
+
+Windows 首个退出事件为 CTRL_CLOSE_EVENT 时，Server/Worker 跳过普通十秒 HTTP 等待；Ctrl+C/Break 和 Unix 信号保留原来的等待。注册失败也跳过等待后进入清理。Windows 工作区 44 项测试、Clippy 全目标且 warnings 视为错误、二进制/示例构建、格式与生成契约检查通过，另有 2 个按设计 ignored 的子进程夹具入口。
+
+`node tests/windows-shutdown.mjs` 在独立隐藏控制台验证 Server/Worker 各自的 Ctrl+C、Ctrl+Break、关闭控制台，共六个真实服务场景。关闭场景对测试控制台发送 WM_CLOSE，发送辅助进程先脱离该控制台；没有关闭用户窗口。Server/Worker 分别在 235/233ms 正常退出，发送前持有的探测及后代进程句柄均确认退出，低于默认五秒系统期限。普通 Ctrl+C/Break 仍约十秒。报告 `.runtime/windows-shutdown/1c97c77b-8202-4a11-a403-742fec4ac06a/report.json`；Server SHA-256 `60d555a4dcc9255cffda2a8bda44fcb3449ad2e83a9fa992b047acb9d53804b5`，Worker `b49345c466e412a358243a40f08fc49517a78fc3e9eab963b45c7fa55ec92829`。
+
+Linux Server SIGTERM/SIGINT 回归通过，约 11.162/11.039 秒正常退出，探测后代、观看连接及实例锁检查通过，报告 `.runtime/server-shutdown/rainsync-shutdown-76cad28f/report.json`。同锁定依赖离线构建的运行时镜像为 `sha256:82985eaf2f309542fd55463dd68543afefb940f804f963782312f6fc46cedb4b`。
+
+同一镜像的完整 Worker 故障矩阵通过，报告 `.runtime/worker-processes/rainsync-process-c4297162/report.json`：真实编码/解码及探测字幕进程回收、缓存权限、ENOSPC、读租约、预算、逐段与最终 HTTP 解码、数据库中断和旧代次恢复均通过。并发探测/字幕退出为 11.237 秒；旧 Worker 恢复后旧 FFmpeg 回收、旧目录清除，attempt 2 保持运行且 init 摘要不变。
+
+完整隔离集成通过，含 NAS 万条分页索引、播放幂等恢复、权限与备份恢复；100 控制连接快照 306ms 仅为本机冒烟。cgraphy 差异审查长时间未返回，改用 Git diff 审查。
+
+系统关闭期限可以配置；本轮不证明数据库/磁盘阻塞时也能在该期限完成，不覆盖普通排空期间再关闭控制台、注销/关机、强杀或 Server 实例锁失联退出。没有前端变化，未重复浏览器测试；未部署。
+
 ## 2026-09-27：Windows 原生 Ctrl+C / Ctrl+Break
 
 Server/Worker 的普通退出监听合并到 media-core，Windows 新增 Ctrl+Break，Unix 保持 SIGTERM/SIGINT；注册错误返回前仍执行清理。Windows 工作区 44 项测试、Clippy 全目标且 warnings 视为错误、二进制/示例构建、格式与生成契约检查通过，2 个 ignored 子进程夹具入口保持原用途。

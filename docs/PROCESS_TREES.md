@@ -6,7 +6,7 @@
 
 Worker 在编码队列和有界 HTTP 等待结束后调用共享进程登记表的 `shutdown()`，关闭启动入口并终止所有仍登记的进程树。启动与登记、关闭入口使用同一锁，避免关闭检查和新进程登记之间漏记；外部 Child 已 Drop 的所有者也仍保留登记。正常回收完成后移除登记；所有者异常结束或回收错误会被登记为失败，不能报告成功排空。关闭等待者被取消不恢复启动入口。Worker 即使遇到队列/清理错误也先完成这一步，随后才结束 Tokio runtime。
 
-Server 与 Worker 共用 `media_core::process_signal::wait`，普通退出处理 Unix SIGTERM/SIGINT、Windows Ctrl+C/Ctrl+Break；信号注册失败也先走已有清理流程，再返回错误。Server 收到信号后停止接受新连接，最多等待 HTTP 十秒，再关闭媒体进程入口并等待 ffprobe 所有者回收；监听服务报错也会进入回收路径。已有实例锁连接在这段时间仍由监督任务持有，直到进程退出，避免排空期间提前让另一实例接手。房间 WebSocket 最迟随 runtime 结束关闭；此处没有承诺给每个升级连接发送关闭帧。
+Server 与 Worker 共用 `media_core::process_signal::wait`，普通退出处理 Unix SIGTERM/SIGINT、Windows Ctrl+C/Ctrl+Break 和关闭控制台；信号注册失败也先走已有清理流程，再返回错误。普通信号下 Server 停止接受新连接，最多等待 HTTP 十秒，再关闭媒体进程入口并等待 ffprobe 所有者回收；监听服务报错也会进入回收路径。已有实例锁连接在这段时间仍由监督任务持有，直到进程退出，避免排空期间提前让另一实例接手。房间 WebSocket 最迟随 runtime 结束关闭；此处没有承诺给每个升级连接发送关闭帧。
 
 Linux 启动独立进程组，并设置 subreaper 收养退出主进程留下的后代。使用 `waitid(WNOWAIT)` 观察主进程退出，保留其尚未回收的 PID，先向该组发送 SIGKILL，再 wait 主进程和本组被收养的后代；不在主进程回收后再次用旧 PGID 发终止信号。已完成的数字 PID 可能复用，因此这种顺序用于避免误杀无关组。语义依据：[wait/waitid](https://man7.org/linux/man-pages/man2/wait.2.html)。
 
@@ -24,6 +24,8 @@ Windows 实现使用 windows Rust 绑定直接调用 API；曾评估的 process-
 
 Server 验证入口 `tests/server-shutdown.mjs` 在独立数据库与容器中分别发送 SIGTERM/SIGINT；每次都持有已加入房间的 WebSocket，并卡住一次本地扫描探测。检查探测后代退出、观看连接关闭、排空期间实例锁不可取得、Server 退出后实例锁可取得，容器始终保留到检查完成。
 
-Windows 原生入口：先 `cargo build --workspace --bins --examples --locked`，再运行 `node tests/windows-shutdown.mjs`（需要 Python 3 与 Docker PostgreSQL）。`windows-console.py` 为每个真实服务创建独立的隐藏控制台，辅助进程只附着到该测试控制台，再发送 Ctrl+C 或 Ctrl+Break；不向用户的控制台广播。事件作用范围依据 [GenerateConsoleCtrlEvent](https://learn.microsoft.com/en-us/windows/console/generateconsolectrlevent)，监听接口依据 [Tokio Windows signals](https://docs.rs/tokio/latest/tokio/signal/windows/index.html)。测试以 `probe_tree_fixture` 替换 ffprobe，保留卡住的探测及后代，发送事件前持有它们的 Windows 进程句柄，随后确认服务正常退出且全部句柄已变为退出状态；不使用 PID 消失或进程名匹配作为唯一证据。测试启动配置只继承必要系统环境变量，创建进程后删除临时启动配置；报告保存服务二进制摘要。
+Windows 原生入口：先 `cargo build --workspace --bins --examples --locked`，再运行 `node tests/windows-shutdown.mjs`（需要 Python 3 与 Docker PostgreSQL）。`windows-console.py` 为每个真实服务创建独立的隐藏控制台，辅助进程只附着到该测试控制台，再发送 Ctrl+C、Ctrl+Break，或对该隐藏控制台发送 WM_CLOSE；不向用户的控制台广播。事件作用范围依据 [GenerateConsoleCtrlEvent](https://learn.microsoft.com/en-us/windows/console/generateconsolectrlevent)，监听接口依据 [Tokio Windows signals](https://docs.rs/tokio/latest/tokio/signal/windows/index.html)。测试以 `probe_tree_fixture` 替换 ffprobe，保留卡住的探测及后代，发送事件前持有它们的 Windows 进程句柄，随后确认服务正常退出且全部句柄已变为退出状态；不使用 PID 消失或进程名匹配作为唯一证据。测试启动配置只继承必要系统环境变量，创建进程后删除临时启动配置；报告保存服务二进制摘要。
 
-这些机制覆盖留在媒体进程组/Job 中的后代，不是任意第三方插件的隔离沙箱；Unix 主动 setsid 逃离组、强杀进程本体、内核不可中断 I/O、Windows 关闭控制台、注销/关机事件仍需单独验收。Server 实例锁连接出错时原有立即 `process::exit(1)` 路径仍保持失败即停止，尚未接入安全的全请求取消与子进程排空；不能把普通信号测试算作这条故障路径的证据。不能用当前测试宣称所有 Windows 系统退出信号或任意运行时终止路径已覆盖。
+Windows 首个退出事件为关闭控制台时，Server/Worker 跳过普通的十秒 HTTP 等待，立即进入既有清理路径。系统允许的处理时间默认五秒且可配置，依据 [HandlerRoutine](https://learn.microsoft.com/en-us/windows/console/handlerroutine)。锁定版本的 Tokio 在接收关闭事件后保留 OS 回调线程，给异步清理留出时间。测试要求服务正常退出且探测后代句柄已退出，实际用时低于五秒；这不保证磁盘/数据库阻塞时也能赶上系统截止，也不覆盖已经开始普通排空后再次关闭控制台。
+
+这些机制覆盖留在媒体进程组/Job 中的后代，不是任意第三方插件的隔离沙箱；Unix 主动 setsid 逃离组、强杀进程本体、内核不可中断 I/O、Windows 注销/关机事件仍需单独验收。Server 实例锁连接出错时原有立即 `process::exit(1)` 路径仍保持失败即停止，尚未接入安全的全请求取消与子进程排空；不能把普通信号测试算作这条故障路径的证据。不能用当前测试宣称所有 Windows 系统退出信号或任意运行时终止路径已覆盖。

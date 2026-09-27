@@ -40,6 +40,19 @@ elif mode == "signal":
     kernel.FreeConsole()
     if not kernel.AttachConsole(int(sys.argv[2])):
         raise ctypes.WinError(ctypes.get_last_error())
+    if sys.argv[3] == "close":
+        kernel.GetConsoleWindow.restype = wintypes.HWND
+        window = kernel.GetConsoleWindow()
+        if not window:
+            raise RuntimeError("isolated console has no window handle")
+        # Detach first: only the test service should receive CTRL_CLOSE_EVENT.
+        kernel.FreeConsole()
+        user = ctypes.WinDLL("user32", use_last_error=True)
+        user.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        if not user.PostMessageW(window, 0x0010, 0, 0):  # WM_CLOSE
+            raise ctypes.WinError(ctypes.get_last_error())
+        emit({"delivered": True})
+        raise SystemExit(0)
     # This helper temporarily shares only the isolated test console. Protect it
     # from the broadcast; descendants launched with CREATE_NO_WINDOW do not
     # receive the console event and therefore require the service's tree cleanup.
