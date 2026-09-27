@@ -15,4 +15,13 @@ node tests/agent-lifecycle.mjs
 
 该脚本运行真实 Linux Agent 与独立稀疏文件卷，使用受控控制端和数据消费者制造背压。检查 16 路文件描述符、第 17 路拒绝、Close/TCP 关闭混合取消、五秒内名额复用、控制断开后的文件/数据连接退出、重连 Range/HEAD、握手期限以及文件缩短。报告记录镜像与几个负载阶段的 RSS；它不是两小时内存趋势或总内存上限证明。
 
-范围仍有缺口：此测试不是生产 Server/Worker 的完整撤销链路，也不覆盖 Windows 原生文件句柄期限、设备进入内核不可中断 I/O、所有阻塞文件系统及两小时连续观影。Tokio 文件操作底层使用 blocking I/O，丢弃异步 future 不代表能强制中断任意内核文件操作。持久化传输状态机、版本绑定与其余 W07 验收继续；HTTP 请求登记清理见 [Worker 传输说明](WORKER_ATTEMPTS.md)。
+端到端传输验证入口：
+
+```powershell
+$env:WORKER_TEST_IMAGE='rainsync-worker-validation:local'
+node tests/input-retries.mjs --agent-relay
+```
+
+该入口启动真实 Server、Worker、Agent 与隔离 PostgreSQL，使用有授权的播放会话夹具读取独立稀疏文件。八路 HTTP 消费者制造背压，检查 HTTP 取消经 Worker 到 Agent 的文件关闭、Agent 重启后旧响应截断与新 Range 成功，以及管理员 DELETE 撤销经 Server 控制连接关闭到 Agent 文件释放、Worker 旧 HTTP 流中断和新请求拒绝。会话夹具直接入库，故不将它称为登录/配对/播放准备到浏览器解码的完整观影验收。
+
+范围仍有缺口：以上不覆盖 Windows 原生文件句柄期限、设备进入内核不可中断 I/O、所有阻塞文件系统及两小时连续观影。Tokio 文件操作底层使用 blocking I/O，丢弃异步 future 不代表能强制中断任意内核文件操作。持久化传输状态机、版本绑定与其余 W07 验收继续；HTTP 请求登记清理见 [Worker 传输说明](WORKER_ATTEMPTS.md)。

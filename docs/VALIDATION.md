@@ -1,5 +1,15 @@
 # 本轮验证记录
 
+## 2026-09-27：真实 Server/Worker/Agent 的取消、重启与撤销
+
+`node tests/input-retries.mjs --agent-relay` 使用已验收镜像 `sha256:b52075257273d06e8ced320c8e13bdc36b0c40f03fe7e85bd4deac68315b1bcf`，隔离 PostgreSQL、Server、Worker 和真实 Agent。八路 HTTP GET 暂停读取，真实控制连接分发一次性票据、真实数据连接转发稀疏文件；本轮没有修改 Rust、数据库或前端代码。
+
+报告 `.runtime/input-retries/rainsync-input-35b82b50/report.json`：取消四路 HTTP 后 179ms 内 Agent 文件句柄从八降到四；补回八路后重启 Agent，旧 HTTP 响应全部不完整中止，新 Range 请求收到正确的 90 字节，重启至恢复约 4456ms。再次启动八路后，通过登录且带 CSRF 的管理员 DELETE API 撤销设备，429ms 内 Agent 文件句柄归零，八个旧 HTTP 响应中断而非正常完成，新读取返回 503；没有遗留 agent_transfers 票据。
+
+共享夹具支持 DELETE 并新增真实 Agent 模式后，HTTP 七类故障回归全部通过，报告 `.runtime/input-retries/rainsync-input-03617d3a/report.json`；脚本格式与差异检查通过。默认镜像统一到已验收的 `rainsync-worker-validation:local`，仍可用 `WORKER_TEST_IMAGE` 指定。cgraphy 差异审查未及时返回，终止后使用 Git diff 复核；未重复无改动的 Rust/前端测试。
+
+测试为传输路径直接建立已授权播放会话，未覆盖实际影片解码、网页同步、完整配对/播放准备或两小时连续观影。它补上了此前受控控制端测试缺少的真实撤销传播证据，不替代其余 W07 门槛。未部署。
+
 ## 2026-09-27：真实 Agent 的并发、取消和控制断开
 
 新增 `node tests/agent-lifecycle.mjs`，真实 Linux Agent 使用独立 1GiB 稀疏文件卷，受控控制连接与数据消费者制造网络背压。上一版镜像 `sha256:5e2e2d099175386f1f9440603e6a9569203a4460bb4ddab2e75b671673861355` 在“control disconnect releases all files”的五秒期限失败，确认控制连接结束后数据任务仍持有源文件。

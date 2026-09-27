@@ -11,15 +11,16 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import WebSocket from "ws";
 import { relayCancellation } from "./relay-cancellation.mjs";
+import { agentRelay } from "./agent-relay.mjs";
 const cancellation = process.argv.includes("--relay-cancel");
-const nas = process.argv.includes("--nas") || cancellation;
+const realAgent = process.argv.includes("--agent-relay");
+const nas = process.argv.includes("--nas") || cancellation || realAgent;
 assert.ok(
   process.argv
     .slice(2)
-    .every((arg) => ["--nas", "--relay-cancel"].includes(arg)),
+    .every((arg) => ["--nas", "--relay-cancel", "--agent-relay"].includes(arg)),
 );
-const tag =
-  process.env.WORKER_TEST_IMAGE ?? "rainsync-input-retry-validation:local";
+const tag = process.env.WORKER_TEST_IMAGE ?? "rainsync-worker-validation:local";
 const docker = (...args) =>
   execFileSync("docker", args, {
     encoding: "utf8",
@@ -36,7 +37,11 @@ const root = resolve(".runtime/input-retries", name);
 const password = randomBytes(20).toString("hex"),
   key = randomBytes(32);
 const report = {
-  transport: nas ? "NAS data WebSocket fixture" : "HTTP",
+  transport: realAgent
+    ? "real Server/Worker/Agent HTTP relay"
+    : nas
+      ? "NAS data WebSocket fixture"
+      : "HTTP",
   image: docker("image", "inspect", "--format", "{{.Id}}", tag),
   cases: [],
 };
@@ -388,9 +393,9 @@ try {
   }, "Server ready");
   let cookie = "",
     csrf = "";
-  async function api(path, body) {
+  async function api(path, body, method = "POST") {
     const r = await fetch(base + "/api/v1" + path, {
-      method: "POST",
+      method,
       headers: {
         Origin: "http://input.test",
         Cookie: cookie,
@@ -434,7 +439,7 @@ try {
     "rainsync-media-worker",
   );
   const workerBase = `http://${docker("port", worker, "8081/tcp")}`;
-  if (nas && !cancellation)
+  if (nas && !cancellation && !realAgent)
     transferPoll = setInterval(() => {
       if (!active) return;
       try {
@@ -478,7 +483,24 @@ try {
         agentId,
       })),
     );
-  for (const kind of cancellation
+  if (realAgent)
+    report.cases.push(
+      ...(await agentRelay({
+        docker,
+        tag,
+        network: name,
+        server,
+        worker,
+        workerBase,
+        sql,
+        encrypt,
+        userId,
+        roomId: room.id,
+        agentId,
+        revoke: () => api(`/agents/${agentId}`, undefined, "DELETE"),
+      })),
+    );
+  for (const kind of cancellation || realAgent
     ? []
     : process.env.INPUT_CASE
       ? [process.env.INPUT_CASE]
