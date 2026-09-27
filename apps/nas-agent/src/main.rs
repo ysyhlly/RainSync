@@ -29,38 +29,89 @@ fn content_type(path: &std::path::Path) -> &'static str {
 
 async fn transfer(root: PathBuf, request: Value) -> Result<()> {
     let url = request["data_url"].as_str().context("data_url")?;
-    let (mut socket, _) = connect_async(url).await?;
-    if request["busy"].as_bool().unwrap_or(false) {
-        socket
-            .send(Message::Text(
-                json!({"status":503,"content-length":"0"})
-                    .to_string()
-                    .into(),
-            ))
-            .await?;
-        socket.close(None).await?;
-        return Ok(());
-    }
-    let result:Result<()>=async{
-        let path=media_core::safe_path(&root,request["resource"].as_str().context("resource")?)?;
-        let mut file=tokio::fs::File::open(&path).await?;let size=file.metadata().await?.len();
-        let range=match media_core::byte_range(request["range"].as_str(),size){Ok(v)=>v,Err(_)=>{socket.send(Message::Text(json!({"status":416,"content-range":format!("bytes */{size}"),"content-length":"0"}).to_string().into())).await?;return Ok(())}};
-        let(start,len)=range.map(|(a,b)|(a,b-a+1)).unwrap_or((0,size));
-        let mut meta=json!({"status":if range.is_some(){206}else{200},"content-length":len.to_string(),"content-type":content_type(&path),"accept-ranges":"bytes"});if let Some((a,b))=range{meta["content-range"]=json!(format!("bytes {a}-{b}/{size}"))}
-        socket.send(Message::Text(meta.to_string().into())).await?;
-        if !request["head"].as_bool().unwrap_or(false){file.seek(std::io::SeekFrom::Start(start)).await?;let mut file=file.take(len);let mut buf=vec![0;65536];loop{let n=file.read(&mut buf).await?;if n==0{break}socket.send(Message::Binary(buf[..n].to_vec().into())).await?;}}
+    let (socket, _) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(url)).await??;
+    let (mut writer, mut reader) = socket.split();
+    let mut headers_started = false;
+    let work = async {
+        if request["busy"].as_bool().unwrap_or(false) {
+            headers_started = true;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                writer.send(Message::Text(
+                    json!({"status":503,"content-length":"0"})
+                        .to_string()
+                        .into(),
+                )),
+            )
+            .await??;
+            return Ok(());
+        }
+        let resource = request["resource"].as_str().context("resource")?.to_owned();
+        let path =
+            tokio::task::spawn_blocking(move || media_core::safe_path(&root, &resource)).await??;
+        let mut file = tokio::fs::File::open(&path).await?;
+        let size = file.metadata().await?.len();
+        let range = match media_core::byte_range(request["range"].as_str(), size) {
+            Ok(value) => value,
+            Err(_) => {
+                headers_started = true;
+                tokio::time::timeout(std::time::Duration::from_secs(30), writer.send(Message::Text(json!({"status":416,"content-range":format!("bytes */{size}"),"content-length":"0"}).to_string().into()))).await??;
+                return Ok(());
+            }
+        };
+        let (start, len) = range.map(|(a, b)| (a, b - a + 1)).unwrap_or((0, size));
+        let mut meta = json!({"status":if range.is_some(){206}else{200},"content-length":len.to_string(),"content-type":content_type(&path),"accept-ranges":"bytes"});
+        if let Some((a, b)) = range {
+            meta["content-range"] = json!(format!("bytes {a}-{b}/{size}"));
+        }
+        // A timed-out send may already have written part of the frame.
+        headers_started = true;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            writer.send(Message::Text(meta.to_string().into())),
+        )
+        .await??;
+        if !request["head"].as_bool().unwrap_or(false) {
+            file.seek(std::io::SeekFrom::Start(start)).await?;
+            let mut remaining = len;
+            let mut buf = vec![0; 65536];
+            while remaining > 0 {
+                let wanted = remaining.min(buf.len() as u64) as usize;
+                let n = file.read(&mut buf[..wanted]).await?;
+                anyhow::ensure!(n > 0, "source_truncated");
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    writer.send(Message::Binary(buf[..n].to_vec().into())),
+                )
+                .await??;
+                remaining -= n as u64;
+            }
+        }
         Ok(())
-    }.await;
-    if result.is_err() {
-        let _ = socket
-            .send(Message::Text(
+    };
+    // Poll the peer while file I/O or a backpressured write is pending. Merely
+    // sending frames does not observe a Close promptly on every socket state.
+    let result: Result<()> = tokio::select! {
+        result = work => result,
+        _ = async {
+            while let Some(Ok(Message::Ping(_) | Message::Pong(_))) = reader.next().await {}
+        } => Ok(()),
+    };
+    if result.is_err() && !headers_started {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            writer.send(Message::Text(
                 json!({"status":404,"content-length":"0"})
                     .to_string()
                     .into(),
-            ))
-            .await;
+            )),
+        )
+        .await;
     }
-    let _ = socket.close(None).await;
+    // Once headers have been sent, failure terminates the stream; never send a
+    // second metadata response as if it were media bytes.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), writer.close()).await;
     result
 }
 type IndexPage = (Vec<Value>, bool);
@@ -144,6 +195,7 @@ async fn main() -> Result<()> {
         v["token"].as_str().context("pair token")?.to_string()
     };
     let slots = Arc::new(Semaphore::new(16));
+    let rejections = Arc::new(Semaphore::new(4));
     loop {
         let url = format!(
             "{}/api/v1/agents/ws",
@@ -155,6 +207,7 @@ async fn main() -> Result<()> {
         req.headers_mut()
             .insert("Authorization", format!("Bearer {token}").parse()?);
         if let Ok((mut socket, _)) = connect_async(req).await {
+            let mut transfers = tokio::task::JoinSet::new();
             let (pages, mut incoming) = tokio::sync::mpsc::channel(2);
             let scan_root = root.clone();
             tokio::task::spawn_blocking(move || {
@@ -175,6 +228,7 @@ async fn main() -> Result<()> {
             let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
+                    _ = transfers.join_next(), if !transfers.is_empty() => {}
                     page = incoming.recv(), if !awaiting_ack && !finished => {
                         let Some(Ok((items, final_page))) = page else { break };
                         let message = json!({"type":"INDEX","snapshot":snapshot,"sequence":sequence,"final":final_page,"items":items});
@@ -203,9 +257,17 @@ async fn main() -> Result<()> {
                             if url.set_scheme(scheme).is_err(){continue}
                             request["data_url"]=json!(url.as_str());
                         }
-                        let root=root.clone();let slots=slots.clone();tokio::spawn(async move{let Ok(_permit)=slots.try_acquire_owned()else{let mut request=request;request["busy"]=json!(true);let _=transfer(root,request).await;return};if transfer(root,request).await.is_err(){tracing::warn!("transfer ended with error")}});}}
+                        let root=root.clone();
+                        let permit = match slots.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => { let Ok(permit) = rejections.clone().try_acquire_owned() else { continue }; request["busy"] = json!(true); permit }
+                        };
+                        transfers.spawn(async move { let _permit=permit; if transfer(root,request).await.is_err(){tracing::warn!("transfer ended with error")} });}}
                 }
             }
+            // Control loss includes revoked credentials. No old transfer may
+            // outlive that authorized connection or retain its admission slot.
+            transfers.shutdown().await;
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }

@@ -1,5 +1,19 @@
 # 本轮验证记录
 
+## 2026-09-27：真实 Agent 的并发、取消和控制断开
+
+新增 `node tests/agent-lifecycle.mjs`，真实 Linux Agent 使用独立 1GiB 稀疏文件卷，受控控制连接与数据消费者制造网络背压。上一版镜像 `sha256:5e2e2d099175386f1f9440603e6a9569203a4460bb4ddab2e75b671673861355` 在“control disconnect releases all files”的五秒期限失败，确认控制连接结束后数据任务仍持有源文件。
+
+最终镜像 `sha256:b52075257273d06e8ced320c8e13bdc36b0c40f03fe7e85bd4deac68315b1bcf` 通过六组场景：16 路活动文件及第 17 路 503；混合 Close/TCP 关闭取消八路并复用名额；控制断开后所有文件和数据连接退出；重连后的 Range/HEAD/缺失文件；16 个停滞握手的十秒期限；传输中文件缩短且不发送第二份元数据。取消八路的文件句柄从 16 降到 8 用时 194ms，控制断开从 16 降到 0 用时 165ms；复用名额另断言少于五秒。
+
+报告 `.runtime/agent-lifecycle/rainsync-agent-life-ea4d9078/report.json`：基线 RSS 5188KiB，16 路背压时采样 11612KiB，控制断开后采样 8400KiB。该值不是峰值或长期上限。Range `bytes=10-99` 实际收到 90 字节；截断场景声明 1GiB，实际收到 5439488 字节后关闭，只有一份元数据。测试直接读取 Agent `/proc` 文件描述符并确认目标可执行文件，未把测试进程或容器退出当作资源释放。
+
+Agent 两项原生单元测试、Clippy 全目标且 warnings 视为错误、二进制/示例构建、格式及生成契约检查通过。夹具修正了关闭收尾与名额释放的时序假设，并在观察旧数据连接 EOF 前停止自动再次暂停，仍保留五秒回收与名额复用断言。cgraphy 差异审查未及时返回，终止后使用 Git diff 审查。
+
+最终原生二进制的完整隔离集成通过，包含真实 Agent 配对/分页索引/relay/撤销、Range/HEAD/416、权限、幂等与备份恢复；100 控制连接快照 282ms 仅为本机冒烟。前端、Worker 与数据库逻辑未改动，未重复其独立故障矩阵。
+
+受控控制端不等于真实 Server/Worker 的全链路撤销，也不证明 Windows 或不可中断文件 I/O 的回收期限。传输状态机、持续两小时和其他 W07 门槛仍未完成，详见 AGENT_TRANSFERS.md。未部署。
+
 ## 2026-09-27：NAS 等待登记与取消竞态
 
 新增 `node tests/input-retries.mjs --relay-cancel`。先在上一版镜像 `sha256:ac7801db2f42a41c352b5346acd0d3201f5cbfbb0356fba621ed6187b58e9bc0` 上复现：隔离数据库的测试触发器将 INSERT 延迟两秒，HTTP 已断开但 INSERT 完成后仍留下票据，测试在“late INSERT did not recreate a cancelled offer”断言失败。
