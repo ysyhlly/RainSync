@@ -1,5 +1,17 @@
 # 本轮验证记录
 
+## 2026-09-27：真实慢编码与原生 HLS 回退
+
+新增 `node tests/slow-playback.mjs`，隔离 PostgreSQL、Server、Worker 和浏览器，40 秒真实 H.264 样本；只给编码器输入加 `-readrate 0.5`，不替换 API、清单、分片或解码结果。Vite 使用部署的 CSP。先走 MSE 与先走原生 HLS 两个场景均完成首段播放、追上生成边界后等待、暂停房间让编码追赶、在权威位置恢复并继续解码；每场仅一个播放会话，任务保持 attempt 1/running。
+
+真实 Chromium 153.0.8010.12 原生 HLS 对增长清单报告 `DEMUXER_ERROR_COULD_NOT_PARSE`，并暴露 seekable 为空而 buffered 有内容的状态。网页新增空 seekable 时使用 buffered 的恢复判断；原生解码/格式错误且支持 hls.js 时只回退一次到 MSE，保持会话及最新房间位置，不往返重试。原生网络错误仍沿用有限入口重取。专门的受控浏览器回归验证空 seekable 不阻止播放；真实场景验证原生错误后 MSE 实际解码，不能把这一结果称为原生 HLS 成功。
+
+最终报告 `.runtime/slow-playback/rainsync-slow-e6f45a15/report.json`：生成区间增长率分别约 0.5305/0.5343 倍；暂停房间锚点 4598.055/4667.961ms，恢复播放器位置 4598.054/4667.960ms；随后分别前进至 5205.857/5290.658ms，解码帧由 4 增至 17。两个场景没有页面异常、错误横幅或额外准备请求。报告保存媒体 SHA-256、App.vue SHA-256、Chromium 版本、请求及媒体管线事件，测试同时检查运行期间 App.vue 未改变。
+
+后端镜像复用已验收的 `sha256:82985eaf2f309542fd55463dd68543afefb940f804f963782312f6fc46cedb4b`，本轮没有 Rust 或数据库改动。前端 31 项测试、38 项桌面/移动视口浏览器测试、类型检查与生产构建通过；构建保留现有大块体积提示。cgraphy 未找到 Vue 节点，差异审查也未及时返回，改用源码与 Git diff 核对。未部署。
+
+此证据覆盖暂停房间后追赶；持续以 0.5 倍生成不可能追上始终 1 倍前进的房间，不承诺这种条件下无缝同步。原生 Safari/真机、不同时间戳样本、长时间运行以及完整计划其余门槛保持未完成。
+
 ## 2026-09-27：Windows 关闭控制台的退出期限
 
 Windows 首个退出事件为 CTRL_CLOSE_EVENT 时，Server/Worker 跳过普通十秒 HTTP 等待；Ctrl+C/Break 和 Unix 信号保留原来的等待。注册失败也跳过等待后进入清理。Windows 工作区 44 项测试、Clippy 全目标且 warnings 视为错误、二进制/示例构建、格式与生成契约检查通过，另有 2 个按设计 ignored 的子进程夹具入口。

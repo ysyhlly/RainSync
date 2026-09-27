@@ -487,7 +487,7 @@ async function loadMedia() {
     const el = video.value;
     waiting.value = true;
     let recoveries = 0;
-    const mse =
+    let mse =
       p.transport === "hls" &&
       !el.canPlayType("application/vnd.apple.mpegurl") &&
       Hls.isSupported();
@@ -540,7 +540,25 @@ async function loadMedia() {
         el.error.code === 1
       )
         return;
-      if (p.transport === "hls" && !mse && recover()) return;
+      if (p.transport === "hls" && !mse) {
+        if ((el.error.code === 3 || el.error.code === 4) && Hls.isSupported()) {
+          // A native decoder/parser failure can be transport-specific. Try MSE
+          // once, with this same authorized plan and the current room position.
+          mse = true;
+          generationWait?.abort();
+          generationWait = undefined;
+          generationWaitFailed = false;
+          generatedEnd = undefined;
+          recoveringHls = true;
+          waiting.value = true;
+          el.pause();
+          el.removeAttribute("src");
+          el.load();
+          attachHls();
+          return;
+        }
+        if (recover()) return;
+      }
       recoveringHls = false;
       error.value =
         el.error.code === 2
@@ -548,7 +566,7 @@ async function loadMedia() {
           : "无法播放此格式，可切换兼容转码后重载";
       waiting.value = false;
     };
-    if (mse) {
+    const attachHls = () => {
       hls = new Hls({
         startPosition: playbackPosition(),
         maxBufferLength: 20,
@@ -565,7 +583,9 @@ async function loadMedia() {
           waiting.value = false;
         }
       });
-    } else el.src = p.playback_url;
+    };
+    if (mse) attachHls();
+    else el.src = p.playback_url;
     el.onloadedmetadata = () => {
       if (serial !== loadSerial) return;
       applySubtitles();
@@ -636,6 +656,11 @@ async function waitForGenerated(p: PlaybackPlan) {
     if (generationWait === controller) generationWait = undefined;
   }
 }
+function availableRange(el: HTMLVideoElement): TimeRanges {
+  // Native EVENT playback can expose decoded buffers before seekable ranges.
+  // Requiring seekable first can deadlock a paused recovery before play().
+  return el.seekable.length ? el.seekable : el.buffered;
+}
 async function applyState(force = false, userSeek = false) {
   const s = state.value,
     el = video.value;
@@ -656,9 +681,8 @@ async function applyState(force = false, userSeek = false) {
     generationWait = undefined;
   }
   if (generationWait || generationWaitFailed) return;
-  const end = el.seekable.length
-    ? el.seekable.end(el.seekable.length - 1)
-    : el.duration;
+  const range = availableRange(el);
+  const end = range.length ? range.end(range.length - 1) : el.duration;
   if (
     plan.rebuild_on_seek &&
     !userSeek &&
@@ -673,11 +697,8 @@ async function applyState(force = false, userSeek = false) {
   if (recoveringHls) {
     // A replacement EVENT playlist may still be growing toward the room time.
     // Waiting here must not create another playback session or jump to its edge.
-    const seekable = Array.from(
-      { length: el.seekable.length },
-      (_, i) => i,
-    ).some(
-      (i) => expected >= el.seekable.start(i) && expected <= el.seekable.end(i),
+    const seekable = Array.from({ length: range.length }, (_, i) => i).some(
+      (i) => expected >= range.start(i) && expected <= range.end(i),
     );
     if (!seekable && (!Number.isFinite(el.duration) || expected > el.duration))
       return;
@@ -729,9 +750,8 @@ function tick() {
     generatedEnd ?? Infinity,
     (target(s, clock.now()) - plan.timeline_origin_ms) / 1000,
   );
-  const end = el.seekable.length
-    ? el.seekable.end(el.seekable.length - 1)
-    : el.duration;
+  const range = availableRange(el);
+  const end = range.length ? range.end(range.length - 1) : el.duration;
   if (
     plan.rebuild_on_seek &&
     generatedEnd === undefined &&

@@ -480,6 +480,57 @@ test("native HLS recovery keeps room time and waits for a growing replacement pl
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
+test("native recovery can play buffered data before seekable is exposed", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    HTMLMediaElement.prototype.canPlayType = () => "probably";
+  });
+  const h = await setup(page, { validMedia: true, nativeHls: true });
+  await expect(page.locator("video")).toHaveAttribute("src", /empty-video/);
+  await page.evaluate(() => {
+    const el = document.querySelector("video")!;
+    el.load = () => {};
+    el.play = async () => {
+      el.dataset.recoveryPlays = String(
+        Number(el.dataset.recoveryPlays ?? 0) + 1,
+      );
+    };
+    Object.defineProperty(el, "paused", {
+      configurable: true,
+      get: () => true,
+    });
+    Object.defineProperty(el, "duration", {
+      configurable: true,
+      get: () => Infinity,
+    });
+    Object.defineProperty(el, "seekable", {
+      configurable: true,
+      get: () => ({ length: 0 }),
+    });
+    Object.defineProperty(el, "buffered", {
+      configurable: true,
+      get: () => ({ length: 1, start: () => 0, end: () => 3600 }),
+    });
+    Object.defineProperty(el, "error", {
+      configurable: true,
+      get: () => ({ code: 2 }),
+    });
+    el.dispatchEvent(new Event("error"));
+    el.dispatchEvent(new Event("loadedmetadata"));
+  });
+  await page.clock.runFor(1000);
+  await expect
+    .poll(() =>
+      page
+        .locator("video")
+        .evaluate((v) => Number(v.dataset.recoveryPlays ?? 0)),
+    )
+    .toBeGreaterThan(0);
+  expect(h.preparations).toHaveLength(1);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
 test("a growing output waits for the room position and resumes the same native session", async ({
   page,
 }) => {
