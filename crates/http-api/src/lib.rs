@@ -35,7 +35,16 @@ pub async fn errors(request: Request, next: Next) -> Response {
         .or_else(|| std::str::from_utf8(&bytes).ok())
         .unwrap_or("");
     let code = ErrorCode::from_reason(reason, parts.status.as_u16());
-    let error = ApiError::new(code, request_id);
+    let mut error = ApiError::new(code, request_id);
+    if code == ErrorCode::RateLimited {
+        error.retry_after_ms = parts
+            .headers
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|seconds| (1..=3600).contains(seconds))
+            .map(|seconds| seconds * 1000);
+    }
     tracing::warn!(%request_id, ?code, status = parts.status.as_u16(), "request failed");
     let normalized = Json(ErrorResponse { error }).into_response();
     parts.headers.remove(header::CONTENT_LENGTH);

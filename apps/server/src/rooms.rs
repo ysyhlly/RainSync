@@ -341,11 +341,11 @@ pub async fn messages(
     let u = auth(&app, &h, false).await?;
     member(&app, &u, id).await?;
     let rows = if let Some(after) = cursor.after {
-        sqlx::query("SELECT c.id,c.body,u.username,c.created_at::text FROM chat_messages c JOIN users u ON u.id=c.user_id WHERE c.room_id=$1 AND (NOT EXISTS(SELECT 1 FROM chat_messages WHERE id=$2 AND room_id=$1) OR (c.created_at,c.id) > (SELECT created_at,id FROM chat_messages WHERE id=$2 AND room_id=$1)) ORDER BY c.created_at,c.id LIMIT 100").bind(id).bind(after).fetch_all(&app.db).await?
+        sqlx::query("SELECT c.id,c.body,c.user_id,u.username,COALESCE(p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE c.room_id=$1 AND (NOT EXISTS(SELECT 1 FROM chat_messages WHERE id=$2 AND room_id=$1) OR (c.created_at,c.id) > (SELECT created_at,id FROM chat_messages WHERE id=$2 AND room_id=$1)) ORDER BY c.created_at,c.id LIMIT 100").bind(id).bind(after).fetch_all(&app.db).await?
     } else {
-        sqlx::query("SELECT * FROM (SELECT c.id,c.body,u.username,c.created_at FROM chat_messages c JOIN users u ON u.id=c.user_id WHERE room_id=$1 ORDER BY c.created_at DESC,c.id DESC LIMIT 100) history ORDER BY created_at,id").bind(id).fetch_all(&app.db).await?
+        sqlx::query("SELECT * FROM (SELECT c.id,c.body,c.user_id,u.username,COALESCE(p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,c.created_at,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE room_id=$1 ORDER BY c.created_at DESC,c.id DESC LIMIT 100) history ORDER BY created_at,id").bind(id).fetch_all(&app.db).await?
     };
-    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"body":r.get::<String,_>("body"),"username":r.get::<String,_>("username")})).collect())))
+    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"body":r.get::<String,_>("body"),"user_id":r.get::<Uuid,_>("user_id"),"username":r.get::<String,_>("username"),"display_name":r.get::<String,_>("display_name"),"created_at":r.get::<i64,_>("created_at_ms"),"avatar_url":avatars::url(r.get("user_id"),r.get("avatar_version"),r.get::<Option<String>,_>("avatar_content_type").is_some()),"avatar_version":r.get::<Option<Uuid>,_>("avatar_version")})).collect())))
 }
 
 pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: String) {
@@ -436,8 +436,8 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                     "CHAT"=>{
                         let Some(body)=v["body"].as_str().filter(|b|!b.trim().is_empty()&&b.chars().count()<=2000)else{reject_socket(&mut out,"invalid_request").await;continue};let cid=Uuid::new_v4();
                         if sqlx::query("INSERT INTO chat_messages(id,room_id,user_id,body) VALUES($1,$2,$3,$4)").bind(cid).bind(id).bind(user.id).bind(body).execute(&app.db).await.is_err(){reject_socket(&mut out,"database_error").await;break}
-                        let name:String=sqlx::query_scalar("SELECT username FROM users WHERE id=$1").bind(user.id).fetch_one(&app.db).await.unwrap_or_default();
-                        let _=handle.events.send(json!({"type":"CHAT","id":cid,"username":name,"body":body,"client_message_id":v["client_message_id"].as_str().and_then(|s| Uuid::parse_str(s).ok())}));continue
+                        let identity=match profile::value(&app,user.id).await{Ok(value)=>value,Err(_)=>{reject_socket(&mut out,"database_error").await;break}};
+                        let _=handle.events.send(json!({"type":"CHAT","id":cid,"user_id":user.id,"username":identity["username"],"display_name":identity["display_name"],"avatar_url":identity["avatar_url"],"avatar_version":identity["avatar_version"],"body":body,"client_message_id":v["client_message_id"].as_str().and_then(|s| Uuid::parse_str(s).ok())}));continue
                     }
                     _=>{
                         let command_id = v["command_id"].as_str().and_then(|s|Uuid::parse_str(s).ok());

@@ -17,7 +17,9 @@ docker compose up --build -d
 
 访问 http://localhost:8088；首次管理员密码保存在 `.runtime/login.txt`，配置保存在 `.env`。脚本不会覆盖已有配置。把影片放在 `media/`，登录后添加本地片源 `/media`，点击检测并扫描。
 
-公网部署时设置 `PUBLIC_ORIGIN=https://你的域名`、`SITE_ADDRESS=你的域名`、`HTTP_PORT=80`、`HTTPS_PORT=443`。PUBLIC_ORIGIN 必须与浏览器地址完全一致，包括端口；登录和 WebSocket 都会校验 Origin。默认未开放公开注册，由管理员创建观看账户，再通过房间邀请加入。
+公网部署时设置 `PUBLIC_ORIGIN=https://你的域名`、`SITE_ADDRESS=你的域名`、`HTTP_PORT=80`、`HTTPS_PORT=443`。PUBLIC_ORIGIN 必须与浏览器地址完全一致，包括端口；登录和 WebSocket 都会校验 Origin。管理员可在“账号与注册”生成一次性注册邀请码，或手动创建普通账号；用户注册成功自动登录，再用独立的房间邀请加入放映室。无需邮箱或手机号。个人资料支持独立保存昵称与裁剪头像，固定登录账号不能修改。
+
+界面已完整替换为浅色米色路由应用。离开观影页前往媒体库、管理或资料页时保持当前播放，底部显示迷你播放器。版本仍为开发预览，实际验证边界见[本次详细修改报告](docs/IMPLEMENTATION_REPORT.md)。
 
 ## NAS Agent
 
@@ -43,13 +45,22 @@ npx playwright install chromium
 npm run test:e2e
 cargo build --workspace --bins --examples
 node tests/integration.mjs
+npm run test:accounts
+# 真实浏览器联合验收须先指定外部输出目录。
+# PowerShell示例见docs/BACKEND_OPERATIONS.md。
+npm run test:browser-real
 ```
 
-集成测试会创建并删除**独立的随机命名 PostgreSQL 容器**，占用本机 15439、18080–18082 端口，不使用或修改已有数据库。浏览器布局测试使用受控 API/WebSocket 样本，与真实后端集成测试分开报告。
+原集成测试创建并删除**独立的随机命名PostgreSQL容器**，占用本机15439、18080–18082端口，不修改已有数据库。`test:accounts`与`test:browser-real`须设置RAINSYNC_ARTIFACT_DIR，使用随机服务端口和独立数据库。浏览器布局/故障回归使用受控API/WebSocket；`test:browser-real`使用真实Server/Worker/数据库及合成视频，独立记录证据。
 
 Windows 本地后端开发需 PostgreSQL、FFmpeg/ffprobe；运行二进制前设置 `.env.example` 中的环境变量和 `DATABASE_URL`。Vite 默认代理控制服务 8080、媒体服务 8081。
 
 ## 文档
+
+- [本次完整修改与验收报告](docs/IMPLEMENTATION_REPORT.md)
+- [账号接口与注册规则](docs/ACCOUNT_REGISTRATION_API.md) / [头像接口](docs/AVATAR_API.md)
+- [升级与兼容回滚](docs/BACKEND_OPERATIONS.md)
+- [前端架构](docs/FRONTEND_ARCHITECTURE.md) / [真实浏览器联调](docs/REAL_BROWSER_VALIDATION.md)
 
 - [架构与工程约定](docs/ARCHITECTURE.md)
 - [实施状态与后续里程碑](docs/STATUS.md)

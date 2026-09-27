@@ -30,6 +30,18 @@ pub enum ErrorCode {
     ControllerRequired,
     InvalidName,
     UsernameOrPasswordInvalid,
+    UsernameTaken,
+    AlreadyAuthenticated,
+    AvatarInvalid,
+    AvatarTooLarge,
+    AvatarVersionConflict,
+    AvatarOperationConflict,
+    AvatarProcessingFailed,
+    AvatarProcessingTimeout,
+    RegistrationInviteInvalid,
+    RegistrationInviteAlreadyUsed,
+    RegistrationBatchConflict,
+    RegistrationBatchAlreadyCreated,
     InvalidInvite,
     RoomFull,
     PairCodeInvalid,
@@ -134,6 +146,8 @@ impl ErrorCode {
         matches!(
             self,
             Self::PlaybackRequestInProgress
+                | Self::AvatarProcessingFailed
+                | Self::AvatarProcessingTimeout
                 | Self::MediaQueueFull
                 | Self::PlaybackRequestInterrupted
                 | Self::RateLimited
@@ -176,6 +190,20 @@ impl ErrorCode {
             }
             Self::InvalidName => "房间名不能为空，且不能超过 120 个字符",
             Self::InvalidCredentials => "用户名或密码不正确",
+            Self::UsernameTaken => "登录账号已被使用，请选择其他账号",
+            Self::AlreadyAuthenticated => "当前已有登录账号，请先确认当前身份",
+            Self::AvatarInvalid => "头像必须为有效的 512×512 静态 PNG 图片",
+            Self::AvatarTooLarge => "头像文件超过允许大小，请重新裁剪后保存",
+            Self::AvatarVersionConflict => "头像已在其他操作中更新，请刷新资料后再保存",
+            Self::AvatarOperationConflict => "此头像操作编号已用于不同内容，请重新确认操作",
+            Self::AvatarProcessingFailed => "头像处理暂时不可用，原头像未更改",
+            Self::AvatarProcessingTimeout => "头像处理超时，原头像未更改",
+            Self::RegistrationInviteInvalid => "邀请码无效或已失效，请检查后重试或联系管理员",
+            Self::RegistrationInviteAlreadyUsed => "邀请码已用于注册，不能撤销",
+            Self::RegistrationBatchConflict => "批次编号已用于其他请求，请核对生成记录",
+            Self::RegistrationBatchAlreadyCreated => {
+                "此批次已生成，请查询记录；完整邀请码无法重新显示"
+            }
             Self::Forbidden
             | Self::NotAMember
             | Self::AdminRequired

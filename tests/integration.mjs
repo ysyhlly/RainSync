@@ -18,7 +18,8 @@ import {
 } from "./playback-idempotency.mjs";
 
 // Isolated, disposable test database and processes; never targets user databases.
-const root = resolve(".runtime/integration", randomUUID());
+const root = resolve(process.env.RAINSYNC_ARTIFACT_DIR ?? ".runtime", "integration", randomUUID());
+const target = resolve(process.env.CARGO_TARGET_DIR ?? "target", "debug");
 await mkdir(root, { recursive: true });
 const password = randomBytes(24).toString("hex"),
   container = `rainsync-test-${randomUUID().slice(0, 8)}`;
@@ -86,7 +87,7 @@ function assertError(value, code, response) {
 function launch(name, extra = {}) {
   const child = spawn(
     resolve(
-      "target/debug",
+      target,
       name + (process.platform === "win32" ? ".exe" : ""),
     ),
     [],
@@ -247,7 +248,7 @@ try {
   await ready(origin + "/health");
   execFileSync(
     resolve(
-      "target/debug/examples/verify_queue_fairness" +
+      target + "/examples/verify_queue_fairness" +
         (process.platform === "win32" ? ".exe" : ""),
     ),
     [],
@@ -258,7 +259,7 @@ try {
   );
   execFileSync(
     resolve(
-      "target/debug/examples/verify_media_queue" +
+      target + "/examples/verify_media_queue" +
         (process.platform === "win32" ? ".exe" : ""),
     ),
     [],
@@ -269,7 +270,7 @@ try {
   );
   execFileSync(
     resolve(
-      "target/debug/examples/verify_output_snapshots" +
+      target + "/examples/verify_output_snapshots" +
         (process.platform === "win32" ? ".exe" : ""),
     ),
     [],
@@ -281,7 +282,7 @@ try {
   );
   execFileSync(
     resolve(
-      "target/debug/examples/verify_cache_budget" +
+      target + "/examples/verify_cache_budget" +
         (process.platform === "win32" ? ".exe" : ""),
     ),
     [],
@@ -293,7 +294,7 @@ try {
   );
   execFileSync(
     resolve(
-      "target/debug/examples/verify_cache_leases" +
+      target + "/examples/verify_cache_leases" +
         (process.platform === "win32" ? ".exe" : ""),
     ),
     [],
@@ -305,7 +306,7 @@ try {
   );
   execFileSync(
     resolve(
-      "target/debug/examples/verify_job_attempts" +
+      target + "/examples/verify_job_attempts" +
         (process.platform === "win32" ? ".exe" : ""),
     ),
     [],
@@ -316,7 +317,7 @@ try {
     },
   );
   execFileSync(
-    resolve("target/debug/examples/verify_output_cleanup" + (process.platform === "win32" ? ".exe" : "")),
+    resolve(target + "/examples/verify_output_cleanup" + (process.platform === "win32" ? ".exe" : "")),
     [],
     { env: { ...env, RAINSYNC_ISOLATED_TEST: "1" }, stdio: "inherit", windowsHide: true },
   );
