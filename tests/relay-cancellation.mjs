@@ -10,6 +10,8 @@ export async function relayCancellation({
   userId,
   roomId,
   agentId,
+  crashWorker,
+  holdTransfer,
 }) {
   const cases = [];
   const sockets = new Set();
@@ -34,7 +36,12 @@ export async function relayCancellation({
     sql(
       `UPDATE agents SET last_seen=now() WHERE id='${agentId}'; INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${userId}','${roomId}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${resource}"}',now()+interval '1 hour')`,
     );
-    const state = { id, body: [], ended: false };
+    const resourceHash = createHash("sha256")
+      .update(
+        JSON.stringify({ agent_id: agentId, kind: "agent", resource: id }),
+      )
+      .digest("hex");
+    const state = { id, resourceHash, body: [], ended: false };
     const req = request(
       `${workerBase}/media-delivery/${id}/source?token=${token}`,
       { method },
@@ -54,6 +61,22 @@ export async function relayCancellation({
     state.request = req;
     return state;
   }
+  function run(state) {
+    const value = sql(
+      `SELECT row_to_json(r) FROM agent_transfer_runs r WHERE resource_hash='${state.resourceHash}'`,
+    );
+    return value ? JSON.parse(value) : undefined;
+  }
+  async function terminal(state, status, reason) {
+    await until(
+      () => run(state)?.status === status,
+      `${status} transfer recorded`,
+    );
+    const row = run(state);
+    assert.ok(row.finished_at);
+    if (reason) assert.equal(row.reason, reason);
+    return row;
+  }
   async function offered(state) {
     let row;
     await until(() => {
@@ -63,6 +86,8 @@ export async function relayCancellation({
       if (value) row = JSON.parse(value);
       return row;
     }, "offered ticket");
+    assert.equal(run(state).status, "offered");
+    assert.equal(run(state).head, row.request.head);
     return row;
   }
   function url(row) {
@@ -108,8 +133,21 @@ export async function relayCancellation({
       assert.ok(status === 401 || status === 410);
     }
     cases.push({ scenario: label, released_ms: Date.now() - began });
+    await terminal(state, "cancelled", "consumer_cancelled");
   }
   try {
+    sql(
+      "CREATE FUNCTION relay_test_reject_state() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled lifecycle insert failure'; END $$; CREATE TRIGGER relay_test_reject_state BEFORE INSERT ON agent_transfer_runs FOR EACH ROW EXECUTE FUNCTION relay_test_reject_state()",
+    );
+    const rejected = start();
+    await until(() => rejected.ended, "failed lifecycle insert response");
+    assert.equal(rejected.response.statusCode, 502);
+    assert.ok(noTicket(rejected.id), "lifecycle failure rolls back its ticket");
+    assert.equal(run(rejected), undefined);
+    sql(
+      "DROP TRIGGER relay_test_reject_state ON agent_transfer_runs; DROP FUNCTION relay_test_reject_state()",
+    );
+    cases.push({ scenario: "offer-and-state-atomic-rollback" });
     // The INSERT continues after the HTTP future disappears. Cleanup must be
     // ordered after that INSERT, not race it with an early DELETE.
     sql(
@@ -138,6 +176,7 @@ export async function relayCancellation({
       "late INSERT did not recreate a cancelled offer",
     );
     assert.ok(Date.now() - began < 5000);
+    await terminal(delayed, "cancelled", "consumer_cancelled");
     cases.push({
       scenario: "cancel-during-insert",
       released_ms: Date.now() - began,
@@ -154,6 +193,7 @@ export async function relayCancellation({
     const headers = start(),
       headerRow = await offered(headers),
       headerSocket = await connect(headerRow);
+    assert.equal(run(headers).status, "connected");
     await cancelled(headers, headerRow, headerSocket, "cancel-before-headers");
 
     const body = start(),
@@ -168,7 +208,9 @@ export async function relayCancellation({
     );
     bodySocket.send(Buffer.alloc(32768, 1));
     await until(() => body.body.length > 0, "HTTP body streaming");
+    assert.equal(run(body).status, "streaming");
     await cancelled(body, bodyRow, bodySocket, "cancel-during-body");
+    assert.equal(run(body).bytes_delivered, 32768);
 
     const head = start("HEAD"),
       headRow = await offered(head),
@@ -184,6 +226,7 @@ export async function relayCancellation({
       "HEAD releases relay",
     );
     assert.equal(Buffer.concat(head.body).length, 0);
+    assert.equal((await terminal(head, "completed")).bytes_delivered, 0);
     cases.push({ scenario: "HEAD-complete" });
 
     const complete = start(),
@@ -197,13 +240,176 @@ export async function relayCancellation({
       "normal completion",
     );
     assert.equal(Buffer.concat(complete.body).toString(), "abc");
+    assert.equal((await terminal(complete, "completed")).bytes_delivered, 3);
     cases.push({ scenario: "body-complete" });
+
+    const raced = start(),
+      racedRow = await offered(raced);
+    const contenders = await Promise.all(
+      [0, 1].map(
+        () =>
+          new Promise((resolve) => {
+            const ws = new WebSocket(url(racedRow));
+            sockets.add(ws);
+            ws.once("open", () => resolve({ ws, status: 101 }));
+            ws.once("unexpected-response", (_, res) => {
+              res.resume();
+              resolve({ ws, status: res.statusCode });
+              ws.terminate();
+            });
+            ws.on("error", () => {});
+            ws.on("close", () => sockets.delete(ws));
+          }),
+      ),
+    );
+    assert.deepEqual(contenders.map((r) => r.status).sort(), [101, 401]);
+    assert.equal(run(raced).status, "connected");
+    await cancelled(
+      raced,
+      racedRow,
+      contenders.find((r) => r.status === 101).ws,
+      "atomic-ticket-claim",
+    );
+
+    for (const kind of ["malformed", "truncated", "denied"]) {
+      const failed = start(),
+        row = await offered(failed),
+        ws = await connect(row);
+      if (kind === "malformed") ws.send("not-json");
+      else {
+        ws.send(
+          JSON.stringify({
+            status: kind === "denied" ? 401 : 200,
+            "content-length": kind === "denied" ? "0" : "100000",
+          }),
+        );
+        if (kind === "truncated") ws.send(Buffer.from("short"));
+        ws.close();
+      }
+      const expected = {
+        malformed: "invalid_agent_headers",
+        truncated: "truncated_agent_data",
+        denied: "agent_http_error",
+      }[kind];
+      await terminal(failed, "failed", expected);
+      cases.push({ scenario: `${kind}-failure-recorded` });
+    }
+
+    for (const target of ["ticket", "lease"]) {
+      const blocked = start(),
+        row = await offered(blocked);
+      holdTransfer(row.id, target);
+      await until(
+        () =>
+          sql(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name='relay_lock_fixture' AND wait_event='PgSleep'",
+          ) === "1",
+        "expiry row locked",
+      );
+      const ws = new WebSocket(url(row));
+      ws.on("error", () => {});
+      const result = new Promise((resolve, reject) => {
+        ws.once("unexpected-response", (_, response) => {
+          response.resume();
+          resolve(response.statusCode);
+          ws.terminate();
+        });
+        ws.once("open", () => {
+          ws.terminate();
+          reject(Error("expired transfer revived after row lock wait"));
+        });
+      });
+      void result.catch(() => {});
+      await until(
+        () =>
+          sql(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%agent_transfer%'",
+          ) === "1",
+        "claim waits for locked expiry",
+      );
+      assert.equal(await result, target === "ticket" ? 401 : 410);
+      assert.equal(run(blocked).status, "offered");
+      blocked.request.destroy();
+      cases.push({ scenario: `${target}-expiry-rechecked-after-lock` });
+    }
+
+    const live = start(),
+      liveRow = await offered(live),
+      liveSocket = await connect(liveRow);
+    liveSocket.send(
+      JSON.stringify({ status: 200, "content-length": "10485760" }),
+    );
+    const firstLease = run(live).lease_until;
+    const keepAlive = setInterval(() => {
+      if (liveSocket.readyState === WebSocket.OPEN)
+        liveSocket.send(Buffer.alloc(512));
+    }, 250);
+    try {
+      await delay(35000);
+      assert.equal(run(live).status, "streaming");
+      assert.ok(Date.parse(run(live).lease_until) > Date.parse(firstLease));
+      assert.ok(!live.ended && live.body.length > 0);
+      sql(
+        `UPDATE agent_transfer_runs SET lease_until=now()-interval '1 second' WHERE id='${liveRow.id}'`,
+      );
+      await until(
+        () => liveSocket.readyState === WebSocket.CLOSED,
+        "lost transfer lease aborts data connection",
+        15000,
+      );
+      // A terminal state after expiry is written by the Server sweeper, never
+      // by the late former owner. Bound this by one real cleanup interval.
+      await until(
+        () => run(live)?.status === "failed",
+        "expired transfer reconciled",
+        70000,
+      );
+      assert.equal(run(live).reason, "transfer_owner_lost");
+      assert.equal(live.ended, false);
+      cases.push({ scenario: "long-stream-renews-and-lost-lease-aborts" });
+    } finally {
+      clearInterval(keepAlive);
+    }
+
+    const crashed = start(),
+      crashRow = await offered(crashed),
+      crashSocket = await connect(crashRow);
+    crashSocket.send(
+      JSON.stringify({ status: 200, "content-length": "10485760" }),
+    );
+    crashSocket.send(Buffer.alloc(1024));
+    await until(() => crashed.body.length > 0, "stream before Worker crash");
+    assert.equal(run(crashed).status, "streaming");
+    // Also exercise retention without waiting 24 hours: only the terminal test
+    // record's timestamp is shifted; active expiry still uses the real clock.
+    sql(
+      `UPDATE agent_transfer_runs SET finished_at=now()-interval '25 hours' WHERE id='${run(head).id}'`,
+    );
+    crashWorker();
+    await until(
+      () => crashSocket.readyState === WebSocket.CLOSED,
+      "crashed Worker connection closed",
+    );
+    await until(
+      () => run(crashed)?.status === "failed",
+      "crashed owner reconciled",
+      100000,
+    );
+    assert.equal(run(crashed).reason, "transfer_owner_lost");
+    assert.ok(noTicket(crashed.id));
+    assert.equal(run(head), undefined);
+    assert.equal(run(complete).status, "completed");
+    assert.equal(crashed.ended, false);
+    cases.push({ scenario: "worker-crash-and-terminal-retention" });
     return cases;
   } finally {
     for (const req of requests) req.destroy();
     for (const ws of sockets) ws.terminate();
     sql(
       "DROP TRIGGER IF EXISTS relay_test_delay ON agent_transfers; DROP FUNCTION IF EXISTS relay_test_delay()",
+    );
+    sql(
+      "DROP TRIGGER IF EXISTS relay_test_reject_state ON agent_transfer_runs; DROP FUNCTION IF EXISTS relay_test_reject_state()",
     );
   }
 }

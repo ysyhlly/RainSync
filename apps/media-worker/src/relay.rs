@@ -9,6 +9,7 @@ pub struct Registry(Arc<Mutex<HashMap<Uuid, Pending>>>);
 struct Registration {
     id: Uuid,
     registry: Registry,
+    state: transfer_state::State,
     // Drop closes this channel after removing the pending connection. The
     // database owner can then clean up even if INSERT finished after cancellation.
     _cancel: oneshot::Sender<()>,
@@ -16,12 +17,14 @@ struct Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         self.registry.0.lock().unwrap().remove(&self.id);
+        self.state.cancel();
     }
 }
 pub struct Pending {
     pub headers: oneshot::Sender<Value>,
     pub chunks: mpsc::Sender<std::result::Result<Vec<u8>, std::io::Error>>,
     pub input_failure: input_failure::Observation,
+    pub state: transfer_state::State,
 }
 pub async fn fetch(
     app: &App,
@@ -44,12 +47,14 @@ pub async fn fetch(
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let (ht, hr) = oneshot::channel();
     let (ct, cr) = mpsc::channel(16);
+    let state = transfer_state::State::observed(input_failure.clone());
     app.relay.0.lock().unwrap().insert(
         id,
         Pending {
             headers: ht,
             chunks: ct,
             input_failure: input_failure.clone(),
+            state: state.clone(),
         },
     );
     let data_url = format!(
@@ -63,35 +68,34 @@ pub async fn fetch(
     let registration = Registration {
         id,
         registry: app.relay.clone(),
+        state: state.clone(),
         _cancel: cancel,
     };
     let (ready, offered) = oneshot::channel();
-    let db = app.db.clone();
-    tokio::spawn(async move {
-        let result = sqlx::query(
-            "INSERT INTO agent_transfers VALUES($1,$2,$3,$4,false,now()+interval '30 seconds')",
-        )
-        .bind(id)
-        .bind(agent)
-        .bind(hash(&token))
-        .bind(request)
-        .execute(&db)
-        .await
-        .map(|_| ());
-        let _ = ready.send(result);
-        let _ = cancelled.await;
-        // Always ordered after INSERT settles; a cancelled HTTP handler must
-        // not race a late insertion and leave a fresh usable ticket behind.
-        let _ = sqlx::query("DELETE FROM agent_transfers WHERE id=$1")
-            .bind(id)
-            .execute(&db)
-            .await;
-    });
+    tokio::spawn(transfer_state::own(
+        app.db.clone(),
+        transfer_state::Offer {
+            id,
+            agent,
+            token_hash: hash(&token),
+            request,
+            resource_hash: hash(&resource.to_string()),
+        },
+        state.clone(),
+        cancelled,
+        ready,
+    ));
     offered.await.map_err(failure)?.map_err(failure)?;
-    let meta = match tokio::time::timeout(std::time::Duration::from_secs(15), hr).await {
+    let reply = tokio::select! {
+        biased;
+        _ = state.stopped() => return Err((StatusCode::SERVICE_UNAVAILABLE, "agent_timeout".into())),
+        reply = tokio::time::timeout(std::time::Duration::from_secs(15), hr) => reply,
+    };
+    let meta = match reply {
         Ok(Ok(v)) => v,
         _ => {
             input_failure.transient();
+            state.fail("agent_timeout");
             return Err((StatusCode::GATEWAY_TIMEOUT, "agent_timeout".into()));
         }
     };
@@ -103,12 +107,34 @@ pub async fn fetch(
         "accept-ranges",
     ] {
         if let Some(v) = meta[key].as_str() {
-            builder = builder.header(key, v)
+            let value = axum::http::HeaderValue::from_str(v).map_err(|error| {
+                state.fail("invalid_agent_headers");
+                failure(error)
+            })?;
+            builder = builder.header(key, value)
         }
     }
-    let stream = futures_util::stream::unfold((cr, registration), |(mut rx, guard)| async {
-        rx.recv().await.map(|v| (v, (rx, guard)))
-    });
+    // connect validates metadata before handing it to the HTTP response.
+    let expected = metadata(&meta).expect("validated Agent metadata").1;
+    if head || expected == 0 {
+        state.complete();
+    }
+    let stream = futures_util::stream::unfold(
+        (cr, registration, state),
+        move |(mut rx, guard, state)| async move {
+            let next = tokio::select! {
+                biased;
+                _ = state.stopped() => Some(Err(std::io::Error::other("transfer_lease_lost"))),
+                v = rx.recv() => v,
+            };
+            next.map(|v| {
+                if let Ok(ref bytes) = v {
+                    state.delivered(bytes.len(), expected);
+                }
+                (v, (rx, guard, state))
+            })
+        },
+    );
     builder
         .body(if head {
             Body::empty()
@@ -123,10 +149,24 @@ pub async fn connect(
     Query(q): Query<Params>,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
-    let row=sqlx::query("DELETE FROM agent_transfers t USING agents a WHERE t.id=$1 AND t.token_hash=$2 AND t.expires_at>now() AND a.id=t.agent_id AND NOT a.revoked RETURNING t.id").bind(id).bind(hash(&q.token)).fetch_optional(&app.db).await.map_err(failure)?;
+    let mut tx = app.db.begin().await.map_err(failure)?;
+    sqlx::query("SELECT id FROM agent_transfers WHERE id=$1 AND token_hash=$2 FOR UPDATE")
+        .bind(id)
+        .bind(hash(&q.token))
+        .execute(&mut *tx)
+        .await
+        .map_err(failure)?;
+    let row=sqlx::query("DELETE FROM agent_transfers t USING agents a WHERE t.id=$1 AND t.token_hash=$2 AND t.expires_at>clock_timestamp() AND a.id=t.agent_id AND NOT a.revoked RETURNING t.id").bind(id).bind(hash(&q.token)).fetch_optional(&mut *tx).await.map_err(failure)?;
     if row.is_none() {
         return Err((StatusCode::UNAUTHORIZED, "invalid_transfer".into()));
     }
+    transfer_state::lock(&mut tx, id).await.map_err(failure)?;
+    let connected = sqlx::query("UPDATE agent_transfer_runs SET status='connected',updated_at=clock_timestamp() WHERE id=$1 AND status='offered' AND lease_until>clock_timestamp()")
+        .bind(id).execute(&mut *tx).await.map_err(failure)?;
+    if connected.rows_affected() != 1 {
+        return Err((StatusCode::GONE, "transfer_expired".into()));
+    }
+    tx.commit().await.map_err(failure)?;
     let pending = app
         .relay
         .0
@@ -142,6 +182,7 @@ pub async fn connect(
             let meta = loop {
                 let first = tokio::select! {
                     _ = pending.chunks.closed() => return,
+                    _ = pending.state.stopped() => return,
                     v = tokio::time::timeout_at(header_deadline, socket.next()) => v,
                 };
                 match first {
@@ -149,25 +190,44 @@ pub async fn connect(
                     Ok(Some(Ok(Message::Text(text)))) => {
                         let Ok(meta) = serde_json::from_str::<Value>(&text) else {
                             pending.input_failure.permanent();
+                            pending.state.fail("invalid_agent_headers");
                             return;
                         };
                         break meta;
                     }
                     Ok(Some(Ok(Message::Binary(_)))) => {
                         pending.input_failure.permanent();
+                        pending.state.fail("invalid_agent_headers");
                         return;
                     }
                     _ => {
                         pending.input_failure.transient();
+                        pending.state.fail("agent_headers_interrupted");
                         return;
                     }
                 }
             };
             let Some((status, expected)) = metadata(&meta) else {
                 pending.input_failure.permanent();
+                pending.state.fail("invalid_agent_headers");
                 return;
             };
             pending.input_failure.status(status);
+            if !status.is_success() {
+                pending.state.fail("agent_http_error");
+            }
+            let streaming = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let mut tx = app.db.begin().await?;
+                transfer_state::lock(&mut tx, id).await?;
+                let row = sqlx::query("UPDATE agent_transfer_runs SET status='streaming',updated_at=clock_timestamp() WHERE id=$1 AND status='connected' AND lease_until>clock_timestamp()")
+                    .bind(id).execute(&mut *tx).await?;
+                tx.commit().await?;
+                Ok::<_, sqlx::Error>(row)
+            }).await;
+            if !matches!(streaming, Ok(Ok(ref row)) if row.rows_affected() == 1) {
+                pending.state.fail("transfer_lease_lost");
+                return;
+            }
             if pending.headers.send(meta).is_err() {
                 return;
             }
@@ -176,6 +236,7 @@ pub async fn connect(
             loop {
                 let message = tokio::select! {
                     _ = pending.chunks.closed() => break,
+                    _ = pending.state.stopped() => break,
                     v = tokio::time::timeout_at(deadline, socket.next()) => v,
                 };
                 let reason = match message {
@@ -187,7 +248,11 @@ pub async fn connect(
                         } else {
                             received += b.len() as u64;
                             let progressed = !b.is_empty();
-                            if pending.chunks.send(Ok(b.to_vec())).await.is_err() {
+                            let sent = tokio::select! {
+                                _ = pending.state.stopped() => break,
+                                sent = pending.chunks.send(Ok(b.to_vec())) => sent,
+                            };
+                            if sent.is_err() {
                                 break;
                             }
                             // Waiting for the bounded consumer queue is local
@@ -209,6 +274,7 @@ pub async fn connect(
                     }
                     _ => break,
                 };
+                pending.state.fail(reason);
                 let _ = pending
                     .chunks
                     .send(Err(std::io::Error::other(reason)))
@@ -223,7 +289,10 @@ fn metadata(meta: &Value) -> Option<(StatusCode, u64)> {
     if !(200..600).contains(&status) {
         return None;
     }
-    let expected = meta["content-length"].as_str()?.parse().ok()?;
+    let expected: u64 = meta["content-length"].as_str()?.parse().ok()?;
+    if expected > i64::MAX as u64 {
+        return None;
+    }
     Some((StatusCode::from_u16(status).ok()?, expected))
 }
 
@@ -242,12 +311,14 @@ mod tests {
                 headers,
                 chunks,
                 input_failure: Default::default(),
+                state: Default::default(),
             },
         );
         let (cancel, cancelled) = oneshot::channel();
         let guard = Registration {
             id,
             registry: registry.clone(),
+            state: Default::default(),
             _cancel: cancel,
         };
         drop(guard);

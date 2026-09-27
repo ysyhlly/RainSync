@@ -194,6 +194,28 @@ export async function agentRelay({
       sql(`SELECT count(*) FROM agent_transfers WHERE agent_id='${agentId}'`),
       "0",
     );
+    await until(
+      () =>
+        sql(
+          `SELECT count(*) FROM agent_transfer_runs WHERE agent_id='${agentId}' AND finished_at IS NULL`,
+        ) === "0",
+      "real Agent transfers have durable terminal states",
+    );
+    const states = JSON.parse(
+      sql(
+        `SELECT json_object_agg(status,n) FROM (SELECT status,count(*) AS n FROM agent_transfer_runs WHERE agent_id='${agentId}' GROUP BY status) s`,
+      ),
+    );
+    assert.equal(states.cancelled, 4);
+    assert.equal(states.failed, 16);
+    assert.equal(states.completed, 1);
+    assert.equal(
+      sql(
+        `SELECT count(*) FROM agent_transfer_runs WHERE agent_id='${agentId}' AND status='completed' AND byte_range='bytes=10-99' AND bytes_delivered=90`,
+      ),
+      "1",
+    );
+    cases.push({ scenario: "durable-real-Agent-outcomes", states });
     return cases;
   } finally {
     for (const req of requests) req.destroy();

@@ -410,6 +410,8 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
                 "DELETE FROM sessions WHERE expires_at<now()",
                 "DELETE FROM login_attempts WHERE window_started<=now()-interval '60 seconds'",
                 "DELETE FROM agent_transfers WHERE expires_at<now()",
+                "UPDATE agent_transfer_runs SET status='failed',reason='transfer_owner_lost',updated_at=now(),finished_at=now() WHERE finished_at IS NULL AND lease_until<=now()",
+                "DELETE FROM agent_transfer_runs WHERE finished_at<now()-interval '24 hours'",
                 "DELETE FROM playback_requests r WHERE r.expires_at<now() AND NOT EXISTS(SELECT 1 FROM playback_sessions p WHERE p.id=r.session_id AND NOT p.stopped AND p.expires_at>now())",
             ] {
                 let _ = sqlx::query(query).execute(&cleanup).await;

@@ -99,6 +99,13 @@ async function transfer(request, attempt, workerBase) {
     socket.terminate();
     return;
   }
+  if (active.kind === "nas_lease_lost" && attempt === 1) {
+    const id = original.pathname.split("/").at(-1);
+    assert.match(id, /^[0-9a-f-]{36}$/);
+    sql(
+      `UPDATE agent_transfer_runs SET lease_until=now()-interval '1 second' WHERE id='${id}'`,
+    );
+  }
   const keepPinging = () => {
     const timer = setInterval(() => {
       if (socket.readyState === WebSocket.OPEN) socket.ping();
@@ -481,6 +488,27 @@ try {
         userId,
         roomId: room.id,
         agentId,
+        crashWorker: () => docker("kill", "--signal", "KILL", worker),
+        holdTransfer: (id, target) => {
+          const [table, column] =
+            target === "ticket"
+              ? ["agent_transfers", "expires_at"]
+              : ["agent_transfer_runs", "lease_until"];
+          docker(
+            "exec",
+            "-d",
+            db,
+            "psql",
+            "-U",
+            "rainsync",
+            "-d",
+            "rainsync",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            `SET application_name='relay_lock_fixture'; BEGIN; UPDATE ${table} SET ${column}=clock_timestamp()+interval '2 seconds' WHERE id='${id}'; SELECT pg_sleep(4); COMMIT`,
+          );
+        },
       })),
     );
   if (realAgent)
@@ -511,6 +539,7 @@ try {
             "nas_timeout",
             "nas_stalled",
             "nas_offline",
+            "nas_lease_lost",
             "nas_exhausted",
             "nas_denied",
             "nas_excess",
@@ -580,6 +609,7 @@ try {
       "nas_timeout",
       "nas_stalled",
       "nas_offline",
+      "nas_lease_lost",
       "nas_ping",
       "unavailable",
       "truncated",
