@@ -88,6 +88,25 @@ pub struct PlaybackPlan {
     pub subtitle_tracks: Vec<MediaTrack>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationStatus {
+    Queued,
+    Preparing,
+    Ready,
+}
+
+/// Ready means the entry can be loaded, not that the entire movie is encoded.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PlaybackReadiness {
+    pub session_id: Uuid,
+    pub status: PreparationStatus,
+    pub complete: bool,
+    /// Exclusive end of the published prefix, relative to the plan's timeline origin.
+    /// None means this source/legacy output has no measured generated interval.
+    pub available_until_ms: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct MediaTrack {
     pub index: u32,

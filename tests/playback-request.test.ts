@@ -4,11 +4,88 @@ import {
   PlaybackCancelled,
   PlaybackTimeout,
   requestPlayback,
+  waitPlaybackReady,
 } from "../apps/web/src/playback-request";
 import { RequestFailure } from "../apps/web/src/errors";
 import type { PlaybackPlan, PlaybackRequest } from "../packages/protocol";
 
 afterEach(() => vi.useRealTimers());
+
+it("waits for published readiness on one session, tolerating a transient read failure", async () => {
+  vi.useFakeTimers();
+  const read = vi
+    .fn()
+    .mockResolvedValueOnce({ session_id: "s", status: "queued" })
+    .mockRejectedValueOnce(new TypeError("offline"))
+    .mockResolvedValueOnce({ session_id: "s", status: "preparing" })
+    .mockResolvedValueOnce({
+      session_id: "s",
+      status: "ready",
+      complete: false,
+    });
+  const done = waitPlaybackReady(read, "s", new AbortController().signal);
+  await vi.advanceTimersByTimeAsync(3000);
+  await done;
+  expect(read).toHaveBeenCalledTimes(4);
+  expect(read.mock.calls.every(([id]) => id === "s")).toBe(true);
+});
+
+it("cancels readiness polling without reporting a timeout", async () => {
+  vi.useFakeTimers();
+  const controller = new AbortController();
+  const read = vi
+    .fn()
+    .mockResolvedValue({ session_id: "s", status: "preparing" });
+  const rejected = expect(
+    waitPlaybackReady(read, "s", controller.signal),
+  ).rejects.toBeInstanceOf(PlaybackCancelled);
+  await vi.advanceTimersByTimeAsync(0);
+  controller.abort();
+  await rejected;
+  await vi.advanceTimersByTimeAsync(200000);
+  expect(read).toHaveBeenCalledTimes(1);
+});
+
+it("bounds readiness waiting and rejects another session's response", async () => {
+  vi.useFakeTimers();
+  const controller = new AbortController();
+  const wrong = vi
+    .fn()
+    .mockResolvedValue({ session_id: "other", status: "ready" });
+  await expect(
+    waitPlaybackReady(wrong, "s", controller.signal),
+  ).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+  const read = vi.fn().mockResolvedValue({ session_id: "s", status: "queued" });
+  const expired = expect(
+    waitPlaybackReady(read, "s", controller.signal),
+  ).rejects.toBeInstanceOf(PlaybackTimeout);
+  await vi.advanceTimersByTimeAsync(180000);
+  await expired;
+  const count = read.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(read).toHaveBeenCalledTimes(count);
+});
+
+it("revokes a prepared session when readiness fails rather than creating another", async () => {
+  const send = vi
+    .fn()
+    .mockResolvedValue({ session_id: "s", rebuild_on_seek: true });
+  const cancel = vi.fn().mockResolvedValue({});
+  const read = vi
+    .fn()
+    .mockRejectedValue(
+      new RequestFailure({ error: { code: "MEDIA_JOB_FAILED" } }),
+    );
+  const requests = new PlaybackRequests(send, cancel, storage(), "user", read);
+  await expect(requests.prepare(input)).rejects.toMatchObject({
+    code: "MEDIA_JOB_FAILED",
+  });
+  expect(send).toHaveBeenCalledTimes(1);
+  expect(cancel).toHaveBeenCalledWith(
+    send.mock.calls[0][0].idempotency_key,
+    expect.any(AbortSignal),
+  );
+});
 const input: PlaybackRequest = {
   room_id: "room",
   media_generation: 1,
@@ -17,6 +94,33 @@ const input: PlaybackRequest = {
   audio_index: null,
   capabilities: null,
 };
+it("polls the advancing room position relative to the plan origin without preparing again", async () => {
+  vi.useFakeTimers();
+  let position = 12000;
+  const send = vi.fn().mockResolvedValue({
+    session_id: "s",
+    rebuild_on_seek: true,
+    timeline_origin_ms: 10000,
+  });
+  const read = vi
+    .fn()
+    .mockResolvedValueOnce({ session_id: "s", status: "preparing" })
+    .mockResolvedValueOnce({ session_id: "s", status: "ready" });
+  const requests = new PlaybackRequests(
+    send,
+    vi.fn().mockResolvedValue({}),
+    storage(),
+    "user",
+    read,
+  );
+  const ready = requests.prepare(input, () => position);
+  await vi.advanceTimersByTimeAsync(0);
+  position = 13000;
+  await vi.advanceTimersByTimeAsync(1000);
+  await ready;
+  expect(read.mock.calls.map((call) => call[2])).toEqual([2000, 3000]);
+  expect(send).toHaveBeenCalledTimes(1);
+});
 it("reuses one key and payload after a lost response and pending preparation", async () => {
   vi.useFakeTimers();
   const send = vi
@@ -41,6 +145,8 @@ it("does not retry authorization, conflicts or exhausted preparation", async () 
     "FORBIDDEN",
     "PLAYBACK_REQUEST_CONFLICT",
     "PLAYBACK_REQUEST_RETRY_EXHAUSTED",
+    "CACHE_READ_ONLY",
+    "CACHE_PERMISSION_DENIED",
   ]) {
     const error = new RequestFailure({ error: { code, retryable: true } });
     const send = vi.fn().mockRejectedValue(error);
@@ -52,6 +158,7 @@ it("retries transient preparation failures with the same key and bounded attempt
   vi.useFakeTimers();
   for (const code of [
     "SOURCE_PROBE_FAILED",
+    "MEDIA_QUEUE_FULL",
     "UPSTREAM_PLAYBACK_FAILED",
     "MEDIA_UNAVAILABLE",
     "PLAYBACK_REQUEST_INTERRUPTED",

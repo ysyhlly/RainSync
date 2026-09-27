@@ -1210,8 +1210,10 @@ name = "persistence"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "protocol",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "uuid",

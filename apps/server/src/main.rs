@@ -1,4 +1,5 @@
 mod agents;
+mod limits;
 mod media;
 mod metrics;
 mod playback_requests;
@@ -28,6 +29,8 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct App {
+    session_limit: i64,
+    queue_limit: i64,
     metrics: Arc<metrics::Metrics>,
     db: PgPool,
     origin: String,
@@ -327,6 +330,8 @@ async fn main() -> anyhow::Result<()> {
     );
     let public_origin = std::env::var("PUBLIC_ORIGIN").unwrap_or("http://localhost:5173".into());
     let app = App {
+        session_limit: limits::configured("PLAYBACK_SESSION_LIMIT", limits::DEFAULT_SESSION_LIMIT)?,
+        queue_limit: limits::configured("MEDIA_QUEUE_LIMIT", limits::DEFAULT_QUEUE_LIMIT)?,
         metrics: Default::default(),
         db: db.clone(),
         secure: public_origin.starts_with("https://"),
@@ -412,7 +417,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/v1/playback-sessions/{id}",
-            delete(media::stop).post(media::renew),
+            get(media::readiness).delete(media::stop).post(media::renew),
         )
         .route("/api/v1/agents", get(agents::list).post(agents::create))
         .route("/api/v1/agents/pair", post(agents::pair))

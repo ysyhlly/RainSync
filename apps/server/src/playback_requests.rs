@@ -89,7 +89,7 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
     }
     let active: i64 = sqlx::query_scalar("SELECT count(*) FROM (SELECT id FROM playback_sessions WHERE user_id=$1 AND NOT stopped AND expires_at>now() UNION SELECT session_id FROM playback_requests WHERE user_id=$1 AND status='pending' AND lease_until>now()) active")
         .bind(user).fetch_one(&mut *tx).await?;
-    if active >= 8 {
+    if active >= app.session_limit {
         // Keep stale-attempt cleanup even if other live sessions fill quota.
         tx.commit().await?;
         return Err(err(

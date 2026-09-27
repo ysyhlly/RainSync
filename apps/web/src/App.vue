@@ -11,7 +11,11 @@ import Hls from "hls.js";
 import { detectCapabilities } from "../../../packages/player-core";
 import { useSession } from "./api";
 import { RequestFailure, stopsReconnect } from "./errors";
-import { PlaybackCancelled, PlaybackRequests } from "./playback-request";
+import {
+  PlaybackCancelled,
+  PlaybackRequests,
+  waitPlaybackReady,
+} from "./playback-request";
 import {
   Clock,
   Corrector,
@@ -37,6 +41,7 @@ function requests() {
         session.api(`/playback-requests/${key}`, "DELETE", undefined, signal),
       sessionStorage,
       `rainsync:playback:${user}`,
+      readReadiness,
     );
   }
   return playbackRequests;
@@ -95,6 +100,17 @@ let roomSerial = 0;
 let clockAction: "load" | "apply" | undefined;
 const dragging = ref(false);
 let recoveringHls = false;
+let generationWait: AbortController | undefined;
+let generationWaitFailed = false;
+let generatedEnd: number | undefined;
+function readReadiness(id: string, signal: AbortSignal, relativePosition = 0) {
+  return session.api(
+    `/playback-sessions/${id}?relative_position_ms=${encodeURIComponent(relativePosition)}`,
+    "GET",
+    undefined,
+    signal,
+  );
+}
 const mediaCursors = ref<string[]>([""]);
 const mediaPage = ref(0),
   mediaLoading = ref(false);
@@ -363,7 +379,8 @@ function connect() {
         audioIndex.value = undefined;
         subtitleIndex.value = undefined;
         void run(() => loadMedia());
-      } else if (v.action?.type === "SEEK") void run(() => applyState(true));
+      } else if (v.action?.type === "SEEK")
+        void run(() => applyState(true, true));
       else {
         const serial = loadSerial;
         void applyState().catch((e) => {
@@ -394,6 +411,10 @@ function send(type: string, payload?: unknown) {
   );
 }
 async function stopPlayback() {
+  generationWait?.abort();
+  generationWait = undefined;
+  generationWaitFailed = false;
+  generatedEnd = undefined;
   recoveringHls = false;
   const old = plan;
   plan = undefined;
@@ -447,7 +468,10 @@ async function loadMedia() {
         Hls.isSupported() ? window.MediaSource : undefined,
       ),
     };
-    const p = await requests().prepare(request);
+    waiting.value = true;
+    const p = await requests().prepare(request, () =>
+      target(state.value ?? s, clock.now()),
+    );
     if (serial !== loadSerial) {
       await session.api(`/playback-sessions/${p.session_id}`, "DELETE");
       return;
@@ -481,6 +505,10 @@ async function loadMedia() {
       )
         return false;
       recoveries++;
+      generationWait?.abort();
+      generationWait = undefined;
+      generationWaitFailed = false;
+      generatedEnd = undefined;
       recoveringHls = true;
       waiting.value = true;
       const position = playbackPosition();
@@ -546,6 +574,7 @@ async function loadMedia() {
     };
   } catch (e) {
     if (serial !== loadSerial || e instanceof PlaybackCancelled) return;
+    waiting.value = false;
     throw e;
   }
 }
@@ -559,7 +588,55 @@ function applySubtitles() {
         : "disabled";
   }
 }
-async function applyState(force = false) {
+async function waitForGenerated(p: PlaybackPlan) {
+  if (generationWait || generationWaitFailed) return;
+  const controller = new AbortController();
+  generationWait = controller;
+  waiting.value = true;
+  video.value?.pause();
+  try {
+    const ready = await waitPlaybackReady(
+      (id, signal) =>
+        readReadiness(
+          id,
+          signal,
+          Math.max(0, target(state.value!, clock.now()) - p.timeline_origin_ms),
+        ),
+      p.session_id,
+      controller.signal,
+    );
+    if (controller.signal.aborted || plan !== p) throw new PlaybackCancelled();
+    if (ready.complete && ready.available_until_ms != null)
+      generatedEnd = ready.available_until_ms / 1000;
+    const position = Math.min(
+      generatedEnd ?? Infinity,
+      Math.max(
+        0,
+        (target(state.value!, clock.now()) - p.timeline_origin_ms) / 1000,
+      ),
+    );
+    recoveringHls = true;
+    if (hls) {
+      hls.stopLoad();
+      hls.config.startPosition = position;
+      hls.loadSource(p.playback_url);
+      hls.startLoad(position);
+    } else if (video.value) {
+      const url = new URL(p.playback_url, location.href);
+      url.hash = `t=${position}`;
+      video.value.src = url.href;
+      video.value.load();
+    }
+  } catch (e) {
+    if (controller.signal.aborted || plan !== p) throw new PlaybackCancelled();
+    generationWaitFailed = true;
+    waiting.value = false;
+    throw e;
+  } finally {
+    if (generationWait === controller) generationWait = undefined;
+  }
+}
+async function applyState(force = false, userSeek = false) {
   const s = state.value,
     el = video.value;
   if (!s || !el || !plan || el.readyState < 1) return;
@@ -567,8 +644,32 @@ async function applyState(force = false) {
     clockAction ??= "apply";
     return;
   }
+  if (userSeek) {
+    generationWaitFailed = false;
+    generatedEnd = undefined;
+    recoveringHls = false;
+  }
   const relative = (target(s, clock.now()) - plan.timeline_origin_ms) / 1000;
-  const expected = Math.max(0, relative);
+  const expected = Math.min(generatedEnd ?? Infinity, Math.max(0, relative));
+  if (userSeek && generationWait) {
+    generationWait.abort();
+    generationWait = undefined;
+  }
+  if (generationWait || generationWaitFailed) return;
+  const end = el.seekable.length
+    ? el.seekable.end(el.seekable.length - 1)
+    : el.duration;
+  if (
+    plan.rebuild_on_seek &&
+    !userSeek &&
+    !recoveringHls &&
+    generatedEnd === undefined &&
+    Number.isFinite(end) &&
+    expected > end + 0.1
+  ) {
+    await waitForGenerated(plan);
+    return;
+  }
   if (recoveringHls) {
     // A replacement EVENT playlist may still be growing toward the room time.
     // Waiting here must not create another playback session or jump to its edge.
@@ -585,7 +686,8 @@ async function applyState(force = false) {
   if (
     force &&
     plan.rebuild_on_seek &&
-    (relative < -0.5 || expected > el.duration + 1)
+    (relative < -0.5 ||
+      (userSeek && Number.isFinite(end) && expected > end + 0.1))
   ) {
     await loadMedia();
     return;
@@ -614,6 +716,7 @@ function tick() {
   const s = state.value,
     el = video.value;
   if (!s || !el || !plan) return;
+  if (generationWait || generationWaitFailed) return;
   if (recoveringHls) {
     void run(() => applyState(true));
     return;
@@ -622,7 +725,22 @@ function tick() {
     position.value = el.currentTime + plan.timeline_origin_ms / 1000;
   if (!clock.ready || !connected.value || s.playback_status !== "playing")
     return;
-  const expected = (target(s, clock.now()) - plan.timeline_origin_ms) / 1000;
+  const expected = Math.min(
+    generatedEnd ?? Infinity,
+    (target(s, clock.now()) - plan.timeline_origin_ms) / 1000,
+  );
+  const end = el.seekable.length
+    ? el.seekable.end(el.seekable.length - 1)
+    : el.duration;
+  if (
+    plan.rebuild_on_seek &&
+    generatedEnd === undefined &&
+    Number.isFinite(end) &&
+    expected > end + 0.1
+  ) {
+    void run(() => applyState(true));
+    return;
+  }
   const adjustment = corrector.step(
     (expected - el.currentTime) * 1000,
     s.playback_rate,
@@ -635,7 +753,8 @@ function tick() {
       plan.rebuild_on_seek &&
       (expected < -0.5 || expected > el.duration + 1)
     ) {
-      void run(loadMedia);
+      if (expected < -0.5) void run(loadMedia);
+      else void run(() => applyState(true));
     } else el.currentTime = Math.max(0, expected);
   }
 }

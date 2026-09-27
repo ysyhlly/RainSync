@@ -25,6 +25,8 @@ fn main() {
         ControlEpoch::decl(),
         MediaTrack::decl(),
         PlaybackPlan::decl(),
+        PreparationStatus::decl(),
+        PlaybackReadiness::decl(),
         PlaybackCapabilities::decl(),
         PlaybackRequest::decl(),
         ErrorCode::decl(),
@@ -35,7 +37,12 @@ fn main() {
         root.join("index.ts"),
         declarations
             .iter()
-            .map(|s| format!("export {s}\n"))
+            .map(|s| {
+                format!(
+                    "export {}\n",
+                    s.lines().map(str::trim_end).collect::<Vec<_>>().join("\n")
+                )
+            })
             .collect::<String>(),
     );
     for (name, schema) in [
@@ -45,6 +52,10 @@ fn main() {
         ("playback-request", schemars::schema_for!(PlaybackRequest)),
         ("error-response", schemars::schema_for!(ErrorResponse)),
         ("playback-plan", schemars::schema_for!(PlaybackPlan)),
+        (
+            "playback-readiness",
+            schemars::schema_for!(PlaybackReadiness),
+        ),
         (
             "playback-capabilities",
             schemars::schema_for!(PlaybackCapabilities),

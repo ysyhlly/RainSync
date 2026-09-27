@@ -115,6 +115,60 @@ pub fn hls_needs_video_transform(meta: &serde_json::Value) -> bool {
     })
 }
 
+/// Admission estimate, not a bitrate guarantee for CRF video. Disk usage is
+/// still monitored while encoding. Unknown duration is budgeted by the Worker.
+pub fn estimated_output_bytes(
+    meta: &serde_json::Value,
+    duration_ms: Option<f64>,
+    start_ms: f64,
+    transcode: bool,
+) -> Option<u64> {
+    let duration = duration_ms.filter(|n| n.is_finite() && *n >= 0.0)?;
+    if !start_ms.is_finite() || start_ms < 0.0 {
+        return None;
+    }
+    let source_rate = meta["format"]["bit_rate"]
+        .as_str()
+        .and_then(|v| v.parse::<f64>().ok())
+        .or_else(|| meta["format"]["bit_rate"].as_f64())
+        .filter(|n| n.is_finite() && *n > 0.0);
+    let video_rate = if transcode {
+        8_000_000.0
+    } else {
+        source_rate.unwrap_or(8_000_000.0)
+    };
+    Some(
+        (((duration - start_ms).max(0.0) / 1000.0) * (video_rate + 192_000.0) / 8.0 * 1.15)
+            .ceil()
+            .max(65536.0) as u64,
+    )
+}
+
+#[cfg(test)]
+mod budget_tests {
+    #[test]
+    fn estimates_remaining_output_and_preserves_unknown_duration() {
+        let meta = serde_json::json!({"format":{"bit_rate":"1000000"}});
+        assert_eq!(
+            super::estimated_output_bytes(&meta, Some(20000.0), 10000.0, false),
+            Some(1713500)
+        );
+        assert_eq!(
+            super::estimated_output_bytes(&meta, Some(20000.0), 10000.0, true),
+            Some(11776000)
+        );
+        assert_eq!(super::estimated_output_bytes(&meta, None, 0.0, false), None);
+        assert_eq!(
+            super::estimated_output_bytes(&meta, Some(0.0), 0.0, false),
+            Some(65536)
+        );
+        assert_eq!(
+            super::estimated_output_bytes(&meta, Some(f64::NAN), 0.0, false),
+            None
+        );
+    }
+}
+
 pub fn hls_args(
     input: &str,
     output: &str,

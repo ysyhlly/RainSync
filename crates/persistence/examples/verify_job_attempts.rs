@@ -4,21 +4,30 @@ async fn finish(
     claim: &persistence::media_jobs::Claim,
     failure: Option<persistence::media_jobs::JobFailure>,
 ) -> anyhow::Result<bool> {
-    let proof = persistence::media_jobs::Publication {
-        manifest_sha256: "0".repeat(64),
-        segment_count: 1,
-    };
-    persistence::media_jobs::finish(
-        db,
-        claim,
-        failure,
-        if failure.is_none() {
-            Some(&proof)
-        } else {
-            None
-        },
-    )
-    .await
+    if failure.is_some() {
+        persistence::media_jobs::finish(db, claim, failure, None).await
+    } else {
+        persistence::media_outputs::publish(
+            db,
+            claim,
+            &persistence::media_outputs::Snapshot {
+                manifest:
+                    "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nindex0.m4s\n#EXT-X-ENDLIST\n"
+                        .into(),
+                segment_count: 1,
+                files: [-1, 0]
+                    .into_iter()
+                    .map(|index| persistence::media_outputs::FileProof {
+                        index,
+                        size_bytes: 9,
+                        sha256: "0".repeat(64),
+                    })
+                    .collect(),
+            },
+            true,
+        )
+        .await
+    }
 }
 use persistence::media_jobs::{claim, output_dir, release, renew};
 use uuid::Uuid;

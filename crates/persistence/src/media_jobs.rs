@@ -6,12 +6,16 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy)]
 pub enum JobFailure {
     CacheCapacityExceeded,
+    CacheReadOnly,
+    CachePermissionDenied,
     ExecutionFailed,
 }
 impl JobFailure {
     pub fn reason(self) -> &'static str {
         match self {
             Self::CacheCapacityExceeded => "cache_capacity_exceeded",
+            Self::CacheReadOnly => "cache_read_only",
+            Self::CachePermissionDenied => "cache_permission_denied",
             Self::ExecutionFailed => "media_job_failed",
         }
     }
@@ -22,6 +26,17 @@ impl std::fmt::Display for JobFailure {
     }
 }
 impl std::error::Error for JobFailure {}
+
+/// Stored task errors are untrusted diagnostic text, never an arbitrary public code.
+pub fn terminal_error(reason: Option<&str>) -> (u16, &'static str) {
+    match reason {
+        Some("cache_capacity_exceeded") => (503, "cache_capacity_exceeded"),
+        Some("cache_read_only") => (503, "cache_read_only"),
+        Some("cache_permission_denied") => (503, "cache_permission_denied"),
+        Some("media_job_retry_exhausted") => (502, "media_job_retry_exhausted"),
+        _ => (502, "media_job_failed"),
+    }
+}
 
 pub struct Claim {
     pub id: Uuid,
@@ -46,8 +61,17 @@ pub async fn claim(pool: &PgPool, owner: Uuid) -> Result<Option<Claim>> {
         .execute(pool).await?;
     sqlx::query("UPDATE media_outputs o SET status='abandoned' FROM media_jobs j WHERE o.job_id=j.id AND o.status='writing' AND (o.attempt<>j.attempt OR j.status<>'running')").execute(pool).await?;
     let mut tx = pool.begin().await?;
-    let row = sqlx::query("UPDATE media_jobs SET status='running',owner_id=$1,attempt=attempt+1,lease_until=clock_timestamp()+interval '30 seconds' WHERE id=(SELECT j.id FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id WHERE j.status='queued' AND j.attempt<j.max_attempts AND j.available_at<=clock_timestamp() AND NOT p.stopped AND p.expires_at>clock_timestamp() ORDER BY j.created_at FOR UPDATE OF j SKIP LOCKED LIMIT 1) RETURNING id,spec,attempt")
+    // Serialize only the short scheduling decision. A committed turn survives
+    // worker restarts; failed claims roll back both the job and its user's turn.
+    sqlx::query("SELECT pg_advisory_xact_lock(72614933)")
+        .execute(&mut *tx)
+        .await?;
+    let row = sqlx::query("UPDATE media_jobs claimed SET status='running',owner_id=$1,attempt=attempt+1,lease_until=clock_timestamp()+interval '30 seconds' FROM playback_sessions session WHERE claimed.id=(SELECT j.id FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id LEFT JOIN media_queue_turns turn ON turn.user_id IS NOT DISTINCT FROM p.user_id WHERE j.status='queued' AND j.attempt<j.max_attempts AND j.available_at<=clock_timestamp() AND NOT p.stopped AND p.expires_at>clock_timestamp() ORDER BY turn.last_turn NULLS FIRST,j.created_at,j.id FOR UPDATE OF j SKIP LOCKED LIMIT 1) AND session.id=claimed.session_id RETURNING claimed.id,claimed.spec,claimed.attempt,session.user_id")
         .bind(owner).fetch_optional(&mut *tx).await?;
+    if let Some(row) = &row {
+        sqlx::query("INSERT INTO media_queue_turns(user_id,last_turn) VALUES($1,nextval('media_queue_turn_seq')) ON CONFLICT(user_id) DO UPDATE SET last_turn=EXCLUDED.last_turn")
+            .bind(row.get::<Option<Uuid>, _>("user_id")).execute(&mut *tx).await?;
+    }
     let claim = row.map(|row| Claim {
         id: row.get("id"),
         owner,
@@ -95,7 +119,7 @@ pub async fn finish(
         tx.rollback().await?;
         return Ok(false);
     }
-    let updated = sqlx::query("UPDATE media_outputs SET status=$4,manifest_sha256=$5,segment_count=$6,published_at=CASE WHEN $4='published' THEN clock_timestamp() ELSE NULL END WHERE job_id=$1 AND attempt=$2 AND owner_id=$3 AND status='writing'")
+    let updated = sqlx::query("UPDATE media_outputs SET status=$4,manifest_sha256=$5,segment_count=$6,published_at=CASE WHEN $4='published' THEN clock_timestamp() ELSE NULL END WHERE job_id=$1 AND attempt=$2 AND owner_id=$3 AND status='writing' AND (validation_version<2 OR $4<>'published')")
         .bind(claim.id).bind(claim.attempt).bind(claim.owner)
         .bind(if failure.is_none() { "published" } else { "failed" })
         .bind(publication.map(|p| p.manifest_sha256.as_str())).bind(publication.map(|p| p.segment_count))

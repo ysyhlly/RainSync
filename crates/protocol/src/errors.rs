@@ -42,6 +42,7 @@ pub enum ErrorCode {
     InvalidSourceUrl,
     SourceScanFailed,
     TooManyPlaybackSessions,
+    MediaQueueFull,
     PlaybackRequestConflict,
     PlaybackRequestInProgress,
     PlaybackRequestInterrupted,
@@ -82,6 +83,8 @@ pub enum ErrorCode {
     InvalidResource,
     MediaJobFailed,
     CacheCapacityExceeded,
+    CacheReadOnly,
+    CachePermissionDenied,
     MediaJobCancelled,
     MediaJobRetryExhausted,
     InvalidResourceSignature,
@@ -129,6 +132,7 @@ impl ErrorCode {
         matches!(
             self,
             Self::PlaybackRequestInProgress
+                | Self::MediaQueueFull
                 | Self::PlaybackRequestInterrupted
                 | Self::RateLimited
                 | Self::RoomBusy
@@ -147,7 +151,12 @@ impl ErrorCode {
 
     fn message(self) -> &'static str {
         match self {
+            Self::MediaQueueFull => "媒体处理队列已满，请稍后使用相同请求编号重试",
             Self::CacheCapacityExceeded => "媒体缓存空间不足，请联系管理员清理后重新发起播放",
+            Self::CacheReadOnly => "媒体缓存为只读，请联系管理员调整挂载后重新发起播放",
+            Self::CachePermissionDenied => {
+                "媒体缓存没有写入权限，请联系管理员修复权限后重新发起播放"
+            }
             Self::MediaJobCancelled => "媒体处理已取消，请重新加载当前播放",
             Self::MediaJobRetryExhausted => "媒体处理重试次数已用尽，请检查服务后重新发起播放",
             Self::PlaybackRequestConflict => "播放请求编号已用于不同参数，请为新的操作使用新编号",

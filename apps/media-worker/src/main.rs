@@ -1,4 +1,8 @@
 mod cache;
+mod cache_read;
+mod output_decode;
+mod output_publish;
+mod output_read;
 mod outputs;
 mod process;
 mod relay;
@@ -32,6 +36,7 @@ struct App {
     relay: Arc<Mutex<HashMap<Uuid, relay::Pending>>>,
     public_url: String,
     probes: Arc<tokio::sync::Semaphore>,
+    output_checks: Arc<output_read::Checks>,
 }
 fn hash(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
@@ -201,13 +206,13 @@ async fn delivery(
             .into_response());
     }
     if resource.get("job_id").is_some() && path != "source" && q.url.is_none() {
-        if path.contains('/') || path.contains('\\') || path.contains("..") {
+        if path != "index.m3u8" && !outputs::media_path(&path) {
             return Err((StatusCode::BAD_REQUEST, "invalid_resource".into()));
         }
         let mut output = None;
         for _ in 0..30 {
             let job =
-                sqlx::query("SELECT j.status,j.error,j.attempt,o.status AS output_status,o.manifest_sha256,(j.status='succeeded' OR (j.status='running' AND j.lease_until>clock_timestamp())) AS readable FROM media_jobs j LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt WHERE j.id=$1")
+                sqlx::query("SELECT j.status,j.error,j.attempt,o.status AS output_status,o.manifest_sha256,o.validation_version,o.visible_manifest,(j.status='succeeded' OR (j.status='running' AND j.lease_until>clock_timestamp())) AS readable FROM media_jobs j LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt WHERE j.id=$1")
                     .bind(id)
                     .fetch_optional(&app.db)
                     .await
@@ -230,16 +235,11 @@ async fn delivery(
             }
             if status == "failed" {
                 let stored: Option<String> = job.get("error");
-                let (status, reason) = match stored.as_deref() {
-                    Some("cache_capacity_exceeded") => {
-                        (StatusCode::SERVICE_UNAVAILABLE, "cache_capacity_exceeded")
-                    }
-                    Some("media_job_retry_exhausted") => {
-                        (StatusCode::BAD_GATEWAY, "media_job_retry_exhausted")
-                    }
-                    _ => (StatusCode::BAD_GATEWAY, "media_job_failed"),
-                };
-                return Err((status, reason.into()));
+                let (status, reason) = persistence::media_jobs::terminal_error(stored.as_deref());
+                return Err((
+                    StatusCode::from_u16(status).expect("fixed terminal status"),
+                    reason.into(),
+                ));
             }
             let output_status: Option<String> = job.get("output_status");
             if (status == "succeeded"
@@ -249,34 +249,86 @@ async fn delivery(
                 return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
             }
             let manifest_digest: Option<String> = job.get("manifest_sha256");
-            let file = persistence::media_jobs::output_dir(&app.cache, id, attempt).join(&path);
-            if job.get::<Option<bool>, _>("readable").unwrap_or(false) && file.is_file() {
-                let manifest = if path.ends_with(".m3u8") {
-                    match outputs::read_manifest(&file).await {
-                        Ok(text) if outputs::readable_manifest(&text) => Some(text),
-                        _ if status == "running" => {
-                            // Recheck the job/attempt on every retry; never serve a torn write.
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            continue;
-                        }
-                        _ => return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into())),
+            let persisted = job
+                .get::<Option<i32>, _>("validation_version")
+                .is_some_and(|v| v >= 2);
+            let visible: Option<String> = job.get("visible_manifest");
+            if persisted && visible.is_none() && status == "running" {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+            let directory = persistence::media_jobs::output_dir(&app.cache, id, attempt);
+            let file = directory.join(&path);
+            if job.get::<Option<bool>, _>("readable").unwrap_or(false)
+                && ((persisted && path == "index.m3u8") || file.is_file())
+            {
+                let reader = cache_read::ReadGuard::acquire(&app.db, id)
+                    .await
+                    .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "media_unavailable".into()))?;
+                let checked = async {
+                    let text = if persisted {
+                        visible.ok_or_else(|| anyhow::anyhow!("output_not_ready"))?
+                    } else {
+                        outputs::read_manifest(&directory.join("index.m3u8")).await?
+                    };
+                    anyhow::ensure!(
+                        if persisted { manifest_digest.as_ref().is_some_and(|digest| hash(&text) == *digest) }
+                        else { status != "succeeded" || manifest_digest.as_ref().is_none_or(|digest| hash(&text) == *digest) },
+                        "output_manifest_changed"
+                    );
+                    let text = if persisted {
+                        anyhow::ensure!(outputs::readable_manifest(&text), "invalid_output_manifest");
+                        text
+                    } else { app.output_checks.snapshot(directory, text).await? };
+                    let opened = if path == "index.m3u8" {
+                        None
+                    } else {
+                        anyhow::ensure!(
+                            path == "init.mp4" || text.lines().any(|line| line == path),
+                            "unpublished_output_segment"
+                        );
+                        let proof = if persisted {
+                            let index: i32 = if path == "init.mp4" { -1 } else { path.strip_prefix("index").and_then(|v| v.strip_suffix(".m4s")).unwrap_or("").parse()? };
+                            let row = sqlx::query("SELECT size_bytes,sha256 FROM media_output_files WHERE job_id=$1 AND attempt=$2 AND segment_index=$3")
+                                .bind(id).bind(attempt).bind(index).fetch_one(&app.db).await?;
+                            Some(persistence::media_outputs::FileProof { index, size_bytes: row.get("size_bytes"), sha256: row.get("sha256") })
+                        } else { None };
+                        Some(app.output_checks.open(file.clone(), proof).await?)
+                    };
+                    Ok::<_, anyhow::Error>((text, opened))
+                }
+                .await;
+                let (text, opened) = match checked {
+                    Ok(value) => value,
+                    _ if status == "running" => {
+                        // Recheck the job/attempt on every retry; never serve a torn write.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
                     }
-                } else {
-                    None
+                    _ => return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into())),
                 };
+                let manifest = (path == "index.m3u8").then_some(text);
                 output = Some((
                     file,
                     attempt,
                     status == "succeeded",
                     manifest_digest,
                     manifest,
+                    reader,
+                    opened,
                 ));
                 break;
             }
+            if status == "succeeded" {
+                return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
+            }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-        let (file, attempt, complete, manifest_digest, manifest) =
+        let (file, attempt, complete, manifest_digest, manifest, reader, opened) =
             output.ok_or((StatusCode::SERVICE_UNAVAILABLE, "media_unavailable".into()))?;
+        if !reader.healthy() {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "media_unavailable".into()));
+        }
         if let Some(manifest) = manifest {
             if complete && manifest_digest.is_some_and(|digest| hash(&manifest) != digest) {
                 return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
@@ -306,7 +358,7 @@ async fn delivery(
             )
                 .into_response());
         }
-        return file_response(&file, &h, head).await;
+        return file_response(&file, &h, head, Some(reader), opened).await;
     }
     if resource["kind"] == "agent" {
         return relay::fetch(&app, &resource, &h, head).await;
@@ -317,7 +369,7 @@ async fn delivery(
             resource["resource"].as_str().unwrap_or(""),
         )
         .map_err(failure)?;
-        return file_response(&p, &h, head).await;
+        return file_response(&p, &h, head, None, None).await;
     }
     let original = url::Url::parse(resource["url"].as_str().unwrap_or("")).map_err(failure)?;
     let target = if let Some(encoded) = q.url.as_deref() {
@@ -491,8 +543,17 @@ fn rewrite_manifest(input: &str, mut uri: impl FnMut(&str) -> String) -> String 
         .join("\n")
         + "\n"
 }
-async fn file_response(path: &std::path::Path, h: &HeaderMap, head: bool) -> Result<Response> {
-    let mut file = tokio::fs::File::open(path).await.map_err(failure)?;
+async fn file_response(
+    path: &std::path::Path,
+    h: &HeaderMap,
+    head: bool,
+    reader: Option<cache_read::ReadGuard>,
+    checked_file: Option<tokio::fs::File>,
+) -> Result<Response> {
+    let mut file = match checked_file {
+        Some(file) => file,
+        None => tokio::fs::File::open(path).await.map_err(failure)?,
+    };
     let size = file.metadata().await.map_err(failure)?.len();
     let range =
         match media_core::byte_range(h.get(header::RANGE).and_then(|v| v.to_str().ok()), size) {
@@ -528,7 +589,10 @@ async fn file_response(path: &std::path::Path, h: &HeaderMap, head: bool) -> Res
     b.body(if head {
         Body::empty()
     } else {
-        Body::from_stream(ReaderStream::with_capacity(file.take(len), 65536))
+        match reader {
+            Some(reader) => reader.body(file.take(len)),
+            None => Body::from_stream(ReaderStream::with_capacity(file.take(len), 65536)),
+        }
     })
     .map_err(failure)
 }
@@ -552,6 +616,9 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
     use std::time::Duration;
     let worker = Uuid::new_v4();
     loop {
+        let mut reservation = None;
+        let mut writer_stopped = true;
+        let output_decoder = output_decode::Gate::default();
         let result: anyhow::Result<()> = async {
             let claim = tokio::select! {
                 biased;
@@ -559,10 +626,13 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 claim = tokio::time::timeout(Duration::from_secs(3), persistence::media_jobs::claim(&app.db, worker)) => claim??,
             };
             let Some(claim) = claim else { return Ok(()) };
+            reservation = Some((claim.id, claim.owner, claim.attempt));
+            let output_builder: output_publish::Shared = Default::default();
             // Preparation has no child and can be cancelled. Once spawned,
             // supervision must finish its explicit kill/wait before release.
             let prepare = async {
                 cache::ensure_capacity(&app).await?;
+                cache::reserve_output(&app, &claim).await?;
                 let spec = &claim.spec;
                 let input = if let Some(ticket) = spec["input_ticket"].as_str() {
                     let ticket = decrypt(&app, ticket)?;
@@ -572,7 +642,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                     media_core::safe_path(std::path::Path::new(spec["root"].as_str().unwrap_or("")), spec["resource"].as_str().unwrap_or(""))?.to_str().ok_or_else(|| anyhow::anyhow!("path"))?.to_owned()
                 };
                 let dir = persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt);
-                tokio::fs::create_dir_all(&dir).await?;
+                tokio::fs::create_dir_all(&dir).await.map_err(cache::write_error)?;
                 let audio_index = spec["audio_index"].as_u64().map(u32::try_from).transpose()?;
                 let args = media_core::hls_args(&input, dir.join("index.m3u8").to_str().unwrap(), spec["start_seconds"].as_f64().unwrap_or(0.0), spec["transcode"].as_bool().unwrap_or(true), audio_index);
                 anyhow::ensure!(persistence::media_jobs::renew(&app.db, &claim).await?, "lease_lost_before_spawn");
@@ -592,11 +662,18 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 #[cfg(windows)]
                 command.creation_flags(0x08000000);
                 let mut child = command.spawn()?;
+                writer_stopped = false;
                 execution_stopped = false;
                 let result = process::supervise(&mut child, &mut stop, || async {
                     persistence::media_jobs::renew(&app.db, &claim).await
-                }, cache::monitor(&app)).await;
+                }, async {
+                    tokio::select! {
+                        error = cache::monitor(&app) => error,
+                        error = output_publish::monitor(&app.db, &claim, persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt), output_builder.clone(), &output_decoder) => error,
+                    }
+                }).await;
                 execution_stopped = child.try_wait()?.is_some();
+                writer_stopped = execution_stopped;
                 result
             }.await;
             if result.as_ref().is_err_and(|e| e.is::<process::LeaseInterrupted>()) {
@@ -617,8 +694,8 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             let mut publication = None;
             if result.is_ok() && !*stop.borrow() {
                 let directory = persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt);
-                result = match process::finalization_deadline(Duration::from_secs(10), async move {
-                    tokio::task::spawn_blocking(move || outputs::validate(&directory)).await?
+                result = match process::finalization_deadline(Duration::from_secs(10), async {
+                    output_publish::prepare(output_builder.clone(), directory, true, &output_decoder).await
                 }).await {
                     Ok(proof) => { publication = Some(proof); Ok(()) },
                     Err(error) => Err(error),
@@ -630,10 +707,30 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             if *stop.borrow() && execution_stopped {
                 tokio::time::timeout(Duration::from_secs(3), persistence::media_jobs::release(&app.db, &claim)).await??;
             } else if !*stop.borrow() {
-                tokio::time::timeout(Duration::from_secs(3), persistence::media_jobs::finish(&app.db, &claim, result.as_ref().err().map(|error| error.downcast_ref::<persistence::media_jobs::JobFailure>().copied().unwrap_or(persistence::media_jobs::JobFailure::ExecutionFailed)), publication.as_ref())).await??;
+                if let Some(snapshot) = publication.as_ref() {
+                    tokio::time::timeout(Duration::from_secs(3), persistence::media_outputs::publish(&app.db, &claim, snapshot, true)).await??;
+                } else {
+                    tokio::time::timeout(Duration::from_secs(3), persistence::media_jobs::finish(&app.db, &claim, result.as_ref().err().map(|error| error.downcast_ref::<persistence::media_jobs::JobFailure>().copied().unwrap_or(persistence::media_jobs::JobFailure::ExecutionFailed)), None)).await??;
+                }
             }
             Ok(())
         }.await;
+        if output_decoder.stop().await.is_err() {
+            tracing::error!("first segment decoder could not be reaped");
+            // Keep the gate alive and retry cleanup before accepting more work.
+            while output_decoder.stop().await.is_err() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        if writer_stopped && let Some((id, owner, attempt)) = reservation {
+            // Completion/error/exit all release only after the child is reaped.
+            // On database failure, the next budget snapshot reclaims dead jobs.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(3),
+                persistence::cache_budget::release(&app.db, id, owner, attempt),
+            )
+            .await;
+        }
         if *stop.borrow() {
             break;
         }
@@ -684,6 +781,7 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
         relay: Default::default(),
         probes: Arc::new(tokio::sync::Semaphore::new(2)),
+        output_checks: Default::default(),
         public_url: std::env::var("PUBLIC_ORIGIN").unwrap_or("http://localhost:8088".into()),
     };
     tokio::fs::create_dir_all(&app.cache).await?;

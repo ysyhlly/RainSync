@@ -1,5 +1,6 @@
 import { reviewRegressions } from "./review-regressions.mjs";
 import { libraryScans } from "./library-scans.mjs";
+import { queueCapacity } from "./queue-capacity.mjs";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir, writeFile, readFile } from "node:fs/promises";
@@ -28,6 +29,8 @@ const bytes = Buffer.from(Array.from({ length: 2048 }, (_, i) => i % 256));
 await writeFile(resolve(root, "fixture.mp4"), bytes);
 const env = {
   ...process.env,
+  PLAYBACK_SESSION_LIMIT: "8",
+  MEDIA_QUEUE_LIMIT: "20",
   DATABASE_URL: `postgres://rainsync:${password}@127.0.0.1:15439/rainsync?sslmode=disable`,
   ADMIN_PASSWORD: password,
   SOURCE_ENCRYPTION_KEY: randomBytes(32).toString("base64"),
@@ -175,6 +178,7 @@ async function connect(client, room) {
   const wait = (p, timeoutMs = 5000) => {
     const i = inbox.findIndex(p);
     if (i >= 0) return Promise.resolve(inbox.splice(i, 1)[0]);
+    const requestedAt = new Error("WebSocket wait requested here");
     return new Promise((resolve, reject) => {
       const w = {
         p,
@@ -186,7 +190,10 @@ async function connect(client, room) {
               "websocket message timeout: " +
                 p.toString() +
                 " queued=" +
-                inbox.map((v) => v.type + ":" + (v.error ?? "")).join(","),
+                inbox.map((v) => v.type + ":" + (v.error ?? "")).join(",") +
+                " readyState=" +
+                ws.readyState,
+              { cause: requestedAt },
             ),
           );
         }, timeoutMs),
@@ -238,6 +245,64 @@ try {
   await delay(2000);
   let server = launch("rainsync-server");
   await ready(origin + "/health");
+  execFileSync(
+    resolve(
+      "target/debug/examples/verify_queue_fairness" +
+        (process.platform === "win32" ? ".exe" : ""),
+    ),
+    [],
+    {
+      env: { ...env, RAINSYNC_ISOLATED_TEST: "1" },
+      stdio: "inherit",
+    },
+  );
+  execFileSync(
+    resolve(
+      "target/debug/examples/verify_media_queue" +
+        (process.platform === "win32" ? ".exe" : ""),
+    ),
+    [],
+    {
+      env: { ...env, RAINSYNC_ISOLATED_TEST: "1" },
+      stdio: "inherit",
+    },
+  );
+  execFileSync(
+    resolve(
+      "target/debug/examples/verify_output_snapshots" +
+        (process.platform === "win32" ? ".exe" : ""),
+    ),
+    [],
+    {
+      env: { ...env, RAINSYNC_ISOLATED_TEST: "1" },
+      stdio: "inherit",
+      windowsHide: true,
+    },
+  );
+  execFileSync(
+    resolve(
+      "target/debug/examples/verify_cache_budget" +
+        (process.platform === "win32" ? ".exe" : ""),
+    ),
+    [],
+    {
+      env: { ...env, RAINSYNC_ISOLATED_TEST: "1" },
+      stdio: "inherit",
+      windowsHide: true,
+    },
+  );
+  execFileSync(
+    resolve(
+      "target/debug/examples/verify_cache_leases" +
+        (process.platform === "win32" ? ".exe" : ""),
+    ),
+    [],
+    {
+      env: { ...env, RAINSYNC_ISOLATED_TEST: "1" },
+      stdio: "inherit",
+      windowsHide: true,
+    },
+  );
   execFileSync(
     resolve(
       "target/debug/examples/verify_job_attempts" +
@@ -513,6 +578,7 @@ try {
   a.ws.send(JSON.stringify({ type: "CHAT", body: "Together!" }));
   assert.equal((await b.wait((v) => v.type === "CHAT")).body, "Together!");
   await playbackIdempotency({ admin, friend, room, state, sql });
+  await queueCapacity({ admin, room, state, sql });
   await audioRouting({ admin, room, state, sql });
   const originalMetadata = sql(
     `SELECT metadata FROM media_items WHERE id='${state.media_id}'`,
@@ -574,6 +640,26 @@ try {
     media_generation: state.media_generation,
     mode: "direct",
   });
+  assert.deepEqual(
+    await friend.request(`/playback-sessions/${plan.session_id}`),
+    {
+      session_id: plan.session_id,
+      status: "ready",
+      complete: true,
+      available_until_ms: null,
+    },
+  );
+  assert.equal(
+    (
+      await admin.request(
+        `/playback-sessions/${plan.session_id}`,
+        "GET",
+        undefined,
+        410,
+      )
+    ).error.code,
+    "INVALID_PLAYBACK_SESSION",
+  );
   let r = await fetch(worker + plan.playback_url, {
     headers: { Range: "bytes=7-18" },
   });
@@ -600,6 +686,13 @@ try {
   r = await fetch(worker + plan.playback_url, { method: "HEAD" });
   assert.equal(r.headers.get("content-length"), "2048");
   await workerAttempts({
+    readiness: (status = 200, position) =>
+      friend.request(
+        `/playback-sessions/${plan.session_id}${position === undefined ? "" : `?relative_position_ms=${position}`}`,
+        "GET",
+        undefined,
+        status,
+      ),
     plan,
     worker,
     sql,
@@ -607,6 +700,17 @@ try {
     cache: env.CACHE_ROOT,
   });
   await friend.request(`/playback-sessions/${plan.session_id}`, "DELETE");
+  assert.equal(
+    (
+      await friend.request(
+        `/playback-sessions/${plan.session_id}`,
+        "GET",
+        undefined,
+        410,
+      )
+    ).error.code,
+    "INVALID_PLAYBACK_SESSION",
+  );
   const revoked = await fetch(worker + plan.playback_url);
   assert.equal(revoked.status, 401);
   assertError(await revoked.json(), "INVALID_PLAYBACK_SESSION", revoked);
@@ -1257,14 +1361,38 @@ try {
     env,
   });
   recovered.ws.close();
-  const limited = await connect(admin, room.id);
-  await limited.wait((v) => v.type === "SNAPSHOT");
-  for (let i = 0; i < 35; i++)
-    limited.ws.send(JSON.stringify({ type: "CLOCK_SYNC", t1: i }));
-  const quotaError = await limited.wait((v) => v.type === "ERROR");
-  assertError(quotaError, "RATE_LIMITED");
-  assert.equal(quotaError.error.retryable, true);
-  limited.ws.close();
+  for (let round = 0; round < 3; round++) {
+    const limited = await connect(admin, room.id);
+    await limited.wait((v) => v.type === "SNAPSHOT");
+    const closed = new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(Error("rate-limited socket did not close")),
+        5000,
+      );
+      limited.ws.once("close", (code) => {
+        clearTimeout(timer);
+        resolve(code);
+      });
+    });
+    // A 35-frame burst can straddle the fixed one-second window under load.
+    // Exceed two windows and leave unread frames after the rejection.
+    for (let i = 0; i < 65; i++)
+      limited.ws.send(JSON.stringify({ type: "CLOCK_SYNC", t1: i }));
+    const [quotaError, closeCode] = await Promise.all([
+      limited.wait((v) => v.type === "ERROR"),
+      closed,
+    ]);
+    assertError(quotaError, "RATE_LIMITED");
+    assert.equal(quotaError.error.retryable, true);
+    assert.notEqual(
+      closeCode,
+      1006,
+      "terminal error must precede a clean WebSocket close",
+    );
+  }
+  console.log(
+    "PASS: fixed-window WebSocket rate limit delivers ERROR and closes gracefully under unread bursts",
+  );
   await reviewRegressions({ admin, friend, sql, connect, origin, container });
   const started = performance.now();
   const clients = await Promise.all(

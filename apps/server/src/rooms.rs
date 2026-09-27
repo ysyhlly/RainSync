@@ -469,4 +469,19 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
             break;
         }
     }
+    // Do not drop a TCP socket with unread burst frames immediately after its
+    // terminal ERROR. Complete the WebSocket close handshake so the peer can
+    // receive that error instead of only observing an abnormal reset.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        if out.send(Message::Close(None)).await.is_err() {
+            return;
+        }
+        while let Some(Ok(message)) = input.next().await {
+            if matches!(message, Message::Close(_)) {
+                let _ = out.flush().await;
+                break;
+            }
+        }
+    })
+    .await;
 }

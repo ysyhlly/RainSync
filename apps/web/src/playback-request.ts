@@ -1,4 +1,8 @@
-import type { PlaybackPlan, PlaybackRequest } from "../../../packages/protocol";
+import type {
+  PlaybackPlan,
+  PlaybackRequest,
+  PlaybackReadiness,
+} from "../../../packages/protocol";
 import { RequestFailure } from "./errors";
 
 export class PlaybackCancelled extends Error {
@@ -98,6 +102,7 @@ export async function requestPlayback(
             "REQUEST_TIMEOUT",
             "UPSTREAM_FAILED",
             "PROBE_BUSY",
+            "MEDIA_QUEUE_FULL",
             "RATE_LIMITED",
             "AGENT_OFFLINE",
             "AGENT_TIMEOUT",
@@ -120,6 +125,58 @@ export async function requestPlayback(
   }
 }
 
+export async function waitPlaybackReady(
+  read: (id: string, signal: AbortSignal) => Promise<PlaybackReadiness>,
+  id: string,
+  signal: AbortSignal,
+): Promise<PlaybackReadiness> {
+  const controller = new AbortController();
+  const abort = () => controller.abort(new PlaybackCancelled());
+  signal.addEventListener("abort", abort, { once: true });
+  if (signal.aborted) abort();
+  const timer = setTimeout(
+    () => controller.abort(new PlaybackTimeout()),
+    180000,
+  );
+  let failures = 0;
+  try {
+    for (;;) {
+      if (controller.signal.aborted) throw controller.signal.reason;
+      try {
+        const result = await read(id, controller.signal);
+        if (controller.signal.aborted) throw controller.signal.reason;
+        if (
+          result.session_id !== id ||
+          !["queued", "preparing", "ready"].includes(result.status)
+        )
+          throw new RequestFailure({ error: { code: "INVALID_RESPONSE" } });
+        if (result.status === "ready") return result;
+        failures = 0;
+      } catch (error) {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        if (
+          !(
+            error instanceof TypeError ||
+            (error instanceof RequestFailure &&
+              [
+                "SERVICE_UNAVAILABLE",
+                "DATABASE_ERROR",
+                "REQUEST_TIMEOUT",
+                "RATE_LIMITED",
+              ].includes(error.code))
+          ) ||
+          ++failures >= 3
+        )
+          throw error;
+      }
+      await retryDelay(controller.signal);
+    }
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", abort);
+  }
+}
+
 /** Keep cancellation identities until the server acknowledges revocation.
  * Tab storage survives refresh; it contains UUIDs only, never playback URLs. */
 export class PlaybackRequests {
@@ -134,6 +191,11 @@ export class PlaybackRequests {
     private cancel: (key: string, signal: AbortSignal) => Promise<unknown>,
     private storage: Pick<Storage, "getItem" | "setItem">,
     private storageKey: string,
+    private readiness?: (
+      id: string,
+      signal: AbortSignal,
+      relativePosition?: number,
+    ) => Promise<PlaybackReadiness>,
   ) {
     const saved = JSON.parse(storage.getItem(storageKey) ?? "[]") as string[];
     this.keys = new Set(saved);
@@ -160,7 +222,10 @@ export class PlaybackRequests {
     this.controller?.abort();
     await this.cleanup();
   }
-  async prepare(input: PlaybackRequest): Promise<PlaybackPlan> {
+  async prepare(
+    input: PlaybackRequest,
+    position?: () => number,
+  ): Promise<PlaybackPlan> {
     const serial = ++this.serial;
     this.controller?.abort();
     // Never consume another quota slot while an older result is uncertain.
@@ -182,6 +247,21 @@ export class PlaybackRequests {
         { ...input, idempotency_key: key },
         controller.signal,
       );
+      if (serial !== this.serial) throw new PlaybackCancelled();
+      if (plan.rebuild_on_seek && this.readiness)
+        await waitPlaybackReady(
+          (id, signal) =>
+            this.readiness!(
+              id,
+              signal,
+              Math.max(
+                0,
+                (position?.() ?? input.position_ms) - plan.timeline_origin_ms,
+              ),
+            ),
+          plan.session_id,
+          controller.signal,
+        );
       if (serial !== this.serial) throw new PlaybackCancelled();
       return plan;
     } catch (error) {

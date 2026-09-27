@@ -23,6 +23,10 @@ services:
       WORKER_URL: http://worker:8081
       MEDIA_ROOT: /media
       CACHE_ROOT: /cache
+      CACHE_MAX_BYTES: ${CACHE_MAX_BYTES:-21474836480}
+      CACHE_UNKNOWN_OUTPUT_BYTES: ${CACHE_UNKNOWN_OUTPUT_BYTES:-2147483648}
+      PLAYBACK_SESSION_LIMIT: ${PLAYBACK_SESSION_LIMIT:-2}
+      MEDIA_QUEUE_LIMIT: ${MEDIA_QUEUE_LIMIT:-20}
       RUST_LOG: info
     volumes: ["${MEDIA_PATH:-./media}:/media:ro"]
     depends_on:

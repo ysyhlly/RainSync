@@ -40,6 +40,7 @@ async function setup(
     holdRoom?: boolean;
     validMedia?: boolean;
     nativeHls?: boolean;
+    holdReady?: boolean;
   } = {},
 ) {
   await page.clock.install();
@@ -63,6 +64,8 @@ async function setup(
   let renewal: (() => void) | undefined,
     rejectRenew = false;
   const history: any[] = [];
+  let mediaReady = !opts.holdReady;
+  let readinessReads = 0;
   await page.route("**/empty-video*", (r) =>
     r.fulfill({
       contentType: "video/mp4",
@@ -120,9 +123,22 @@ async function setup(
           timeline_origin_ms: 0,
           duration_ms: 3600000,
           expires_in_seconds: 1800,
-          rebuild_on_seek: !!opts.nativeHls,
+          rebuild_on_seek: !!opts.nativeHls || !!opts.holdReady,
           audio_tracks: [],
           subtitle_tracks: [],
+        },
+      });
+    }
+    if (
+      path.includes("/playback-sessions/") &&
+      r.request().method() === "GET"
+    ) {
+      readinessReads++;
+      return r.fulfill({
+        json: {
+          session_id: path.split("/").at(-1),
+          status: mediaReady ? "ready" : "preparing",
+          complete: false,
         },
       });
     }
@@ -190,6 +206,10 @@ async function setup(
     preparations,
     sockets,
     history,
+    readinessReads: () => readinessReads,
+    releaseReady() {
+      mediaReady = true;
+    },
     releaseClock() {
       replyClock = true;
       sockets.at(-1)!.send(
@@ -216,6 +236,20 @@ async function setup(
     },
   };
 }
+
+test("does not load unpublished media or allocate a second session while waiting", async ({
+  page,
+}) => {
+  const h = await setup(page, { holdReady: true, validMedia: true });
+  await expect.poll(h.readinessReads).toBe(1);
+  await expect(page.locator("video")).not.toHaveAttribute("src");
+  expect(h.preparations).toHaveLength(1);
+  h.releaseReady();
+  await page.clock.runFor(1000);
+  await expect(page.locator("video")).toHaveAttribute("src", /empty-video/);
+  expect(h.preparations).toHaveLength(1);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
 
 test("playing snapshot waits for clock; visibility preserves offset and dragging survives ticks", async ({
   page,
@@ -445,6 +479,174 @@ test("native HLS recovery keeps room time and waits for a growing replacement pl
   expect(h.preparations).toHaveLength(1);
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
+
+test("a growing output waits for the room position and resumes the same native session", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    HTMLMediaElement.prototype.canPlayType = () => "probably";
+    Object.defineProperty(HTMLMediaElement.prototype, "seekable", {
+      configurable: true,
+      get: () => ({ length: 1, start: () => 0, end: () => 3600 }),
+    });
+  });
+  const h = await setup(page, { validMedia: true, nativeHls: true });
+  await expect(page.locator("video")).toHaveAttribute("src", /empty-video/);
+  let ready = false;
+  const positions: number[] = [];
+  await page.route("**/api/v1/playback-sessions/session-1?*", (r) => {
+    positions.push(
+      Number(
+        new URL(r.request().url()).searchParams.get("relative_position_ms"),
+      ),
+    );
+    return r.fulfill({
+      json: {
+        session_id: "session-1",
+        status: ready ? "ready" : "preparing",
+        complete: false,
+        available_until_ms: ready ? 1900000 : 10000,
+      },
+    });
+  });
+  await page.evaluate(() => {
+    const el = document.querySelector("video")!;
+    el.load = () => {};
+    Object.defineProperty(el, "duration", {
+      configurable: true,
+      get: () => 10,
+    });
+    Object.defineProperty(el, "seekable", {
+      configurable: true,
+      get: () => ({ length: 1, start: () => 0, end: () => 10 }),
+    });
+    el.dispatchEvent(new Event("loadedmetadata"));
+  });
+  await expect.poll(() => positions.length).toBeGreaterThan(0);
+  await page.clock.runFor(1000);
+  expect(h.preparations).toHaveLength(1);
+  expect(positions.every((p) => p >= 1800000)).toBe(true);
+  ready = true;
+  await page.evaluate(() => {
+    const el = document.querySelector("video")!;
+    Object.defineProperty(el, "duration", {
+      configurable: true,
+      get: () => 3600,
+    });
+    Object.defineProperty(el, "seekable", {
+      configurable: true,
+      get: () => ({ length: 1, start: () => 0, end: () => 3600 }),
+    });
+  });
+  await page.clock.runFor(1000);
+  await expect(page.locator("video")).toHaveAttribute("src", /#t=18\d\d/);
+  expect(h.preparations).toHaveLength(1);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+for (const action of [
+  "switching rooms",
+  "seeking beyond the generated range",
+]) {
+  test(`${action} aborts a pending generated-range read and ignores its late response`, async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      HTMLMediaElement.prototype.canPlayType = () => "probably";
+      Object.defineProperty(HTMLMediaElement.prototype, "seekable", {
+        configurable: true,
+        get: () => ({ length: 1, start: () => 0, end: () => 3600 }),
+      });
+    });
+    const unhandled: string[] = [];
+    page.on("pageerror", (e) => unhandled.push(e.message));
+    const h = await setup(page, { validMedia: true, nativeHls: true });
+    await expect(page.locator("video")).toHaveAttribute(
+      "src",
+      /empty-video\?n=1/,
+    );
+    let release: (() => void) | undefined;
+    let reads = 0;
+    let aborted = false;
+    page.on("requestfailed", (request) => {
+      if (request.url().includes("playback-sessions/session-1?"))
+        aborted = true;
+    });
+    await page.route(
+      "**/api/v1/playback-sessions/session-1?*",
+      async (route) => {
+        reads++;
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        await route.fulfill({
+          json: {
+            session_id: "session-1",
+            status: "ready",
+            complete: false,
+            available_until_ms: 3600000,
+          },
+        });
+      },
+    );
+    await page.evaluate(() => {
+      const el = document.querySelector("video")!;
+      Object.defineProperty(el, "seekable", {
+        configurable: true,
+        get: () => ({ length: 1, start: () => 0, end: () => 10 }),
+      });
+      el.dispatchEvent(new Event("loadedmetadata"));
+    });
+    await expect.poll(() => reads).toBe(1);
+    if (action === "switching rooms") {
+      await page.evaluate(() => {
+        Reflect.deleteProperty(document.querySelector("video")!, "seekable");
+      });
+      await page.getByLabel("选择房间").selectOption("c");
+    } else {
+      h.sockets.at(-1)!.send(
+        JSON.stringify({
+          type: "STATE",
+          action: { type: "SEEK" },
+          state: {
+            room_id: "a",
+            revision: 2,
+            media_id: "movie",
+            media_generation: 1,
+            playback_status: "playing",
+            anchor_position_ms: 120000,
+            anchor_server_time_ms: 2000000,
+            playback_rate: 1,
+            controller_user_id: "owner",
+            duration_ms: 3600000,
+            clock_epoch: "epoch",
+          },
+        }),
+      );
+      await expect.poll(() => h.preparations.length).toBe(2);
+      await page.evaluate(() => {
+        Reflect.deleteProperty(document.querySelector("video")!, "seekable");
+      });
+      expect(h.preparations[1].position_ms).toBeGreaterThanOrEqual(120000);
+      expect(h.preparations[1].position_ms).toBeLessThan(130000);
+    }
+    await expect(page.locator("video")).toHaveAttribute(
+      "src",
+      /empty-video\?n=2/,
+    );
+    await expect.poll(() => aborted).toBe(true);
+    release!();
+    await page.clock.runFor(3000);
+    await expect(page.locator("video")).toHaveAttribute(
+      "src",
+      /empty-video\?n=2/,
+    );
+    expect(h.preparations).toHaveLength(2);
+    expect(reads).toBe(1);
+    expect(unhandled).toEqual([]);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
+}
 
 test("teardown media errors are silent while an active unsupported resource is reported", async ({
   page,

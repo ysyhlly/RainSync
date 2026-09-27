@@ -1,0 +1,119 @@
+//! Fenced, atomic visibility for incrementally completed local HLS output.
+use crate::media_jobs::Claim;
+use anyhow::{Result, ensure};
+use sha2::{Digest, Sha256};
+use sqlx::{PgPool, Row};
+
+#[derive(Clone, Debug)]
+pub struct FileProof {
+    pub index: i32,
+    pub size_bytes: i64,
+    pub sha256: String,
+}
+
+pub struct Snapshot {
+    pub manifest: String,
+    pub segment_count: i32,
+    /// Only newly validated files are needed; retries must repeat the same proof.
+    pub files: Vec<FileProof>,
+}
+
+pub async fn publish(
+    pool: &PgPool,
+    claim: &Claim,
+    snapshot: &Snapshot,
+    complete: bool,
+) -> Result<bool> {
+    ensure!(
+        snapshot.segment_count > 0
+            && snapshot.manifest.len() <= 2 * 1024 * 1024
+            && snapshot.manifest.starts_with("#EXTM3U\n")
+            && snapshot.manifest.ends_with('\n')
+            && (if complete {
+                snapshot.manifest.ends_with("#EXT-X-ENDLIST\n")
+            } else {
+                !snapshot.manifest.contains("#EXT-X-ENDLIST")
+            }),
+        "invalid_output_snapshot"
+    );
+    let mut count = 0;
+    for name in snapshot
+        .manifest
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        ensure!(
+            name == format!("index{count}.m4s"),
+            "invalid_snapshot_reference"
+        );
+        count += 1;
+    }
+    ensure!(
+        count == snapshot.segment_count
+            && snapshot
+                .manifest
+                .lines()
+                .filter(|line| *line == "#EXT-X-MAP:URI=\"init.mp4\"")
+                .count()
+                == 1,
+        "invalid_snapshot_reference"
+    );
+    for file in &snapshot.files {
+        ensure!(
+            file.index >= -1
+                && file.index < snapshot.segment_count
+                && file.size_bytes > 0
+                && file.sha256.len() == 64
+                && file
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "invalid_file_proof"
+        );
+    }
+    let mut tx = pool.begin().await?;
+    let owned = sqlx::query("SELECT j.id FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND NOT p.stopped AND p.expires_at>clock_timestamp() FOR UPDATE OF j")
+        .bind(claim.id).bind(claim.owner).bind(claim.attempt).fetch_optional(&mut *tx).await?;
+    if owned.is_none() {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let output = sqlx::query("SELECT ready_segments FROM media_outputs WHERE job_id=$1 AND attempt=$2 AND owner_id=$3 AND status='writing' AND validation_version=3 FOR UPDATE")
+        .bind(claim.id).bind(claim.attempt).bind(claim.owner).fetch_optional(&mut *tx).await?;
+    let Some(output) = output else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    ensure!(
+        snapshot.segment_count >= output.get::<i32, _>("ready_segments"),
+        "output_snapshot_regressed"
+    );
+    let indices: Vec<i32> = snapshot.files.iter().map(|f| f.index).collect();
+    let sizes: Vec<i64> = snapshot.files.iter().map(|f| f.size_bytes).collect();
+    let hashes: Vec<&str> = snapshot.files.iter().map(|f| f.sha256.as_str()).collect();
+    let inserted = sqlx::query("INSERT INTO media_output_files(job_id,attempt,segment_index,size_bytes,sha256) SELECT $1,$2,* FROM unnest($3::integer[],$4::bigint[],$5::text[]) ON CONFLICT(job_id,attempt,segment_index) DO UPDATE SET sha256=media_output_files.sha256 WHERE media_output_files.size_bytes=excluded.size_bytes AND media_output_files.sha256=excluded.sha256")
+        .bind(claim.id).bind(claim.attempt).bind(&indices).bind(&sizes).bind(&hashes).execute(&mut *tx).await?.rows_affected();
+    ensure!(
+        inserted == snapshot.files.len() as u64,
+        "published_output_changed"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM media_output_files WHERE job_id=$1 AND attempt=$2 AND segment_index>=-1 AND segment_index<$3")
+        .bind(claim.id).bind(claim.attempt).bind(snapshot.segment_count).fetch_one(&mut *tx).await?;
+    ensure!(
+        count == i64::from(snapshot.segment_count) + 1,
+        "missing_file_proof"
+    );
+    // Recheck the lease after acquiring locks and writing proofs. Disk work is
+    // done before this transaction; an expired writer can never move visibility.
+    let updated = sqlx::query("UPDATE media_jobs j SET status=CASE WHEN $4 THEN 'succeeded' ELSE j.status END,lease_until=CASE WHEN $4 THEN NULL ELSE j.lease_until END,error=NULL FROM playback_sessions p WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND p.id=j.session_id AND NOT p.stopped AND p.expires_at>clock_timestamp()")
+        .bind(claim.id).bind(claim.owner).bind(claim.attempt).bind(complete).execute(&mut *tx).await?.rows_affected();
+    if updated != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query("UPDATE media_outputs SET visible_manifest=$4,ready_segments=$5,status=CASE WHEN $6 THEN 'published' ELSE 'writing' END,manifest_sha256=$7,segment_count=CASE WHEN $6 THEN $5 ELSE segment_count END,published_at=CASE WHEN $6 THEN clock_timestamp() ELSE published_at END WHERE job_id=$1 AND attempt=$2 AND owner_id=$3")
+        .bind(claim.id).bind(claim.attempt).bind(claim.owner).bind(&snapshot.manifest).bind(snapshot.segment_count).bind(complete)
+        .bind(hex::encode(Sha256::digest(snapshot.manifest.as_bytes()))).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(true)
+}

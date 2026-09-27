@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaybackReadiness",
+  "description": "Ready means the entry can be loaded, not that the entire movie is encoded.",
+  "type": "object",
+  "properties": {
+    "available_until_ms": {
+      "description": "Exclusive end of the published prefix, relative to the plan's timeline origin.\nNone means this source/legacy output has no measured generated interval.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "session_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "status": {
+      "$ref": "#/$defs/PreparationStatus"
+    }
+  },
+  "required": [
+    "session_id",
+    "status",
+    "complete"
+  ],
+  "$defs": {
+    "PreparationStatus": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "preparing",
+        "ready"
+      ]
+    }
+  }
+}

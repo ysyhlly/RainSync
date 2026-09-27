@@ -543,7 +543,12 @@ async fn prepare_playback(
         } else {
             None
         };
-        sqlx::query("INSERT INTO media_jobs(id,session_id,status,spec) VALUES($1,$1,'queued',$2)").bind(id).bind(json!({"root":config.root,"resource":item,"input_ticket":input_ticket,"start_seconds":timeline/1000.0,"transcode":mode=="transcode","audio_index":body.audio_index})).execute(&mut *tx).await?;
+        let estimated_output_bytes =
+            media_core::estimated_output_bytes(&meta, duration, timeline, mode == "transcode");
+        let spec = json!({"root":config.root,"resource":item,"input_ticket":input_ticket,"start_seconds":timeline/1000.0,"transcode":mode=="transcode","audio_index":body.audio_index,"estimated_output_bytes":estimated_output_bytes});
+        if !persistence::media_queue::enqueue(&mut tx, id, &spec, app.queue_limit).await? {
+            return Err(err(StatusCode::SERVICE_UNAVAILABLE, "media_queue_full"));
+        }
     }
     playback_requests::complete(app, &mut tx, reservation, &plan).await?;
     tx.commit().await?;
@@ -553,6 +558,101 @@ async fn prepare_playback(
 
     Ok(plan)
 }
+#[derive(Deserialize)]
+pub struct ReadinessQuery {
+    relative_position_ms: Option<f64>,
+}
+
+// Only the committed manifest is authoritative; never inspect FFmpeg's private file.
+fn published_duration_ms(manifest: &str, segments: i32) -> Option<f64> {
+    let mut count = 0;
+    let mut seconds = 0.0;
+    for duration in manifest
+        .lines()
+        .filter_map(|line| line.strip_prefix("#EXTINF:"))
+    {
+        let value: f64 = duration.split_once(',')?.0.parse().ok()?;
+        if !value.is_finite() || value <= 0.0 {
+            return None;
+        }
+        seconds += value;
+        count += 1;
+    }
+    let ms = seconds * 1000.0;
+    (count == segments && count > 0 && ms.is_finite()).then_some(ms)
+}
+
+pub async fn readiness(
+    State(app): State<App>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<ReadinessQuery>,
+) -> Result<Json<protocol::PlaybackReadiness>> {
+    let u = auth(&app, &h, false).await?;
+    if query
+        .relative_position_ms
+        .is_some_and(|p| !p.is_finite() || p < 0.0)
+    {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid_position"));
+    }
+    // One statement gives permission and the current attempt a consistent snapshot.
+    let row = sqlx::query("SELECT j.status AS job_status, j.error AS job_error, o.validation_version, o.ready_segments, o.visible_manifest FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id LEFT JOIN media_jobs j ON j.session_id=p.id LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND p.expires_at>now() AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
+        .bind(id).bind(u.id).fetch_optional(&app.db).await?
+        .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
+    use protocol::PreparationStatus::{Preparing, Queued, Ready};
+    let job: Option<String> = row.get("job_status");
+    let legacy = row
+        .get::<Option<i32>, _>("validation_version")
+        .is_some_and(|v| v < 2);
+    let available_until_ms = if job.is_none() || legacy {
+        None
+    } else {
+        Some(
+            row.get::<Option<String>, _>("visible_manifest")
+                .as_deref()
+                .and_then(|m| {
+                    published_duration_ms(
+                        m,
+                        row.get::<Option<i32>, _>("ready_segments").unwrap_or(0),
+                    )
+                })
+                .unwrap_or(0.0),
+        )
+    };
+    let (status, complete) = match job.as_deref() {
+        None => (Ready, true),
+        Some("queued") => (Queued, false),
+        Some("failed") => {
+            let reason: Option<String> = row.get("job_error");
+            let (status, reason) = persistence::media_jobs::terminal_error(reason.as_deref());
+            return Err(err(
+                StatusCode::from_u16(status).expect("fixed terminal status"),
+                reason,
+            ));
+        }
+        Some("cancelled") => return Err(err(StatusCode::GONE, "media_job_cancelled")),
+        Some("running" | "succeeded") => {
+            // Legacy outputs use the Worker's on-demand verification path.
+            let visible = available_until_ms.is_some_and(|end| {
+                end > 0.0
+                    && (job.as_deref() == Some("succeeded")
+                        || query.relative_position_ms.unwrap_or(0.0) < end)
+            });
+            (
+                if legacy || visible { Ready } else { Preparing },
+                job.as_deref() == Some("succeeded"),
+            )
+        }
+        _ => (Preparing, false),
+    };
+    Ok(Json(protocol::PlaybackReadiness {
+        session_id: id,
+        status,
+        complete,
+        available_until_ms,
+    }))
+}
+
 pub async fn stop(
     State(app): State<App>,
     h: HeaderMap,
@@ -582,4 +682,24 @@ pub async fn renew(
     };
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::published_duration_ms;
+    #[test]
+    fn published_interval_requires_finite_positive_durations_and_exact_count() {
+        assert_eq!(
+            published_duration_ms("#EXTINF:4.125,\nindex0.m4s\n#EXTINF:2,\nindex1.m4s\n", 2),
+            Some(6125.0)
+        );
+        for duration in ["NaN", "inf", "-1", "0", "1e308", "broken"] {
+            assert_eq!(
+                published_duration_ms(&format!("#EXTINF:{duration},\n"), 1),
+                None
+            );
+        }
+        assert_eq!(published_duration_ms("#EXTINF:4,\n", 2), None);
+        assert_eq!(published_duration_ms("", 0), None);
+    }
 }
