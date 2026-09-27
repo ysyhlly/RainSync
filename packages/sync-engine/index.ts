@@ -8,13 +8,21 @@ export interface PlaybackState {
 export class Clock {
   private samples: { rtt: number; offset: number }[] = [];
   offset = 0;
+  get ready() {
+    return this.samples.length > 0;
+  }
   reset() {
     this.samples = [];
     this.offset = 0;
   }
   sample(t1: number, t2: number, t3: number, t4: number) {
     const rtt = t4 - t1 - (t3 - t2);
-    if (!Number.isFinite(rtt) || rtt < 0) return;
+    if (
+      ![t1, t2, t3, t4].every(Number.isFinite) ||
+      !Number.isFinite(rtt) ||
+      rtt < 0
+    )
+      return false;
     this.samples.push({ rtt, offset: (t2 - t1 + (t3 - t4)) / 2 });
     this.samples = this.samples.slice(-24);
     const best = [...this.samples]
@@ -23,6 +31,7 @@ export class Clock {
       .map((v) => v.offset)
       .sort((a, b) => a - b);
     this.offset = best[Math.floor(best.length / 2)];
+    return true;
   }
   now() {
     return performance.now() + this.offset;
@@ -30,7 +39,7 @@ export class Clock {
 }
 export function target(s: PlaybackState, now: number) {
   return Math.min(
-    s.duration_ms ?? Infinity,
+    s.duration_ms ?? 7 * 24 * 60 * 60 * 1000,
     Math.max(
       0,
       s.anchor_position_ms +

@@ -1,4 +1,28 @@
 use super::*;
+
+/// Completion must not trust the encoder exit code alone: some muxer write
+/// failures can occur between periodic checks. Do not evict files here, since
+/// freeing space would hide the failure we are trying to classify.
+pub async fn check_output_capacity(app: &App) -> anyhow::Result<()> {
+    let root = app.cache.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let max = std::env::var("CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(20 * 1024 * 1024 * 1024);
+        anyhow::ensure!(
+            fs2::available_space(&root)? as f64 / fs2::total_space(&root)? as f64 > 0.1,
+            persistence::media_jobs::JobFailure::CacheCapacityExceeded
+        );
+        anyhow::ensure!(
+            size(&root)? < max,
+            persistence::media_jobs::JobFailure::CacheCapacityExceeded
+        );
+        Ok(())
+    })
+    .await??;
+    Ok(())
+}
 fn size(path: &std::path::Path) -> std::io::Result<u64> {
     let mut bytes = 0;
     for entry in std::fs::read_dir(path)? {
@@ -49,13 +73,30 @@ pub async fn ensure_capacity(app: &App) -> anyhow::Result<()> {
             std::fs::remove_dir_all(path)?;
             total = total.saturating_sub(bytes);
         }
-        anyhow::ensure!(total < max, "cache_full");
+        anyhow::ensure!(
+            total < max,
+            persistence::media_jobs::JobFailure::CacheCapacityExceeded
+        );
         anyhow::ensure!(
             fs2::available_space(&root)? as f64 / fs2::total_space(&root)? as f64 > 0.1,
-            "disk_space_low"
+            persistence::media_jobs::JobFailure::CacheCapacityExceeded
         );
         Ok(())
     })
     .await??;
     Ok(())
+}
+
+/// Cache traversal is independent of lease renewal. Slow scans cannot consume
+/// the renewal deadline; only a confirmed capacity error stops the encoder.
+pub async fn monitor(app: &App) -> anyhow::Error {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if let Err(error) = ensure_capacity(app).await {
+            if error.is::<persistence::media_jobs::JobFailure>() {
+                return error;
+            }
+            tracing::warn!("cache capacity scan unavailable; will retry");
+        }
+    }
 }

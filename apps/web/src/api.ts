@@ -14,6 +14,7 @@ export const useSession = defineStore("session", () => {
     body?: unknown,
     signal?: AbortSignal,
   ) {
+    const identity = user.value;
     const response = await fetch("/api/v1" + path, {
       method,
       signal,
@@ -29,11 +30,19 @@ export const useSession = defineStore("session", () => {
       if (response.ok) throw new TypeError("服务器响应不完整，请稍后重试");
       return null;
     });
-    if (!response.ok) throw new RequestFailure(value);
+    if (!response.ok) {
+      const failure = new RequestFailure(value);
+      if (identity === user.value) invalidate(failure);
+      throw failure;
+    }
     return value;
+  }
+  function invalidate(failure: RequestFailure) {
+    if (["LOGIN_REQUIRED", "SESSION_EXPIRED"].includes(failure.code))
+      user.value = null;
   }
   async function load() {
     user.value = await api("/auth/me");
   }
-  return { user, api, load };
+  return { user, api, load, invalidate };
 });

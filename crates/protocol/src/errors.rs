@@ -81,6 +81,9 @@ pub enum ErrorCode {
     CrossOriginSubtitle,
     InvalidResource,
     MediaJobFailed,
+    CacheCapacityExceeded,
+    MediaJobCancelled,
+    MediaJobRetryExhausted,
     InvalidResourceSignature,
     WrongResourceSession,
     CrossOriginMediaRejected,
@@ -144,6 +147,9 @@ impl ErrorCode {
 
     fn message(self) -> &'static str {
         match self {
+            Self::CacheCapacityExceeded => "媒体缓存空间不足，请联系管理员清理后重新发起播放",
+            Self::MediaJobCancelled => "媒体处理已取消，请重新加载当前播放",
+            Self::MediaJobRetryExhausted => "媒体处理重试次数已用尽，请检查服务后重新发起播放",
             Self::PlaybackRequestConflict => "播放请求编号已用于不同参数，请为新的操作使用新编号",
             Self::PlaybackRequestInProgress => "播放方案正在准备，请使用相同请求编号稍后查询",
             Self::PlaybackRequestInterrupted => "播放准备已中断，可使用相同请求编号重试",
@@ -153,6 +159,7 @@ impl ErrorCode {
             Self::LoginRequired | Self::SessionExpired | Self::InvalidPlaybackSession => {
                 "会话已失效，请重新登录或重新加载播放"
             }
+            Self::InvalidName => "房间名不能为空，且不能超过 120 个字符",
             Self::InvalidCredentials => "用户名或密码不正确",
             Self::Forbidden
             | Self::NotAMember

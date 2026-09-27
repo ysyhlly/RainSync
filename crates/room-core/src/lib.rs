@@ -7,9 +7,7 @@ pub fn position(state: &RoomState, now: f64) -> f64 {
     } else {
         0.0
     };
-    (state.anchor_position_ms + elapsed)
-        .max(0.0)
-        .min(state.duration_ms.unwrap_or(f64::MAX))
+    protocol::bounded_position(state.anchor_position_ms + elapsed, state.duration_ms)
 }
 
 pub fn reduce(
@@ -47,7 +45,7 @@ pub fn reduce(
             if !position_ms.is_finite() || position_ms < 0.0 {
                 return Err("invalid_position");
             }
-            next.anchor_position_ms = position_ms.min(state.duration_ms.unwrap_or(f64::MAX));
+            next.anchor_position_ms = protocol::bounded_position(position_ms, state.duration_ms);
         }
         Action::SetRate { rate } => {
             if !rate.is_finite() || !(0.25..=2.0).contains(&rate) {
@@ -125,6 +123,27 @@ mod tests {
         assert_eq!(
             reduce(&s, &c, s.controller_user_id, false, 0.0),
             Err("stale_media")
+        );
+    }
+    #[test]
+    fn unknown_duration_seek_is_bounded() {
+        let (mut s, mut c) = fixture();
+        s.duration_ms = None;
+        c.action = Action::Seek {
+            position_ms: f64::MAX,
+        };
+        assert_eq!(
+            reduce(&s, &c, s.controller_user_id, false, 0.0)
+                .unwrap()
+                .anchor_position_ms,
+            protocol::UNKNOWN_DURATION_LIMIT_MS
+        );
+        s.duration_ms = Some(1234.0);
+        assert_eq!(
+            reduce(&s, &c, s.controller_user_id, false, 0.0)
+                .unwrap()
+                .anchor_position_ms,
+            1234.0
         );
     }
     #[test]

@@ -1,5 +1,12 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, nextTick } from "vue";
+import {
+  ref,
+  computed,
+  onMounted,
+  onBeforeUnmount,
+  nextTick,
+  watch,
+} from "vue";
 import Hls from "hls.js";
 import { detectCapabilities } from "../../../packages/player-core";
 import { useSession } from "./api";
@@ -72,7 +79,8 @@ const newUser = ref(""),
   pairCode = ref("");
 const tracks = ref<PlaybackPlan["audio_tracks"]>([]),
   subtitles = ref<PlaybackPlan["subtitle_tracks"]>([]),
-  audioIndex = ref<number | undefined>();
+  audioIndex = ref<number | undefined>(),
+  subtitleIndex = ref<number | undefined>();
 const duration = ref(0),
   position = ref(0);
 let socket: WebSocket | undefined,
@@ -83,6 +91,27 @@ let attempt = 0,
   connectionSerial = 0,
   loadSerial = 0;
 let controlEpoch: string | undefined;
+let roomSerial = 0;
+let clockAction: "load" | "apply" | undefined;
+const dragging = ref(false);
+let pendingChat: { id: string; body: string } | undefined;
+watch(
+  () => session.user,
+  (user) => {
+    if (user) return;
+    ++connectionSerial;
+    ++roomSerial;
+    ++loadSerial;
+    clearTimeout(retry);
+    socket?.close();
+    connected.value = false;
+    room.value = null;
+    state.value = null;
+    clockAction = undefined;
+    void playbackRequests?.stop().catch(() => {});
+    void stopPlayback().catch(() => {});
+  },
+);
 const clock = new Clock(),
   corrector = new Corrector();
 const owner = computed(
@@ -136,19 +165,53 @@ async function login() {
   await refresh();
 }
 async function createRoom() {
+  if ([...roomName.value].length > 120)
+    throw new Error("房间名不能超过 120 个字符");
   const r = await session.api("/rooms", "POST", { name: roomName.value });
   await refresh();
   await enter(rooms.value.find((x) => x.id === r.id));
 }
 async function enter(r: any) {
+  const serial = ++roomSerial;
+  ++connectionSerial;
+  clearTimeout(retry);
+  socket?.close();
+  connected.value = false;
+  controlEpoch = undefined;
+  clockAction = undefined;
+  clock.reset();
   room.value = r;
   state.value = null;
+  playlist.value = [];
+  messages.value = [];
+  pendingChat = undefined;
+  dragging.value = false;
   tab.value = "watch";
   loadSerial++;
   await stopPlayback();
+  if (serial !== roomSerial) return;
   connect();
-  playlist.value = await session.api(`/rooms/${r.id}/playlist`);
-  messages.value = await session.api(`/rooms/${r.id}/messages`);
+  const items = await session.api(`/rooms/${r.id}/playlist`);
+  if (serial === roomSerial) playlist.value = items;
+}
+async function catchUpChat(id: string, serial: number) {
+  const before = [...messages.value];
+  const recovered: any[] = [];
+  let after = before.at(-1)?.id;
+  do {
+    const history = await session.api(
+      `/rooms/${id}/messages${after ? `?after=${after}` : ""}`,
+    );
+    if (serial !== connectionSerial || room.value?.id !== id) return;
+    recovered.push(...history);
+    messages.value = [
+      ...new Map(
+        [...before, ...recovered, ...messages.value].map((m) => [m.id, m]),
+      ).values(),
+    ];
+    if (history.length < 100) return;
+    after = history.at(-1)?.id;
+  } while (after);
 }
 function connect() {
   controlEpoch = undefined;
@@ -163,6 +226,7 @@ function connect() {
   socket = new WebSocket(
     `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/v1/ws`,
   );
+  clock.reset();
   socket.onopen = () => {
     if (serial !== connectionSerial) return;
     connected.value = true;
@@ -175,7 +239,11 @@ function connect() {
         clock_epoch: state.value?.clock_epoch,
       }),
     );
-    clock.reset();
+    pendingChat = undefined;
+    void catchUpChat(room.value.id, serial).catch((e) => {
+      if (serial === connectionSerial)
+        error.value = e instanceof Error ? e.message : String(e);
+    });
     for (let i = 0; i < 8; i++)
       setTimeout(() => {
         if (serial === connectionSerial) sampleClock();
@@ -190,7 +258,15 @@ function connect() {
       try {
         await session.load();
       } catch (failure) {
-        if (serial !== connectionSerial) return;
+        if (serial !== connectionSerial) {
+          if (
+            !session.user &&
+            failure instanceof RequestFailure &&
+            ["SESSION_EXPIRED", "LOGIN_REQUIRED"].includes(failure.code)
+          )
+            error.value = failure.message;
+          return;
+        }
         if (failure instanceof RequestFailure && stopsReconnect(failure)) {
           retryAllowed = false;
           error.value = failure.message;
@@ -207,15 +283,25 @@ function connect() {
     if (typeof v.control_epoch?.id === "string")
       controlEpoch = v.control_epoch.id;
     if (v.type === "CLOCK_SYNC_REPLY") {
-      clock.sample(v.t1, v.t2, v.t3, performance.now());
+      if (clock.sample(v.t1, v.t2, v.t3, performance.now()) && clockAction) {
+        const action = clockAction;
+        clockAction = undefined;
+        void run(action === "load" ? loadMedia : () => applyState(true));
+      }
       return;
     }
     if (v.type === "CHAT") {
-      messages.value.push(v);
+      if (!messages.value.some((m) => m.id === v.id)) messages.value.push(v);
+      if (pendingChat && v.client_message_id === pendingChat.id) {
+        if (chat.value === pendingChat.body) chat.value = "";
+        pendingChat = undefined;
+      }
       return;
     }
     if (v.type === "ERROR") {
       const failure = new RequestFailure(v);
+      session.invalidate(failure);
+      pendingChat = undefined;
       error.value = failure.message;
       if (stopsReconnect(failure)) {
         retryAllowed = false;
@@ -231,10 +317,16 @@ function connect() {
         next.revision < old.revision
       )
         return;
+      if (next.room_id !== room.value?.id) return;
+      if (old && old.clock_epoch !== next.clock_epoch) {
+        clock.reset();
+        sampleClock();
+      }
       state.value = next;
       if (!old || old.media_generation !== next.media_generation) {
         corrector.reset();
         audioIndex.value = undefined;
+        subtitleIndex.value = undefined;
         void run(() => loadMedia());
       } else if (v.action?.type === "SEEK") void run(() => applyState(true));
       else {
@@ -276,20 +368,34 @@ async function stopPlayback() {
   }
   const old = plan;
   plan = undefined;
-  if (old)
-    await session
-      .api(`/playback-sessions/${old.session_id}`, "DELETE")
-      .catch(() => {});
-  if (session.user) await requests().stop();
+  // Capture and cancel this operation before the first asynchronous wait.
+  // A late session DELETE must never call stop() on a newer preparation.
+  const cancellation = session.user ? requests().stop() : Promise.resolve();
+  await Promise.all([
+    cancellation,
+    old
+      ? session
+          .api(`/playback-sessions/${old.session_id}`, "DELETE")
+          .catch(() => {})
+      : Promise.resolve(),
+  ]);
 }
 async function loadMedia() {
   const s = state.value;
   if (!s?.media_id) return;
+  if (!clock.ready) {
+    clockAction = "load";
+    return;
+  }
   const serial = ++loadSerial;
   try {
     await stopPlayback();
     await nextTick();
     if (serial !== loadSerial || !video.value) return;
+    if (!clock.ready) {
+      clockAction = "load";
+      return;
+    }
     const request: PlaybackRequest = {
       room_id: s.room_id,
       media_generation: s.media_generation,
@@ -309,6 +415,11 @@ async function loadMedia() {
     plan = p;
     tracks.value = p.audio_tracks;
     subtitles.value = p.subtitle_tracks;
+    if (!p.subtitle_tracks.some((t) => t.index === subtitleIndex.value))
+      subtitleIndex.value = undefined;
+    await nextTick();
+    if (serial !== loadSerial) return;
+    applySubtitles();
     const el = video.value;
     waiting.value = true;
     if (
@@ -323,8 +434,16 @@ async function loadMedia() {
       });
       hls.loadSource(p.playback_url);
       hls.attachMedia(el);
+      let recoveries = 0;
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (serial === loadSerial && data.fatal) {
+          if (data.response?.code === 409 && recoveries++ < 3) {
+            // The entry URL resolves the new worker attempt without creating a session.
+            hls?.stopLoad();
+            hls?.loadSource(p.playback_url);
+            hls?.startLoad(-1);
+            return;
+          }
           error.value = "媒体加载失败：" + data.details;
           waiting.value = false;
         }
@@ -332,6 +451,7 @@ async function loadMedia() {
     } else el.src = p.playback_url;
     el.onloadedmetadata = () => {
       if (serial !== loadSerial) return;
+      applySubtitles();
       duration.value = p.duration_ms ? p.duration_ms / 1000 : el.duration;
       void run(() => applyState(true));
     };
@@ -340,10 +460,24 @@ async function loadMedia() {
     throw e;
   }
 }
+function applySubtitles() {
+  if (!video.value) return;
+  for (const element of Array.from(video.value.querySelectorAll("track"))) {
+    element.track.mode =
+      subtitleIndex.value !== undefined &&
+      Number(element.dataset.index) === subtitleIndex.value
+        ? "showing"
+        : "disabled";
+  }
+}
 async function applyState(force = false) {
   const s = state.value,
     el = video.value;
   if (!s || !el || !plan || el.readyState < 1) return;
+  if (!clock.ready) {
+    clockAction ??= "apply";
+    return;
+  }
   const relative = (target(s, clock.now()) - plan.timeline_origin_ms) / 1000;
   const expected = Math.max(0, relative);
   if (
@@ -378,8 +512,10 @@ function tick() {
   const s = state.value,
     el = video.value;
   if (!s || !el || !plan) return;
-  position.value = el.currentTime + plan.timeline_origin_ms / 1000;
-  if (!connected.value || s.playback_status !== "playing") return;
+  if (!dragging.value)
+    position.value = el.currentTime + plan.timeline_origin_ms / 1000;
+  if (!clock.ready || !connected.value || s.playback_status !== "playing")
+    return;
   const expected = (target(s, clock.now()) - plan.timeline_origin_ms) / 1000;
   const adjustment = corrector.step(
     (expected - el.currentTime) * 1000,
@@ -431,15 +567,33 @@ async function scan(id: string) {
   await refresh();
 }
 async function addQueue(id: string) {
-  await session.api(`/rooms/${room.value.id}/playlist`, "POST", {
+  const selected = room.value.id,
+    serial = roomSerial;
+  await session.api(`/rooms/${selected}/playlist`, "POST", {
     media_id: id,
   });
-  playlist.value = await session.api(`/rooms/${room.value.id}/playlist`);
+  const items = await session.api(`/rooms/${selected}/playlist`);
+  if (serial === roomSerial) playlist.value = items;
 }
 function sendChat() {
-  if (!chat.value.trim() || !connected.value) return;
-  socket?.send(JSON.stringify({ type: "CHAT", body: chat.value }));
-  chat.value = "";
+  if (!chat.value.trim() || !connected.value || pendingChat) return;
+  if ([...chat.value].length > 2000) {
+    error.value = "聊天消息不能超过 2000 个字符";
+    return;
+  }
+  pendingChat = { id: crypto.randomUUID(), body: chat.value };
+  socket?.send(
+    JSON.stringify({
+      type: "CHAT",
+      body: chat.value,
+      client_message_id: pendingChat.id,
+    }),
+  );
+}
+function seek(event: Event) {
+  position.value = Number((event.target as HTMLInputElement).value);
+  dragging.value = false;
+  send("SEEK", { position_ms: position.value * 1000 });
 }
 function format(s: number) {
   if (!Number.isFinite(s)) return "--:--";
@@ -448,7 +602,7 @@ function format(s: number) {
     .padStart(2, "0")}`;
 }
 const statusTimer = setInterval(() => {
-  if (connected.value && state.value && video.value)
+  if (clock.ready && connected.value && state.value && video.value)
     socket?.send(
       JSON.stringify({
         type: "CLIENT_STATUS",
@@ -462,16 +616,23 @@ const statusTimer = setInterval(() => {
 const timer = setInterval(tick, 500),
   clockTimer = setInterval(sampleClock, 30000),
   renewTimer = setInterval(() => {
-    if (plan)
+    const current = plan?.session_id;
+    if (current)
       void session
-        .api(`/playback-sessions/${plan.session_id}`, "POST")
-        .catch(() => {
-          error.value = "播放会话已失效，请重新加载";
+        .api(`/playback-sessions/${current}`, "POST")
+        .catch((failure) => {
+          if (
+            plan?.session_id === current &&
+            failure instanceof RequestFailure &&
+            ["INVALID_PLAYBACK_SESSION", "SESSION_EXPIRED"].includes(
+              failure.code,
+            )
+          )
+            error.value = "播放会话已失效，请重新加载";
         });
   }, 600000);
 function wake() {
   if (document.visibilityState === "visible") {
-    clock.reset();
     sampleClock();
     void run(() => applyState(true));
   }
@@ -611,7 +772,7 @@ onBeforeUnmount(() => {
             <input
               aria-label="新房间名称"
               v-model="roomName"
-              maxlength="120"
+              :maxlength="240"
             /><button :disabled="busy">＋ 创建房间</button>
           </form>
           <details>
@@ -639,6 +800,7 @@ onBeforeUnmount(() => {
                 <track
                   v-for="t in subtitles"
                   :key="t.index"
+                  :data-index="t.index"
                   kind="subtitles"
                   :src="t.url ?? undefined"
                   :srclang="t.language"
@@ -678,12 +840,15 @@ onBeforeUnmount(() => {
                 :max="Number.isFinite(duration) ? duration : 0"
                 :value="position"
                 :disabled="!owner || !connected"
-                @change="
-                  send('SEEK', {
-                    position_ms:
-                      Number(($event.target as HTMLInputElement).value) * 1000,
-                  })
+                @pointerdown="dragging = true"
+                @input="
+                  dragging = true;
+                  position = Number(($event.target as HTMLInputElement).value);
                 "
+                @change="seek"
+                @pointerup="dragging = false"
+                @pointercancel="dragging = false"
+                @blur="dragging = false"
               /><select
                 aria-label="房间倍速"
                 :disabled="!owner || !connected"
@@ -730,21 +895,13 @@ onBeforeUnmount(() => {
                   </option>
                 </select></label
               ><label v-if="subtitles.length"
-                >字幕<select
-                  @change="
-                    video &&
-                    Array.from(video.textTracks).forEach(
-                      (t, i) =>
-                        (t.mode =
-                          i ===
-                          Number(($event.target as HTMLSelectElement).value)
-                            ? 'showing'
-                            : 'disabled'),
-                    )
-                  "
-                >
-                  <option value="-1">关闭</option>
-                  <option v-for="(t, i) in subtitles" :key="t.index" :value="i">
+                >字幕<select v-model="subtitleIndex" @change="applySubtitles">
+                  <option :value="undefined">关闭</option>
+                  <option
+                    v-for="t in subtitles"
+                    :key="t.index"
+                    :value="t.index"
+                  >
                     {{ t.label }} · {{ t.language }}
                   </option>
                 </select></label
@@ -783,7 +940,7 @@ onBeforeUnmount(() => {
                 v-model="chat"
                 aria-label="聊天消息"
                 placeholder="说点什么…"
-                maxlength="2000"
+                :maxlength="4000"
                 :disabled="!connected"
               /><button :disabled="!connected">↑</button>
             </form>

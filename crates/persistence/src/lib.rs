@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use protocol::{Command, RoomState};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use uuid::Uuid;
+pub mod media_jobs;
 
 pub async fn connect(url: &str) -> Result<PgPool> {
     Ok(PgPoolOptions::new()

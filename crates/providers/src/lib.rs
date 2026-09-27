@@ -43,6 +43,17 @@ pub fn validate_url(value: &str) -> Result<reqwest::Url> {
     }
     Ok(url)
 }
+/// PlaybackInfo may contain absolute URLs, but credentials must stay at the configured origin.
+pub fn upstream_url(base: &reqwest::Url, path: &str) -> Result<reqwest::Url> {
+    let joined = if path.starts_with("//") {
+        base.join(path)?
+    } else {
+        base.join(path.trim_start_matches('/'))?
+    };
+    let url = validate_url(joined.as_str())?;
+    anyhow::ensure!(url.origin() == base.origin(), "upstream_origin_mismatch");
+    Ok(url)
+}
 fn base(config: &SourceConfig) -> Result<String> {
     Ok(validate_url(&config.url)?
         .as_str()
@@ -84,9 +95,6 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
                                 duration_ms: None,
                                 metadata: json!({}),
                             });
-                        }
-                        if items.len() > 10000 {
-                            bail!("library_limit")
                         }
                     }
                 }
@@ -146,9 +154,6 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
                 {
                     break;
                 };
-                if start >= 10000 {
-                    bail!("library_limit")
-                }
             }
             Ok(result)
         }
@@ -198,6 +203,56 @@ pub async fn upstream_plan(
 #[cfg(test)]
 mod playback_tests {
     use super::*;
+    #[tokio::test]
+    async fn local_library_exceeding_ten_thousand_is_not_discarded() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let root = parent.join(format!(
+            "rainsync-provider-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        for i in 0..10001 {
+            std::fs::write(root.join(format!("{i}.mp4")), []).unwrap();
+        }
+        let config: SourceConfig = serde_json::from_value(json!({"root":root})).unwrap();
+        let result = list_items("local", &config).await;
+        assert_eq!(
+            root.canonicalize().unwrap().parent(),
+            Some(parent.as_path())
+        );
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("rainsync-provider-test-")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result.unwrap().len(), 10001);
+    }
+    #[test]
+    fn playback_url_cannot_move_credentials_to_another_origin() {
+        let base = validate_url("https://media.example/emby/").unwrap();
+        for path in [
+            "https://evil.example/stream",
+            "//evil.example/stream",
+            "http://media.example/stream",
+            "https://media.example:444/stream",
+            "https://user:pass@media.example/stream",
+        ] {
+            assert!(upstream_url(&base, path).is_err(), "{path}");
+        }
+        for path in [
+            "Videos/1/master.m3u8",
+            "/Videos/1/master.m3u8",
+            "https://media.example/stream",
+        ] {
+            assert_eq!(upstream_url(&base, path).unwrap().origin(), base.origin());
+        }
+    }
     #[test]
     fn playback_request_preserves_seek_audio_and_transport_constraints() {
         let config: SourceConfig = serde_json::from_value(json!({"user_id":"viewer"})).unwrap();

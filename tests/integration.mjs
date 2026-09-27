@@ -1,3 +1,4 @@
+import { reviewRegressions } from "./review-regressions.mjs";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir, writeFile, readFile } from "node:fs/promises";
@@ -5,6 +6,9 @@ import { resolve } from "node:path";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { controlEpochs } from "./control-epochs.mjs";
+import { audioRouting } from "./audio-routing.mjs";
+import { subtitleDelivery } from "./subtitle-delivery.mjs";
+import { workerAttempts } from "./worker-attempts.mjs";
 import {
   playbackIdempotency,
   preparePlaybackRestart,
@@ -12,7 +16,7 @@ import {
 } from "./playback-idempotency.mjs";
 
 // Isolated, disposable test database and processes; never targets user databases.
-const root = resolve(".runtime/integration");
+const root = resolve(".runtime/integration", randomUUID());
 await mkdir(root, { recursive: true });
 const password = randomBytes(24).toString("hex"),
   container = `rainsync-test-${randomUUID().slice(0, 8)}`;
@@ -233,6 +237,18 @@ try {
   await delay(2000);
   let server = launch("rainsync-server");
   await ready(origin + "/health");
+  execFileSync(
+    resolve(
+      "target/debug/examples/verify_job_attempts" +
+        (process.platform === "win32" ? ".exe" : ""),
+    ),
+    [],
+    {
+      env: { ...env, RAINSYNC_ISOLATED_TEST: "1" },
+      stdio: "inherit",
+      windowsHide: true,
+    },
+  );
   launch("rainsync-media-worker", { PUBLIC_ORIGIN: worker });
   await ready(worker + "/health");
   for (const [base, path, options, status, code] of [
@@ -495,6 +511,62 @@ try {
   a.ws.send(JSON.stringify({ type: "CHAT", body: "Together!" }));
   assert.equal((await b.wait((v) => v.type === "CHAT")).body, "Together!");
   await playbackIdempotency({ admin, friend, room, state, sql });
+  await audioRouting({ admin, room, state, sql });
+  const originalMetadata = sql(
+    `SELECT metadata FROM media_items WHERE id='${state.media_id}'`,
+  );
+  const rotatedMetadata = {
+    format: { format_name: "mov,mp4" },
+    streams: [
+      {
+        index: 0,
+        codec_type: "video",
+        codec_name: "h264",
+        pix_fmt: "yuv420p",
+        side_data_list: [{ side_data_type: "Display Matrix", rotation: 90 }],
+      },
+    ],
+  };
+  sql(
+    `UPDATE media_items SET metadata='${JSON.stringify(rotatedMetadata)}'::jsonb WHERE id='${state.media_id}'`,
+  );
+  try {
+    for (const [mode, capabilities, expected] of [
+      ["auto", null, "direct"],
+      ["remux", null, "transcode"],
+      [
+        "auto",
+        { progressive_h264_aac: false, native_hls: true, mse_h264_aac: false },
+        "transcode",
+      ],
+    ]) {
+      const rotationPlan = await admin.request("/playback-sessions", "POST", {
+        room_id: room.id,
+        media_generation: state.media_generation,
+        mode,
+        capabilities,
+      });
+      assert.equal(rotationPlan.delivery_mode, expected);
+      if (expected === "transcode")
+        assert.equal(
+          sql(
+            `SELECT spec->>'transcode' FROM media_jobs WHERE session_id='${rotationPlan.session_id}'`,
+          ),
+          "true",
+        );
+      await admin.request(
+        `/playback-sessions/${rotationPlan.session_id}`,
+        "DELETE",
+      );
+    }
+  } finally {
+    sql(
+      `UPDATE media_items SET metadata='${originalMetadata.replaceAll("'", "''")}'::jsonb WHERE id='${state.media_id}'`,
+    );
+  }
+  console.log(
+    "PASS: rotated direct source stays direct; requested or negotiated local HLS transcodes orientation",
+  );
   const plan = await friend.request("/playback-sessions", "POST", {
     room_id: room.id,
     media_generation: state.media_generation,
@@ -525,6 +597,13 @@ try {
   assert.equal(await r.text(), "");
   r = await fetch(worker + plan.playback_url, { method: "HEAD" });
   assert.equal(r.headers.get("content-length"), "2048");
+  await workerAttempts({
+    plan,
+    worker,
+    sql,
+    key: env.SOURCE_ENCRYPTION_KEY,
+    cache: env.CACHE_ROOT,
+  });
   await friend.request(`/playback-sessions/${plan.session_id}`, "DELETE");
   const revoked = await fetch(worker + plan.playback_url);
   assert.equal(revoked.status, 401);
@@ -584,6 +663,9 @@ try {
   await admin.request(`/agents/${pair.id}`, "DELETE");
   assert.equal((await fetch(worker + agentPlan.playback_url)).status, 503);
   const upstreamReports = [];
+  const subtitleFixture =
+    "\ufeffWEBVTT\r\n\r\n00:00.000 --> 00:01.000\r\n已结束\r\n\r\n00:01.000 --> 00:05.000\r\n中文跨越起点\r\n";
+  let subtitleBody = subtitleFixture;
   let negotiations = 0;
   let failNegotiations = 0;
   let probeResponse;
@@ -625,12 +707,33 @@ try {
           () =>
             res.end(
               JSON.stringify({
-                MediaSources: [{ Id: "source-1", SupportsDirectPlay: true }],
+                MediaSources: [
+                  {
+                    Id: "source-1",
+                    SupportsDirectPlay: true,
+                    MediaStreams: [
+                      {
+                        Type: "Subtitle",
+                        Index: 7,
+                        IsTextSubtitleStream: true,
+                        DisplayTitle: "中文",
+                        Language: "zho",
+                      },
+                    ],
+                  },
+                ],
                 PlaySessionId: "mock-session",
               }),
             ),
           1000,
         );
+      } else if (req.url.includes("/Subtitles/7/Stream.vtt")) {
+        assert.ok(
+          req.headers["x-emby-token"] === "mock-token" ||
+            req.headers.authorization?.includes("mock-token"),
+        );
+        res.setHeader("Content-Type", "text/vtt");
+        res.end(subtitleBody);
       } else if (req.url.startsWith("/Sessions/Playing")) {
         upstreamReports.push(req.url);
         res.setHeader("Content-Type", "application/json");
@@ -789,6 +892,15 @@ try {
       "duplicate request must not negotiate a second upstream session",
     );
     assert.ok(!JSON.stringify(p).includes("mock-token"));
+    await subtitleDelivery({
+      plan: p,
+      worker,
+      sql,
+      key: env.SOURCE_ENCRYPTION_KEY,
+      setBody: (body = subtitleFixture) => {
+        subtitleBody = body;
+      },
+    });
     assert.deepEqual(
       Buffer.from(await (await fetch(worker + p.playback_url)).arrayBuffer()),
       bytes,
@@ -1120,6 +1232,7 @@ try {
   assertError(quotaError, "RATE_LIMITED");
   assert.equal(quotaError.error.retryable, true);
   limited.ws.close();
+  await reviewRegressions({ admin, friend, sql, connect, origin, container });
   const started = performance.now();
   const clients = await Promise.all(
     Array.from({ length: 100 }, () => connect(admin, room.id)),

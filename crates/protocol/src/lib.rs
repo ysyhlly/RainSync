@@ -7,6 +7,15 @@ mod errors;
 pub use errors::{ApiError, ErrorCode, ErrorResponse};
 
 pub const VERSION: u8 = 1;
+/// Unknown-duration media is bounded to one week. Known durations are authoritative.
+pub const UNKNOWN_DURATION_LIMIT_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+pub fn bounded_position(position: f64, duration: Option<f64>) -> f64 {
+    position.max(0.0).min(
+        duration
+            .filter(|d| d.is_finite() && *d >= 0.0)
+            .unwrap_or(UNKNOWN_DURATION_LIMIT_MS),
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]

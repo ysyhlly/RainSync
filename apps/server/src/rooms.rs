@@ -101,12 +101,14 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                     room_core::reduce(&state, &req.command, req.user.id, req.user.admin, app.now())
                         .map_err(String::from)?;
                 if let protocol::Action::ChangeMedia { media_id } = req.command.action {
-                    let duration = sqlx::query("SELECT duration_ms FROM media_items WHERE id=$1")
-                        .bind(media_id)
-                        .fetch_optional(&app.db)
-                        .await
-                        .map_err(|_| "database_error".to_string())?
-                        .ok_or("media_not_found")?;
+                    let duration = sqlx::query(
+                        "SELECT duration_ms FROM media_items WHERE id=$1 AND available",
+                    )
+                    .bind(media_id)
+                    .fetch_optional(&app.db)
+                    .await
+                    .map_err(|_| "database_error".to_string())?
+                    .ok_or("media_not_found")?;
                     next.duration_ms = duration.get("duration_ms");
                 }
                 persistence::commit(&app.db, &next, &req.command, req.user.id, state.revision)
@@ -159,7 +161,7 @@ pub async fn create(
     Json(body): Json<Name>,
 ) -> Result<Json<Value>> {
     let u = auth(&app, &h, true).await?;
-    if body.name.trim().is_empty() || body.name.len() > 120 {
+    if body.name.trim().is_empty() || body.name.chars().count() > 120 {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_name"));
     }
     let id = Uuid::new_v4();
@@ -204,6 +206,11 @@ async fn controller<'a>(
     let u = auth(app, h, true).await?;
     member(app, &u, id).await?;
     let mut tx = app.db.begin().await?;
+    // Same order as joining: room first, then snapshot/invitation.
+    sqlx::query("SELECT id FROM rooms WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
     let value: Value =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
             .bind(id)
@@ -321,15 +328,24 @@ pub async fn remove_playlist(
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }
+#[derive(Deserialize)]
+pub struct MessageCursor {
+    after: Option<Uuid>,
+}
 pub async fn messages(
     State(app): State<App>,
     h: HeaderMap,
     Path(id): Path<Uuid>,
+    axum::extract::Query(cursor): axum::extract::Query<MessageCursor>,
 ) -> Result<Json<Value>> {
     let u = auth(&app, &h, false).await?;
     member(&app, &u, id).await?;
-    let rows=sqlx::query("SELECT c.id,c.body,u.username FROM chat_messages c JOIN users u ON u.id=c.user_id WHERE room_id=$1 ORDER BY c.created_at DESC LIMIT 100").bind(id).fetch_all(&app.db).await?;
-    Ok(Json(Value::Array(rows.iter().rev().map(|r|json!({"id":r.get::<Uuid,_>("id"),"body":r.get::<String,_>("body"),"username":r.get::<String,_>("username")})).collect())))
+    let rows = if let Some(after) = cursor.after {
+        sqlx::query("SELECT c.id,c.body,u.username,c.created_at::text FROM chat_messages c JOIN users u ON u.id=c.user_id WHERE c.room_id=$1 AND (NOT EXISTS(SELECT 1 FROM chat_messages WHERE id=$2 AND room_id=$1) OR (c.created_at,c.id) > (SELECT created_at,id FROM chat_messages WHERE id=$2 AND room_id=$1)) ORDER BY c.created_at,c.id LIMIT 100").bind(id).bind(after).fetch_all(&app.db).await?
+    } else {
+        sqlx::query("SELECT * FROM (SELECT c.id,c.body,u.username,c.created_at FROM chat_messages c JOIN users u ON u.id=c.user_id WHERE room_id=$1 ORDER BY c.created_at DESC,c.id DESC LIMIT 100) history ORDER BY created_at,id").bind(id).fetch_all(&app.db).await?
+    };
+    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"body":r.get::<String,_>("body"),"username":r.get::<String,_>("username")})).collect())))
 }
 
 pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: String) {
@@ -418,10 +434,10 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                     "CLOCK_SYNC"=>{let t2=app.now();json!({"type":"CLOCK_SYNC_REPLY","t1":v["t1"],"t2":t2,"t3":app.now(),"clock_epoch":app.epoch})},
                     "CLIENT_STATUS"=>{app.metrics.report(&v["status"]);let _=handle.events.send(json!({"type":"CLIENT_STATUS","user_id":user.id,"status":v["status"]}));continue},
                     "CHAT"=>{
-                        let Some(body)=v["body"].as_str().filter(|b|!b.trim().is_empty()&&b.len()<=2000)else{reject_socket(&mut out,"invalid_request").await;continue};let cid=Uuid::new_v4();
+                        let Some(body)=v["body"].as_str().filter(|b|!b.trim().is_empty()&&b.chars().count()<=2000)else{reject_socket(&mut out,"invalid_request").await;continue};let cid=Uuid::new_v4();
                         if sqlx::query("INSERT INTO chat_messages(id,room_id,user_id,body) VALUES($1,$2,$3,$4)").bind(cid).bind(id).bind(user.id).bind(body).execute(&app.db).await.is_err(){reject_socket(&mut out,"database_error").await;break}
                         let name:String=sqlx::query_scalar("SELECT username FROM users WHERE id=$1").bind(user.id).fetch_one(&app.db).await.unwrap_or_default();
-                        let _=handle.events.send(json!({"type":"CHAT","id":cid,"username":name,"body":body}));continue
+                        let _=handle.events.send(json!({"type":"CHAT","id":cid,"username":name,"body":body,"client_message_id":v["client_message_id"].as_str().and_then(|s| Uuid::parse_str(s).ok())}));continue
                     }
                     _=>{
                         let command_id = v["command_id"].as_str().and_then(|s|Uuid::parse_str(s).ok());

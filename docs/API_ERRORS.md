@@ -21,6 +21,8 @@ HTTP 状态仍表达请求结果。响应中的 `request_id` 由服务端生成�
 
 ## 客户端处理
 
+Worker 任务终态补充：`CACHE_CAPACITY_EXCEEDED`（503）、`MEDIA_JOB_RETRY_EXHAUSTED`（502）和 `MEDIA_JOB_CANCELLED`（410）均为 `retryable: false`。这些任务已经终止，重复读取相同媒体 URL 不能恢复；容量不足需清理后重新发起播放。未知持久化原因只返回 `MEDIA_JOB_FAILED`，不回显数据库原文。此处定义 HTTP 契约，不代表浏览器原生 HLS 会把 JSON 错误正文展示给用户。
+
 | 情况 | 处理 |
 |---|---|
 | `LOGIN_REQUIRED` / `SESSION_EXPIRED` / `NOT_A_MEMBER` / `ORIGIN_REJECTED` | 停止自动重连并提示登录或连接授权问题 |
@@ -45,3 +47,7 @@ HTTP 状态仍表达请求结果。响应中的 `request_id` 由服务端生成�
 先部署支持两种形状的新 Web，再部署 Server/Worker；旧 Web 必须刷新，新 Web 可读取旧后端字符串。第三方客户端需从 `error.code` 读取机器码，并使用 `error.message` 展示文本，不能比较可翻译的说明文字。代理网关自身生成的非 JSON 错误不属于此契约，新 Web 对这类响应显示通用失败提示。
 
 验证入口：`cargo test -p protocol`、`npm test`、`node tests/integration.mjs`、`npm run test:e2e`。真实数据库集成覆盖应用/提取器/路由错误、范围头及权限；浏览器测试用受控 HTTP/WS 响应验证 UI 展示和停止重连，不替代真实弱网验收。
+
+### 播放续期与登录失效的区分
+
+`POST /playback-sessions/{id}` 对停止、过期、旧媒体代次或无权续期的播放会话返回 410 `INVALID_PLAYBACK_SESSION`。`LOGIN_REQUIRED` / `SESSION_EXPIRED` 表示登录失效，Web 清空登录用户；旧播放的续期失败不应触发退出登录。房间名使用 `INVALID_NAME` 的专用中文文案，长度按 Unicode 标量计算。

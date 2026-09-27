@@ -15,6 +15,17 @@ describe("clock and playback convergence", () => {
     c.sample(60, 1000, 1001, 1000);
     expect(c.offset).toBe(100);
   });
+  it("requires a finite sample after reset", () => {
+    const c = new Clock();
+    expect(c.ready).toBe(false);
+    expect(c.sample(0, Infinity, Infinity, 5)).toBe(false);
+    expect(c.ready).toBe(false);
+    c.sample(0, 1800000, 1800000, 10);
+    expect(c.ready).toBe(true);
+    expect(c.offset).toBe(1799995);
+    c.reset();
+    expect(c.ready).toBe(false);
+  });
   it("honors pause, rate and duration", () => {
     const s = {
       anchor_position_ms: 1000,

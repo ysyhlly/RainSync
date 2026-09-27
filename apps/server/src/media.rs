@@ -69,6 +69,12 @@ pub async fn scan(
         .await
         .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_scan_failed"))?;
     let count = items.len();
+    let resources: Vec<String> = items.iter().map(|i| i.resource.clone()).collect();
+    let mut tx = app.db.begin().await?;
+    sqlx::query("SELECT id FROM sources WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
     for mut item in items {
         if row.get::<String, _>("kind") == "local"
             && let Ok(path) =
@@ -92,13 +98,21 @@ pub async fn scan(
             }
             item.metadata["sidecars"] = Value::Object(sidecars);
         }
-        sqlx::query("INSERT INTO media_items(id,source_id,title,resource,duration_ms,metadata) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,duration_ms=EXCLUDED.duration_ms,metadata=EXCLUDED.metadata").bind(Uuid::new_v4()).bind(id).bind(item.title).bind(item.resource).bind(item.duration_ms).bind(item.metadata).execute(&app.db).await?;
+        sqlx::query("INSERT INTO media_items(id,source_id,title,resource,duration_ms,metadata) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,duration_ms=EXCLUDED.duration_ms,metadata=EXCLUDED.metadata,available=true").bind(Uuid::new_v4()).bind(id).bind(item.title).bind(item.resource).bind(item.duration_ms).bind(item.metadata).execute(&mut *tx).await?;
     }
+    sqlx::query(
+        "UPDATE media_items SET available=false WHERE source_id=$1 AND NOT(resource=ANY($2))",
+    )
+    .bind(id)
+    .bind(&resources)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(Json(json!({"count":count})))
 }
 pub async fn library(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     auth(&app, &h, false).await?;
-    let rows=sqlx::query("SELECT m.id,m.title,m.duration_ms,s.kind FROM media_items m JOIN sources s ON s.id=m.source_id ORDER BY m.title LIMIT 10000").fetch_all(&app.db).await?;
+    let rows=sqlx::query("SELECT m.id,m.title,m.duration_ms,s.kind FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.available ORDER BY m.title").fetch_all(&app.db).await?;
     Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"title":r.get::<String,_>("title"),"duration_ms":r.get::<Option<f64>,_>("duration_ms"),"kind":r.get::<String,_>("kind")})).collect())))
 }
 pub async fn playback(
@@ -153,7 +167,7 @@ async fn prepare_playback(
     let media = state
         .media_id
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no_media"))?;
-    let row=sqlx::query("SELECT m.resource,m.duration_ms,m.metadata,s.kind,s.config_encrypted FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1").bind(media).fetch_one(&app.db).await?;
+    let row=sqlx::query("SELECT m.resource,m.duration_ms,m.metadata,s.kind,s.config_encrypted FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND m.available").bind(media).fetch_optional(&app.db).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "media_not_found"))?;
     let kind: String = row.get("kind");
     let config: SourceConfig =
         serde_json::from_value(app.decrypt(&row.get::<String, _>("config_encrypted"))?)
@@ -162,6 +176,7 @@ async fn prepare_playback(
     let mut resource = json!({"kind":kind,"resource":item,"root":config.root,"headers":{}});
     let mut meta: Value = row.get("metadata");
     let mut duration: Option<f64> = row.get("duration_ms");
+    let mut position_ms = protocol::bounded_position(body.position_ms, duration);
     let mut transport = "progressive";
     let mut mode = body.mode.as_deref().unwrap_or("auto");
     if !["auto", "direct", "remux", "transcode"].contains(&mode) {
@@ -198,7 +213,7 @@ async fn prepare_playback(
                 &config,
                 &item,
                 &providers::PlaybackOptions {
-                    position_ms: body.position_ms,
+                    position_ms,
                     audio_index: body.audio_index,
                     progressive: body
                         .capabilities
@@ -267,8 +282,8 @@ async fn prepare_playback(
             let url = if !use_direct && let Some(path) = source["TranscodingUrl"].as_str() {
                 transport = "hls";
                 mode = "transcode";
-                base.join(path.trim_start_matches('/'))
-                    .map_err(anyhow::Error::from)?
+                providers::upstream_url(&base, path)
+                    .map_err(|_| err(StatusCode::BAD_GATEWAY, "invalid_upstream_base"))?
                     .to_string()
             } else {
                 if !use_direct {
@@ -404,6 +419,15 @@ async fn prepare_playback(
     resource["subtitle_files"] = meta["sidecars"].clone();
     resource["subtitle_indices"] =
         json!(subtitle_tracks.iter().map(|t| t.index).collect::<Vec<_>>());
+    // A progressive file exposes the original/default track to the browser.
+    // Honor an explicit track selection through the local HLS mapping path.
+    if body.audio_index.is_some()
+        && mode == "direct"
+        && matches!(kind.as_str(), "local" | "http" | "agent")
+    {
+        mode = media_core::compatible_mode(&meta, true)
+            .map_err(|_| err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_video_or_hdr"))?;
+    }
     if let Some(caps) = &body.capabilities {
         let (selected_mode, selected_transport) =
             caps.negotiate(mode, transport).ok_or_else(|| {
@@ -421,10 +445,14 @@ async fn prepare_playback(
         mode = selected_mode;
         transport = selected_transport;
     }
+    position_ms = protocol::bounded_position(position_ms, duration);
     let local_job = matches!(kind.as_str(), "local" | "http" | "agent") && mode != "direct";
     if local_job {
+        if mode == "remux" && (position_ms > 0.0 || media_core::hls_needs_video_transform(&meta)) {
+            mode = "transcode";
+        }
         transport = "hls";
-        timeline = body.position_ms;
+        timeline = position_ms;
         resource["job_id"] = json!(id);
     }
     resource["transport"] = json!(transport);
@@ -504,7 +532,7 @@ pub async fn renew(
         .bind(id).bind(u.id).execute(&mut *tx).await?;
     let r=sqlx::query("UPDATE playback_sessions p SET expires_at=now()+interval '30 minutes' FROM room_snapshots s WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND p.expires_at>now() AND s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation").bind(id).bind(u.id).execute(&mut *tx).await?;
     if r.rows_affected() == 0 {
-        return Err(err(StatusCode::GONE, "session_expired"));
+        return Err(err(StatusCode::GONE, "invalid_playback_session"));
     };
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))

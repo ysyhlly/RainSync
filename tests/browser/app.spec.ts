@@ -112,9 +112,10 @@ test("room, library, invitation and settings are usable", async ({
         ws.send(
           JSON.stringify({
             type: "CHAT",
-            id: "chat",
+            id: v.client_message_id,
             username: "雨声",
             body: v.body,
+            client_message_id: v.client_message_id,
           }),
         );
     });
@@ -208,7 +209,9 @@ test("room, library, invitation and settings are usable", async ({
     }),
   );
   await expect(page.getByRole("alert")).toContainText("请重新登录");
-  await expect(page.getByText("○ 连接已停止")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "进入影院 →", exact: true }),
+  ).toBeVisible();
   await page.clock.fastForward(20000);
   expect(connectionCount).toBe(2);
   expect(errors).toEqual([]);
@@ -260,7 +263,9 @@ test("rejected WebSocket upgrade rechecks login and stops retrying", async ({
   await page.goto("/");
   await page.getByLabel("选择房间").selectOption("room");
   await expect(page.getByRole("alert")).toContainText("登录已过期");
-  await expect(page.getByText("○ 连接已停止")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "进入影院 →", exact: true }),
+  ).toBeVisible();
   await page.clock.fastForward(30000);
   expect(connections).toBe(1);
 });
@@ -364,7 +369,17 @@ test("playback retries a lost HTTP response with the same operation key", async 
   });
   await page.routeWebSocket("**/api/v1/ws", (ws) =>
     ws.onMessage((message) => {
-      if (JSON.parse(String(message)).type === "RESUME")
+      const sample = JSON.parse(String(message));
+      if (sample.type === "CLOCK_SYNC")
+        ws.send(
+          JSON.stringify({
+            type: "CLOCK_SYNC_REPLY",
+            t1: sample.t1,
+            t2: sample.t1,
+            t3: sample.t1,
+          }),
+        );
+      if (sample.type === "RESUME")
         ws.send(
           JSON.stringify({
             type: "SNAPSHOT",
@@ -439,4 +454,297 @@ test("playback retries a lost HTTP response with the same operation key", async 
     [],
   );
   expect(pageErrors).toEqual([]);
+});
+
+test("rapid audio switches preserve the newest plan while an old DELETE is delayed", async ({
+  page,
+}) => {
+  const requests: any[] = [];
+  const revoked: string[] = [];
+  const commands: any[] = [];
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  let releaseDelete: (() => void) | undefined;
+  let held = false;
+  await page.route("**/audio-test-media/**", (route) =>
+    route.fulfill({ contentType: "video/mp4", body: "" }),
+  );
+  await page.route("**/api/v1/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/auth/me"))
+      return route.fulfill({
+        json: { id: "owner", username: "test", admin: false, csrf: "test" },
+      });
+    if (path.endsWith("/rooms"))
+      return route.fulfill({
+        json: [{ id: "room", name: "room", owner_id: "owner" }],
+      });
+    if (path.endsWith("/media"))
+      return route.fulfill({
+        json: [{ id: "movie", title: "movie", kind: "local" }],
+      });
+    if (path.includes("/playback-requests/")) {
+      revoked.push(path.split("/").at(-1)!);
+      return route.fulfill({ json: { ok: true } });
+    }
+    if (
+      path.endsWith("/playback-sessions/initial") &&
+      route.request().method() === "DELETE"
+    ) {
+      held = true;
+      await new Promise<void>((resolve) => {
+        releaseDelete = resolve;
+      });
+      return route.fulfill({ json: { ok: true } });
+    }
+    if (path.endsWith("/playback-sessions")) {
+      const body = route.request().postDataJSON();
+      requests.push(body);
+      const id =
+        requests.length === 1 ? "initial" : `track-${body.audio_index}`;
+      return route.fulfill({
+        json: {
+          session_id: id,
+          media_id: "movie",
+          media_generation: 1,
+          delivery_mode: "direct",
+          transport: "progressive",
+          playback_url: `/audio-test-media/${id}`,
+          timeline_origin_ms: 0,
+          duration_ms: 30000,
+          expires_in_seconds: 1800,
+          rebuild_on_seek: false,
+          audio_tracks: [
+            { index: 1, label: "English", language: "eng" },
+            { index: 2, label: "Japanese", language: "jpn" },
+          ],
+          subtitle_tracks: [],
+        },
+      });
+    }
+    return route.fulfill({ json: [] });
+  });
+  await page.routeWebSocket("**/api/v1/ws", (ws) =>
+    ws.onMessage((message) => {
+      const frame = JSON.parse(String(message));
+      if (frame.type === "CLOCK_SYNC")
+        ws.send(
+          JSON.stringify({
+            type: "CLOCK_SYNC_REPLY",
+            t1: frame.t1,
+            t2: frame.t1,
+            t3: frame.t1,
+          }),
+        );
+      if (frame.type === "RESUME")
+        ws.send(
+          JSON.stringify({
+            type: "SNAPSHOT",
+            control_epoch: {
+              id: "audio-control",
+              expires_at_ms: Date.now() + 3600000,
+            },
+            state: {
+              room_id: "room",
+              revision: 7,
+              media_id: "movie",
+              media_generation: 1,
+              playback_status: "paused",
+              anchor_position_ms: 1250,
+              anchor_server_time_ms: 0,
+              playback_rate: 1,
+              controller_user_id: "owner",
+              duration_ms: 30000,
+              clock_epoch: "epoch",
+            },
+          }),
+        );
+      else if (!["CLOCK_SYNC", "CLIENT_STATUS"].includes(frame.type))
+        commands.push(frame);
+    }),
+  );
+  await page.goto("/");
+  await page.getByLabel("选择房间").selectOption("room");
+  await expect(page.locator("video")).toHaveAttribute(
+    "src",
+    "/audio-test-media/initial",
+  );
+  await page.getByLabel("音轨").selectOption("2");
+  await expect.poll(() => held).toBe(true);
+  await page.getByLabel("音轨").selectOption("1");
+  await expect(page.locator("video")).toHaveAttribute(
+    "src",
+    "/audio-test-media/track-1",
+  );
+  expect(requests).toHaveLength(2);
+  expect(requests[1].audio_index).toBe(1);
+  await expect(page.getByLabel("音轨")).toHaveValue("1");
+  expect(requests[1].position_ms).toBe(1250);
+  expect(requests[1].idempotency_key).not.toBe(requests[0].idempotency_key);
+  releaseDelete!();
+  await page.waitForLoadState("networkidle");
+  await expect(page.locator("video")).toHaveAttribute(
+    "src",
+    "/audio-test-media/track-1",
+  );
+  expect(revoked).toContain(requests[0].idempotency_key);
+  expect(revoked).not.toContain(requests[1].idempotency_key);
+  expect(
+    await page.evaluate(() =>
+      JSON.parse(sessionStorage.getItem("rainsync:playback:owner") ?? "[]"),
+    ),
+  ).toEqual([requests[1].idempotency_key]);
+  expect(commands).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+test("subtitle identity survives reload and resets on media change", async ({
+  page,
+}) => {
+  const clip = Buffer.from(
+    readFileSync("tests/fixtures/browser-video.base64", "utf8").trim(),
+    "base64",
+  );
+  let plans = 0;
+  let socket: WebSocketRoute | undefined;
+  const commands: string[] = [];
+  const state = {
+    room_id: "room",
+    revision: 1,
+    media_id: "movie",
+    media_generation: 1,
+    playback_status: "paused",
+    anchor_position_ms: 0,
+    anchor_server_time_ms: 0,
+    playback_rate: 1,
+    controller_user_id: "owner",
+    duration_ms: 3000,
+    clock_epoch: "epoch",
+  };
+  await page.route("**/subtitle-video.mp4*", (route) =>
+    route.fulfill({ contentType: "video/mp4", body: clip }),
+  );
+  await page.route("**/subtitle-fixture-*.vtt*", (route) =>
+    route.fulfill({
+      contentType: "text/vtt; charset=utf-8",
+      body: "WEBVTT\n\n00:00.000 --> 00:02.500\n字幕验证\n",
+    }),
+  );
+  await page.route("**/api/v1/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/auth/me"))
+      return route.fulfill({
+        json: { id: "owner", username: "test", admin: false, csrf: "test" },
+      });
+    if (path.endsWith("/rooms"))
+      return route.fulfill({
+        json: [{ id: "room", name: "room", owner_id: "owner" }],
+      });
+    if (path.endsWith("/media"))
+      return route.fulfill({
+        json: [{ id: "movie", title: "movie", kind: "local" }],
+      });
+    if (path.endsWith("/playback-sessions")) {
+      plans++;
+      const tracks = [
+        {
+          index: 11,
+          label: "English",
+          language: "eng",
+          url: `/subtitle-fixture-11.vtt?plan=${plans}`,
+        },
+        {
+          index: 42,
+          label: "中文",
+          language: "zho",
+          url: `/subtitle-fixture-42.vtt?plan=${plans}`,
+        },
+      ];
+      if (plans % 2 === 0) tracks.reverse();
+      return route.fulfill({
+        json: {
+          session_id: `subtitle-${plans}`,
+          media_id: state.media_id,
+          media_generation: state.media_generation,
+          delivery_mode: "direct",
+          transport: "progressive",
+          playback_url: `/subtitle-video.mp4?plan=${plans}`,
+          timeline_origin_ms: 0,
+          duration_ms: 3000,
+          expires_in_seconds: 1800,
+          rebuild_on_seek: false,
+          audio_tracks: [],
+          subtitle_tracks: tracks,
+        },
+      });
+    }
+    return route.fulfill({ json: [] });
+  });
+  await page.routeWebSocket("**/api/v1/ws", (ws) => {
+    socket = ws;
+    ws.onMessage((message) => {
+      const frame = JSON.parse(String(message));
+      if (frame.type === "CLOCK_SYNC")
+        ws.send(
+          JSON.stringify({
+            type: "CLOCK_SYNC_REPLY",
+            t1: frame.t1,
+            t2: frame.t1,
+            t3: frame.t1,
+          }),
+        );
+      if (frame.type === "RESUME")
+        ws.send(
+          JSON.stringify({
+            type: "SNAPSHOT",
+            state,
+            control_epoch: {
+              id: "subtitles",
+              expires_at_ms: Date.now() + 3600000,
+            },
+          }),
+        );
+      else if (!["CLOCK_SYNC", "CLIENT_STATUS"].includes(frame.type))
+        commands.push(frame.type);
+    });
+  });
+  await page.goto("/");
+  await page.getByLabel("选择房间").selectOption("room");
+  const video = page.locator("video");
+  await expect
+    .poll(() => video.evaluate((v: HTMLVideoElement) => v.readyState))
+    .toBeGreaterThanOrEqual(2);
+  await page.getByLabel("字幕").selectOption({ label: "中文 · zho" });
+  const showing = () =>
+    video.evaluate((v: HTMLVideoElement) =>
+      Array.from(v.querySelectorAll("track"))
+        .filter((t) => t.track.mode === "showing")
+        .map((t) => ({ label: t.label, cues: t.track.cues?.length ?? 0 })),
+    );
+  await expect.poll(showing).toEqual([{ label: "中文", cues: 1 }]);
+  await page.getByRole("button", { name: "重新加载", exact: true }).click();
+  await expect.poll(() => plans).toBe(2);
+  await expect(page.getByLabel("字幕").locator("option:checked")).toContainText(
+    "中文",
+  );
+  await expect.poll(showing).toEqual([{ label: "中文", cues: 1 }]);
+  await page.getByLabel("字幕").selectOption({ label: "关闭" });
+  await page.getByRole("button", { name: "重新加载", exact: true }).click();
+  await expect.poll(() => plans).toBe(3);
+  await expect(page.getByLabel("字幕").locator("option:checked")).toHaveText(
+    "关闭",
+  );
+  await expect.poll(showing).toEqual([]);
+  await page.getByLabel("字幕").selectOption({ label: "中文 · zho" });
+  await expect.poll(showing).toEqual([{ label: "中文", cues: 1 }]);
+  state.media_generation = 2;
+  state.media_id = "next-movie";
+  state.revision++;
+  socket!.send(JSON.stringify({ type: "SNAPSHOT", state }));
+  await expect.poll(() => plans).toBe(4);
+  await expect(page.getByLabel("字幕").locator("option:checked")).toHaveText(
+    "关闭",
+  );
+  await expect.poll(showing).toEqual([]);
+  expect(commands).toEqual([]);
 });

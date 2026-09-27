@@ -26,6 +26,8 @@ docker compose up --build -d
 3. 运行 `docker compose -f deploy/agent.compose.yaml up -d`。
 4. Agent 凭据保存在 `/state/credentials.json`，重启复用；管理员可撤销设备。
 
+Agent 与 Server 应同时升级到分页索引协议：每页确认后继续发送，完整批次提交才更新片库；扫描/发送失败自动重连。完整重扫中消失的文件会从可用片库移除，历史会话引用保留。
+
 Agent 仅主动建立连接。支持经 Worker 中继直放、探测、转封装和基础转码。NAS 的上行和中继出口仍需要容纳视频流量。
 
 ## 开发与验证
@@ -39,7 +41,7 @@ npm test
 npm run build
 npx playwright install chromium
 npm run test:e2e
-cargo build --workspace
+cargo build --workspace --bins --examples
 node tests/integration.mjs
 ```
 

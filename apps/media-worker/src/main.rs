@@ -1,4 +1,6 @@
 mod cache;
+mod outputs;
+mod process;
 mod relay;
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use axum::{
@@ -53,6 +55,8 @@ struct Params {
     token: String,
     #[serde(default)]
     url: Option<String>,
+    #[serde(default)]
+    attempt: Option<i64>,
 }
 async fn delivery(
     State(app): State<App>,
@@ -118,9 +122,11 @@ async fn delivery(
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            if !bytes.starts_with(b"WEBVTT") {
-                return Err(failure("invalid_webvtt"));
-            }
+            let bytes = media_core::subtitles::shift_webvtt(
+                &bytes,
+                resource["timeline_origin_ms"].as_f64().unwrap_or(0.0),
+            )
+            .map_err(failure)?;
             return Ok((
                 [
                     (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
@@ -142,17 +148,16 @@ async fn delivery(
         } else {
             source_url(id, &q.token).map_err(failure)?
         };
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            tokio::process::Command::new("ffmpeg")
-                .args([
-                    "-v",
-                    "error",
-                    "-nostdin",
-                    "-ss",
-                    &(resource["timeline_origin_ms"].as_f64().unwrap_or(0.0) / 1000.0).to_string(),
-                    "-i",
-                ])
+        if sidecar.is_some() {
+            let size = tokio::fs::metadata(&input).await.map_err(failure)?.len();
+            if size > media_core::subtitles::MAX_BYTES as u64 {
+                return Err(failure("subtitle_too_large"));
+            }
+        }
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            use tokio::io::AsyncReadExt;
+            let mut child = tokio::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-nostdin", "-i"])
                 .arg(input)
                 .args([
                     "-map",
@@ -161,21 +166,37 @@ async fn delivery(
                     "webvtt",
                     "pipe:1",
                 ])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
                 .kill_on_drop(true)
-                .output(),
-        )
+                .spawn()?;
+            let mut bytes = Vec::new();
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("subtitle_stdout"))?
+                .take(media_core::subtitles::MAX_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await?;
+            anyhow::ensure!(
+                bytes.len() <= media_core::subtitles::MAX_BYTES,
+                "subtitle_too_large"
+            );
+            anyhow::ensure!(child.wait().await?.success(), "subtitle_failed");
+            media_core::subtitles::shift_webvtt(
+                &bytes,
+                resource["timeline_origin_ms"].as_f64().unwrap_or(0.0),
+            )
+        })
         .await
         .map_err(failure)?
         .map_err(failure)?;
-        if !output.status.success() {
-            return Err(failure("subtitle_failed"));
-        }
         return Ok((
             [
                 (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
                 (header::CACHE_CONTROL, "private, no-store"),
             ],
-            output.stdout,
+            if head { Vec::new() } else { output },
         )
             .into_response());
     }
@@ -183,26 +204,89 @@ async fn delivery(
         if path.contains('/') || path.contains('\\') || path.contains("..") {
             return Err((StatusCode::BAD_REQUEST, "invalid_resource".into()));
         }
-        let file = app.cache.join(id.to_string()).join(&path);
+        let mut output = None;
         for _ in 0..30 {
-            if file.is_file() {
-                break;
-            }
-            let status: Option<String> =
-                sqlx::query_scalar("SELECT status FROM media_jobs WHERE id=$1")
+            let job =
+                sqlx::query("SELECT j.status,j.error,j.attempt,o.status AS output_status,o.manifest_sha256,(j.status='succeeded' OR (j.status='running' AND j.lease_until>clock_timestamp())) AS readable FROM media_jobs j LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt WHERE j.id=$1")
                     .bind(id)
                     .fetch_optional(&app.db)
                     .await
                     .map_err(failure)?;
-            if matches!(status.as_deref(), Some("failed" | "cancelled")) {
+            let Some(job) = job else {
                 return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
+            };
+            let status: String = job.get("status");
+            let attempt: i64 = job.get("attempt");
+            if q.attempt.is_some_and(|requested| requested != attempt) {
+                return Err((StatusCode::CONFLICT, "stale_media".into()));
+            }
+            // Only the entry playlist may discover the current attempt. Its
+            // child URLs must remain pinned, including the init segment.
+            if path != "index.m3u8" && q.attempt.is_none() {
+                return Err((StatusCode::CONFLICT, "stale_media".into()));
+            }
+            if status == "cancelled" {
+                return Err((StatusCode::GONE, "media_job_cancelled".into()));
+            }
+            if status == "failed" {
+                let stored: Option<String> = job.get("error");
+                let (status, reason) = match stored.as_deref() {
+                    Some("cache_capacity_exceeded") => {
+                        (StatusCode::SERVICE_UNAVAILABLE, "cache_capacity_exceeded")
+                    }
+                    Some("media_job_retry_exhausted") => {
+                        (StatusCode::BAD_GATEWAY, "media_job_retry_exhausted")
+                    }
+                    _ => (StatusCode::BAD_GATEWAY, "media_job_failed"),
+                };
+                return Err((status, reason.into()));
+            }
+            let output_status: Option<String> = job.get("output_status");
+            if (status == "succeeded"
+                && !matches!(output_status.as_deref(), Some("published" | "legacy")))
+                || (status == "running" && output_status.as_deref() != Some("writing"))
+            {
+                return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
+            }
+            let manifest_digest: Option<String> = job.get("manifest_sha256");
+            let file = persistence::media_jobs::output_dir(&app.cache, id, attempt).join(&path);
+            if job.get::<Option<bool>, _>("readable").unwrap_or(false) && file.is_file() {
+                output = Some((file, attempt, status == "succeeded", manifest_digest));
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
+        let (file, attempt, complete, manifest_digest) =
+            output.ok_or((StatusCode::SERVICE_UNAVAILABLE, "media_unavailable".into()))?;
         if path.ends_with(".m3u8") {
-            let manifest = tokio::fs::read_to_string(file).await.map_err(failure)?;
+            let mut manifest = String::new();
+            tokio::fs::File::open(file)
+                .await
+                .map_err(failure)?
+                .take(2 * 1024 * 1024 + 1)
+                .read_to_string(&mut manifest)
+                .await
+                .map_err(failure)?;
+            if manifest.len() > 2 * 1024 * 1024
+                || (complete && manifest_digest.is_some_and(|digest| hash(&manifest) != digest))
+            {
+                return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
+            }
+            // ENDLIST is visible only after this attempt commits success.
+            let manifest = if complete {
+                manifest
+            } else {
+                manifest
+                    .lines()
+                    .filter(|line| *line != "#EXT-X-ENDLIST")
+                    .map(|line| format!("{line}\n"))
+                    .collect::<String>()
+            };
             let text = rewrite_manifest(&manifest, |uri| {
-                format!("/media-delivery/{id}/{uri}?token={}", q.token)
+                format!(
+                    "/media-delivery/{id}/{uri}?token={}&attempt={attempt}",
+                    q.token
+                )
             });
             return Ok((
                 [
@@ -455,37 +539,117 @@ fn source_url_for_bind(mut bind: std::net::SocketAddr, id: Uuid, token: &str) ->
     }
     format!("http://{bind}/media-delivery/{id}/source?token={token}")
 }
-async fn jobs(app: App) {
+async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
+    use std::time::Duration;
     let worker = Uuid::new_v4();
     loop {
-        let result: anyhow::Result<()> = async{
-            let row=sqlx::query("UPDATE media_jobs SET status='running',owner_id=$1,lease_until=now()+interval '30 seconds' WHERE id=(SELECT j.id FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id WHERE (j.status='queued' OR (j.status='running' AND j.lease_until<now())) AND NOT p.stopped AND p.expires_at>now() ORDER BY j.created_at FOR UPDATE OF j SKIP LOCKED LIMIT 1) RETURNING id,spec").bind(worker).fetch_optional(&app.db).await?;
-            let Some(row)=row else{tokio::time::sleep(std::time::Duration::from_secs(1)).await;return Ok(())};let id:Uuid=row.get("id");let spec:Value=row.get("spec");
-            let result:anyhow::Result<()>=async{
+        let result: anyhow::Result<()> = async {
+            let claim = tokio::select! {
+                biased;
+                _ = process::stopped(&mut stop) => return Ok(()),
+                claim = tokio::time::timeout(Duration::from_secs(3), persistence::media_jobs::claim(&app.db, worker)) => claim??,
+            };
+            let Some(claim) = claim else { return Ok(()) };
+            // Preparation has no child and can be cancelled. Once spawned,
+            // supervision must finish its explicit kill/wait before release.
+            let prepare = async {
                 cache::ensure_capacity(&app).await?;
+                let spec = &claim.spec;
                 let input = if let Some(ticket) = spec["input_ticket"].as_str() {
                     let ticket = decrypt(&app, ticket)?;
-                    let token = ticket["token"].as_str().ok_or_else(||anyhow::anyhow!("invalid_input_ticket"))?;
-                    source_url(id, token)?
+                    let token = ticket["token"].as_str().ok_or_else(|| anyhow::anyhow!("invalid_input_ticket"))?;
+                    source_url(claim.id, token)?
                 } else {
-                    media_core::safe_path(std::path::Path::new(spec["root"].as_str().unwrap_or("")),spec["resource"].as_str().unwrap_or(""))?.to_str().ok_or_else(||anyhow::anyhow!("path"))?.to_owned()
+                    media_core::safe_path(std::path::Path::new(spec["root"].as_str().unwrap_or("")), spec["resource"].as_str().unwrap_or(""))?.to_str().ok_or_else(|| anyhow::anyhow!("path"))?.to_owned()
                 };
-                let dir=app.cache.join(id.to_string());tokio::fs::create_dir_all(&dir).await?;
-                let mut args=media_core::hls_args(&input,dir.join("index.m3u8").to_str().unwrap(),spec["start_seconds"].as_f64().unwrap_or(0.0),spec["transcode"].as_bool().unwrap_or(true));
-                if let Some(index)=spec["audio_index"].as_u64()&& let Some(arg)=args.iter_mut().find(|a|a.as_str()=="0:a:0?"){*arg=format!("0:{index}")}
-                let mut child=tokio::process::Command::new("ffmpeg").args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true).spawn()?;
-                loop{tokio::select!{status=child.wait()=>{anyhow::ensure!(status?.success(),"ffmpeg_failed");break},_=tokio::time::sleep(std::time::Duration::from_secs(5))=>{
-                    let result=sqlx::query("UPDATE media_jobs j SET lease_until=now()+interval '30 seconds' FROM playback_sessions p WHERE j.id=$1 AND j.owner_id=$2 AND j.status='running' AND p.id=j.session_id AND NOT p.stopped AND p.expires_at>now()").bind(id).bind(worker).execute(&app.db).await?;
-                    if result.rows_affected()==0{child.kill().await?;anyhow::bail!("cancelled")}
-                    if cache::ensure_capacity(&app).await.is_err(){child.kill().await?;anyhow::bail!("cache_full")}
-                }}}Ok(())
+                let dir = persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt);
+                tokio::fs::create_dir_all(&dir).await?;
+                let audio_index = spec["audio_index"].as_u64().map(u32::try_from).transpose()?;
+                let args = media_core::hls_args(&input, dir.join("index.m3u8").to_str().unwrap(), spec["start_seconds"].as_f64().unwrap_or(0.0), spec["transcode"].as_bool().unwrap_or(true), audio_index);
+                anyhow::ensure!(persistence::media_jobs::renew(&app.db, &claim).await?, "lease_lost_before_spawn");
+                Ok::<_, anyhow::Error>(args)
+            };
+            let prepared = tokio::select! {
+                biased;
+                _ = process::stopped(&mut stop) => Err(anyhow::anyhow!("worker_shutdown")),
+                result = prepare => result,
+            };
+            let mut execution_stopped = true;
+            let mut result = async {
+                let args = prepared?;
+                anyhow::ensure!(!*stop.borrow(), "worker_shutdown");
+                let mut command = tokio::process::Command::new("ffmpeg");
+                command.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+                #[cfg(windows)]
+                command.creation_flags(0x08000000);
+                let mut child = command.spawn()?;
+                execution_stopped = false;
+                let result = process::supervise(&mut child, &mut stop, || async {
+                    persistence::media_jobs::renew(&app.db, &claim).await
+                }, cache::monitor(&app)).await;
+                execution_stopped = child.try_wait()?.is_some();
+                result
             }.await;
-            sqlx::query("UPDATE media_jobs SET status=$3,error=$4,lease_until=NULL WHERE id=$1 AND owner_id=$2 AND status='running'").bind(id).bind(worker).bind(if result.is_ok(){"succeeded"}else{"failed"}).bind(result.err().map(|_|"media_job_failed")).execute(&app.db).await?;Ok(())
+            if result.as_ref().is_err_and(|e| e.is::<process::LeaseInterrupted>()) {
+                // Reaped child; leave the fenced lease to expire and be retried by the queue.
+                return result;
+            }
+            if !*stop.borrow() && execution_stopped {
+                match tokio::time::timeout(Duration::from_secs(3), cache::check_output_capacity(&app)).await {
+                    Ok(Ok(())) => {},
+                    Ok(Err(error)) => {
+                        if result.is_ok() || error.downcast_ref::<persistence::media_jobs::JobFailure>().is_some() {
+                            result = Err(error);
+                        }
+                    },
+                    Err(_) if result.is_ok() => return Err(process::LeaseInterrupted.into()),
+                    Err(_) => {},
+                }
+            }
+            let mut publication = None;
+            if result.is_ok() && !*stop.borrow() {
+                let directory = persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt);
+                result = match tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || outputs::validate(&directory))).await {
+                    Ok(Ok(Ok(proof))) => { publication = Some(proof); Ok(()) },
+                    Ok(Ok(Err(error))) => Err(error),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(error) => Err(error.into()),
+                };
+            }
+            if *stop.borrow() && execution_stopped {
+                tokio::time::timeout(Duration::from_secs(3), persistence::media_jobs::release(&app.db, &claim)).await??;
+            } else if !*stop.borrow() {
+                tokio::time::timeout(Duration::from_secs(3), persistence::media_jobs::finish(&app.db, &claim, result.as_ref().err().map(|error| error.downcast_ref::<persistence::media_jobs::JobFailure>().copied().unwrap_or(persistence::media_jobs::JobFailure::ExecutionFailed)), publication.as_ref())).await??;
+            }
+            Ok(())
         }.await;
+        if *stop.borrow() {
+            break;
+        }
         if result.is_err() {
             tracing::warn!("media queue retry");
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
+        tokio::select! {
+            _ = process::stopped(&mut stop) => break,
+            _ = tokio::time::sleep(Duration::from_secs(if result.is_err() { 2 } else { 1 })) => {},
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 #[tokio::main]
@@ -512,7 +676,8 @@ async fn main() -> anyhow::Result<()> {
         public_url: std::env::var("PUBLIC_ORIGIN").unwrap_or("http://localhost:8088".into()),
     };
     tokio::fs::create_dir_all(&app.cache).await?;
-    tokio::spawn(jobs(app.clone()));
+    let (stop, mut server_stop) = tokio::sync::watch::channel(false);
+    let job_app = app.clone();
     let router = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/media-delivery/{id}/{path}", get(delivery).head(delivery))
@@ -523,7 +688,28 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("WORKER_BIND").unwrap_or("0.0.0.0:8081".into()),
     )
     .await?;
-    axum::serve(listener, router).await?;
+    let queue = tokio::spawn(jobs(job_app, stop.subscribe()));
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(async move { process::stopped(&mut server_stop).await })
+        .into_future();
+    tokio::pin!(server);
+    let result = tokio::select! {
+        result = &mut server => Some(result),
+        _ = shutdown_signal() => None,
+    };
+    let _ = stop.send(true);
+    // Keep the runtime alive until the queue has reaped its child. HTTP
+    // consumers get a bounded drain; they cannot hold process exit forever.
+    let (queue_result, server_result) = tokio::join!(queue, async {
+        match result {
+            Some(result) => result,
+            None => tokio::time::timeout(std::time::Duration::from_secs(10), &mut server)
+                .await
+                .unwrap_or(Ok(())),
+        }
+    });
+    queue_result?;
+    server_result?;
     Ok(())
 }
 
