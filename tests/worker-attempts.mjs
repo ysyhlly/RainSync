@@ -244,7 +244,11 @@ export async function workerAttempts({
         `SELECT id FROM cache_read_leases WHERE cache_id='${id}' ORDER BY expires_at DESC LIMIT 1`,
       );
       assert.ok(lease, "paused HTTP body retains its read lease");
-      assert.equal(sql(`SELECT attempt FROM cache_read_leases WHERE id='${lease}'`), "2", "HTTP reader pins its actual output attempt");
+      assert.equal(
+        sql(`SELECT attempt FROM cache_read_leases WHERE id='${lease}'`),
+        "2",
+        "HTTP reader pins its actual output attempt",
+      );
       const expires = sql(
         `SELECT expires_at FROM cache_read_leases WHERE id='${lease}'`,
       );
@@ -369,6 +373,7 @@ export async function workerAttempts({
       ["cache_read_only", "CACHE_READ_ONLY", 503],
       ["cache_permission_denied", "CACHE_PERMISSION_DENIED", 503],
       ["media_job_retry_exhausted", "MEDIA_JOB_RETRY_EXHAUSTED", 502],
+      ["upstream_transport_retry_exhausted", "MEDIA_JOB_RETRY_EXHAUSTED", 502],
       ["private_path_and_credentials", "MEDIA_JOB_FAILED", 502],
     ]) {
       sql(

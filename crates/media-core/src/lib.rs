@@ -178,12 +178,13 @@ pub fn hls_args(
     // Stream copy seeks to an earlier keyframe and cannot honor the plan's
     // requested timeline origin. Decode/discard preroll for nonzero starts.
     let transcode = transcode || start_seconds > 0.0;
-    let mut a = vec![
-        "-hide_banner".into(),
-        "-nostdin".into(),
-        "-y".into(),
-        "-ss".into(),
-        start_seconds.to_string(),
+    let mut a = vec!["-hide_banner".into(), "-nostdin".into(), "-y".into()];
+    // Seeking to zero needlessly resets the HLS demuxer; FFmpeg 5.1 can then
+    // lose the fMP4 init/segment alignment. Opening normally preserves it.
+    if start_seconds > 0.0 {
+        a.extend(["-ss".into(), start_seconds.to_string()]);
+    }
+    a.extend([
         "-i".into(),
         input.into(),
         "-map".into(),
@@ -191,7 +192,7 @@ pub fn hls_args(
         "-map".into(),
         // API track indices are absolute stream indices, not audio ordinals.
         audio_index.map_or_else(|| "0:a:0?".into(), |index| format!("0:{index}")),
-    ];
+    ]);
     let extra = if transcode {
         vec![
             "-c:v",

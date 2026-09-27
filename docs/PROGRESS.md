@@ -1,5 +1,7 @@
 # 全计划实施进度
 
+2026-09-27 W05 HTTP 输入重试：按执行标识记录已确认的连接/响应体/HTTP 临时故障，原子退回队列并最多执行三次；已知断流即使 FFmpeg 返回成功也不发布部分成品。真实 HLS 分片故障同时暴露并修复零起点多余 seek 的解码问题。NAS relay 和编解码细分分类仍待继续；机制见 WORKER_ATTEMPTS.md，证据见 VALIDATION.md。
+
 2026-09-27 W05/W06 慢编码：隔离真实 Server/Worker、0.5 倍 FFmpeg 输入及浏览器检查等待、暂停房间后追赶和原会话恢复；发现并修复原生 HLS 空 seekable 的恢复阻塞，并为原生解码/格式错误增加一次同会话 MSE 回退。Chromium 回退成功不等于原生 Safari 验收；持续运行、不同时间戳及设备矩阵继续。详见 PLAYBACK_READINESS.md。
 
 2026-09-27 W05 关闭控制台：Windows 首次关闭事件跳过普通 HTTP 等待；Server/Worker 的隐藏控制台关闭及探测后代回收已实测。注销/关机、退出期间再次关闭、阻塞 I/O 与实例锁失联仍保留边界；详见 PROCESS_TREES.md 和 VALIDATION.md。

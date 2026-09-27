@@ -9,6 +9,7 @@ pub enum JobFailure {
     CacheReadOnly,
     CachePermissionDenied,
     ExecutionFailed,
+    UpstreamTransient,
 }
 impl JobFailure {
     pub fn reason(self) -> &'static str {
@@ -17,6 +18,7 @@ impl JobFailure {
             Self::CacheReadOnly => "cache_read_only",
             Self::CachePermissionDenied => "cache_permission_denied",
             Self::ExecutionFailed => "media_job_failed",
+            Self::UpstreamTransient => "upstream_transport_failed",
         }
     }
 }
@@ -33,7 +35,9 @@ pub fn terminal_error(reason: Option<&str>) -> (u16, &'static str) {
         Some("cache_capacity_exceeded") => (503, "cache_capacity_exceeded"),
         Some("cache_read_only") => (503, "cache_read_only"),
         Some("cache_permission_denied") => (503, "cache_permission_denied"),
-        Some("media_job_retry_exhausted") => (502, "media_job_retry_exhausted"),
+        Some("upstream_transport_retry_exhausted" | "media_job_retry_exhausted") => {
+            (502, "media_job_retry_exhausted")
+        }
         _ => (502, "media_job_failed"),
     }
 }
@@ -110,10 +114,11 @@ pub async fn finish(
         );
     }
     let mut tx = pool.begin().await?;
-    let updated = sqlx::query("UPDATE media_jobs j SET status=$4,error=$5,lease_until=NULL FROM playback_sessions p WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND p.id=j.session_id AND NOT p.stopped AND p.expires_at>clock_timestamp()")
+    let retryable = matches!(failure, Some(JobFailure::UpstreamTransient));
+    let updated = sqlx::query("UPDATE media_jobs j SET status=CASE WHEN $6 AND j.attempt<j.max_attempts THEN 'queued' ELSE $4 END,error=CASE WHEN $6 AND j.attempt>=j.max_attempts THEN 'upstream_transport_retry_exhausted' ELSE $5 END,available_at=CASE WHEN $6 THEN clock_timestamp()+((CASE WHEN j.attempt=1 THEN 2 ELSE 5 END)+random())*interval '1 second' ELSE j.available_at END,owner_id=CASE WHEN $6 THEN NULL ELSE j.owner_id END,lease_until=NULL FROM playback_sessions p WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND p.id=j.session_id AND NOT p.stopped AND p.expires_at>clock_timestamp()")
         .bind(claim.id).bind(claim.owner).bind(claim.attempt)
         .bind(if failure.is_none() { "succeeded" } else { "failed" })
-        .bind(failure.map(JobFailure::reason))
+        .bind(failure.map(JobFailure::reason)).bind(retryable)
         .execute(&mut *tx).await?.rows_affected();
     if updated != 1 {
         tx.rollback().await?;
@@ -121,7 +126,7 @@ pub async fn finish(
     }
     let updated = sqlx::query("UPDATE media_outputs SET status=$4,manifest_sha256=$5,segment_count=$6,published_at=CASE WHEN $4='published' THEN clock_timestamp() ELSE NULL END WHERE job_id=$1 AND attempt=$2 AND owner_id=$3 AND status='writing' AND (validation_version<2 OR $4<>'published')")
         .bind(claim.id).bind(claim.attempt).bind(claim.owner)
-        .bind(if failure.is_none() { "published" } else { "failed" })
+        .bind(if failure.is_none() { "published" } else if retryable { "abandoned" } else { "failed" })
         .bind(publication.map(|p| p.manifest_sha256.as_str())).bind(publication.map(|p| p.segment_count))
         .execute(&mut *tx).await?.rows_affected();
     if updated != 1 {

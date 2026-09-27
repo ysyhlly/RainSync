@@ -1,5 +1,19 @@
 # 本轮验证记录
 
+## 2026-09-27：确认 HTTP 输入故障后有限重试
+
+Windows 工作区 46 项测试通过，另有 2 个按设计 ignored 的子进程夹具入口；Clippy 全目标且 warnings 视为错误、二进制/示例构建、格式与生成契约检查通过。新增真实 TCP 断连和截断响应测试，覆盖 reqwest 的响应体 Decode 错误分类；执行标识测试验证旧请求及其他会话不能影响新执行。
+
+`node tests/input-retries.mjs` 使用隔离 PostgreSQL/Server/Worker 和真实 HTTP 来源，七个场景通过：503、截断响应、连接重置、HLS 子分片 503 均在第二次执行成功并通过最终 Worker HTTP 输出解码，断言实际视频帧数大于零；持续 503 在第三次终止，401 与完整传输的非法媒体在第一次终止。检查退避下限、旧产物 abandoned、写入预留释放与公开错误码/不可重试属性。最终报告 `.runtime/input-retries/rainsync-input-1152ddf5/report.json`，镜像 `sha256:4573ffd3bb487717a05f3e4bd5c831d692d6c7ec54afd62f80a46b7350c6aa33`。
+
+真实 HLS 测试暴露 FFmpeg 5.1 在 fMP4 输入上执行多余 `-ss 0` 时的解码错误。零起点改为正常打开后通过；非零起点原有逻辑保持。相同镜像的 `tests/seek-fixtures.mjs` 验证 0、1.25、5.25、5.267、8.125 秒的 remux/transcode 请求，十项均确认首 PTS、源帧与剩余时长，报告 `.runtime/fixtures/seek-ddb6fadc-4f96-4148-aab2-3f1b7033fc31/report.json`。
+
+完整隔离集成通过，包含生产 finish 的重试事务、重复提交、旧续租拒绝及退避检查，Server/Worker 终态契约，NAS 万条分页索引、幂等恢复与备份恢复；100 控制连接快照 271ms 仅为本机冒烟。
+
+同一最终镜像的完整 Worker 故障矩阵通过，报告 `.runtime/worker-processes/rainsync-process-c70d46e1/report.json`：实际编码/解码、首段失败与检查期限、进程树与探测字幕回收、缓存权限/ENOSPC、读租约和预算、完成产物 HTTP 解码、数据库中断及暂停旧 Worker 后的代次替换均通过。
+
+此轮只分类已确认的 HTTP 输入故障；NAS relay 和具体媒体编解码失败分类仍未完成，不代表完整 W05 或发布验收完成。cgraphy 差异审查未及时返回，终止后使用源码与 Git diff 核对。未部署。
+
 ## 2026-09-27：真实慢编码与原生 HLS 回退
 
 新增 `node tests/slow-playback.mjs`，隔离 PostgreSQL、Server、Worker 和浏览器，40 秒真实 H.264 样本；只给编码器输入加 `-readrate 0.5`，不替换 API、清单、分片或解码结果。Vite 使用部署的 CSP。先走 MSE 与先走原生 HLS 两个场景均完成首段播放、追上生成边界后等待、暂停房间让编码追赶、在权威位置恢复并继续解码；每场仅一个播放会话，任务保持 attempt 1/running。

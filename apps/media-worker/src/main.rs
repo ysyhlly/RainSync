@@ -2,6 +2,7 @@ mod cache;
 mod cache_outputs;
 mod cache_read;
 use media_core::child_process;
+mod input_failure;
 mod output_decode;
 mod output_publish;
 mod output_read;
@@ -18,6 +19,7 @@ use axum::{
     routing::get,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
@@ -39,6 +41,7 @@ struct App {
     public_url: String,
     probes: Arc<tokio::sync::Semaphore>,
     output_checks: Arc<output_read::Checks>,
+    input_failures: input_failure::Registry,
 }
 fn hash(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
@@ -64,6 +67,8 @@ struct Params {
     url: Option<String>,
     #[serde(default)]
     attempt: Option<i64>,
+    #[serde(default)]
+    execution: Option<Uuid>,
 }
 async fn delivery(
     State(app): State<App>,
@@ -76,6 +81,7 @@ async fn delivery(
     let data: Value = row.get("resource");
     let resource = decrypt(&app, data["encrypted"].as_str().unwrap_or("")).map_err(failure)?;
     let head = method == axum::http::Method::HEAD;
+    let input_failure = app.input_failures.observe(id, q.execution);
     if path == "probe" {
         let _permit = app
             .probes
@@ -401,8 +407,12 @@ async fn delivery(
     if let Some(range) = h.get(header::RANGE) {
         request = request.header(header::RANGE, range)
     }
-    let response = request.send().await.map_err(failure)?;
+    let response = request.send().await.map_err(|error| {
+        input_failure.network(&error);
+        failure(error)
+    })?;
     let status = response.status();
+    input_failure.status(status);
     if !status.is_success() {
         return Err((
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -423,7 +433,10 @@ async fn delivery(
         let mut stream = response.bytes_stream();
         use futures_util::StreamExt;
         while let Some(chunk) = stream.next().await {
-            bytes.extend_from_slice(&chunk.map_err(failure)?);
+            bytes.extend_from_slice(&chunk.map_err(|error| {
+                input_failure.network(&error);
+                failure(error)
+            })?);
             if bytes.len() > 2 * 1024 * 1024 {
                 return Err((StatusCode::BAD_GATEWAY, "manifest_too_large".into()));
             }
@@ -453,8 +466,12 @@ async fn delivery(
                         .map(str::to_owned)
                 })
                 .unwrap_or_else(|| "bin".into());
+            let execution = q
+                .execution
+                .map(|t| format!("&execution={t}"))
+                .unwrap_or_default();
             format!(
-                "/media-delivery/{id}/segment.{extension}?token={}&url={grant}",
+                "/media-delivery/{id}/segment.{extension}?token={}&url={grant}{execution}",
                 q.token
             )
         });
@@ -483,7 +500,12 @@ async fn delivery(
         .body(if head {
             Body::empty()
         } else {
-            Body::from_stream(response.bytes_stream())
+            Body::from_stream(response.bytes_stream().map(move |chunk| {
+                if let Err(error) = &chunk {
+                    input_failure.network(error);
+                }
+                chunk
+            }))
         })
         .map_err(failure)
 }
@@ -619,6 +641,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             let Some(claim) = claim else { return Ok(()) };
             reservation = Some((claim.id, claim.owner, claim.attempt));
             let output_builder: output_publish::Shared = Default::default();
+            let input_failure = app.input_failures.register(claim.id);
             // Preparation has no child and can be cancelled. Once spawned,
             // supervision must finish its explicit kill/wait before release.
             let prepare = async {
@@ -628,7 +651,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 let input = if let Some(ticket) = spec["input_ticket"].as_str() {
                     let ticket = decrypt(&app, ticket)?;
                     let token = ticket["token"].as_str().ok_or_else(|| anyhow::anyhow!("invalid_input_ticket"))?;
-                    source_url(claim.id, token)?
+                    format!("{}&execution={}", source_url(claim.id, token)?, input_failure.token())
                 } else {
                     media_core::safe_path(std::path::Path::new(spec["root"].as_str().unwrap_or("")), spec["resource"].as_str().unwrap_or(""))?.to_str().ok_or_else(|| anyhow::anyhow!("path"))?.to_owned()
                 };
@@ -681,6 +704,12 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                         }
                     },
                 }
+            }
+            if execution_stopped && !*stop.borrow() && let Some(failure) = input_failure.failure()
+                && result.as_ref().err().is_none_or(|error| error.downcast_ref::<persistence::media_jobs::JobFailure>().is_none()) {
+                // A truncated input may make FFmpeg exit successfully. A known
+                // source transport failure must not publish that partial movie.
+                result = Err(failure.into());
             }
             let mut publication = None;
             if result.is_ok() && !*stop.borrow() {
@@ -757,6 +786,7 @@ async fn main() -> anyhow::Result<()> {
         relay: Default::default(),
         probes: Arc::new(tokio::sync::Semaphore::new(2)),
         output_checks: Default::default(),
+        input_failures: Default::default(),
         public_url: std::env::var("PUBLIC_ORIGIN").unwrap_or("http://localhost:8088".into()),
     };
     tokio::fs::create_dir_all(&app.cache).await?;

@@ -203,6 +203,82 @@ async fn main() -> anyhow::Result<()> {
             .await?;
     assert_eq!(terminal, "failed:media_job_retry_exhausted:3");
     assert!(claim(&db, owner).await?.is_none());
+    // Explicit transport failures retry atomically, with bounded jitter and
+    // abandoned output isolation; repeating a finish cannot postpone backoff.
+    sqlx::query("DELETE FROM media_outputs WHERE job_id=$1")
+        .bind(id)
+        .execute(&db)
+        .await?;
+    sqlx::query("UPDATE media_jobs SET status='queued',attempt=0,max_attempts=3,available_at=now() WHERE id=$1").bind(id).execute(&db).await?;
+    for attempt in 1..=3 {
+        let execution = claim(&db, owner).await?.unwrap();
+        assert_eq!(execution.attempt, attempt);
+        assert!(
+            finish(
+                &db,
+                &execution,
+                Some(persistence::media_jobs::JobFailure::UpstreamTransient)
+            )
+            .await?
+        );
+        let state: String =
+            sqlx::query_scalar("SELECT status||':'||error FROM media_jobs WHERE id=$1")
+                .bind(id)
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(
+            state,
+            if attempt < 3 {
+                "queued:upstream_transport_failed"
+            } else {
+                "failed:upstream_transport_retry_exhausted"
+            }
+        );
+        let output: String =
+            sqlx::query_scalar("SELECT status FROM media_outputs WHERE job_id=$1 AND attempt=$2")
+                .bind(id)
+                .bind(attempt)
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(output, "abandoned");
+        let due: String =
+            sqlx::query_scalar("SELECT available_at::text FROM media_jobs WHERE id=$1")
+                .bind(id)
+                .fetch_one(&db)
+                .await?;
+        assert!(
+            !finish(
+                &db,
+                &execution,
+                Some(persistence::media_jobs::JobFailure::UpstreamTransient)
+            )
+            .await?
+        );
+        assert!(!renew(&db, &execution).await?);
+        assert_eq!(
+            due,
+            sqlx::query_scalar::<_, String>(
+                "SELECT available_at::text FROM media_jobs WHERE id=$1"
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await?
+        );
+        assert!(claim(&db, owner).await?.is_none());
+        if attempt < 3 {
+            let remaining: f64 = sqlx::query_scalar("SELECT extract(epoch FROM available_at-clock_timestamp())::float8 FROM media_jobs WHERE id=$1").bind(id).fetch_one(&db).await?;
+            let minimum = if attempt == 1 { 2.0 } else { 5.0 };
+            assert!(remaining > minimum - 1.0 && remaining <= minimum + 1.0);
+            sqlx::query("UPDATE media_jobs SET available_at=now()-interval '1 second' WHERE id=$1")
+                .bind(id)
+                .execute(&db)
+                .await?;
+        }
+    }
+    assert_eq!(
+        persistence::media_jobs::terminal_error(Some("upstream_transport_retry_exhausted")),
+        (502, "media_job_retry_exhausted")
+    );
     sqlx::query("DELETE FROM media_jobs WHERE id=$1")
         .bind(id)
         .execute(&db)
