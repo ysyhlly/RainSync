@@ -36,8 +36,9 @@ export async function captureProcesses({
       `#!/bin/sh
 sleep 120 &
 leaf=$!
-printf '%s\\n%s\\n' "$$" "$leaf" > /cache/pids.tmp
-mv /cache/pids.tmp /cache/pids
+printf '%s\\n%s\\n' "$$" "$leaf" > /cache/${program}.pids.tmp
+mv /cache/${program}.pids.tmp /cache/${program}.pids
+cp /cache/${program}.pids /cache/pids
 case "$(cat /media/capture/mode)" in
 timeout) wait "$leaf" ;;
 oversize) head -c 9000000 /dev/zero; wait "$leaf" ;;
@@ -65,7 +66,9 @@ esac
     "--mount",
     `type=bind,source=${cache},target=/cache`,
     image,
-    "rainsync-media-worker",
+    "sh",
+    "-c",
+    'rainsync-media-worker & worker=$!; printf "%s" "$worker" > /cache/worker.pid; wait "$worker"; code=$?; printf "%s" "$code" > /cache/worker.exit; exec sleep 120',
   );
   const origin = `http://${docker("port", worker, "8081/tcp")}`;
   const room = randomUUID(),
@@ -141,14 +144,61 @@ esac
       });
     }
   }
-  docker("kill", "--signal=TERM", worker);
-  await until(
-    () =>
-      docker("inspect", "--format", "{{.State.Running}}", worker) === "false",
-    "capture worker shutdown",
+  await writeFile(resolve(directory, "mode"), "timeout");
+  const requests = ["probe", "subtitle-0.vtt"].map((path) =>
+    fetch(`${origin}/media-delivery/${id}/${path}?token=${token}`, {
+      signal: AbortSignal.timeout(45000),
+    })
+      .then((response) => response.text())
+      .catch(() => null),
   );
-  assert.equal(docker("wait", worker), "0");
+  let activePids;
+  await until(() => {
+    try {
+      activePids = ["ffprobe", "ffmpeg"].flatMap((program) =>
+        docker("exec", worker, "cat", `/cache/${program}.pids`).split(/\s+/),
+      );
+      assert.equal(activePids.length, 4);
+      for (const pid of activePids) {
+        assert.match(pid, /^\d+$/);
+        docker("exec", worker, "test", "-d", `/proc/${pid}`);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }, "concurrent probe and subtitle process trees started");
+  const workerPid = docker("exec", worker, "cat", "/cache/worker.pid");
+  assert.match(workerPid, /^\d+$/);
+  const started = Date.now();
+  docker("exec", worker, "sh", "-c", 'kill -TERM "$1"', "sh", workerPid);
+  await until(
+    () => {
+      try {
+        docker("exec", worker, "test", "-s", "/cache/worker.exit");
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    "capture worker shutdown",
+    20000,
+  );
+  await Promise.all(requests);
+  assert.equal(docker("exec", worker, "cat", "/cache/worker.exit"), "0");
+  assert.equal(
+    docker("inspect", "--format", "{{.State.Running}}", worker),
+    "true",
+  );
+  for (const pid of activePids)
+    docker("exec", worker, "test", "!", "-e", `/proc/${pid}`);
+  report.cases.push({
+    scenario: "capture-shutdown-drain",
+    elapsed_ms: Date.now() - started,
+    container_still_running: true,
+    remaining_processes: 0,
+  });
   console.log(
-    "PASS: real ffprobe and subtitle FFmpeg responses reap descendants on success, output limit and deadline",
+    "PASS: probe/subtitle capture reaps on success, output limit, deadline and concurrent shutdown before runtime/container exit",
   );
 }

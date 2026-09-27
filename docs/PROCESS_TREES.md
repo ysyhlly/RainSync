@@ -4,6 +4,8 @@
 
 实现位于 `crates/media-core/src/child_process.rs`，Server 的本地探测、Worker 的远程探测及字幕转换也使用同一所有者。探测标准输出最多 8 MiB，字幕沿用 2 MiB 限制；超过上限、读取错误或 30 秒执行截止都会先终止并回收整棵进程树，再返回错误。标准错误丢弃，不累计任意诊断内容。调用 future 被取消后，独立所有者继续回收，但依赖 Tokio runtime 仍运行；执行截止不限制操作系统回收时间，不能把截止误认为回收保证。
 
+Worker 在编码队列和有界 HTTP 等待结束后调用共享进程登记表的 `shutdown()`，关闭启动入口并终止所有仍登记的进程树。启动与登记、关闭入口使用同一锁，避免关闭检查和新进程登记之间漏记；外部 Child 已 Drop 的所有者也仍保留登记。正常回收完成后移除登记；所有者异常结束或回收错误会被登记为失败，不能报告成功排空。关闭等待者被取消不恢复启动入口。Worker 即使遇到队列/清理错误也先完成这一步，随后才结束 Tokio runtime。
+
 Linux 启动独立进程组，并设置 subreaper 收养退出主进程留下的后代。使用 `waitid(WNOWAIT)` 观察主进程退出，保留其尚未回收的 PID，先向该组发送 SIGKILL，再 wait 主进程和本组被收养的后代；不在主进程回收后再次用旧 PGID 发终止信号。已完成的数字 PID 可能复用，因此这种顺序用于避免误杀无关组。语义依据：[wait/waitid](https://man7.org/linux/man-pages/man2/wait.2.html)。
 
 Windows 先创建带 KILL_ON_JOB_CLOSE 的 Job，以 CREATE_SUSPENDED 和 CREATE_NO_WINDOW 启动进程，完成 Job 关联后恢复主线程，禁止先运行后关联留下的快速派生空窗。结束时调用 TerminateJobObject，检查 Job 活动进程数，同时等待所捕获成员的进程句柄真正变为已退出状态。只收到一个完成通知，或仅看到主进程结束，都不是整棵树退出的证明。相关 API：[Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)、[活动进程计数](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information)。
@@ -16,4 +18,6 @@ Windows 实现使用 windows Rust 绑定直接调用 API；曾评估的 process-
 
 共享模块另有有界输出测试，覆盖正常完成、截止、超限和取消调用；真实 HTTP 场景见 `tests/capture-processes.mjs`，通过隔离 Worker 调用 ffprobe 与字幕 FFmpeg，响应返回后检查包装进程及遗留后代已消失，Worker 保持运行。
 
-这些机制覆盖留在媒体进程组/Job 中的后代，不是任意第三方插件的隔离沙箱；Unix 主动 setsid 逃离组、强杀 Worker 本体、内核不可中断 I/O、Windows 控制台退出事件及 runtime 退出时的所有者排空仍需单独验收。不能用当前测试宣称所有 Windows 系统退出信号或任意运行时终止路径已覆盖。
+新增原生测试验证关闭入口、持有/已 Drop 子进程回收以及取消关闭等待后继续等待。HTTP 测试同时卡住探测与字幕后向 Worker 发送 SIGTERM，要求在各自 30 秒执行截止前退出，并在容器继续运行时检查四个包装/后代 PID 均消失，防止依赖容器退出自动清理。
+
+这些机制覆盖留在媒体进程组/Job 中的后代，不是任意第三方插件的隔离沙箱；Unix 主动 setsid 逃离组、强杀 Worker 本体、内核不可中断 I/O、Windows 控制台退出事件及 Server 退出排空仍需单独验收。不能用当前测试宣称所有 Windows 系统退出信号或任意运行时终止路径已覆盖。

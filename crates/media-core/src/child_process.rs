@@ -8,6 +8,79 @@ use tokio::{
 
 type Outcome = Result<ExitStatus, (io::ErrorKind, String)>;
 
+#[derive(Default)]
+struct Owners {
+    closing: bool,
+    next_id: u64,
+    active: std::collections::HashMap<u64, watch::Sender<bool>>,
+    failure: Option<(io::ErrorKind, String)>,
+}
+
+struct Registry {
+    owners: std::sync::Mutex<Owners>,
+    count: watch::Sender<usize>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            owners: Default::default(),
+            count: watch::channel(0).0,
+        }
+    }
+}
+
+impl Registry {
+    async fn shutdown(&self) -> io::Result<()> {
+        let mut count = self.count.subscribe();
+        {
+            let mut owners = self.owners.lock().expect("process registry lock");
+            owners.closing = true;
+            for stop in owners.active.values() {
+                let _ = stop.send(true);
+            }
+        }
+        while *count.borrow_and_update() != 0 {
+            count
+                .changed()
+                .await
+                .map_err(|_| io::Error::other("process registry closed"))?;
+        }
+        match &self.owners.lock().expect("process registry lock").failure {
+            Some((kind, message)) => Err(io::Error::new(*kind, message.clone())),
+            None => Ok(()),
+        }
+    }
+}
+
+fn registry() -> std::sync::Arc<Registry> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Arc<Registry>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(Default::default).clone()
+}
+
+/// Permanently close process admission and wait for all owners, including those
+/// whose public Child was dropped. Call before shutting down the Tokio runtime.
+pub async fn shutdown() -> io::Result<()> {
+    registry().shutdown().await
+}
+
+struct Registration {
+    registry: std::sync::Arc<Registry>,
+    id: u64,
+    failure: Option<(io::ErrorKind, String)>,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let mut owners = self.registry.owners.lock().expect("process registry lock");
+        owners.active.remove(&self.id);
+        if owners.failure.is_none() {
+            owners.failure = self.failure.take();
+        }
+        self.registry.count.send_replace(owners.active.len());
+    }
+}
+
 async fn stopped(stop: &mut watch::Receiver<bool>) {
     while !*stop.borrow_and_update() {
         if stop.changed().await.is_err() {
@@ -101,18 +174,46 @@ impl Drop for Child {
     }
 }
 
-pub fn spawn(mut command: Command) -> io::Result<Child> {
+pub fn spawn(command: Command) -> io::Result<Child> {
+    spawn_registered(command, registry())
+}
+
+fn spawn_registered(mut command: Command, registry: std::sync::Arc<Registry>) -> io::Result<Child> {
+    // Admission and registration share one lock with shutdown: there is no
+    // successfully spawned but unregistered child across the closing boundary.
+    let mut owners = registry.owners.lock().expect("process registry lock");
+    if owners.closing {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "media processes are shutting down",
+        ));
+    }
     command.kill_on_drop(true);
     let mut child = platform::spawn(command)?;
     let stdin = platform::stdin(&mut child);
     let stdout = platform::stdout(&mut child);
     let (stop, receiver) = watch::channel(false);
     let (status, result) = watch::channel(None);
+    let id = owners.next_id;
+    owners.next_id += 1;
+    owners.active.insert(id, stop.clone());
+    registry.count.send_replace(owners.active.len());
+    drop(owners);
+    let mut registration = Registration {
+        registry,
+        id,
+        failure: Some((
+            io::ErrorKind::Other,
+            "process owner stopped before reaping".into(),
+        )),
+    };
     tokio::spawn(async move {
         let outcome = platform::reap(child, receiver)
             .await
             .map_err(|e| (e.kind(), e.to_string()));
+        registration.failure = outcome.as_ref().err().cloned();
         let _ = status.send(Some(outcome));
+        drop(registration);
     });
     Ok(Child {
         stop,
@@ -508,6 +609,66 @@ mod tests {
         fn exited(&self) -> bool {
             (unsafe { libc::kill(self.0, 0) }) != 0
                 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaps_owned_and_dropped_children_and_closes_admission() {
+        let registry = std::sync::Arc::new(Registry::default());
+        let mut children = Vec::new();
+        let mut witnesses = Vec::new();
+        let mut roots = Vec::new();
+        for _ in 0..2 {
+            let root =
+                std::env::temp_dir().join(format!("rainsync-drain-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--ignored", "--exact", "child_process::tests::tree_fixture"])
+                .env("RAINSYNC_TREE_FIXTURE", &root)
+                .env_remove("RAINSYNC_TREE_LEAF")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            children.push(spawn_registered(command, registry.clone()).unwrap());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !root.join("leaf.pid").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            witnesses.push(Witness::open(
+                std::fs::read_to_string(root.join("leaf.pid"))
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            ));
+            roots.push(root);
+        }
+        drop(children.pop());
+        // Interrupting a shutdown waiter cannot reopen admission or discard owners.
+        let mut shutdown = Box::pin(registry.shutdown());
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(shutdown.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(shutdown);
+        let error = spawn_registered(Command::new("must-never-be-launched"), registry.clone())
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        tokio::time::timeout(Duration::from_secs(5), registry.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(witnesses.iter().all(Witness::exited));
+        assert!(children[0].try_wait().unwrap().is_some());
+        assert!(registry.owners.lock().unwrap().active.is_empty());
+        registry.shutdown().await.unwrap();
+        for root in roots {
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 

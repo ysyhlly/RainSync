@@ -1,5 +1,15 @@
 # 本轮验证记录
 
+## 2026-09-27：Worker runtime 退出前排空媒体进程
+
+新增进程登记表，将关闭启动入口与登记新进程串行化；关闭等待覆盖仍持有句柄与已 Drop 的所有者。Windows 工作区 44 项测试通过，Linux release 的 media-core 12 项及 Worker 15 项通过；各平台另有 2 个用于主动启动的 ignored 子进程夹具入口。新增测试确认取消关闭等待不会重新开放入口，重复关闭等待仍能确认全部后代退出。Clippy 全目标且 warnings 视为错误、格式、工作区二进制/示例构建及生成契约一致性通过。
+
+完整隔离 PostgreSQL 集成通过，100 控制连接快照 274ms 仅是本机冒烟。首次 Worker 矩阵通过并发探测/字幕退出检查，但最后旧目录回收在 15 秒门槛超时；此门槛未覆盖产品已有的 60 秒删除重试间隔。测试改为等待 75 秒并保留失败时数据库清理状态，不强制推进 cleanup_after，也不改变产品清理逻辑。关闭等待的原生用例另改为明确 poll 到 Pending 后取消，避免依赖 1ms 超时；Windows/Linux 对应用例重新通过。
+
+同一运行时代码镜像 `sha256:53559aea9e7c47d039750e99df9b5f07b8bde6d64f9daa05a7f1db97c0786c21` 完整重跑通过，报告 `.runtime/worker-processes/rainsync-process-65a83e61/report.json`。探测与字幕同时卡住时发送 SIGTERM，11.267 秒后 Worker 正常退出，容器继续运行，四个包装/后代进程均已消失；不是靠两次 30 秒执行截止或容器销毁回收。旧 Worker 恢复后 FFmpeg 退出、旧目录回收，attempt 2 正常运行且 init 摘要未变。首段解码、进程树、输出上限、缓存权限、ENOSPC、读租约、预算、逐段及完整 HTTP 解码与数据库中断回归全部通过。运行命令为设置 `WORKER_TEST_IMAGE=rainsync-drain-validation:local` 后执行 `node tests/worker-processes.mjs`。
+
+本轮 cgraphy 差异审查未在等待期间返回，改用 Git diff 审查。没有网页改动，未重跑前端或浏览器测试；未部署。Server 退出排空、Windows 系统退出事件、强杀 Worker 与内核不可中断 I/O 等不能由本轮证据覆盖，完整计划继续进行。
+
 ## 2026-09-27：探测与字幕有界输出及进程回收
 
 进程树所有者移到 media-core，探测和字幕转换接入同一生命周期。Windows 工作区 43 项测试通过，另有 2 个刻意忽略、由测试显式启动的子进程夹具入口。新增 capture 用例检查正常完成、输出超限、截止和取消 future 的后代回收；Windows 用进程句柄确认退出。Clippy 全目标且 warnings 视为错误、格式、工作区二进制/示例构建和生成契约一致性通过。

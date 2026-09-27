@@ -1152,7 +1152,10 @@ try {
   await until(
     () => !existsSync(resolve(cache, old.id, "1")),
     "obsolete output reclaimed while replacement session remains active",
-    15000,
+    // A sweep can race the still-running stale encoder and defer a failed
+    // removal for the documented 60-second revisit interval. Do not assume
+    // the first sweep succeeds while that writer still has files open.
+    75000,
   );
   assert.deepEqual(
     await readFile(resolve(cache, old.id, "2", "init.mp4")),
@@ -1179,6 +1182,20 @@ try {
     JSON.stringify(report, null, 2) + "\n",
   );
   console.log(`Evidence: ${resolve(root, "report.json")}`);
+} catch (error) {
+  report.failure = String(error?.stack ?? error);
+  try {
+    report.output_cleanup = JSON.parse(
+      sql(
+        "SELECT coalesce(json_agg(t),'[]'::json) FROM (SELECT job_id,attempt,status,cleanup_owner,cleanup_until,cleanup_after,clock_timestamp() AS observed_at FROM media_outputs ORDER BY job_id,attempt) t",
+      ),
+    );
+  } catch {}
+  await writeFile(
+    resolve(root, "failed-report.json"),
+    JSON.stringify(report, null, 2) + "\n",
+  );
+  throw error;
 } finally {
   try {
     docker("unpause", db);

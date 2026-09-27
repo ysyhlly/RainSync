@@ -809,8 +809,14 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(Ok(())),
         }
     });
+    // HTTP draining may stop before a cancelled probe/subtitle owner finishes.
+    // Close admission and reap every registered owner before returning from main,
+    // even when the queue or cleanup task failed.
+    let process_result = child_process::shutdown().await;
+    let cleaner_result = cleaner.await;
+    process_result?;
     queue_result?;
-    cleaner.await?;
+    cleaner_result?;
     server_result?;
     Ok(())
 }
