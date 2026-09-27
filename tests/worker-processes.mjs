@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import {
   randomUUID,
@@ -470,7 +471,7 @@ try {
     try {
       return (
         sql(
-          "SELECT count(*) FROM _sqlx_migrations WHERE version=16 AND success",
+          "SELECT count(*) FROM _sqlx_migrations WHERE version=17 AND success",
         ) === "1"
       );
     } catch {
@@ -1123,12 +1124,19 @@ try {
     await readFile(resolve(cache, old.id, "2", "init.mp4")),
     init,
   );
+  await until(
+    () => !existsSync(resolve(cache, old.id, "1")),
+    "obsolete output reclaimed while replacement session remains active",
+    15000,
+  );
+  assert.deepEqual(await readFile(resolve(cache, old.id, "2", "init.mp4")), init);
   report.cases.push({
     scenario: "expired_old_worker_resumed",
     elapsed_ms: Date.now() - started,
     current_attempt: 2,
     old_ffmpeg: 0,
     current_ffmpeg_running: true,
+    obsolete_directory_removed: true,
     init_sha256: createHash("sha256").update(init).digest("hex"),
   });
   docker("kill", "--signal=TERM", old.worker);

@@ -11,11 +11,14 @@ pub struct ReadGuard {
 }
 
 impl ReadGuard {
-    pub async fn acquire(pool: &PgPool, id: uuid::Uuid) -> anyhow::Result<Self> {
+    pub async fn acquire(pool: &PgPool, id: uuid::Uuid, attempt: i64) -> anyhow::Result<Self> {
         let began = Instant::now();
-        let lease = tokio::time::timeout(Duration::from_secs(3), cache::acquire(pool, id))
-            .await??
-            .ok_or_else(|| anyhow::anyhow!("cache_read_unavailable"))?;
+        let lease = tokio::time::timeout(
+            Duration::from_secs(3),
+            cache::acquire_attempt(pool, id, attempt),
+        )
+        .await??
+        .ok_or_else(|| anyhow::anyhow!("cache_read_unavailable"))?;
         let (health, receiver) = watch::channel(Some(began));
         let db = pool.clone();
         let task = tokio::spawn(async move {

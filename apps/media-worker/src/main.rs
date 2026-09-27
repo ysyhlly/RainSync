@@ -1,4 +1,5 @@
 mod cache;
+mod cache_outputs;
 mod cache_read;
 mod output_decode;
 mod output_publish;
@@ -262,7 +263,7 @@ async fn delivery(
             if job.get::<Option<bool>, _>("readable").unwrap_or(false)
                 && ((persisted && path == "index.m3u8") || file.is_file())
             {
-                let reader = cache_read::ReadGuard::acquire(&app.db, id)
+                let reader = cache_read::ReadGuard::acquire(&app.db, id, attempt)
                     .await
                     .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "media_unavailable".into()))?;
                 let checked = async {
@@ -797,6 +798,7 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("WORKER_BIND").unwrap_or("0.0.0.0:8081".into()),
     )
     .await?;
+    let cleaner = tokio::spawn(cache_outputs::run(job_app.clone(), stop.subscribe()));
     let queue = tokio::spawn(jobs(job_app, stop.subscribe()));
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { process::stopped(&mut server_stop).await })
@@ -818,6 +820,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     queue_result?;
+    cleaner.await?;
     server_result?;
     Ok(())
 }

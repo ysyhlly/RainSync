@@ -315,6 +315,11 @@ try {
       windowsHide: true,
     },
   );
+  execFileSync(
+    resolve("target/debug/examples/verify_output_cleanup" + (process.platform === "win32" ? ".exe" : "")),
+    [],
+    { env: { ...env, RAINSYNC_ISOLATED_TEST: "1" }, stdio: "inherit", windowsHide: true },
+  );
   launch("rainsync-media-worker", { PUBLIC_ORIGIN: worker });
   await ready(worker + "/health");
   for (const [base, path, options, status, code] of [

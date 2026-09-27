@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createCipheriv, randomBytes, createHash } from "node:crypto";
 import { mkdir, writeFile, readFile, open, rename, rm } from "node:fs/promises";
 import http from "node:http";
+import { outputCleanup } from "./output-cleanup.mjs";
 import { resolve } from "node:path";
 
 // Controlled output bytes isolate actual Worker routing from FFmpeg execution.
@@ -243,6 +244,7 @@ export async function workerAttempts({
         `SELECT id FROM cache_read_leases WHERE cache_id='${id}' ORDER BY expires_at DESC LIMIT 1`,
       );
       assert.ok(lease, "paused HTTP body retains its read lease");
+      assert.equal(sql(`SELECT attempt FROM cache_read_leases WHERE id='${lease}'`), "2", "HTTP reader pins its actual output attempt");
       const expires = sql(
         `SELECT expires_at FROM cache_read_leases WHERE id='${lease}'`,
       );
@@ -361,6 +363,7 @@ export async function workerAttempts({
     console.log(
       "PASS: persisted snapshots ignore private torn playlists; full content proofs gate GET, HEAD and Range",
     );
+    await outputCleanup({ id, cache, sql });
     for (const [reason, code, status] of [
       ["cache_capacity_exceeded", "CACHE_CAPACITY_EXCEEDED", 503],
       ["cache_read_only", "CACHE_READ_ONLY", 503],

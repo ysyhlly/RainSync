@@ -11,6 +11,24 @@ pub struct ReadLease {
 }
 
 pub async fn acquire(pool: &PgPool, cache_id: Uuid) -> Result<Option<ReadLease>> {
+    acquire_scoped(pool, cache_id, None).await
+}
+
+/// Pin a generated-output reader to the current attempt. Validate after taking
+/// the entry lock, shared with obsolete-output cleanup, before opening files.
+pub async fn acquire_attempt(
+    pool: &PgPool,
+    cache_id: Uuid,
+    attempt: i64,
+) -> Result<Option<ReadLease>> {
+    acquire_scoped(pool, cache_id, Some(attempt)).await
+}
+
+async fn acquire_scoped(
+    pool: &PgPool,
+    cache_id: Uuid,
+    attempt: Option<i64>,
+) -> Result<Option<ReadLease>> {
     let mut tx = pool.begin().await?;
     sqlx::query("INSERT INTO cache_entries(id,cache_key,path) VALUES($1,$1::text,$1::text) ON CONFLICT DO NOTHING")
         .bind(cache_id)
@@ -26,6 +44,13 @@ pub async fn acquire(pool: &PgPool, cache_id: Uuid) -> Result<Option<ReadLease>>
     if state != "ready" || !valid {
         return Ok(None);
     }
+    if let Some(attempt) = attempt {
+        let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_jobs WHERE id=$1 AND attempt=$2 AND (status='succeeded' OR (status='running' AND lease_until>clock_timestamp())))")
+            .bind(cache_id).bind(attempt).fetch_one(&mut *tx).await?;
+        if !current {
+            return Ok(None);
+        }
+    }
     let lease = ReadLease {
         id: Uuid::new_v4(),
         cache_id,
@@ -36,8 +61,8 @@ pub async fn acquire(pool: &PgPool, cache_id: Uuid) -> Result<Option<ReadLease>>
     .bind(cache_id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("INSERT INTO cache_read_leases(id,cache_id,expires_at) VALUES($1,$2,clock_timestamp()+interval '30 seconds')")
-        .bind(lease.id).bind(cache_id).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO cache_read_leases(id,cache_id,expires_at,attempt) VALUES($1,$2,clock_timestamp()+interval '30 seconds',$3)")
+        .bind(lease.id).bind(cache_id).bind(attempt).execute(&mut *tx).await?;
     sqlx::query("UPDATE cache_entries SET last_used=clock_timestamp() WHERE id=$1")
         .bind(cache_id)
         .execute(&mut *tx)
