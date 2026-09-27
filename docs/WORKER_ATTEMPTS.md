@@ -50,4 +50,4 @@ node tests/worker-processes.mjs
 
 测试容器使用 init 转发退出信号，暂停针对实际 Worker 子进程，并断言进程处于 T 状态；不能把向容器 PID 1 发送但被忽略的 SIGSTOP 当作成功注入。该测试覆盖 FFmpeg 直接子进程，不代表任意后代进程组或 Windows 系统信号验收。
 
-缓存读取租约、清理互斥与编码前写入预留现已接入，细节和验证范围见 [缓存租约](CACHE_LEASES.md) 和 [写入预算](CACHE_BUDGET.md)。迁移 0015 后新产物为版本 3，首次发布增加受限的首段实际解码，参见 [产物发布](OUTPUT_PUBLICATION.md)。逐段状态见 [播放就绪](PLAYBACK_READINESS.md)，迁移 0017 的代次读取租约及后台回收见 [旧代次清理](OUTPUT_CLEANUP.md)。这仍只是 W05 的部分基础；细化执行错误分类与可重试网络故障、后代进程组与 Windows 系统退出信号故障注入仍需继续完成。
+缓存读取租约、清理互斥与编码前写入预留现已接入，细节和验证范围见 [缓存租约](CACHE_LEASES.md) 和 [写入预算](CACHE_BUDGET.md)。迁移 0015 后新产物为版本 3，首次发布增加受限的首段实际解码，参见 [产物发布](OUTPUT_PUBLICATION.md)。逐段状态见 [播放就绪](PLAYBACK_READINESS.md)，迁移 0017 的代次读取租约及后台回收见 [旧代次清理](OUTPUT_CLEANUP.md)。编码和首段解码的进程树回收见 [进程生命周期](PROCESS_TREES.md)，以上早期测试段落仍保留当时的证据范围。这仍只是 W05 的部分基础；细化执行错误分类、可确认网络故障重试、剩余进程调用链与 Windows 系统退出事件仍需继续完成。

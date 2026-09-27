@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
+import { processTrees } from "./process-trees.mjs";
 import { execFileSync } from "node:child_process";
 import {
   randomUUID,
@@ -481,6 +482,7 @@ try {
 
   await firstDecodeFaults();
   await cacheAccessFaults();
+  await processTrees({ docker, image, root, env, name, sql, children, until, report });
 
   const evictionCache = resolve(root, "eviction-cache");
   const protectedId = randomUUID(),

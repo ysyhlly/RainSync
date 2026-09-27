@@ -1,6 +1,7 @@
 mod cache;
 mod cache_outputs;
 mod cache_read;
+mod child_process;
 mod output_decode;
 mod output_publish;
 mod output_read;
@@ -662,7 +663,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 command.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
                 #[cfg(windows)]
                 command.creation_flags(0x08000000);
-                let mut child = command.spawn()?;
+                let mut child = child_process::spawn(command)?;
                 writer_stopped = false;
                 execution_stopped = false;
                 let result = process::supervise(&mut child, &mut stop, || async {

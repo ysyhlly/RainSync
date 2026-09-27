@@ -1,0 +1,15 @@
+# 编码与首段解码的进程树回收
+
+编码器和首段验证解码器通过同一进程所有者启动。所有者任务持有操作系统进程及其组/Job 句柄；外部 wait 被取消只取消订阅，不取消实际回收。显式终止、丢弃外部句柄及主进程正常退出都会终止残留后代。只有确认整组退出之后，wait/kill 才完成；编码任务随后才能释放写入预算或继续发布。首段解码的截止和取消也使用该路径。
+
+Linux 启动独立进程组，并设置 subreaper 收养退出主进程留下的后代。使用 `waitid(WNOWAIT)` 观察主进程退出，保留其尚未回收的 PID，先向该组发送 SIGKILL，再 wait 主进程和本组被收养的后代；不在主进程回收后再次用旧 PGID 发终止信号。已完成的数字 PID 可能复用，因此这种顺序用于避免误杀无关组。语义依据：[wait/waitid](https://man7.org/linux/man-pages/man2/wait.2.html)。
+
+Windows 先创建带 KILL_ON_JOB_CLOSE 的 Job，以 CREATE_SUSPENDED 和 CREATE_NO_WINDOW 启动进程，完成 Job 关联后恢复主线程，禁止先运行后关联留下的快速派生空窗。结束时调用 TerminateJobObject，检查 Job 活动进程数，同时等待所捕获成员的进程句柄真正变为已退出状态。只收到一个完成通知，或仅看到主进程结束，都不是整棵树退出的证明。相关 API：[Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)、[活动进程计数](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information)。
+
+Windows 实现使用 windows Rust 绑定直接调用 API；曾评估的 process-wrap 不在最终依赖中。回归测试要求主进程正常结束后仍要回收故意遗留的叶进程，且持有该叶进程句柄验证退出，而不是仅比较进程名或等待固定时间。
+
+验证入口：`cargo test --workspace --locked` 包含真实原生父子进程的终止、Drop、正常主进程退出、取消 wait 四类检查；两个 ignored 函数是由测试显式启动的子进程夹具。`node tests/worker-processes.mjs` 调用 `tests/process-trees.mjs`，使用真实 FFmpeg 加包装进程和长睡眠后代，覆盖停止会话、SIGTERM 和正常编码完成；容器保持运行并逐一检查 `/proc`，防止把容器退出后的自动清理当作 Worker 回收。
+
+本轮网络下载缓慢，最终测试镜像使用 `cargo vendor --locked --respect-source-config` 生成的本地依赖副本，以 `cargo build --release --frozen --workspace` 构建；基础镜像、运行层和其余步骤沿用 deploy/Dockerfile。临时构建输入保存在 `.runtime/build-inputs/`，不提交 vendor，也不更改部署构建配置。Linux Worker 测试在对应 build 阶段容器内断网执行 `cargo test --release --frozen -p rainsync-media-worker`，真实 FFmpeg 矩阵使用 `WORKER_TEST_IMAGE=rainsync-worker-tree-validation:local` 指定镜像，具体摘要见 VALIDATION.md。
+
+这些机制覆盖留在编码进程组/Job 中的后代，不是任意第三方插件的隔离沙箱；Unix 主动 setsid 逃离组、强杀 Worker 本体、内核不可中断 I/O、Windows 控制台退出事件及探测/字幕的完整进程生命周期仍需单独验收。不能用当前测试宣称所有 Windows 系统退出信号或全部子进程调用链已覆盖。

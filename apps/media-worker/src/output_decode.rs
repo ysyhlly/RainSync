@@ -1,11 +1,15 @@
 //! Decode the first immutable fMP4 fragment before publishing any playlist.
-use crate::{outputs, process::LeaseInterrupted};
+use crate::{
+    child_process::{self, Child},
+    outputs,
+    process::LeaseInterrupted,
+};
 use anyhow::{Result, ensure};
 use persistence::media_outputs::FileProof;
 use std::{path::PathBuf, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    process::{Child, Command},
+    process::Command,
     sync::Mutex,
 };
 
@@ -137,7 +141,7 @@ impl Gate {
                 .kill_on_drop(true);
             #[cfg(windows)]
             command.creation_flags(0x08000000);
-            state.child = Some(command.spawn()?);
+            state.child = Some(child_process::spawn(command)?);
             let child = state.child.as_mut().unwrap();
             let mut stdin = child.stdin.take().unwrap();
             let stdout = child.stdout.take().unwrap();

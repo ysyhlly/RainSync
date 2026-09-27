@@ -1,5 +1,6 @@
+use crate::child_process::Child;
 use std::{future::Future, time::Duration};
-use tokio::{process::Child, sync::watch};
+use tokio::sync::watch;
 
 #[derive(Debug)]
 pub struct LeaseInterrupted;
@@ -29,7 +30,7 @@ pub async fn stopped(stop: &mut watch::Receiver<bool>) {
     }
 }
 
-/// Own the wait until the direct child is reaped, including shutdown while a
+/// Own the wait until the process tree is reaped, including shutdown while a
 /// lease renewal is blocked. Never cancel this future to stop a child.
 pub async fn supervise<F, Fut, Capacity>(
     child: &mut Child,
@@ -94,7 +95,7 @@ mod tests {
             .kill_on_drop(true);
         #[cfg(windows)]
         command.creation_flags(0x08000000);
-        command.spawn().unwrap()
+        crate::child_process::spawn(command).unwrap()
     }
 
     #[tokio::test]
