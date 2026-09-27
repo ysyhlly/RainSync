@@ -115,9 +115,15 @@ try {
   );
   await until(() => {
     try {
-      return docker("exec", db, "pg_isready", "-U", "rainsync").includes(
-        "accepting connections",
-      );
+      return docker(
+        "exec",
+        db,
+        "pg_isready",
+        "-h",
+        "127.0.0.1",
+        "-U",
+        "rainsync",
+      ).includes("accepting connections");
     } catch {
       return false;
     }
@@ -129,6 +135,7 @@ try {
       [0, "ctrl-c"],
       [1, "ctrl-break"],
       ["close", "console-close"],
+      ...(program === "rainsync-server" ? [["lock-loss", "lock-loss"]] : []),
     ]) {
       const state = join(root, `${program}-${label}`),
         selectedPort = await port();
@@ -263,16 +270,29 @@ try {
         () => witness.events.some((e) => e.watching),
         "process handles retained",
       );
-      const started = Date.now(),
-        sender = helper("signal", String(pid), String(event));
-      await until(() => sender.done, "console event delivered", 5000);
-      assert.equal(sender.code, 0, sender.stderr);
-      assert.ok(sender.events.some((e) => e.delivered));
-      await until(() => service.done, "native shutdown", 20000);
+      const started = Date.now();
+      if (event === "lock-loss") {
+        assert.equal(
+          sql(
+            "SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=72614931 AND granted",
+          ),
+          "t",
+        );
+      } else {
+        const sender = helper("signal", String(pid), String(event));
+        await until(() => sender.done, "console event delivered", 5000);
+        assert.equal(sender.code, 0, sender.stderr);
+        assert.ok(sender.events.some((e) => e.delivered));
+      }
+      await until(
+        () => service.done,
+        "native shutdown",
+        event === "lock-loss" ? 8000 : 20000,
+      );
       assert.equal(service.code, 0, service.stderr);
       assert.equal(
         service.events.find((e) => Object.hasOwn(e, "exit_code"))?.exit_code,
-        0,
+        event === "lock-loss" ? 1 : 0,
         service.stderr,
       );
       await until(() => witness.done, "descendants exited", 5000);
@@ -287,7 +307,7 @@ try {
         program,
         event: label,
         elapsed_ms: Date.now() - started,
-        normal_exit: true,
+        exit_code: event === "lock-loss" ? 1 : 0,
         retained_process_handles_signalled: true,
       });
       console.log(

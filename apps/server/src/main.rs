@@ -283,11 +283,36 @@ async fn ws(State(app): State<App>, h: HeaderMap, upgrade: WebSocketUpgrade) -> 
         .on_upgrade(move |socket| rooms::socket(app, user, socket, session_hash)))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    let owners = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("media-owner")
+        .enable_all()
+        .build()?;
+    media_core::child_process::set_owner_runtime(owners.handle().clone())?;
+    let application = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = application.block_on(async {
+        let (lost, loss) = tokio::sync::oneshot::channel();
+        tokio::select! {
+            biased;
+            Ok(()) = loss => anyhow::bail!("server instance lock connection lost"),
+            result = run(lost) => result,
+        }
+    });
+    // On lock loss there is no HTTP grace period: abort every application task,
+    // including upgraded sockets and detached maintenance/preparation tasks.
+    // The separate process reactor remains alive to kill and reap descendants.
+    drop(application);
+    owners.block_on(media_core::child_process::shutdown())?;
+    result
+}
+
+async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     let db = persistence::connect(&std::env::var("DATABASE_URL")?).await?;
     persistence::migrate(&db).await?;
     let mut lock = db.acquire().await?;
@@ -298,8 +323,19 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            if sqlx::query("SELECT 1").execute(&mut *lock).await.is_err() {
-                std::process::exit(1)
+            if !matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    sqlx::query("SELECT 1").execute(&mut *lock),
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
+                let _ = lost.send(());
+                // A timed-out connection may still own the lock. Retain it
+                // until the supervisor stops the entire application runtime.
+                std::future::pending::<()>().await;
+                return;
             }
         }
     });

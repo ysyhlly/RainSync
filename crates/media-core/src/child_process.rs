@@ -10,6 +10,7 @@ type Outcome = Result<ExitStatus, (io::ErrorKind, String)>;
 
 #[derive(Default)]
 struct Owners {
+    runtime: Option<tokio::runtime::Handle>,
     closing: bool,
     next_id: u64,
     active: std::collections::HashMap<u64, watch::Sender<bool>>,
@@ -31,6 +32,15 @@ impl Default for Registry {
 }
 
 impl Registry {
+    fn set_owner_runtime(&self, runtime: tokio::runtime::Handle) -> io::Result<()> {
+        let mut owners = self.owners.lock().expect("process registry lock");
+        if owners.runtime.is_some() || owners.next_id != 0 || owners.closing {
+            return Err(io::Error::other("process owner runtime is already in use"));
+        }
+        owners.runtime = Some(runtime);
+        Ok(())
+    }
+
     async fn shutdown(&self) -> io::Result<()> {
         let mut count = self.count.subscribe();
         {
@@ -62,6 +72,13 @@ fn registry() -> std::sync::Arc<Registry> {
 /// whose public Child was dropped. Call before shutting down the Tokio runtime.
 pub async fn shutdown() -> io::Result<()> {
     registry().shutdown().await
+}
+
+/// Configure a separate owner runtime before the first process is spawned.
+/// Keep it alive through shutdown(), even after the application runtime stops.
+/// Without this configuration, owners use the caller's runtime as before.
+pub fn set_owner_runtime(runtime: tokio::runtime::Handle) -> io::Result<()> {
+    registry().set_owner_runtime(runtime)
 }
 
 struct Registration {
@@ -188,6 +205,13 @@ fn spawn_registered(mut command: Command, registry: std::sync::Arc<Registry>) ->
             "media processes are shutting down",
         ));
     }
+    let runtime = owners
+        .runtime
+        .clone()
+        .unwrap_or_else(tokio::runtime::Handle::current);
+    // Register process and pipe IO with the owner's reactor too. Moving only
+    // the reaping task would leave its process driver on the cancelled runtime.
+    let _entered = runtime.enter();
     command.kill_on_drop(true);
     let mut child = platform::spawn(command)?;
     let stdin = platform::stdin(&mut child);
@@ -207,7 +231,7 @@ fn spawn_registered(mut command: Command, registry: std::sync::Arc<Registry>) ->
             "process owner stopped before reaping".into(),
         )),
     };
-    tokio::spawn(async move {
+    runtime.spawn(async move {
         let outcome = platform::reap(child, receiver)
             .await
             .map_err(|e| (e.kind(), e.to_string()));
@@ -610,6 +634,60 @@ mod tests {
             (unsafe { libc::kill(self.0, 0) }) != 0
                 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
         }
+    }
+
+    #[test]
+    fn owner_reaps_after_application_runtime_is_destroyed() {
+        let owners = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let application = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let registry = std::sync::Arc::new(Registry::default());
+        registry.set_owner_runtime(owners.handle().clone()).unwrap();
+        let root = std::env::temp_dir().join(format!("rainsync-runtime-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let witness = application.block_on(async {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--ignored", "--exact", "child_process::tests::tree_fixture"])
+                .env("RAINSYNC_TREE_FIXTURE", &root)
+                .env_remove("RAINSYNC_TREE_LEAF")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = spawn_registered(command, registry.clone()).unwrap();
+            tokio::spawn(async move { child.wait().await });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !root.join("leaf.pid").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            Witness::open(
+                std::fs::read_to_string(root.join("leaf.pid"))
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            )
+        });
+        assert!(!witness.exited());
+        drop(application);
+        owners.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), registry.shutdown())
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        assert!(witness.exited());
+        assert!(registry.owners.lock().unwrap().active.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

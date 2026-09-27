@@ -85,14 +85,23 @@ try {
   );
   await until(() => {
     try {
-      return docker("exec", db, "pg_isready", "-U", "rainsync").includes(
-        "accepting connections",
-      );
+      return docker(
+        "exec",
+        db,
+        "pg_isready",
+        "-h",
+        "127.0.0.1",
+        "-U",
+        "rainsync",
+      ).includes("accepting connections");
     } catch {
       return false;
     }
   }, "database ready");
-  for (const signal of ["TERM", "INT"]) {
+  const cases = process.argv.includes("--lock-loss-only")
+    ? ["LOCK_LOSS"]
+    : ["TERM", "INT", "LOCK_LOSS", "LOCK_STALL", "LOCK_DURING_DRAIN"];
+  for (const signal of cases) {
     const server = `${name}-${signal.toLowerCase()}`,
       state = resolve(root, signal);
     await mkdir(state);
@@ -203,13 +212,40 @@ try {
     const pid = docker("exec", server, "cat", "/state/server.pid");
     assert.match(pid, /^\d+$/);
     const began = Date.now();
-    docker("exec", server, "sh", "-c", `kill -${signal} "$1"`, "sh", pid);
-    await delay(300);
-    assert.equal(
-      sql("SELECT pg_try_advisory_lock(72614931)"),
-      "f",
-      "instance lock remains held during drain",
-    );
+    const lockFailure = signal.startsWith("LOCK_");
+    let stoppedBackend;
+    if (!lockFailure || signal === "LOCK_DURING_DRAIN") {
+      const osSignal = lockFailure ? "TERM" : signal;
+      docker("exec", server, "sh", "-c", `kill -${osSignal} "$1"`, "sh", pid);
+      await delay(300);
+      assert.equal(
+        sql("SELECT pg_try_advisory_lock(72614931)"),
+        "f",
+        "instance lock remains held during healthy drain",
+      );
+    }
+    if (lockFailure) {
+      const backend = sql(
+        "SELECT pid FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=72614931 AND granted",
+      );
+      assert.match(backend, /^\d+$/);
+      if (signal === "LOCK_STALL") {
+        stoppedBackend = backend;
+        docker(
+          "exec",
+          "-u",
+          "postgres",
+          db,
+          "sh",
+          "-c",
+          'kill -STOP "$1"',
+          "sh",
+          backend,
+        );
+      } else {
+        assert.equal(sql(`SELECT pg_terminate_backend(${backend})`), "t");
+      }
+    }
     await until(
       () => {
         try {
@@ -220,9 +256,12 @@ try {
         }
       },
       "server shutdown",
-      20000,
+      lockFailure ? 8000 : 20000,
     );
-    assert.equal(docker("exec", server, "cat", "/state/server.exit"), "0");
+    assert.equal(
+      docker("exec", server, "cat", "/state/server.exit"),
+      lockFailure ? "1" : "0",
+    );
     for (const child of pids)
       docker("exec", server, "test", "!", "-e", `/proc/${child}`);
     assert.equal(
@@ -231,10 +270,22 @@ try {
     );
     await until(() => closed, "watching socket closed", 3000);
     await scan;
-    assert.equal(
-      sql("SELECT pg_try_advisory_lock(72614931)"),
-      "t",
+    if (stoppedBackend)
+      docker(
+        "exec",
+        "-u",
+        "postgres",
+        db,
+        "sh",
+        "-c",
+        'kill -CONT "$1"',
+        "sh",
+        stoppedBackend,
+      );
+    await until(
+      () => sql("SELECT pg_try_advisory_lock(72614931)") === "t",
       "instance lock released after exit",
+      3000,
     );
     report.cases.push({
       signal,
@@ -242,7 +293,8 @@ try {
       container_still_running: true,
       remaining_processes: 0,
       websocket_closed: true,
-      lock_held_during_drain: true,
+      exit_code: lockFailure ? 1 : 0,
+      lock_held_during_drain: !lockFailure || signal === "LOCK_DURING_DRAIN",
       lock_released_after_exit: true,
     });
   }
@@ -251,7 +303,7 @@ try {
     JSON.stringify(report, null, 2) + "\n",
   );
   console.log(
-    `PASS: SIGTERM/SIGINT drain stalled local probes, close watching sockets and preserve the instance lock until exit\nEvidence: ${resolve(root, "report.json")}`,
+    `PASS: ${cases.join("/")} close watching sockets and reap stalled probe trees before exit\nEvidence: ${resolve(root, "report.json")}`,
   );
 } catch (error) {
   report.failure = String(error?.stack ?? error);

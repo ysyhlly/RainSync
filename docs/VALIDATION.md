@@ -1,5 +1,21 @@
 # 本轮验证记录
 
+## 2026-09-27：Server 实例锁失联后的进程树回收
+
+Server 将媒体进程及其 I/O 驱动、所有者任务放在独立 runtime。实例锁查询每两秒执行，三秒无结果也按失联处理；最外层先销毁应用 runtime，再等待媒体回收，返回非零退出码。正常退出仍保留最多十秒 HTTP 排空及其间的实例锁；排空中的锁故障可中断等待。无协议或迁移变更，机制及边界见 PROCESS_TREES.md。
+
+先在上一版镜像 `sha256:b52075257273d06e8ced320c8e13bdc36b0c40f03fe7e85bd4deac68315b1bcf` 运行 `node tests/server-shutdown.mjs --lock-loss-only`，终止持锁 PostgreSQL backend 后 Server 退出，但 `/proc` 中仍有探测进程，故障复现记录为 `.runtime/server-shutdown/rainsync-shutdown-14fea821/failed-report.json`。测试容器保持运行，没有用容器清理掩盖残留。
+
+修复镜像 `sha256:cb7b872ffc4f8633f4fbae99a521b59d970fdb2e65224beb507aca6852251e30` 通过 Linux 五场景，报告 `.runtime/server-shutdown/rainsync-shutdown-5c72c4ba/report.json`：SIGTERM/SIGINT 保持正常排空且退出码为零；终止持锁连接、暂停该数据库进程、正常排空期间终止连接分别约 1686/4892/3595ms 完成非零退出。全部检查探测及其后代消失、观看 WebSocket 关闭、实例锁最终可取得；其中暂停场景在检查 Server 退出后才恢复数据库进程。
+
+Windows 原生 `node tests/windows-shutdown.mjs` 七场景通过，报告 `.runtime/windows-shutdown/7b28a68e-bc15-479c-a99f-b727c423876c/report.json`，含二进制摘要。Server/Worker 的 Ctrl+C、Ctrl+Break 和关闭隐藏控制台均正常退出；Server 实例锁连接终止约 1074ms 非零退出。事先保留探测与后代进程句柄，确认全部变为退出状态。首次运行遇到 PostgreSQL 初始化临时实例的就绪竞态，夹具改为 TCP `pg_isready` 后重跑通过。
+
+工作区 48 项 Rust 测试通过，另两个子进程夹具入口 ignored；新增单元测试先销毁应用 runtime，再检查独立所有者的回收结果。Clippy 全目标且 warnings 视为错误、二进制/示例构建、格式与生成契约一致性检查通过。完整原生隔离集成通过，包含鉴权、播放幂等、扫描/索引、真实 NAS、HLS、备份恢复和重启；100 个本机控制连接快照 283ms 仅为冒烟。cgraphy 差异审查未及时返回，终止后使用 Git diff 复核。
+
+同一修复镜像的 `node tests/worker-processes.mjs` 全矩阵通过，报告 `.runtime/worker-processes/rainsync-process-33bc0f2c/report.json`：真实编码/解码及探测字幕进程树、取消/退出、磁盘写满、只读目录、数据库断连、旧 Worker 恢复和新代次隔离均回归通过。确认共享进程模块的默认运行方式仍可正常回收并发布可解码产物。
+
+这不保证撤销数据库已接受的写入，也不替代多实例 fencing；强杀本体、不可中断内核 I/O、Windows 注销/关机和完整持续运行门槛仍待验收。未部署。
+
 ## 2026-09-27：真实 Server/Worker/Agent 的取消、重启与撤销
 
 `node tests/input-retries.mjs --agent-relay` 使用已验收镜像 `sha256:b52075257273d06e8ced320c8e13bdc36b0c40f03fe7e85bd4deac68315b1bcf`，隔离 PostgreSQL、Server、Worker 和真实 Agent。八路 HTTP GET 暂停读取，真实控制连接分发一次性票据、真实数据连接转发稀疏文件；本轮没有修改 Rust、数据库或前端代码。
