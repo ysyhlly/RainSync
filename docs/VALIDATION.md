@@ -1,5 +1,15 @@
 # 本轮验证记录
 
+## 2026-09-27：Server 正常信号退出与探测回收
+
+Server 接入 SIGTERM/SIGINT、有界 HTTP 等待和共享媒体进程排空。Windows 工作区 44 项测试通过，2 个子进程夹具入口按设计 ignored；Clippy 全目标且 warnings 视为错误、格式、二进制/示例构建及生成契约一致性通过。Linux 运行时镜像使用同一锁定依赖及离线构建方式完成构建，没有修改部署文件。
+
+`SERVER_TEST_IMAGE=rainsync-server-shutdown-validation:local node tests/server-shutdown.mjs` 在隔离 PostgreSQL 与真实 Server 容器通过。测试保留已加入房间的 WebSocket，并用 ffprobe 包装进程及 sleep 后代卡住本地扫描；SIGTERM/SIGINT 分别在 11.108/11.076 秒后正常退出。两次都确认后代消失、观看连接关闭、容器仍运行，以及实例锁在退出等待期间不可取得、进程退出后可取得。第二次启动同时验证前一实例已释放锁。此测试没有把容器销毁当作子进程回收，也不声称 WebSocket 收到了关闭帧。
+
+完整 `node tests/integration.mjs` 通过，包含鉴权/房间、播放幂等恢复、控制权限、远程探测/字幕、NAS 万条索引、读租约/旧目录清理及备份恢复；100 控制连接快照 330ms 仅为本机冒烟。Worker 运行时代码未改，本轮未重复其完整 FFmpeg 故障矩阵。cgraphy 差异审查未及时返回，提交审查使用 Git diff。
+
+报告 `.runtime/server-shutdown/rainsync-shutdown-3870ca1a/report.json`，镜像 `sha256:7f6c487f70ced5ecc6290c03fd728df767b0ad13dc4608503821a58d9d4bf4d5`。Windows 真实控制台/系统退出事件、Server 实例锁连接失联的立即退出路径及强杀进程不在此证据范围。没有前端变化，未重复浏览器测试；未部署，完整计划继续进行。
+
 ## 2026-09-27：Worker runtime 退出前排空媒体进程
 
 新增进程登记表，将关闭启动入口与登记新进程串行化；关闭等待覆盖仍持有句柄与已 Drop 的所有者。Windows 工作区 44 项测试通过，Linux release 的 media-core 12 项及 Worker 15 项通过；各平台另有 2 个用于主动启动的 ignored 子进程夹具入口。新增测试确认取消关闭等待不会重新开放入口，重复关闭等待仍能确认全部后代退出。Clippy 全目标且 warnings 视为错误、格式、工作区二进制/示例构建及生成契约一致性通过。

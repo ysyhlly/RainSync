@@ -283,6 +283,22 @@ async fn ws(State(app): State<App>, h: HeaderMap, upgrade: WebSocketUpgrade) -> 
         .on_upgrade(move |socket| rooms::socket(app, user, socket, session_hash)))
 }
 
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -432,10 +448,27 @@ async fn main() -> anyhow::Result<()> {
         tokio::net::TcpListener::bind(std::env::var("BIND").unwrap_or("0.0.0.0:8080".into()))
             .await?;
     tracing::info!("RainSync server ready");
-    axum::serve(listener, router)
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, router)
         .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+            let _ = stopped.await;
         })
-        .await?;
+        .into_future();
+    tokio::pin!(server);
+    let server_result = tokio::select! {
+        result = &mut server => result,
+        signal = shutdown_signal() => {
+            let _ = stop.send(());
+            // A stalled request or long-lived connection cannot delay process
+            // shutdown indefinitely. Keep the instance lock throughout draining.
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut server)
+                .await.unwrap_or(Ok(()));
+            signal.and(result)
+        },
+    };
+    // Also drain after listener failure: cancelling a request does not itself
+    // wait for the independent ffprobe process owner to reap its descendants.
+    media_core::child_process::shutdown().await?;
+    server_result?;
     Ok(())
 }
