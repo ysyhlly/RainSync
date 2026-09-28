@@ -8,6 +8,17 @@ import AppIcon from "../shared/ui/AppIcon.vue";
 const props = defineProps<{ variant: "sidebar" | "bottom"; admin: boolean }>();
 const route = useRoute();
 const container = ref<HTMLElement | null>(null);
+// Sample the fade more finely than a screen pixel along the usual sidebar path.
+// Every sample shares the same arc-length animation, so the whole tail travels
+// at constant speed, including where the rounded path turns a corner.
+const beamSamples = Array.from({ length: 96 }, (_, index) => {
+  const progress = (index + 0.5) / 96;
+  return {
+    offset: `${-(index * 18) / 96}px`,
+    opacity: progress,
+    color: `color-mix(in srgb, var(--navigation-glow-tail) ${(1 - progress) * 100}%, var(--navigation-glow))`,
+  };
+});
 const selected = computed(() => {
   const path = route.path.replace(/\/$/, "");
   const watching = watchNavigation.find(
@@ -49,11 +60,31 @@ const indicatorStyle = computed(() =>
       :style="indicatorStyle"
       aria-hidden="true"
     >
-      <span
+      <svg
         v-if="variant === 'sidebar'"
         class="navigation-glow"
+        :viewBox="`0 0 ${rect.width} ${rect.height}`"
         aria-hidden="true"
-      />
+        focusable="false"
+      >
+        <rect
+          v-for="(sample, index) in beamSamples"
+          :key="index"
+          class="navigation-beam"
+          :style="{
+            '--beam-offset': sample.offset,
+            opacity: sample.opacity,
+            color: sample.color,
+          }"
+          x="1"
+          y="1"
+          :width="Math.max(0, rect.width - 2)"
+          :height="Math.max(0, rect.height - 2)"
+          rx="11"
+          pathLength="100"
+          stroke-dasharray="0.2075 49.7925"
+        />
+      </svg>
     </span>
     <RouterLink
       v-for="item in watchNavigation"

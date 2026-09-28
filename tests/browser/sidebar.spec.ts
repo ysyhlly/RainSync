@@ -149,32 +149,27 @@ test("desktop has two circulating gradient beams while mobile has no glow", asyn
     return;
   }
   await expect(glow).toHaveAttribute("aria-hidden", "true");
-  await expect(glow).toHaveCSS("background-image", /conic-gradient/);
-  const initial = await glow.evaluate((el) =>
-    getComputedStyle(el).getPropertyValue("--navigation-angle"),
+  const head = glow.locator(".navigation-beam").last();
+  await expect(head).toHaveAttribute("pathLength", "100");
+  const initial = await head.evaluate(
+    (el) => getComputedStyle(el).strokeDashoffset,
   );
   await expect
-    .poll(() =>
-      glow.evaluate((el) =>
-        getComputedStyle(el).getPropertyValue("--navigation-angle"),
-      ),
-    )
+    .poll(() => head.evaluate((el) => getComputedStyle(el).strokeDashoffset))
     .not.toBe(initial);
   // Compare rendered pixels, not just an animation's computed property.
   const frames: Buffer[] = [];
   for (const time of [0, 1250, 2500]) {
     await glow.evaluate((el, at) => {
-      for (const animation of el.getAnimations()) {
+      for (const animation of el.getAnimations({ subtree: true })) {
         animation.pause();
         animation.currentTime = at;
       }
     }, time);
-    const frame = await nav
-      .locator(".navigation-indicator")
-      .screenshot({
-        animations: "allow",
-        path: info.outputPath(`gradient-${time}ms.png`),
-      });
+    const frame = await nav.locator(".navigation-indicator").screenshot({
+      animations: "allow",
+      path: info.outputPath(`gradient-${time}ms.png`),
+    });
     frames.push(frame);
     await info.attach(`gradient-${time}ms`, {
       body: frame,
@@ -184,8 +179,29 @@ test("desktop has two circulating gradient beams while mobile has no glow", asyn
   expect(frames[0].equals(frames[1])).toBe(false);
   // The two opposite beams make a half turn visually identical.
   expect(frames[0].equals(frames[2])).toBe(true);
+  // Equal elapsed times must advance equal arc lengths, including the corners.
+  const offsets: number[] = [];
+  for (let time = 0; time <= 5000; time += 250) {
+    await head.evaluate((el, at) => {
+      for (const animation of el.getAnimations()) {
+        animation.pause();
+        animation.currentTime = at;
+      }
+    }, time);
+    offsets.push(
+      await head.evaluate((el) =>
+        parseFloat(getComputedStyle(el).strokeDashoffset),
+      ),
+    );
+  }
+  for (let i = 1; i < offsets.length - 1; i++) {
+    expect(offsets[i - 1] - offsets[i]).toBeCloseTo(5, 2);
+  }
+  expect(offsets.at(-1)).toBeCloseTo(offsets[0], 2);
   await glow.evaluate((el) =>
-    el.getAnimations().forEach((animation) => animation.play()),
+    el
+      .getAnimations({ subtree: true })
+      .forEach((animation) => animation.play()),
   );
   await nav.getByRole("link", { name: "媒体库", exact: true }).focus();
   await page.keyboard.press("Enter");
@@ -229,7 +245,7 @@ test("reduced motion stops ongoing motion and preserves ordinary-account navigat
   if (!isMobile) {
     expect(
       await nav
-        .locator(".navigation-glow")
+        .locator(".navigation-beam")
         .evaluateAll((els) =>
           els.every((el) => getComputedStyle(el).animationName === "none"),
         ),

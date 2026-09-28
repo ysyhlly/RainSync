@@ -12,23 +12,18 @@ button:active:not(:disabled),
 .bottom-nav a {
   transition: color 150ms var(--ease);
 }
-@property --navigation-angle {
-  syntax: "<angle>";
-  inherits: false;
-  initial-value: 0deg;
-}
-.navigation-glow {
+.navigation-beam {
   animation: navigation-glow 5s linear infinite;
 }
-.motion-paused .navigation-glow {
+.motion-paused .navigation-beam {
   animation-play-state: paused;
 }
 @keyframes navigation-glow {
   from {
-    --navigation-angle: 0deg;
+    stroke-dashoffset: var(--beam-offset);
   }
   to {
-    --navigation-angle: 360deg;
+    stroke-dashoffset: calc(var(--beam-offset) - 100px);
   }
 }
 .page-enter-active {
@@ -87,9 +82,11 @@ button:active:not(:disabled),
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .navigation-glow {
+  .navigation-beam {
     animation: none !important;
-    background: none;
+  }
+  .navigation-glow {
+    visibility: hidden;
   }
   *,
   *::before,
