@@ -307,7 +307,10 @@ pub async fn encode(settings: &Settings, input: Vec<u8>) -> Result<Vec<u8>> {
                     "-threads",
                     "1",
                     "-f",
-                    "webp",
+                    // libwebp already emits a complete RIFF frame. The WebP
+                    // muxer in FFmpeg 5.1 needs seekable output to finalize
+                    // larger files; image2pipe preserves the encoder's header.
+                    "image2pipe",
                     "pipe:1",
                 ],
                 &raw,

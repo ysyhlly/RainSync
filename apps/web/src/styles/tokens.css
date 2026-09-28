@@ -1,14 +1,14 @@
 :root {
   color-scheme: light;
-  --surface-canvas: #e5d1c1;
-  --surface-panel: #f6ede5;
-  --surface-muted: #dbc1af;
+  --surface-canvas: #ffefc1;
+  --surface-panel: #fff8e5;
+  --surface-muted: #f0e0b5;
   --text-primary: #30241f;
   --text-secondary: #65493d;
   --accent: #9e7867;
   --text-on-accent: #1a100b;
-  --accent-soft: #d3b6a3;
-  --border-subtle: #cfb5a4;
+  --accent-soft: #eed9b5;
+  --border-subtle: #dfcda5;
   --border-control: #866250;
   --danger: #9a3d32;
   --focus-ring: #6d5043;

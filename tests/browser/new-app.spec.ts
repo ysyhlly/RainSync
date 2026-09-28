@@ -121,7 +121,7 @@ test("beige tokens, media ratio, dialogs and required widths remain usable", asy
         .trim()
         .toUpperCase(),
     ),
-  ).toBe("#E5D1C1");
+  ).toBe("#FFEFC1");
   expect(
     await page.evaluate(() =>
       getComputedStyle(document.documentElement)
