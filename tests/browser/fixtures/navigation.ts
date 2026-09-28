@@ -21,9 +21,17 @@ export async function chooseRoom(page: Page, id: string) {
     .locator(".room-card")
     .filter({ has: page.getByRole("heading", { name: id, exact: true }) });
   await card.getByRole("button").click();
-  await expect(page.locator(".full-player h1")).toHaveText(id);
+  await expect(page.locator(".room-information h1")).toHaveText(id);
 }
 export async function showOptions(page: Page) {
+  await page
+    .locator("video")
+    .dispatchEvent("pointerenter", { pointerType: "mouse" });
+  await page
+    .locator("video")
+    .dispatchEvent("pointermove", { pointerType: "mouse" });
+  // Keyboard focus also reveals chrome on touch devices.
+  await page.locator(".playback-options summary").focus();
   await expect(page.locator(".playback-options")).toBeVisible();
   if (
     !(await page

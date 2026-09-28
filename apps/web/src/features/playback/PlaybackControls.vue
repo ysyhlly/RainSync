@@ -16,11 +16,19 @@ function mute() {
   muted.value = !muted.value;
   if (r.video) r.video.muted = muted.value;
 }
-async function fullscreen() {
-  const host = r.video?.closest(".playback-host");
-  if (!host) return;
-  if (document.fullscreenElement) await document.exitFullscreen();
-  else await host.requestFullscreen();
+const emit = defineEmits<{
+  fullscreen: [];
+  menuOpen: [value: boolean];
+  dragging: [value: boolean];
+}>();
+function drag(event: PointerEvent) {
+  (event.target as HTMLElement).setPointerCapture(event.pointerId);
+  r.dragging = true;
+  emit("dragging", true);
+}
+function end() {
+  r.dragging = false;
+  emit("dragging", false);
 }
 </script>
 <template>
@@ -45,15 +53,15 @@ async function fullscreen() {
       step="0.1"
       :value="r.position"
       :disabled="!r.owner || !r.connected || !r.state?.media_id"
-      @pointerdown="r.dragging = true"
+      @pointerdown="drag"
       @input="
         r.dragging = true;
         r.position = Number(($event.target as HTMLInputElement).value);
       "
       @change="r.seek"
-      @pointerup="r.dragging = false"
-      @pointercancel="r.dragging = false"
-      @blur="r.dragging = false"
+      @pointerup="end"
+      @pointercancel="end"
+      @blur="end"
     /><button
       class="icon-button volume-toggle"
       :aria-label="muted ? '取消静音' : '静音'"
@@ -70,11 +78,16 @@ async function fullscreen() {
       max="1"
       step="0.05"
       :value="volume"
+      @pointerdown="emit('dragging', true)"
+      @pointerup="emit('dragging', false)"
+      @pointercancel="emit('dragging', false)"
+      @blur="emit('dragging', false)"
       @input="setVolume"
     /><AppSelect
       v-if="!mini"
       class="rate-control"
       label="房间倍速"
+      @open-change="emit('menuOpen', $event)"
       :disabled="!r.owner || !r.connected"
       :model-value="r.state?.playback_rate ?? 1"
       :options="
@@ -85,7 +98,7 @@ async function fullscreen() {
       v-if="!mini"
       class="icon-button"
       aria-label="全屏"
-      @click="r.run(fullscreen)"
+      @click="emit('fullscreen')"
     >
       <AppIcon name="maximize" />
     </button>

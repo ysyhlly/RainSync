@@ -1,3 +1,4 @@
+import {mediaExtraResponse} from "./fixtures/media";
 import { test, expect, type WebSocketRoute } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { navigate, roomPanel, showOptions } from "./fixtures/navigation";
@@ -26,6 +27,7 @@ test("room, library, invitation and settings are usable", async ({
   await page.clock.install();
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/api/v1/**", async (route) => {
+    const extra=mediaExtraResponse(route);if(extra)return extra;
     const path = new URL(route.request().url()).pathname;
     let body: unknown = [];
     if (path.endsWith("/auth/me"))
@@ -246,6 +248,7 @@ test("rejected WebSocket upgrade rechecks login and stops retrying", async ({
   let expired = false;
   let connections = 0;
   await page.route("**/api/v1/**", (route) => {
+    const extra=mediaExtraResponse(route);if(extra)return extra;
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/me")) {
       return route.fulfill(
@@ -312,6 +315,7 @@ test("playback retries a lost HTTP response with the same operation key", async 
     route.fulfill({ contentType: "video/mp4", body: "" }),
   );
   await page.route("**/api/v1/**", async (route) => {
+    const extra=mediaExtraResponse(route);if(extra)return extra;
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/me"))
       return route.fulfill({
@@ -495,6 +499,7 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
     route.fulfill({ contentType: "video/mp4", body: "" }),
   );
   await page.route("**/api/v1/**", async (route) => {
+    const extra=mediaExtraResponse(route);if(extra)return extra;
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/me"))
       return route.fulfill({
@@ -664,6 +669,7 @@ test("subtitle identity survives reload and resets on media change", async ({
     }),
   );
   await page.route("**/api/v1/**", async (route) => {
+    const extra=mediaExtraResponse(route);if(extra)return extra;
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/me"))
       return route.fulfill({

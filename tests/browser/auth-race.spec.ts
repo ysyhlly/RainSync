@@ -1,3 +1,4 @@
+import {mediaExtraResponse} from "./fixtures/media";
 import { test, expect, type Route } from "@playwright/test";
 
 for (const predecessor of ["login", "register"]) {
@@ -27,6 +28,7 @@ for (const predecessor of ["login", "register"]) {
       ),
     });
     await page.route("**/api/v1/**", async (route) => {
+    const extra=mediaExtraResponse(route);if(extra)return extra;
       const request = route.request(),
         path = new URL(request.url()).pathname.replace("/api/v1", "");
       const name = (await request.allHeaders()).cookie?.match(

@@ -60,7 +60,7 @@ test("library pages use bounded cursors and server search without invented metad
   await expect(page.locator(".media-card")).toHaveCount(1);
   await expect(page.getByText("第 1 页 · 本页 1 部")).toBeVisible();
   expect(app.searches.at(-1)).not.toContain("after=");
-  await expect(page.getByRole("img", { name: "暂无影片封面" })).toHaveCount(1);
+  await expect(page.locator(".media-card .media-thumbnail")).toHaveCount(1);
   expect(app.errors).toEqual([]);
 });
 

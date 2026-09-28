@@ -40,3 +40,12 @@
 - `catalog-browser2` 四项桌面/手机测试通过；`catalog-unit-final` 全部单测通过；`catalog-ui-build2` 类型和生产构建通过。
 - 后续真实双用户 `library-player-real` 已通过：预览前无播放 session，改名/路由/全屏全过程同 video、同连接、同播放申请数和数据库 session 数。
 - 7897 代理通过任务进程环境及 Docker build args 使用；独立镜像构建 `preview-image-proxy` 成功。未修改 Docker Desktop 配置或用户服务。
+
+
+## T7 — 持久播放器与显隐（2026-09-29）
+
+- 普通片名/房间/控制信息移至右侧聊天顶部；单列/手机放在视频下和分段标签上方。视频 DOM 仍位于原 video-frame，AppShell 仍在 RouterView 外持有运行时。
+- 增加纯 UI 状态机：桌面 hover、触摸切换、真实全屏 5000ms、菜单/拖动/键盘独立锁、退出/隐藏/销毁清理。设置内容保持在播放器子树，通过 Popover 解决小屏裁剪和全屏层级。
+- `chrome-browser-red` 在未实施时失败；`chrome-final` 17 通过/1 手机全屏跳过；`browser-polish-final2` 完整 118 通过/2 跳过；`frontend-build-final2` 构建通过。
+- 五秒边界浏览器测试采用暂停的 Playwright clock，消除 4999ms 检查时真实时间继续前进的测量误差。真实 document.fullscreenElement、计算 opacity/cursor、倍速命令、退出和 DOM 身份均有断言。
+- 真实联调 `library-player-real` 成功；最终报告将补列音轨/字幕在真实产品全屏中的验证范围，不把模拟接口等同产品联调。

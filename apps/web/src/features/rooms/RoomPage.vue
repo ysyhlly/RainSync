@@ -6,12 +6,15 @@ import { useRoomRuntime } from "./room-runtime";
 import { roomsApi } from "./rooms.api";
 import type { RoomInvitation } from "../../shared/api/types";
 import { useAction } from "../../shared/use-action";
+import PlaybackInformation from "../playback/PlaybackInformation.vue";
 import ChatPanel from "./ChatPanel.vue";
 import AppSegmented from "../../shared/ui/AppSegmented.vue";
 import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import Notice from "../../shared/ui/Notice.vue";
+import { useMediaCatalog } from "../library/media-catalog.store";
 import MediaThumbnail from "../library/MediaThumbnail.vue";
+const catalog = useMediaCatalog();
 const r = useRoomRuntime(),
   session = useSession(),
   route = useRoute(),
@@ -77,7 +80,13 @@ async function leave() {
       <RouterLink class="button" to="/rooms">返回放映室</RouterLink>
     </div>
     <template v-else
-      ><AppSegmented
+      ><PlaybackInformation
+        class="room-information"
+        :title="r.currentTitle"
+        :room="r.room?.name ?? ''"
+        :connected="r.connected"
+        :stopped="r.connectionStopped"
+        :owner="r.owner" /><AppSegmented
         v-model="mobilePanel"
         class="mobile-room-tabs"
         label="房间面板"
@@ -121,11 +130,17 @@ async function leave() {
             暂无待播影片，在媒体库中添加。
           </p>
           <article v-for="item in r.playlist" :key="item.id" class="queue-row">
-            <MediaThumbnail small />
-            <h3>{{ item.title }}</h3>
+            <MediaThumbnail
+              small
+              :cover="catalog.records[item.media_id]?.cover ?? item.cover"
+              :alt="catalog.records[item.media_id]?.title ?? item.title"
+            />
+            <h3>{{ catalog.records[item.media_id]?.title ?? item.title }}</h3>
             <button
               class="icon-button"
-              :aria-label="'播放 ' + item.title"
+              :aria-label="
+                '播放 ' + (catalog.records[item.media_id]?.title ?? item.title)
+              "
               :disabled="!r.owner || !r.connected"
               @click="r.choose(item.media_id)"
             >
