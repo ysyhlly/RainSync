@@ -135,10 +135,10 @@ test("selection follows detail routes, profile return and viewport changes", asy
   ).toBeInViewport();
 });
 
-test("desktop has two circulating border beams while mobile has no glow", async ({
+test("desktop has two circulating gradient beams while mobile has no glow", async ({
   page,
   isMobile,
-}) => {
+}, info) => {
   await appFixture(page);
   await page.goto("/rooms");
   const nav = navigation(page, isMobile);
@@ -149,15 +149,44 @@ test("desktop has two circulating border beams while mobile has no glow", async 
     return;
   }
   await expect(glow).toHaveAttribute("aria-hidden", "true");
-  const beam = glow.locator(".navigation-beam").first();
-  await expect(beam).toHaveAttribute("pathLength", "100");
-  await expect(beam).toHaveAttribute("stroke-dasharray", "16 34");
-  const initial = await beam.evaluate(
-    (el) => getComputedStyle(el).strokeDashoffset,
+  await expect(glow).toHaveCSS("background-image", /conic-gradient/);
+  const initial = await glow.evaluate((el) =>
+    getComputedStyle(el).getPropertyValue("--navigation-angle"),
   );
   await expect
-    .poll(() => beam.evaluate((el) => getComputedStyle(el).strokeDashoffset))
+    .poll(() =>
+      glow.evaluate((el) =>
+        getComputedStyle(el).getPropertyValue("--navigation-angle"),
+      ),
+    )
     .not.toBe(initial);
+  // Compare rendered pixels, not just an animation's computed property.
+  const frames: Buffer[] = [];
+  for (const time of [0, 1250, 2500]) {
+    await glow.evaluate((el, at) => {
+      for (const animation of el.getAnimations()) {
+        animation.pause();
+        animation.currentTime = at;
+      }
+    }, time);
+    const frame = await nav
+      .locator(".navigation-indicator")
+      .screenshot({
+        animations: "allow",
+        path: info.outputPath(`gradient-${time}ms.png`),
+      });
+    frames.push(frame);
+    await info.attach(`gradient-${time}ms`, {
+      body: frame,
+      contentType: "image/png",
+    });
+  }
+  expect(frames[0].equals(frames[1])).toBe(false);
+  // The two opposite beams make a half turn visually identical.
+  expect(frames[0].equals(frames[2])).toBe(true);
+  await glow.evaluate((el) =>
+    el.getAnimations().forEach((animation) => animation.play()),
+  );
   await nav.getByRole("link", { name: "媒体库", exact: true }).focus();
   await page.keyboard.press("Enter");
   await aligned(nav, "媒体库");
@@ -200,7 +229,7 @@ test("reduced motion stops ongoing motion and preserves ordinary-account navigat
   if (!isMobile) {
     expect(
       await nav
-        .locator(".navigation-beam")
+        .locator(".navigation-glow")
         .evaluateAll((els) =>
           els.every((el) => getComputedStyle(el).animationName === "none"),
         ),

@@ -12,27 +12,23 @@ button:active:not(:disabled),
 .bottom-nav a {
   transition: color 150ms var(--ease);
 }
-.navigation-beam {
+@property --navigation-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+.navigation-glow {
   animation: navigation-glow 5s linear infinite;
 }
-.navigation-beam.beam-0 {
-  opacity: 0.25;
-}
-.navigation-beam.beam-1 {
-  opacity: 0.6;
-}
-.navigation-beam.beam-2 {
-  opacity: 1;
-}
-.motion-paused .navigation-beam {
+.motion-paused .navigation-glow {
   animation-play-state: paused;
 }
 @keyframes navigation-glow {
   from {
-    stroke-dashoffset: var(--beam-offset, 0);
+    --navigation-angle: 0deg;
   }
   to {
-    stroke-dashoffset: calc(var(--beam-offset, 0) - 100);
+    --navigation-angle: 360deg;
   }
 }
 .page-enter-active {
@@ -91,9 +87,9 @@ button:active:not(:disabled),
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .navigation-beam {
+  .navigation-glow {
     animation: none !important;
-    opacity: 0;
+    background: none;
   }
   *,
   *::before,

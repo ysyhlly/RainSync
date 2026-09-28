@@ -49,32 +49,11 @@ const indicatorStyle = computed(() =>
       :style="indicatorStyle"
       aria-hidden="true"
     >
-      <svg
+      <span
         v-if="variant === 'sidebar'"
         class="navigation-glow"
-        :viewBox="`0 0 ${rect.width} ${rect.height}`"
         aria-hidden="true"
-        focusable="false"
-      >
-        <rect
-          v-for="(beam, index) in [
-            { length: 16, offset: 0 },
-            { length: 8, offset: -8 },
-            { length: 3, offset: -13 },
-          ]"
-          :key="index"
-          class="navigation-beam"
-          :class="`beam-${index}`"
-          :style="{ '--beam-offset': beam.offset }"
-          x="1"
-          y="1"
-          :width="Math.max(0, rect.width - 2)"
-          :height="Math.max(0, rect.height - 2)"
-          rx="11"
-          pathLength="100"
-          :stroke-dasharray="`${beam.length} ${50 - beam.length}`"
-        />
-      </svg>
+      />
     </span>
     <RouterLink
       v-for="item in watchNavigation"

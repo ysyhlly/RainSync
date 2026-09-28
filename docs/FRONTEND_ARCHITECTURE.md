@@ -48,11 +48,15 @@ Library store请求25项，展示24项，用额外一项判断下一页；新搜
 
 `app/use-navigation-indicator.ts` 管理测量与弹簧：快速切换保留当前位置和速度，达到阈值后停止 requestAnimationFrame；ResizeObserver 与 resize 更新位置，首次显示/重新显示直接定位。路由立即响应，动画不阻塞页面或播放。减少动态效果时即时定位，页面隐藏时暂停装饰动效；卸载取消帧、观察器和事件监听。
 
-桌面选中项的 SVG 使用规范化圆角路径，两段相对的流光每 5 秒沿同一圈边框移动一周。三层不同长度/透明度的描边构成两条有尾迹的光带；边框矩形本身不旋转，文字和图标不移动，装饰元素不捕获指针。手机只保留选中背景回弹，没有流光。reduced-motion 完全关闭循环，保留静态选中背景与轮廓。
+桌面选中项使用带角度属性的 conic-gradient，两段相隔 180 度的连续渐变光带每 5 秒旋转一周，从透明尾部过渡到暖金、暖棕。CSS mask 将渐变限制在 2px 的圆角边框内；边框轮廓固定，文字和图标不移动，装饰元素不捕获指针。手机只保留选中背景回弹，没有流光。reduced-motion 完全关闭循环，保留静态选中背景与轮廓。
 
 执行计划和验证结果见[导航动画计划](superpowers/plans/2026-09-28-navigation-motion.md)。此变更仅本地源码提交，按用户要求未更新运行中的服务。
 
 后续部署（2026-09-28 21:18，Asia/Shanghai）：用户明确要求“同步已运行的服务”后，将 `f437fdd` 的前端构建为 `rainsync-web:navigation-f437fdd`，更新 dev 标签并仅执行 `docker compose up -d --no-deps --no-build web`。实际部署页面资源通过桌面/手机共 8 项导航回归（真实 Chromium，接口由隔离测试模拟），首页/CSS 为 200，匿名账号接口为 401。server/db/worker 容器 ID 及 SnowLuma 5099 的 PID 752 均未变化。证据目录为 `C:/Users/ALIENWARE/Desktop/杂项/RainSync-navigation-deploy-2026-09-28`，包含构建、更新、浏览器检查日志与 `verification.json`。回滚前端时将 `rainsync-web:rollback-navigation-20260928-211228` 标记为 `rainsync-web:dev`，再执行上述仅更新 web 的命令。
+
+渐变边框修正（2026-09-28 22:47，Asia/Shanghai）：用户反馈旋转不可见且需要渐变。旧实现只有三层固定透明度的 SVG 描边，并非连续渐变；旧测试仅验证描边数值变化，不能证明可见旋转，未据此认定所有浏览器中的不可见原因相同。本次改为上述真正的渐变旋转，新增实际渲染像素验证：0ms 与 1250ms 画面不同，0ms 与 2500ms 画面相同，验证两个相对光带的四分之一圈位移和半圈对称。保留自动循环、减少动态效果、两端回弹和焦点验证。
+
+本次证据目录 `C:/Users/ALIENWARE/Desktop/杂项/RainSync-gradient-border-2026-09-28`：`gradient-red` 在旧部署资源上确认无渐变；`gradient-green` 8/8、`gradient-regression` 30/30、镜像构建（含类型检查和生产构建）通过；`gradient-deployed` 在实际新部署资源上 8/8 通过，产物包含三个相位截图。接口均由测试隔离，不操作真实用户数据。仅 web 容器更新，server/db/worker 和 SnowLuma 进程保持不变；首页 200、匿名账号接口 401。新镜像 `rainsync-web:gradient-border`；前端回滚标签 `rainsync-web:rollback-gradient-20260928-224652`，重新标记为 dev 后执行上述仅更新 web 的命令。远程 CI 和 Safari/手机实机未验证。
 
 ## 已执行的阶段证据
 
