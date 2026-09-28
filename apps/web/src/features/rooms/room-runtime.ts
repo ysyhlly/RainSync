@@ -16,11 +16,13 @@ import type {
 import { RequestFailure, stopsReconnect } from "../../errors";
 import { StaleIdentity } from "../../shared/api/client";
 import { PlaybackCancelled } from "../../playback-request";
+import { useMediaCatalog } from "../library/media-catalog.store";
 import { useSession } from "../auth/session.store";
 import { createPlaybackRuntime } from "../playback/playback-runtime";
 
 export const useRoomRuntime = defineStore("room-runtime", () => {
-  const session = useSession();
+  const session = useSession(),
+    catalog = useMediaCatalog();
   const error = ref(""),
     busy = ref(false),
     room = ref<Room | null>(null),
@@ -30,15 +32,24 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
   const messages = ref<Message[]>([]),
     playlist = ref<QueueItem[]>([]),
     chat = ref("");
-  const metadata = ref<Record<string, Media>>({});
-  function remember(rows: Media[]) {
-    for (const row of rows) metadata.value[row.id] = row;
-  }
+  const remember = catalog.remember;
   const currentTitle = computed(() =>
     state.value?.media_id
-      ? (metadata.value[state.value.media_id]?.title ?? "正在播放")
+      ? (catalog.records[state.value.media_id]?.title ?? "正在播放")
       : "尚未选择影片",
   );
+  watch(
+    () => state.value?.media_id,
+    (id) => {
+      if (id) void catalog.ensure(id, true).catch(() => {});
+    },
+  );
+  function refreshMetadata() {
+    const id = state.value?.media_id;
+    if (id) void catalog.ensure(id, true).catch(() => {});
+  }
+  window.addEventListener("focus", refreshMetadata);
+  onScopeDispose(() => window.removeEventListener("focus", refreshMetadata));
   const clock = new Clock();
   let socket: WebSocket | undefined,
     retry: ReturnType<typeof setTimeout> | undefined;
@@ -110,7 +121,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
   watch(
     () => session.user?.id,
     (id) => {
-      metadata.value = {};
+      catalog.reset();
       if (id) error.value = "";
       void leave().catch(() => {});
     },

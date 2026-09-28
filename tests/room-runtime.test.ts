@@ -12,6 +12,7 @@ it("failed entry cleanup keeps the room inactive so the same room can be retried
   vi.useFakeTimers();
   setActivePinia(createPinia());
   vi.stubGlobal("document", new EventTarget());
+  vi.stubGlobal("window", new EventTarget());
   vi.stubGlobal("location", { protocol: "http:", host: "localhost" });
   const saved = new Map([["rainsync:playback:user", '["old-request"]']]);
   vi.stubGlobal("sessionStorage", {
@@ -63,6 +64,7 @@ it("same room entry retains its socket and stale playlist cannot overwrite a new
   vi.useFakeTimers();
   setActivePinia(createPinia());
   vi.stubGlobal("document", new EventTarget());
+  vi.stubGlobal("window", new EventTarget());
   vi.stubGlobal("location", { protocol: "http:", host: "localhost" });
   vi.stubGlobal("sessionStorage", {
     getItem: () => null,

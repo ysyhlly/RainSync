@@ -23,6 +23,18 @@ export interface Media {
   title: string;
   duration_ms: number | null;
   kind: string;
+  original_title: string;
+  shared_title: string | null;
+  shared_title_revision: string;
+  personal_title: string | null;
+  personal_title_revision: string;
+  cover: MediaCover;
+}
+export interface MediaCover {
+  status: "missing" | "queued" | "running" | "ready" | "unavailable";
+  revision: string | null;
+  url: string | null;
+  retry_after_ms: number | null;
 }
 export interface Source {
   id: string;
@@ -48,6 +60,7 @@ export interface QueueItem {
   id: string;
   media_id: string;
   title: string;
+  cover: MediaCover;
 }
 export interface RoomInvitation {
   room_id: string;

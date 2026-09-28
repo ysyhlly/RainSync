@@ -31,3 +31,12 @@
 | T9 报告/提交 | 待执行 | |
 
 每个 logs/NAME.json 记录命令、时间、退出码；同名 .log 保存真实输出。只在实际验证通过后更新检查点。
+
+
+## T6 — 媒体资料与重命名（2026-09-29）
+
+- 实现按身份 epoch 隔离的 catalog、双作用域版本合并、预览请求序号、可见卡片批量请求和 60 秒停止等待/手动重试。
+- 卡片提供个人/管理员全站改名，冲突保留草稿，网络失败读回核验；直接进入房间按媒体 ID 读取标题，改名不调用媒体重载。
+- `catalog-browser2` 四项桌面/手机测试通过；`catalog-unit-final` 全部单测通过；`catalog-ui-build2` 类型和生产构建通过。
+- 后续真实双用户 `library-player-real` 已通过：预览前无播放 session，改名/路由/全屏全过程同 video、同连接、同播放申请数和数据库 session 数。
+- 7897 代理通过任务进程环境及 Docker build args 使用；独立镜像构建 `preview-image-proxy` 成功。未修改 Docker Desktop 配置或用户服务。

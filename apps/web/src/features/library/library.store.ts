@@ -1,11 +1,11 @@
 import { defineStore } from "pinia";
 import { ref, watch, onScopeDispose } from "vue";
 import { useSession } from "../auth/session.store";
-import { useRoomRuntime } from "../rooms/room-runtime";
+import { useMediaCatalog } from "./media-catalog.store";
 import type { Media } from "../../shared/api/types";
 export const useLibrary = defineStore("library", () => {
   const session = useSession(),
-    runtime = useRoomRuntime();
+    catalog = useMediaCatalog();
   const items = ref<Media[]>([]),
     query = ref(""),
     page = ref(0),
@@ -19,6 +19,7 @@ export const useLibrary = defineStore("library", () => {
   const pageSize = 24;
   async function load(next = 0, search = query.value) {
     const id = ++serial;
+    const stamp = catalog.stamp();
     controller?.abort();
     controller = new AbortController();
     busy.value = true;
@@ -43,7 +44,7 @@ export const useLibrary = defineStore("library", () => {
       page.value = next;
       loaded.value = true;
       cursors = [...cursors.slice(0, next + 1), items.value.at(-1)?.id ?? ""];
-      runtime.remember(rows);
+      catalog.remember(rows, stamp);
     } catch (e) {
       if (id === serial && !controller.signal.aborted)
         error.value = e instanceof Error ? e.message : String(e);
@@ -52,7 +53,7 @@ export const useLibrary = defineStore("library", () => {
     }
   }
   watch(
-    () => session.user?.id,
+    () => session.epoch,
     () => {
       ++serial;
       controller?.abort();
@@ -65,6 +66,7 @@ export const useLibrary = defineStore("library", () => {
       hasMore.value = false;
       cursors = [""];
     },
+    { flush: "sync" },
   );
   onScopeDispose(() => controller?.abort());
   return { items, query, page, busy, error, loaded, hasMore, load };

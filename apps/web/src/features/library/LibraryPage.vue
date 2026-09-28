@@ -1,5 +1,8 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount } from "vue";
+import { ref, computed, onMounted, onBeforeUnmount } from "vue";
+import { useMediaCatalog } from "./media-catalog.store";
+import { useVisiblePreviews } from "./use-visible-previews";
+import MediaRenameDialog from "./MediaRenameDialog.vue";
 import { useLibrary } from "./library.store";
 import { useRoomRuntime } from "../rooms/room-runtime";
 import { useSession } from "../auth/session.store";
@@ -13,6 +16,18 @@ const library = useLibrary(),
   session = useSession(),
   router = useRouter(),
   search = ref(library.query);
+const catalog = useMediaCatalog(),
+  grid = ref<HTMLElement>(),
+  renaming = ref<string | null>(null);
+const items = computed(() =>
+  library.items.map((item) => catalog.records[item.id] ?? item),
+);
+const previews = useVisiblePreviews(grid, () =>
+  items.value.map((item) => item.id),
+);
+function refresh() {
+  void library.load(library.page, library.query);
+}
 let debounce: ReturnType<typeof setTimeout> | undefined;
 function submit() {
   clearTimeout(debounce);
@@ -31,10 +46,14 @@ async function choose(id: string) {
   await router.push("/rooms/" + runtime.room.id);
 }
 onMounted(() => {
+  window.addEventListener("focus", refresh);
   // Preserve navigation context, but refresh records changed by source scans.
   void library.load(library.page, library.query);
 });
-onBeforeUnmount(() => clearTimeout(debounce));
+onBeforeUnmount(() => {
+  clearTimeout(debounce);
+  window.removeEventListener("focus", refresh);
+});
 </script>
 <template>
   <section class="page library-page">
@@ -91,9 +110,18 @@ onBeforeUnmount(() => clearTimeout(debounce));
     <p v-else-if="runtime.room && !runtime.owner" class="helper">
       当前为观看者，选片与待播由控制者操作。
     </p>
-    <div class="media-grid">
-      <article v-for="item in library.items" :key="item.id" class="media-card">
-        <MediaThumbnail />
+    <div ref="grid" class="media-grid">
+      <article
+        v-for="item in items"
+        :data-media-id="item.id"
+        :key="item.id"
+        class="media-card"
+      >
+        <MediaThumbnail
+          :cover="item.cover"
+          :stalled="previews.stalled.value.has(item.id)"
+          :alt="item.title"
+        />
         <h2 :title="item.title">{{ item.title }}</h2>
         <p class="media-meta">
           {{ item.kind }} ·
@@ -104,6 +132,20 @@ onBeforeUnmount(() => clearTimeout(debounce));
           }}
         </p>
         <div class="media-actions">
+          <button
+            :aria-label="'重命名 ' + item.title"
+            @click="renaming = item.id"
+          >
+            重命名</button
+          ><button
+            v-if="
+              item.cover?.status === 'unavailable' ||
+              previews.stalled.value.has(item.id)
+            "
+            @click="previews.retry(item.id)"
+          >
+            重试预览
+          </button>
           <button
             :disabled="!!runtime.room && (!runtime.owner || !runtime.connected)"
             :aria-label="'播放 ' + item.title"
@@ -142,5 +184,6 @@ onBeforeUnmount(() => clearTimeout(debounce));
         下一页<AppIcon name="next" />
       </button>
     </nav>
+    <MediaRenameDialog :media-id="renaming" @close="renaming = null" />
   </section>
 </template>

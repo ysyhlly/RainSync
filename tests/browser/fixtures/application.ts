@@ -1,5 +1,6 @@
 import type { Page, WebSocketRoute } from "@playwright/test";
 import { readFileSync } from "node:fs";
+import { mediaRecord, missingCover } from "./media";
 export const appBase = "";
 export async function appFixture(
   page: Page,
@@ -40,12 +41,14 @@ export async function appFixture(
     duration_ms: 30000,
     clock_epoch: "test-clock",
   };
-  const media = Array.from({ length: 30 }, (_, i) => ({
-    id: i === 0 ? "movie" : "movie-" + i,
-    title: i === 0 ? "真实合成测试视频" : "测试影片 " + i,
-    kind: "local",
-    duration_ms: 30000,
-  }));
+  const media = Array.from({ length: 30 }, (_, i) =>
+    mediaRecord({
+      id: i === 0 ? "movie" : "movie-" + i,
+      title: i === 0 ? "真实合成测试视频" : "测试影片 " + i,
+      kind: "local",
+      duration_ms: 30000,
+    }),
+  );
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/fixture-video.mp4", (route) =>
     route.fulfill({ contentType: "video/mp4", body: clip }),
@@ -79,6 +82,62 @@ export async function appFixture(
         offset,
         offset + Number(url.searchParams.get("limit") ?? 100),
       );
+    } else if (path === "/media/previews") {
+      const ids =
+        request.method() === "POST"
+          ? request.postDataJSON().media_ids
+          : (url.searchParams.get("ids") ?? "").split(",");
+      value = {
+        items: ids
+          .filter((id: string) => media.some((m) => m.id === id))
+          .map((media_id: string) => ({
+            media_id,
+            cover: {
+              ...missingCover,
+              status: "unavailable",
+              retry_after_ms: 60000,
+            },
+          })),
+      };
+    } else if (
+      /^\/(admin\/)?media\/[^/]+\/(personal|shared)-title$/.test(path)
+    ) {
+      const id = path.split("/").at(-2),
+        item = media.find((m) => m.id === id)!;
+      const scope = path.endsWith("personal-title") ? "personal" : "shared",
+        body = request.postDataJSON();
+      if (scope === "shared" && !identity.admin)
+        return route.fulfill({
+          status: 403,
+          json: {
+            error: { code: "ADMIN_REQUIRED", message: "仅管理员可操作" },
+          },
+        });
+      if (body.expected_revision !== item[`${scope}_title_revision`])
+        return route.fulfill({
+          status: 409,
+          json: {
+            error: { code: "MEDIA_TITLE_CONFLICT", message: "名称冲突" },
+          },
+        });
+      Object.assign(item, {
+        [`${scope}_title`]: body.title,
+        [`${scope}_title_revision`]: String(Number(body.expected_revision) + 1),
+      });
+      item.title = String(
+        item.personal_title ?? item.shared_title ?? item.original_title,
+      );
+      value = item;
+    } else if (path.startsWith("/media/")) {
+      const item = media.find(
+        (m) => m.id === decodeURIComponent(path.split("/")[2]),
+      );
+      if (!item)
+        return route.fulfill({
+          status: 404,
+          json: { error: { code: "MEDIA_NOT_FOUND", message: "未找到影片" } },
+        });
+      value = item;
     } else if (path.endsWith("/playlist")) value = [];
     else if (path.endsWith("/messages")) value = [];
     else if (path.endsWith("/invites"))
