@@ -129,7 +129,7 @@ label {
 label .helper {
   font-weight: 400;
 }
-input:not([type="range"]):not([type="checkbox"]),
+input:not([type="range"]):not([type="checkbox"]):not([type="radio"]),
 textarea,
 select {
   width: 100%;

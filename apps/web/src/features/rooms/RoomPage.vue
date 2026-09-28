@@ -7,6 +7,7 @@ import { roomsApi } from "./rooms.api";
 import type { RoomInvitation } from "../../shared/api/types";
 import { useAction } from "../../shared/use-action";
 import ChatPanel from "./ChatPanel.vue";
+import AppSegmented from "../../shared/ui/AppSegmented.vue";
 import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import Notice from "../../shared/ui/Notice.vue";
@@ -76,28 +77,27 @@ async function leave() {
       <RouterLink class="button" to="/rooms">返回放映室</RouterLink>
     </div>
     <template v-else
-      ><div class="mobile-room-tabs" role="tablist" aria-label="房间面板">
-        <button
-          role="tab"
-          :aria-selected="mobilePanel === 'chat'"
-          @click="mobilePanel = 'chat'"
-        >
-          聊天</button
-        ><button
-          role="tab"
-          :aria-selected="mobilePanel === 'queue'"
-          @click="mobilePanel = 'queue'"
-        >
-          待播
-        </button>
-      </div>
+      ><AppSegmented
+        v-model="mobilePanel"
+        class="mobile-room-tabs"
+        label="房间面板"
+        :options="[
+          { value: 'chat', label: '聊天', panel: 'room-chat' },
+          { value: 'queue', label: '待播', panel: 'room-queue' },
+        ]" />
       <div
+        id="room-chat"
+        role="tabpanel"
+        aria-labelledby="room-chat-tab"
         class="room-chat"
         :class="{ 'mobile-hidden': mobilePanel !== 'chat' }"
       >
         <ChatPanel />
       </div>
       <section
+        id="room-queue"
+        role="tabpanel"
+        aria-labelledby="room-queue-tab"
         class="room-secondary"
         :class="{ 'mobile-hidden': mobilePanel !== 'queue' }"
       >

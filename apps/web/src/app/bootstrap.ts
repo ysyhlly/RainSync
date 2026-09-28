@@ -8,6 +8,7 @@ import "../styles/layout.css";
 import "../styles/motion.css";
 import "../styles/account.css";
 import "../styles/admin.css";
+import "../styles/selection.css";
 export function start(base = "/") {
   const app = createApp(AppShell);
   app.use(createPinia());

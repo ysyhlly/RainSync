@@ -594,13 +594,15 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
     "/audio-test-media/initial",
   );
   await showOptions(page);
+  await page.getByRole("combobox", { name: "音轨", exact: true }).click();
   await page
-    .getByRole("combobox", { name: "音轨", exact: true })
-    .selectOption("2");
+    .getByRole("option", { name: "Japanese · jpn", exact: true })
+    .click();
   await expect.poll(() => held).toBe(true);
+  await page.getByRole("combobox", { name: "音轨", exact: true }).click();
   await page
-    .getByRole("combobox", { name: "音轨", exact: true })
-    .selectOption("1");
+    .getByRole("option", { name: "English · eng", exact: true })
+    .click();
   await expect(page.locator("video")).toHaveAttribute(
     "src",
     "/audio-test-media/track-1",
@@ -609,7 +611,7 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
   expect(requests[1].audio_index).toBe(1);
   await expect(
     page.getByRole("combobox", { name: "音轨", exact: true }),
-  ).toHaveValue("1");
+  ).toContainText("English · eng");
   expect(requests[1].position_ms).toBe(1250);
   expect(requests[1].idempotency_key).not.toBe(requests[0].idempotency_key);
   releaseDelete!();
@@ -745,9 +747,8 @@ test("subtitle identity survives reload and resets on media change", async ({
     .poll(() => video.evaluate((v: HTMLVideoElement) => v.readyState))
     .toBeGreaterThanOrEqual(2);
   await showOptions(page);
-  await page
-    .getByRole("combobox", { name: "字幕", exact: true })
-    .selectOption({ label: "中文 · zho" });
+  await page.getByRole("combobox", { name: "字幕", exact: true }).click();
+  await page.getByRole("option", { name: "中文 · zho", exact: true }).click();
   const showing = () =>
     video.evaluate((v: HTMLVideoElement) =>
       Array.from(v.querySelectorAll("track"))
@@ -759,27 +760,21 @@ test("subtitle identity survives reload and resets on media change", async ({
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
   await expect.poll(() => plans).toBe(2);
   await expect(
-    page
-      .getByRole("combobox", { name: "字幕", exact: true })
-      .locator("option:checked"),
+    page.getByRole("combobox", { name: "字幕", exact: true }),
   ).toContainText("中文");
   await expect.poll(showing).toEqual([{ label: "中文", cues: 1 }]);
-  await page
-    .getByRole("combobox", { name: "字幕", exact: true })
-    .selectOption({ label: "关闭" });
+  await page.getByRole("combobox", { name: "字幕", exact: true }).click();
+  await page.getByRole("option", { name: "关闭", exact: true }).click();
   await showOptions(page);
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
   await expect.poll(() => plans).toBe(3);
   await expect(
-    page
-      .getByRole("combobox", { name: "字幕", exact: true })
-      .locator("option:checked"),
-  ).toHaveText("关闭");
+    page.getByRole("combobox", { name: "字幕", exact: true }),
+  ).toContainText("关闭");
   await expect.poll(showing).toEqual([]);
   await showOptions(page);
-  await page
-    .getByRole("combobox", { name: "字幕", exact: true })
-    .selectOption({ label: "中文 · zho" });
+  await page.getByRole("combobox", { name: "字幕", exact: true }).click();
+  await page.getByRole("option", { name: "中文 · zho", exact: true }).click();
   await expect.poll(showing).toEqual([{ label: "中文", cues: 1 }]);
   state.media_generation = 2;
   state.media_id = "next-movie";
@@ -787,10 +782,8 @@ test("subtitle identity survives reload and resets on media change", async ({
   socket!.send(JSON.stringify({ type: "SNAPSHOT", state }));
   await expect.poll(() => plans).toBe(4);
   await expect(
-    page
-      .getByRole("combobox", { name: "字幕", exact: true })
-      .locator("option:checked"),
-  ).toHaveText("关闭");
+    page.getByRole("combobox", { name: "字幕", exact: true }),
+  ).toContainText("关闭");
   await expect.poll(showing).toEqual([]);
   expect(commands).toEqual([]);
 });

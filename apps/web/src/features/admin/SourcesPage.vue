@@ -3,6 +3,7 @@ import { ref, reactive, onMounted, onBeforeUnmount, watch } from "vue";
 import { useSession } from "../auth/session.store";
 import type { Source } from "../../shared/api/types";
 import { useAction } from "../../shared/use-action";
+import AppSelect from "../../shared/ui/AppSelect.vue";
 import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import Notice from "../../shared/ui/Notice.vue";
@@ -147,12 +148,15 @@ onBeforeUnmount(() => {
             maxlength="120"
             autofocus /></label
         ><label
-          >类型<select v-model="kind">
-            <option value="local">本地挂载目录</option>
-            <option value="http">HTTP MP4 / HLS</option>
-            <option value="jellyfin">Jellyfin</option>
-            <option value="emby">Emby</option>
-          </select></label
+          >类型<AppSelect
+            v-model="kind"
+            label="类型"
+            :options="[
+              { value: 'local', label: '本地挂载目录' },
+              { value: 'http', label: 'HTTP MP4 / HLS' },
+              { value: 'jellyfin', label: 'Jellyfin' },
+              { value: 'emby', label: 'Emby' },
+            ]" /></label
         ><label v-if="kind === 'local'"
           >容器内路径<input v-model="root" required /></label
         ><label v-else

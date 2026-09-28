@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { useRoomRuntime } from "../rooms/room-runtime";
+import AppSelect from "../../shared/ui/AppSelect.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import { formatTime } from "../../shared/use-action";
 defineProps<{ mini?: boolean }>();
@@ -70,23 +71,17 @@ async function fullscreen() {
       step="0.05"
       :value="volume"
       @input="setVolume"
-    /><select
+    /><AppSelect
       v-if="!mini"
       class="rate-control"
-      aria-label="房间倍速"
+      label="房间倍速"
       :disabled="!r.owner || !r.connected"
-      :value="r.state?.playback_rate ?? 1"
-      @change="
-        r.send('SET_RATE', {
-          rate: Number(($event.target as HTMLSelectElement).value),
-        })
+      :model-value="r.state?.playback_rate ?? 1"
+      :options="
+        [0.5, 1, 1.5, 2].map((value) => ({ value, label: value + '×' }))
       "
-    >
-      <option :value="0.5">0.5×</option>
-      <option :value="1">1×</option>
-      <option :value="1.5">1.5×</option>
-      <option :value="2">2×</option></select
-    ><button
+      @change="r.send('SET_RATE', { rate: $event })"
+    /><button
       v-if="!mini"
       class="icon-button"
       aria-label="全屏"

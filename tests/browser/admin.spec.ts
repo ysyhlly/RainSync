@@ -109,7 +109,7 @@ test("invitation raw codes appear once with honest copy fallback, close warning 
   await expect(page.getByLabel("数量", { exact: true })).toHaveValue("1");
   await expect(
     page.getByRole("combobox", { name: "有效期", exact: true }),
-  ).toHaveValue("7");
+  ).toContainText("7 天");
   await page
     .getByRole("button", { name: "生成 1 个邀请码", exact: true })
     .click();
@@ -182,9 +182,8 @@ test("uncommitted unknown batch explicitly retries the same persisted parameters
   await page.goto(appBase + "/admin/registration-invites");
   await page.getByRole("button", { name: "生成邀请码", exact: true }).click();
   await page.getByLabel("备注（可选）").fill("批次参数");
-  await page
-    .getByRole("combobox", { name: "有效期", exact: true })
-    .selectOption("30");
+  await page.getByRole("combobox", { name: "有效期", exact: true }).click();
+  await page.getByRole("option", { name: "30 天", exact: true }).click();
   await page
     .getByRole("button", { name: "生成 1 个邀请码", exact: true })
     .click();
@@ -207,9 +206,8 @@ test("invitation filters reset server cursor and list both account and nickname"
   await page.getByRole("button", { name: "下一页", exact: true }).click();
   await expect(page.getByText("第 2 页 · 本页 1 条")).toBeVisible();
   expect(app.queries.at(-1)).toContain("cursor=next-id");
-  await page
-    .getByRole("combobox", { name: "状态", exact: true })
-    .selectOption("used");
+  await page.getByRole("combobox", { name: "状态", exact: true }).click();
+  await page.getByRole("option", { name: "已使用", exact: true }).click();
   await expect(page.getByText("第 1 页 · 本页 1 条")).toBeVisible();
   await expect(page.getByText("昵称（viewer）", { exact: true })).toBeVisible();
   expect(app.queries.at(-1)).not.toContain("cursor=");
@@ -257,9 +255,10 @@ test("sources validate dynamic fields and keep scans scoped to each row", async 
   ).toHaveCount(0);
   await page.getByRole("button", { name: "添加片源", exact: true }).click();
   await page.getByLabel("名称", { exact: true }).fill("HTTP来源");
+  await page.getByRole("combobox", { name: "类型", exact: true }).click();
   await page
-    .getByRole("combobox", { name: "类型", exact: true })
-    .selectOption("http");
+    .getByRole("option", { name: "HTTP MP4 / HLS", exact: true })
+    .click();
   await page
     .getByLabel("媒体或服务 URL")
     .fill("https://example.test/video.mp4");
@@ -319,7 +318,9 @@ test("NAS history is not claimed online; pairing and revoke preserve actual cont
     "PAIR-SYNTHETIC",
   );
   await expect(page.getByText(/预计剩余/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "关闭弹窗" })).toBeEnabled();
   await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "添加NAS设备" })).toBeHidden();
   await page.getByRole("button", { name: "撤销设备", exact: true }).click();
   expect(deletes).toBe(0);
   await page.getByRole("button", { name: "确认撤销设备" }).click();

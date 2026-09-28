@@ -23,7 +23,7 @@
 | T1 双层名称 | 已验证 | titles-red 真实接口 404；titles-green 通过；titles-rust、titles-protocol-check 通过。local 真扫描、Jellyfin/Emby 协议 fixture 扫描、NAS WebSocket 索引与 Server 重启覆盖；真实上游留待 T3 |
 | T2 预览任务 | 核心路径通过，扩展审查继续 | previews-red、preview-races-red 暴露路由/容量缺陷；previews-bind-green 验证去重、领取、租约、旧 attempt/source 拒绝、LRU 预算和认证图片；preview-sources-reuse 五类读取路径通过 |
 | T3 真实解码 | 部分通过/环境限制 | 合成帧像素、黑/暗/损坏/竖屏、Range/HLS、真实 NAS、上游协议 fixture 通过；previews-container 验证 Bookworm 5.1 编码。preview-image-build 因 Docker Hub 认证超时失败；新 Linux Worker 和真实 Jellyfin/Emby 产品未验证 |
-| T4 选择器/抽屉 | 待执行 | |
+| T4 选择器/抽屉 | 实现/基本回归通过 | selection-red 3 个预期失败；selection-final 25 通过、手机全宽外部点击跳过，字幕文本断言适配后 selection-subtitle-final 2/2；admin 16 项已通过。全屏层级随 T7 验证 |
 | T5 配色 | 待执行 | |
 | T6 媒体资料 UI | 待执行 | |
 | T7 播放器 | 待执行 | |

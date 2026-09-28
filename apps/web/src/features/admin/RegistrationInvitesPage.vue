@@ -12,6 +12,7 @@ import { RequestFailure } from "../../errors";
 import { StaleIdentity } from "../../shared/api/client";
 import { formatDate } from "../../shared/use-action";
 import AccountTabs from "./AccountTabs.vue";
+import AppSelect from "../../shared/ui/AppSelect.vue";
 import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import Notice from "../../shared/ui/Notice.vue";
@@ -317,11 +318,12 @@ onBeforeUnmount(() => {
     <AccountTabs />
     <div class="admin-filters">
       <label
-        >状态<select v-model="status">
-          <option v-for="(label, key) in labels" :key="key" :value="key">
-            {{ label }}
-          </option>
-        </select></label
+        >状态<AppSelect
+          v-model="status"
+          label="状态"
+          :options="
+            Object.entries(labels).map(([value, label]) => ({ value, label }))
+          " /></label
       ><button :disabled="loading" @click="load">
         <AppIcon name="refresh" />刷新列表
       </button>
@@ -456,12 +458,13 @@ onBeforeUnmount(() => {
             autofocus
         /></label>
         <label
-          >有效期<select v-model.number="days">
-            <option :value="1">1 天</option>
-            <option :value="7">7 天</option>
-            <option :value="30">30 天</option>
-          </select></label
-        >
+          >有效期<AppSelect
+            v-model="days"
+            label="有效期"
+            :options="
+              [1, 7, 30].map((value) => ({ value, label: value + ' 天' }))
+            "
+        /></label>
         <label>备注（可选）<textarea v-model="note" /></label>
         <p class="helper">最多60个字符。每个邀请码仅可注册一个普通账号。</p>
         <Notice :message="operationError" error /><button
@@ -475,9 +478,7 @@ onBeforeUnmount(() => {
     <AppDialog v-model="revokeOpen" title="撤销注册邀请码" :busy="busy"
       ><p>
         撤销尾号
-        {{
-          revoking?.code_suffix
-        }}
+        {{ revoking?.code_suffix }}
         后，此邀请码将无法用于注册。已创建的账号不受影响。
       </p>
       <Notice :message="revokeError" error />

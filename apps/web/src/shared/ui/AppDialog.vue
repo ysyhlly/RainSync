@@ -12,6 +12,28 @@ const emit = defineEmits<{ "update:modelValue": [boolean] }>();
 const dialog = ref<HTMLDialogElement>(),
   titleId = useId();
 let previous: HTMLElement | null = null;
+let backdropPointer: number | null = null;
+function outside(event: PointerEvent) {
+  if (!dialog.value || event.target !== dialog.value) return false;
+  const rect = dialog.value.getBoundingClientRect();
+  return (
+    event.clientX < rect.left ||
+    event.clientX > rect.right ||
+    event.clientY < rect.top ||
+    event.clientY > rect.bottom
+  );
+}
+function down(event: PointerEvent) {
+  backdropPointer =
+    props.drawer && event.isPrimary && event.button === 0 && outside(event)
+      ? event.pointerId
+      : null;
+}
+function up(event: PointerEvent) {
+  const dismiss = backdropPointer === event.pointerId && outside(event);
+  backdropPointer = null;
+  if (dismiss) close();
+}
 function close() {
   if (props.busy || (props.canClose && !props.canClose())) return;
   emit("update:modelValue", false);
@@ -72,6 +94,9 @@ onBeforeUnmount(() => {
     :aria-labelledby="titleId"
     @cancel.prevent="close"
     @keydown="trapTab"
+    @pointerdown="down"
+    @pointerup="up"
+    @pointercancel="backdropPointer = null"
   >
     <header>
       <h2 :id="titleId" tabindex="-1">{{ title }}</h2>

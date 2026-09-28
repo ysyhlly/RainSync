@@ -1,0 +1,73 @@
+.app-select {
+  display: inline-block;
+  min-width: 0;
+  width: 100%;
+  position: relative;
+}
+.select-trigger {
+  width: 100%;
+  justify-content: space-between;
+  text-align: left;
+  font-weight: 400;
+  background: var(--surface-panel);
+}
+.select-menu {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  padding: 5px;
+  border: 1px solid var(--border-control);
+  border-radius: 11px;
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-floating);
+  overflow: auto;
+  overscroll-behavior: contain;
+  z-index: 1000;
+}
+.select-option {
+  min-height: 44px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-radius: 7px;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.select-option.active,
+.select-option:hover {
+  background: var(--accent-soft);
+}
+.select-option[aria-selected="true"] {
+  background: var(--accent);
+  font-weight: 600;
+}
+.select-option[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border-control);
+}
+.app-segmented {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--surface-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+}
+.app-segmented button {
+  flex: 1;
+  border: 0;
+  background: transparent;
+}
+.app-segmented button[aria-selected="true"] {
+  background: var(--accent-soft);
+}

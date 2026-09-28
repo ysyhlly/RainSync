@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
 import { useRoomRuntime } from "../rooms/room-runtime";
+import AppSelect from "../../shared/ui/AppSelect.vue";
 import PlaybackControls from "./PlaybackControls.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 defineProps<{ full: boolean }>();
@@ -84,36 +85,45 @@ onMounted(() => {
       <summary>播放选项</summary>
       <div class="option-fields">
         <label
-          >播放方式<select v-model="r.mode">
-            <option value="auto">自动适配</option>
-            <option value="direct">直接播放</option>
-            <option value="remux">转封装</option>
-            <option value="transcode">兼容转码</option>
-          </select></label
+          >播放方式<AppSelect
+            v-model="r.mode"
+            label="播放方式"
+            :options="[
+              { value: 'auto', label: '自动适配' },
+              { value: 'direct', label: '直接播放' },
+              { value: 'remux', label: '转封装' },
+              { value: 'transcode', label: '兼容转码' },
+            ]" /></label
         ><button :disabled="!r.state?.media_id" @click="r.run(r.loadMedia)">
           <AppIcon name="refresh" />重新加载</button
         ><label v-if="r.tracks.length > 1"
-          >音轨<select v-model="r.audioIndex" @change="r.run(r.loadMedia)">
-            <option
-              v-for="track in r.tracks"
-              :key="track.index"
-              :value="track.index"
-            >
-              {{ track.label }} · {{ track.language }}
-            </option>
-          </select></label
+          >音轨<AppSelect
+            :model-value="r.audioIndex ?? null"
+            label="音轨"
+            :options="
+              r.tracks.map((track) => ({
+                value: track.index,
+                label: track.label + ' · ' + track.language,
+              }))
+            "
+            @update:model-value="r.audioIndex = $event as number"
+            @change="r.run(r.loadMedia)" /></label
         ><label v-if="r.subtitles.length"
-          >字幕<select v-model="r.subtitleIndex" @change="r.applySubtitles">
-            <option :value="undefined">关闭</option>
-            <option
-              v-for="track in r.subtitles"
-              :key="track.index"
-              :value="track.index"
-            >
-              {{ track.label }} · {{ track.language }}
-            </option>
-          </select></label
-        >
+          >字幕<AppSelect
+            :model-value="r.subtitleIndex ?? null"
+            label="字幕"
+            :options="[
+              { value: null, label: '关闭' },
+              ...r.subtitles.map((track) => ({
+                value: track.index,
+                label: track.label + ' · ' + track.language,
+              })),
+            ]"
+            @update:model-value="
+              r.subtitleIndex = $event === null ? undefined : ($event as number)
+            "
+            @change="r.applySubtitles"
+        /></label>
       </div>
     </details>
   </section>
