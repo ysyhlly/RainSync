@@ -12,7 +12,9 @@
 
 浅色主背景改为 `#ffefc1`，面板、播放器底色及柔和边框同步调整为相配的浅米黄色；辅色仍为 `#9E7867`。未加入深色模式。
 
-2026-09-28 后续调整：按用户指定，将源码主背景进一步改为 `#fff4d5`，同步更新浏览器颜色断言。用户随后确认暖棕按钮、深棕文字：沿用主按钮 `#9E7867`、正文 `#30241F`、按钮文字 `#1A100B`；次要按钮保留浅底棕色边框以区分操作层级，其余语义颜色保持原值。本次仅本地提交源码，未更新运行中的部署容器。
+2026-09-28 后续调整：按用户指定，将源码主背景进一步改为 `#fff4d5`，同步更新浏览器颜色断言。用户随后确认暖棕按钮、深棕文字：沿用主按钮 `#9E7867`、正文 `#30241F`、按钮文字 `#1A100B`；次要按钮保留浅底棕色边框以区分操作层级，其余语义颜色保持原值。
+
+2026-09-28 19:49（Asia/Shanghai）：按用户“更新”指令完成本地前端部署。镜像 `rainsync-web:cream-fff4d5` 构建成功后更新 `rainsync-web:dev`，执行 `docker compose up -d --no-deps --no-build web`。HTTP 首页和实际引用的 CSS 均返回 200，CSS 四项色值与上述方案一致，匿名 `/api/v1/auth/me` 返回预期 401；运行中的前端镜像与构建镜像一致，server/db/worker 容器 ID 均未变化。证据位于 `C:/Users/ALIENWARE/Desktop/杂项/RainSync-cream-deploy-2026-09-28` 的 `logs/web-build.*`、`logs/web-update.*` 和 `verification.json`。本次前端回滚：将 `rainsync-web:rollback-cream-20260928-194809` 重新标记为 `rainsync-web:dev`，再执行上述仅更新 web 的 compose 命令。
 
 本次验证证据：`C:/Users/ALIENWARE/Desktop/杂项/RainSync-cream-refinement-2026-09-28/logs`。`cream-browser` 的桌面/移动界面及布局回归 22/22 通过，包含颜色、文字对比度、响应布局及跨路由播放；`cream-build-cmd` 的类型检查和生产构建通过，仍有既有的大 JS chunk 提示。前两次构建启动未实际执行构建：直接启动 npm 报 ENOENT，通过 Windows PowerShell 启动则被 npm.ps1 执行策略阻止（其包装进程虽返回 0，日志不构成构建成功证据）；最终改用 `cmd.exe /d /c npm.cmd run build` 完成验证。
 
