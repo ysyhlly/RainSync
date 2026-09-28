@@ -52,6 +52,8 @@ Library store请求25项，展示24项，用额外一项判断下一页；新搜
 
 执行计划和验证结果见[导航动画计划](superpowers/plans/2026-09-28-navigation-motion.md)。此变更仅本地源码提交，按用户要求未更新运行中的服务。
 
+后续部署（2026-09-28 21:18，Asia/Shanghai）：用户明确要求“同步已运行的服务”后，将 `f437fdd` 的前端构建为 `rainsync-web:navigation-f437fdd`，更新 dev 标签并仅执行 `docker compose up -d --no-deps --no-build web`。实际部署页面资源通过桌面/手机共 8 项导航回归（真实 Chromium，接口由隔离测试模拟），首页/CSS 为 200，匿名账号接口为 401。server/db/worker 容器 ID 及 SnowLuma 5099 的 PID 752 均未变化。证据目录为 `C:/Users/ALIENWARE/Desktop/杂项/RainSync-navigation-deploy-2026-09-28`，包含构建、更新、浏览器检查日志与 `verification.json`。回滚前端时将 `rainsync-web:rollback-navigation-20260928-211228` 标记为 `rainsync-web:dev`，再执行上述仅更新 web 的命令。
+
 ## 已执行的阶段证据
 
 - C1：35单测、类型与原38浏览器案例。
