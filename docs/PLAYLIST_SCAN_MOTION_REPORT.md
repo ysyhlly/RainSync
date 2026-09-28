@@ -133,3 +133,13 @@ docker compose up -d --no-deps --no-build server web
 - 生成前缀结束防误跳为可控浏览器协议回归；自然结束联调用真实 progressive 视频。既有真实 HLS/relay 集成另通过，但未声称本轮实测所有长片编码的自然结尾。
 - 生产侧只验证服务就绪和实际静态资产，不读取账号或替用户操作私人媒体；没有将隔离联调冒充用户数据库测试。
 - 远程 CI 未运行；新增的 CI 测试步骤已本地按对应命令验证。
+
+## 8. 小窗控制区位置微调（2026-09-29）
+
+按用户对“捕获19”的最新说明，调整的是小窗播放控制位置，不涉及叉号。桌面宽度（≥768px）将按钮、时间、音量和进度条所在控制区底部对齐并下移 8px，按钮行与进度条行的间距由 8px 缩为 2px。手机原有紧凑排布及完整播放器/全屏布局保持原样。实现仅位于 `apps/web/src/styles/player-overlay.css`，使用 grid 对齐和 margin，避免改变窄桌面绝对定位进度条的包含块。
+
+证据目录：`C:/Users/ALIENWARE/Desktop/杂项/RainSync-mini-alignment-20260929`。既有 Playwright 布局/导航/小窗回归 8/8 通过，覆盖六种宽度、桌面/手机、键盘和 reduced-motion；内部查看桌面/手机运行截图确认控件可见。前端 Docker 镜像构建通过（含类型检查与 Vite 生产构建），保留既有 chunk 大小提示。没有为本次纯 CSS 调整重跑后端集成或声称实机验证。
+
+已将 `rainsync-web:mini-alignment-20260929` 同步为当前 web 容器；首页 200、匿名账号接口 401，实际返回的 CSS 含新对齐规则。server、worker、数据库、live-dashboard 容器 ID 均未改变。只更新前端，旧镜像保留为 `rainsync-web:rollback-mini-alignment-20260929`。必要时将该标签重新标记为 `rainsync-web:dev` 后执行 `docker compose up -d --no-deps --no-build web` 回退本次前端微调；未执行回退。
+
+本次 CSS 与本节记录一起本地提交，Author/Committer 为 Rainfrost <luo005962@gmail.com>，准确 SHA 见最终回复。原有 Dockerfile 修改和三个删除继续保留，不纳入提交。详细命令、退出码及更新前后容器 ID 见证据目录 logs 和 deployment.json。

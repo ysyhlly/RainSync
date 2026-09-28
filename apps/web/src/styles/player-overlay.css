@@ -224,6 +224,15 @@
   min-height: 28px;
   border-radius: 0;
 }
+@media (min-width: 768px) {
+  .mini-player:not(:fullscreen) .player-chrome {
+    align-self: end;
+    margin-bottom: -8px;
+  }
+  .mini-player:not(:fullscreen) .playback-controls {
+    row-gap: 2px;
+  }
+}
 @media (max-width: 1279px) {
   .mini-player:not(:fullscreen) {
     padding-bottom: 28px;
