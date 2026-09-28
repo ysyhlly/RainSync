@@ -12,6 +12,10 @@
 
 浅色主背景改为 `#ffefc1`，面板、播放器底色及柔和边框同步调整为相配的浅米黄色；辅色仍为 `#9E7867`。未加入深色模式。
 
+2026-09-28 后续调整：按用户指定，将源码主背景进一步改为 `#fff4d5`，同步更新浏览器颜色断言。辅色尚待选择，当前保留 `#9E7867`，其余语义颜色保持原值。本次仅本地提交源码，未更新运行中的部署容器。
+
+本次验证证据：`C:/Users/ALIENWARE/Desktop/杂项/RainSync-cream-refinement-2026-09-28/logs`。`cream-browser` 的桌面/移动界面及布局回归 22/22 通过，包含颜色、文字对比度、响应布局及跨路由播放；`cream-build-cmd` 的类型检查和生产构建通过，仍有既有的大 JS chunk 提示。前两次构建启动未实际执行构建：直接启动 npm 报 ENOENT，通过 Windows PowerShell 启动则被 npm.ps1 执行策略阻止（其包装进程虽返回 0，日志不构成构建成功证据）；最终改用 `cmd.exe /d /c npm.cmd run build` 完成验证。
+
 ## 实际验证
 
 证据目录：`C:/Users/ALIENWARE/Desktop/杂项/RainSync-avatar-theme-2026-09-28`。每项 logs/NAME.json 记录实际命令、起止时间和退出码，同名 .log 为输出。
