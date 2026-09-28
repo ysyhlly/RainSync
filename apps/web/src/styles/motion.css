@@ -10,7 +10,30 @@ button:active:not(:disabled),
 }
 .sidebar nav a,
 .bottom-nav a {
-  transition: background-color 180ms var(--ease);
+  transition: color 150ms var(--ease);
+}
+.navigation-beam {
+  animation: navigation-glow 5s linear infinite;
+}
+.navigation-beam.beam-0 {
+  opacity: 0.25;
+}
+.navigation-beam.beam-1 {
+  opacity: 0.6;
+}
+.navigation-beam.beam-2 {
+  opacity: 1;
+}
+.motion-paused .navigation-beam {
+  animation-play-state: paused;
+}
+@keyframes navigation-glow {
+  from {
+    stroke-dashoffset: var(--beam-offset, 0);
+  }
+  to {
+    stroke-dashoffset: calc(var(--beam-offset, 0) - 100);
+  }
 }
 .page-enter-active {
   transition:
@@ -68,6 +91,10 @@ button:active:not(:disabled),
   }
 }
 @media (prefers-reduced-motion: reduce) {
+  .navigation-beam {
+    animation: none !important;
+    opacity: 0;
+  }
   *,
   *::before,
   *::after {

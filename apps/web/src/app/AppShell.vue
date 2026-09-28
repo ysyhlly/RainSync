@@ -4,7 +4,8 @@ import { useRoute, useRouter } from "vue-router";
 import { useSession } from "../features/auth/session.store";
 import { useRoomRuntime } from "../features/rooms/room-runtime";
 import { useAction } from "../shared/use-action";
-import { watchNavigation, adminNavigation } from "./navigation";
+import { adminNavigation } from "./navigation";
+import AnimatedNavigation from "./AnimatedNavigation.vue";
 import AppIcon from "../shared/ui/AppIcon.vue";
 import UserAvatar from "../shared/ui/UserAvatar.vue";
 import Notice from "../shared/ui/Notice.vue";
@@ -72,20 +73,7 @@ async function retry() {
     <a v-if="session.user" class="skip-link" href="#main-content">跳转到内容</a>
     <aside v-if="session.user" class="sidebar">
       <RouterLink class="brand" to="/rooms">RainSync</RouterLink>
-      <nav aria-label="主导航">
-        <RouterLink v-for="item in watchNavigation" :key="item.to" :to="item.to"
-          ><AppIcon :name="item.icon" />{{ item.label }}</RouterLink
-        >
-        <div v-if="session.user.admin" class="navigation-group">
-          <p>管理</p>
-          <RouterLink
-            v-for="item in adminNavigation"
-            :key="item.to"
-            :to="item.to"
-            ><AppIcon :name="item.icon" />{{ item.label }}</RouterLink
-          >
-        </div>
-      </nav>
+      <AnimatedNavigation variant="sidebar" :admin="session.user.admin" />
       <div class="sidebar-account">
         <RouterLink
           to="/account/profile"
@@ -173,12 +161,10 @@ async function retry() {
             ><component :is="Component" /></Transition></RouterView
       ></template>
     </main>
-    <nav v-if="session.user" class="bottom-nav" aria-label="移动导航">
-      <RouterLink to="/rooms"><AppIcon name="rooms" />放映室</RouterLink
-      ><RouterLink to="/library"><AppIcon name="movie" />媒体库</RouterLink
-      ><RouterLink v-if="session.user.admin" to="/admin/sources"
-        ><AppIcon name="settings" />管理</RouterLink
-      >
-    </nav>
+    <AnimatedNavigation
+      v-if="session.user"
+      variant="bottom"
+      :admin="session.user.admin"
+    />
   </div>
 </template>

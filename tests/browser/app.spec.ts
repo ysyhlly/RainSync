@@ -4,8 +4,8 @@ import { navigate, roomPanel, showOptions } from "./fixtures/navigation";
 const csp = readFileSync("deploy/Caddyfile", "utf8").match(
   /Content-Security-Policy "([^"]+)"/,
 )![1];
-test.beforeEach(async ({ page }) => {
-  await page.route("http://127.0.0.1:5173/**", async (route) => {
+test.beforeEach(async ({ page, baseURL }) => {
+  await page.route(new URL("/**", baseURL).href, async (route) => {
     if (route.request().resourceType() !== "document") return route.fallback();
     const response = await route.fetch();
     await route.fulfill({
