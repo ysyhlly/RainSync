@@ -17,7 +17,8 @@ await isolatedMediaStack("preview-products", async (f) => {
       env: { ...process.env, ...env },
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
-  const image = "rainsync-polish-fixture:20260929",
+  const image =
+      process.env.RAINSYNC_PREVIEW_IMAGE ?? "rainsync-polish-fixture:20260929",
     evidence = [];
   const wait = async (fn, label) => {
     for (let i = 0; i < 180; i++) {

@@ -14,13 +14,17 @@ const catalog = useMediaCatalog(),
   busy = ref(false),
   error = ref(""),
   message = ref("");
+// A draft's compare-and-swap version belongs to its loaded text, not the catalog.
+const revisions = { personal: "0", shared: "0" };
+const conflict = ref<{ scope: "personal" | "shared"; title: string | null }>();
 let serial = 0;
 watch(
-  () => props.mediaId,
-  async (id) => {
+  () => [props.mediaId, session.epoch] as const,
+  async ([id]) => {
     const n = ++serial;
     error.value = "";
     message.value = "";
+    conflict.value = undefined;
     if (!id) return;
     busy.value = true;
     try {
@@ -28,6 +32,8 @@ watch(
       if (n === serial) {
         personal.value = item.personal_title ?? "";
         shared.value = item.shared_title ?? "";
+        revisions.personal = item.personal_title_revision;
+        revisions.shared = item.shared_title_revision;
       }
     } catch (e) {
       if (n === serial) error.value = String(e);
@@ -50,29 +56,45 @@ async function save(scope: "personal" | "shared", clear = false) {
   error.value = "";
   message.value = "";
   try {
-    await (
+    const saved = await (
       scope === "personal" ? catalog.renamePersonal : catalog.renameShared
-    )(id, title, item[`${scope}_title_revision`]);
+    )(id, title, revisions[scope]);
     if (n === serial && epoch === session.epoch) {
       if (clear) (scope === "personal" ? personal : shared).value = "";
+      revisions[scope] = saved[`${scope}_title_revision`];
+      conflict.value = undefined;
       message.value = "名称已保存";
     }
   } catch (e) {
     if (n !== serial || epoch !== session.epoch) return;
     if (e instanceof RequestFailure && e.code === "MEDIA_TITLE_CONFLICT") {
-      error.value =
-        "名称已被其他操作修改。已读取最新版本，你的草稿已保留，请核对后再次保存。";
-      await catalog.ensure(id, true).catch(() => {});
+      try {
+        const latest = await catalog.ensure(id, true);
+        if (n !== serial || epoch !== session.epoch) return;
+        revisions[scope] = latest[`${scope}_title_revision`];
+        conflict.value = { scope, title: latest[`${scope}_title`] };
+        error.value =
+          "名称已被其他操作修改。已读取最新版本，你的草稿已保留，请核对后再次保存。";
+      } catch {
+        if (n === serial && epoch === session.epoch)
+          error.value =
+            "名称已被其他操作修改，最新版本读取失败。你的草稿已保留，请重试。";
+      }
     } else if (e instanceof RequestFailure && !e.retryable) {
       error.value = e.message;
     } else {
       try {
         const latest = await catalog.ensure(id, true);
-        if (latest[`${scope}_title`] === title)
+        if (n !== serial || epoch !== session.epoch) return;
+        if (latest[`${scope}_title`] === title) {
+          revisions[scope] = latest[`${scope}_title_revision`];
+          if (clear) (scope === "personal" ? personal : shared).value = "";
+          conflict.value = undefined;
           message.value = "已确认名称保存成功";
-        else error.value = "保存结果尚未确认，草稿已保留。请核对后再保存。";
+        } else error.value = "保存结果尚未确认，草稿已保留。请核对后再保存。";
       } catch {
-        error.value = e instanceof Error ? e.message : String(e);
+        if (n === serial && epoch === session.epoch)
+          error.value = e instanceof Error ? e.message : String(e);
       }
     }
   } finally {
@@ -132,6 +154,11 @@ async function save(scope: "personal" | "shared", clear = false) {
       </form>
     </template>
     <p v-if="busy" role="status">正在保存或读取名称…</p>
+    <p v-if="conflict" class="helper">
+      本次冲突读取到的{{
+        conflict.scope === "personal" ? "个人" : "全站"
+      }}名称：{{ conflict.title ?? "未设置" }}
+    </p>
     <Notice :message="error" error /><Notice :message="message" />
   </AppDialog>
 </template>

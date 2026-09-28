@@ -12,6 +12,7 @@ export const useLibrary = defineStore("library", () => {
     busy = ref(false),
     error = ref(""),
     loaded = ref(false),
+    refreshKey = ref(0),
     hasMore = ref(false);
   let cursors = [""],
     serial = 0,
@@ -45,6 +46,7 @@ export const useLibrary = defineStore("library", () => {
       loaded.value = true;
       cursors = [...cursors.slice(0, next + 1), items.value.at(-1)?.id ?? ""];
       catalog.remember(rows, stamp);
+      refreshKey.value++;
     } catch (e) {
       if (id === serial && !controller.signal.aborted)
         error.value = e instanceof Error ? e.message : String(e);
@@ -69,5 +71,5 @@ export const useLibrary = defineStore("library", () => {
     { flush: "sync" },
   );
   onScopeDispose(() => controller?.abort());
-  return { items, query, page, busy, error, loaded, hasMore, load };
+  return { items, query, page, busy, error, loaded, hasMore, refreshKey, load };
 });

@@ -119,6 +119,7 @@ onBeforeUnmount(() => {
       >
         <MediaThumbnail
           :cover="item.cover"
+          :refresh-key="library.refreshKey"
           :stalled="previews.stalled.value.has(item.id)"
           :alt="item.title"
         />

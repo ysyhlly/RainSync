@@ -97,7 +97,10 @@ pub async fn generate(
         "-an",
         "-sn",
         "-vf",
-        "split[a][b];[a]scale=640:360,setsar=1[a];[b]scale=640:360:force_original_aspect_ratio=increase,crop=640:360,setsar=1[b];[a][b]hstack",
+        // Crop in display space before resizing, including non-square pixels.
+        // FFmpeg 5.1 supports exact crop; no unbounded intermediate scale or
+        // newer reset_sar option is needed. Unspecified SAR falls back to 1.
+        "split[a][b];[a]scale=640:360,setsar=1[a];[b]crop=w='min(iw,ih*16/9/if(gt(sar,0),sar,1))':h='min(ih,iw*if(gt(sar,0),sar,1)*9/16)':exact=1,scale=640:360,setsar=1[b];[a][b]hstack",
         "-pix_fmt",
         "rgb24",
         "-f",

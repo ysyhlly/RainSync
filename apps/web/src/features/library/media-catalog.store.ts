@@ -92,7 +92,8 @@ export const useMediaCatalog = defineStore("media-catalog", () => {
     const item = await api.rename(id, scope, title, revision, signal);
     if (epoch !== session.epoch || signal.aborted) throw new StaleIdentity();
     remember([item], started);
-    return records.value[id];
+    // Return the write's snapshot; background reads may already be newer.
+    return item;
   }
   async function previews(
     ids: string[],

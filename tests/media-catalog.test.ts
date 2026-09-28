@@ -103,3 +103,31 @@ it("old preview status cannot overwrite a later source generation detail", async
   await old;
   expect(c.records.m.cover.revision).toBe("new");
 });
+
+it("rename returns its own revision even when a later read has reached the catalog", async () => {
+  const { s, c } = setup();
+  let reply!: (value: any) => void;
+  s.api = vi.fn(
+    () =>
+      new Promise((resolve) => {
+        reply = resolve;
+      }),
+  ) as any;
+  c.remember([media()]);
+  const save = c.renamePersonal("m", "my draft", "0");
+  c.remember([
+    media({ personal_title: "later writer", personal_title_revision: "2" }),
+  ]);
+  reply(
+    media({
+      title: "my draft",
+      personal_title: "my draft",
+      personal_title_revision: "1",
+    }),
+  );
+  const saved = await save;
+  expect(saved.personal_title).toBe("my draft");
+  expect(saved.personal_title_revision).toBe("1");
+  expect(c.records.m.personal_title).toBe("later writer");
+  expect(c.records.m.personal_title_revision).toBe("2");
+});

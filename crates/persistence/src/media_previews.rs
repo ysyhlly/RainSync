@@ -3,7 +3,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 pub const VALID: &str = "m.available AND (s.kind<>'agent' OR EXISTS(SELECT 1 FROM agents a WHERE a.id=s.id AND NOT a.revoked))";
-pub const FRESH: &str = "p.source_generation=m.preview_generation AND p.recipe_version=1 AND (s.kind IN ('local','agent') OR p.generated_at IS NULL OR p.generated_at>clock_timestamp()-interval '24 hours')";
+pub const FRESH: &str = "p.source_generation=m.preview_generation AND p.recipe_version=2 AND (s.kind IN ('local','agent') OR p.generated_at IS NULL OR p.generated_at>clock_timestamp()-interval '24 hours')";
 const LOCK: i64 = 724198234;
 
 #[derive(Clone)]
@@ -57,7 +57,7 @@ pub async fn enqueue(db: &PgPool, ids: &[Uuid], limit: i64) -> anyhow::Result<bo
         if count >= limit {
             return Ok(false);
         }
-        sqlx::query("INSERT INTO media_previews(media_id,source_generation,status) VALUES($1,$2,'queued') ON CONFLICT(media_id) DO UPDATE SET source_generation=EXCLUDED.source_generation,recipe_version=1,result_revision=gen_random_uuid(),status='queued',attempt=0,attempt_id=NULL,owner_id=NULL,lease_until=NULL,next_attempt_at=clock_timestamp(),requested_at=clock_timestamp(),generated_at=NULL,image=NULL,image_sha256=NULL,error_code=NULL")
+        sqlx::query("INSERT INTO media_previews(media_id,source_generation,recipe_version,status) VALUES($1,$2,2,'queued') ON CONFLICT(media_id) DO UPDATE SET source_generation=EXCLUDED.source_generation,recipe_version=2,result_revision=gen_random_uuid(),status='queued',attempt=0,attempt_id=NULL,owner_id=NULL,lease_until=NULL,next_attempt_at=clock_timestamp(),requested_at=clock_timestamp(),generated_at=NULL,image=NULL,image_sha256=NULL,error_code=NULL")
             .bind(id).bind(row.get::<i64,_>("preview_generation")).execute(&mut *tx).await?;
     }
     tx.commit().await?;
