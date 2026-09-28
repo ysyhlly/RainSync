@@ -240,3 +240,9 @@ test("soft keyboard viewport hides overlays without removing video or reconnecti
   expect(app.preparations()).toBe(1);
   expect(app.errors).toEqual([]);
 });
+test("empty player uses the cream panel while video letterboxing is neutral",async({page})=>{
+  const app=await appFixture(page);app.state.media_id=null as any;
+  await page.goto("/rooms/room");await expect(page.getByText("尚未选择影片").first()).toBeVisible();
+  await expect(page.locator(".video-frame")).toHaveCSS("background-color","rgb(255, 248, 229)");
+  await expect(page.locator("video")).toHaveCSS("background-color","rgb(255, 248, 229)");
+});

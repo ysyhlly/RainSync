@@ -27,7 +27,7 @@ onMounted(() => {
         r.connected ? "已连接" : r.connectionStopped ? "连接已停止" : "正在重连"
       }}</span>
     </header>
-    <div class="video-frame">
+    <div class="video-frame" :class="{'has-media':!!r.state?.media_id}">
       <video
         ref="element"
         playsinline
