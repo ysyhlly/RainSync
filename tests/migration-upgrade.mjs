@@ -17,7 +17,7 @@ await isolatedServer("upgrade",async(f)=>{
   const roomInvite=await user.request(`/rooms/${room.id}/invites`,"POST");
   const before=f.sql("SELECT string_agg(version||':'||encode(checksum,'hex'),',' ORDER BY version) FROM _sqlx_migrations");
   await f.startServer({ADMIN_USERNAME:"do-not-rename",ADMIN_PASSWORD:"invalid-for-creation"});
-  assert.equal(f.sql("SELECT max(version) FROM _sqlx_migrations"),"21");
+  assert.equal(f.sql("SELECT max(version) FROM _sqlx_migrations"),"22");
   assert.equal(f.sql("SELECT string_agg(version||':'||encode(checksum,'hex'),',' ORDER BY version) FROM _sqlx_migrations WHERE version<=19"),before);
   assert.equal((await admin.request("/auth/me")).id,adminBefore.id);
   const profile=await user.request("/users/me/profile");
@@ -33,5 +33,5 @@ await isolatedServer("upgrade",async(f)=>{
   assert.deepEqual(await created.request("/rooms"),[]);
   await created.request(`/rooms/${room.id}/join`,"POST",{token:roomInvite.token});
   assert.equal((await created.request("/rooms"))[0].id,room.id);
-  console.log("PASS: actual untouched baseline starts at migration 0019, issues legacy sessions and room invitations; latest Server applies 0020/0021 without changing old checksums/users/credentials/membership, then supports nickname/avatar/registration independently");
+  console.log("PASS: actual untouched baseline starts at migration 0019, issues legacy sessions and room invitations; latest Server applies 0020/0021/0022 without changing old checksums/users/credentials/membership, then supports nickname/avatar/registration independently");
 },{binary,env:{ADMIN_USERNAME:"旧管理员",ADMIN_PASSWORD:"旧密码12345678"}});

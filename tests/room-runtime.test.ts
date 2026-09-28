@@ -8,6 +8,57 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
+it("failed entry cleanup keeps the room inactive so the same room can be retried", async () => {
+  vi.useFakeTimers();
+  setActivePinia(createPinia());
+  vi.stubGlobal("document", new EventTarget());
+  vi.stubGlobal("location", { protocol: "http:", host: "localhost" });
+  const saved = new Map([["rainsync:playback:user", '["old-request"]']]);
+  vi.stubGlobal("sessionStorage", {
+    getItem: (key: string) => saved.get(key) ?? null,
+    setItem: (key: string, value: string) => saved.set(key, value),
+  });
+  const sockets: any[] = [];
+  class Socket {
+    static OPEN = 1;
+    readyState = 1;
+    close = vi.fn();
+    send = vi.fn();
+    constructor() {
+      sockets.push(this);
+    }
+  }
+  vi.stubGlobal("WebSocket", Socket);
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("temporary cleanup failure"))
+      .mockImplementation(async () => Response.json([])),
+  );
+  const session = useSession();
+  session.accept({ id: "user", username: "user", admin: false, csrf: "csrf" });
+  const runtime = useRoomRuntime();
+  const room = { id: "a", name: "A", owner_id: "user" };
+  try {
+    await expect(runtime.enter(room)).rejects.toThrow(
+      "temporary cleanup failure",
+    );
+    expect(runtime.room).toBeNull();
+    expect(sockets).toHaveLength(0);
+    expect(saved.get("rainsync:playback:user")).toBe('["old-request"]');
+    await runtime.enter(room);
+    expect(runtime.room?.id).toBe("a");
+    expect(sockets).toHaveLength(1);
+    sockets[0].onopen();
+    expect(runtime.connected).toBe(true);
+    await runtime.enter(room);
+    expect(sockets).toHaveLength(1);
+    expect(saved.get("rainsync:playback:user")).toBe("[]");
+  } finally {
+    runtime.$dispose();
+  }
+});
 it("same room entry retains its socket and stale playlist cannot overwrite a newer room", async () => {
   vi.useFakeTimers();
   setActivePinia(createPinia());

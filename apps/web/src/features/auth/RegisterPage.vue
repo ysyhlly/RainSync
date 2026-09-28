@@ -2,7 +2,6 @@
 import { ref, onBeforeUnmount, nextTick } from "vue";
 import { useRouter } from "vue-router";
 import { useSession } from "./session.store";
-import type { Identity } from "../../shared/api/types";
 import { RequestFailure } from "../../errors";
 import { validateAccount } from "./account-rules";
 import Notice from "../../shared/ui/Notice.vue";
@@ -23,6 +22,7 @@ const session = useSession(),
   retrySeconds = ref(0);
 let retryAt = 0,
   alive = true;
+const authentication = new AbortController();
 const timer = setInterval(
   () =>
     (retrySeconds.value = Math.max(
@@ -33,6 +33,7 @@ const timer = setInterval(
 );
 onBeforeUnmount(() => {
   alive = false;
+  authentication.abort();
   clearInterval(timer);
   password.value = "";
   confirm.value = "";
@@ -112,19 +113,16 @@ async function register() {
   }
   busy.value = true;
   try {
-    const value = await session.api<Identity>(
-      "/auth/register",
-      "POST",
+    await session.register(
       {
         code: code.value,
         username: username.value,
         password: password.value,
         display_name: nickname.value,
       },
-      AbortSignal.timeout(20000),
+      authentication.signal,
     );
     if (!alive) return;
-    session.accept(value);
     await complete();
   } catch (e) {
     if (!alive) return;
@@ -160,7 +158,7 @@ async function recover() {
       error.value = "当前已登录其他账号，请先退出该账号。";
       return;
     }
-    await session.login(username.value, password.value);
+    await session.login(username.value, password.value, authentication.signal);
     if (alive) await complete();
   } catch (e) {
     if (alive) failure(e);

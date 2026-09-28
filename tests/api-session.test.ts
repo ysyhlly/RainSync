@@ -136,3 +136,53 @@ it("keeps profile refreshes in the same identity epoch and invalidates actual ex
   expect(s.user).toBeNull();
   expect(s.epoch).toBeGreaterThan(epoch);
 });
+
+it("does not accept a login whose actual cookie session belongs to another account", async () => {
+  setActivePinia(createPinia());
+  const s = useSession();
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce(Response.json({ csrf: "bob" }))
+      .mockResolvedValueOnce(Response.json(user("alice"))),
+  );
+  await expect(s.login("bob", "password-b")).rejects.toThrow();
+  expect(s.user).toBeNull();
+});
+
+it("serializes cookie writes until an aborted earlier login has settled", async () => {
+  setActivePinia(createPinia());
+  const s = useSession();
+  const old = deferred<Response>();
+  let oldSignal: AbortSignal | undefined;
+  const requests: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/auth/login")) {
+        const name = JSON.parse(String(init?.body)).username;
+        requests.push(name);
+        if (name === "alice") {
+          oldSignal = init?.signal ?? undefined;
+          return old.promise;
+        }
+        return Response.json({ csrf: "bob" });
+      }
+      return Response.json(user("bob"));
+    }),
+  );
+  const first = s.login("alice", "password-a").catch((e) => e);
+  await vi.waitFor(() => expect(requests).toEqual(["alice"]));
+  const second = s.login("bob", "password-b");
+  await Promise.resolve();
+  const serialized = requests.length === 1;
+  const aborted = oldSignal?.aborted;
+  old.resolve(Response.json({ csrf: "alice" }));
+  await first;
+  await second;
+  expect(serialized).toBe(true);
+  expect(aborted).toBe(true);
+  expect(requests).toEqual(["alice", "bob"]);
+  expect(s.user?.username).toBe("bob");
+});

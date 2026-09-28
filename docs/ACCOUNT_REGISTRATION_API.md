@@ -51,6 +51,8 @@
 
 聊天历史和新 CHAT 保留 username，并增加 user_id/display_name/头像元数据。加载历史及新消息使用当前昵称，已经显示在其他客户端中的历史不额外广播更新。历史响应增加 created_at 毫秒字段，原有分页排序和权限不变。
 
+审计修复后，0022为CHAT增加持久幂等：同room_id/user_id/client_message_id及相同正文返回原消息ID，不重复写入或广播；同键换正文返回INVALID_REQUEST。缺少编号的旧客户端仍兼容。真实并发/重启及迁移回退证据见[AUDIT_FIXES.md](AUDIT_FIXES.md)。
+
 代码回退必须保留新迁移文件及数据库历史；直接运行缺少新迁移的旧 SQLx 二进制不保证启动。已执行的兼容构建、升级、数据保留和备份恢复证据见 BACKEND_VALIDATION.md，具体步骤见 BACKEND_OPERATIONS.md。
 
 ## 证据入口

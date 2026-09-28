@@ -18,11 +18,14 @@ await isolatedServer("rollback",async(f)=>{
   assert.equal(avatarResponse.status,200); const avatar=await avatarResponse.json();
   const beforeBytes=Buffer.from(await (await user.raw(avatar.avatar_url.replace("/api/v1",""))).arrayBuffer());
   const room=await user.request("/rooms","POST",{name:"rollback viewing room"});
+  const chatId=randomUUID(), chatKey=randomUUID();
+  f.sql(`INSERT INTO chat_messages(id,room_id,user_id,body,client_message_id) VALUES('${chatId}','${room.id}','${identity.id}','retained chat','${chatKey}')`);
   const preserved=()=>({
     profile:f.sql(`SELECT display_name FROM user_profiles WHERE user_id='${identity.id}'`),
     avatar:f.sql(`SELECT version||':'||md5(content) FROM user_avatars WHERE user_id='${identity.id}'`),
     invites:f.sql(`SELECT id||':'||COALESCE(used_by::text,'unused') FROM registration_invites WHERE batch_id='${batch.batch_id}' ORDER BY id`),
     operations:f.sql(`SELECT count(*) FROM avatar_operations WHERE user_id='${identity.id}'`),
+    chat:f.sql(`SELECT id||':'||client_message_id||':'||body FROM chat_messages WHERE id='${chatId}'`),
   });
   const data=preserved();
   await f.startServer({},binary);
@@ -47,6 +50,8 @@ await isolatedServer("rollback",async(f)=>{
   assert.equal((await user.request("/users/me/profile")).avatar_version,avatar.avatar_version);
   assert.equal((await user.request("/auth/me")).display_name,"保留的昵称😀");
   assert.equal((await admin.request(`/admin/registration-invites?batch_id=${batch.batch_id}`)).items.length,2);
+  assert.equal((await user.request(`/rooms/${room.id}/messages`))[0].id,chatId);
+  assert.equal(docker(["psql","-U","rainsync","-d","rainsync_restore","-At","-c",`SELECT id||':'||client_message_id||':'||body FROM chat_messages WHERE id='${chatId}'`]).toString().trim(),data.chat);
   assert.deepEqual(Buffer.from(await (await user.raw(avatar.avatar_url.replace("/api/v1",""))).arrayBuffer()),beforeBytes);
-  console.log("PASS: baseline Server with retained SQLx migrations accepts newly registered credentials/session and rooms; account/profile/avatar/invite records unchanged across rollback and forward restart; pg_dump/pg_restore preserves avatar bytes and sessions");
+  console.log("PASS: baseline Server with retained SQLx migrations accepts newly registered credentials/session and rooms; account/profile/avatar/invite/chat-key records unchanged across rollback and forward restart; pg_dump/pg_restore preserves avatar bytes, sessions and chat");
 });

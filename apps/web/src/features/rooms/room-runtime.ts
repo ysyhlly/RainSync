@@ -119,9 +119,9 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     if (room.value?.id === r.id) return;
     const cleanup = leave(),
       serial = roomSerial;
-    room.value = r;
     await cleanup;
     if (serial !== roomSerial) return;
+    room.value = r;
     connect();
     const items = await session.api<QueueItem[]>(
       "/rooms/" + r.id + "/playlist",

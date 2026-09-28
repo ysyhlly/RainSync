@@ -1,5 +1,7 @@
 # 前端迁移与运行时职责
 
+审计后补充：认证Cookie写入由session共享协调，取消并等待前项结束，再核验auth/me与预期账号/CSRF后接受身份；注销不再等待远端播放清理；进房成功清理后才记录激活房间。聊天同编号重试由0022数据库唯一约束保障。新证据见[AUDIT_FIXES.md](AUDIT_FIXES.md)，以下阶段记录保留为历史。
+
 根入口现为完整路由应用。真实联调通过后，已删除旧App.vue、style.css及api.ts适配层，不再保留并行UI。注册/资料/头像/全部管理页面以及真实视频联合验收详见ACCOUNT_FRONTEND、ADMIN_FRONTEND、REAL_BROWSER_VALIDATION，最终验收以IMPLEMENTATION_REPORT为准。
 
 ## 依赖与边界

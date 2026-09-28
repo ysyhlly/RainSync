@@ -46,6 +46,7 @@ npm run test:e2e
 cargo build --workspace --bins --examples
 node tests/integration.mjs
 npm run test:accounts
+npm run test:chat
 # 真实浏览器联合验收须先指定外部输出目录。
 # PowerShell示例见docs/BACKEND_OPERATIONS.md。
 npm run test:browser-real
@@ -58,6 +59,7 @@ Windows 本地后端开发需 PostgreSQL、FFmpeg/ffprobe；运行二进制前�
 ## 文档
 
 - [本次完整修改与验收报告](docs/IMPLEMENTATION_REPORT.md)
+- [四项P2审计修复与新一轮回归](docs/AUDIT_FIXES.md)
 - [账号接口与注册规则](docs/ACCOUNT_REGISTRATION_API.md) / [头像接口](docs/AVATAR_API.md)
 - [升级与兼容回滚](docs/BACKEND_OPERATIONS.md)
 - [前端架构](docs/FRONTEND_ARCHITECTURE.md) / [真实浏览器联调](docs/REAL_BROWSER_VALIDATION.md)

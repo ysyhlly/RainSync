@@ -1,5 +1,7 @@
 # RainSync 实施进度
 
+后续更新：本页以下为原Goal结束时的阶段记录。用户已将原15提交压为982936a并将分支改为`front/rainsync-implementation`，后续提交使用`Rainfrost <luo005962@gmail.com>`。新增4项P2审计整改和0022迁移的新执行记录见[AUDIT_FIXES.md](AUDIT_FIXES.md)，当前运维步骤见[BACKEND_OPERATIONS.md](BACKEND_OPERATIONS.md)。
+
 ## 最终恢复点
 
 - A/B/C/D实现及必要验收已完成。后端先验收提交、前端再实施，真实联调先通过、之后根入口切换删除旧UI，未跳过门槛。

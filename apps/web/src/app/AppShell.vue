@@ -47,7 +47,9 @@ onBeforeUnmount(() => {
   runtime.$dispose();
 });
 async function logout() {
-  await runtime.leave();
+  // leave() stops local media and reconnection synchronously. Remote cleanup
+  // retains failed request keys and must never gate revoking authentication.
+  void runtime.leave().catch(() => {});
   await session.logout();
   await router.replace("/login");
 }

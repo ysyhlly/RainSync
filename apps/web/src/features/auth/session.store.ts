@@ -14,6 +14,37 @@ export const useSession = defineStore("session", () => {
     profileRevision = 0;
   const startupError = ref("");
   let restoring: Promise<void> | undefined;
+  let authentication: Promise<unknown> | undefined;
+  let authenticationController: AbortController | undefined;
+  // Cookie mutations must finish (including abort) before their successor is
+  // sent. Epoch checks alone cannot stop the browser applying Set-Cookie.
+  function authenticate<T>(
+    action: (signal: AbortSignal) => Promise<T>,
+    external?: AbortSignal,
+  ): Promise<T> {
+    const previous = authentication;
+    authenticationController?.abort(new StaleIdentity());
+    const controller = new AbortController();
+    const signal = AbortSignal.any([
+      controller.signal,
+      AbortSignal.timeout(20000),
+      ...(external ? [external] : []),
+    ]);
+    const work = Promise.resolve().then(async () => {
+      await previous?.catch(() => {});
+      signal.throwIfAborted();
+      return action(signal);
+    });
+    const completion = work.finally(() => {
+      if (authentication === completion) {
+        authentication = undefined;
+        authenticationController = undefined;
+      }
+    });
+    authenticationController = controller;
+    authentication = completion;
+    return completion;
+  }
   async function restore() {
     if (loaded.value) return;
     if (restoring) return restoring;
@@ -64,11 +95,27 @@ export const useSession = defineStore("session", () => {
     };
     loaded.value = true;
   }
-  async function load() {
+  async function readIdentity(
+    signal?: AbortSignal,
+    expected?: { username: string; csrf: string; id?: string },
+  ) {
     const serial = ++loadSerial;
     const profileAtStart = profileRevision;
-    const value = await api<ServerIdentity>("/auth/me");
+    const value = await api<ServerIdentity>(
+      "/auth/me",
+      "GET",
+      undefined,
+      signal,
+    );
+    signal?.throwIfAborted();
     if (serial !== loadSerial) throw new StaleIdentity();
+    if (
+      expected &&
+      (value.username !== expected.username ||
+        value.csrf !== expected.csrf ||
+        (expected.id && value.id !== expected.id))
+    )
+      throw new StaleIdentity();
     if (profileAtStart !== profileRevision && user.value?.id === value.id) {
       value.display_name = user.value.display_name;
       value.custom_display_name = user.value.custom_display_name;
@@ -78,16 +125,54 @@ export const useSession = defineStore("session", () => {
     accept(value);
     return user.value!;
   }
-  async function login(username: string, password: string) {
-    clear();
-    const current = epoch.value;
-    await api<{ csrf: string }>("/auth/login", "POST", { username, password });
-    if (current !== epoch.value) throw new StaleIdentity();
-    return load();
+  async function load() {
+    while (authentication) await authentication.catch(() => {});
+    return readIdentity();
   }
-  async function logout() {
-    await api("/auth/logout", "POST");
-    clear();
+  function login(username: string, password: string, signal?: AbortSignal) {
+    return authenticate(async (active) => {
+      clear();
+      const result = await api<{ csrf: string }>(
+        "/auth/login",
+        "POST",
+        { username, password },
+        active,
+      );
+      active.throwIfAborted();
+      return readIdentity(active, { username, csrf: result.csrf });
+    }, signal);
+  }
+  function register(
+    input: {
+      code: string;
+      username: string;
+      password: string;
+      display_name?: string;
+    },
+    signal?: AbortSignal,
+  ) {
+    return authenticate(async (active) => {
+      clear();
+      const result = await api<ServerIdentity>(
+        "/auth/register",
+        "POST",
+        input,
+        active,
+      );
+      active.throwIfAborted();
+      return readIdentity(active, {
+        username: input.username,
+        csrf: result.csrf,
+        id: result.id,
+      });
+    }, signal);
+  }
+  function logout() {
+    return authenticate(async (active) => {
+      await api("/auth/logout", "POST", undefined, active);
+      active.throwIfAborted();
+      clear();
+    });
   }
   function updateProfile(
     value:
@@ -110,6 +195,7 @@ export const useSession = defineStore("session", () => {
     clear,
     invalidate,
     login,
+    register,
     logout,
     updateProfile,
   };

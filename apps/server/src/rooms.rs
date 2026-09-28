@@ -348,6 +348,44 @@ pub async fn messages(
     Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"body":r.get::<String,_>("body"),"user_id":r.get::<Uuid,_>("user_id"),"username":r.get::<String,_>("username"),"display_name":r.get::<String,_>("display_name"),"created_at":r.get::<i64,_>("created_at_ms"),"avatar_url":avatars::url(r.get("user_id"),r.get("avatar_version"),r.get::<Option<String>,_>("avatar_content_type").is_some()),"avatar_version":r.get::<Option<Uuid>,_>("avatar_version")})).collect())))
 }
 
+async fn persist_chat(
+    db: &sqlx::PgPool,
+    room_id: Uuid,
+    user_id: Uuid,
+    body: &str,
+    client_message_id: Option<Uuid>,
+) -> std::result::Result<(Uuid, bool), &'static str> {
+    let inserted = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO chat_messages(id,room_id,user_id,body,client_message_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT (room_id,user_id,client_message_id) DO NOTHING RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(room_id)
+    .bind(user_id)
+    .bind(body)
+    .bind(client_message_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|_| "database_error")?;
+    if let Some(id) = inserted {
+        return Ok((id, false));
+    }
+    // The unique-index conflict waits for the concurrent insertion to commit.
+    // Read in a new statement so its committed row is visible at READ COMMITTED.
+    let existing = sqlx::query(
+        "SELECT id,body FROM chat_messages WHERE room_id=$1 AND user_id=$2 AND client_message_id=$3",
+    )
+    .bind(room_id)
+    .bind(user_id)
+    .bind(client_message_id)
+    .fetch_one(db)
+    .await
+    .map_err(|_| "database_error")?;
+    if existing.get::<String, _>("body") != body {
+        return Err("invalid_request");
+    }
+    Ok((existing.get("id"), true))
+}
+
 pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: String) {
     let (mut out, mut input) = socket.split();
     let first = tokio::time::timeout(std::time::Duration::from_secs(10), input.next()).await;
@@ -434,10 +472,24 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                     "CLOCK_SYNC"=>{let t2=app.now();json!({"type":"CLOCK_SYNC_REPLY","t1":v["t1"],"t2":t2,"t3":app.now(),"clock_epoch":app.epoch})},
                     "CLIENT_STATUS"=>{app.metrics.report(&v["status"]);let _=handle.events.send(json!({"type":"CLIENT_STATUS","user_id":user.id,"status":v["status"]}));continue},
                     "CHAT"=>{
-                        let Some(body)=v["body"].as_str().filter(|b|!b.trim().is_empty()&&b.chars().count()<=2000)else{reject_socket(&mut out,"invalid_request").await;continue};let cid=Uuid::new_v4();
-                        if sqlx::query("INSERT INTO chat_messages(id,room_id,user_id,body) VALUES($1,$2,$3,$4)").bind(cid).bind(id).bind(user.id).bind(body).execute(&app.db).await.is_err(){reject_socket(&mut out,"database_error").await;break}
+                        let Some(body)=v["body"].as_str().filter(|b|!b.trim().is_empty()&&b.chars().count()<=2000)else{reject_socket(&mut out,"invalid_request").await;continue};
+                        let client_message_id = match v.get("client_message_id") {
+                            None | Some(Value::Null) => None,
+                            Some(value) => match value.as_str().and_then(|s| Uuid::parse_str(s).ok()) {
+                                Some(key) => Some(key),
+                                None => {reject_socket(&mut out,"invalid_request").await;continue},
+                            },
+                        };
+                        let (cid,replayed)=match persist_chat(&app.db,id,user.id,body,client_message_id).await {
+                            Ok(result)=>result,
+                            Err(reason)=>{reject_socket(&mut out,reason).await;continue},
+                        };
                         let identity=match profile::value(&app,user.id).await{Ok(value)=>value,Err(_)=>{reject_socket(&mut out,"database_error").await;break}};
-                        let _=handle.events.send(json!({"type":"CHAT","id":cid,"user_id":user.id,"username":identity["username"],"display_name":identity["display_name"],"avatar_url":identity["avatar_url"],"avatar_version":identity["avatar_version"],"body":body,"client_message_id":v["client_message_id"].as_str().and_then(|s| Uuid::parse_str(s).ok())}));continue
+                        let reply=json!({"type":"CHAT","id":cid,"user_id":user.id,"username":identity["username"],"display_name":identity["display_name"],"avatar_url":identity["avatar_url"],"avatar_version":identity["avatar_version"],"body":body,"client_message_id":client_message_id});
+                        if replayed {
+                            if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Text(reply.to_string().into()))).await,Ok(Ok(()))) {break}
+                        } else {let _=handle.events.send(reply);}
+                        continue
                     }
                     _=>{
                         let command_id = v["command_id"].as_str().and_then(|s|Uuid::parse_str(s).ok());

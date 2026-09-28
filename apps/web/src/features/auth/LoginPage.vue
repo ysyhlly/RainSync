@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, onBeforeUnmount } from "vue";
 import { useRouter, useRoute } from "vue-router";
 import { useSession } from "./session.store";
 import { useAction } from "../../shared/use-action";
@@ -12,8 +12,16 @@ const session = useSession(),
   password = ref(""),
   show = ref(false);
 const { busy, error, run } = useAction();
+const authentication = new AbortController();
+let alive = true;
+onBeforeUnmount(() => {
+  alive = false;
+  authentication.abort();
+  password.value = "";
+});
 async function login() {
-  await session.login(username.value, password.value);
+  await session.login(username.value, password.value, authentication.signal);
+  if (!alive) return;
   password.value = "";
   await router.replace(safeRedirect(route.query.redirect));
 }

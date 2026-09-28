@@ -154,6 +154,10 @@ export async function appFixture(
     });
   });
   return {
+    signIn: (value: Partial<typeof identity>) => {
+      Object.assign(identity, value);
+      authenticated = true;
+    },
     identity,
     room,
     media,

@@ -31,6 +31,11 @@ test("two-step registration preserves password spaces and auto logs in without j
   });
   await page.route("**/auth/register", async (r) => {
     submitted = r.request().postDataJSON();
+    app.signIn({
+      username: submitted.username,
+      display_name: submitted.display_name,
+      admin: false,
+    });
     await r.fulfill({
       status: 201,
       json: {

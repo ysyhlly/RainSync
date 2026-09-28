@@ -134,7 +134,12 @@ export function createPlaybackRuntime(ctx: {
       cancellation,
       old
         ? session
-            .api(`/playback-sessions/${old.session_id}`, "DELETE")
+            .api(
+              `/playback-sessions/${old.session_id}`,
+              "DELETE",
+              undefined,
+              AbortSignal.timeout(5000),
+            )
             .catch(() => {})
         : Promise.resolve(),
     ]);

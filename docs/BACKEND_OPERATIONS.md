@@ -1,6 +1,6 @@
 # 后端启动、升级与兼容回退
 
-本记录对应0020/0021增量后端。正式部署仍由维护者操作，本任务没有部署、推送或创建PR。API细节见 [ACCOUNT_REGISTRATION_API.md](ACCOUNT_REGISTRATION_API.md)、[AVATAR_API.md](AVATAR_API.md)，演练证据见 [BACKEND_VALIDATION.md](BACKEND_VALIDATION.md)。
+本记录对应0020/0021账号头像及0022聊天幂等增量后端。正式部署仍由维护者操作，本任务没有部署、推送或创建PR。API细节见 [ACCOUNT_REGISTRATION_API.md](ACCOUNT_REGISTRATION_API.md)、[AVATAR_API.md](AVATAR_API.md)，原验收见 [BACKEND_VALIDATION.md](BACKEND_VALIDATION.md)，本轮0022及审计整改证据见[AUDIT_FIXES.md](AUDIT_FIXES.md)。
 
 ## 启动与配置
 
@@ -22,22 +22,23 @@ node scripts/run-check.mjs accounts 300 node --run test:accounts
 ## 升级
 
 1. 保存数据库完整备份及匹配的 `SOURCE_ENCRYPTION_KEY`，另行保管媒体、Agent状态及部署配置；保留当前镜像/二进制版本。先在恢复副本演练。
-2. 停止旧应用写入，备份完成后部署新Server（Worker/NAS协议本轮未改变）。SQLx启动按序自动应用0020和0021，历史0019及以前文件不能编辑。
-3. 确认 `_sqlx_migrations` 最新21且success为true；测试旧账号和已有Cookie、房间邀请、原观看流程。
+2. 停止旧应用写入，备份完成后部署新Server（Worker/NAS协议本轮未改变）。SQLx启动按序自动应用0020、0021、0022，已发布的历史迁移不能编辑。0022新增聊天可空UUID与唯一索引，需要数据库DDL锁，先在恢复副本演练。
+3. 确认 `_sqlx_migrations` 最新22且success为true；测试旧账号和已有Cookie、房间邀请、原观看流程及同消息编号重放不重复落库。
 4. 管理员生成注册邀请码，新客户端注册应普通用户且不加入任何房间；独立检查昵称与头像。管理员生成响应只显示一次原码，丢失后按batch_id确认并撤销不可取回的未使用条目，不自动生成未知批次。
 5. 新注册成功自动登录；网络不确定时先查auth/me再用刚创建凭据正常登录。不要自动重发注册。头像失败先读profile确认operation版本，再使用原UUID/内容/预期版本确认或显式重试。
 
 ## 应用回退：保留迁移与数据
 
-不能直接运行缺少新迁移的旧SQLx二进制。已验证的兼容版本是**基线业务代码 + 完全相同的0020/0021迁移**。此版本保留新用户、会话、昵称、头像和邀请码表，但不暴露新资料/注册接口；因此前端也须回退到与旧接口匹配的版本。
+不能直接运行缺少新迁移的旧SQLx二进制。已验证的兼容版本是**基线业务代码 + 完全相同的0020/0021/0022迁移**。此版本保留新用户、会话、昵称、头像、邀请码和聊天去重键，但不暴露新资料/注册接口，也不会为旧聊天写入生成去重键；因此前端也须回退到与旧接口匹配的版本，不能保留新版显式CHAT重试连接旧无幂等后端。
 
-未来执行回退前在单独分支确保没有未处理用户修改，记录当前交付SHA及要撤销的明确提交列表。按依赖逆序逐个 `git revert --no-commit <明确SHA>`；遇冲突逐项解决并检查。恢复增量迁移原文件，再形成一个兼容回退提交，而不是删除数据库表或历史：
+未来执行回退前在单独分支确保没有未处理用户修改，记录当前交付SHA及要撤销的明确提交列表。原15阶段提交已按用户要求压缩为`982936a7db58460fee7b259e4d2f9fd045eefe5d`，不能照抄原报告的历史SHA逆序。先撤销本轮审计修复提交（实际SHA见交付回复），再按需要撤销982936a，每步检查退出码并处理冲突。撤销前从完整交付检出记录`$delivery = git rev-parse HEAD`，它必须包含原样三份迁移。恢复迁移后再形成兼容回退提交，而不是删数据库表：
 
 ```powershell
 # 此处只说明未来维护步骤，不是本任务已执行的revert。
-# 先按最终报告的清单逆序revert相关应用提交。
-git restore --source 11fe2cb6da2915adf1fe26b1c898544dd1e54b78 -- migrations/0020_registration_accounts.sql migrations/0021_user_avatars.sql
-git add migrations/0020_registration_accounts.sql migrations/0021_user_avatars.sql
+# $delivery是在开始revert之前记录并核对的完整交付SHA。
+# 先撤销审计修复提交，再按需要撤销982936a；遇冲突立即停止处理。
+git restore --source $delivery -- migrations/0020_registration_accounts.sql migrations/0021_user_avatars.sql migrations/0022_chat_idempotency.sql
+git add migrations/0020_registration_accounts.sql migrations/0021_user_avatars.sql migrations/0022_chat_idempotency.sql
 # 审查完整暂存差异并执行兼容验证后提交，再构建待回退二进制。
 ```
 
@@ -64,6 +65,6 @@ try {
 
 ## 数据恢复独立于应用回退
 
-不提供删除0020/0021表的down migration。新注册账号、已消费码、头像墓碑及operation历史不得为回退而清空；否则会失去单次消费和迟到上传保护。数据库完整备份要包含SQLx历史及全部新增表，并同SOURCE_ENCRYPTION_KEY配套。
+不提供删除0020/0021表或0022字段/索引的down migration。新注册账号、已消费码、头像墓碑、operation历史及聊天去重键不得为回退而清空；否则会失去单次消费、迟到上传和消息重放保护。数据库完整备份要包含SQLx历史及全部新增数据，并同SOURCE_ENCRYPTION_KEY配套。
 
 已实测在隔离容器内 `pg_dump -Fc`，新建另一数据库，`pg_restore`，将Server指向恢复库后核对现有Cookie、昵称、头像字节/版本和批次记录。生产恢复需维护者为自己的备份重复演练；不能把这次合成数据库演练称为生产一键回滚。恢复到旧时间点会丢失之后写入，须单独评估数据恢复点，不能与保留当前数据的代码回退混为一谈。

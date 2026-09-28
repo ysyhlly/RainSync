@@ -15,7 +15,7 @@ $archive = Join-Path $fixtureRoot 'baseline.zip'
 git -C $project archive --format=zip --output=$archive $Baseline
 if ($LASTEXITCODE -ne 0) { throw 'Baseline archive failed.' }
 Expand-Archive -LiteralPath $archive -DestinationPath $source
-$migrationFiles = @('0020_registration_accounts.sql', '0021_user_avatars.sql')
+$migrationFiles = @('0020_registration_accounts.sql', '0021_user_avatars.sql', '0022_chat_idempotency.sql')
 foreach ($name in $migrationFiles) {
     Copy-Item -LiteralPath (Join-Path $project "migrations/$name") -Destination (Join-Path $source "migrations/$name")
 }
