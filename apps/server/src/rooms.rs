@@ -100,9 +100,18 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                 let mut next =
                     room_core::reduce(&state, &req.command, req.user.id, req.user.admin, app.now())
                         .map_err(String::from)?;
-                if let protocol::Action::ChangeMedia { media_id } = req.command.action {
+                if matches!(req.command.action, protocol::Action::EndMedia { .. }) {
+                    let ids: Vec<Uuid> = sqlx::query_scalar(&format!("SELECT q.media_id FROM playlist_items q JOIN media_items m ON m.id=q.media_id JOIN sources s ON s.id=m.source_id WHERE q.room_id=$1 AND {} ORDER BY q.sort_order,q.id", media_titles::VISIBLE))
+                        .bind(id).fetch_all(&app.db).await.map_err(|_| "database_error")?;
+                    if !ids.is_empty() {
+                        let index = ids.iter().position(|media| Some(*media) == state.media_id);
+                        next.media_id = Some(ids[index.map_or(0, |i| (i + 1) % ids.len())]);
+                    }
+                }
+                if matches!(req.command.action, protocol::Action::ChangeMedia { .. } | protocol::Action::EndMedia { .. }) {
+                    let media_id = next.media_id.ok_or("no_media")?;
                     let duration = sqlx::query(
-                        "SELECT duration_ms FROM media_items WHERE id=$1 AND available",
+                        &format!("SELECT m.duration_ms FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND {}", media_titles::VISIBLE),
                     )
                     .bind(media_id)
                     .fetch_optional(&app.db)
@@ -312,6 +321,15 @@ pub async fn add_playlist(
     Json(body): Json<Add>,
 ) -> Result<Json<Value>> {
     let mut tx = controller(&app, &h, id).await?;
+    if let Some(item) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM playlist_items WHERE room_id=$1 AND media_id=$2 ORDER BY sort_order,id LIMIT 1")
+        .bind(id).bind(body.media_id).fetch_optional(&mut *tx).await? {
+        return Ok(Json(json!({"id":item})));
+    }
+    let available: bool = sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND {})", media_titles::VISIBLE))
+        .bind(body.media_id).fetch_one(&mut *tx).await?;
+    if !available {
+        return Err(err(StatusCode::NOT_FOUND, "media_not_found"));
+    }
     let item = Uuid::new_v4();
     sqlx::query("INSERT INTO playlist_items SELECT $1,$2,$3,COALESCE(max(sort_order),0)+1 FROM playlist_items WHERE room_id=$2").bind(item).bind(id).bind(body.media_id).execute(&mut *tx).await?;
     tx.commit().await?;

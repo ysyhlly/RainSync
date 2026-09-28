@@ -250,6 +250,17 @@ async fn main() -> Result<()> {
         req.headers_mut()
             .insert("Authorization", format!("Bearer {token}").parse()?);
         if let Ok((mut socket, _)) = connect_async(req).await {
+            if socket
+                .send(Message::Text(
+                    json!({"type":"HELLO","manual_scan":true})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .is_err()
+            {
+                continue;
+            }
             let mut transfers = tokio::task::JoinSet::new();
             let (pages, mut incoming) = tokio::sync::mpsc::channel(2);
             let scan_root = root.clone();
@@ -262,7 +273,7 @@ async fn main() -> Result<()> {
             let mut awaiting_ack = false;
             let mut sent_at = tokio::time::Instant::now();
             let mut finished = false;
-            let snapshot = format!(
+            let mut snapshot = format!(
                 "{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)?
@@ -284,6 +295,24 @@ async fn main() -> Result<()> {
                         if socket.send(Message::Text(json!({"type":"HEARTBEAT"}).to_string().into())).await.is_err(){break}}
                     message=socket.next()=>{let text = match message { Some(Ok(Message::Text(text))) => text, Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue, _ => break };let Ok(v)=serde_json::from_str::<Value>(&text)else{continue};
                         if v["type"] == "INDEX_ERROR" { break }
+                        if v["type"] == "SCAN" {
+                            if !finished || awaiting_ack {
+                                if socket.send(Message::Text(json!({"type":"SCAN_BUSY","snapshot":v["snapshot"]}).to_string().into())).await.is_err() { break }
+                                continue;
+                            }
+                            let Some(request_id) = v["snapshot"].as_str() else { continue };
+                            if request_id.len() > 64 { continue; }
+                            let (pages, receiver) = tokio::sync::mpsc::channel(2);
+                            incoming = receiver;
+                            let scan_root = root.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(error) = index(&scan_root, &pages) { let _ = pages.blocking_send(Err(error)); }
+                            });
+                            snapshot = request_id.to_string();
+                            sequence = 0;
+                            finished = false;
+                            continue;
+                        }
                         if v["type"] == "INDEX_ACK" {
                             if !awaiting_ack || v["sequence"].as_u64() != Some(sequence) { break }
                             awaiting_ack = false;

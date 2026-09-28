@@ -51,6 +51,7 @@ pub struct App {
     epoch: Uuid,
     start: Instant,
     rooms: Arc<Mutex<HashMap<Uuid, rooms::Handle>>>,
+    agent_controls: Arc<Mutex<HashMap<Uuid, agents::Control>>>,
 }
 impl App {
     fn now(&self) -> f64 {
@@ -414,6 +415,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         epoch: Uuid::new_v4(),
         start: Instant::now(),
         rooms: Default::default(),
+        agent_controls: Default::default(),
     };
     // A previous process cannot still own preparations after the instance lock
     // has been acquired. Retire their grants before same-key recovery.
@@ -535,6 +537,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route("/api/v1/agents", get(agents::list).post(agents::create))
         .route("/api/v1/agents/pair", post(agents::pair))
         .route("/api/v1/agents/{id}", delete(agents::revoke))
+        .route("/api/v1/agents/{id}/scan", post(agents::scan))
         .route("/api/v1/agents/ws", get(agents::connect))
         .route("/api/v1/ws", get(ws))
         .route("/api/v1/metrics", get(metrics::endpoint))

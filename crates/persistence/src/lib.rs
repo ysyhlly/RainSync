@@ -118,6 +118,11 @@ pub async fn commit(
     if result.rows_affected() != 1 {
         bail!("revision_conflict")
     }
+    // The snapshot lock is shared with playlist mutation; play-and-enqueue is atomic.
+    if let protocol::Action::ChangeMedia { media_id } = command.action {
+        sqlx::query("INSERT INTO playlist_items SELECT $1,$2,$3,COALESCE(max(sort_order),0)+1 FROM playlist_items WHERE room_id=$2 HAVING NOT EXISTS(SELECT 1 FROM playlist_items WHERE room_id=$2 AND media_id=$3)")
+            .bind(Uuid::new_v4()).bind(state.room_id).bind(media_id).execute(&mut *tx).await?;
+    }
     sqlx::query("INSERT INTO room_events(room_id,revision,state) VALUES($1,$2,$3)")
         .bind(state.room_id)
         .bind(i64::from(state.revision))
