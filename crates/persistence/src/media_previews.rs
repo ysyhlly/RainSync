@@ -49,7 +49,7 @@ pub async fn enqueue(db: &PgPool, ids: &[Uuid], limit: i64) -> anyhow::Result<bo
             .bind(id).fetch_optional(&mut *tx).await?;
         let Some(row) = eligible else { continue };
         let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM media_previews WHERE status IN ('queued','running') AND media_id<>$1",
+            &format!("SELECT count(*) FROM media_previews p JOIN media_items m ON m.id=p.media_id JOIN sources s ON s.id=m.source_id WHERE p.status IN ('queued','running') AND p.media_id<>$1 AND {VALID} AND {FRESH}"),
         )
         .bind(id)
         .fetch_one(&mut *tx)
@@ -117,10 +117,10 @@ pub async fn finish(
             .execute(&mut *tx)
             .await?;
     }
+    let oversized = image.is_some_and(|(bytes, _)| bytes.len() as i64 > budget);
+    let image = image.filter(|_| !oversized);
+    let retry = retry && !oversized;
     if let Some((bytes, _)) = image {
-        if bytes.len() as i64 > budget {
-            return Ok(false);
-        }
         loop {
             let used:i64=sqlx::query_scalar("SELECT COALESCE(sum(octet_length(image)),0)::bigint FROM media_previews WHERE media_id<>$1").bind(a.media_id).fetch_one(&mut *tx).await?;
             if used + bytes.len() as i64 <= budget {

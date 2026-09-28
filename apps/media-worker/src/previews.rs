@@ -71,7 +71,11 @@ async fn execute(
     a: Attempt,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
-    let result = resource(&app, &a).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(settings.timeout_seconds);
+    let result = tokio::select! {
+        _ = process::stopped(&mut stop) => return,
+        result = tokio::time::timeout_at(deadline, resource(&app, &a)) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("preview_timeout"))),
+    };
     let Ok((resource, posters)) = result else {
         let _ = media_previews::finish(&app.db, &a, None, true, settings.cache_bytes).await;
         return;
@@ -84,7 +88,6 @@ async fn execute(
         settings.input_bytes,
         cancel.clone(),
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(settings.timeout_seconds);
     let produce = async {
         for target in posters.iter().chain(std::iter::once(
             &resource["url"].as_str().unwrap_or("").to_owned(),

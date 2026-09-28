@@ -11,6 +11,7 @@
     "test": "vitest run",
     "test:accounts": "node tests/account-rules.mjs && node tests/registration-invites.mjs && node tests/registration.mjs && node tests/avatar-upload.mjs",
     "test:e2e": "playwright test",
+    "test:library-player-real": "node tests/library-player-real.mjs",
     "test:browser-real": "node tests/browser-real.mjs",
     "test:chat": "node tests/chat-idempotency.mjs",
     "test:avatar-container": "node tests/avatar-container.mjs"

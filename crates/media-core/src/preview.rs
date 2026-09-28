@@ -6,7 +6,7 @@ use tokio::{
     process::Command,
     sync::watch,
 };
-const FRAME: usize = 640 * 360 * 3;
+const FRAME: usize = 1280 * 360 * 3;
 pub const MAX_IMAGE: usize = 262144;
 
 pub fn is_black(rgb: &[u8]) -> bool {
@@ -97,7 +97,7 @@ pub async fn generate(
         "-an",
         "-sn",
         "-vf",
-        "scale=640:360:force_original_aspect_ratio=increase,crop=640:360,setsar=1",
+        "split[a][b];[a]scale=640:360,setsar=1[a];[b]scale=640:360:force_original_aspect_ratio=increase,crop=640:360,setsar=1[b];[a][b]hstack",
         "-pix_fmt",
         "rgb24",
         "-f",
@@ -111,7 +111,16 @@ pub async fn generate(
         _=cancel.changed()=>Err(anyhow::anyhow!("preview_cancelled")),
         result=tokio::time::timeout_at(deadline,async {
             let mut frame=vec![0;FRAME];
-            loop {out.read_exact(&mut frame).await?;if poster || !is_black(&frame){return Ok::<_,anyhow::Error>(frame)}}
+            loop {
+                out.read_exact(&mut frame).await?;
+                // Inspect the complete frame before center cropping; the left
+                // half is analysis-only, the right half preserves output aspect.
+                let sample: Vec<u8> = frame.chunks_exact(1280*3).flat_map(|row|row[..640*3].iter().copied()).collect();
+                if poster || !is_black(&sample) {
+                    let result: Vec<u8> = frame.chunks_exact(1280*3).flat_map(|row|row[640*3..].iter().copied()).collect();
+                    return Ok::<_,anyhow::Error>(result)
+                }
+            }
         })=>result.unwrap_or_else(|_|Err(anyhow::anyhow!("preview_timeout"))),
     };
     child.kill().await?;

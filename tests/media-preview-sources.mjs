@@ -9,6 +9,7 @@ import { delay } from "./fixtures/server.mjs";
 await isolatedMediaStack("preview-sources",async f=>{
   const admin=f.client();await admin.login();
   for(const [name,options] of [["first",{}],["black-first",{blackSeconds:2}],["dark",{color:"0x202020"}],["black",{color:"black"}],["portrait",{width:360,height:640}]]) await f.makeClip(name+".mp4",options);
+  execFileSync("ffmpeg",["-v","error","-f","lavfi","-i","color=black:s=360x640:d=1,drawbox=x=0:y=0:w=iw:h=30:color=white:t=fill","-c:v","libx264","-threads","1","-pix_fmt","yuv420p",resolve(f.root,"edge-light.mp4")],{timeout:10000,windowsHide:true});
   await writeFile(resolve(f.root,"broken.mp4"),"broken");
   const source=await admin.request("/sources","POST",{name:"synthetic",kind:"local",config:{root:f.root}});
   await admin.request(`/sources/${source.id}/test`,"POST");
@@ -24,7 +25,7 @@ await isolatedMediaStack("preview-sources",async f=>{
     await admin.request("/media/previews","POST",{media_ids:[item.id]});
     const unavailable=["black","broken"].includes(item.original_title);
     const cover=await f.waitForPreview(item.id,unavailable?"unavailable":"ready");
-    if(!unavailable){const rgb=await pixel(cover);if(item.original_title==="dark")assert.ok(rgb.every(v=>v>=24&&v<=45));else assert.ok(rgb[0]>180&&rgb[1]<50&&rgb[2]<50,`${item.title}: ${rgb}`);}
+    if(!unavailable){const rgb=await pixel(cover);if(item.original_title==="dark")assert.ok(rgb.every(v=>v>=24&&v<=45));else if(item.original_title==="edge-light")assert.ok(rgb.every(v=>v<24),"frame accepted from uncropped edge light");else assert.ok(rgb[0]>180&&rgb[1]<50&&rgb[2]<50,`${item.title}: ${rgb}`);}
   }
   const video=await readFile(resolve(f.root,"first.mp4"));
   const poster=execFileSync("ffmpeg",["-v","error","-f","lavfi","-i","color=blue:s=640x360","-frames:v","1","-f","image2pipe","-c:v","png","pipe:1"],{timeout:10000,windowsHide:true,maxBuffer:2e6});
@@ -65,6 +66,14 @@ await isolatedMediaStack("preview-sources",async f=>{
     await f.waitForSql(`SELECT count(*) FROM media_items WHERE source_id='${agentId}' AND resource='first.mp4'`,"1",15000);
     const id=f.sql(`SELECT id FROM media_items WHERE source_id='${agentId}' AND resource='first.mp4'`);
     await admin.request("/media/previews","POST",{media_ids:[id]});const cover=await f.waitForPreview(id);assert.ok((await pixel(cover))[0]>180);
+    await f.stopAgent();
+    f.sql(`UPDATE media_items SET preview_generation=preview_generation+1 WHERE id='${id}'`);
+    await admin.request('/media/previews','POST',{media_ids:[id]});await f.waitForPreview(id,'unavailable',60000);
+    // Replace the actual NAS file and restart the same owned agent/credentials.
+    await f.makeClip('first.mp4',{color:'blue'});await f.startAgent();
+    await f.waitForSql(`SELECT count(*) FROM agents WHERE id='${agentId}' AND last_seen>now()-interval '5 seconds'`,'1',15000);
+    f.sql(`UPDATE media_previews SET next_attempt_at=now()-interval '1 second' WHERE media_id='${id}'`);
+    await admin.request('/media/previews','POST',{media_ids:[id]});const recovered=await f.waitForPreview(id);assert.ok((await pixel(recovered))[2]>180,'NAS recovery uses changed file');
     await admin.request(`/agents/${agentId}`,"DELETE");
     assert.notEqual((await admin.raw(cover.url.replace("/api/v1",""))).status,200);
     assert.equal((await admin.request(`/media/previews?ids=${id}`)).items.length,0);

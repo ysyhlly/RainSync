@@ -12,7 +12,7 @@ async function port() {
 export async function isolatedMediaStack(name, run, options = {}) {
   return isolatedServer(name, async f => {
     const children = new Set(), streams = [];
-    let worker, agent, launch = 0;
+    let worker, agent, agentPair, launch = 0;
     const workerPort = await port(); f.workerOrigin = `http://127.0.0.1:${workerPort}`;
     const start = (binary, env, args = []) => {
       const log = createWriteStream(resolve(f.root, `child-${++launch}.log`)); streams.push(log);
@@ -36,7 +36,7 @@ export async function isolatedMediaStack(name, run, options = {}) {
     f.stopWorker = async () => { await stop(worker); worker = undefined; };
     f.startAgent = async () => {
       const admin = f.client(); await admin.login();
-      const created = await admin.request("/agents", "POST", { name: "owned preview agent" });
+      const created = agentPair ??= await admin.request("/agents", "POST", { name: "owned preview agent" });
       agent = start(resolve(f.target, `rainsync-nas-agent${process.platform === "win32" ? ".exe" : ""}`), { ...f.env, SERVER_URL: f.origin, AGENT_DATA_ORIGIN: f.workerOrigin, PAIR_CODE: created.pair_code, MEDIA_ROOT: f.root, AGENT_CREDENTIAL_FILE: resolve(f.root, "agent-token") });
       return { agentId: created.id };
     };

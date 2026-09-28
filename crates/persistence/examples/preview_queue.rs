@@ -64,6 +64,23 @@ async fn main() -> anyhow::Result<()> {
         count, 1,
         "LRU eviction stays inside the shared cache budget"
     );
+    // Invisible/stale work must not exhaust capacity for currently visible media.
+    assert!(enqueue(&db, &[ids[2]], 1).await?);
+    sqlx::query("UPDATE media_items SET available=false WHERE id=$1")
+        .bind(ids[2])
+        .execute(&db)
+        .await?;
+    let replacement = Uuid::new_v4();
+    sqlx::query("INSERT INTO media_items(id,source_id,title,resource) VALUES($1,$2,'replacement','replacement')").bind(replacement).bind(source).execute(&db).await?;
+    assert!(enqueue(&db, &[replacement], 1).await?);
+    let too_large = claim(&db, owner).await?.unwrap();
+    assert_eq!(too_large.media_id, replacement);
+    assert!(finish(&db, &too_large, Some((&image, &sha)), false, 1).await?);
+    let status: String = sqlx::query_scalar("SELECT status FROM media_previews WHERE media_id=$1")
+        .bind(replacement)
+        .fetch_one(&db)
+        .await?;
+    assert_eq!(status, "unavailable");
     println!(
         "PASS: distinct concurrent claims, attempt/lease/source fences, requeue capacity and transactional LRU budget"
     );

@@ -123,6 +123,7 @@ export async function isolatedServer(name, run, options = {}) {
       BIND: `127.0.0.1:${port}`, MEDIA_ROOT: root, CACHE_ROOT: resolve(root, "cache"),
       RUST_LOG: "warn", TRUSTED_PROXY_CIDRS: "", ...options.env,
     };
+    if (options.beforeStart) await options.beforeStart(fixture);
     await fixture.startServer({}, options.binary);
     await run(fixture);
   } finally {
