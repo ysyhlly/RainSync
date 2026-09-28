@@ -49,6 +49,43 @@ test("queue thumbnail image retry is reachable inside its compact bounds", async
 });
 
 for (const scope of ["personal", "shared"] as const) {
+  test(`${scope} save superseded before response preserves draft and shows the concurrent value`, async ({
+    page,
+  }) => {
+    const app = await appFixture(page);
+    await page.goto("/library");
+    await page
+      .getByRole("button", { name: "重命名 真实合成测试视频", exact: true })
+      .click();
+    const field = page.getByLabel(
+      scope === "personal" ? "仅我看到的名称" : "所有人的默认名称",
+    );
+    await expect(field).toBeEnabled();
+    await field.fill("my draft");
+    await page.route(
+      `**/movie/${scope}-title`,
+      async (route) => {
+        Object.assign(app.media[0], {
+          [`${scope}_title`]: "newer than my save",
+          [`${scope}_title_revision`]: "2",
+          title: "newer than my save",
+        });
+        await route.fulfill({ json: app.media[0] });
+      },
+      { times: 1 },
+    );
+    const save = page.getByRole("button", {
+      name: scope === "personal" ? "保存个人名称" : "保存全站名称",
+      exact: true,
+    });
+    await save.click();
+    await expect(page.getByText(/你的草稿已保留/)).toBeVisible();
+    await expect(page.getByRole("dialog")).toContainText("newer than my save");
+    await expect(field).toHaveValue("my draft");
+    await expect(page.getByText("名称已保存", { exact: true })).toHaveCount(0);
+    await save.click();
+    await expect(page.getByText("名称已保存", { exact: true })).toBeVisible();
+  });
   test(`${scope} draft keeps its version across focus refresh and explicit conflict retry`, async ({
     page,
   }) => {

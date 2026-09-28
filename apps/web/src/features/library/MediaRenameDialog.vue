@@ -60,10 +60,17 @@ async function save(scope: "personal" | "shared", clear = false) {
       scope === "personal" ? catalog.renamePersonal : catalog.renameShared
     )(id, title, revisions[scope]);
     if (n === serial && epoch === session.epoch) {
-      if (clear) (scope === "personal" ? personal : shared).value = "";
       revisions[scope] = saved[`${scope}_title_revision`];
-      conflict.value = undefined;
-      message.value = "名称已保存";
+      // The server reads after commit; another writer may already have won.
+      if (saved[`${scope}_title`] !== title) {
+        conflict.value = { scope, title: saved[`${scope}_title`] };
+        error.value =
+          "名称保存后又被其他操作修改。你的草稿已保留，请核对后再次保存。";
+      } else {
+        if (clear) (scope === "personal" ? personal : shared).value = "";
+        conflict.value = undefined;
+        message.value = "名称已保存";
+      }
     }
   } catch (e) {
     if (n !== serial || epoch !== session.epoch) return;

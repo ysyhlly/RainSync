@@ -20,6 +20,8 @@ Media 包含 id、title、original_title、shared_title、shared_title_revision�
 
 409 时保留草稿、GET 最新版本并让用户再次确认保存；网络响应丢失后 GET 核验目标 scope，不自动重发 PUT。
 
+草稿文本与个人/全站各自的 revision 一起载入。窗口聚焦、列表和其他 catalog 刷新不会推进草稿版本；冲突读取到的名称单独展示，下次手动保存只使用这次读取的版本。改名调用返回该 PUT 响应快照，catalog 则可以保留并发读取到的更新版本。后端在提交后读取返回数据；若响应中的目标名称已与本次提交不同，界面展示被后续写入覆盖的冲突提示和最新值，保留草稿等待用户再次核对。
+
 ## 请求封面
 
 | 请求 | 行为 |
@@ -31,6 +33,8 @@ Media 包含 id、title、original_title、shared_title、shared_title_revision�
 状态响应为 `{"items":[{"media_id":"uuid","cover":{...}}]}`。cover 字段：status 为 missing/queued/running/ready/unavailable，revision/url 在 ready 时提供，retry_after_ms 表示等待建议。图片地址仅为同源 Server 地址，凭据和源路径不交给浏览器。
 
 状态 no-store；图片 private, no-cache，认证先于 304。旧版本 409 MEDIA_PREVIEW_STALE，队列满 503 MEDIA_PREVIEW_QUEUE_FULL，不可生成 MEDIA_PREVIEW_UNAVAILABLE。前端只请求可见卡片，每批最多 24、一批在途，2 秒起合并轮询，60 秒后停止等待并提供手动重试；页面隐藏/卸载取消。
+
+图片 GET 失败显示“封面加载失败”，提供一次性的“重新加载封面”；媒体库成功刷新也可重新加载同一 revision。失败本身不触发生成 POST、计时重试或无限循环，普通名称/详情缓存更新不会触发图片重试。旧图片因版本变化或缓存淘汰失效时，重新聚焦/搜索刷新列表可取得最新状态并按需生成。
 
 ## Worker 与配置
 
@@ -45,6 +49,8 @@ Media 包含 id、title、original_title、shared_title、shared_title_revision�
 Server/Worker 使用对应相同配置。缓存预算小于单张图时任务返回 unavailable，不无限续租。独立 SKIP LOCKED 队列、15 秒租约、5 秒续租、最多 3 次尝试、2/5 秒退避和 60 秒失败重试。发布检查 attempt/owner/lease/源 generation；事务锁保护 LRU 字节预算。
 
 Jellyfin/Emby 优先 Backdrop 再 Primary，失败后使用认证静态视频流；本地/HTTP/NAS 从开头顺序解码。完整帧缩放采样用于黑帧判定（灰度<24，比例>=99.5%），接受后输出按比例中心裁剪 640×360。WebP 使用 libwebp/image2pipe，检查 RIFF、尺寸、静态结构及 256KiB 上限。
+
+当前预览配方为 2：按含 SAR 的显示比例在编码画面中中心裁剪，再缩放为 640×360 方形像素，兼容 FFmpeg 5.1。旧配方 1 的图像视为 missing、旧 URL 返回 409，下次请求按配方 2 重建。没有新增或修改 SQLx 迁移；新入队显式写入 recipe_version=2，不依赖历史表默认值。Server 和 Worker 必须使用同一配方版本；不承诺新旧二进制混跑，旧 Server 可能重新写入配方 1。
 
 预览输入授权只在本 attempt 内有效，累计网络/relay 输入预算，HTTP/嵌套 HLS 保持同源，不跟随重定向。local 前后比较读取侧文件属性；NAS 验证 source_version。HTTP 同 attempt 绑定 ETag/Last-Modified；重新扫描和 24 小时上限保守失效，不保证无扫描时即时发现上游替换。修改片源配置/资源/版本/metadata/可用性会改变 generation，改名不会。
 

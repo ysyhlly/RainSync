@@ -1,5 +1,7 @@
 # 媒体库、播放器与公共控件实施报告
 
+> 后续独立审计发现的三项 P2 及 T9 前向修复证据，见 [审计修复报告](LIBRARY_PLAYER_AUDIT_FIX_REPORT.md)。本文保留首轮实施的历史验证范围；后续结论以修复报告为准。
+
 执行日期：2026-09-29，Asia/Shanghai。分支 `front/rainsync-implementation`；起点 `75c45d82f784ad6f2bf60241c67f65544627faef`。执行依据为 [原计划](superpowers/plans/2026-09-28-library-player-polish.md)，过程见 [进度记录](LIBRARY_PLAYER_PROGRESS.md)。
 
 本轮已实现双层改名、认证封面队列、统一选择器/抽屉关闭、奶油空态、聊天上方播放信息、视频内控件、五秒全屏显隐及持久播放。源码和测试仅本地提交，未部署。下述验证覆盖有界隔离环境，实机与特定媒体边界单独列在“未验证项”，不视为已验收。
