@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+pub mod preview;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
@@ -154,7 +155,7 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
                             .ok_or_else(|| anyhow::anyhow!("missing_id"))?
                             .into(),
                         duration_ms: v["RunTimeTicks"].as_f64().map(|v| v / 10000.0),
-                        metadata: json!({}),
+                        metadata: json!({"ImageTags":v["ImageTags"],"BackdropImageTags":v["BackdropImageTags"]}),
                     });
                 }
                 start += rows.len();

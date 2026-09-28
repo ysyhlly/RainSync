@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 pub mod child_process;
 pub mod file_version;
+pub mod preview;
 pub mod process_signal;
 pub mod subtitles;
 

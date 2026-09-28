@@ -295,7 +295,7 @@ pub async fn playlist(
 ) -> Result<Response> {
     let u = auth(&app, &h, false).await?;
     member(&app, &u, id).await?;
-    let rows=sqlx::query(&format!("{} JOIN playlist_items p ON p.media_id=m.id WHERE {} AND p.room_id=$2 ORDER BY p.sort_order,p.id", media_titles::SELECT.replace("SELECT m.id,", "SELECT p.id AS playlist_id,m.id,"), media_titles::VISIBLE)).bind(u.id).bind(id).fetch_all(&app.db).await?;
+    let rows=sqlx::query(&format!("{} JOIN playlist_items q ON q.media_id=m.id WHERE {} AND q.room_id=$2 ORDER BY q.sort_order,q.id", media_titles::SELECT.replace("SELECT m.id,", "SELECT q.id AS playlist_id,m.id,"), media_titles::VISIBLE)).bind(u.id).bind(id).fetch_all(&app.db).await?;
     Ok(media_titles::private_json(Value::Array(rows.iter().map(|r| {
         let media = media_titles::media(r);
         json!({"id":r.get::<Uuid,_>("playlist_id"),"media_id":media["id"],"title":media["title"],"cover":media["cover"]})

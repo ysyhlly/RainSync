@@ -5,6 +5,7 @@ mod avatar_image;
 mod avatars;
 mod limits;
 mod media;
+mod media_previews;
 mod media_titles;
 mod metrics;
 mod playback_requests;
@@ -41,6 +42,7 @@ pub struct App {
     avatar_settings: avatar_image::Settings,
     session_limit: i64,
     queue_limit: i64,
+    preview_settings: persistence::media_previews::Settings,
     metrics: Arc<metrics::Metrics>,
     db: PgPool,
     origin: String,
@@ -403,6 +405,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         avatar_settings: avatar_image::Settings::configured()?,
         session_limit: limits::configured("PLAYBACK_SESSION_LIMIT", limits::DEFAULT_SESSION_LIMIT)?,
         queue_limit: limits::configured("MEDIA_QUEUE_LIMIT", limits::DEFAULT_QUEUE_LIMIT)?,
+        preview_settings: persistence::media_previews::Settings::configured()?,
         metrics: Default::default(),
         db: db.clone(),
         secure: public_origin.starts_with("https://"),
@@ -506,6 +509,11 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         )
         .route("/api/v1/sources/{id}/test", post(media::scan))
         .route("/api/v1/media", get(media::library))
+        .route(
+            "/api/v1/media/previews",
+            get(media_previews::status).post(media_previews::request),
+        )
+        .route("/api/v1/media/{id}/cover", get(media_previews::image))
         .route("/api/v1/media/{id}", get(media_titles::detail))
         .route(
             "/api/v1/media/{id}/personal-title",

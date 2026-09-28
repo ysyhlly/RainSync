@@ -1414,6 +1414,7 @@ dependencies = [
  "http-api",
  "media-core",
  "persistence",
+ "providers",
  "reqwest",
  "serde",
  "serde_json",

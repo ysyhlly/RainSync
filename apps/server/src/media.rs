@@ -85,6 +85,11 @@ pub async fn scan(
                 .and_then(|v| v.parse::<f64>().ok())
                 .map(|v| v * 1000.0);
             item.metadata = meta;
+            if let Ok(file) = std::fs::File::open(&path)
+                && let Ok(snapshot) = media_core::file_version::snapshot_file(&file)
+            {
+                item.metadata["preview_file_version"] = json!(snapshot.version);
+            }
             let mut sidecars = serde_json::Map::new();
             for (i, ext) in ["srt", "vtt"].iter().enumerate() {
                 let relative = std::path::Path::new(&item.resource)
@@ -96,6 +101,9 @@ pub async fn scan(
                 }
             }
             item.metadata["sidecars"] = Value::Object(sidecars);
+        }
+        if row.get::<String, _>("kind") != "local" {
+            item.metadata["preview_scan"] = json!(generation);
         }
         batch.push(item);
         if batch.len() == 32 {

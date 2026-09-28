@@ -21,8 +21,8 @@
 | --- | --- | --- |
 | T0 基线 | 已核实 | Rust 56 通过/2 忽略；前端 47 通过；类型构建通过；浏览器 103/104，NAS 单例复跑通过（busy/Escape 时序），T4 补就绪等待 |
 | T1 双层名称 | 已验证 | titles-red 真实接口 404；titles-green 通过；titles-rust、titles-protocol-check 通过。local 真扫描、Jellyfin/Emby 协议 fixture 扫描、NAS WebSocket 索引与 Server 重启覆盖；真实上游留待 T3 |
-| T2 预览任务 | 待执行 | |
-| T3 真实解码 | 待执行 | |
+| T2 预览任务 | 核心路径通过，扩展审查继续 | previews-red、preview-races-red 暴露路由/容量缺陷；previews-bind-green 验证去重、领取、租约、旧 attempt/source 拒绝、LRU 预算和认证图片；preview-sources-reuse 五类读取路径通过 |
+| T3 真实解码 | 部分通过/环境限制 | 合成帧像素、黑/暗/损坏/竖屏、Range/HLS、真实 NAS、上游协议 fixture 通过；previews-container 验证 Bookworm 5.1 编码。preview-image-build 因 Docker Hub 认证超时失败；新 Linux Worker 和真实 Jellyfin/Emby 产品未验证 |
 | T4 选择器/抽屉 | 待执行 | |
 | T5 配色 | 待执行 | |
 | T6 媒体资料 UI | 待执行 | |
@@ -31,5 +31,3 @@
 | T9 报告/提交 | 待执行 | |
 
 每个 logs/NAME.json 记录命令、时间、退出码；同名 .log 保存真实输出。只在实际验证通过后更新检查点。
-
-

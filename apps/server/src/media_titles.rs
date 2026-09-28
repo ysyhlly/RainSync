@@ -1,7 +1,7 @@
 use super::*;
 
 // $1 is always the authenticated viewer, never an input user id.
-pub const SELECT: &str = "SELECT m.id,COALESCE(u.title,m.shared_title,m.title) AS title,m.title AS original_title,m.shared_title,m.shared_title_revision,u.title AS personal_title,COALESCE(u.revision,0) AS personal_title_revision,m.duration_ms,s.kind FROM media_items m JOIN sources s ON s.id=m.source_id LEFT JOIN media_user_titles u ON u.media_id=m.id AND u.user_id=$1";
+pub const SELECT: &str = "SELECT m.id,COALESCE(u.title,m.shared_title,m.title) AS title,m.title AS original_title,m.shared_title,m.shared_title_revision,u.title AS personal_title,COALESCE(u.revision,0) AS personal_title_revision,m.duration_ms,s.kind,p.status AS preview_status,p.result_revision AS preview_revision FROM media_items m JOIN sources s ON s.id=m.source_id LEFT JOIN media_user_titles u ON u.media_id=m.id AND u.user_id=$1 LEFT JOIN media_previews p ON p.media_id=m.id AND p.source_generation=m.preview_generation AND p.recipe_version=1 AND (s.kind IN ('local','agent') OR p.generated_at IS NULL OR p.generated_at>clock_timestamp()-interval '24 hours')";
 pub const VISIBLE: &str = "m.available AND (s.kind<>'agent' OR EXISTS(SELECT 1 FROM agents a WHERE a.id=s.id AND NOT a.revoked))";
 
 pub fn media(row: &sqlx::postgres::PgRow) -> Value {
@@ -13,7 +13,7 @@ pub fn media(row: &sqlx::postgres::PgRow) -> Value {
         "personal_title": row.get::<Option<String>,_>("personal_title"),
         "personal_title_revision": row.get::<i64,_>("personal_title_revision").to_string(),
         "duration_ms": row.get::<Option<f64>,_>("duration_ms"), "kind": row.get::<String,_>("kind"),
-        "cover": {"status":"missing","revision":null,"url":null,"retry_after_ms":null}
+        "cover": media_previews::cover(row)
     })
 }
 
@@ -49,7 +49,7 @@ struct Change {
 
 fn validate(value: Value) -> Result<(Option<String>, i64)> {
     // Option alone would also accept a missing field; require explicit null to clear.
-    if !value.get("title").is_some() {
+    if value.get("title").is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "media_title_invalid"));
     }
     let change: Change = serde_json::from_value(value)
