@@ -21,14 +21,14 @@
 | --- | --- | --- |
 | T0 基线 | 已核实 | Rust 56 通过/2 忽略；前端 47 通过；类型构建通过；浏览器 103/104，NAS 单例复跑通过（busy/Escape 时序），T4 补就绪等待 |
 | T1 双层名称 | 已验证 | titles-red 真实接口 404；titles-green 通过；titles-rust、titles-protocol-check 通过。local 真扫描、Jellyfin/Emby 协议 fixture 扫描、NAS WebSocket 索引与 Server 重启覆盖；真实上游留待 T3 |
-| T2 预览任务 | 核心路径通过，扩展审查继续 | previews-red、preview-races-red 暴露路由/容量缺陷；previews-bind-green 验证去重、领取、租约、旧 attempt/source 拒绝、LRU 预算和认证图片；preview-sources-reuse 五类读取路径通过 |
-| T3 真实解码 | 部分通过/环境限制 | 合成帧像素、黑/暗/损坏/竖屏、Range/HLS、真实 NAS、上游协议 fixture 通过；previews-container 验证 Bookworm 5.1 编码。preview-image-build 因 Docker Hub 认证超时失败；新 Linux Worker 和真实 Jellyfin/Emby 产品未验证 |
+| T2 预览任务 | 已验证 | previews-red、preview-races-red 暴露路由/容量缺陷；previews-bind-green 验证去重、领取、租约、旧 attempt/source 拒绝、LRU 预算和认证图片；preview-sources-reuse 五类读取路径通过 |
+| T3 真实解码 | 已验证，特殊媒体边界见报告 | 7897代理解决镜像构建；preview-products-acceptance 新 Linux Worker + Jellyfin/Emby真实产品通过；preview-sources-nas-final 含NAS离线恢复/版本变化和裁剪前黑帧 |
 | T4 选择器/抽屉 | 实现/基本回归通过 | selection-red 3 个预期失败；selection-final 25 通过、手机全宽外部点击跳过，字幕文本断言适配后 selection-subtitle-final 2/2；admin 16 项已通过。全屏层级随 T7 验证 |
 | T5 配色 | 通过 | cream-layout 桌面/手机六宽度、登录注册/全部管理页/抽屉/媒体库/房间/资料页和真实计算颜色通过；cream-build 通过。硬编码扫描仅剩主题 token、有意遮罩和中性视频留边 |
-| T6 媒体资料 UI | 待执行 | |
-| T7 播放器 | 待执行 | |
-| T8 综合回归 | 待执行 | |
-| T9 报告/提交 | 待执行 | |
+| T6 媒体资料 UI | 已验证 | catalog单测、media-library冲突/丢响应/回退及真实双用户连续播放 |
+| T7 播放器 | 已验证 | 真实Fullscreen API/5000ms、触控、音轨字幕菜单、不支持API提示 |
+| T8 综合回归 | 已验证 | browser-complete 120通过/2跳过；Rust57/2ignored，前端55；真实产品/迁移/relay/进程回归 |
+| T9 报告/提交 | 已执行 | 实施报告/API/架构已更新，指定身份本地提交，原4项用户改动保留 |
 
 每个 logs/NAME.json 记录命令、时间、退出码；同名 .log 保存真实输出。只在实际验证通过后更新检查点。
 
@@ -49,3 +49,12 @@
 - `chrome-browser-red` 在未实施时失败；`chrome-final` 17 通过/1 手机全屏跳过；`browser-polish-final2` 完整 118 通过/2 跳过；`frontend-build-final2` 构建通过。
 - 五秒边界浏览器测试采用暂停的 Playwright clock，消除 4999ms 检查时真实时间继续前进的测量误差。真实 document.fullscreenElement、计算 opacity/cursor、倍速命令、退出和 DOM 身份均有断言。
 - 真实联调 `library-player-real` 成功；最终报告将补列音轨/字幕在真实产品全屏中的验证范围，不把模拟接口等同产品联调。
+
+
+## T8/T9 — 最终证据和交接
+
+- 最终完整浏览器 `browser-complete` 120通过/2跳过；前端55、Rust57，2个Rust ignored为父测试按需启动的子进程入口。
+- `library-player-real-final`、`titles-final`、`previews-boundaries`、`preview-sources-nas-final`、`preview-products-acceptance`、`media-migration-upgrade`、`worker-processes-polish`、`relay-cancel-final`、`agent-relay-final` 全部退出0。
+- 上游产品稳定启动需 GET Startup/User 初始化默认用户；Emby需等待首次库扫描完成再上传封面，避免扫描覆盖测试上传。最终真实产品通过，不沿用早期失败结果。
+- `ownership-final.json`、`processes-after.json`、`listeners-after.json` 核对原有容器/端口进程。用户Dockerfile哈希一致，三个原删除未恢复、未提交。
+- `acceptance-manifest.json` 汇总最终证据、命令、退出码和日志SHA256。详细范围、未验证项和安全回滚见 `LIBRARY_PLAYER_IMPLEMENTATION_REPORT.md`；没有部署、推送、PR或外部消息。

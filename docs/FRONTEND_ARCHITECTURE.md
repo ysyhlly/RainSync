@@ -68,3 +68,14 @@ Library store请求25项，展示24项，用额外一项判断下一页；新搜
 - 新浏览器验证真实DOM对象身份、WebSocket和POST播放会话数量、搜索分页、普通权限、精确颜色/16:9/六宽度、reduced-motion和焦点。媒体字节为合成真实MP4，控制/API为mock，不能代替D阶段真实Server/Worker视频连续播放。
 - 冷启动图标依赖发现导致最初页面就绪超过断言时间；显式optimizeDeps后全套通过。密码显示按钮最初混入label可访问名称，改为显式label/for后通过，没有放宽定位断言。
 - 保留原有大chunk构建提示，未修改警告阈值。原始日志和内部检查截图不入库、不作为产品效果图交付。
+
+
+## 2026-09-29 媒体库和播放器更新（仅本地实施）
+
+`media-catalog.store.ts` 统一按身份保存媒体资料。个人/共享版本独立比较，详情和预览以请求序号抑制旧响应；身份 epoch 同步清空并取消请求。library 只负责搜索和游标分页，room-runtime 按当前 ID 和队列刷新资料，不因为改名重建播放。其他页面重进/窗口焦点刷新资料，不广播个人别名。
+
+AppShell 仍持久挂载 PlaybackHost，video 的父级始终是 video-frame，未引入按路由 key 或搬运 video 的 Teleport。RoomPage 的纯展示 PlaybackInformation 在桌面聊天上方，手机视频下方。use-player-chrome 仅管理 UI：hover、触控、五秒计时、菜单/拖动/键盘锁、页面隐藏与销毁。Fullscreen API 目标为 PlaybackHost，必要错误/自动播放提示保持可用。
+
+PlaybackSettings 的面板和 AppSelect 菜单始终留在所属播放器/dialog 子树，Popover 提供顶层显示；自绘 combobox 保留 number/null 类型、键盘和焦点规则。播放方式保留手动“重新加载”，音轨沿用重载，字幕保持轨道标识，音量/静音仅本地，房间倍速沿用控制权限。
+
+相关接口/配置见 [MEDIA_LIBRARY_API.md](MEDIA_LIBRARY_API.md)，本轮证据与限制见 [LIBRARY_PLAYER_IMPLEMENTATION_REPORT.md](LIBRARY_PLAYER_IMPLEMENTATION_REPORT.md)。此前本文件的部署历史不是本轮部署记录；本轮未操作运行中的 RainSync/SnowLuma。
