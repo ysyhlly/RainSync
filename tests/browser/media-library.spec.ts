@@ -1,18 +1,52 @@
 import { test, expect } from "@playwright/test";
 import { appFixture } from "./fixtures/application";
 import { navigate } from "./fixtures/navigation";
-test("rename conflict preserves draft; lost response is read back; clear restores shared title",async({page})=>{
- const app=await appFixture(page);await page.goto('/library');await page.getByRole('button',{name:'重命名 真实合成测试视频',exact:true}).click();
- const field=page.getByLabel('仅我看到的名称');await expect(field).toBeEnabled();await field.fill('retained draft');
- Object.assign(app.media[0],{personal_title:'concurrent',personal_title_revision:'1',title:'concurrent'});
- await page.getByRole('button',{name:'保存个人名称',exact:true}).click();await expect(page.getByText(/你的草稿已保留/)).toBeVisible();await expect(field).toHaveValue('retained draft');
- await page.getByRole('button',{name:'保存个人名称',exact:true}).click();await expect(page.getByText('名称已保存',{exact:true})).toBeVisible();
- await page.route('**/media/movie/personal-title',async route=>{
-  const body=route.request().postDataJSON();Object.assign(app.media[0],{personal_title:body.title,personal_title_revision:'3',title:body.title});await route.abort('failed');
- },{times:1});
- await field.fill('response lost');await page.getByRole('button',{name:'保存个人名称',exact:true}).click();await expect(page.getByText('已确认名称保存成功')).toBeVisible();
- await page.getByLabel('所有人的默认名称').fill('shared fallback');await page.getByRole('button',{name:'保存全站名称',exact:true}).click();await expect.poll(()=>app.media[0].shared_title).toBe('shared fallback');
- await page.getByRole('button',{name:'恢复个人默认',exact:true}).click();await expect(field).toHaveValue('');await page.getByRole('button',{name:'关闭弹窗'}).click();await expect(page.locator('.media-card h2').first()).toHaveText('shared fallback');
+test("rename conflict preserves draft; lost response is read back; clear restores shared title", async ({
+  page,
+}) => {
+  const app = await appFixture(page);
+  await page.goto("/library");
+  await page
+    .getByRole("button", { name: "重命名 真实合成测试视频", exact: true })
+    .click();
+  const field = page.getByLabel("仅我看到的名称");
+  await expect(field).toBeEnabled();
+  await field.fill("retained draft");
+  Object.assign(app.media[0], {
+    personal_title: "concurrent",
+    personal_title_revision: "1",
+    title: "concurrent",
+  });
+  await page.getByRole("button", { name: "保存个人名称", exact: true }).click();
+  await expect(page.getByText(/你的草稿已保留/)).toBeVisible();
+  await expect(field).toHaveValue("retained draft");
+  await page.getByRole("button", { name: "保存个人名称", exact: true }).click();
+  await expect(page.getByText("名称已保存", { exact: true })).toBeVisible();
+  await page.route(
+    "**/media/movie/personal-title",
+    async (route) => {
+      const body = route.request().postDataJSON();
+      Object.assign(app.media[0], {
+        personal_title: body.title,
+        personal_title_revision: "3",
+        title: body.title,
+      });
+      await route.abort("failed");
+    },
+    { times: 1 },
+  );
+  await field.fill("response lost");
+  await page.getByRole("button", { name: "保存个人名称", exact: true }).click();
+  await expect(page.getByText("已确认名称保存成功")).toBeVisible();
+  await page.getByLabel("所有人的默认名称").fill("shared fallback");
+  await page.getByRole("button", { name: "保存全站名称", exact: true }).click();
+  await expect.poll(() => app.media[0].shared_title).toBe("shared fallback");
+  await page.getByRole("button", { name: "恢复个人默认", exact: true }).click();
+  await expect(field).toHaveValue("");
+  await page.getByRole("button", { name: "关闭弹窗" }).click();
+  await expect(page.locator(".media-card h2").first()).toHaveText(
+    "shared fallback",
+  );
 });
 test("rename updates library and playing metadata without another media session", async ({
   page,

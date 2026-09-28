@@ -1,4 +1,4 @@
-import {mediaExtraResponse} from "./fixtures/media";
+import { mediaExtraResponse } from "./fixtures/media";
 import { test, expect, type WebSocketRoute } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { navigate, roomPanel, showOptions } from "./fixtures/navigation";
@@ -27,7 +27,8 @@ test("room, library, invitation and settings are usable", async ({
   await page.clock.install();
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/api/v1/**", async (route) => {
-    const extra=mediaExtraResponse(route);if(extra)return extra;
+    const extra = mediaExtraResponse(route);
+    if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
     let body: unknown = [];
     if (path.endsWith("/auth/me"))
@@ -248,7 +249,8 @@ test("rejected WebSocket upgrade rechecks login and stops retrying", async ({
   let expired = false;
   let connections = 0;
   await page.route("**/api/v1/**", (route) => {
-    const extra=mediaExtraResponse(route);if(extra)return extra;
+    const extra = mediaExtraResponse(route);
+    if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/me")) {
       return route.fulfill(
@@ -315,7 +317,8 @@ test("playback retries a lost HTTP response with the same operation key", async 
     route.fulfill({ contentType: "video/mp4", body: "" }),
   );
   await page.route("**/api/v1/**", async (route) => {
-    const extra=mediaExtraResponse(route);if(extra)return extra;
+    const extra = mediaExtraResponse(route);
+    if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/me"))
       return route.fulfill({
@@ -487,6 +490,7 @@ test("playback retries a lost HTTP response with the same operation key", async 
 
 test("rapid audio switches preserve the newest plan while an old DELETE is delayed", async ({
   page,
+  isMobile,
 }) => {
   const requests: any[] = [];
   const revoked: string[] = [];
@@ -499,7 +503,8 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
     route.fulfill({ contentType: "video/mp4", body: "" }),
   );
   await page.route("**/api/v1/**", async (route) => {
-    const extra=mediaExtraResponse(route);if(extra)return extra;
+    const extra = mediaExtraResponse(route);
+    if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/me"))
       return route.fulfill({
@@ -598,6 +603,17 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
     "src",
     "/audio-test-media/initial",
   );
+  if (!isMobile && !(await page.evaluate(() => !!document.fullscreenElement))) {
+    await page.locator("video").hover();
+    await page.getByRole("button", { name: "全屏", exact: true }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          document.fullscreenElement?.classList.contains("playback-host"),
+        ),
+      )
+      .toBe(true);
+  }
   await showOptions(page);
   await page.getByRole("combobox", { name: "音轨", exact: true }).click();
   await page
@@ -638,6 +654,7 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
 
 test("subtitle identity survives reload and resets on media change", async ({
   page,
+  isMobile,
 }) => {
   const clip = Buffer.from(
     readFileSync("tests/fixtures/browser-video.base64", "utf8").trim(),
@@ -669,7 +686,8 @@ test("subtitle identity survives reload and resets on media change", async ({
     }),
   );
   await page.route("**/api/v1/**", async (route) => {
-    const extra=mediaExtraResponse(route);if(extra)return extra;
+    const extra = mediaExtraResponse(route);
+    if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/me"))
       return route.fulfill({
@@ -752,6 +770,17 @@ test("subtitle identity survives reload and resets on media change", async ({
   await expect
     .poll(() => video.evaluate((v: HTMLVideoElement) => v.readyState))
     .toBeGreaterThanOrEqual(2);
+  if (!isMobile) {
+    await page.locator("video").hover();
+    await page.getByRole("button", { name: "全屏", exact: true }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          document.fullscreenElement?.classList.contains("playback-host"),
+        ),
+      )
+      .toBe(true);
+  }
   await showOptions(page);
   await page.getByRole("combobox", { name: "字幕", exact: true }).click();
   await page.getByRole("option", { name: "中文 · zho", exact: true }).click();

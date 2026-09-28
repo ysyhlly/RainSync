@@ -44,10 +44,35 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       if (id) void catalog.ensure(id, true).catch(() => {});
     },
   );
+  let metadataRefresh = 0;
   function refreshMetadata() {
-    const id = state.value?.media_id;
-    if (id) void catalog.ensure(id, true).catch(() => {});
+    const serial = ++metadataRefresh,
+      identity = session.epoch;
+    const ids = [
+      ...new Set(
+        [
+          state.value?.media_id,
+          ...playlist.value.map((item) => item.media_id),
+        ].filter((id): id is string => !!id),
+      ),
+    ];
+    // Keep large queues bounded without changing playback or broadcasting aliases.
+    const work = async () => {
+      while (
+        ids.length &&
+        serial === metadataRefresh &&
+        identity === session.epoch
+      ) {
+        const id = ids.shift()!;
+        await catalog.ensure(id, true).catch(() => {});
+      }
+    };
+    void Promise.all(Array.from({ length: Math.min(4, ids.length) }, work));
   }
+  watch(
+    () => playlist.value.map((item) => item.media_id).join(","),
+    refreshMetadata,
+  );
   window.addEventListener("focus", refreshMetadata);
   onScopeDispose(() => window.removeEventListener("focus", refreshMetadata));
   const clock = new Clock();
@@ -428,6 +453,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     busy,
     owner,
     currentTitle,
+    refreshMetadata,
     remember,
     enter,
     leave,

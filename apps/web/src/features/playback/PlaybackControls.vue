@@ -78,7 +78,10 @@ function end() {
       max="1"
       step="0.05"
       :value="volume"
-      @pointerdown="emit('dragging', true)"
+      @pointerdown="
+        ($event.target as HTMLElement).setPointerCapture($event.pointerId);
+        emit('dragging', true);
+      "
       @pointerup="emit('dragging', false)"
       @pointercancel="emit('dragging', false)"
       @blur="emit('dragging', false)"

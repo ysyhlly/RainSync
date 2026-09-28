@@ -23,12 +23,33 @@ export function mediaRecord(item: {
 }
 
 // Independent legacy playback fixtures must return real DTO shapes for new routes.
-export function mediaExtraResponse(route: import('@playwright/test').Route) {
- const url=new URL(route.request().url()),path=url.pathname;
- if(path==='/api/v1/media/previews'){
-  const ids=route.request().method()==='POST'?route.request().postDataJSON().media_ids:(url.searchParams.get('ids')??'').split(',');
-  return route.fulfill({json:{items:ids.map((media_id:string)=>({media_id,cover:{...missingCover,status:'unavailable',retry_after_ms:60000}}))}});
- }
- if(/^\/api\/v1\/media\/[^/]+$/.test(path))return route.fulfill({json:mediaRecord({id:decodeURIComponent(path.split('/').at(-1)!),title:'movie'})});
- return undefined;
+export function mediaExtraResponse(route: import("@playwright/test").Route) {
+  const url = new URL(route.request().url()),
+    path = url.pathname;
+  if (path === "/api/v1/media/previews") {
+    const ids =
+      route.request().method() === "POST"
+        ? route.request().postDataJSON().media_ids
+        : (url.searchParams.get("ids") ?? "").split(",");
+    return route.fulfill({
+      json: {
+        items: ids.map((media_id: string) => ({
+          media_id,
+          cover: {
+            ...missingCover,
+            status: "unavailable",
+            retry_after_ms: 60000,
+          },
+        })),
+      },
+    });
+  }
+  if (/^\/api\/v1\/media\/[^/]+$/.test(path))
+    return route.fulfill({
+      json: mediaRecord({
+        id: decodeURIComponent(path.split("/").at(-1)!),
+        title: "movie",
+      }),
+    });
+  return undefined;
 }

@@ -37,7 +37,10 @@ watch(
     run(async () => {
       const serial = ++entry,
         id = String(route.params.id);
-      if (r.room?.id === id) return;
+      if (r.room?.id === id) {
+        r.refreshMetadata();
+        return;
+      }
       const rooms = await api.list();
       if (!alive || serial !== entry || String(route.params.id) !== id) return;
       const room = rooms.find((r) => r.id === id);

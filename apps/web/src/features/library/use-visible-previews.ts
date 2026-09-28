@@ -36,6 +36,8 @@ export function useVisiblePreviews(
     running = true;
     const signal = controller.signal;
     try {
+      for (const id of visible)
+        if (catalog.records[id]?.cover.status === "ready") requested.delete(id);
       const fresh = [...visible]
         .filter(
           (id) =>
@@ -67,6 +69,9 @@ export function useVisiblePreviews(
         .slice(0, 24);
       if (due.length) {
         await catalog.refreshPreviewStatuses(due, signal);
+        for (const id of due)
+          if (catalog.records[id]?.cover.status === "missing")
+            requested.delete(id);
         for (const id of due)
           retryAt.set(
             id,

@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, watch } from "vue";
 import { useRoomRuntime } from "../rooms/room-runtime";
-import { useMediaCatalog } from "../library/media-catalog.store";
 import PlaybackControls from "./PlaybackControls.vue";
 import PlaybackInformation from "./PlaybackInformation.vue";
 import PlaybackSettings from "./PlaybackSettings.vue";
@@ -9,7 +8,6 @@ import AppIcon from "../../shared/ui/AppIcon.vue";
 import { createPlayerChrome } from "./use-player-chrome";
 const props = defineProps<{ full: boolean }>();
 const r = useRoomRuntime(),
-  catalog = useMediaCatalog(),
   element = ref<HTMLVideoElement>(),
   host = ref<HTMLElement>(),
   fullscreenError = ref("");
@@ -165,7 +163,7 @@ onBeforeUnmount(() => {
         @keydown="chrome.activity"
       >
         <PlaybackSettings
-          :active="full||fullscreen"
+          :active="full || fullscreen"
           v-show="full || fullscreen"
           @open-change="menu('settings', $event)"
         />
@@ -176,6 +174,9 @@ onBeforeUnmount(() => {
           @fullscreen="toggleFullscreen"
         />
       </div>
+      <p v-if="fullscreen && r.error" class="fullscreen-error" role="alert">
+        {{ r.error }} <button @click="r.error = ''">关闭提示</button>
+      </p>
       <p v-if="fullscreenError" class="fullscreen-error" role="alert">
         {{ fullscreenError }}
       </p>

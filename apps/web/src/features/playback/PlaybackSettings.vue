@@ -3,13 +3,25 @@ import { ref, nextTick, onBeforeUnmount, watch } from "vue";
 import { useRoomRuntime } from "../rooms/room-runtime";
 import AppSelect from "../../shared/ui/AppSelect.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
-const props=defineProps<{active:boolean}>();
+const props = defineProps<{ active: boolean }>();
 const r = useRoomRuntime();
 const emit = defineEmits<{ openChange: [value: boolean] }>();
 const panel = ref<HTMLElement>(),
   details = ref<HTMLDetailsElement>();
-watch(()=>props.active,value=>{if(!value&&details.value)details.value.open=false});
-function escape(event:KeyboardEvent){if(event.key==="Escape"&&details.value?.open){event.preventDefault();event.stopPropagation();details.value.open=false;details.value.querySelector("summary")?.focus()}}
+watch(
+  () => props.active,
+  (value) => {
+    if (!value && details.value) details.value.open = false;
+  },
+);
+function escape(event: KeyboardEvent) {
+  if (event.key === "Escape" && details.value?.open) {
+    event.preventDefault();
+    event.stopPropagation();
+    details.value.open = false;
+    details.value.querySelector("summary")?.focus();
+  }
+}
 async function toggle() {
   const open = !!details.value?.open;
   emit("openChange", open);
@@ -50,7 +62,12 @@ onBeforeUnmount(() => {
 });
 </script>
 <template>
-  <details @keydown="escape" ref="details" @toggle="toggle" class="playback-options">
+  <details
+    @keydown="escape"
+    ref="details"
+    @toggle="toggle"
+    class="playback-options"
+  >
     <summary>播放选项</summary>
     <div ref="panel" popover="manual" class="settings-panel">
       <p class="helper">更改播放方式后点击重新加载。</p>
