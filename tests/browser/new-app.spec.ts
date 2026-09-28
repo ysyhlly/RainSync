@@ -129,7 +129,7 @@ test("beige tokens, media ratio, dialogs and required widths remain usable", asy
         .trim()
         .toUpperCase(),
     ),
-  ).toBe("#9E7867");
+  ).toBe("#D2B49C");
   await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
   expect(
     await page.evaluate(

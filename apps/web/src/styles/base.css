@@ -57,7 +57,7 @@ button:disabled {
 .primary {
   background: var(--accent);
   color: var(--text-on-accent);
-  border-color: var(--accent);
+  border-color: var(--border-control);
 }
 .primary:hover {
   background: var(--accent-soft);

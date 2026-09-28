@@ -4,6 +4,10 @@
 
 ## 原因与修复
 
+最新配色（2026-09-28 20:02，Asia/Shanghai）：用户反馈按钮过深，现将主按钮底色调浅为奶茶棕 `#D2B49C`，按钮文字改为深棕 `#30241F`，对比度约 7.69:1；主按钮边框使用 `#866250` 保持轮廓清晰。主背景仍为 `#FFF4D5`，悬停底色仍为 `#EED9B5`。下方旧色值和部署记录为历史过程。
+
+本次已更新本地 web 容器，server/db/worker 容器 ID 未变。22 项桌面/移动浏览器回归通过；部署镜像构建包含类型检查与生产构建，均通过，既有大 chunk 提示仍在。另以真实 Chromium 打开部署登录页，确认按钮正常/悬停状态的实际计算颜色、首页 200、匿名账号接口 401。证据目录：`C:/Users/ALIENWARE/Desktop/杂项/RainSync-light-buttons-2026-09-28`，检查名称 `button-browser`、`button-build`、`button-update`、`button-live`。修复镜像为 `rainsync-web:light-brown`；回滚时将 `rainsync-web:rollback-buttons-20260928-200140` 标记为 `rainsync-web:dev`，再执行 `docker compose up -d --no-deps --no-build web`。
+
 本地部署镜像使用 Debian Bookworm FFmpeg 5.1.9。本机原生测试使用较新的 FFmpeg，因此先前原生测试未暴露这个版本差异。5.1 的 `webp` 封装器通过不可寻址的 stdout 管道输出较大文件时，无法回填 RIFF 长度：细节较多的合成头像原输出186212字节，但头部长度为0，被现有严格校验拒绝；小图可以正常保存。这解释了为什么只有部分头像失败。
 
 保留 libwebp 编码器，将单帧输出封装改为 `image2pipe`，直接保留编码器生成的完整 RIFF 帧。未放宽512×512、256KiB、静态图片、版本冲突、并发、超时或进程回收限制。浏览器上传流程及数据库结构未改变。
