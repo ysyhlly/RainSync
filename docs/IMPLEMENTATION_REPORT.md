@@ -1,5 +1,7 @@
 # RainSync 全量改造实施报告
 
+2026-09-29 最新增量交付：[播放循环、片源扫描与交互动效报告](PLAYLIST_SCAN_MOTION_REPORT.md)，含真实验收、当前容器同步与回退入口。
+
 后续状态：本文保留最初Goal实施和验收的历史记录。用户随后将15个提交压缩为`982936a7db58460fee7b259e4d2f9fd045eefe5d`，当前分支为`front/rainsync-implementation`，作者Rainfrost。之后审计确认的4个P2已另行修复，新增迁移0022及新一轮回归见[AUDIT_FIXES.md](AUDIT_FIXES.md)。当前升级/回退按[BACKEND_OPERATIONS.md](BACKEND_OPERATIONS.md)，不要再按本文历史阶段SHA执行回退。
 
 交付记录日期：2026-09-28（Asia/Shanghai；验证日志使用2026-09-27 UTC）。本报告按[本次完整要求](IMPLEMENTATION_REQUIREMENTS.md)组织，历史设计中的“仅设计”阶段限制已由本次实施授权替代。

@@ -13,11 +13,13 @@
 
 ## 任务与验收
 
-- [ ] 后端：protocol / room-core 增加带版本的结束命令；rooms 选择下一可用影片；persistence 在播放提交事务中去重入列；重播重置时间及 generation。单测覆盖片尾播放、过早结束、旧 generation；真实 WS 覆盖循环、空队列、重复命令、队列去重。
-- [ ] NAS：agents 控制连接登记扫描能力，POST /agents/{id}/scan 等待匹配扫描快照的最终 ACK；Agent 单扫描任务复用连接，独立保留传输。真实 Agent 验证新增/移除文件、离线；模拟旧 Agent 和忙碌状态。
-- [ ] 前端：播放 runtime 只在完整媒体结束后发送 END_MEDIA，HLS 未完成片段继续等待；播放 ACK 刷新队列。共用扫描组件支持有界并发及逐源反馈，媒体库和片源管理可用。
-- [ ] 交互：AppDialog 退出保持 top layer 到动画完成，恢复焦点及处理中途重开；播放器全屏 2 秒，小窗细轨道、正常进度平滑而拖拽立即；导航非选中悬停色块。
-- [ ] 验证：Rust/协议、前端单测/构建、浏览器关键流程、真实隔离 Server/Agent/DB 和视频播放；记录实际结果与边界。
-- [ ] 本地提交与报告；若同步用户 RainSync 容器，先保留旧镜像，仅替换所需服务，复核无关资源。NAS 外部设备升级单独说明，不假称已部署。
+- [x] 后端：protocol / room-core 增加带版本的结束命令；rooms 选择下一可用影片；persistence 在播放提交事务中去重入列；重播重置时间及 generation。单测覆盖片尾播放、过早结束、旧 generation；真实 WS 覆盖循环、空队列、重复命令、队列去重。
+- [x] NAS：agents 控制连接登记扫描能力，POST /agents/{id}/scan 等待匹配扫描快照的最终 ACK；Agent 单扫描任务复用连接，独立保留传输。真实 Agent 验证新增/移除文件、离线；模拟旧 Agent 和忙碌状态。
+- [x] 前端：播放 runtime 只在完整媒体结束后发送 END_MEDIA，HLS 未完成片段继续等待；播放 ACK 刷新队列。共用扫描组件支持有界并发及逐源反馈，媒体库和片源管理可用。
+- [x] 交互：AppDialog 退出保持 top layer 到动画完成，恢复焦点及处理中途重开；播放器全屏 2 秒，小窗细轨道、正常进度平滑而拖拽立即；导航非选中悬停色块。
+- [x] 验证：Rust/协议、前端单测/构建、浏览器关键流程、真实隔离 Server/Agent/DB 和视频播放；记录实际结果与边界。
+- [x] 本地提交与报告；若同步用户 RainSync 容器，先保留旧镜像，仅替换所需服务，复核无关资源。NAS 外部设备升级单独说明，不假称已部署。
 
 证据目录：C:/Users/ALIENWARE/Desktop/杂项/RainSync-playlist-scan-motion-20260929。
+
+完成记录：后端 0f47e75，前端及回归 ed59ecf；全部结果与边界见 PLAYLIST_SCAN_MOTION_REPORT.md。
