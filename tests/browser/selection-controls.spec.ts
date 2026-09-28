@@ -16,7 +16,9 @@ test("custom source menu keeps the drawer open and Escape closes only the menu",
   await expect(drawer).toBeVisible();
   await expect(select).toContainText("HTTP MP4 / HLS");
   await select.click();
-  await expect(page.getByRole("option", { selected: true })).toContainText("✓");
+  await expect(
+    page.getByRole("option", { selected: true }).locator("svg"),
+  ).toBeVisible();
   await expect(page.getByRole("listbox")).toHaveCSS(
     "background-color",
     "rgb(255, 248, 229)",

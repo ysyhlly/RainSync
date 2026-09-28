@@ -39,9 +39,12 @@ function place() {
   if (!p || !d?.open) return;
   const r = d.getBoundingClientRect(),
     top = document.fullscreenElement ? 12 : 72;
-  const width = Math.min(480, innerWidth - 24);
+  const frame = d.closest(".video-frame")?.getBoundingClientRect();
+  const left = Math.max(12, (frame?.left ?? 0) + 12);
+  const right = Math.min(innerWidth - 12, (frame?.right ?? innerWidth) - 12);
+  const width = Math.min(480, right - left);
   p.style.width = width + "px";
-  p.style.left = Math.max(12, Math.min(r.left, innerWidth - width - 12)) + "px";
+  p.style.left = Math.max(left, Math.min(r.right - width, right - width)) + "px";
   p.style.top =
     Math.max(
       top,
@@ -68,7 +71,14 @@ onBeforeUnmount(() => {
     @toggle="toggle"
     class="playback-options"
   >
-    <summary>播放选项</summary>
+    <summary
+      role="button"
+      aria-label="播放选项"
+      title="播放选项"
+      class="settings-trigger"
+    >
+      <AppIcon name="settings" /><span class="sr-only">播放选项</span>
+    </summary>
     <div ref="panel" popover="manual" class="settings-panel">
       <p class="helper">更改播放方式后点击重新加载。</p>
       <div class="option-fields">

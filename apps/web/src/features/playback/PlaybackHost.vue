@@ -162,17 +162,18 @@ onBeforeUnmount(() => {
         @click.stop="chrome.activity"
         @keydown="chrome.activity"
       >
-        <PlaybackSettings
-          :active="full || fullscreen"
-          v-show="full || fullscreen"
-          @open-change="menu('settings', $event)"
-        />
         <PlaybackControls
           :mini="!full && !fullscreen"
           @menu-open="menu('select', $event)"
           @dragging="chrome.setDragging"
           @fullscreen="toggleFullscreen"
-        />
+        >
+          <PlaybackSettings
+            :active="full || fullscreen"
+            v-show="full || fullscreen"
+            @open-change="menu('settings', $event)"
+          />
+        </PlaybackControls>
       </div>
       <p v-if="fullscreen && r.error" class="fullscreen-error" role="alert">
         {{ r.error }} <button @click="r.error = ''">关闭提示</button>

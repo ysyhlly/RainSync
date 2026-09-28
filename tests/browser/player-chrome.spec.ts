@@ -13,13 +13,13 @@ test("information is outside clean video and hover or touch reveals controls", a
   if (isMobile) await page.locator("video").tap({ position: { x: 20, y: 20 } });
   else await page.locator("video").hover();
   await expect(chrome).toHaveCSS("opacity", "1");
-  await page.getByText("播放选项", { exact: true }).click();
+  await page.getByRole("button", { name: "播放选项", exact: true }).click();
   await page.getByRole("combobox", { name: "播放方式", exact: true }).click();
   await page.mouse.move(0, 0);
   await expect(page.getByRole("listbox")).toBeVisible();
   await expect(chrome).toHaveCSS("opacity", "1");
   await page.keyboard.press("Escape");
-  await page.getByText("播放选项", { exact: true }).click();
+  await page.getByRole("button", { name: "播放选项", exact: true }).click();
   if (!isMobile) {
     await page.mouse.move(0, 0);
     await expect(chrome).toHaveCSS("opacity", "0");

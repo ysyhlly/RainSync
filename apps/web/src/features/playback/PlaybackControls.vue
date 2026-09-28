@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, computed } from "vue";
 import { useRoomRuntime } from "../rooms/room-runtime";
 import AppSelect from "../../shared/ui/AppSelect.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
@@ -8,6 +8,11 @@ defineProps<{ mini?: boolean }>();
 const r = useRoomRuntime(),
   volume = ref(1),
   muted = ref(false);
+const progress = computed(() =>
+  Number.isFinite(r.duration) && r.duration > 0
+    ? Math.max(0, Math.min(100, (r.position / r.duration) * 100))
+    : 0,
+);
 function setVolume(event: Event) {
   volume.value = Number((event.target as HTMLInputElement).value);
   if (r.video) r.video.volume = volume.value;
@@ -52,6 +57,7 @@ function end() {
       :max="Number.isFinite(r.duration) ? r.duration : 0"
       step="0.1"
       :value="r.position"
+      :style="{ '--range-progress': progress + '%' }"
       :disabled="!r.owner || !r.connected || !r.state?.media_id"
       @pointerdown="drag"
       @input="
@@ -62,31 +68,33 @@ function end() {
       @pointerup="end"
       @pointercancel="end"
       @blur="end"
-    /><button
-      class="icon-button volume-toggle"
-      :aria-label="muted ? '取消静音' : '静音'"
-      :aria-pressed="muted"
-      @click="mute"
-    >
-      <AppIcon :name="muted ? 'mute' : 'volume'" /></button
-    ><input
-      v-if="!mini"
-      class="volume-control"
-      aria-label="音量"
-      type="range"
-      min="0"
-      max="1"
-      step="0.05"
-      :value="volume"
-      @pointerdown="
-        ($event.target as HTMLElement).setPointerCapture($event.pointerId);
-        emit('dragging', true);
-      "
-      @pointerup="emit('dragging', false)"
-      @pointercancel="emit('dragging', false)"
-      @blur="emit('dragging', false)"
-      @input="setVolume"
-    /><AppSelect
+    /><span class="volume-group"
+      ><button
+        class="icon-button volume-toggle"
+        :aria-label="muted ? '取消静音' : '静音'"
+        :aria-pressed="muted"
+        @click="mute"
+      >
+        <AppIcon :name="muted ? 'mute' : 'volume'" /></button
+      ><input
+        v-if="!mini"
+        class="volume-control"
+        aria-label="音量"
+        type="range"
+        min="0"
+        max="1"
+        step="0.05"
+        :value="volume"
+        :style="{ '--range-progress': volume * 100 + '%' }"
+        @pointerdown="
+          ($event.target as HTMLElement).setPointerCapture($event.pointerId);
+          emit('dragging', true);
+        "
+        @pointerup="emit('dragging', false)"
+        @pointercancel="emit('dragging', false)"
+        @blur="emit('dragging', false)"
+        @input="setVolume" /></span
+    ><AppSelect
       v-if="!mini"
       class="rate-control"
       label="房间倍速"
@@ -97,7 +105,7 @@ function end() {
         [0.5, 1, 1.5, 2].map((value) => ({ value, label: value + '×' }))
       "
       @change="r.send('SET_RATE', { rate: $event })"
-    /><button
+    /><slot /><button
       v-if="!mini"
       class="icon-button"
       aria-label="全屏"

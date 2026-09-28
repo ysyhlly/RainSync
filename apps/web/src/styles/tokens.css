@@ -8,6 +8,10 @@
   --accent: #d2b49c;
   --text-on-accent: #30241f;
   --accent-soft: #eed9b5;
+  --player-text: #fff;
+  --player-progress: #eed9b5;
+  --player-track: rgb(255 255 255 / 0.3);
+  --player-menu: rgb(24 24 24 / 0.96);
   --navigation-outline: #d6bc96;
   --navigation-glow: #866250;
   --navigation-glow-tail: #cfac78;

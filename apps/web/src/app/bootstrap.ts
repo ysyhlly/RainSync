@@ -9,6 +9,7 @@ import "../styles/motion.css";
 import "../styles/account.css";
 import "../styles/admin.css";
 import "../styles/selection.css";
+import "../styles/player-overlay.css";
 export function start(base = "/") {
   const app = createApp(AppShell);
   app.use(createPinia());

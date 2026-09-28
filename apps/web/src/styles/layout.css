@@ -463,7 +463,7 @@
   min-width: 0;
   overflow-wrap: anywhere;
 }
-.mobile-room-tabs {
+.app-segmented.mobile-room-tabs {
   display: none;
 }
 .mini-player {
@@ -790,7 +790,7 @@
   .room-chat {
     grid-column: 1;
   }
-  .mobile-room-tabs {
+  .app-segmented.mobile-room-tabs {
     display: flex;
     gap: 8px;
     grid-column: 1;

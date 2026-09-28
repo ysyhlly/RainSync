@@ -11,6 +11,17 @@
   font-weight: 400;
   background: var(--surface-panel);
 }
+.select-chevron {
+  transition: transform 160ms ease;
+}
+.select-trigger[aria-expanded="true"] .select-chevron {
+  transform: rotate(180deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .select-chevron {
+    transition: none;
+  }
+}
 .select-menu {
   position: fixed;
   inset: auto;

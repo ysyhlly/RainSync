@@ -38,5 +38,5 @@ export async function showOptions(page: Page) {
       .locator(".playback-options")
       .evaluate((el) => (el as HTMLDetailsElement).open))
   )
-    await page.getByText("播放选项", { exact: true }).click();
+    await page.getByRole("button", { name: "播放选项", exact: true }).click();
 }

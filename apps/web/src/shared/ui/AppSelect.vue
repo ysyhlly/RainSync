@@ -2,6 +2,7 @@
 import { computed, nextTick, ref, useId, watch } from "vue";
 import type { SelectOption, SelectValue } from "./select";
 import { useSelectPopup } from "./use-select-popup";
+import AppIcon from "./AppIcon.vue";
 const props = defineProps<{
   modelValue: T;
   options: SelectOption[];
@@ -154,7 +155,7 @@ watch(
         placeholder ??
         (options.length ? "请选择" : "暂无可用选项")
       }}</span
-      ><span aria-hidden="true">⌄</span>
+      ><AppIcon name="down" :size="20" class="select-chevron" />
     </button>
     <div
       v-show="open"
@@ -180,9 +181,7 @@ watch(
         @click.stop.prevent="choose(index)"
       >
         <span>{{ option.label }}</span
-        ><span aria-hidden="true">{{
-          option.value === modelValue ? "✓" : ""
-        }}</span>
+        ><AppIcon v-if="option.value === modelValue" name="check" :size="20" />
       </div>
       <div v-if="!options.length" class="select-option" aria-disabled="true">
         暂无可用选项
