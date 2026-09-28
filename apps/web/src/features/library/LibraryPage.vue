@@ -11,6 +11,7 @@ import AppIcon from "../../shared/ui/AppIcon.vue";
 import MediaThumbnail from "./MediaThumbnail.vue";
 import Notice from "../../shared/ui/Notice.vue";
 import { formatTime } from "../../shared/use-action";
+import ScanAllSources from "../admin/ScanAllSources.vue";
 const library = useLibrary(),
   runtime = useRoomRuntime(),
   session = useSession(),
@@ -64,6 +65,7 @@ onBeforeUnmount(() => {
         <p>浏览片源中的影片，在当前房间播放或加入待播。</p>
       </div>
     </div>
+    <ScanAllSources v-if="session.user?.admin" @complete="refresh" />
     <form class="search-form" role="search" @submit.prevent="submit">
       <AppIcon name="search" /><input
         v-model="search"

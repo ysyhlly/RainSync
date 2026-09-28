@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted, onBeforeUnmount, watch } from "vue";
+import { ref, onMounted, onBeforeUnmount, watch } from "vue";
 import { useSession } from "../auth/session.store";
 import type { Source } from "../../shared/api/types";
 import { useAction } from "../../shared/use-action";
@@ -7,6 +7,9 @@ import AppSelect from "../../shared/ui/AppSelect.vue";
 import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import Notice from "../../shared/ui/Notice.vue";
+import ScanAllSources from "./ScanAllSources.vue";
+import { useSourceScans } from "./source-scans.store";
+const scans = useSourceScans();
 const session = useSession(),
   { busy, error, message, run } = useAction();
 const rows = ref<Source[]>([]),
@@ -19,9 +22,6 @@ const rows = ref<Source[]>([]),
   userId = ref(""),
   token = ref(""),
   headers = ref("{}");
-const scanning = reactive<
-  Record<string, { busy: boolean; error: string; count?: number }>
->({});
 let alive = true;
 async function load() {
   const value = await session.api<Source[]>("/sources");
@@ -66,24 +66,6 @@ async function create() {
   await load();
   message.value = "片源已添加，可检测并扫描影片";
 }
-async function scan(row: Source) {
-  if (scanning[row.id]?.busy) return;
-  scanning[row.id] = { busy: true, error: "" };
-  try {
-    const result = await session.api<{ count: number }>(
-      "/sources/" + row.id + "/test",
-      "POST",
-    );
-    if (alive)
-      scanning[row.id] = { busy: false, error: "", count: result.count };
-  } catch (e) {
-    if (alive)
-      scanning[row.id] = {
-        busy: false,
-        error: e instanceof Error ? e.message : String(e),
-      };
-  }
-}
 watch(open, (value) => {
   if (!value) {
     token.value = "";
@@ -110,6 +92,7 @@ onBeforeUnmount(() => {
       </button>
     </div>
     <Notice v-if="!open" :message="error" error /><Notice :message="message" />
+    <ScanAllSources />
     <p v-if="busy && !loaded" role="status">正在加载片源…</p>
     <button v-if="error && !open" @click="run(load)">重新加载</button>
     <div v-if="loaded && !rows.length" class="empty-state">
@@ -124,19 +107,19 @@ onBeforeUnmount(() => {
           <h2>{{ row.name }}</h2>
           <span class="helper">{{ row.kind }}</span>
         </div>
-        <p v-if="row.kind === 'agent'" class="helper">由NAS设备主动同步</p>
-        <button v-else :disabled="scanning[row.id]?.busy" @click="scan(row)">
-          <AppIcon name="refresh" />{{
-            scanning[row.id]?.busy ? "正在检测扫描…" : "检测并扫描"
-          }}</button
-        ><Notice class="row-result" :message="scanning[row.id]?.error" error />
-        <p
-          v-if="scanning[row.id]?.count != null"
-          class="row-result helper"
-          role="status"
+        <button
+          :disabled="scans.running || scans.results[row.id]?.busy"
+          @click="scans.scan(row)"
         >
-          本次扫描发现 {{ scanning[row.id].count }} 部影片
-        </p>
+          <AppIcon name="refresh" />{{
+            scans.results[row.id]?.busy ? "正在检测扫描…" : "检测并扫描"
+          }}
+        </button>
+        <Notice
+          class="row-result"
+          :message="scans.results[row.id]?.message"
+          :error="scans.results[row.id]?.failed"
+        />
       </article>
     </div>
     <AppDialog v-model="open" title="添加片源" drawer :busy="busy"

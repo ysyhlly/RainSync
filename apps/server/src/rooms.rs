@@ -101,8 +101,12 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                     room_core::reduce(&state, &req.command, req.user.id, req.user.admin, app.now())
                         .map_err(String::from)?;
                 if matches!(req.command.action, protocol::Action::EndMedia { .. }) {
-                    let ids: Vec<Uuid> = sqlx::query_scalar(&format!("SELECT q.media_id FROM playlist_items q JOIN media_items m ON m.id=q.media_id JOIN sources s ON s.id=m.source_id WHERE q.room_id=$1 AND {} ORDER BY q.sort_order,q.id", media_titles::VISIBLE))
+                    let mut ids: Vec<Uuid> = sqlx::query_scalar(&format!("SELECT q.media_id FROM playlist_items q JOIN media_items m ON m.id=q.media_id JOIN sources s ON s.id=m.source_id WHERE q.room_id=$1 AND {} ORDER BY q.sort_order,q.id", media_titles::VISIBLE))
                         .bind(id).fetch_all(&app.db).await.map_err(|_| "database_error")?;
+                    // Legacy playlists may contain duplicates. Without an item cursor,
+                    // repeated media must not trap advancement at its first occurrence.
+                    let mut seen = std::collections::HashSet::new();
+                    ids.retain(|media| seen.insert(*media));
                     if !ids.is_empty() {
                         let index = ids.iter().position(|media| Some(*media) == state.media_id);
                         next.media_id = Some(ids[index.map_or(0, |i| (i + 1) % ids.len())]);

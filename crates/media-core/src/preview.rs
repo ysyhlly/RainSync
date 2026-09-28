@@ -11,7 +11,9 @@ pub const MAX_IMAGE: usize = 262144;
 
 pub fn is_black(rgb: &[u8]) -> bool {
     let black = rgb
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .filter(|p| (u32::from(p[0]) * 299 + u32::from(p[1]) * 587 + u32::from(p[2]) * 114) < 24000)
         .count();
     !rgb.is_empty() && black * 1000 >= (rgb.len() / 3) * 995
@@ -118,9 +120,9 @@ pub async fn generate(
                 out.read_exact(&mut frame).await?;
                 // Inspect the complete frame before center cropping; the left
                 // half is analysis-only, the right half preserves output aspect.
-                let sample: Vec<u8> = frame.chunks_exact(1280*3).flat_map(|row|row[..640*3].iter().copied()).collect();
+                let sample: Vec<u8> = frame.as_chunks::<{1280*3}>().0.iter().flat_map(|row|row[..640*3].iter().copied()).collect();
                 if poster || !is_black(&sample) {
-                    let result: Vec<u8> = frame.chunks_exact(1280*3).flat_map(|row|row[640*3..].iter().copied()).collect();
+                    let result: Vec<u8> = frame.as_chunks::<{1280*3}>().0.iter().flat_map(|row|row[640*3..].iter().copied()).collect();
                     return Ok::<_,anyhow::Error>(result)
                 }
             }

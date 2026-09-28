@@ -10,6 +10,7 @@ use std::{
     },
 };
 use tokio::sync::watch;
+type HttpValidators = (Option<String>, Option<String>);
 
 #[derive(Clone, Default)]
 pub struct Registry(Arc<Mutex<HashMap<Uuid, Arc<Grant>>>>);
@@ -19,7 +20,7 @@ pub struct Grant {
     pub cancel: watch::Sender<bool>,
     remaining: AtomicU64,
     targets: Mutex<HashMap<Uuid, String>>,
-    validators: Mutex<HashMap<String, (Option<String>, Option<String>)>>,
+    validators: Mutex<HashMap<String, HttpValidators>>,
 }
 impl Grant {
     pub fn target(&self, url: String) -> Uuid {

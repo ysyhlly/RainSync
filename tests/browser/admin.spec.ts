@@ -252,7 +252,7 @@ test("sources validate dynamic fields and keep scans scoped to each row", async 
       .locator(".admin-row")
       .filter({ hasText: "NAS片源" })
       .getByRole("button"),
-  ).toHaveCount(0);
+  ).toHaveCount(1);
   await page.getByRole("button", { name: "添加片源", exact: true }).click();
   await page.getByLabel("名称", { exact: true }).fill("HTTP来源");
   await page.getByRole("combobox", { name: "类型", exact: true }).click();

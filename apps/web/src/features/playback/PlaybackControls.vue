@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, watch } from "vue";
 import { useRoomRuntime } from "../rooms/room-runtime";
 import AppSelect from "../../shared/ui/AppSelect.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
@@ -8,6 +8,13 @@ defineProps<{ mini?: boolean }>();
 const r = useRoomRuntime(),
   volume = ref(1),
   muted = ref(false);
+const animateProgress = ref(false);
+watch(
+  () => r.position,
+  (value, old) => {
+    animateProgress.value = !r.dragging && value >= old && value - old < 2;
+  },
+);
 const progress = computed(() =>
   Number.isFinite(r.duration) && r.duration > 0
     ? Math.max(0, Math.min(100, (r.position / r.duration) * 100))
@@ -37,7 +44,13 @@ function end() {
 }
 </script>
 <template>
-  <div class="playback-controls" :class="{ compact: mini }">
+  <div
+    class="playback-controls"
+    :class="{
+      compact: mini,
+      'animate-progress': animateProgress && !r.dragging,
+    }"
+  >
     <button
       class="icon-button control-play"
       :aria-label="r.state?.playback_status === 'playing' ? '暂停' : '播放'"

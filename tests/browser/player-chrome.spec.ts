@@ -25,7 +25,7 @@ test("information is outside clean video and hover or touch reveals controls", a
     await expect(chrome).toHaveCSS("opacity", "0");
   }
 });
-test("real fullscreen has exactly five idle seconds, locked menus and persistent video", async ({
+test("real fullscreen has exactly two idle seconds, locked menus and persistent video", async ({
   page,
   isMobile,
 }) => {
@@ -57,7 +57,7 @@ test("real fullscreen has exactly five idle seconds, locked menus and persistent
   await page
     .locator("video")
     .dispatchEvent("pointermove", { pointerType: "mouse" });
-  await page.clock.runFor(4999);
+  await page.clock.runFor(1999);
   await expect(page.locator(".player-chrome")).toHaveCSS("opacity", "1");
   await page.clock.runFor(151);
   await expect(page.locator(".player-chrome")).toHaveCSS("opacity", "0");

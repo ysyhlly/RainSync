@@ -25,10 +25,13 @@ export function createPlayerChrome(touch = false) {
     if (disposed || hidden || locked()) return;
     if (fullscreen.value || touch) {
       if (visible.value)
-        timer = setTimeout(() => {
-          timer = undefined;
-          show(false);
-        }, 5000);
+        timer = setTimeout(
+          () => {
+            timer = undefined;
+            show(false);
+          },
+          fullscreen.value ? 2000 : 5000,
+        );
     } else if (!inside) show(false);
   }
   function activity() {

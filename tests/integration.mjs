@@ -484,8 +484,9 @@ try {
     sql(
       `SELECT count(DISTINCT sort_order) FROM playlist_items WHERE room_id='${room.id}'`,
     ),
-    "5",
+    "1",
   );
+  assert.equal(new Set(playlistEntries.map(item => item.id)).size, 1, "concurrent additions return the same playlist entry");
   for (const item of playlistEntries)
     await admin.request(`/rooms/${room.id}/playlist/${item.id}`, "DELETE");
   const a = await connect(admin, room.id),

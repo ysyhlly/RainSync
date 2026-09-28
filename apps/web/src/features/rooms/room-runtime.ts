@@ -94,6 +94,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     clock,
     error,
     run,
+    ended: (position_ms) => send("END_MEDIA", { position_ms }),
   });
   const { video, position, waiting, blocked, applyState, loadMedia } = playback;
   const owner = computed(
@@ -310,6 +311,14 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         state.value = next;
         if (!old || old.media_generation !== next.media_generation) {
           playback.mediaChanged();
+          const serial = roomSerial,
+            selected = next.room_id;
+          void session
+            .api<QueueItem[]>(`/rooms/${selected}/playlist`)
+            .then((items) => {
+              if (serial === roomSerial) playlist.value = items;
+            })
+            .catch(() => {});
         } else if (v.action?.type === "SEEK")
           void run(() => applyState(true, true));
         else {

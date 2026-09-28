@@ -31,5 +31,7 @@ jobs:
           docker build -f deploy/Dockerfile -t rainsync-server:dev .
           npm run test:avatar-container
       - run: npm run test:chat
+      - run: node tests/playlist-scan.mjs
       - run: npx playwright install --with-deps chromium && npm run test:e2e
       - run: npm run test:browser-real
+      - run: node tests/playlist-real.mjs

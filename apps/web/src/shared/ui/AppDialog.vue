@@ -11,6 +11,9 @@ const props = defineProps<{
 const emit = defineEmits<{ "update:modelValue": [boolean] }>();
 const dialog = ref<HTMLDialogElement>(),
   titleId = useId();
+const closing = ref(false);
+let closeTimer: ReturnType<typeof setTimeout> | undefined;
+let emitClosed = false;
 let previous: HTMLElement | null = null;
 let backdropPointer: number | null = null;
 function outside(event: PointerEvent) {
@@ -36,7 +39,27 @@ function up(event: PointerEvent) {
 }
 function close() {
   if (props.busy || (props.canClose && !props.canClose())) return;
-  emit("update:modelValue", false);
+  beginClose(true);
+}
+function finishClose() {
+  if (!closing.value) return;
+  clearTimeout(closeTimer);
+  dialog.value?.close();
+  closing.value = false;
+  previous?.focus({ preventScroll: true });
+  if (emitClosed) emit("update:modelValue", false);
+  emitClosed = false;
+}
+function beginClose(notify: boolean) {
+  if (!dialog.value?.open || closing.value) return;
+  emitClosed = notify;
+  closing.value = true;
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) finishClose();
+  else closeTimer = setTimeout(finishClose, 300);
+}
+function animationEnded(event: AnimationEvent) {
+  if (event.target === dialog.value && event.animationName.endsWith("-leave"))
+    finishClose();
 }
 function trapTab(event: KeyboardEvent) {
   if (event.key !== "Tab" || !dialog.value) return;
@@ -70,18 +93,21 @@ function trapTab(event: KeyboardEvent) {
 async function sync() {
   await nextTick();
   if (props.modelValue) {
+    clearTimeout(closeTimer);
+    closing.value = false;
+    emitClosed = false;
     if (!dialog.value?.open) {
       previous = document.activeElement as HTMLElement;
       dialog.value?.showModal();
     }
   } else {
-    dialog.value?.close();
-    previous?.focus({ preventScroll: true });
+    beginClose(false);
   }
 }
 watch(() => props.modelValue, sync);
 onMounted(sync);
 onBeforeUnmount(() => {
+  clearTimeout(closeTimer);
   dialog.value?.close();
   previous?.focus({ preventScroll: true });
 });
@@ -90,7 +116,8 @@ onBeforeUnmount(() => {
   <dialog
     ref="dialog"
     class="app-dialog"
-    :class="{ drawer }"
+    :class="{ drawer, closing }"
+    @animationend="animationEnded"
     :aria-labelledby="titleId"
     @cancel.prevent="close"
     @keydown="trapTab"

@@ -28,6 +28,7 @@ export function createPlaybackRuntime(ctx: {
   clock: Clock;
   error: Ref<string>;
   run: (action: () => Promise<void>) => Promise<void>;
+  ended?: (positionMs: number) => void;
 }) {
   const { session, state, connected, clock, error, run } = ctx;
   const video = ref<HTMLVideoElement>(),
@@ -54,6 +55,49 @@ export function createPlaybackRuntime(ctx: {
   let playbackRequests: PlaybackRequests | undefined;
   let playbackUser: string | undefined;
   let playbackEpoch: number | undefined;
+  let checkingEnd = false,
+    endAttempt = -Infinity;
+  async function completed() {
+    const p = plan,
+      el = video.value,
+      s = state.value;
+    if (
+      !p ||
+      !el?.ended ||
+      !s ||
+      !connected.value ||
+      s.playback_status !== "playing" ||
+      p.media_generation !== s.media_generation ||
+      checkingEnd ||
+      performance.now() - endAttempt < 2000
+    )
+      return;
+    checkingEnd = true;
+    endAttempt = performance.now();
+    try {
+      // A generated HLS prefix ending is not the end of the film.
+      if (p.rebuild_on_seek) {
+        const readiness = await readReadiness(
+          p.session_id,
+          AbortSignal.timeout(5000),
+        );
+        if (plan !== p || state.value?.media_generation !== p.media_generation)
+          return;
+        if (!readiness.complete) {
+          await waitForGenerated(p);
+          return;
+        }
+      }
+      if (plan === p && el.ended && state.value?.playback_status === "playing")
+        ctx.ended?.(el.currentTime * 1000 + p.timeline_origin_ms);
+    } catch (failure) {
+      if (plan === p)
+        error.value =
+          failure instanceof Error ? failure.message : String(failure);
+    } finally {
+      checkingEnd = false;
+    }
+  }
   function requests() {
     const user = session.user!.id;
     const epoch = session.epoch;
@@ -109,6 +153,7 @@ export function createPlaybackRuntime(ctx: {
     sessionId.value = null;
     if (video.value) {
       video.value.onerror = null;
+      video.value.onended = null;
       video.value.onloadedmetadata = null;
     }
     hls?.destroy();
@@ -189,6 +234,10 @@ export function createPlaybackRuntime(ctx: {
       if (serial !== loadSerial) return;
       applySubtitles();
       const el = video.value;
+      endAttempt = -Infinity;
+      el.onended = () => {
+        void completed();
+      };
       waiting.value = true;
       let recoveries = 0;
       let mse =
@@ -377,6 +426,10 @@ export function createPlaybackRuntime(ctx: {
     const s = state.value,
       el = video.value;
     if (!s || !el || !plan || el.readyState < 1) return;
+    if (el.ended && s.playback_status === "playing" && !userSeek) {
+      void completed();
+      return;
+    }
     if (!clock.ready) {
       clockAction ??= "apply";
       return;
@@ -452,6 +505,10 @@ export function createPlaybackRuntime(ctx: {
     const s = state.value,
       el = video.value;
     if (!s || !el || !plan) return;
+    if (el.ended) {
+      void completed();
+      return;
+    }
     if (generationWait || generationWaitFailed) return;
     if (recoveringHls) {
       void run(() => applyState(true));

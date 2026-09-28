@@ -10,7 +10,9 @@ button:active:not(:disabled),
 }
 .sidebar nav a,
 .bottom-nav a {
-  transition: color 150ms var(--ease);
+  transition:
+    color 150ms var(--ease),
+    background-color 150ms var(--ease);
 }
 .navigation-beam {
   animation: navigation-glow 5s linear infinite;
@@ -46,6 +48,56 @@ button:active:not(:disabled),
 }
 .app-dialog.drawer[open] {
   animation: drawer-enter 280ms var(--ease);
+}
+.app-dialog[open].closing {
+  animation: dialog-leave 180ms var(--ease) forwards;
+}
+.app-dialog.drawer[open].closing {
+  animation: drawer-leave 220ms var(--ease) forwards;
+}
+.app-dialog[open]::backdrop {
+  animation: backdrop-enter 220ms var(--ease);
+}
+.app-dialog[open].closing::backdrop {
+  animation: backdrop-leave 220ms var(--ease) forwards;
+}
+@keyframes dialog-leave {
+  to {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+@keyframes drawer-leave {
+  to {
+    opacity: 0;
+    transform: translateX(32px);
+  }
+}
+@keyframes backdrop-enter {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes backdrop-leave {
+  to {
+    opacity: 0;
+  }
+}
+.select-menu,
+.settings-panel {
+  animation: dialog-enter 140ms var(--ease);
+}
+.playback-controls input[type="range"]::-webkit-slider-runnable-track {
+  transition: height 140ms var(--ease);
+}
+.playback-controls input[type="range"]::-webkit-slider-thumb {
+  transition: opacity 140ms var(--ease);
+}
+.playback-controls input[type="range"]::-moz-range-track {
+  transition: height 140ms var(--ease);
+}
+.playback-controls input[type="range"]::-moz-range-thumb {
+  transition: opacity 140ms var(--ease);
 }
 .chat-message {
   animation: message-enter 160ms var(--ease);

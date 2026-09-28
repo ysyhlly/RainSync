@@ -34,6 +34,31 @@
 .sidebar nav [aria-current="page"] {
   color: var(--text-primary);
 }
+.sidebar nav a:not([aria-current="page"]):is(:hover, :focus-visible),
+.bottom-nav a:not([aria-current="page"]):is(:hover, :focus-visible) {
+  background-color: color-mix(in srgb, var(--accent-soft) 55%, transparent);
+  border-radius: 12px;
+}
+.scan-all-sources {
+  margin-bottom: 16px;
+}
+.scan-results {
+  margin-top: 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+}
+.scan-results ul {
+  padding-left: 20px;
+  margin-bottom: 0;
+}
+.scan-results li {
+  margin: 6px 0;
+  overflow-wrap: anywhere;
+}
+.scan-failed {
+  color: var(--text-primary);
+}
 .navigation-indicator {
   position: absolute;
   top: 0;
@@ -608,7 +633,7 @@
 @media (max-width: 767px) {
   :root {
     --sidebar-width: 0px;
-    --mini-height: 84px;
+    --mini-height: 112px;
     --bottom-nav-height: 64px;
   }
   body {

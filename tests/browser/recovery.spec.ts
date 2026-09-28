@@ -550,6 +550,26 @@ test("native recovery can play buffered data before seekable is exposed", async 
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
+test("ending an incomplete generated prefix waits without advancing the room", async ({ page }) => {
+  await page.addInitScript(() => { HTMLMediaElement.prototype.canPlayType = () => "probably"; });
+  const h = await setup(page, { validMedia: true, nativeHls: true });
+  await expect(page.locator("video")).toHaveAttribute("src", /empty-video/);
+  let reads = 0;
+  await page.route("**/api/v1/playback-sessions/session-1?*", r => {
+    reads++;
+    return r.fulfill({ json: { session_id: "session-1", status: reads === 1 ? "ready" : "preparing", complete: false, available_until_ms: 10000 } });
+  });
+  await page.evaluate(() => {
+    const video = document.querySelector("video")!;
+    Object.defineProperty(video, "ended", { configurable: true, get: () => true });
+    video.dispatchEvent(new Event("ended"));
+  });
+  await expect.poll(() => reads).toBeGreaterThan(1);
+  await page.clock.runFor(6000);
+  expect(h.frames.filter(f => f.type === "END_MEDIA")).toHaveLength(0);
+  expect(h.preparations).toHaveLength(1);
+});
+
 test("a growing output waits for the room position and resumes the same native session", async ({
   page,
 }) => {

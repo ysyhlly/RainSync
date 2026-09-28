@@ -13,19 +13,19 @@ describe("player chrome", () => {
     expect(c.hideCursor.value).toBe(false);
     c.dispose();
   });
-  it("fullscreen hides exactly at five seconds and activity restarts deadline", () => {
+  it("fullscreen hides exactly at two seconds and activity restarts deadline", () => {
     vi.useFakeTimers();
     const c = createPlayerChrome();
     c.setFullscreen(true);
-    vi.advanceTimersByTime(4999);
+    vi.advanceTimersByTime(1999);
     expect(c.visible.value).toBe(true);
     vi.advanceTimersByTime(1);
     expect(c.visible.value).toBe(false);
     expect(c.hideCursor.value).toBe(true);
     c.activity();
-    vi.advanceTimersByTime(4000);
+    vi.advanceTimersByTime(1000);
     c.activity();
-    vi.advanceTimersByTime(4999);
+    vi.advanceTimersByTime(1999);
     expect(c.visible.value).toBe(true);
     c.setFullscreen(false);
     expect(c.hideCursor.value).toBe(false);

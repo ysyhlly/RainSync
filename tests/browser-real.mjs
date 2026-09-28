@@ -427,7 +427,8 @@ await isolatedServer(
         { timeout: 30000 },
       );
       await expect(admin.locator(".queue-row")).toHaveCount(2);
-      await admin.getByRole("button", { name: "播放", exact: true }).click();
+      await admin.locator("video").hover();
+      await expect(admin.getByRole("button", { name: "暂停", exact: true })).toBeEnabled();
       await expect
         .poll(() => admin.locator("video").evaluate((el) => el.currentTime), {
           timeout: 20000,

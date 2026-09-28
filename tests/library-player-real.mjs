@@ -112,9 +112,7 @@ await isolatedMediaStack(
         "Viewer private",
       );
       await ownerPage.locator("video").hover();
-      await ownerPage
-        .getByRole("button", { name: "播放", exact: true })
-        .click();
+      await expect(ownerPage.getByRole("button", { name: "暂停", exact: true })).toBeEnabled();
       for (const page of [ownerPage, viewerPage])
         await expect
           .poll(() => page.locator("video").evaluate((v) => v.currentTime), {
