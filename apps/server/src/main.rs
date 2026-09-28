@@ -5,6 +5,7 @@ mod avatar_image;
 mod avatars;
 mod limits;
 mod media;
+mod media_titles;
 mod metrics;
 mod playback_requests;
 mod profile;
@@ -505,6 +506,15 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         )
         .route("/api/v1/sources/{id}/test", post(media::scan))
         .route("/api/v1/media", get(media::library))
+        .route("/api/v1/media/{id}", get(media_titles::detail))
+        .route(
+            "/api/v1/media/{id}/personal-title",
+            axum::routing::put(media_titles::personal),
+        )
+        .route(
+            "/api/v1/admin/media/{id}/shared-title",
+            axum::routing::put(media_titles::shared),
+        )
         .route("/api/v1/playback-sessions", post(media::playback))
         .route(
             "/api/v1/playback-requests/{key}",

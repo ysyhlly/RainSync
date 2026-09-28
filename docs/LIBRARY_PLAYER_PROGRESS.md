@@ -20,7 +20,7 @@
 | 检查点 | 状态 | 证据/备注 |
 | --- | --- | --- |
 | T0 基线 | 已核实 | Rust 56 通过/2 忽略；前端 47 通过；类型构建通过；浏览器 103/104，NAS 单例复跑通过（busy/Escape 时序），T4 补就绪等待 |
-| T1 双层名称 | 待执行 | |
+| T1 双层名称 | 已验证 | titles-red 真实接口 404；titles-green 通过；titles-rust、titles-protocol-check 通过。local 真扫描、Jellyfin/Emby 协议 fixture 扫描、NAS WebSocket 索引与 Server 重启覆盖；真实上游留待 T3 |
 | T2 预览任务 | 待执行 | |
 | T3 真实解码 | 待执行 | |
 | T4 选择器/抽屉 | 待执行 | |
@@ -31,4 +31,5 @@
 | T9 报告/提交 | 待执行 | |
 
 每个 logs/NAME.json 记录命令、时间、退出码；同名 .log 保存真实输出。只在实际验证通过后更新检查点。
+
 

@@ -292,11 +292,14 @@ pub async fn playlist(
     State(app): State<App>,
     h: HeaderMap,
     Path(id): Path<Uuid>,
-) -> Result<Json<Value>> {
+) -> Result<Response> {
     let u = auth(&app, &h, false).await?;
     member(&app, &u, id).await?;
-    let rows=sqlx::query("SELECT p.id,p.media_id,m.title FROM playlist_items p JOIN media_items m ON m.id=p.media_id WHERE room_id=$1 ORDER BY sort_order,id").bind(id).fetch_all(&app.db).await?;
-    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"media_id":r.get::<Uuid,_>("media_id"),"title":r.get::<String,_>("title")})).collect())))
+    let rows=sqlx::query(&format!("{} JOIN playlist_items p ON p.media_id=m.id WHERE {} AND p.room_id=$2 ORDER BY p.sort_order,p.id", media_titles::SELECT.replace("SELECT m.id,", "SELECT p.id AS playlist_id,m.id,"), media_titles::VISIBLE)).bind(u.id).bind(id).fetch_all(&app.db).await?;
+    Ok(media_titles::private_json(Value::Array(rows.iter().map(|r| {
+        let media = media_titles::media(r);
+        json!({"id":r.get::<Uuid,_>("playlist_id"),"media_id":media["id"],"title":media["title"],"cover":media["cover"]})
+    }).collect())))
 }
 #[derive(Deserialize)]
 pub struct Add {

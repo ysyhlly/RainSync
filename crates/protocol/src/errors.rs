@@ -89,6 +89,8 @@ pub enum ErrorCode {
     CommitFailed,
     RoomBusy,
     MediaNotFound,
+    MediaTitleInvalid,
+    MediaTitleConflict,
     MediaUnavailable,
     InvalidPlaybackSession,
     ProbeBusy,
@@ -167,6 +169,8 @@ impl ErrorCode {
 
     fn message(self) -> &'static str {
         match self {
+            Self::MediaTitleInvalid => "名称需为 1—200 个字符，不能包含换行或控制字符",
+            Self::MediaTitleConflict => "名称已被其他操作修改，请核对最新名称后再次保存",
             Self::SourceChanged => "源文件已变化，请重新连接 NAS Agent 更新索引后重新播放",
             Self::SourceVersionRequired => {
                 "NAS Agent 缺少文件版本信息，请升级 Agent 并重新连接以更新索引"

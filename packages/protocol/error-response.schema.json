@@ -128,6 +128,8 @@
         "COMMIT_FAILED",
         "ROOM_BUSY",
         "MEDIA_NOT_FOUND",
+        "MEDIA_TITLE_INVALID",
+        "MEDIA_TITLE_CONFLICT",
         "MEDIA_UNAVAILABLE",
         "INVALID_PLAYBACK_SESSION",
         "PROBE_BUSY",
