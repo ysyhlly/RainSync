@@ -1,5 +1,21 @@
 # 本轮验证记录
 
+## 2026-09-30：指定前端分支集成
+
+`git fetch origin` 后 `origin/main` 仍为 `d699418`；指定前端为 `origin/front/rainsync-implementation`，提交 `7f17ab7`。先将 NAS 索引、源版本、执行取消和持续验证入口保存为本地检查点 `8b3d5de`，再合入前端及配套服务端/Worker 接口。合并冲突集中在 Agent、Server 索引控制和输入回归入口；保留现有 ACK 分页、周期扫描、全局扫描许可、单文件隔离及目录失败回滚，补入 HELLO/SCAN/SCAN_BUSY，并让匹配的 INDEX_ABORT_ACK 结束手工扫描为 failed。
+
+当前 `npm ci`、`npm run build`、`npm test` 通过：11 个单元测试文件、58 项测试。完整 `npx playwright test --workers=4` 通过 150 项，另两项移动不适用场景跳过，耗时约 1.8 分钟；报告位于 `.runtime/frontend-merge/7f17ab7/playwright-report/index.html`。这些浏览器回归使用 API/媒体夹具，不等于移动实机或真实 NAS 持续播放。Rust 生成协议 `--check` 已通过，工作区和服务集成结果继续追加。
+
+旧前端与 A 镜像最后一轮 90 秒诊断通过，报告 `.runtime/nas-soak/rainsync-soak-78f813dd/report.json`：实际媒体 90.018 秒，rVFC 呈现 880 帧/预计 899.52 帧（97.83%），原生累计掉帧 0.565%，缓冲 2.36%，视频所有样本完整可见，停止约 1.755 秒完成释放。八次原生计数重置均记录同会话增长清单重载证据；此前停止瞬时采样不能证明超过五秒的资源泄漏。该诊断仅校验测量方法，不作为指定前端或两小时验收。
+
+新预览 NAS 输入已接入独立 attempt 的生命周期停止信号；正常完成、超时、租约失效、Worker 停止和读取预算耗尽均通知 relay，任务被 Drop 也能停止。三项新增回归验证未消费的 HTTP Body 仍能被停止，以及旧/新预览和普通播放的隔离。Worker 27 项测试通过，另一个子进程夹具入口忽略；全工作区 Clippy（所有目标，warnings 视为错误）、格式及二进制/示例构建通过。
+
+最终原生工作区统一重跑 66 项测试通过，两个子进程夹具入口忽略，无失败；命令/原始日志为 `.runtime/frontend-merge/7f17ab7/logs/frontend-rust-workspace.{json,log}`。Clippy 首次指出新测试模块后仍有生产函数，已将测试移至文件末尾并重新全工作区检查通过，没有压制 lint。cgraphy 差异上下文仍因内部错误或长时间无返回不可用，采用符号源码与 Git 差异复核，没有 enrich。
+
+原生完整 `tests/integration.mjs` 在新二进制通过：持久化/缓存/授权/播放幂等/任务预算/旧代次/真实 NAS/10001 条分页索引/回滚/备份恢复等既有矩阵保持通过；100 连接快照 273ms 仅是本机短测。手工扫描入口 `tests/playlist-scan.mjs` 的真实 Agent 矩阵通过，扩展受控控制端中止回归也通过：API 18.9135ms 返回 failed/count0，旧索引保留且 partial 未落库，同一连接重新扫描成功；报告 `.runtime/frontend-merge/7f17ab7/playlist-scan/17027518-c01a-4bd9-8ca6-1d4ebb6378be/report.json` 保存实际二进制哈希，隔离容器已清理。
+
+候选工具新增 `--frontend-ref`，记录分支提交、基线树和最终冻结前端清单，并将前端提交写入镜像 label。指定前端的真实服务短测和持续门槛必须使用重新构建的新候选。原生媒体预览源矩阵首次因宿主 PATH 缺少 FFmpeg 在生成素材前失败，尚未测到产品；单独准备验证依赖后重跑，容器内 FFmpeg 的证明单独记录。
+
 ## 2026-09-30：自动索引、背压修复与持续验证入口
 
 自动索引候选 `sha256:65a541c773eb2aaabe5c23936c0cff003828dcb11feb56e25868ceb243eb2fcb` 的 `node tests/agent-index-refresh.mjs` 七场景通过，报告 `.runtime/agent-index-refresh/rainsync-index-refresh-da2839a8/report.json`。真实 Server/Agent/PostgreSQL，1406 条索引、九次完整提交及一次断线回滚；11.5 秒 ACK 延迟无重叠扫描，扫描期间两路数据流与新 Range 持续成功。不可读视频恢复、同尺寸同 mtime 的版本变化与元数据清空、目录失败保留旧库、真实删除及重连恢复均覆盖。既有 Windows 原生十一场景在索引及最新背压源码重新通过，最后报告 `.runtime/agent-native/run-74274db8-a15c-4e53-9bfa-a3b5a72afef2/report.json`。

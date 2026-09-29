@@ -39,7 +39,34 @@ pub fn reduce(
     next.anchor_position_ms = position(state, now);
     next.anchor_server_time_ms = now;
     match command.action {
-        Action::Play => next.playback_status = PlaybackStatus::Playing,
+        Action::Play => {
+            if state.playback_status == PlaybackStatus::Ended
+                || state.duration_ms.is_some_and(|d| position(state, now) >= d)
+            {
+                next.anchor_position_ms = 0.0;
+                next.media_generation = next
+                    .media_generation
+                    .checked_add(1)
+                    .ok_or("generation_overflow")?;
+            }
+            next.playback_status = PlaybackStatus::Playing;
+        }
+        Action::EndMedia { position_ms } => {
+            if state.playback_status != PlaybackStatus::Playing
+                || !position_ms.is_finite()
+                || position_ms <= 0.0
+                || state.duration_ms.is_some_and(|d| position_ms + 1500.0 < d)
+                || position(state, now) + 1500.0 < position_ms
+            {
+                return Err("invalid_position");
+            }
+            next.anchor_position_ms = 0.0;
+            next.media_generation = next
+                .media_generation
+                .checked_add(1)
+                .ok_or("generation_overflow")?;
+            next.playback_status = PlaybackStatus::Playing;
+        }
         Action::Pause => next.playback_status = PlaybackStatus::Paused,
         Action::Seek { position_ms } => {
             if !position_ms.is_finite() || position_ms < 0.0 {
@@ -61,7 +88,7 @@ pub fn reduce(
                 .ok_or("generation_overflow")?;
             next.anchor_position_ms = 0.0;
             next.duration_ms = None;
-            next.playback_status = PlaybackStatus::Paused;
+            next.playback_status = PlaybackStatus::Playing;
         }
     }
     next.revision = next.revision.checked_add(1).ok_or("revision_overflow")?;
@@ -95,6 +122,15 @@ mod tests {
             action: Action::Pause,
         };
         (s, c)
+    }
+    #[test]
+    fn play_at_end_restarts_a_new_generation() {
+        let (mut s, mut c) = fixture();
+        s.anchor_position_ms = 10000.0;
+        c.action = Action::Play;
+        let n = reduce(&s, &c, s.controller_user_id, false, 100.0).unwrap();
+        assert_eq!(n.anchor_position_ms, 0.0);
+        assert_eq!(n.media_generation, s.media_generation + 1);
     }
     #[test]
     fn pause_preserves_elapsed_rate() {

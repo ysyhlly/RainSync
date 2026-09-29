@@ -25,7 +25,8 @@ const image = docker("image", "inspect", "--format", "{{.Id}}", tag);
 const name = `rainsync-process-${randomUUID().slice(0, 8)}`;
 const db = `${name}-db`,
   server = `${name}-server`;
-const root = resolve(".runtime/worker-processes", name);
+assert.ok(process.env.RAINSYNC_ARTIFACT_DIR, "Set external artifacts directory");
+const root = resolve(process.env.RAINSYNC_ARTIFACT_DIR, "worker-processes", name);
 await mkdir(root, { recursive: true });
 const cache = resolve(root, "cache");
 await mkdir(cache);

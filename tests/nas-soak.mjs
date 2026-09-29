@@ -1090,7 +1090,17 @@ try {
     ),
   );
   await page.goto(origin);
-  await page.getByLabel("选择房间").selectOption(room.id);
+  await page
+    .locator(".room-card")
+    .filter({
+      has: page.getByRole("heading", {
+        name: "NAS sustained playback acceptance",
+        exact: true,
+      }),
+    })
+    .getByRole("button", { name: "进入房间", exact: true })
+    .click();
+  await page.waitForURL(`${origin}/rooms/${room.id}`);
   await page.locator("video").waitFor();
   assert.ok(
     hlsModuleUrl,
@@ -1298,11 +1308,29 @@ try {
     });
     arm();
   }, hlsModuleUrl);
-  await page.getByLabel("播放方式").selectOption("auto");
+  await page.locator(".video-frame").hover();
+  await page.getByRole("button", { name: "播放选项", exact: true }).click();
+  await page.getByRole("combobox", { name: "播放方式", exact: true }).click();
+  await page.getByRole("option", { name: "自动适配", exact: true }).click();
+  await page.getByRole("button", { name: "播放选项", exact: true }).click();
   await page.locator("video").evaluate((v) => {
     v.muted = true;
   });
-  await page.locator(".poster").click();
+  await page.getByRole("link", { name: "选择影片", exact: true }).click();
+  await page
+    .locator(`.media-card[data-media-id="${indexed.id}"]`)
+    .getByRole("button", { name: /^播放 / })
+    .click();
+  await page.waitForURL(`${origin}/rooms/${room.id}`);
+  report.frontend_flow = {
+    implementation:
+      "front/rainsync-implementation modular RoomPage/PlaybackHost/LibraryPage",
+    room_entry: "room-card normal Enter room button",
+    selection: "normal LibraryPage media-card Play button",
+    mode: "normal PlaybackSettings Auto option",
+    change_media: "normal room websocket CHANGE_MEDIA",
+    preview_requests_included_in_all_transfer_finalization: true,
+  };
   await page.waitForFunction(
     () => document.querySelector("video")?.readyState >= 2,
     undefined,
@@ -1325,10 +1353,25 @@ try {
   // additionally requires the unmodified Web app's ten-minute renewals.
   await api(`/playback-sessions/${sessionId}`, "POST");
   report.initial_manual_renewal = true;
-  await page.getByRole("button", { name: "▷ 播放", exact: true }).click();
-  // Choosing the lower media card scrolls the player outside the viewport.
-  // Bring the real player back into view so compositor drop statistics describe
-  // an actual viewing session rather than offscreen-video optimization.
+  await page.locator(".video-frame").hover();
+  const blockedPlay = page.getByRole("button", {
+    name: "点击加入播放",
+    exact: true,
+  });
+  if (await blockedPlay.isVisible()) {
+    await blockedPlay.click();
+    report.frontend_flow.play_action =
+      "normal user gesture joins blocked autoplay";
+  } else if (
+    await page.getByRole("button", { name: "播放", exact: true }).isVisible()
+  ) {
+    await page.getByRole("button", { name: "播放", exact: true }).click();
+    report.frontend_flow.play_action = "normal room PLAY control";
+  } else
+    report.frontend_flow.play_action =
+      "normal CHANGE_MEDIA automatically starts Playing";
+  // Keep the actual player visible after returning from the media library so
+  // compositor statistics describe an actual viewing session.
   await page.locator("video").scrollIntoViewIfNeeded();
   await page.waitForFunction(
     () => {

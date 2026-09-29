@@ -1,8 +1,17 @@
+mod account_rules;
+mod account_security;
 mod agents;
+mod avatar_image;
+mod avatars;
 mod limits;
 mod media;
+mod media_previews;
+mod media_titles;
 mod metrics;
 mod playback_requests;
+mod profile;
+mod registration;
+mod registration_auth;
 mod rooms;
 mod upstream;
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
@@ -29,8 +38,11 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct App {
+    account_security: account_security::Security,
+    avatar_settings: avatar_image::Settings,
     session_limit: i64,
     queue_limit: i64,
+    preview_settings: persistence::media_previews::Settings,
     metrics: Arc<metrics::Metrics>,
     db: PgPool,
     origin: String,
@@ -39,6 +51,7 @@ pub struct App {
     epoch: Uuid,
     start: Instant,
     rooms: Arc<Mutex<HashMap<Uuid, rooms::Handle>>>,
+    agent_controls: Arc<Mutex<HashMap<Uuid, agents::Control>>>,
 }
 impl App {
     fn now(&self) -> f64 {
@@ -70,25 +83,40 @@ pub struct User {
     id: Uuid,
     admin: bool,
 }
-pub struct Error(StatusCode, String);
+#[derive(Debug)]
+pub struct Error(StatusCode, String, Option<u32>);
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({"error":self.1}))).into_response()
+        let mut response = (self.0, Json(json!({"error":self.1}))).into_response();
+        if let Some(seconds) = self.2 {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, seconds.to_string().parse().unwrap());
+        }
+        response
     }
 }
 impl From<anyhow::Error> for Error {
     fn from(_: anyhow::Error) -> Self {
-        Self(StatusCode::INTERNAL_SERVER_ERROR, "operation_failed".into())
+        Self(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "operation_failed".into(),
+            None,
+        )
     }
 }
 impl From<sqlx::Error> for Error {
     fn from(_: sqlx::Error) -> Self {
-        Self(StatusCode::INTERNAL_SERVER_ERROR, "database_error".into())
+        Self(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "database_error".into(),
+            None,
+        )
     }
 }
 type Result<T> = std::result::Result<T, Error>;
 fn err(status: StatusCode, msg: &str) -> Error {
-    Error(status, msg.into())
+    Error(status, msg.into(), None)
 }
 fn hash(v: &str) -> String {
     hex::encode(Sha256::digest(v.as_bytes()))
@@ -97,6 +125,12 @@ fn token() -> String {
     let mut v = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut v);
     hex::encode(v)
+}
+fn session_cookie(app: &App, token: &str) -> String {
+    format!(
+        "rainsync_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800{}",
+        if app.secure { "; Secure" } else { "" }
+    )
 }
 fn cookie(h: &HeaderMap) -> Option<String> {
     h.get(header::COOKIE)?
@@ -184,11 +218,14 @@ async fn login(State(app): State<App>, h: HeaderMap, Json(body): Json<Login>) ->
         .bind(&csrf)
         .execute(&app.db)
         .await?;
-    let cookie = format!(
-        "rainsync_session={t}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800{}",
-        if app.secure { "; Secure" } else { "" }
-    );
-    Ok(([(header::SET_COOKIE, cookie)], Json(json!({"csrf":csrf}))).into_response())
+    Ok((
+        [
+            (header::SET_COOKIE, session_cookie(&app, &t)),
+            (header::CACHE_CONTROL, "no-store".into()),
+        ],
+        Json(json!({"csrf":csrf})),
+    )
+        .into_response())
 }
 async fn login_attempt(db: &PgPool, username: &str) -> Result<()> {
     let mut tx = db.begin().await?;
@@ -214,19 +251,16 @@ async fn login_attempt(db: &PgPool, username: &str) -> Result<()> {
     }
     Ok(())
 }
-async fn me(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
+async fn me(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     let u = auth(&app, &h, false).await?;
-    let row = sqlx::query("SELECT username FROM users WHERE id=$1")
-        .bind(u.id)
-        .fetch_one(&app.db)
-        .await?;
+    let mut value = profile::value(&app, u.id).await?;
     let csrf: String = sqlx::query_scalar("SELECT csrf FROM sessions WHERE token_hash=$1")
         .bind(hash(&cookie(&h).unwrap()))
         .fetch_one(&app.db)
         .await?;
-    Ok(Json(
-        json!({"id":u.id,"username":row.get::<String,_>("username"),"admin":u.admin,"csrf":csrf}),
-    ))
+    value["admin"] = json!(u.admin);
+    value["csrf"] = json!(csrf);
+    Ok(registration::private_json(StatusCode::OK, value))
 }
 async fn logout(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     auth(&app, &h, true).await?;
@@ -246,31 +280,28 @@ async fn logout(State(app): State<App>, h: HeaderMap) -> Result<Response> {
 async fn users(
     State(app): State<App>,
     h: HeaderMap,
-    Json(body): Json<Login>,
+    Json(body): Json<account_rules::NewAccount>,
 ) -> Result<Json<Value>> {
     admin(&auth(&app, &h, true).await?)?;
-    if body.username.is_empty()
-        || body.username.len() > 80
-        || body.password.len() < 12
-        || body.password.len() > 1024
-    {
-        return Err(err(StatusCode::BAD_REQUEST, "username_or_password_invalid"));
-    }
-    let pw = tokio::task::spawn_blocking(move || {
-        Argon2::default()
-            .hash_password(body.password.as_bytes(), &SaltString::generate(&mut OsRng))
-            .unwrap()
-            .to_string()
-    })
-    .await
-    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "hash_failed"))?;
+    let display_name = body.validate()?;
+    let pw = account_security::password_hash(&app, body.password).await?;
     let id = Uuid::new_v4();
+    let mut tx = app.db.begin().await?;
     sqlx::query("INSERT INTO users VALUES($1,$2,$3,false)")
         .bind(id)
         .bind(body.username)
         .bind(pw)
-        .execute(&app.db)
-        .await?;
+        .execute(&mut *tx)
+        .await
+        .map_err(account_rules::insert_error)?;
+    if let Some(name) = display_name {
+        sqlx::query("INSERT INTO user_profiles(user_id,display_name) VALUES($1,$2)")
+            .bind(id)
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     Ok(Json(json!({"id":id})))
 }
 async fn ws(State(app): State<App>, h: HeaderMap, upgrade: WebSocketUpgrade) -> Result<Response> {
@@ -344,9 +375,14 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .await?;
     if count == 0 {
         let password = std::env::var("ADMIN_PASSWORD")?;
+        let username = std::env::var("ADMIN_USERNAME").unwrap_or("admin".into());
         anyhow::ensure!(
-            password.len() >= 12,
-            "ADMIN_PASSWORD must have at least 12 characters"
+            account_rules::valid_password(&password),
+            "ADMIN_PASSWORD must have 8-1024 printable ASCII characters; spaces are preserved"
+        );
+        anyhow::ensure!(
+            account_rules::valid_username(&username),
+            "ADMIN_USERNAME must match [A-Za-z0-9_.-] and have 1-80 characters"
         );
         let pw = Argon2::default()
             .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
@@ -354,7 +390,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
             .to_string();
         sqlx::query("INSERT INTO users VALUES($1,$2,$3,true)")
             .bind(Uuid::new_v4())
-            .bind(std::env::var("ADMIN_USERNAME").unwrap_or("admin".into()))
+            .bind(username)
             .bind(pw)
             .execute(&db)
             .await?;
@@ -366,8 +402,11 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     );
     let public_origin = std::env::var("PUBLIC_ORIGIN").unwrap_or("http://localhost:5173".into());
     let app = App {
+        account_security: account_security::Security::configured()?,
+        avatar_settings: avatar_image::Settings::configured()?,
         session_limit: limits::configured("PLAYBACK_SESSION_LIMIT", limits::DEFAULT_SESSION_LIMIT)?,
         queue_limit: limits::configured("MEDIA_QUEUE_LIMIT", limits::DEFAULT_QUEUE_LIMIT)?,
+        preview_settings: persistence::media_previews::Settings::configured()?,
         metrics: Default::default(),
         db: db.clone(),
         secure: public_origin.starts_with("https://"),
@@ -376,6 +415,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         epoch: Uuid::new_v4(),
         start: Instant::now(),
         rooms: Default::default(),
+        agent_controls: Default::default(),
     };
     // A previous process cannot still own preparations after the instance lock
     // has been acquired. Retire their grants before same-key recovery.
@@ -409,6 +449,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
                 "DELETE FROM chat_messages WHERE created_at<now()-interval '7 days'",
                 "DELETE FROM sessions WHERE expires_at<now()",
                 "DELETE FROM login_attempts WHERE window_started<=now()-interval '60 seconds'",
+                "DELETE FROM account_rate_limits WHERE expires_at<=clock_timestamp()",
                 "DELETE FROM agent_transfers WHERE expires_at<now()",
                 "UPDATE agent_transfer_runs SET status='failed',reason='transfer_owner_lost',updated_at=now(),finished_at=now() WHERE finished_at IS NULL AND lease_until<=now()",
                 "DELETE FROM agent_transfer_runs WHERE finished_at<now()-interval '24 hours'",
@@ -423,9 +464,31 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     let router = Router::new()
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/api/v1/auth/login", post(login))
+        .route(
+            "/api/v1/auth/registration-invites/validate",
+            post(registration_auth::validate),
+        )
+        .route("/api/v1/auth/register", post(registration_auth::register))
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/users", post(users))
+        .route(
+            "/api/v1/users/me/profile",
+            get(profile::get_profile).patch(profile::update),
+        )
+        .route(
+            "/api/v1/users/me/avatar",
+            axum::routing::put(avatars::upload).delete(avatars::remove),
+        )
+        .route("/api/v1/users/{id}/avatar", get(avatars::read))
+        .route(
+            "/api/v1/admin/registration-invites",
+            get(registration::list).post(registration::create),
+        )
+        .route(
+            "/api/v1/admin/registration-invites/{id}",
+            delete(registration::revoke),
+        )
         .route("/api/v1/rooms", get(rooms::list).post(rooms::create))
         .route("/api/v1/rooms/{id}/join", post(rooms::join))
         .route("/api/v1/rooms/{id}/invites", post(rooms::invite))
@@ -448,6 +511,20 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         )
         .route("/api/v1/sources/{id}/test", post(media::scan))
         .route("/api/v1/media", get(media::library))
+        .route(
+            "/api/v1/media/previews",
+            get(media_previews::status).post(media_previews::request),
+        )
+        .route("/api/v1/media/{id}/cover", get(media_previews::image))
+        .route("/api/v1/media/{id}", get(media_titles::detail))
+        .route(
+            "/api/v1/media/{id}/personal-title",
+            axum::routing::put(media_titles::personal),
+        )
+        .route(
+            "/api/v1/admin/media/{id}/shared-title",
+            axum::routing::put(media_titles::shared),
+        )
         .route("/api/v1/playback-sessions", post(media::playback))
         .route(
             "/api/v1/playback-requests/{key}",
@@ -460,6 +537,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route("/api/v1/agents", get(agents::list).post(agents::create))
         .route("/api/v1/agents/pair", post(agents::pair))
         .route("/api/v1/agents/{id}", delete(agents::revoke))
+        .route("/api/v1/agents/{id}/scan", post(agents::scan))
         .route("/api/v1/agents/ws", get(agents::connect))
         .route("/api/v1/ws", get(ws))
         .route("/api/v1/metrics", get(metrics::endpoint))
@@ -471,11 +549,14 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
             .await?;
     tracing::info!("RainSync server ready");
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = stopped.await;
-        })
-        .into_future();
+    let server = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = stopped.await;
+    })
+    .into_future();
     tokio::pin!(server);
     let server_result = tokio::select! {
         result = &mut server => result,

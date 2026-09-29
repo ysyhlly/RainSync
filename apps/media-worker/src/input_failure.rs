@@ -53,6 +53,11 @@ impl Registry {
     }
 }
 impl Observation {
+    /// End only the execution that owns this observation. Existing relay
+    /// streams must stop even when their HTTP bodies are not being polled.
+    pub fn stop(&self) {
+        self.1.send_replace(true);
+    }
     pub async fn stopped(&self) {
         let mut stop = self.1.subscribe();
         if !*stop.borrow_and_update() {
@@ -122,7 +127,7 @@ impl Drop for Guard {
         self.registry.0.lock().unwrap().remove(&self.token);
         // The HTTP body may outlive its FFmpeg consumer under backpressure.
         // Cancel this execution's existing streams independently of body Drop.
-        self.observation.1.send_replace(true);
+        self.observation.stop();
     }
 }
 #[cfg(test)]

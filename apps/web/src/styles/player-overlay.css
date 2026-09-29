@@ -1,0 +1,253 @@
+/* Video overlays have their own contrast palette; page controls stay cream. */
+.playback-host:is(.full-player, :fullscreen) .player-chrome {
+  padding: 0 12px 4px;
+  color: var(--player-text);
+}
+.playback-host:is(.full-player, :fullscreen) .player-chrome::before {
+  content: "";
+  position: absolute;
+  inset: -24px 0 0;
+  z-index: -1;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    rgb(0 0 0 / 0.48) 40%,
+    rgb(0 0 0 / 0.76)
+  );
+}
+.playback-host:is(.full-player, :fullscreen) .playback-controls {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 6px;
+  row-gap: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--player-text);
+}
+.playback-host:is(.full-player, :fullscreen) .player-chrome button,
+.playback-host:is(.full-player, :fullscreen) .settings-trigger {
+  color: var(--player-text);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  min-height: 44px;
+  padding: 8px;
+}
+.playback-host:is(.full-player, :fullscreen) .player-chrome button:hover,
+.playback-host:is(.full-player, :fullscreen) .settings-trigger:hover {
+  background: rgb(255 255 255 / 0.12);
+}
+.playback-host:is(.full-player, :fullscreen) .player-chrome :focus-visible {
+  outline-color: var(--player-progress);
+}
+.playback-host:is(.full-player, :fullscreen) .playback-time {
+  font-size: 12px;
+  text-shadow: 0 1px 3px #000;
+}
+.playback-host:is(.full-player, :fullscreen) .rate-control {
+  width: 68px;
+  flex: 0 0 68px;
+  max-width: none;
+}
+.playback-host:is(.full-player, :fullscreen) .rate-control .select-trigger {
+  gap: 4px;
+  white-space: nowrap;
+}
+.playback-host:is(.full-player, :fullscreen) .playback-options {
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  flex: 0 0 44px;
+}
+.settings-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  list-style: none;
+}
+.settings-trigger::-webkit-details-marker {
+  display: none;
+}
+.playback-host:is(.full-player, :fullscreen) .settings-panel,
+.playback-host:is(.full-player, :fullscreen) .select-menu {
+  --surface-panel: var(--player-menu);
+  --text-primary: var(--player-text);
+  --text-secondary: #ddd;
+  --border-control: rgb(255 255 255 / 0.25);
+  --accent: rgb(238 217 181 / 0.24);
+  --accent-soft: rgb(255 255 255 / 0.12);
+  background: var(--player-menu);
+  color: var(--player-text);
+}
+.playback-host:is(.full-player, :fullscreen) .settings-panel .select-trigger {
+  border: 1px solid var(--border-control);
+  background: rgb(255 255 255 / 0.05);
+}
+.playback-host:is(.full-player, :fullscreen) .seek-control {
+  display: block;
+  order: -1;
+  flex: 0 0 100%;
+  width: 100%;
+  margin: 0;
+  height: 24px;
+}
+.playback-host input[type="range"] {
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  padding: 0;
+  border: 0;
+  --track-height: 3px;
+}
+.playback-host input[type="range"]:is(:hover, :focus-visible, :active) {
+  --track-height: 5px;
+}
+.playback-host input[type="range"]::-webkit-slider-runnable-track {
+  height: var(--track-height);
+  border-radius: 4px;
+  background: linear-gradient(
+    to right,
+    var(--player-progress) var(--range-progress),
+    var(--player-track) var(--range-progress)
+  );
+}
+.playback-host input[type="range"]::-moz-range-track {
+  height: var(--track-height);
+  border-radius: 4px;
+  background: linear-gradient(
+    to right,
+    var(--player-progress) var(--range-progress),
+    var(--player-track) var(--range-progress)
+  );
+}
+.playback-host input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 10px;
+  height: 10px;
+  margin-top: calc((var(--track-height) - 10px) / 2);
+  border: 0;
+  border-radius: 50%;
+  background: var(--player-progress);
+  opacity: 0;
+}
+.playback-host input[type="range"]::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--player-progress);
+  opacity: 0;
+}
+.playback-host
+  input[type="range"]:is(
+    :hover,
+    :focus-visible,
+    :active
+  )::-webkit-slider-thumb {
+  opacity: 1;
+}
+.playback-host
+  input[type="range"]:is(:hover, :focus-visible, :active)::-moz-range-thumb {
+  opacity: 1;
+}
+.volume-group {
+  display: inline-flex;
+  position: relative;
+  align-items: center;
+}
+.playback-host:is(.full-player, :fullscreen) input.volume-control {
+  display: none;
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 100px;
+  min-width: 100px;
+  height: 44px;
+  margin: 0;
+  padding: 0 12px;
+  border-radius: 8px;
+  background: var(--player-menu);
+}
+.playback-host:is(.full-player, :fullscreen)
+  .volume-group:is(:hover, :focus-within)
+  .volume-control {
+  display: block;
+}
+.playback-host:fullscreen .fullscreen-information {
+  background: linear-gradient(rgb(0 0 0 / 0.65), transparent);
+  color: var(--player-text);
+}
+.playback-host:fullscreen .fullscreen-information :is(h1, h2, p) {
+  color: var(--player-text);
+  text-shadow: 0 1px 3px #000;
+}
+@media (max-width: 479px) {
+  .playback-host:is(.full-player, :fullscreen) .player-chrome {
+    padding: 0 4px 2px;
+  }
+  .playback-host:is(.full-player, :fullscreen) .playback-controls {
+    column-gap: 0;
+  }
+  .playback-host:is(.full-player, :fullscreen) .rate-control {
+    width: 58px;
+    flex-basis: 58px;
+  }
+  .playback-host:is(.full-player, :fullscreen) .playback-time {
+    font-size: 11px;
+    flex: 1 1 0;
+    min-width: 0;
+    white-space: normal;
+    line-height: 1.3;
+  }
+}
+
+@property --range-progress {
+  syntax: "<percentage>";
+  inherits: true;
+  initial-value: 0%;
+}
+.playback-controls.animate-progress .seek-control {
+  transition: --range-progress 450ms linear;
+}
+.mini-player:not(:fullscreen) {
+  --player-progress: #9e7867;
+  --player-track: #dbc8a8;
+}
+.mini-player:not(:fullscreen) .seek-control {
+  height: 28px;
+  min-height: 28px;
+  border-radius: 0;
+}
+@media (min-width: 768px) {
+  .mini-player:not(:fullscreen) .player-chrome {
+    align-self: end;
+    margin-bottom: -8px;
+  }
+  .mini-player:not(:fullscreen) .playback-controls {
+    row-gap: 2px;
+  }
+}
+@media (max-width: 1279px) {
+  .mini-player:not(:fullscreen) {
+    padding-bottom: 28px;
+  }
+  .mini-player:not(:fullscreen) .playback-controls .seek-control {
+    display: block;
+    position: absolute;
+    left: 12px;
+    bottom: 0;
+    width: calc(100% - 24px);
+    margin: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .playback-controls.animate-progress .seek-control {
+    transition: none;
+  }
+}

@@ -108,9 +108,22 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                 let mut next =
                     room_core::reduce(&state, &req.command, req.user.id, req.user.admin, app.now())
                         .map_err(String::from)?;
-                if let protocol::Action::ChangeMedia { media_id } = req.command.action {
+                if matches!(req.command.action, protocol::Action::EndMedia { .. }) {
+                    let mut ids: Vec<Uuid> = sqlx::query_scalar(&format!("SELECT q.media_id FROM playlist_items q JOIN media_items m ON m.id=q.media_id JOIN sources s ON s.id=m.source_id WHERE q.room_id=$1 AND {} ORDER BY q.sort_order,q.id", media_titles::VISIBLE))
+                        .bind(id).fetch_all(&app.db).await.map_err(|_| "database_error")?;
+                    // Legacy playlists may contain duplicates. Without an item cursor,
+                    // repeated media must not trap advancement at its first occurrence.
+                    let mut seen = std::collections::HashSet::new();
+                    ids.retain(|media| seen.insert(*media));
+                    if !ids.is_empty() {
+                        let index = ids.iter().position(|media| Some(*media) == state.media_id);
+                        next.media_id = Some(ids[index.map_or(0, |i| (i + 1) % ids.len())]);
+                    }
+                }
+                if matches!(req.command.action, protocol::Action::ChangeMedia { .. } | protocol::Action::EndMedia { .. }) {
+                    let media_id = next.media_id.ok_or("no_media")?;
                     let duration = sqlx::query(
-                        "SELECT duration_ms FROM media_items WHERE id=$1 AND available",
+                        &format!("SELECT m.duration_ms FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND {}", media_titles::VISIBLE),
                     )
                     .bind(media_id)
                     .fetch_optional(&app.db)
@@ -300,11 +313,14 @@ pub async fn playlist(
     State(app): State<App>,
     h: HeaderMap,
     Path(id): Path<Uuid>,
-) -> Result<Json<Value>> {
+) -> Result<Response> {
     let u = auth(&app, &h, false).await?;
     member(&app, &u, id).await?;
-    let rows=sqlx::query("SELECT p.id,p.media_id,m.title FROM playlist_items p JOIN media_items m ON m.id=p.media_id WHERE room_id=$1 ORDER BY sort_order,id").bind(id).fetch_all(&app.db).await?;
-    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"media_id":r.get::<Uuid,_>("media_id"),"title":r.get::<String,_>("title")})).collect())))
+    let rows=sqlx::query(&format!("{} JOIN playlist_items q ON q.media_id=m.id WHERE {} AND q.room_id=$2 ORDER BY q.sort_order,q.id", media_titles::SELECT.replace("SELECT m.id,", "SELECT q.id AS playlist_id,m.id,"), media_titles::VISIBLE)).bind(u.id).bind(id).fetch_all(&app.db).await?;
+    Ok(media_titles::private_json(Value::Array(rows.iter().map(|r| {
+        let media = media_titles::media(r);
+        json!({"id":r.get::<Uuid,_>("playlist_id"),"media_id":media["id"],"title":media["title"],"cover":media["cover"]})
+    }).collect())))
 }
 #[derive(Deserialize)]
 pub struct Add {
@@ -317,6 +333,15 @@ pub async fn add_playlist(
     Json(body): Json<Add>,
 ) -> Result<Json<Value>> {
     let mut tx = controller(&app, &h, id).await?;
+    if let Some(item) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM playlist_items WHERE room_id=$1 AND media_id=$2 ORDER BY sort_order,id LIMIT 1")
+        .bind(id).bind(body.media_id).fetch_optional(&mut *tx).await? {
+        return Ok(Json(json!({"id":item})));
+    }
+    let available: bool = sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND {})", media_titles::VISIBLE))
+        .bind(body.media_id).fetch_one(&mut *tx).await?;
+    if !available {
+        return Err(err(StatusCode::NOT_FOUND, "media_not_found"));
+    }
     let item = Uuid::new_v4();
     sqlx::query("INSERT INTO playlist_items SELECT $1,$2,$3,COALESCE(max(sort_order),0)+1 FROM playlist_items WHERE room_id=$2").bind(item).bind(id).bind(body.media_id).execute(&mut *tx).await?;
     tx.commit().await?;
@@ -349,11 +374,49 @@ pub async fn messages(
     let u = auth(&app, &h, false).await?;
     member(&app, &u, id).await?;
     let rows = if let Some(after) = cursor.after {
-        sqlx::query("SELECT c.id,c.body,u.username,c.created_at::text FROM chat_messages c JOIN users u ON u.id=c.user_id WHERE c.room_id=$1 AND (NOT EXISTS(SELECT 1 FROM chat_messages WHERE id=$2 AND room_id=$1) OR (c.created_at,c.id) > (SELECT created_at,id FROM chat_messages WHERE id=$2 AND room_id=$1)) ORDER BY c.created_at,c.id LIMIT 100").bind(id).bind(after).fetch_all(&app.db).await?
+        sqlx::query("SELECT c.id,c.body,c.user_id,u.username,COALESCE(p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE c.room_id=$1 AND (NOT EXISTS(SELECT 1 FROM chat_messages WHERE id=$2 AND room_id=$1) OR (c.created_at,c.id) > (SELECT created_at,id FROM chat_messages WHERE id=$2 AND room_id=$1)) ORDER BY c.created_at,c.id LIMIT 100").bind(id).bind(after).fetch_all(&app.db).await?
     } else {
-        sqlx::query("SELECT * FROM (SELECT c.id,c.body,u.username,c.created_at FROM chat_messages c JOIN users u ON u.id=c.user_id WHERE room_id=$1 ORDER BY c.created_at DESC,c.id DESC LIMIT 100) history ORDER BY created_at,id").bind(id).fetch_all(&app.db).await?
+        sqlx::query("SELECT * FROM (SELECT c.id,c.body,c.user_id,u.username,COALESCE(p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,c.created_at,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE room_id=$1 ORDER BY c.created_at DESC,c.id DESC LIMIT 100) history ORDER BY created_at,id").bind(id).fetch_all(&app.db).await?
     };
-    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"body":r.get::<String,_>("body"),"username":r.get::<String,_>("username")})).collect())))
+    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"body":r.get::<String,_>("body"),"user_id":r.get::<Uuid,_>("user_id"),"username":r.get::<String,_>("username"),"display_name":r.get::<String,_>("display_name"),"created_at":r.get::<i64,_>("created_at_ms"),"avatar_url":avatars::url(r.get("user_id"),r.get("avatar_version"),r.get::<Option<String>,_>("avatar_content_type").is_some()),"avatar_version":r.get::<Option<Uuid>,_>("avatar_version")})).collect())))
+}
+
+async fn persist_chat(
+    db: &sqlx::PgPool,
+    room_id: Uuid,
+    user_id: Uuid,
+    body: &str,
+    client_message_id: Option<Uuid>,
+) -> std::result::Result<(Uuid, bool), &'static str> {
+    let inserted = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO chat_messages(id,room_id,user_id,body,client_message_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT (room_id,user_id,client_message_id) DO NOTHING RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(room_id)
+    .bind(user_id)
+    .bind(body)
+    .bind(client_message_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|_| "database_error")?;
+    if let Some(id) = inserted {
+        return Ok((id, false));
+    }
+    // The unique-index conflict waits for the concurrent insertion to commit.
+    // Read in a new statement so its committed row is visible at READ COMMITTED.
+    let existing = sqlx::query(
+        "SELECT id,body FROM chat_messages WHERE room_id=$1 AND user_id=$2 AND client_message_id=$3",
+    )
+    .bind(room_id)
+    .bind(user_id)
+    .bind(client_message_id)
+    .fetch_one(db)
+    .await
+    .map_err(|_| "database_error")?;
+    if existing.get::<String, _>("body") != body {
+        return Err("invalid_request");
+    }
+    Ok((existing.get("id"), true))
 }
 
 pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: String) {
@@ -442,10 +505,24 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                     "CLOCK_SYNC"=>{let t2=app.now();json!({"type":"CLOCK_SYNC_REPLY","t1":v["t1"],"t2":t2,"t3":app.now(),"clock_epoch":app.epoch})},
                     "CLIENT_STATUS"=>{app.metrics.report(&v["status"]);let _=handle.events.send(json!({"type":"CLIENT_STATUS","user_id":user.id,"status":v["status"]}));continue},
                     "CHAT"=>{
-                        let Some(body)=v["body"].as_str().filter(|b|!b.trim().is_empty()&&b.chars().count()<=2000)else{reject_socket(&mut out,"invalid_request").await;continue};let cid=Uuid::new_v4();
-                        if sqlx::query("INSERT INTO chat_messages(id,room_id,user_id,body) VALUES($1,$2,$3,$4)").bind(cid).bind(id).bind(user.id).bind(body).execute(&app.db).await.is_err(){reject_socket(&mut out,"database_error").await;break}
-                        let name:String=sqlx::query_scalar("SELECT username FROM users WHERE id=$1").bind(user.id).fetch_one(&app.db).await.unwrap_or_default();
-                        let _=handle.events.send(json!({"type":"CHAT","id":cid,"username":name,"body":body,"client_message_id":v["client_message_id"].as_str().and_then(|s| Uuid::parse_str(s).ok())}));continue
+                        let Some(body)=v["body"].as_str().filter(|b|!b.trim().is_empty()&&b.chars().count()<=2000)else{reject_socket(&mut out,"invalid_request").await;continue};
+                        let client_message_id = match v.get("client_message_id") {
+                            None | Some(Value::Null) => None,
+                            Some(value) => match value.as_str().and_then(|s| Uuid::parse_str(s).ok()) {
+                                Some(key) => Some(key),
+                                None => {reject_socket(&mut out,"invalid_request").await;continue},
+                            },
+                        };
+                        let (cid,replayed)=match persist_chat(&app.db,id,user.id,body,client_message_id).await {
+                            Ok(result)=>result,
+                            Err(reason)=>{reject_socket(&mut out,reason).await;continue},
+                        };
+                        let identity=match profile::value(&app,user.id).await{Ok(value)=>value,Err(_)=>{reject_socket(&mut out,"database_error").await;break}};
+                        let reply=json!({"type":"CHAT","id":cid,"user_id":user.id,"username":identity["username"],"display_name":identity["display_name"],"avatar_url":identity["avatar_url"],"avatar_version":identity["avatar_version"],"body":body,"client_message_id":client_message_id});
+                        if replayed {
+                            if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Text(reply.to_string().into()))).await,Ok(Ok(()))) {break}
+                        } else {let _=handle.events.send(reply);}
+                        continue
                     }
                     _=>{
                         let command_id = v["command_id"].as_str().and_then(|s|Uuid::parse_str(s).ok());

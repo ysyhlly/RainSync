@@ -135,6 +135,31 @@
         "type",
         "payload"
       ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "properties": {
+            "position_ms": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "required": [
+            "position_ms"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "END_MEDIA"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
     }
   ],
   "required": [

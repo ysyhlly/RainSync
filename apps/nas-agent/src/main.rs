@@ -368,6 +368,21 @@ async fn main() -> Result<()> {
         req.headers_mut()
             .insert("Authorization", format!("Bearer {token}").parse()?);
         if let Ok((mut socket, _)) = connect_async(req).await {
+            if !matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    socket.send(Message::Text(
+                        json!({"type":"HELLO","manual_scan":true})
+                            .to_string()
+                            .into()
+                    ))
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
             let mut transfers = tokio::task::JoinSet::new();
             let mut scan: Option<IndexScan> = None;
             let mut refresh = tokio::time::interval(index_interval);
@@ -402,6 +417,16 @@ async fn main() -> Result<()> {
                     }
                     message=socket.next()=>{let text = match message { Some(Ok(Message::Text(text))) => text, Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue, _ => break };let Ok(v)=serde_json::from_str::<Value>(&text)else{continue};
                         if v["type"] == "INDEX_ERROR" { break }
+                        if v["type"] == "SCAN" {
+                            let Some(request_id) = v["snapshot"].as_str() else { continue };
+                            if request_id.is_empty() || request_id.len() > 64 { continue; }
+                            let requested = if scan.is_none() { start_index(root.clone(), scans.clone()) } else { None };
+                            if let Some(mut requested) = requested {
+                                requested.snapshot = request_id.to_owned();
+                                scan = Some(requested);
+                            } else if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3), socket.send(Message::Text(json!({"type":"SCAN_BUSY","snapshot":request_id}).to_string().into()))).await, Ok(Ok(()))) { break }
+                            continue;
+                        }
                         if v["type"] == "INDEX_ACK" || v["type"] == "INDEX_ABORT_ACK" {
                             let Some(current) = scan.as_mut() else { break };
                             if !current.awaiting_ack || v["sequence"].as_u64() != Some(current.sequence)

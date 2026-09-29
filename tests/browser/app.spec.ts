@@ -1,10 +1,13 @@
+import { mediaExtraResponse } from "./fixtures/media";
 import { test, expect, type WebSocketRoute } from "@playwright/test";
 import { readFileSync } from "node:fs";
+import { navigate, roomPanel, showOptions } from "./fixtures/navigation";
 const csp = readFileSync("deploy/Caddyfile", "utf8").match(
   /Content-Security-Policy "([^"]+)"/,
 )![1];
-test.beforeEach(async ({ page }) => {
-  await page.route("http://127.0.0.1:5173/", async (route) => {
+test.beforeEach(async ({ page, baseURL }) => {
+  await page.route(new URL("/**", baseURL).href, async (route) => {
+    if (route.request().resourceType() !== "document") return route.fallback();
     const response = await route.fetch();
     await route.fulfill({
       response,
@@ -24,6 +27,8 @@ test("room, library, invitation and settings are usable", async ({
   await page.clock.install();
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/api/v1/**", async (route) => {
+    const extra = mediaExtraResponse(route);
+    if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
     let body: unknown = [];
     if (path.endsWith("/auth/me"))
@@ -121,36 +126,52 @@ test("room, library, invitation and settings are usable", async ({
     });
   });
   await page.goto("/");
-  await expect(page.getByText("今晚，一起看什么？")).toBeVisible();
-  await page.getByLabel("选择房间").selectOption("room");
-  await expect(page.getByText("已连接", { exact: false })).toBeVisible();
-  await page.getByRole("button", { name: /山海之间/ }).click();
+  await expect(
+    page.getByRole("heading", { name: "放映室", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "进入房间", exact: true }).click();
+  await expect(page.locator(".connection-status")).toHaveText("已连接");
+  await navigate(page, "媒体库");
+  await page
+    .getByRole("button", { name: "播放 山海之间", exact: true })
+    .click();
   await expect(page.getByRole("alert")).toContainText("控制凭据已更新");
   await page.clock.fastForward(3000);
   expect(commands.length).toBe(1);
   expect(commands[0].control_epoch).toBe(firstEpoch);
-  await page.getByRole("button", { name: /山海之间/ }).click();
+  await page.getByRole("button", { name: "关闭提示" }).click();
+  await navigate(page, "媒体库");
+  await page
+    .getByRole("button", { name: "播放 山海之间", exact: true })
+    .click();
   await expect.poll(() => commands.length).toBe(2);
   expect(commands[1].control_epoch).toBe(nextEpoch);
   expect(commands[1].command_id).not.toBe(commands[0].command_id);
   await page.getByLabel("聊天消息").fill("今晚一起看");
   await page.getByLabel("聊天消息").press("Enter");
   await expect(page.getByText("今晚一起看")).toBeVisible();
-  await page.getByRole("button", { name: "邀请朋友" }).click();
-  await expect(page.locator("input[readonly]")).toHaveValue(
+  await roomPanel(page, "待播");
+  await page.getByRole("button", { name: "房间邀请", exact: true }).click();
+  await expect(page.getByLabel("完整房间邀请")).toHaveValue(
     /invitation-test-token/,
   );
   await page.screenshot({
-    path: `.runtime/${info.project.name}-room.png`,
+    path: info.outputPath(`${info.project.name}-room.png`),
     fullPage: true,
   });
   const overflow = await page.evaluate(
     () => document.documentElement.scrollWidth > innerWidth,
   );
   expect(overflow).toBe(false);
-  await page.getByRole("button", { name: "片源管理" }).click();
+  await page.getByRole("button", { name: "关闭弹窗" }).click();
+  await page
+    .getByRole("link", { name: /^(片源管理|管理)$/ })
+    .filter({ visible: true })
+    .click();
+  await page.getByRole("button", { name: "添加片源", exact: true }).click();
   await expect(page.getByRole("heading", { name: "添加片源" })).toBeVisible();
-  await page.getByRole("button", { name: "一起看", exact: true }).click();
+  await page.getByRole("button", { name: "关闭弹窗" }).click();
+  await page.getByRole("link", { name: "返回房间", exact: true }).click();
   const diagnostic = "11111111-1111-4111-8111-111111111111";
   await page.route("**/invites", (route) =>
     route.fulfill({
@@ -165,9 +186,13 @@ test("room, library, invitation and settings are usable", async ({
       },
     }),
   );
-  await page.getByRole("button", { name: "邀请朋友" }).click();
+  await roomPanel(page, "待播");
+  await page.getByRole("button", { name: "房间邀请", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText("服务资源正忙");
   await expect(page.getByRole("alert")).toContainText(diagnostic);
+  await navigate(page, "媒体库");
+  await page.getByRole("link", { name: "返回房间", exact: true }).click();
+  await roomPanel(page, "聊天");
   for (const code of ["CONTROLLER_REQUIRED", "FORBIDDEN"]) {
     controlSocket!.send(
       JSON.stringify({
@@ -176,7 +201,7 @@ test("room, library, invitation and settings are usable", async ({
       }),
     );
     await expect(page.getByRole("alert")).toContainText("当前没有控制权限");
-    await expect(page.getByText("已连接", { exact: false })).toBeVisible();
+    await expect(page.locator(".connection-status")).toHaveText("已连接");
     await page.getByLabel("聊天消息").fill(code);
     await page.getByLabel("聊天消息").press("Enter");
     await expect(page.getByText(code, { exact: true })).toBeVisible();
@@ -193,10 +218,10 @@ test("room, library, invitation and settings are usable", async ({
     }),
   );
   controlSocket!.close({ code: 1011 });
-  await expect(page.getByText("○ 正在重连")).toBeVisible();
+  await expect(page.locator(".connection-status")).toHaveText("正在重连");
   await page.clock.fastForward(10000);
   await expect.poll(() => connectionCount).toBe(2);
-  await expect(page.getByText("已连接", { exact: false })).toBeVisible();
+  await expect(page.locator(".connection-status")).toHaveText("已连接");
   controlSocket!.send(
     JSON.stringify({
       type: "ERROR",
@@ -210,7 +235,7 @@ test("room, library, invitation and settings are usable", async ({
   );
   await expect(page.getByRole("alert")).toContainText("请重新登录");
   await expect(
-    page.getByRole("button", { name: "进入影院 →", exact: true }),
+    page.getByRole("button", { name: "登录", exact: true }),
   ).toBeVisible();
   await page.clock.fastForward(20000);
   expect(connectionCount).toBe(2);
@@ -224,6 +249,8 @@ test("rejected WebSocket upgrade rechecks login and stops retrying", async ({
   let expired = false;
   let connections = 0;
   await page.route("**/api/v1/**", (route) => {
+    const extra = mediaExtraResponse(route);
+    if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/me")) {
       return route.fulfill(
@@ -260,11 +287,10 @@ test("rejected WebSocket upgrade rechecks login and stops retrying", async ({
     expired = true;
     ws.onMessage(() => ws.close({ code: 1008 }));
   });
-  await page.goto("/");
-  await page.getByLabel("选择房间").selectOption("room");
+  await page.goto("/rooms/room");
   await expect(page.getByRole("alert")).toContainText("登录已过期");
   await expect(
-    page.getByRole("button", { name: "进入影院 →", exact: true }),
+    page.getByRole("button", { name: "登录", exact: true }),
   ).toBeVisible();
   await page.clock.fastForward(30000);
   expect(connections).toBe(1);
@@ -291,6 +317,8 @@ test("playback retries a lost HTTP response with the same operation key", async 
     route.fulfill({ contentType: "video/mp4", body: "" }),
   );
   await page.route("**/api/v1/**", async (route) => {
+    const extra = mediaExtraResponse(route);
+    if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/me"))
       return route.fulfill({
@@ -400,8 +428,7 @@ test("playback retries a lost HTTP response with the same operation key", async 
         );
     }),
   );
-  await page.goto("/");
-  await page.getByLabel("选择房间").selectOption("room");
+  await page.goto("/rooms/room");
   await expect.poll(() => requests.length).toBe(1);
   await expect.poll(() => requests.length).toBe(2);
   await expect.poll(() => requests.length).toBe(3);
@@ -414,6 +441,7 @@ test("playback retries a lost HTTP response with the same operation key", async 
   // does not claim decoder/playback coverage; verify the accepted plan binding.
   await expect(page.locator("video")).toHaveAttribute("src", "/test-media");
   loseResponses = true;
+  await showOptions(page);
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
   await expect.poll(() => requests.length).toBe(5);
   // Stopping the old accepted plan has succeeded. Lose cleanup of the next one.
@@ -431,19 +459,23 @@ test("playback retries a lost HTTP response with the same operation key", async 
       ),
     )
     .toEqual([abandoned]);
+  await showOptions(page);
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText("清理暂不可用");
   expect(requests.length).toBe(7);
   loseResponses = false;
   cleanupOffline = false;
+  await showOptions(page);
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
   await expect.poll(() => requests.length).toBe(8);
   expect(revoked).toContain(abandoned);
   expect(requests[7].idempotency_key).not.toBe(abandoned);
   await expect(page.locator("video")).toHaveAttribute("src", "/test-media");
   holdNext = true;
+  await showOptions(page);
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
   await expect.poll(() => requests.length).toBe(9);
+  await showOptions(page);
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
   await expect.poll(() => requests.length).toBe(10);
   await expect(page.locator("video")).toHaveAttribute("src", "/test-media");
@@ -458,6 +490,7 @@ test("playback retries a lost HTTP response with the same operation key", async 
 
 test("rapid audio switches preserve the newest plan while an old DELETE is delayed", async ({
   page,
+  isMobile,
 }) => {
   const requests: any[] = [];
   const revoked: string[] = [];
@@ -470,6 +503,8 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
     route.fulfill({ contentType: "video/mp4", body: "" }),
   );
   await page.route("**/api/v1/**", async (route) => {
+    const extra = mediaExtraResponse(route);
+    if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/me"))
       return route.fulfill({
@@ -563,22 +598,41 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
         commands.push(frame);
     }),
   );
-  await page.goto("/");
-  await page.getByLabel("选择房间").selectOption("room");
+  await page.goto("/rooms/room");
   await expect(page.locator("video")).toHaveAttribute(
     "src",
     "/audio-test-media/initial",
   );
-  await page.getByLabel("音轨").selectOption("2");
+  if (!isMobile && !(await page.evaluate(() => !!document.fullscreenElement))) {
+    await page.locator("video").hover();
+    await page.getByRole("button", { name: "全屏", exact: true }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          document.fullscreenElement?.classList.contains("playback-host"),
+        ),
+      )
+      .toBe(true);
+  }
+  await showOptions(page);
+  await page.getByRole("combobox", { name: "音轨", exact: true }).click();
+  await page
+    .getByRole("option", { name: "Japanese · jpn", exact: true })
+    .click();
   await expect.poll(() => held).toBe(true);
-  await page.getByLabel("音轨").selectOption("1");
+  await page.getByRole("combobox", { name: "音轨", exact: true }).click();
+  await page
+    .getByRole("option", { name: "English · eng", exact: true })
+    .click();
   await expect(page.locator("video")).toHaveAttribute(
     "src",
     "/audio-test-media/track-1",
   );
   expect(requests).toHaveLength(2);
   expect(requests[1].audio_index).toBe(1);
-  await expect(page.getByLabel("音轨")).toHaveValue("1");
+  await expect(
+    page.getByRole("combobox", { name: "音轨", exact: true }),
+  ).toContainText("English · eng");
   expect(requests[1].position_ms).toBe(1250);
   expect(requests[1].idempotency_key).not.toBe(requests[0].idempotency_key);
   releaseDelete!();
@@ -600,6 +654,7 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
 
 test("subtitle identity survives reload and resets on media change", async ({
   page,
+  isMobile,
 }) => {
   const clip = Buffer.from(
     readFileSync("tests/fixtures/browser-video.base64", "utf8").trim(),
@@ -631,6 +686,8 @@ test("subtitle identity survives reload and resets on media change", async ({
     }),
   );
   await page.route("**/api/v1/**", async (route) => {
+    const extra = mediaExtraResponse(route);
+    if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/me"))
       return route.fulfill({
@@ -708,13 +765,25 @@ test("subtitle identity survives reload and resets on media change", async ({
         commands.push(frame.type);
     });
   });
-  await page.goto("/");
-  await page.getByLabel("选择房间").selectOption("room");
+  await page.goto("/rooms/room");
   const video = page.locator("video");
   await expect
     .poll(() => video.evaluate((v: HTMLVideoElement) => v.readyState))
     .toBeGreaterThanOrEqual(2);
-  await page.getByLabel("字幕").selectOption({ label: "中文 · zho" });
+  if (!isMobile) {
+    await page.locator("video").hover();
+    await page.getByRole("button", { name: "全屏", exact: true }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          document.fullscreenElement?.classList.contains("playback-host"),
+        ),
+      )
+      .toBe(true);
+  }
+  await showOptions(page);
+  await page.getByRole("combobox", { name: "字幕", exact: true }).click();
+  await page.getByRole("option", { name: "中文 · zho", exact: true }).click();
   const showing = () =>
     video.evaluate((v: HTMLVideoElement) =>
       Array.from(v.querySelectorAll("track"))
@@ -722,29 +791,34 @@ test("subtitle identity survives reload and resets on media change", async ({
         .map((t) => ({ label: t.label, cues: t.track.cues?.length ?? 0 })),
     );
   await expect.poll(showing).toEqual([{ label: "中文", cues: 1 }]);
+  await showOptions(page);
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
   await expect.poll(() => plans).toBe(2);
-  await expect(page.getByLabel("字幕").locator("option:checked")).toContainText(
-    "中文",
-  );
+  await expect(
+    page.getByRole("combobox", { name: "字幕", exact: true }),
+  ).toContainText("中文");
   await expect.poll(showing).toEqual([{ label: "中文", cues: 1 }]);
-  await page.getByLabel("字幕").selectOption({ label: "关闭" });
+  await page.getByRole("combobox", { name: "字幕", exact: true }).click();
+  await page.getByRole("option", { name: "关闭", exact: true }).click();
+  await showOptions(page);
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
   await expect.poll(() => plans).toBe(3);
-  await expect(page.getByLabel("字幕").locator("option:checked")).toHaveText(
-    "关闭",
-  );
+  await expect(
+    page.getByRole("combobox", { name: "字幕", exact: true }),
+  ).toContainText("关闭");
   await expect.poll(showing).toEqual([]);
-  await page.getByLabel("字幕").selectOption({ label: "中文 · zho" });
+  await showOptions(page);
+  await page.getByRole("combobox", { name: "字幕", exact: true }).click();
+  await page.getByRole("option", { name: "中文 · zho", exact: true }).click();
   await expect.poll(showing).toEqual([{ label: "中文", cues: 1 }]);
   state.media_generation = 2;
   state.media_id = "next-movie";
   state.revision++;
   socket!.send(JSON.stringify({ type: "SNAPSHOT", state }));
   await expect.poll(() => plans).toBe(4);
-  await expect(page.getByLabel("字幕").locator("option:checked")).toHaveText(
-    "关闭",
-  );
+  await expect(
+    page.getByRole("combobox", { name: "字幕", exact: true }),
+  ).toContainText("关闭");
   await expect.poll(showing).toEqual([]);
   expect(commands).toEqual([]);
 });
