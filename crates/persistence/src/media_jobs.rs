@@ -10,6 +10,8 @@ pub enum JobFailure {
     CachePermissionDenied,
     ExecutionFailed,
     UpstreamTransient,
+    SourceChanged,
+    SourceVersionRequired,
 }
 impl JobFailure {
     pub fn reason(self) -> &'static str {
@@ -19,6 +21,8 @@ impl JobFailure {
             Self::CachePermissionDenied => "cache_permission_denied",
             Self::ExecutionFailed => "media_job_failed",
             Self::UpstreamTransient => "upstream_transport_failed",
+            Self::SourceChanged => "source_changed",
+            Self::SourceVersionRequired => "source_version_required",
         }
     }
 }
@@ -35,6 +39,8 @@ pub fn terminal_error(reason: Option<&str>) -> (u16, &'static str) {
         Some("cache_capacity_exceeded") => (503, "cache_capacity_exceeded"),
         Some("cache_read_only") => (503, "cache_read_only"),
         Some("cache_permission_denied") => (503, "cache_permission_denied"),
+        Some("source_changed") => (409, "source_changed"),
+        Some("source_version_required") => (409, "source_version_required"),
         Some("upstream_transport_retry_exhausted" | "media_job_retry_exhausted") => {
             (502, "media_job_retry_exhausted")
         }

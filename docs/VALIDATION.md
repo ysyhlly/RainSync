@@ -1,5 +1,41 @@
 # 本轮验证记录
 
+## 2026-09-30：自动索引、背压修复与持续验证入口
+
+自动索引候选 `sha256:65a541c773eb2aaabe5c23936c0cff003828dcb11feb56e25868ceb243eb2fcb` 的 `node tests/agent-index-refresh.mjs` 七场景通过，报告 `.runtime/agent-index-refresh/rainsync-index-refresh-da2839a8/report.json`。真实 Server/Agent/PostgreSQL，1406 条索引、九次完整提交及一次断线回滚；11.5 秒 ACK 延迟无重叠扫描，扫描期间两路数据流与新 Range 持续成功。不可读视频恢复、同尺寸同 mtime 的版本变化与元数据清空、目录失败保留旧库、真实删除及重连恢复均覆盖。既有 Windows 原生十一场景在索引及最新背压源码重新通过，最后报告 `.runtime/agent-native/run-74274db8-a15c-4e53-9bfa-a3b5a72afef2/report.json`。
+
+低码率真实观影入口在约 32.4 秒发现 Agent 把正常发送背压误判为写入超时，句柄提前关闭；失败证据 `.runtime/nas-soak/rainsync-soak-15a08d1d/report.json`。修复使用有效租约、本地消费者队列等待期间的精确健康 Ping；普通 Ping/Pong 不延长期限，字节读取无进展与取消路径保持各自期限。
+
+冻结候选 A 的镜像 `sha256:69e02cc605067ddfbfc25c3daab4f2d502823a299815aca46435f4bd376e7ac3` 已由完整源码/生产清单、构建输入、label 和三份二进制证明绑定。生产摘要 `8581d1ad8e77793bed8927ba7c80a4faf4ea5cb47c49ff1306ea5b5471d48cea`，全源码摘要 `134ae0903ccbb432c3c5ec6443a996a4bb982ff5b386c90775295fdc0287834a`。`agent-backpressure.mjs` 通过 43.742 秒健康等待/21 Ping，恢复后精确交付 67,108,864 字节；普通 Ping/Pong 两路按期限退出，停专用信号后 29.019 秒释放，Close 173ms，控制丢失含重连 2.019 秒。报告在候选 `source/.runtime/agent-backpressure/rainsync-agent-backpressure-34031143/report.json`。最后两项的本次新流未先明确等待健康 Pulse；下一候选入口补充该条件，不能把这份证据扩大为已续期后取消。
+
+候选 A 的低码率浏览器短测跨过旧故障点，四十三秒仍真实播放并保持源句柄/租约。但约五十四秒同一播放方案发生 MSE 重载，原生帧计数 437→101 导致入口失败，原始报告 `source/.runtime/nas-soak/rainsync-soak-4042a62c/report.json`。实际媒体时间继续前进，不把失败计为观影通过；正在核查重载原因、累计呈现帧的计量方式和停止后传输收尾。两小时尚未启动。
+
+`node tests/control-load.mjs --duration-seconds=25` 在上述指标候选通过两个拓扑：十房×十人 ACK p95 44.0ms、三十条命令；五十房×两人 32.4ms、一百五十条命令。报告 `.runtime/control-load/rainsync-load-a8222b78/report.json`。100 个独立 `/auth/me` 身份及精确房间成员已核对；PLAY/PAUSE 动作、完整 ACK/EVENT 状态、逐 revision 数据库事件/命令及最终快照一致。各项计划次数和实际调度迟到、聊天持久化、时钟回复与重连均检查；真实行锁阻塞暴露排队命令指标。早期夹具误把所有房间用于单房间队列证明的 revision 检查，修正限定房间后完整重跑。二十五秒结果仅为短测，不能关闭每拓扑六十分钟门槛。
+
+Windows 真实 Ctrl+C 回归 `node tests/control-load-interrupt.mjs` 在行锁阻塞和 ACK 等待期间通过，报告 `.runtime/control-interrupt/b1a575db-74a1-444e-8ccb-0aec4b7ade1a/report.json`。隐藏独立控制台收到信号后约 1735ms 非零退出，负载报告为 failed，所有本次容器和网络已移除；没有附着用户控制台。随后新增重连立即完整快照核对及重复 EVENT 拒绝，需在下一冻结候选重跑正常短测。
+
+`scripts/validation-candidate.mjs` 将允许的源码、测试及依赖清单复制到独立冻结目录，并把镜像源码 label、镜像 ID、实际二进制哈希与构建输入清单保存到 `candidate.json`。持续入口使用冻结副本和镜像摘要，核对整个清单；后续活仓库修改不能混入同次测量。隔离测试验证凭据路径拒绝、源码篡改/额外文件拒绝、活仓库继续编辑隔离、禁止覆写及冻结 vendor 的严格复用范围。入口和统计口径见 [持续验证](SUSTAINED_VALIDATION.md)。基底镜像及 FFmpeg 发布版本固定仍属 W10 后续要求。
+
+最新原生工作区 51 项 Rust 测试、两个 ignored 夹具入口及 Clippy 全目标检查通过。当前 cgraphy 差异上下文返回内部 NoneType 错误，采用 Git diff 和各符号源码复核，没有 enrich。持续两小时、两种拓扑各六十分钟和最终七十二小时尚未完成；真实设备/网络文件系统仍须按 [全计划核对](PLAN_AUDIT.md) 逐项验证。
+
+## 2026-09-30：NAS 版本错误闭环与 Windows 原生 Agent
+
+同步 `origin/main` 后 HEAD 为 `d699418`，工作区原先干净。先用现有版本绑定镜像 `sha256:95e965184e2200294e9c38908ce792b37140bea704d0e87610349c5d0caa3298` 重跑真实 Server/Worker/Agent 链路，报告 `.runtime/input-retries/rainsync-input-84e8757a/report.json`；同大小同 mtime 的替换拒绝旧授权、重新索引清空旧 metadata、原地修改中断旧流均通过。发现新增版本错误在默认 auto 探测中仍被转成可重试探测失败，转码任务也只保存通用失败。
+
+修复为执行作用域内的固定 `SourceChanged` / `SourceVersionRequired` 分类，确认源冲突不被并发通用/网络失败覆盖。Worker probe 无论 FFprobe 成功或失败均先检查分类；Server 仅传播这两项 409 白名单，未知错误仍脱敏。转码失败保存相同固定原因并返回不可重试的 409，不发布产物，释放写入预留。无新增迁移/公开错误枚举，生成协议只读检查保持通过。
+
+最终隔离镜像 `sha256:e69bd13cbe3cda5ed6e20257d847a5b4d5a5ff07b306e0e011f943e60d2b4af9`：
+
+- `node tests/input-retries.mjs --source-version-playback` 十项通过，报告 `.runtime/input-retries/rainsync-input-6f8378e1/report.json`。真实 Worker/Server/PostgreSQL/FFprobe、受控 Agent 数据端，覆盖正常 probe/auto、显式源变化、成功首部缺版本/错版本、未知错误脱敏；失败准备 grant 已撤销，同请求编号重放不再探测且 attempt 保持 1。首次夹具使用错误的 `/playback` 地址造成 404，改为实际 `/playback-sessions` 后完整重跑；不是产品路由故障。
+- `node tests/input-retries.mjs --nas` 十八类输入故障通过，报告 `.runtime/input-retries/rainsync-input-8d00d9a2/report.json`。六项新增场景覆盖 Agent 源变化/缺版本 409、成功首部版本不符/缺失、授权缺版本和未知冲突脱敏。确定版本冲突仅一次执行，无产物发布；原网络恢复、退避、三次耗尽、失租、权限/撤销及 Ping 回归通过，成功产物仍由 FFmpeg 解码。
+- `node tests/input-retries.mjs --agent-relay` 六组真实链路场景通过，报告 `.runtime/input-retries/rainsync-input-4e34d7c3/report.json`。HTTP 取消释放四路文件 186ms，Agent 重启后的新 Range 恢复约 5409ms，管理员撤销释放旧文件 211ms；源替换旧授权 409/新授权 206，原地修改中断流。终态 4 cancelled、19 failed、2 completed，无活跃传输遗留。
+
+`node tests/agent-native.mjs` 使用当前源码编译的真实 Windows exe，通过十一组场景，约 31.8 秒，报告 `.runtime/agent-native/run-b353a753-10cd-4f1e-a2f4-c541c27146fd/report.json`，同目录保存构建/Agent 日志及源码、锁文件、入口和二进制 SHA-256。十六路独立大文件证明活跃句柄，第十七路 503；Close/TCP 混合取消八路在 452ms 内释放，控制断开在 406ms 内释放所有源，消费者恢复读取前即通过逐文件 `FileShare.None` 验证。另覆盖槽位复用、重连 Range/HEAD/404/416、十秒握手期限、同大小同 mtime 的原地修改及替换、源缩短、三轮十六路取消（458/440/444ms）。私有内存由 3,993,600 增至 11,591,680 字节，增长约 7.25MiB；所有文件释放、夹具删除且进程退出。
+
+原生工作区 51 项 Rust 测试通过，两个子进程夹具入口 ignored；Clippy 全目标且 warnings 视为错误、二进制/示例构建、格式与生成协议检查通过。完整 `node tests/integration.mjs` 在最终原生二进制通过，含鉴权/幂等/真实 NAS/索引/HLS/队列缓存事务/恢复与备份；100 个本机控制连接快照 272ms 仍仅为冒烟。新增 JS/PowerShell 入口的格式与 JS 语法检查通过。cgraphy 差异审查未返回，终止后用 Git diff 复核，未进行图 enrich。
+
+这些证据没有关闭两小时连续观影/内存趋势、移动实机、网络共享文件系统、内核不可中断 I/O 或完整 Windows Server/Worker/Agent 链路。句柄身份/时间检测不是内容哈希，路径替换也不保证已经持有的旧文件句柄必然中断。自动索引与单文件故障隔离的后续结果见本页最新记录。未部署，改动保留在本地工作区。
+
 ## 2026-09-27：NAS 持久化传输状态与租约收尾
 
 迁移 0018 增加 `agent_transfer_runs`，与原短期授权票据分开。原子登记/领取、收到首部后的阶段推进、取消/失败/完成终态、字节计数及活跃续租接入 Worker；Server 负责崩溃租约和二十四小时终态清理。等行锁后重新检查数据库当前时间；传输失租接入现有可恢复输入故障分类。字段含义、旧票据升级处理与剩余范围见 AGENT_TRANSFERS.md。

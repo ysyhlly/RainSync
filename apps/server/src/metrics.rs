@@ -53,6 +53,30 @@ impl Metrics {
 pub async fn endpoint(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     admin(&auth(&app, &h, false).await?)?;
     let mut text = app.metrics.render();
+    let (actors, connections, queue_total, queue_max) = {
+        let rooms = app.rooms.lock().await;
+        (
+            rooms.len(),
+            rooms
+                .values()
+                .map(|h| h.connected_receivers())
+                .sum::<usize>(),
+            rooms
+                .values()
+                .map(|h| h.command_queue_depth())
+                .sum::<usize>(),
+            rooms
+                .values()
+                .map(|h| h.command_queue_depth())
+                .max()
+                .unwrap_or(0),
+        )
+    };
+    text += &format!(
+        "# TYPE rainsync_room_actors gauge\nrainsync_room_actors {actors}\n# TYPE rainsync_control_connections gauge\nrainsync_control_connections {connections}\n# TYPE rainsync_control_queue_depth gauge\nrainsync_control_queue_depth {queue_total}\n# TYPE rainsync_control_queue_max_depth gauge\nrainsync_control_queue_max_depth {queue_max}\n# TYPE rainsync_db_pool_connections gauge\nrainsync_db_pool_connections {}\n# TYPE rainsync_db_pool_idle_connections gauge\nrainsync_db_pool_idle_connections {}\n",
+        app.db.size(),
+        app.db.num_idle()
+    );
     let rooms: i64 = sqlx::query_scalar("SELECT count(*) FROM rooms")
         .fetch_one(&app.db)
         .await?;

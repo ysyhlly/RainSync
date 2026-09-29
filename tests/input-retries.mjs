@@ -14,11 +14,20 @@ import { relayCancellation } from "./relay-cancellation.mjs";
 import { agentRelay } from "./agent-relay.mjs";
 const cancellation = process.argv.includes("--relay-cancel");
 const realAgent = process.argv.includes("--agent-relay");
-const nas = process.argv.includes("--nas") || cancellation || realAgent;
+const sourcePlayback = process.argv.includes("--source-version-playback");
+const nas =
+  process.argv.includes("--nas") || cancellation || realAgent || sourcePlayback;
 assert.ok(
   process.argv
     .slice(2)
-    .every((arg) => ["--nas", "--relay-cancel", "--agent-relay"].includes(arg)),
+    .every((arg) =>
+      [
+        "--nas",
+        "--relay-cancel",
+        "--agent-relay",
+        "--source-version-playback",
+      ].includes(arg),
+    ),
 );
 const tag = process.env.WORKER_TEST_IMAGE ?? "rainsync-worker-validation:local";
 const docker = (...args) =>
@@ -135,6 +144,26 @@ async function transfer(request, attempt, workerBase) {
     socket.close();
     return;
   }
+  if (
+    [
+      "nas_source_changed",
+      "nas_source_version_required",
+      "nas_unknown_conflict",
+    ].includes(active.kind)
+  ) {
+    await send(
+      JSON.stringify({
+        status: 409,
+        error:
+          active.kind === "nas_unknown_conflict"
+            ? "private diagnostic"
+            : active.kind.slice(4),
+        "content-length": "0",
+      }),
+    );
+    socket.close();
+    return;
+  }
   const range = /^bytes=(\d+)-(\d*)$/.exec(request.range ?? "");
   const start = range ? Number(range[1]) : 0;
   const end = range?.[2]
@@ -150,7 +179,12 @@ async function transfer(request, attempt, workerBase) {
   await send(
     JSON.stringify({
       status: range ? 206 : 200,
-      source_version: request.source_version,
+      source_version:
+        active.kind === "nas_version_missing"
+          ? undefined
+          : active.kind === "nas_version_mismatch"
+            ? `stat-v1:${"1".repeat(64)}`
+            : request.source_version,
       "content-length": String(excess ? 1 : end - start + 1),
       "content-type": "video/mp4",
       "accept-ranges": "bytes",
@@ -388,6 +422,8 @@ try {
     "-p",
     "127.0.0.1::8080",
     ...env,
+    "-e",
+    `WORKER_URL=http://${worker}:8081`,
     tag,
     "rainsync-server",
   );
@@ -401,7 +437,7 @@ try {
   }, "Server ready");
   let cookie = "",
     csrf = "";
-  async function api(path, body, method = "POST") {
+  async function apiResponse(path, body, method = "POST") {
     const r = await fetch(base + "/api/v1" + path, {
       method,
       headers: {
@@ -414,6 +450,10 @@ try {
     });
     if (r.headers.has("set-cookie"))
       cookie = r.headers.get("set-cookie").split(";")[0];
+    return r;
+  }
+  async function api(path, body, method = "POST") {
+    const r = await apiResponse(path, body, method);
     const v = await r.json();
     assert.equal(r.status, 200, JSON.stringify(v));
     return v;
@@ -447,7 +487,7 @@ try {
     "rainsync-media-worker",
   );
   const workerBase = `http://${docker("port", worker, "8081/tcp")}`;
-  if (nas && !cancellation && !realAgent)
+  if (nas && !cancellation && !realAgent && !sourcePlayback)
     transferPoll = setInterval(() => {
       if (!active) return;
       try {
@@ -529,7 +569,23 @@ try {
         revoke: () => api(`/agents/${agentId}`, undefined, "DELETE"),
       })),
     );
-  for (const kind of cancellation || realAgent
+  if (sourcePlayback) {
+    const { sourceVersionPlayback } =
+      await import("./source-version-playback.mjs");
+    report.cases.push(
+      ...(await sourceVersionPlayback({
+        workerBase,
+        sql,
+        encrypt,
+        userId,
+        roomId: room.id,
+        agentId,
+        fixture,
+        playback: (body) => apiResponse("/playback-sessions", body),
+      })),
+    );
+  }
+  for (const kind of cancellation || realAgent || sourcePlayback
     ? []
     : process.env.INPUT_CASE
       ? [process.env.INPUT_CASE]
@@ -545,6 +601,12 @@ try {
             "nas_denied",
             "nas_excess",
             "nas_malformed",
+            "nas_source_changed",
+            "nas_source_version_required",
+            "nas_version_mismatch",
+            "nas_version_missing",
+            "nas_grant_version_missing",
+            "nas_unknown_conflict",
             "nas_revoked",
             "nas_ping",
           ]
@@ -571,7 +633,10 @@ try {
             job_id: id,
             agent_id: agentId,
             resource: "input.mp4",
-            source_version: `stat-v1:${"0".repeat(64)}`,
+            source_version:
+              kind === "nas_grant_version_missing"
+                ? undefined
+                : `stat-v1:${"0".repeat(64)}`,
           }
         : {
             kind: "http",
@@ -640,8 +705,19 @@ try {
     );
     if (kind.endsWith("exhausted"))
       assert.equal(state.error, "upstream_transport_retry_exhausted");
+    const sourceError = ["nas_source_changed", "nas_version_mismatch"].includes(
+      kind,
+    )
+      ? "source_changed"
+      : [
+            "nas_source_version_required",
+            "nas_version_missing",
+            "nas_grant_version_missing",
+          ].includes(kind)
+        ? "source_version_required"
+        : undefined;
     if (expected === "failed" && !kind.endsWith("exhausted"))
-      assert.equal(state.error, "media_job_failed");
+      assert.equal(state.error, sourceError ?? "media_job_failed");
     const entry =
       workerBase + `/media-delivery/${id}/index.m3u8?token=${token}`;
     const response = await fetch(entry);
@@ -673,14 +749,25 @@ try {
         "published output actually decodes video frames",
       );
     } else {
+      assert.equal(response.status, sourceError ? 409 : 502);
       const error = await response.json();
       assert.equal(
         error.error.code,
-        kind.endsWith("exhausted")
-          ? "MEDIA_JOB_RETRY_EXHAUSTED"
-          : "MEDIA_JOB_FAILED",
+        sourceError
+          ? sourceError.toUpperCase()
+          : kind.endsWith("exhausted")
+            ? "MEDIA_JOB_RETRY_EXHAUSTED"
+            : "MEDIA_JOB_FAILED",
       );
       assert.equal(error.error.retryable, false);
+      if (sourceError) {
+        assert.ok(
+          outputs.every((o) => o.status === "failed"),
+          "no stale source output published",
+        );
+        if (kind === "nas_grant_version_missing")
+          assert.equal(active.requests.length, 0);
+      }
     }
     assert.equal(
       sql(`SELECT count(*) FROM cache_write_reservations WHERE job_id='${id}'`),

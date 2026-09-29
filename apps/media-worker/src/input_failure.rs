@@ -5,15 +5,21 @@ use std::{
         atomic::{AtomicU8, Ordering},
     },
 };
+use tokio::sync::watch;
 use uuid::Uuid;
 
 /// Only the encoder's unguessable execution token can associate proxy failures
 /// with a running attempt. Browser/probe requests and old streams cannot poison
-/// a newer execution. Stores classification only, never URLs or response text.
+/// a newer execution. Stores classification and lifetime only, never URLs or response text.
 #[derive(Clone, Default)]
 pub struct Registry(Arc<Mutex<HashMap<Uuid, (Uuid, Observation)>>>);
-#[derive(Clone, Default)]
-pub struct Observation(Arc<AtomicU8>);
+#[derive(Clone)]
+pub struct Observation(Arc<AtomicU8>, watch::Sender<bool>);
+impl Default for Observation {
+    fn default() -> Self {
+        Self(Default::default(), watch::channel(false).0)
+    }
+}
 pub struct Guard {
     registry: Registry,
     token: Uuid,
@@ -47,11 +53,25 @@ impl Registry {
     }
 }
 impl Observation {
+    pub async fn stopped(&self) {
+        let mut stop = self.1.subscribe();
+        if !*stop.borrow_and_update() {
+            let _ = stop.changed().await;
+        }
+    }
     pub fn transient(&self) {
         self.0.fetch_max(1, Ordering::Relaxed);
     }
     pub fn permanent(&self) {
-        self.0.store(2, Ordering::Relaxed);
+        self.0.fetch_max(2, Ordering::Relaxed);
+    }
+    // Preserve a confirmed source conflict across concurrent generic failures.
+    // A transport retry cannot repair a grant pinned to the previous version.
+    pub fn source_version_required(&self) {
+        self.0.fetch_max(3, Ordering::Relaxed);
+    }
+    pub fn source_changed(&self) {
+        self.0.fetch_max(4, Ordering::Relaxed);
     }
     pub fn status(&self, status: reqwest::StatusCode) {
         if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
@@ -84,6 +104,8 @@ impl Guard {
         match self.observation.0.load(Ordering::Relaxed) {
             1 => Some(JobFailure::UpstreamTransient),
             2 => Some(JobFailure::ExecutionFailed),
+            3 => Some(JobFailure::SourceVersionRequired),
+            4 => Some(JobFailure::SourceChanged),
             _ => None,
         }
     }
@@ -98,6 +120,9 @@ impl Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         self.registry.0.lock().unwrap().remove(&self.token);
+        // The HTTP body may outlive its FFmpeg consumer under backpressure.
+        // Cancel this execution's existing streams independently of body Drop.
+        self.observation.1.send_replace(true);
     }
 }
 #[cfg(test)]
@@ -176,5 +201,61 @@ mod tests {
         assert!(!next.retryable());
         drop(next);
         assert!(registry.0.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn execution_drop_stops_old_streams_but_not_the_next_attempt_or_direct_requests() {
+        let registry = Registry::default();
+        let id = Uuid::new_v4();
+        let old = registry.register(id);
+        let token = old.token();
+        let old_stream = registry.observe(id, Some(token));
+        let next = registry.register(id);
+        let current = registry.observe(id, Some(next.token()));
+        drop(old);
+        tokio::time::timeout(std::time::Duration::from_millis(500), old_stream.stopped())
+            .await
+            .unwrap();
+        for unrelated in [
+            current.clone(),
+            registry.observe(id, None),
+            registry.observe(id, Some(token)),
+            registry.observe(Uuid::new_v4(), Some(next.token())),
+        ] {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), unrelated.stopped())
+                    .await
+                    .is_err()
+            );
+        }
+        drop(next);
+        current.stopped().await;
+    }
+    #[test]
+    fn source_conflicts_survive_other_failures_and_stay_execution_scoped() {
+        use persistence::media_jobs::{JobFailure, terminal_error};
+        let registry = Registry::default();
+        let id = Uuid::new_v4();
+        for (changed, reason) in [(false, "source_version_required"), (true, "source_changed")] {
+            let guard = registry.register(id);
+            let observer = registry.observe(id, Some(guard.token()));
+            if changed {
+                observer.source_changed();
+            } else {
+                observer.source_version_required();
+            }
+            observer.permanent();
+            observer.transient();
+            assert_eq!(guard.failure().map(JobFailure::reason), Some(reason));
+            assert_eq!(terminal_error(Some(reason)), (409, reason));
+            assert!(!guard.retryable());
+            drop(guard);
+            let next = registry.register(id);
+            observer.source_changed();
+            assert!(next.failure().is_none());
+        }
+        assert_eq!(
+            terminal_error(Some("private upstream diagnostic")),
+            (502, "media_job_failed")
+        );
     }
 }

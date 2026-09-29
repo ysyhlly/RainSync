@@ -376,16 +376,36 @@ async fn prepare_playback(
         sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '1 minute')")
             .bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":app.encrypt(&resource)?})).execute(&mut *preparation).await?;
         preparation.commit().await?;
-        let probe = async {
+        let probe: Result<Value> = async {
             let base = std::env::var("WORKER_URL").unwrap_or("http://127.0.0.1:8081".into());
             let response = reqwest::Client::new()
                 .get(format!("{base}/media-delivery/{id}/probe"))
                 .query(&[("token", &t)])
                 .timeout(std::time::Duration::from_secs(35))
                 .send()
-                .await?
-                .error_for_status()?;
-            response.json::<Value>().await
+                .await
+                .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_probe_failed"))?;
+            if response.status() == StatusCode::CONFLICT {
+                let reason = match response.json::<protocol::ErrorResponse>().await {
+                    Ok(response) if response.error.code == protocol::ErrorCode::SourceChanged => {
+                        "source_changed"
+                    }
+                    Ok(response)
+                        if response.error.code == protocol::ErrorCode::SourceVersionRequired =>
+                    {
+                        "source_version_required"
+                    }
+                    _ => return Err(err(StatusCode::BAD_GATEWAY, "source_probe_failed")),
+                };
+                return Err(err(StatusCode::CONFLICT, reason));
+            }
+            if !response.status().is_success() {
+                return Err(err(StatusCode::BAD_GATEWAY, "source_probe_failed"));
+            }
+            response
+                .json::<Value>()
+                .await
+                .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_probe_failed"))
         }
         .await;
         // The preparation grant cannot linger after failure or while the final plan is validated.
@@ -393,7 +413,7 @@ async fn prepare_playback(
             .bind(id)
             .execute(&app.db)
             .await?;
-        meta = probe.map_err(|_| err(StatusCode::BAD_GATEWAY, "source_probe_failed"))?;
+        meta = probe?;
         duration = meta["format"]["duration"]
             .as_str()
             .and_then(|v| v.parse::<f64>().ok())

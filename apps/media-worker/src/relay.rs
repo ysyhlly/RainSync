@@ -48,7 +48,7 @@ pub async fn fetch(
         .as_str()
         .filter(|v| media_core::file_version::valid_file_version(v))
         .ok_or_else(|| {
-            input_failure.permanent();
+            input_failure.source_version_required();
             (StatusCode::CONFLICT, "source_version_required".into())
         })?
         .to_owned();
@@ -234,13 +234,28 @@ pub async fn connect(
             pending.input_failure.status(status);
             if status.is_success() && meta["source_version"].as_str() != Some(pending.source_version.as_str()) {
                 let reason = if meta["source_version"].as_str().is_none() { "source_version_required" } else { "source_changed" };
-                pending.input_failure.permanent();
+                if reason == "source_changed" {
+                    pending.input_failure.source_changed();
+                } else {
+                    pending.input_failure.source_version_required();
+                }
                 pending.state.fail(reason);
                 let _ = pending.headers.send(json!({"status":409,"content-length":"0","error":reason}));
                 return;
             }
             if !status.is_success() {
-                pending.state.fail(if status == StatusCode::CONFLICT && meta["error"] == "source_changed" {"source_changed"}else{"agent_http_error"});
+                let reason = match (status, meta["error"].as_str()) {
+                    (StatusCode::CONFLICT, Some("source_changed")) => {
+                        pending.input_failure.source_changed();
+                        "source_changed"
+                    }
+                    (StatusCode::CONFLICT, Some("source_version_required")) => {
+                        pending.input_failure.source_version_required();
+                        "source_version_required"
+                    }
+                    _ => "agent_http_error",
+                };
+                pending.state.fail(reason);
             }
             let streaming = tokio::time::timeout(std::time::Duration::from_secs(3), async {
                 let mut tx = app.db.begin().await?;
@@ -259,6 +274,8 @@ pub async fn connect(
             }
             let mut received = 0u64;
             let mut deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 let message = tokio::select! {
                     _ = pending.chunks.closed() => break,
@@ -274,11 +291,35 @@ pub async fn connect(
                         } else {
                             received += b.len() as u64;
                             let progressed = !b.is_empty();
-                            let sent = tokio::select! {
-                                _ = pending.state.stopped() => break,
-                                sent = pending.chunks.send(Ok(b.to_vec())) => sent,
+                            let send = pending.chunks.send(Ok(b.to_vec()));
+                            tokio::pin!(send);
+                            let sent = loop {
+                                tokio::select! {
+                                    biased;
+                                    _ = pending.state.stopped() => break None,
+                                    _ = pending.chunks.closed() => break None,
+                                    sent = &mut send => break Some(sent),
+                                    _ = heartbeat.tick() => {
+                                        // This exact Ping is evidence of local
+                                        // queue backpressure under a live owner,
+                                        // not evidence of Agent byte progress.
+                                        // Lease failure or HTTP cancellation
+                                        // stops it even while the queue is full.
+                                        let ping = tokio::select! {
+                                            biased;
+                                            _ = pending.state.stopped() => break None,
+                                            _ = pending.chunks.closed() => break None,
+                                            ping = tokio::time::timeout(std::time::Duration::from_secs(3), socket.send(Message::Ping(b"rainsync-backpressure-v1".to_vec().into()))) => ping,
+                                        };
+                                        if !matches!(ping, Ok(Ok(()))) {
+                                            pending.input_failure.transient();
+                                            pending.state.fail("agent_backpressure_heartbeat_failed");
+                                            break None;
+                                        }
+                                    }
+                                }
                             };
-                            if sent.is_err() {
+                            if !matches!(sent, Some(Ok(()))) {
                                 break;
                             }
                             // Waiting for the bounded consumer queue is local
@@ -301,13 +342,23 @@ pub async fn connect(
                     _ => break,
                 };
                 pending.state.fail(reason);
-                let _ = pending
-                    .chunks
-                    .send(Err(std::io::Error::other(reason)))
-                    .await;
+                send_error(&pending.chunks, &pending.state, reason).await;
                 break;
             }
         }))
+}
+
+async fn send_error(
+    chunks: &mpsc::Sender<std::io::Result<Vec<u8>>>,
+    state: &transfer_state::State,
+    reason: &'static str,
+) {
+    tokio::select! {
+        biased;
+        _ = state.stopped() => {},
+        _ = chunks.closed() => {},
+        _ = tokio::time::timeout(std::time::Duration::from_secs(1), chunks.send(Err(std::io::Error::other(reason)))) => {},
+    }
 }
 
 fn metadata(meta: &Value) -> Option<(StatusCode, u64)> {
@@ -325,6 +376,41 @@ fn metadata(meta: &Value) -> Option<(StatusCode, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn full_error_queue_releases_on_execution_end_without_dropping_the_body() {
+        let registry = input_failure::Registry::default();
+        let id = Uuid::new_v4();
+        let execution = registry.register(id);
+        let state = transfer_state::State::observed(registry.observe(id, Some(execution.token())));
+        let (chunks, mut retained_body) = mpsc::channel(1);
+        chunks.send(Ok(vec![1])).await.unwrap();
+        let sending = send_error(&chunks, &state, "truncated_agent_data");
+        tokio::pin!(sending);
+        tokio::select! {
+            _ = &mut sending => panic!("full queue unexpectedly accepted terminal error"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {},
+        }
+        drop(execution);
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut sending)
+            .await
+            .unwrap();
+        assert_eq!(retained_body.recv().await.unwrap().unwrap(), vec![1]);
+        assert!(retained_body.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn full_error_queue_has_a_deadline_for_a_direct_request() {
+        let state = transfer_state::State::default();
+        let (chunks, mut retained_body) = mpsc::channel(1);
+        chunks.send(Ok(vec![1])).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            send_error(&chunks, &state, "truncated_agent_data"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retained_body.recv().await.unwrap().unwrap(), vec![1]);
+        assert!(retained_body.try_recv().is_err());
+    }
     #[tokio::test]
     async fn cancelled_registration_releases_pending_channels_before_database_cleanup() {
         let registry = Registry::default();

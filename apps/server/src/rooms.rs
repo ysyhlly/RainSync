@@ -9,6 +9,14 @@ pub struct Handle {
     tx: mpsc::Sender<Request>,
     events: broadcast::Sender<Value>,
 }
+impl Handle {
+    pub fn command_queue_depth(&self) -> usize {
+        self.tx.max_capacity() - self.tx.capacity()
+    }
+    pub fn connected_receivers(&self) -> usize {
+        self.events.receiver_count()
+    }
+}
 struct Request {
     user: User,
     command: Command,

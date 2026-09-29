@@ -2,7 +2,13 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::io::{Read, Seek};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tokio::sync::Semaphore;
 
 #[derive(Debug)]
@@ -34,11 +40,40 @@ fn content_type(path: &std::path::Path) -> &'static str {
     }
 }
 
+// Sent by Worker only while its bounded consumer queue is backpressured and
+// its transfer owner remains live. Ordinary Ping/Pong cannot excuse a stall.
+const BACKPRESSURE_HEARTBEAT: &[u8] = b"rainsync-backpressure-v1";
+
+async fn send_with_backpressure_health<F>(
+    send: F,
+    signals: &mut tokio::sync::watch::Receiver<tokio::time::Instant>,
+) -> Result<()>
+where
+    F: std::future::Future<Output = std::result::Result<(), tokio_tungstenite::tungstenite::Error>>,
+{
+    let idle = std::time::Duration::from_secs(30);
+    let mut deadline = tokio::time::Instant::now() + idle;
+    // Keep the same send future: cancelling and retrying it could duplicate a
+    // partially written frame. The receiver is polled independently below.
+    tokio::pin!(send);
+    loop {
+        tokio::select! {
+            result = &mut send => { result?; return Ok(()) }
+            changed = signals.changed() => {
+                changed.context("agent_backpressure_peer_lost")?;
+                deadline = deadline.max(*signals.borrow_and_update() + idle);
+            }
+            _ = tokio::time::sleep_until(deadline) => anyhow::bail!("agent_write_progress_timeout"),
+        }
+    }
+}
+
 async fn transfer(root: PathBuf, request: Value) -> Result<()> {
     let url = request["data_url"].as_str().context("data_url")?;
     let (socket, _) =
         tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(url)).await??;
     let (mut writer, mut reader) = socket.split();
+    let (liveness, mut signals) = tokio::sync::watch::channel(tokio::time::Instant::now());
     let mut headers_started = false;
     let work = async {
         if request["busy"].as_bool().unwrap_or(false) {
@@ -114,11 +149,11 @@ async fn transfer(root: PathBuf, request: Value) -> Result<()> {
                 })
                 .await??;
                 let n = buf.len();
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
+                send_with_backpressure_health(
                     writer.send(Message::Binary(buf.into())),
+                    &mut signals,
                 )
-                .await??;
+                .await?;
                 remaining -= n as u64;
             }
         }
@@ -129,7 +164,17 @@ async fn transfer(root: PathBuf, request: Value) -> Result<()> {
     let result: Result<()> = tokio::select! {
         result = work => result,
         _ = async {
-            while let Some(Ok(Message::Ping(_) | Message::Pong(_))) = reader.next().await {}
+            while let Some(Ok(message)) = reader.next().await {
+                match message {
+                    Message::Ping(payload) => {
+                        if payload.as_ref() == BACKPRESSURE_HEARTBEAT {
+                            liveness.send_replace(tokio::time::Instant::now());
+                        }
+                    }
+                    Message::Pong(_) => {},
+                    _ => break,
+                }
+            }
         } => Ok(()),
     };
     if result.is_err() && !headers_started {
@@ -156,14 +201,21 @@ type IndexPage = (Vec<Value>, bool);
 fn index(
     root: &std::path::Path,
     pages: &tokio::sync::mpsc::Sender<Result<IndexPage>>,
+    cancelled: &AtomicBool,
 ) -> Result<()> {
     let mut stack = vec![root.to_path_buf()];
     let mut items = vec![];
     let mut bytes = 0;
     while let Some(dir) = stack.pop() {
+        anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "index_cancelled");
         for entry in std::fs::read_dir(dir)? {
+            anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "index_cancelled");
             let e = entry?;
-            let ty = e.file_type()?;
+            let ty = match e.file_type() {
+                Ok(ty) => ty,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             if ty.is_symlink() {
                 continue;
             }
@@ -189,9 +241,17 @@ fn index(
                 title.chars().count() <= 1024 && resource.chars().count() <= 16384,
                 "index_path_too_long"
             );
-            let version =
-                media_core::file_version::snapshot_file(&std::fs::File::open(&p)?)?.version;
-            let item = json!({"title":title,"resource":resource,"source_version":version});
+            // A known individual file may be unavailable without invalidating
+            // enumeration of the rest of the library. Directory errors still
+            // abort the snapshot: its missing entries cannot justify deletion.
+            let version = match std::fs::File::open(&p) {
+                Ok(file) => media_core::file_version::snapshot_file(&file)
+                    .ok()
+                    .map(|snapshot| snapshot.version),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => None,
+            };
+            let item = json!({"title":title,"resource":resource,"available":version.is_some(),"source_version":version});
             let size = serde_json::to_vec(&item)?.len() + 1;
             if !items.is_empty() && (items.len() >= 128 || bytes + size > 128 * 1024) {
                 pages.blocking_send(Ok((std::mem::take(&mut items), false)))?;
@@ -204,6 +264,62 @@ fn index(
     pages.blocking_send(Ok((items, true)))?;
     Ok(())
 }
+
+struct IndexScan {
+    incoming: tokio::sync::mpsc::Receiver<Result<IndexPage>>,
+    snapshot: String,
+    sequence: u64,
+    awaiting_ack: bool,
+    final_page: bool,
+    aborting: bool,
+    sent_at: tokio::time::Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for IndexScan {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+fn start_index(root: PathBuf, scans: Arc<Semaphore>) -> Option<IndexScan> {
+    // The permit belongs to the actual blocking task, including across control
+    // reconnects. A cancelled task stuck in filesystem I/O must not cause new
+    // scans to accumulate while it is still alive.
+    let permit = scans.try_acquire_owned().ok()?;
+    let (pages, incoming) = tokio::sync::mpsc::channel(2);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let scan_cancelled = cancelled.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if let Err(error) = index(&root, &pages, &scan_cancelled) {
+            let _ = pages.blocking_send(Err(error));
+        }
+    });
+    Some(IndexScan {
+        incoming,
+        snapshot: uuid::Uuid::new_v4().to_string(),
+        sequence: 0,
+        awaiting_ack: false,
+        final_page: false,
+        aborting: false,
+        sent_at: tokio::time::Instant::now(),
+        cancelled,
+    })
+}
+
+fn index_interval_seconds() -> Result<u64> {
+    let seconds = std::env::var("AGENT_INDEX_INTERVAL_SECS")
+        .unwrap_or_else(|_| "60".into())
+        .parse::<u64>()
+        .context("invalid_agent_index_interval")?;
+    anyhow::ensure!(
+        (5..=86400).contains(&seconds),
+        "invalid_agent_index_interval"
+    );
+    Ok(seconds)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().init();
@@ -239,6 +355,8 @@ async fn main() -> Result<()> {
     };
     let slots = Arc::new(Semaphore::new(16));
     let rejections = Arc::new(Semaphore::new(4));
+    let scans = Arc::new(Semaphore::new(1));
+    let index_interval = std::time::Duration::from_secs(index_interval_seconds()?);
     loop {
         let url = format!(
             "{}/api/v1/agents/ws",
@@ -251,43 +369,46 @@ async fn main() -> Result<()> {
             .insert("Authorization", format!("Bearer {token}").parse()?);
         if let Ok((mut socket, _)) = connect_async(req).await {
             let mut transfers = tokio::task::JoinSet::new();
-            let (pages, mut incoming) = tokio::sync::mpsc::channel(2);
-            let scan_root = root.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Err(error) = index(&scan_root, &pages) {
-                    let _ = pages.blocking_send(Err(error));
-                }
-            });
-            let mut sequence = 0u64;
-            let mut awaiting_ack = false;
-            let mut sent_at = tokio::time::Instant::now();
-            let mut finished = false;
-            let snapshot = format!(
-                "{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_nanos()
-            );
+            let mut scan: Option<IndexScan> = None;
+            let mut refresh = tokio::time::interval(index_interval);
+            refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
                     _ = transfers.join_next(), if !transfers.is_empty() => {}
-                    page = incoming.recv(), if !awaiting_ack && !finished => {
-                        let Some(Ok((items, final_page))) = page else { break };
-                        let message = json!({"type":"INDEX","snapshot":snapshot,"sequence":sequence,"final":final_page,"items":items});
-                        if socket.send(Message::Text(message.to_string().into())).await.is_err() { break }
-                        awaiting_ack = true;
-                        sent_at = tokio::time::Instant::now();
-                        finished = final_page;
+                    _ = refresh.tick() => {
+                        if scan.is_none() { scan = start_index(root.clone(), scans.clone()); }
                     }
-                    _=heartbeat.tick()=>{if awaiting_ack && sent_at.elapsed().as_secs() > 60 { break }
-                        if socket.send(Message::Text(json!({"type":"HEARTBEAT"}).to_string().into())).await.is_err(){break}}
+                    page = async { scan.as_mut().unwrap().incoming.recv().await }, if scan.as_ref().is_some_and(|s| !s.awaiting_ack) => {
+                        let current = scan.as_mut().unwrap();
+                        let message = match page {
+                            Some(Ok((items, final_page))) => {
+                                current.final_page = final_page;
+                                json!({"type":"INDEX","snapshot":current.snapshot,"sequence":current.sequence,"final":final_page,"items":items})
+                            }
+                            _ => {
+                                tracing::warn!("index scan incomplete; retaining previous snapshot");
+                                current.aborting = true;
+                                json!({"type":"INDEX_ABORT","snapshot":current.snapshot,"sequence":current.sequence})
+                            }
+                        };
+                        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3), socket.send(Message::Text(message.to_string().into()))).await, Ok(Ok(()))) { break }
+                        current.awaiting_ack = true;
+                        current.sent_at = tokio::time::Instant::now();
+                    }
+                    _=heartbeat.tick()=>{
+                        if scan.as_ref().is_some_and(|s| s.awaiting_ack && s.sent_at.elapsed().as_secs() > 60) { break }
+                        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3), socket.send(Message::Text(json!({"type":"HEARTBEAT"}).to_string().into()))).await, Ok(Ok(()))) { break }
+                    }
                     message=socket.next()=>{let text = match message { Some(Ok(Message::Text(text))) => text, Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue, _ => break };let Ok(v)=serde_json::from_str::<Value>(&text)else{continue};
                         if v["type"] == "INDEX_ERROR" { break }
-                        if v["type"] == "INDEX_ACK" {
-                            if !awaiting_ack || v["sequence"].as_u64() != Some(sequence) { break }
-                            awaiting_ack = false;
-                            sequence += 1;
+                        if v["type"] == "INDEX_ACK" || v["type"] == "INDEX_ABORT_ACK" {
+                            let Some(current) = scan.as_mut() else { break };
+                            if !current.awaiting_ack || v["sequence"].as_u64() != Some(current.sequence)
+                                || (!v["snapshot"].is_null() && v["snapshot"] != current.snapshot)
+                                || (v["type"] == "INDEX_ABORT_ACK") != current.aborting { break }
+                            if current.aborting || current.final_page { scan = None; }
+                            else { current.awaiting_ack = false; current.sequence += 1; }
                             continue
                         }
                         if v["type"]=="TRANSFER"{let mut request=v["request"].clone();
@@ -308,6 +429,7 @@ async fn main() -> Result<()> {
                         transfers.spawn(async move { let _permit=permit; if transfer(root,request).await.is_err(){tracing::warn!("transfer ended with error")} });}}
                 }
             }
+            drop(scan);
             // Control loss includes revoked credentials. No old transfer may
             // outlive that authorized connection or retain its admission slot.
             transfers.shutdown().await;
@@ -349,7 +471,7 @@ mod tests {
         }
         let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
         let scan_root = root.clone();
-        let scan = std::thread::spawn(move || index(&scan_root, &sender));
+        let scan = std::thread::spawn(move || index(&scan_root, &sender, &AtomicBool::new(false)));
         let (mut count, mut pages, mut final_seen) = (0, 0, false);
         while let Some(page) = receiver.blocking_recv() {
             let (items, done) = page.unwrap();
@@ -374,6 +496,6 @@ mod tests {
         );
         std::fs::remove_dir_all(&root).unwrap();
         let (sender, _) = tokio::sync::mpsc::channel(1);
-        assert!(index(&root, &sender).is_err());
+        assert!(index(&root, &sender, &AtomicBool::new(false)).is_err());
     }
 }

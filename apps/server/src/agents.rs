@@ -99,7 +99,7 @@ pub async fn connect(
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {},
                     Some(Ok(Message::Text(text))) => {
                         let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
-                        if value["type"] == "INDEX" && pages.try_send(value).is_err() { break }
+                        if matches!(value["type"].as_str(), Some("INDEX" | "INDEX_ABORT")) && pages.try_send(value).is_err() { break }
                     }
                     Some(Ok(Message::Binary(_))) => {},
                     _ => break,
@@ -137,6 +137,15 @@ async fn ingest_index(
             return Ok(());
         };
         let snapshot = first["snapshot"].clone();
+        if first["type"] == "INDEX_ABORT" {
+            anyhow::ensure!(
+                first["sequence"].as_u64() == Some(0),
+                "invalid_index_sequence"
+            );
+            acks.send(json!({"type":"INDEX_ABORT_ACK","snapshot":snapshot,"sequence":0}))
+                .await?;
+            continue;
+        }
         let mut page = first;
         let mut sequence = 0u64;
         let mut tx = app.db.begin().await?;
@@ -144,12 +153,20 @@ async fn ingest_index(
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
-        sqlx::query("CREATE TEMP TABLE agent_index_page (resource text PRIMARY KEY, title text NOT NULL, source_version text) ON COMMIT DROP").execute(&mut *tx).await?;
+        sqlx::query("CREATE TEMP TABLE agent_index_page (resource text PRIMARY KEY, title text NOT NULL, source_version text, available boolean NOT NULL) ON COMMIT DROP").execute(&mut *tx).await?;
         loop {
             anyhow::ensure!(
                 page["snapshot"] == snapshot && page["sequence"].as_u64().unwrap_or(0) == sequence,
                 "invalid_index_sequence"
             );
+            if page["type"] == "INDEX_ABORT" {
+                tx.rollback().await?;
+                acks.send(
+                    json!({"type":"INDEX_ABORT_ACK","snapshot":snapshot,"sequence":sequence}),
+                )
+                .await?;
+                break;
+            }
             let items = page["items"]
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("invalid_index"))?;
@@ -175,19 +192,25 @@ async fn ingest_index(
                         "invalid_source_version"
                     );
                 }
+                anyhow::ensure!(
+                    item["available"].is_null() || item["available"].is_boolean(),
+                    "invalid_index_availability"
+                );
             }
-            sqlx::query("INSERT INTO agent_index_page SELECT resource,title,source_version FROM jsonb_to_recordset($1) AS x(resource text,title text,source_version text) ON CONFLICT(resource) DO UPDATE SET title=EXCLUDED.title,source_version=EXCLUDED.source_version").bind(&page["items"]).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO agent_index_page SELECT resource,title,source_version,COALESCE(available,true) FROM jsonb_to_recordset($1) AS x(resource text,title text,source_version text,available boolean) ON CONFLICT(resource) DO UPDATE SET title=EXCLUDED.title,source_version=EXCLUDED.source_version,available=EXCLUDED.available").bind(&page["items"]).execute(&mut *tx).await?;
             let final_page = page["final"].as_bool().unwrap_or(snapshot.is_null());
             if final_page {
                 sqlx::query("UPDATE media_items SET available=false WHERE source_id=$1 AND NOT EXISTS(SELECT 1 FROM agent_index_page i WHERE i.resource=media_items.resource)").bind(id).execute(&mut *tx).await?;
-                sqlx::query("INSERT INTO media_items(id,source_id,title,resource,source_version) SELECT gen_random_uuid(),$1,title,resource,source_version FROM agent_index_page ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,available=true,source_version=EXCLUDED.source_version,metadata=CASE WHEN media_items.source_version IS DISTINCT FROM EXCLUDED.source_version THEN '{}'::jsonb ELSE media_items.metadata END,duration_ms=CASE WHEN media_items.source_version IS DISTINCT FROM EXCLUDED.source_version THEN NULL ELSE media_items.duration_ms END").bind(id).execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO media_items(id,source_id,title,resource,source_version,available) SELECT gen_random_uuid(),$1,title,resource,source_version,available FROM agent_index_page ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,available=EXCLUDED.available,source_version=EXCLUDED.source_version,metadata=CASE WHEN media_items.source_version IS DISTINCT FROM EXCLUDED.source_version THEN '{}'::jsonb ELSE media_items.metadata END,duration_ms=CASE WHEN media_items.source_version IS DISTINCT FROM EXCLUDED.source_version THEN NULL ELSE media_items.duration_ms END").bind(id).execute(&mut *tx).await?;
                 tx.commit().await?;
-                acks.send(json!({"type":"INDEX_ACK","sequence":sequence,"final":true}))
+                acks.send(json!({"type":"INDEX_ACK","snapshot":snapshot,"sequence":sequence,"final":true}))
                     .await?;
                 break;
             }
-            acks.send(json!({"type":"INDEX_ACK","sequence":sequence,"final":false}))
-                .await?;
+            acks.send(
+                json!({"type":"INDEX_ACK","snapshot":snapshot,"sequence":sequence,"final":false}),
+            )
+            .await?;
             sequence += 1;
             page = tokio::time::timeout(std::time::Duration::from_secs(60), pages.recv())
                 .await?

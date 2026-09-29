@@ -36,6 +36,7 @@ impl State {
             .unwrap()
             .terminal
             .get_or_insert(("cancelled", Some("consumer_cancelled")));
+        self.stop.send_replace(true);
     }
     pub fn fail(&self, reason: &'static str) {
         if reason == "transfer_lease_lost" {
@@ -64,7 +65,10 @@ impl State {
     pub async fn stopped(&self) {
         let mut stop = self.stop.subscribe();
         if !*stop.borrow_and_update() {
-            let _ = stop.changed().await;
+            tokio::select! {
+                _ = stop.changed() => {},
+                _ = self.input_failure.stopped() => {},
+            }
         }
     }
 }
@@ -119,6 +123,10 @@ pub async fn own(
         tokio::select! {
             biased;
             _ = &mut cancelled => break,
+            _ = state.input_failure.stopped() => {
+                state.cancel();
+                break;
+            },
             _ = tick.tick() => {
                 let bytes = state.progress.lock().unwrap().bytes;
                 let renewed = tokio::time::timeout(Duration::from_secs(3), async {
@@ -163,6 +171,23 @@ pub async fn own(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn execution_end_stops_a_live_transfer_even_with_its_body_retained() {
+        let registry = input_failure::Registry::default();
+        let id = Uuid::new_v4();
+        let execution = registry.register(id);
+        let state = State::observed(registry.observe(id, Some(execution.token())));
+        let retained_body = state.clone();
+        state.fail("source_changed");
+        drop(execution);
+        tokio::time::timeout(Duration::from_millis(500), retained_body.stopped())
+            .await
+            .unwrap();
+        state.cancel();
+        let progress = state.progress.lock().unwrap();
+        assert_eq!(progress.terminal, Some(("failed", Some("source_changed"))));
+    }
 
     #[test]
     fn terminal_outcome_survives_late_cleanup_and_partial_delivery_is_not_success() {

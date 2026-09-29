@@ -85,9 +85,23 @@ async fn delivery(
             .probes
             .try_acquire()
             .map_err(|_| (StatusCode::TOO_MANY_REQUESTS, "probe_busy".into()))?;
-        let metadata = media_core::probe(&source_url(id, &q.token).map_err(failure)?)
-            .await
-            .map_err(failure)?;
+        let observed = app.input_failures.register(id);
+        let source = format!(
+            "{}&execution={}",
+            source_url(id, &q.token).map_err(failure)?,
+            observed.token()
+        );
+        let metadata = media_core::probe(&source).await;
+        if let Some(reason) = match observed.failure() {
+            Some(persistence::media_jobs::JobFailure::SourceChanged) => Some("source_changed"),
+            Some(persistence::media_jobs::JobFailure::SourceVersionRequired) => {
+                Some("source_version_required")
+            }
+            _ => None,
+        } {
+            return Err((StatusCode::CONFLICT, reason.into()));
+        }
+        let metadata = metadata.map_err(failure)?;
         return Ok(axum::Json(metadata).into_response());
     }
     if path.starts_with("subtitle-") && path.ends_with(".vtt") {

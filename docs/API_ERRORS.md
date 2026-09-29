@@ -23,6 +23,8 @@ HTTP 状态仍表达请求结果。响应中的 `request_id` 由服务端生成�
 
 Worker 任务终态补充：`CACHE_CAPACITY_EXCEEDED`（503）、`MEDIA_JOB_RETRY_EXHAUSTED`（502）和 `MEDIA_JOB_CANCELLED`（410）均为 `retryable: false`。这些任务已经终止，重复读取相同媒体 URL 不能恢复；容量不足需清理后重新发起播放。未知持久化原因只返回 `MEDIA_JOB_FAILED`，不回显数据库原文。此处定义 HTTP 契约，不代表浏览器原生 HLS 会把 JSON 错误正文展示给用户。
 
+NAS 的自动探测、直读和转码任务终态均保留 `SOURCE_CHANGED` / `SOURCE_VERSION_REQUIRED`（409、`retryable: false`）。前者需 Agent 重新连接更新索引后重新播放，后者需升级 Agent 并更新索引。固定错误不会被同时发生的网络或通用失败覆盖，不用旧请求编号重复探测旧版本；未知 Agent 错误仍按原有通用契约脱敏。
+
 | 情况 | 处理 |
 |---|---|
 | `LOGIN_REQUIRED` / `SESSION_EXPIRED` / `NOT_A_MEMBER` / `ORIGIN_REJECTED` | 停止自动重连并提示登录或连接授权问题 |
