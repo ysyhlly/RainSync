@@ -3,9 +3,12 @@ mod cache_outputs;
 mod cache_read;
 mod file_delivery;
 use media_core::child_process;
+use media_core::runtime_metrics::{Cache, CacheDecision, Layer};
 mod http_identity;
 mod http_media;
 mod input_failure;
+mod metric_stream;
+mod metrics;
 mod output_decode;
 mod output_publish;
 mod output_read;
@@ -38,6 +41,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct App {
     readiness: readiness::Runtime,
+    metrics: media_core::runtime_metrics::RuntimeMetrics,
     db: PgPool,
     key: Arc<Aes256Gcm>,
     cache: PathBuf,
@@ -88,9 +92,43 @@ async fn delivery(
     let deliveries = app.deliveries.clone();
     let token_hash = hash(&q.token);
     let input_cancel = app.input_failures.observe(id, q.execution);
+    let measure = method == axum::http::Method::GET && path != "probe";
+    let metrics = app.metrics.clone();
     let response = delivery_response(app, id, path, q, h, method);
-    playback_access::protect(response, pool, id, token_hash, deliveries, input_cancel).await
+    let response =
+        playback_access::protect(response, pool, id, token_hash, deliveries, input_cancel).await?;
+    if !measure || !response.status().is_success() || response.status() == StatusCode::NO_CONTENT {
+        return Ok(response);
+    }
+    let cache = response
+        .extensions()
+        .get::<Cache>()
+        .copied()
+        .unwrap_or(Cache::NotHit);
+    let body_length = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let (parts, body) = response.into_parts();
+    Ok(Response::from_parts(
+        parts,
+        Body::from_stream(
+            metric_stream::wrap(
+                body.into_data_stream(),
+                &metrics,
+                Layer::WorkerEgress,
+                cache,
+            )
+            .with_body_length(body_length),
+        ),
+    ))
 }
+fn with_cache(mut response: Response, cache: Cache) -> Response {
+    response.extensions_mut().insert(cache);
+    response
+}
+
 async fn delivery_response(
     app: App,
     id: Uuid,
@@ -168,7 +206,12 @@ async fn delivery_response(
                 .error_for_status()
                 .map_err(failure)?;
             use futures_util::StreamExt;
-            let mut stream = response.bytes_stream();
+            let mut stream = metric_stream::wrap(
+                response.bytes_stream(),
+                &app.metrics,
+                Layer::UpstreamRead,
+                Cache::NotHit,
+            );
             let mut bytes = Vec::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(failure)?;
@@ -259,6 +302,7 @@ async fn delivery_response(
             return Err((StatusCode::BAD_REQUEST, "invalid_resource".into()));
         }
         let mut output = None;
+        let mut cache_hit = true;
         for _ in 0..30 {
             let job =
                 sqlx::query("SELECT j.status,j.error,j.attempt,o.status AS output_status,o.manifest_sha256,o.validation_version,o.visible_manifest,(j.status='succeeded' OR (j.status='running' AND j.lease_until>clock_timestamp())) AS readable FROM media_jobs j LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt WHERE j.id=$1")
@@ -296,6 +340,10 @@ async fn delivery_response(
                 || (status == "running" && output_status.as_deref() != Some("writing"))
             {
                 return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
+            }
+            if status != "succeeded" && cache_hit {
+                app.metrics.cache_lookup(CacheDecision::Miss);
+                cache_hit = false;
             }
             let manifest_digest: Option<String> = job.get("manifest_sha256");
             let persisted = job
@@ -354,7 +402,12 @@ async fn delivery_response(
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         continue;
                     }
-                    _ => return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into())),
+                    _ => {
+                        if cache_hit {
+                            app.metrics.cache_lookup(CacheDecision::Miss);
+                        }
+                        return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
+                    }
                 };
                 let manifest = (path == "index.m3u8").then_some(text);
                 output = Some((
@@ -369,6 +422,9 @@ async fn delivery_response(
                 break;
             }
             if status == "succeeded" {
+                if cache_hit {
+                    app.metrics.cache_lookup(CacheDecision::Miss);
+                }
                 return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -378,6 +434,7 @@ async fn delivery_response(
         if !reader.healthy() {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "media_unavailable".into()));
         }
+        let cache = if cache_hit { Cache::Hit } else { Cache::NotHit };
         if let Some(manifest) = manifest {
             if complete && manifest_digest.is_some_and(|digest| hash(&manifest) != digest) {
                 return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
@@ -398,16 +455,26 @@ async fn delivery_response(
                     q.token
                 )
             });
-            return Ok((
-                [
-                    (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
-                    (header::CACHE_CONTROL, "no-store"),
-                ],
-                if head { String::new() } else { text },
-            )
-                .into_response());
+            if cache_hit {
+                app.metrics.cache_lookup(CacheDecision::Hit);
+            }
+            return Ok(with_cache(
+                (
+                    [
+                        (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+                        (header::CACHE_CONTROL, "no-store"),
+                    ],
+                    if head { String::new() } else { text },
+                )
+                    .into_response(),
+                cache,
+            ));
         }
-        return file_delivery::response(&file, &h, head, Some(reader), opened, None).await;
+        let response = file_delivery::response(&file, &h, head, Some(reader), opened, None).await?;
+        if cache_hit {
+            app.metrics.cache_lookup(CacheDecision::Hit);
+        }
+        return Ok(with_cache(response, cache));
     }
     if resource["kind"] == "agent" {
         return relay::fetch(&app, &resource, &h, head, input_failure, Some(id)).await;
@@ -690,6 +757,7 @@ async fn main() -> anyhow::Result<()> {
     let runtime_readiness = readiness::Runtime::default();
     let app = App {
         readiness: runtime_readiness.clone(),
+        metrics: Default::default(),
         db,
         key: Arc::new(
             Aes256Gcm::new_from_slice(&key)
@@ -717,6 +785,7 @@ async fn main() -> anyhow::Result<()> {
     let deliveries = app.deliveries.clone();
     let router = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/metrics", get(metrics::endpoint))
         .route("/media-delivery/{id}/{path}", get(delivery).head(delivery))
         .route("/agent-data/{id}", get(relay::connect))
         .route(

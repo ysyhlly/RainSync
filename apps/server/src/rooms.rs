@@ -7,10 +7,14 @@ use tokio::sync::{mpsc, oneshot};
 #[path = "room_delivery.rs"]
 mod delivery;
 
+#[path = "room_presence.rs"]
+mod presence_runtime;
+
 #[derive(Clone)]
 pub struct Handle {
     tx: mpsc::Sender<Request>,
     events: delivery::Bus,
+    presence: presence_runtime::Runtime,
 }
 impl Handle {
     pub fn command_queue_depth(&self) -> usize {
@@ -132,6 +136,29 @@ async fn socket_membership(
     }
 }
 
+async fn socket_access(
+    app: &App,
+    room: Uuid,
+    user: Uuid,
+    session_hash: &str,
+    presence: bool,
+) -> std::result::Result<(), &'static str> {
+    socket_membership(app, room, user).await?;
+    if presence {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), database_checks::boolean(
+            &app.db,
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>now())")
+                .bind(session_hash).bind(user),
+            1500,
+        )).await {
+            Ok(Ok(true)) => {},
+            Ok(Ok(false)) => return Err("session_expired"),
+            _ => return Err("service_unavailable"),
+        }
+    }
+    Ok(())
+}
+
 async fn reject_socket(
     out: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     reason: &str,
@@ -141,6 +168,21 @@ async fn reject_socket(
         out.send(Message::Text(socket_error(reason, None).to_string().into())),
     )
     .await;
+}
+
+async fn reject_with_presence(
+    out: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    reason: &str,
+    lease: Option<&presence_runtime::Lease>,
+) {
+    if matches!(
+        reason,
+        "not_a_member" | "session_expired" | "service_unavailable" | "rate_limited"
+    ) && let Some(lease) = lease
+    {
+        lease.revoke();
+    }
+    reject_socket(out, reason).await;
 }
 
 async fn handle(app: &App, id: Uuid) -> Result<Handle> {
@@ -154,6 +196,7 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
     let h = Handle {
         tx,
         events: events.clone(),
+        presence: presence_runtime::Runtime::new(app, id, events.clone()),
     };
     map.insert(id, h.clone());
     let app = app.clone();
@@ -588,7 +631,9 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
         reject_socket(&mut out, "database_error").await;
         return;
     };
-    let mut events = handle.events.subscribe();
+    let negotiated_presence =
+        v["presence_version"].as_u64() == Some(u64::from(protocol::PRESENCE_VERSION));
+    let mut events = handle.events.subscribe_with_presence(negotiated_presence);
     let (s, owner_id, lifecycle, lifecycle_epoch, control_epoch) =
         match owned_snapshot(&app, id, user.id).await {
             Ok(snapshot) => snapshot,
@@ -616,63 +661,125 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
             missing = rows.iter().map(|r| r.get("state")).collect();
         }
     }
-    if let Err(reason) = socket_membership(&app, id, user.id).await {
+    if let Err(reason) = socket_access(&app, id, user.id, &session_hash, negotiated_presence).await
+    {
         reject_socket(&mut out, reason).await;
         return;
     }
-    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),
-        out.send(Message::Text(
-            json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"recovery":recovery,"events":missing,"control_epoch":control_epoch,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch})
-                .to_string()
-                .into(),
-        ))).await, Ok(Ok(())))
-    {
+    let presence_lease = if negotiated_presence {
+        match handle.presence.register(user.id, &session_hash) {
+            Ok(lease) => Some(lease),
+            Err(_) => {
+                reject_socket(&mut out, "rate_limited").await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let mut initial = json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"recovery":recovery,"events":missing,"control_epoch":control_epoch,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch});
+    if let Some(lease) = &presence_lease {
+        match handle
+            .presence
+            .for_recipient(&app, user.id, &session_hash)
+            .await
+        {
+            Ok(Some(presence)) => {
+                initial["presence_connection_id"] = json!(lease.id);
+                initial["presence"] = json!(presence);
+            }
+            Ok(None) => {
+                reject_with_presence(&mut out, "service_unavailable", presence_lease.as_ref())
+                    .await;
+                return;
+            }
+            Err(reason) => {
+                reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;
+                return;
+            }
+        }
+        if lease.deadline().is_none() {
+            reject_with_presence(&mut out, "service_unavailable", presence_lease.as_ref()).await;
+            return;
+        }
+    }
+    if !matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            out.send(Message::Text(initial.to_string().into()))
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
         return;
     }
+    let deadline = presence_lease
+        .as_ref()
+        .and_then(|lease| lease.deadline())
+        .unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(3600));
+    let lease_expiry = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+    tokio::pin!(lease_expiry);
+    let mut probes = std::collections::VecDeque::<Vec<u8>>::with_capacity(3);
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
     let mut last_seen = Instant::now();
     let mut window = Instant::now();
     let mut count = 0;
     loop {
         let mut value = tokio::select! {
+            _ = &mut lease_expiry, if negotiated_presence => { break; },
             _=heartbeat.tick()=>{
-                if last_seen.elapsed().as_secs()>45 {break};
+                if !negotiated_presence && last_seen.elapsed().as_secs()>45 {break};
                 let valid=tokio::time::timeout(std::time::Duration::from_secs(2),database_checks::boolean(&app.db,sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND expires_at>now())").bind(&session_hash),1500)).await;
                 match valid {
                     Ok(Ok(true)) => {},
-                    Ok(Ok(false)) => {reject_socket(&mut out,"session_expired").await;break},
-                    _ => {reject_socket(&mut out,"service_unavailable").await;break},
+                    Ok(Ok(false)) => {reject_with_presence(&mut out, "session_expired", presence_lease.as_ref()).await;break},
+                    _ => {reject_with_presence(&mut out, "service_unavailable", presence_lease.as_ref()).await;break},
                 }
-                if let Err(reason)=socket_membership(&app,id,user.id).await {reject_socket(&mut out,reason).await;break};
-                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Ping(Vec::new().into()))).await,Ok(Ok(()))) {break};continue;
+                if let Err(reason)=socket_access(&app,id,user.id,&session_hash,negotiated_presence).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
+                let payload = if negotiated_presence {
+                    let nonce = Uuid::new_v4().as_bytes().to_vec();
+                    if probes.len() == 3 { probes.pop_front(); }
+                    probes.push_back(nonce.clone());
+                    nonce
+                } else { Vec::new() };
+                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Ping(payload.into()))).await,Ok(Ok(()))) {break};continue;
             }
             event=events.recv()=>match event {Ok(v)=>v,Err(delivery::Lag::Control)=>{match owned_snapshot(&app,id,user.id).await{Ok((s,owner_id,lifecycle,lifecycle_epoch,control_epoch))=>json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch,"control_epoch":control_epoch}),Err(_)=>break}},Err(delivery::Lag::Chat | delivery::Lag::Closed)=>break},
             message=input.next()=>{
                 let Some(Ok(message))=message else{break};last_seen=Instant::now();
+                if let Message::Pong(payload) = &message {
+                    if let Some(lease) = &presence_lease && let Some(index) = probes.iter().position(|probe| probe.as_slice() == payload.as_ref()) {
+                            probes.remove(index);
+                            if let Err(reason) = socket_access(&app,id,user.id,&session_hash,true).await { reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break; }
+                            if !lease.renew() { break; }
+                            if let Some(deadline) = lease.deadline() { lease_expiry.as_mut().reset(tokio::time::Instant::from_std(deadline)); }
+                    }
+                    continue;
+                }
                 let Message::Text(text)=message else{continue};
-                if window.elapsed().as_secs()>=1{window=Instant::now();count=0} count+=1;if count>30{reject_socket(&mut out,"rate_limited").await;break}
-                let Ok(v)=serde_json::from_str::<Value>(&text)else{reject_socket(&mut out,"invalid_request").await;continue};
-                if let Err(reason)=socket_membership(&app,id,user.id).await {reject_socket(&mut out,reason).await;break};
+                if window.elapsed().as_secs()>=1{window=Instant::now();count=0} count+=1;if count>30{reject_with_presence(&mut out, "rate_limited", presence_lease.as_ref()).await;break}
+                let Ok(v)=serde_json::from_str::<Value>(&text)else{reject_with_presence(&mut out, "invalid_request", presence_lease.as_ref()).await;continue};
+                if let Err(reason)=socket_access(&app,id,user.id,&session_hash,negotiated_presence).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
                 match v["type"].as_str().unwrap_or("") {
                     "CLOCK_SYNC"=>{let t2=app.now();json!({"type":"CLOCK_SYNC_REPLY","t1":v["t1"],"t2":t2,"t3":app.now(),"clock_epoch":app.epoch})},
                     "CLIENT_STATUS"=>{app.metrics.report(&v["status"]);let _=handle.events.send(json!({"type":"CLIENT_STATUS","user_id":user.id,"status":v["status"]}));continue},
                     "CHAT"=>{
-                        let Some(body)=v["body"].as_str().filter(|b|!b.trim().is_empty()&&b.chars().count()<=2000)else{reject_socket(&mut out,"invalid_request").await;continue};
+                        let Some(body)=v["body"].as_str().filter(|b|!b.trim().is_empty()&&b.chars().count()<=2000)else{reject_with_presence(&mut out, "invalid_request", presence_lease.as_ref()).await;continue};
                         let client_message_id = match v.get("client_message_id") {
                             None | Some(Value::Null) => None,
                             Some(value) => match value.as_str().and_then(|s| Uuid::parse_str(s).ok()) {
                                 Some(key) => Some(key),
-                                None => {reject_socket(&mut out,"invalid_request").await;continue},
+                                None => {reject_with_presence(&mut out, "invalid_request", presence_lease.as_ref()).await;continue},
                             },
                         };
                         let (cid,replayed)=match persist_chat(&app.db,id,user.id,body,client_message_id).await {
                             Ok(result)=>result,
-                            Err(reason)=>{reject_socket(&mut out,reason).await;if reason=="not_a_member" {break};continue},
+                            Err(reason)=>{reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;if reason=="not_a_member" {break};continue},
                         };
-                        let identity=match profile::value(&app,user.id).await{Ok(value)=>value,Err(_)=>{reject_socket(&mut out,"database_error").await;break}};
+                        let identity=match profile::value(&app,user.id).await{Ok(value)=>value,Err(_)=>{reject_with_presence(&mut out, "database_error", presence_lease.as_ref()).await;break}};
                         let reply=json!({"type":"CHAT","id":cid,"user_id":user.id,"username":identity["username"],"display_name":identity["display_name"],"avatar_url":identity["avatar_url"],"avatar_version":identity["avatar_version"],"body":body,"client_message_id":client_message_id});
                         if replayed {
-                            if let Err(reason)=socket_membership(&app,id,user.id).await {reject_socket(&mut out,reason).await;break};
+                            if let Err(reason)=socket_access(&app,id,user.id,&session_hash,negotiated_presence).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
                             if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Text(reply.to_string().into()))).await,Ok(Ok(()))) {break}
                         } else {let _=handle.events.send(reply);}
                         continue
@@ -689,6 +796,25 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                 }
             }
         };
+        if value["type"] == "PRESENCE_SNAPSHOT" {
+            // Never send a cached watch value: its subjects may have been revoked
+            // or its epoch retired while this writer was awaiting other work.
+            match handle
+                .presence
+                .for_recipient(&app, user.id, &session_hash)
+                .await
+            {
+                Ok(Some(snapshot)) => {
+                    value = json!(snapshot);
+                    value["type"] = json!("PRESENCE_SNAPSHOT");
+                }
+                Ok(None) => continue,
+                Err(reason) => {
+                    reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;
+                    break;
+                }
+            }
+        }
         let renew_control = value["action"]["type"] == "TRANSFER_OWNERSHIP"
             || (value["action"]["type"] == "ROOM_LIFECYCLE" && value["lifecycle"] == "active")
             || matches!(
@@ -696,18 +822,28 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                 Some("CONTROL_EPOCH_REQUIRED" | "CONTROL_EPOCH_EXPIRED")
             );
         if renew_control {
-            if let Err(reason) = socket_membership(&app, id, user.id).await {
-                reject_socket(&mut out, reason).await;
+            if let Err(reason) =
+                socket_access(&app, id, user.id, &session_hash, negotiated_presence).await
+            {
+                reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;
                 break;
             }
             if let Ok(epoch) = persistence::issue_control_epoch(&app.db, id, user.id).await {
                 value["control_epoch"] = json!(epoch);
             }
         }
-        // Credential renewal above may wait for a management transaction. Check
-        // again at send admission after that wait, before exposing state/epochs.
-        if let Err(reason) = socket_membership(&app, id, user.id).await {
-            reject_socket(&mut out, reason).await;
+        // Presence has just checked recipient and subjects in one final read.
+        if value["type"] != "PRESENCE_SNAPSHOT"
+            && let Err(reason) =
+                socket_access(&app, id, user.id, &session_hash, negotiated_presence).await
+        {
+            reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;
+            break;
+        }
+        if presence_lease
+            .as_ref()
+            .is_some_and(|lease| lease.deadline().is_none())
+        {
             break;
         }
         if !matches!(
@@ -721,6 +857,7 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
             break;
         }
     }
+    drop(presence_lease);
     // Do not drop a TCP socket with unread burst frames immediately after its
     // terminal ERROR. Complete the WebSocket close handshake so the peer can
     // receive that error instead of only observing an abnormal reset.

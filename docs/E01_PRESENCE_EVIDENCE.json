@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "base": "79cff19718f94d053d69f5b969147ae540921d9e",
+  "date": "2026-09-30",
+  "scope": "Cloud functional and necessary permission/lease/compatibility regressions; no sustained or physical-device acceptance claim",
+  "checks": {
+    "server_tests": {
+      "passed": 53,
+      "unit": 36,
+      "independent_presence": 17
+    },
+    "strict_clippy": "passed",
+    "frontend_state_tests": {
+      "passed": 25
+    },
+    "vue_typecheck": "passed",
+    "web_production_build": "passed",
+    "browser_presence": {
+      "passed": 6,
+      "projects": [
+        "desktop Chromium",
+        "mobile Chromium simulation"
+      ]
+    },
+    "legacy_event_isolation": {
+      "result": "passed",
+      "healthy_control_ms": 21,
+      "owned_fixture_cleanup": "passed"
+    },
+    "presence": {
+      "result": "passed",
+      "checks": [
+        "100 legacy control connections remain admitted, receive no presence, and do not consume v1 quota; unsupported version remains legacy; forged connection ID is not reused",
+        "v1 per-user cap is bounded and explicit; normal disconnect releases quota; admission/join/leave does not change control revision",
+        "multiple login sessions aggregate by user, disconnect is per connection, resume assigns a new ID, permanent membership is retained, CLIENT_STATUS and forged snapshots cannot establish presence",
+        "one revoked login session is removed before response admission; another session for the same member remains online",
+        "snapshot subject admission waits behind an actual membership deletion; after commit both sessions are excluded and revoked recipients receive no new state",
+        "real 45-second lease expires despite CLIENT_STATUS and unsolicited Pong; independent valid Ping/Pong keeps another socket online without playback telemetry",
+        "process restart establishes a fresh epoch and empty prior presence; admission adds no revision beyond the existing playback-clock startup update"
+      ],
+      "fixture_id": "76448321-dd5c-4c6d-b36d-13061d447273",
+      "server_version": "PostgreSQL 17.11 (Debian 17.11-0+deb13u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+      "cleanup": {
+        "completed": true,
+        "all_owned_server_pids_absent": true,
+        "server_port_closed": true,
+        "postgres_pid_absent": true,
+        "postgres_port_closed": true
+      },
+      "expiry_ms": 45001
+    },
+    "presence_permission_timeout": {
+      "result": "passed",
+      "checks": [
+        "negotiated sockets fail closed under real permission-table contention without admitting control replies; cancellation releases the shared pool before unlock; fresh handshake contains no abandoned leases and does not change revision"
+      ],
+      "fixture_id": "e1e12c7a-cecf-4819-9440-0f0594103bfd",
+      "server_version": "PostgreSQL 17.11 (Debian 17.11-0+deb13u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+      "cleanup": {
+        "completed": true,
+        "all_owned_server_pids_absent": true,
+        "server_port_closed": true,
+        "postgres_pid_absent": true,
+        "postgres_port_closed": true
+      }
+    },
+    "legacy_permission_timeout": {
+      "result": "passed",
+      "checks": [
+        "24 sockets fail closed under actual ACCESS EXCLUSIVE membership lock in under 5 seconds",
+        "authenticated same-pool request and readiness recover before lock release"
+      ],
+      "fixture_id": "eb7c77f2-2cce-4c0d-a509-22a07213d56e",
+      "server_version": "PostgreSQL 17.11 (Debian 17.11-0+deb13u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+      "cleanup": {
+        "completed": true,
+        "all_owned_server_pids_absent": true,
+        "server_port_closed": true,
+        "postgres_pid_absent": true,
+        "postgres_port_closed": true
+      }
+    }
+  }
+}

@@ -1,4 +1,5 @@
 pub mod input_policy;
+pub mod runtime_metrics;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 pub mod capabilities;

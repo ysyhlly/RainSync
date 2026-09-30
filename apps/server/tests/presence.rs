@@ -41,7 +41,9 @@ fn expires_at_exact_boundary_and_late_heartbeat_cannot_resurrect() {
             .members
             .is_empty()
     );
+    assert_eq!(p.deadline(id), Some(now + LEASE));
     assert!(!p.renew(id, now + LEASE));
+    assert_eq!(p.deadline(id), None);
     assert!(p.snapshot(now + LEASE).members.is_empty());
 }
 
@@ -158,4 +160,154 @@ fn actor_recreation_and_other_rooms_share_the_process_epoch_and_monotonic_sequen
     assert_eq!(before.epoch, after.epoch);
     assert!(after.seq > before.seq);
     assert_eq!(after.epoch, b.snapshot(now).epoch);
+}
+
+#[test]
+fn a_join_during_authorization_cannot_be_published_as_a_checked_full_snapshot() {
+    let now = Instant::now();
+    let mut p = Presence::new(Sequence::default());
+    let user = Uuid::new_v4();
+    let first = p.connect(user, now).unwrap();
+    let checked = vec![first];
+    let next = p.connect(user, now).unwrap();
+    assert!(
+        p.checked_snapshot(&checked, &HashSet::from([first]), now)
+            .is_none()
+    );
+    let complete = p
+        .checked_snapshot(&[first, next], &HashSet::from([first, next]), now)
+        .unwrap();
+    assert_eq!(complete.members[0].connection_count, 2);
+}
+
+#[test]
+fn completed_permission_checks_remove_denied_members_before_snapshot_publication() {
+    let now = Instant::now();
+    let mut p = Presence::new(Sequence::default());
+    let revoked = Uuid::new_v4();
+    let authorized = Uuid::new_v4();
+    let a = p.connect(revoked, now).unwrap();
+    let b = p.connect(revoked, now).unwrap();
+    let c = p.connect(authorized, now).unwrap();
+    let full = p
+        .checked_snapshot(&[a, b, c], &HashSet::from([c]), now)
+        .unwrap();
+    assert_eq!(
+        full.members,
+        vec![Member {
+            user_id: authorized,
+            connection_count: 1
+        }]
+    );
+    // A delayed positive permission result is not a fresh connection admission.
+    p.checked_snapshot(&[a, b, c], &HashSet::from([a, b, c]), now)
+        .unwrap();
+    assert!(!p.renew(a, now));
+    assert!(!p.renew(b, now));
+}
+
+#[test]
+fn checked_snapshot_does_not_need_to_recheck_connections_that_have_expired() {
+    let now = Instant::now();
+    let mut p = Presence::new(Sequence::default());
+    p.connect(Uuid::new_v4(), now).unwrap();
+    let full = p
+        .checked_snapshot(&[], &HashSet::new(), now + LEASE)
+        .unwrap();
+    assert!(full.members.is_empty());
+}
+
+#[test]
+fn stale_renewals_do_not_shorten_a_newer_lease_and_expiry_is_terminal() {
+    let now = Instant::now();
+    let mut p = Presence::new(Sequence::default());
+    let id = p.connect(Uuid::new_v4(), now).unwrap();
+    assert!(p.renew(id, now + Duration::from_secs(30)));
+    assert!(p.renew(id, now + Duration::from_secs(1)));
+    assert!(!p.snapshot(now + Duration::from_secs(74)).members.is_empty());
+    assert!(p.snapshot(now + Duration::from_secs(75)).members.is_empty());
+    assert!(!p.renew(id, now + Duration::from_secs(20)));
+}
+
+#[test]
+fn process_capacity_is_shared_and_released_on_disconnect_expiry_revocation_and_room_drop() {
+    let sequence = Sequence::default();
+    let now = Instant::now();
+    let mut rooms: Vec<_> = (0..PROCESS_LIMIT.div_ceil(ROOM_LIMIT))
+        .map(|_| Presence::new(sequence.clone()))
+        .collect();
+    for index in 0..PROCESS_LIMIT {
+        rooms[index / ROOM_LIMIT]
+            .connect(Uuid::new_v4(), now)
+            .unwrap();
+    }
+    let mut extra = Presence::new(sequence);
+    let before = extra.snapshot(now);
+    assert_eq!(
+        extra.connect(Uuid::new_v4(), now),
+        Err(AdmissionError::ProcessCapacity)
+    );
+    assert_eq!(extra.snapshot(now), before);
+
+    let (id, _) = rooms[0].candidates()[0];
+    rooms[0].disconnect(id);
+    let test_user = Uuid::new_v4();
+    let test_id = extra.connect(test_user, now).unwrap();
+    extra.revoke_user(test_user);
+    let test_id2 = extra.connect(test_user, now).unwrap();
+    assert_ne!(test_id, test_id2);
+    extra.reconcile(&[test_id2], &HashSet::new());
+    extra.connect(test_user, now).unwrap();
+    extra.expire(now + LEASE);
+    extra.connect(test_user, now + LEASE).unwrap();
+    drop(rooms);
+    for _ in 1..PER_USER_LIMIT {
+        extra.connect(test_user, now + LEASE).unwrap();
+    }
+    assert_eq!(
+        extra.snapshot(now + LEASE).members[0].connection_count,
+        PER_USER_LIMIT as u32
+    );
+}
+
+#[test]
+fn concurrent_rooms_cannot_overbook_process_capacity() {
+    let sequence = Sequence::default();
+    let now = Instant::now();
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let sequence = sequence.clone();
+            std::thread::spawn(move || {
+                let mut rooms = Vec::new();
+                for index in 0..PROCESS_LIMIT / 8 {
+                    if index % ROOM_LIMIT == 0 {
+                        rooms.push(Presence::new(sequence.clone()));
+                    }
+                    rooms
+                        .last_mut()
+                        .unwrap()
+                        .connect(Uuid::new_v4(), now)
+                        .unwrap();
+                }
+                rooms
+            })
+        })
+        .collect();
+    // Thread results retain their leases, even before the main thread joins.
+    let rooms: Vec<_> = workers
+        .into_iter()
+        .flat_map(|worker| worker.join().unwrap())
+        .collect();
+    let ids: HashSet<_> = rooms
+        .iter()
+        .flat_map(|room| room.candidates().into_iter().map(|(id, _)| id))
+        .collect();
+    assert_eq!(ids.len(), PROCESS_LIMIT);
+    let mut extra = Presence::new(sequence);
+    assert_eq!(
+        extra.connect(Uuid::new_v4(), now),
+        Err(AdmissionError::ProcessCapacity)
+    );
+    drop(rooms);
+    extra.connect(Uuid::new_v4(), now).unwrap();
 }

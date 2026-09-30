@@ -1,4 +1,37 @@
-/** Internal view model; the protocol adapter is installed after contract approval. */
+import type { PresenceSnapshot } from "../../../../../packages/protocol";
+
+/** Bounded projection of the shared wire DTO into the internal view model. */
+export function readPresenceSnapshot(
+  value: unknown,
+): OnlineSnapshot | undefined {
+  if (!value || typeof value !== "object") return;
+  const wire = value as PresenceSnapshot;
+  if (
+    typeof wire.room_id !== "string" ||
+    typeof wire.presence_epoch !== "string" ||
+    typeof wire.presence_seq !== "number" ||
+    !Array.isArray(wire.members) ||
+    wire.members.length > 80 ||
+    !wire.members.every(
+      (member) =>
+        !!member &&
+        typeof member.user_id === "string" &&
+        typeof member.connection_count === "number",
+    )
+  )
+    return;
+  return {
+    roomId: wire.room_id,
+    epoch: wire.presence_epoch,
+    sequence: wire.presence_seq,
+    members: wire.members.map((member) => ({
+      userId: member.user_id,
+      connections: member.connection_count,
+    })),
+  };
+}
+
+/** Internal view model, independent of room control state. */
 export interface OnlineMember {
   userId: string;
   connections: number;
@@ -10,6 +43,8 @@ export interface OnlineSnapshot {
   members: OnlineMember[];
 }
 export type PresenceResult = "applied" | "ignored" | "resync";
+const MAX_ID_LENGTH = 64;
+const RETIRED_EPOCH_LIMIT = 8;
 
 /** Each socket callback must capture the generation returned by begin(). */
 export class PresenceState {
@@ -17,8 +52,10 @@ export class PresenceState {
   private roomId = "";
   private connectionId: string | undefined;
   private snapshot: OnlineSnapshot | undefined;
+  private retiredEpochs = new Set<string>();
 
   begin(roomId: string): number {
+    if (this.snapshot) this.retire(this.snapshot.epoch);
     this.generation++;
     this.roomId = roomId;
     this.connectionId = undefined;
@@ -44,11 +81,15 @@ export class PresenceState {
     if (
       generation !== this.generation ||
       this.connectionId ||
+      typeof connectionId !== "string" ||
       !connectionId ||
+      connectionId.length > MAX_ID_LENGTH ||
       !this.valid(value)
     )
       return "ignored";
     this.connectionId = connectionId;
+    // Only a fresh socket's authenticated handshake can re-establish an epoch.
+    this.retiredEpochs.delete(value.epoch);
     this.snapshot = this.copy(value);
     return "applied";
   }
@@ -62,6 +103,7 @@ export class PresenceState {
     )
       return "ignored";
     if (value.epoch !== this.snapshot.epoch) {
+      if (this.retiredEpochs.has(value.epoch)) return "ignored";
       // A new epoch must be established by a new authenticated socket handshake.
       // Never let a late old epoch become the current epoch merely by arriving.
       this.end(generation);
@@ -74,9 +116,21 @@ export class PresenceState {
 
   private copy(value: OnlineSnapshot): OnlineSnapshot {
     return {
-      ...value,
-      members: value.members.map((member) => ({ ...member })),
+      roomId: value.roomId,
+      epoch: value.epoch,
+      sequence: value.sequence,
+      members: value.members.map(({ userId, connections }) => ({
+        userId,
+        connections,
+      })),
     };
+  }
+
+  private retire(epoch: string): void {
+    this.retiredEpochs.delete(epoch);
+    this.retiredEpochs.add(epoch);
+    if (this.retiredEpochs.size > RETIRED_EPOCH_LIMIT)
+      this.retiredEpochs.delete(this.retiredEpochs.values().next().value!);
   }
 
   private valid(value: OnlineSnapshot): boolean {
@@ -86,6 +140,7 @@ export class PresenceState {
       !!value.roomId &&
       typeof value.epoch === "string" &&
       value.epoch.length > 0 &&
+      value.epoch.length <= MAX_ID_LENGTH &&
       Number.isInteger(value.sequence) &&
       value.sequence >= 0 &&
       value.sequence <= 0xffffffff &&
@@ -96,6 +151,7 @@ export class PresenceState {
           !!member &&
           typeof member.userId === "string" &&
           member.userId.length > 0 &&
+          member.userId.length <= MAX_ID_LENGTH &&
           Number.isInteger(member.connections) &&
           member.connections > 0 &&
           member.connections <= 8,

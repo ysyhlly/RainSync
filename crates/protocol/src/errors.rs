@@ -221,7 +221,7 @@ impl ErrorCode {
             Self::RoomNotActive => "房间已关闭或正在清理，请刷新房间状态",
             Self::RoomLifecycleConflict => "房间生命周期已改变，请刷新后重试",
             Self::SourceVersionRequired => {
-                "片源缺少可靠版本信息；HTTP 片源需提供稳定校验器，NAS 片源请升级 Agent 并重新扫描"
+                "片源缺少可靠版本信息；HTTP 片源需提供稳定校验器，NAS 片源请升级 Agent 并重新扫描，然后重新发起播放"
             }
             Self::SourceSeekUnsupported => {
                 "HTTP 片源不支持所需的字节范围读取，无法定位或探测此媒体"

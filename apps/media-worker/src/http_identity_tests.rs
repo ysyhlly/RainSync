@@ -9,6 +9,7 @@ use std::sync::{
 fn make_app(db: PgPool) -> App {
     App {
         readiness: Default::default(),
+        metrics: Default::default(),
         db,
         key: Arc::new(Aes256Gcm::new_from_slice(&[31; 32]).unwrap()),
         cache: std::env::temp_dir(),

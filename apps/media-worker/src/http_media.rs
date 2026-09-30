@@ -270,7 +270,12 @@ async fn prepare(
         }
         return out.body(Body::empty()).map_err(failure);
     }
-    let mut stream = response.bytes_stream();
+    let mut stream = metric_stream::wrap(
+        response.bytes_stream(),
+        &app.metrics,
+        Layer::UpstreamRead,
+        Cache::NotHit,
+    );
     if kind == Some(Kind::Key) {
         let mut key = Vec::with_capacity(16);
         loop {
@@ -446,7 +451,12 @@ async fn prepare_pinned(
             .validate(status, response.headers())
             .map_err(failure)?;
         declared |= playlist_headers(response.headers());
-        let mut stream = response.bytes_stream();
+        let mut stream = metric_stream::wrap(
+            response.bytes_stream(),
+            &app.metrics,
+            Layer::UpstreamRead,
+            Cache::NotHit,
+        );
         let mut prefix = Vec::new();
         if status != StatusCode::RANGE_NOT_SATISFIABLE {
             while prefix.len() < http_delivery::SNIFF_BYTES {
@@ -599,7 +609,12 @@ async fn prepare_pinned(
             .and_then(|value| value.parse::<u64>().ok())
     };
     let mut stream = counted_stream(
-        response.bytes_stream(),
+        metric_stream::wrap(
+            response.bytes_stream(),
+            &app.metrics,
+            Layer::UpstreamRead,
+            Cache::NotHit,
+        ),
         expected_length,
         observation.clone(),
     );

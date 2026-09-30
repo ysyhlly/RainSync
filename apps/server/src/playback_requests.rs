@@ -318,18 +318,50 @@ pub async fn fail(app: &App, reservation: &Reservation, error: &Error) -> Result
     } else {
         err(error.0, &error.1)
     };
-    sqlx::query("UPDATE playback_requests SET status='failed',error_status=$3,error_code=$4 WHERE user_id=$1 AND idempotency_key=$2 AND status='pending'")
-        .bind(reservation.user).bind(reservation.key).bind(recorded.0.as_u16() as i16).bind(&recorded.1).execute(&mut *tx).await?;
+    let new_failure = sqlx::query("UPDATE playback_requests SET status='failed',error_status=$3,error_code=$4 WHERE user_id=$1 AND idempotency_key=$2 AND status='pending'")
+        .bind(reservation.user).bind(reservation.key).bind(recorded.0.as_u16() as i16).bind(&recorded.1).execute(&mut *tx).await?.rows_affected() == 1;
     sqlx::query("UPDATE playback_sessions SET stopped=true WHERE id=$1")
         .bind(reservation.session)
         .execute(&mut *tx)
         .await?;
     persistence::upstream_reservations::close(&mut tx, reservation.session, &recorded.1).await?;
     tx.commit().await?;
+    // A replay, rollback, cancellation or superseded owner is not a new failure.
+    // The process-local counter can lose this sample if the process crashes
+    // after commit; it is not a durable exactly-once accounting ledger.
+    if new_failure && let Some(category) = failure_metric(error) {
+        app.metrics.runtime.playback_failure(category);
+    }
     if exhausted {
         return Err(recorded);
     }
     Ok(None)
+}
+
+fn failure_metric(error: &Error) -> Option<media_core::runtime_metrics::Failure> {
+    use media_core::runtime_metrics::Failure;
+    use protocol::ErrorCode;
+    let code = ErrorCode::from_reason(&error.1, error.0.as_u16());
+    match code {
+        ErrorCode::PlaybackRequestCancelled
+        | ErrorCode::PlaybackRequestInterrupted
+        | ErrorCode::StalePlaybackPlan
+        | ErrorCode::StaleMedia
+        | ErrorCode::RoomNotActive
+        | ErrorCode::RoomLifecycleConflict
+        | ErrorCode::UpstreamPolicyChanged
+        | ErrorCode::MediaJobCancelled => None,
+        ErrorCode::MediaQueueFull
+        | ErrorCode::CacheCapacityExceeded
+        | ErrorCode::ProbeBusy
+        | ErrorCode::RateLimited => Some(Failure::Capacity),
+        ErrorCode::UpstreamFailed
+        | ErrorCode::UpstreamPlaybackFailed
+        | ErrorCode::UpstreamNoCompatibleStream
+        | ErrorCode::UpstreamMediaError
+        | ErrorCode::UpstreamPolicyUnavailable => Some(Failure::Upstream),
+        _ => Some(Failure::Prepare),
+    }
 }
 
 async fn guard_generation(

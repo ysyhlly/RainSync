@@ -1,122 +1,140 @@
-# E01 presence: contract request and independent implementation checkpoint
+# E01 reported presence production handoff
 
-Base: `9b167ab92e36b373bdb6c46718ced16dfb8070aa` on
-`integration/v0.1-next`, fetched 2026-09-30. Remote matched that exact baseline.
-Branch: `feature/e01-presence`. Existing workspace/branch were not overwritten.
+## Baseline and scope
 
-This checkpoint is **not a completed E01 implementation**. Protocol and production
-wiring are pending integration-owner confirmation and the shared protocol commit.
-No migration, shared manifest/lockfile, main/lib entrypoint, global status document,
-HTTP file delivery or Worker readiness implementation was edited.
+Branch: `feature/e01-presence`. Final changes are relative to shared contract
+`79cff19718f94d053d69f5b969147ae540921d9e` (tree `26d7862`). The original
+`9b167ab` checkout and independent checkpoint were preserved; only the later
+independent audit was rebased onto 79cff. The original core/UI checkpoint was
+already included by the parent and was not reapplied. Later HTTP/readiness
+milestones were not followed or modified.
 
-## Requested shared protocol
+This lane implements server room/socket integration, replaceable delivery,
+frontend runtime adaptation and the mounted presence panel. Shared protocol,
+TypeScript/schema generation, process startup initialization and `pub mod
+presence` are already supplied by 79cff. No additional main/lib patch, database
+migration, dependency, lockfile, CI or global ledger change is required. No branch
+was pushed or merged and no deployment, production service, user computer,
+credential configuration or access-permission change was performed.
 
-```typescript
-// UUID denotes the existing protocol's UUID representation, not a device ID.
-type PresenceMember = { user_id: UUID; connection_count: number /* u32 */ };
-type PresenceSnapshot = {
-  room_id: UUID;
-  presence_epoch: UUID;
-  presence_seq: number; // u32; gaps allowed
-  members: PresenceMember[];
-};
-// JOIN / RESUME: optional presence_version: 1
-// Initial SNAPSHOT: optional presence_connection_id: UUID and
-//                   presence: PresenceSnapshot, present together.
-// Server envelope: { type: "PRESENCE_SNAPSHOT", ...PresenceSnapshot }
-```
+## Implemented behavior
 
-No RoomState field, control revision, persistent event, or migration. Unknown
-presence versions do not enable presence delivery. Old clients still participate
-in actual connection counts but receive no new envelopes. New clients on old
-servers display unavailable, never infer presence from permanent membership.
-The server assigns a fresh connection UUID after admission, returns it only to
-that socket, and never accepts a client-selected replacement. Counts describe
-connections (potentially devices or tabs), not unique physical devices. Public
-snapshots reveal only user IDs and counts, with no session tokens, connection
-lists, IP addresses, user agents or device fingerprints.
+- JOIN/RESUME opts in only with integer `presence_version: 1`. Legacy and unknown
+  versions retain existing control admission/capacity and receive no presence.
+- Each participating connection has a fresh server-issued UUID. Only the initial
+  SNAPSHOT exposes that connection's ID, paired with the four-field snapshot.
+  Subsequent PRESENCE_SNAPSHOT envelopes are complete replacements.
+- Counts aggregate participating connections per user. They cover reported
+  connections, potentially devices or browser tabs. Missing members remain
+  unknown. The UI says “已上报在线状态的连接” and explicitly explains coverage;
+  old servers or missing negotiation show “在线状态不可用”. No device identity,
+  IP, browser fingerprint, session token or connection list is published.
+- Server Ping/Pong probes run every 15 seconds. Only a matching outstanding
+  server nonce with fresh authorization renews the 45-second monotonic lease.
+  Three outstanding probes are retained. CLIENT_STATUS, CLOCK_SYNC and other
+  text never establish or renew presence. Expiry is terminal; reconnect requires
+  a new ID. Per-socket deadline and a separate expiry task remove stale leases
+  independently of database and network waits.
+- A cleanup guard removes the lease/session context on early return,
+  disconnect, terminal rejection and task cancellation, before close-handshake
+  waits. Limits apply only to participating connections: 8/user/room, 80/room,
+  4096/process. Process capacity is released on expiry/revocation/disconnect or
+  room drop. Admission failures return bounded RATE_LIMITED responses.
+- Before each presence send, recipient and every captured subject are checked
+  together against sessions and room_members with bounded cancellation-safe
+  database reads and membership/session key-share locks. Candidate IDs fence
+  delayed results: new unexamined connections trigger at most two attempts;
+  exhausted retries skip updates or fail the initial handshake explicitly.
+  Removed IDs cannot be restored by stale positive results. Logout removes only
+  the associated login sessions; membership removal removes all that user's
+  participating connections. Failed permission checks fence leases.
+- The dedicated watch slot keeps one full snapshot. CLIENT_STATUS churn cannot
+  evict it; control remains first with bounded background fairness. Queue values
+  are hints: current subjects and epoch are revalidated before writing. Room/DB
+  locks do not span network writes, which retain the existing five-second bound.
+  Revocation follows admission reads relative to committed removal; bytes
+  admitted before removal may already be in transport buffers.
+- One process-wide Sequence supplies epoch/seq across rooms and actor recreation.
+  Renewal alone and all presence changes leave control revision unchanged. On
+  u32 exhaustion the shared epoch rotates without clearing live leases or
+  resetting capacity; a 15-second maintenance pass propagates it to active
+  rooms, and clients establish the epoch through a fresh handshake. Process
+  restart retains no online collection. Existing playback-clock startup still
+  increments control revision once; presence admission adds nothing to that.
+- The client binds once per socket generation, accepts same-epoch sequence gaps,
+  ignores smaller/equal sequences and old socket callbacks, and clears claims
+  synchronously on disconnect, leave and terminal permission/session errors.
+  Eight retired epochs are retained; known old epochs are ignored, unknown
+  epochs trigger authenticated reconnect. Names from existing membership API
+  are optional labels and never the source of online claims.
+- Closed/archived rooms retain the existing readable-room admission rules;
+  presence grants no playback/control permission and does not change lifecycle,
+  ownership transfer, event replay or media generation behavior.
 
-Heartbeat uses existing WebSocket Ping/Pong: probe every 15 seconds, expire at
-45 seconds using server monotonic time. CLIENT_STATUS is playback telemetry and
-must neither create nor be required to maintain presence. Expired leases cannot
-be resurrected by late frames. An explicit reconnect creates a new connection.
-Renewals with unchanged membership need not send another snapshot.
+## Changed files relative to 79cff
 
-Epoch is process-wide and independent of control state. The internal Sequence is
-shared across rooms; every membership change consumes a u32 sequence, so gaps
-are normal and room Actor eviction cannot reset its sequence. On counter
-exhaustion the allocator rotates its process-wide presence epoch atomically;
-clients reconnect rather than adopting an unsolicited epoch. Please confirm this
-exhaustion behavior with the shared contract. Restart initializes an empty
-presence collection and a new process epoch.
+Server: `apps/server/src/presence.rs`, `room_presence.rs`, `room_delivery.rs`,
+`rooms.rs`, `apps/server/tests/presence.rs`.
 
-## Production integration locations and pending requirements
+Web: `apps/web/src/features/rooms/presence-state.ts`, `PresencePanel.vue`,
+`room-runtime.ts`, `RoomPage.vue` (panel import/mount only).
 
-1. Integration-owned `apps/server/src/main.rs`: expose the module with
-   `mod presence;`, add `presence_sequence: presence::Sequence` to App and
-   initialize `presence::Sequence::default()` exactly once at process startup.
-   `Sequence` is Clone (shared Arc), not one allocator per room or socket.
-   No database or new service is needed. The new module remains unmounted in
-   this checkpoint and is compiled through the independent test target.
-2. `rooms.rs`: each Handle owns a mutex-protected `Presence::new` using the App
-   allocator and a connection-to-session admission context. Subscribe before
-   capturing the first full snapshot. Register only after auth and membership
-   admission; retain a cleanup guard so aborted tasks drop the connection before
-   close-handshake waits. Reconcile revoked memberships and sessions, expire
-   leases and publish under serialized room mutation order. Distinguish removing
-   one expired login session from removing all connections of a revoked member.
-3. Before send admission validate both recipient session and membership; current
-   code only validates membership on each outbound frame and checks sessions
-   periodically. A presence snapshot must also filter/reconcile its **subjects**,
-   not just authorize its recipient. DB failures fail closed. Never hold a DB
-   transaction or room lock over network writes. Already admitted transport bytes
-   cannot be recalled. Asynchronous authorization results must not authorize
-   unexamined new connections or restore removed connection IDs.
-4. `room_delivery.rs`: add a separate watch/latest-value slot for full presence
-   snapshots. Do not share CLIENT_STATUS's broadcast buffer and do not enqueue
-   presence in control. Keep existing control-first scheduling with bounded
-   background fairness and slow-consumer isolation. Per-recipient negotiated
-   presence gates must not cause old clients to spin on a pending watch update.
-5. `room-runtime.ts`: opt in on RESUME; adapt generated protocol types to the
-   internal PresenceState; bind initial snapshot once per socket generation.
-   Clear online claims synchronously on disconnect, leave, permission errors and
-   new socket construction. Ignore old callbacks and non-increasing seq; unknown
-   epochs request a new connection/snapshot. Do not touch control revision.
-6. Mount `PresencePanel.vue` in the room UI. It is standalone and typechecked but
-   not mounted yet; the parent should assign ownership of the existing host view
-   or apply a mounting patch. Existing member display names may be supplied, but
-   that permanent list is not an online source. Multiple connections are labeled
-   accurately without claiming unique physical device identity.
+Tests: `tests/presence-state.test.ts`, `tests/browser/room-presence.spec.ts`,
+`tests/room-presence.mjs`, `tests/room-presence-timeout.mjs`.
 
-## Independent implementation and evidence
+Task docs: this file, `docs/E01_PRESENCE_WIRING_PLAN.md` and the portable
+`docs/E01_PRESENCE_EVIDENCE.json` record.
 
-- `apps/server/src/presence.rs`: monotonic lease set, server-issued IDs, aggregation,
-  idempotent disconnect, terminal expiry, user and per-connection revocation,
-  async checked-candidate reconciliation, bounded admission (8/user, 80/room),
-  process-shared epoch/sequence allocator.
-- `apps/server/tests/presence.rs`: core expiry, aggregation, revocation, late
-  results, reconnection, process restart, actor recreation and quota regressions.
-- `apps/web/src/features/rooms/presence-state.ts`: handshake/socket/epoch/sequence
-  fences, full replacement, disconnect clearing and defensive validation.
-- `PresencePanel.vue`: accessible status and connection count presentation.
-- `tests/presence-state.test.ts`: 14 reducer regressions.
+## Regression evidence
 
-Validation commands (no database or ports used):
+Cloud verification uses an isolated Rust build/output directory, disposable
+PostgreSQL 17.11 clusters and random loopback ports. Shared installed node
+packages were used read-only. Existing tests/fixtures and capacity assertions
+were not changed.
 
-```sh
-source /workspace/.rainsync-cloud/env.sh
-CARGO_TARGET_DIR=/workspace/rainsync-e01-target cargo test --locked -p rainsync-server --test presence
-./node_modules/.bin/vitest run tests/presence-state.test.ts --cache=false
-./node_modules/.bin/vue-tsc --noEmit -p apps/web/tsconfig.json
-```
+- `cargo test --locked -p rainsync-server`: 36 unit + 17 independent presence
+  tests passed. Includes cleanup guard cancellation, exact/terminal expiry,
+  reconciliation races, independent sessions, room/process capacity and shared
+  epoch rollover with live leases/capacity intact.
+- `cargo clippy --locked -p rainsync-server --all-targets -- -D warnings`: passed.
+- `vitest run tests/presence-state.test.ts`: 25 passed, including bounded wire
+  projection, unknown/retired epochs and generation fences.
+- `vue-tsc --noEmit -p apps/web/tsconfig.json`: passed.
+- `npm run build -w apps/web -- --outDir <isolated-output>`: passed; Vite
+  reports the existing large-bundle warning.
+- Desktop and mobile Chromium `tests/browser/room-presence.spec.ts`: 6 passed.
+  Tests reported coverage, multiple connections, member removal, unavailable old
+  server, sequence gaps without player/command effects, epoch reconnect, revoked
+  UI cleanup and leave. These are browser simulations, not physical devices.
+- Real `tests/room-presence.mjs`: passed. Covers 100 simultaneous same-user
+  legacy control sockets beside participating sockets, unsupported versions,
+  fresh server IDs, v1 cap/reclaimed slots, multi-session aggregation, logout,
+  actual membership-deletion lock race for subjects and revoked recipients,
+  CLIENT_STATUS/forged-frame rejection, no presence-driven revision increments,
+  restart/new epoch, and real lease expiry at **45.001 seconds** despite text and
+  unsolicited Pong. Valid Pong keeps another socket online without video.
+- Existing `tests/room-events-isolation.mjs`: passed, including a paused slow
+  socket, six-device telemetry burst, healthy control in **21 ms**, control/chat
+  ordering/recovery and transactional membership races.
+- Existing `tests/room-membership-timeout.mjs`: passed; 24 old control sockets
+  fail closed and recover the shared pool before permission-table unlock.
 
-The Rust tests include the core directly rather than claiming production wiring
-exists. Frontend tests validate an internal view model, not a duplicated public
-wire schema. Shared dependency installation is read-only; Rust build outputs are
-isolated. No long-running, real-device or production checks were performed.
+- Real `tests/room-presence-timeout.mjs`: passed. Negotiated connections fail
+  closed under actual permission-table contention, admit no control replies,
+  release the shared pool before unlock and leave no abandoned online leases.
 
-Required after shared protocol lands: real WebSocket/PostgreSQL permission and
-revocation races, task cancellation cleanup, room close/reopen/archived permission
-semantics, independent users/devices, black-holed heartbeats, control revision
-invariance, slow consumers/presence floods/control priority, browser reconnect and
-legacy compatibility. Pure state tests do not prove these integration properties.
+Real fixture reports assert owned Server/PostgreSQL processes stopped, PIDs
+absent and loopback ports closed. Reports contain no session tokens or passwords.
+
+## Reproduction and remaining work
+
+Build server into your isolated CARGO_TARGET_DIR, set RAINSYNC_ARTIFACT_DIR and
+(optional) RAINSYNC_NATIVE_POSTGRES_BIN, then run the listed Node integration
+scripts. Browser tests can use an isolated Playwright config overriding the dev
+port/output directory; no repository config change is necessary.
+
+The parent can apply the downloadable commits/bundle onto 79cff and carry out
+combined-lane review. No remaining shared interface/startup wiring blocker exists.
+Long-duration, physical-device, broad multi-service acceptance and deployment
+remain later work. This handoff does not claim all of E01 or the multi-lane release
+is complete; persistent event replay is outside this lane.

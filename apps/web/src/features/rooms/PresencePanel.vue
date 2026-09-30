@@ -9,10 +9,11 @@ defineProps<{
 </script>
 
 <template>
-  <section class="presence-panel" aria-label="在线成员">
-    <p v-if="!snapshot" role="status">在线状态暂不可用</p>
+  <section class="presence-panel" aria-label="已上报在线状态的连接">
+    <p v-if="!snapshot" role="status">在线状态不可用</p>
     <template v-else>
-      <p role="status">{{ snapshot.members.length }} 人在线</p>
+      <p role="status">{{ snapshot.members.length }} 位成员已上报在线状态</p>
+      <p>仅显示已上报在线状态的连接；其他成员的状态未知。</p>
       <ul v-if="snapshot.members.length">
         <li v-for="member in snapshot.members" :key="member.userId">
           <span
@@ -25,7 +26,7 @@ defineProps<{
           >
             {{ member.connections }} 个连接
           </span>
-          <span v-else>在线</span>
+          <span v-else>1 个连接</span>
         </li>
       </ul>
     </template>
