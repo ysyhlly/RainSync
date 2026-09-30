@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 
 export async function controlEpochs({
   socket,
@@ -72,19 +74,21 @@ export async function controlEpochs({
   sql(
     `INSERT INTO command_results(room_id,command_id,user_id,state,request_payload,created_at) SELECT room_id,'${oldId}',user_id,state,request_payload,now()-interval '49 hours' FROM command_results WHERE command_id='${command.command_id}'`,
   );
-  execFileSync(
-    "cargo",
-    [
-      "run",
-      "--quiet",
-      "--locked",
-      "-p",
-      "persistence",
-      "--example",
-      "cleanup_control_history",
-    ],
-    { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
+  const cleanup = resolve(
+    env.CARGO_TARGET_DIR ?? "target",
+    "debug",
+    "examples",
+    `cleanup_control_history${process.platform === "win32" ? ".exe" : ""}`,
   );
+  assert.ok(
+    existsSync(cleanup),
+    "Build cleanup_control_history before this test: cargo build --locked -p persistence --example cleanup_control_history",
+  );
+  execFileSync(cleanup, [], {
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
   assert.equal(
     sql(
       `SELECT count(*) FROM command_results WHERE command_id='${command.command_id}'`,

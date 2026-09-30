@@ -171,6 +171,7 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
     }
 }
 
+#[derive(Clone)]
 pub struct PlaybackOptions {
     pub position_ms: f64,
     pub audio_index: Option<u32>,
@@ -198,21 +199,160 @@ pub async fn upstream_plan(
     config: &SourceConfig,
     item: &str,
     options: &PlaybackOptions,
+    device_id: &str,
 ) -> Result<Value> {
     let body = playback_request(config, options);
-    let url = format!("{}/Items/{}/PlaybackInfo", base(config)?, item);
-    let req = client().post(url).json(&body);
-    let req = if kind == "jellyfin" {
-        req.header("Authorization",format!("MediaBrowser Client=\"RainSync\", Device=\"Web\", DeviceId=\"rainsync\", Version=\"0.1.0\", Token=\"{}\"",config.token))
-    } else {
-        req.header("X-Emby-Token", &config.token)
-    };
+    let mut url = validate_url(&format!("{}/", base(config)?))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("invalid_upstream_base"))?
+        .pop_if_empty()
+        .extend(["Items", item, "PlaybackInfo"]);
+    let mut req = client().post(url).json(&body);
+    for (name, value) in upstream_headers(kind, config, device_id)? {
+        req = req.header(name, value);
+    }
     Ok(req.send().await?.error_for_status()?.json().await?)
+}
+
+/// The same device identity must accompany negotiation, media/subtitle delivery
+/// and playback check-ins. Tokens remain inside encrypted server-side scope.
+pub fn upstream_headers(
+    kind: &str,
+    config: &SourceConfig,
+    device_id: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    anyhow::ensure!(
+        !device_id.is_empty()
+            && device_id.len() <= 128
+            && device_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+        "invalid_upstream_device"
+    );
+    let token = config.token.replace('\\', "\\\\").replace('"', "\\\"");
+    let prefix = match kind {
+        "jellyfin" => "MediaBrowser",
+        "emby" => "Emby",
+        _ => bail!("invalid_upstream_kind"),
+    };
+    let identity = format!(
+        "{prefix} Client=\"RainSync\", Device=\"Web\", DeviceId=\"{device_id}\", Version=\"0.1.0\", Token=\"{token}\""
+    );
+    let mut headers: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    headers.insert(
+        if kind == "jellyfin" {
+            "Authorization"
+        } else {
+            "X-Emby-Authorization"
+        }
+        .into(),
+        identity,
+    );
+    if kind == "emby" {
+        headers.insert("X-Emby-Token".into(), config.token.clone());
+    }
+    for (name, value) in &headers {
+        reqwest::header::HeaderName::from_bytes(name.as_bytes())?;
+        reqwest::header::HeaderValue::from_str(value)?;
+    }
+    Ok(headers)
+}
+
+/// Reject URLs naming another playback/device pair and encode both identifiers.
+pub fn bind_playback_identity(
+    mut url: reqwest::Url,
+    sid: &str,
+    device: &str,
+) -> Result<reqwest::Url> {
+    let mut session = false;
+    let mut identity = false;
+    for (name, value) in url.query_pairs() {
+        if name.eq_ignore_ascii_case("PlaySessionId") {
+            anyhow::ensure!(value == sid, "upstream_session_mismatch");
+            session = true;
+        }
+        if name.eq_ignore_ascii_case("DeviceId") {
+            anyhow::ensure!(value == device, "upstream_device_mismatch");
+            identity = true;
+        }
+    }
+    if !session {
+        url.query_pairs_mut().append_pair("PlaySessionId", sid);
+    }
+    if !identity {
+        url.query_pairs_mut().append_pair("DeviceId", device);
+    }
+    Ok(url)
+}
+
+/// Accepted/redirect/error responses do not confirm a check-in executed.
+pub fn checkin_confirmed(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::OK | reqwest::StatusCode::NO_CONTENT
+    )
 }
 
 #[cfg(test)]
 mod playback_tests {
     use super::*;
+    #[test]
+    fn playback_identity_is_consistent_and_rejects_cross_session_urls() {
+        let config: SourceConfig =
+            serde_json::from_value(json!({"token":"private-token"})).unwrap();
+        let a = "rainsync-01234567-0123-4567-89ab-0123456789ab";
+        let b = "rainsync-12345678-1234-4567-89ab-0123456789ab";
+        for kind in ["jellyfin", "emby"] {
+            let headers = upstream_headers(kind, &config, a).unwrap();
+            let field = if kind == "jellyfin" {
+                "Authorization"
+            } else {
+                "X-Emby-Authorization"
+            };
+            assert!(headers[field].contains(&format!("DeviceId=\"{a}\"")));
+            assert_ne!(headers, upstream_headers(kind, &config, b).unwrap());
+            if kind == "emby" {
+                assert_eq!(headers["X-Emby-Token"], "private-token");
+            }
+        }
+        for bad in ["", "rainsync\"injected", "rainsync\nnew-header"] {
+            assert!(upstream_headers("jellyfin", &config, bad).is_err());
+        }
+        let url = validate_url("https://media.example/master.m3u8?keep=1").unwrap();
+        let bound = bind_playback_identity(url, "sid +&/?", a).unwrap();
+        let values: std::collections::BTreeMap<_, _> = bound.query_pairs().into_owned().collect();
+        assert_eq!(values["PlaySessionId"], "sid +&/?");
+        assert_eq!(values["DeviceId"], a);
+        assert_eq!(values["keep"], "1");
+        for query in [
+            "PlaySessionId=other",
+            "DeviceId=other",
+            "playsessionid=other",
+            "PlaySessionId=sid&PlaySessionId=other",
+        ] {
+            assert!(
+                bind_playback_identity(
+                    validate_url(&format!("https://media.example/master.m3u8?{query}")).unwrap(),
+                    "sid",
+                    a
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn only_completed_checkin_responses_confirm_remote_execution() {
+        for code in [200, 204] {
+            assert!(checkin_confirmed(
+                reqwest::StatusCode::from_u16(code).unwrap()
+            ));
+        }
+        for code in [202, 301, 401, 403, 404, 429, 500, 503] {
+            assert!(!checkin_confirmed(
+                reqwest::StatusCode::from_u16(code).unwrap()
+            ));
+        }
+    }
     #[tokio::test]
     async fn local_library_exceeding_ten_thousand_is_not_discarded() {
         let parent = std::env::temp_dir().canonicalize().unwrap();

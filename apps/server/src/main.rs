@@ -52,6 +52,7 @@ pub struct App {
     start: Instant,
     rooms: Arc<Mutex<HashMap<Uuid, rooms::Handle>>>,
     agent_controls: Arc<Mutex<HashMap<Uuid, agents::Control>>>,
+    upstream: Arc<upstream::Runtime>,
 }
 impl App {
     fn now(&self) -> f64 {
@@ -416,6 +417,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         start: Instant::now(),
         rooms: Default::default(),
         agent_controls: Default::default(),
+        upstream: Default::default(),
     };
     // A previous process cannot still own preparations after the instance lock
     // has been acquired. Retire their grants before same-key recovery.
@@ -424,6 +426,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .execute(&mut *recovery).await?;
     sqlx::query("UPDATE playback_sessions SET stopped=true WHERE id IN(SELECT session_id FROM playback_requests WHERE status='failed' AND error_code='playback_request_interrupted')")
         .execute(&mut *recovery).await?;
+    persistence::upstream_reservations::recover(&mut recovery, app.epoch).await?;
     recovery.commit().await?;
     for row in sqlx::query("SELECT state FROM room_snapshots")
         .fetch_all(&db)
@@ -454,6 +457,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
                 "UPDATE agent_transfer_runs SET status='failed',reason='transfer_owner_lost',updated_at=now(),finished_at=now() WHERE finished_at IS NULL AND lease_until<=now()",
                 "DELETE FROM agent_transfer_runs WHERE finished_at<now()-interval '24 hours'",
                 "DELETE FROM playback_requests r WHERE r.expires_at<now() AND NOT EXISTS(SELECT 1 FROM playback_sessions p WHERE p.id=r.session_id AND NOT p.stopped AND p.expires_at>now())",
+                "DELETE FROM upstream_reservations WHERE state='closed' AND closed_at<now()-interval '48 hours'",
             ] {
                 let _ = sqlx::query(query).execute(&cleanup).await;
             }

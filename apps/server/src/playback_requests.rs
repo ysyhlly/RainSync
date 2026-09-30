@@ -75,6 +75,8 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
             .execute(&mut *tx)
             .await?;
         sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')").bind(old).execute(&mut *tx).await?;
+        persistence::upstream_reservations::close(&mut tx, old, "playback_request_interrupted")
+            .await?;
         sqlx::query("UPDATE playback_requests SET status='failed',error_status=409,error_code='playback_request_interrupted',response_encrypted=NULL WHERE user_id=$1 AND idempotency_key=$2")
             .bind(user).bind(key).execute(&mut *tx).await?;
         if row.get::<i32, _>("attempt") >= 3 {
@@ -162,6 +164,7 @@ pub async fn fail(app: &App, reservation: &Reservation, error: &Error) -> Result
         .bind(reservation.session)
         .execute(&mut *tx)
         .await?;
+    persistence::upstream_reservations::close(&mut tx, reservation.session, &recorded.1).await?;
     tx.commit().await?;
     if exhausted {
         return Err(recorded);
@@ -189,6 +192,8 @@ pub async fn cancel(
         .execute(&mut *tx)
         .await?;
     sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')").bind(session).execute(&mut *tx).await?;
+    persistence::upstream_reservations::close(&mut tx, session, "playback_request_cancelled")
+        .await?;
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }

@@ -8,6 +8,7 @@ pub mod cache_outputs;
 pub mod media_jobs;
 pub mod media_outputs;
 pub mod media_queue;
+pub mod upstream_reservations;
 
 pub async fn connect(url: &str) -> Result<PgPool> {
     Ok(PgPoolOptions::new()
@@ -140,6 +141,8 @@ pub async fn commit(
     .execute(&mut *tx)
     .await?;
     sqlx::query("UPDATE playback_sessions SET stopped=true WHERE room_id=$1 AND generation<>$2 AND NOT stopped").bind(state.room_id).bind(i64::from(state.media_generation)).execute(&mut *tx).await?;
+    upstream_reservations::close_room(&mut tx, state.room_id, i64::from(state.media_generation))
+        .await?;
     sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE status IN('queued','running') AND session_id IN(SELECT id FROM playback_sessions WHERE room_id=$1 AND stopped)").bind(state.room_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())

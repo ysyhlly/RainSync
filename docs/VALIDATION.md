@@ -1,5 +1,61 @@
 # 本轮验证记录
 
+## 2026-09-30：候选 D 两小时 NAS 失败
+
+原 `rainsync-soak-a38b55a9` 于 `02:50:16.976Z` 终态失败，未重启或拼接时长。实际观察 6192.203 秒（103.2 分钟）、呈现 61917 帧，仍是原 session/attempt 1，十次网页续租成功，无计数重置或控制断连。`02:49:56.589Z` 源因 consumer_cancelled 结束，早于测试 DELETE；失败采样源文件已关闭、FFmpeg 已退出，严格持续传输门槛失败。报告 `D/source/.runtime/nas-soak/rainsync-soak-a38b55a9/report.json` SHA `1435cd5759483fea1ae67700fe29ea892b9176a40857f80ca0550b71780101b1`，日志、截图和原始采样保留。
+
+Worker 续租查询和产物发布末端查询分别达到 3.001/3.012 秒期限，现有健康路径把数据库结果未知当作租约失效，提前终止编码。失败后数据库仍显示正任务租约约 10.52 秒；sqlx 超时丢弃查询也会记录默认 rows_affected=0，不能据此证明失去所有权。发布事务会持有同任务行锁，但现场未留 PG 活动/锁快照，数据库锁、Docker VM 或 I/O 停顿的具体原因仍未知；两次临界资源采样不可得也不能当作零负载。后续须受控阻塞回归并区分确认撤销与暂时未知，不能只放大期限。
+
+实际 DELETE 200 后 0.776 秒释放，全部传输终态、会话停止、任务取消，owned 容器/网络清理。独立 post-run verify exit 0，D 冻结源码与不可变镜像保持原身份。原控制长测继续：十房×十人已完成实际六十分钟，ACK p95 12.2ms；五十房×两人尚在原进程运行，不能提前认定通过。联合资源和开发活动证据单独保存，不作为独占 SLO。
+
+## 2026-09-30：W03 旧会话公平收尾
+
+独立审查发现并修复旧会话固定最低 UUID 批次导致的清理饥饿。待清理和有效进度分开查询/调度，复用各自全局四路、每来源两路预算后独立执行；进度按最近上报时间轮转且不超过十秒频率。领取在数据库中原子核对状态、IO 租约和预算，只有实际领取才计入最多五次；退避最多十六秒，六十秒总期限的剩余预算扣除 SQL 往返时间后限制真实 HTTP，总期末零余量不发请求。完成仍需匹配原 claim 和有效租约；不改旧加密 scope/设备/SID。
+
+八生产文件新摘要 `894a1463163c836fa4b6a39b0011b18cf9b916a3887474c505358083e14ec1b3`；新绑定 `.runtime/w03-backend/fairness/backend-binding.json` SHA `56e9586f285afa757678f2e4d5ac5f0a8bec9d5652e9429bf7c529f457f8953a`。实际 Windows Server `3d512f80c1ab0ac3abcf542cd2e910c39ffe3039f1126625475cd07a73c4f1d4`，Worker/Agent 与首批相同。新受影响十五项测试、全工作区 Clippy、格式、生成协议检查及全部二进制/示例构建通过；旧 e7bf/775ef 绑定和源码归档保留，未混作新版本证明。
+
+最终 `tests/upstream-reservations.mjs` 同一入口一次十九场景全通过（116.524 秒），`.runtime/upstream-reservations/a96bbdb3-b6a4-4a55-87f7-90e4ef38626a/report.json`。入口仍为 `52f8550e…`，新增崩溃恢复与十八个既有契约门槛全部执行；实际 Server 副本/八源/入口前后稳定，失败为零，owned PG 和匿名卷清理通过。
+
+新版本完整原生集成也通过（175.524 秒），`.runtime/w03-backend/native-integration/4f2d0b78-886c-4d72-a500-cf8c0b9c6828/report.json`：八源/三 exe/八预构建例子/入口与导入前后稳定，全部既有媒体/控制/任务/索引/备份恢复门槛保持通过，owned PG/匿名卷和登记的三十四个进程查空。100 连接快照 256ms 是共享宿主短测，不是独占容量 SLO。D 两个原持续进程及三套本批回归实际 UTC 重叠另记 sidecar。
+
+密集旧库升级最终一次通过全部五十项检查（161.197 秒），`.runtime/upstream-reservations-upgrade/96f6eb44-3f7f-4596-9b8b-2e8d39801337/report.json` SHA `c463a487bb266fbf52d6566c4d0ef84baff7bb37c125bccda5f3b8805196da24`，入口 SHA `c96b9b9a4f1e8e43f93b6d6fccc58b93b0cdf168d09db12cdbc6d7ac8504a3f6`。四十六个真实旧 API 授权实际迁移 1–24→25；四十二个正常存活授权持续收到 Progress 204。被停止的高 UUID 会话之前仍有四十四个低 UUID 活跃授权，原设备/SID 的一次 Stopped 204 正确关闭，不再饥饿。三种失败均实际领取五次；已知 Jellyfin 五次 503，旧 Emby 五次 Stopped 204 但无可恢复设备且不发 DELETE、不假闭合，未知 SID 零 HTTP Stop。等待第五次真实 HTTP 响应及 IO claim 结束后检查，失败窗 47.902 秒、另 14.641 秒稳定窗无第六次。八源、新旧 exe、绑定、夹具和入口前后稳定，二十四项 owned 清理核对全部通过。
+
+此前两份密集失败证据保留：首轮把四十人放同房触发正常 `ROOM_FULL`，夹具改为五个各八人的真实房间，通过正常创建/邀请/WS 切片源；第二轮在第五次领取与响应之间过早断言，修为等待 IO 结束及第五次实际响应。没有抬房间配额、绕过 API 或降低预算门槛。
+
+## 2026-09-30：W03 上游预约、取消补偿及旧库升级
+
+第一批增加迁移 0025、独立上游预约/设备身份、SID 先持久化、独立协商执行者、有界并行清理及累计分步确认。网络 Start/Progress 结果未知时保留 `io_uncertain`，不把本地租约当成上游取消保证；旧 Emby 无可恢复 DeviceId 时不猜测身份或假记编码已停止。实际视频触发 Start/每观看者进度与真实固定 Jellyfin/Emby 矩阵仍待下一批，本批没有改动指定分支前端，也没有部署。机制及边界见 [上游会话核对](UPSTREAM_SESSION_AUDIT.md)。
+
+冻结后端八文件摘要 `e7bf20826e5f2f54857beaf4e5d20a4d1890050299df4260f14b5909dab173b7`，绑定 `.runtime/w03-backend/backend-binding.json`。成功原生构建实际 Server SHA `775ef9e09523244f3135e787b34b4cf6015007faeedaf8bfb257cb18a6c8284e`、Worker `ea98d517dd9e7fddff067f1f8e1422d0f2949115686219898fe8d9f75af8cf60`、Agent `5cd04b9df03303a3b570e91d44871d57f3a23d352a19564a0c03fdb1b5cbed8e`。工作区 71 项 Rust 测试通过、两项子进程夹具入口忽略；最终 Server 十项再次通过，全部目标 Clippy、格式、生成协议检查及二进制/示例构建通过。首次类型推断编译错误及修正后日志保留，不压低检查要求。
+
+真实 Windows Server/隔离 PostgreSQL 与受控 HTTP 的十八场景通过（114.233 秒），报告 `.runtime/upstream-reservations/a2c65d49-bc47-444b-ae07-2143f72ed7b1/report.json`。覆盖两种服务的独立尝试/加密/幂等、成功 SID 后的空流/音轨/URL 校验失败、取消迟到响应、提交事务失败、真实房间换代、重启保留其他有效授权、Emby 一次 Stopped 成功后只重试失败的 DELETE、慢 Stop 不阻塞独立会话、最多五次清理和未知 SID。协商超时使用真实三十秒期限，收到请求至返回 30.022 秒；健康会话在慢 Stop 连接关闭前完成，实际清理 1.448 秒。迟到 Start 在已成功补偿 Stop 后实际重新生效，测试要求本地仍 `cleanup_failed / io_uncertain`，不将远端不确定性伪装成释放通过。入口 SHA `e209c43b7dfaaae250e2f31c13888e611dec6e05829b2074ac12669cc7fe87b7`，该精确版本保存在报告旁 `tested-entry.mjs`。
+
+同一冻结后端另行补测进程在 held PlaybackInfo、SID/响应均未保存时真正终止，再启动新 epoch、释放旧上游迟到响应并用原 key 重试；旧行保持 `unknown / cleanup_failed`、无授权/旧 SID Stop，新尝试有独立设备/SID，真实 Start 活跃后单独 Stop 成功，旧行在新 Stop 后仍不假闭合。独立审查补上 Start 前活跃及 Stop 后旧行断言后，唯一最终单选运行通过（15.423 秒），报告 `.runtime/upstream-reservations/41a97163-38d9-4e4c-ac9d-3aea5c959e11/report.json`，入口 SHA `52f8550eb9f2f20d0e499a117f79e9417d3514db8f3592c9cddb4545414cdfaa`。十八场景与补测是不同入口版本/随机运行，未称为最终入口一次十九场景实跑；首次补测版本也归档在原报告旁。
+
+旧库升级另行通过九项检查（100.933 秒），报告 `.runtime/upstream-reservations-upgrade/a15b46dd-b7a1-4a1b-a464-60e32a2899fd/report.json`，入口 SHA `a2704bdaeec2e8c0ab1f154372fdba69cfa5e7d7d8bc97fcda50e678f8ffcfea`。旧 Server `a4efce0d…` 创建六个真实 API 授权，确认实际迁移 1–24→1–25，新增预约表未凭空回填；ready/renew 保留原 scope/SID、不新增协商。已知 Jellyfin 使用原 `rainsync` 身份收到 Stopped 204，另两个 Jellyfin/Emby 授权仍活跃。三种失败各最多五次：已知 Jellyfin 五次 HTTP 503、旧 Emby 五次 Stopped 204 但无 DeviceId/不发 DELETE且远端编码仍活跃、未知 SID 五次本地领取且零 HTTP Stop；均不标记 closed。实际预算观察 65.56 秒及额外 13.92 秒稳定窗无第六次领取。
+
+三轮最终实跑的入口/夹具/实际 exe 与八文件后端输入前后稳定；各自随机隔离容器及登记匿名卷清理通过。这些证明受控协议和本地恢复，不代表真实 Jellyfin/Emby 解码兼容。D 长测继续使用原镜像与 frozen source；上述开发和测试 UTC 区间另记共享资源的 `development-activity.jsonl`，不可混合候选身份或宣称独占 SLO。cgraphy 差异上下文再次长时间无返回，停止该只读调用，采用符号源码、独立审查和 Git 差异复核，没有 enrich。
+
+随后完整 Windows 原生集成首次失败，`.runtime/w03-backend/native-integration/04e0fb36-8492-44fd-be89-132e9609f79e/report.json` 与 `stdout.log` 保留。既有媒体/幂等/恢复检查通过后，控制 epoch 检查遇到 WS 已关闭；测试在活连接后同步 `cargo run cleanup_control_history`，隔离 target 漏预构建该示例，实际发生冷编译，观测产物时间跨度 69.545 秒超过服务端 45 秒无心跳期限。首次输出未捕获 Server 退出原因，不能声称生产退出已证实。测试现要求执行预构建例子、缺失即明确失败，原 epoch/48 小时/锁等待断言与期限保留；单例 `-j2` 构建通过，完整重跑继续。首次隐藏 Cargo 的实际并行数未知，另行如实记录，不能事后填成两个任务。
+
+修正后完整集成在原冻结后端通过（176.144 秒），`.runtime/w03-backend/native-integration/6354293b-0aac-4f36-ab4a-44274fec8a19/report.json`：控制 epoch/48 小时/锁等待、WS 限流、真实媒体/任务/缓存/NAS、10001 条索引及 PostgreSQL 备份恢复均通过，100 连接快照 268ms 仍只是短测。修后 `control-epochs.mjs` SHA `cd74c725981210f70df636c3b762a3e21d2ec45a49408e04a9198b07e43ad7f8`，执行的预构建例子 SHA `0f93394802b7355371aaefb5afa46e3738a8b957d15b7cff1f5bab4d5fdf9e6c`；八生产源/绑定/三实际副本 exe、入口及导入前后稳定，隔离 PG/匿名卷和登记的三十个进程查空，未观测到新的 Cargo/rustc。原八份源码及绑定另外保存在 `.runtime/w03-backend/pre-fairness-e7bf2082`，这轮仍不是公平性修后的证明。
+
+提交前独立审查另发现旧会话批次按最低 UUID 固定取 32 条，持续有效的旧授权可能长期阻挡较后面的清理。小规模升级回归没有覆盖该公平性问题；正在分离旧会话清理与进度轮转，并扩充超过 32 个真实旧授权的回归。修后须重新构建、绑定并重测受影响矩阵，现有八文件/775ef 原生证据只证明其原版本，不作为修后证明。
+
+## 2026-09-30：候选 D 短测与持续验证启动
+
+D 从干净提交 `036ac194a5bbbfce081c55f7421170b67da0ba6c` 冻结、实际构建并独立 verify：`.runtime/validation-candidates/w07-w08-20260930-d/candidate.json`。镜像 `sha256:90a49394c7e17198992a6eef6b2edd48b4ddfe4822fd4548b5a0f95b54487aaa`；全源码 `f83940c9bfa08ffd87a6e8124a53f5030c2f14ba878268ebdcab88f0f81c4970`、生产 `39dbd5a4b3c930df10caeab17c2784b256c57d6d2da7df36be4adbbe9e730c32`，372 份源码、105 份生产清单项。实际前端仍为 `262cb8eb414fdc3861816fee1655cdf0e05a9a538541e83fabd3a0bec41fc54c`，指定分支提交 `7f17ab7`；相比 C，生产清单只增加精度回归及 Cargo float feature，Cargo.lock 未变。五个镜像 label、A 只读 vendor、FFmpeg 5.1.9 和三份实际 Linux 二进制核对通过，独立证据 `D/independent-identity-proof.json`；Server `70552ac613da24b5bf5d1bdafe17910d95058549e6d210c7649ef5b543d401b9`、Worker `7def067ba34ab6137ccf9ea7543ac357e8b705f5efa1676e2155bc4c03afbcb4`、Agent `1ea2405d5831b4b0e328af2e6beebfe1d69e335d79026ae39c968f4e2e6042ab`。
+
+D 两种拓扑各二十五秒短测通过，`D/source/.runtime/control-load/rainsync-load-2dfdcd82/report.json`：十房×十人 ACK p95 29.5ms/30 条命令，五十房×两人 32.5ms/150 条命令，两阶段均至少 100 个在线独立身份，完整状态/重连/持久化一致。真实 Ctrl+C 另行通过，`D/source/.runtime/control-interrupt/c9e3c6e6-fc65-48ac-b63c-8ddc09bc77a6/report.json`：排队 ACK 中约 1661ms 非零退出、failed 报告且 owned 容器/网络清理。正常短测与中断测试是不同随机运行，未把预期失败报告当成正常门槛通过。
+
+D 新完整窗口 NAS 九十秒短测通过，`D/source/.runtime/nas-soak/rainsync-soak-58e0b91b/report.json`：首帧 92.346 秒，实际帧计数窗口 90.8214 秒、呈现 902/907.733 帧（99.3684%），媒体前进 90.8 秒；掉帧 2、缓冲 0.6823 秒（0.7513%）、无计数重置。最终 fresh counter 2→904 包含末采样之后新增八帧。持续真实源句柄、正租约、任务 attempt 1、同方案；停止 3.8142 秒内三流终态、源文件与编码进程释放，候选前后 verify、全部隔离清理通过。
+
+D 背压五场景通过，`D/proofs/agent-backpressure-64e3d610-132b-4f0b-a1fd-d25c094648e2/binding.json` 与 `D/source/.runtime/agent-backpressure/rainsync-agent-backpressure-673bed03/report.json`：21 次健康信号/43.771 秒后精确恢复 64MiB；先收到健康信号再 Close 181ms、控制丢失 168ms 释放/2.009 秒重连，失健康 29.227 秒释放。完整前后候选/实际二进制核对和 owned 容器/卷清理通过。三组短测共享宿主资源，不能称作独占单场景 SLO。
+
+上述短门槛通过后才启动两份持续负载：控制 `rainsync-load-f01d14c6` 默认串行十房×十人、五十房×两人各 3600 秒；NAS `rainsync-soak-a38b55a9` 请求 7200 秒、30 秒采样，真实起播 `2026-09-30T01:07:00.126Z`。唯一不可变 D 镜像和 frozen source 保持绑定，长测未完成前不关闭时长门槛。外层只读采样器在 `01:03:27.462Z` 先于两入口启动，`.runtime/validation-joint/w07-w08-20260930-d` 保存精确 argv、D 身份、两项 run bindings、15 秒共享 Docker/宿主资源快照；代码 SHA `6707c8def06e061f148df44ec046223ad4cde0dd5d50311eb86e9861ea59562b`。缺失或无法确认的阶段保持 unknown，重叠只用入口报告的实际测量区间，不能把两个负载写成独立单场景 SLO。
+
+NAS 真实样本 8340.061 秒，1.10 读取设置并保留实际准备之后约 289 秒覆盖余量。十分钟检查已实际收到网页定时同会话续租 200（不是 initial manual），持续真实解码、源字节/租约及单 attempt；这些仅为运行中检查点。活仓库后续 W03 源码和测试不混入 D，若同宿主编译，命令/两个并行任务限制和 UTC 区间另记 `development-activity.jsonl`，最终评估需一并呈现。
+
 ## 2026-09-30：候选 C、精度回归与完整呈现窗口
 
 C 从 `a9d5ee7` 冻结并实际构建、独立 verify 通过：`.runtime/validation-candidates/w07-w08-20260930-c/candidate.json`，镜像 `sha256:65f18d489cf5a16d527051fc4fc0ca8b4b3b20df405b9ab5d082726309a56c6b`，全源码 `02974c5ab56e910ef3f9b17a6607d5f8f53aac31c333f63ccb6fb9bf22444b2c`，生产 `2d9365348a8c617476aa32bd0f77a3f982e1e51afea10ddb26988af26056165d`，实际前端 `262cb8eb414fdc3861816fee1655cdf0e05a9a538541e83fabd3a0bec41fc54c`。370 份源码、五个 label、只读 A vendor、实际三份二进制及 FFmpeg 5.1.9 全部核验；Rust 产物哈希与 B 相同，前端分支提交仍为 `7f17ab7`，实际前端包含已验证的增长恢复修复。

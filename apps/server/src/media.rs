@@ -223,7 +223,7 @@ async fn prepare_playback(
     let media = state
         .media_id
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no_media"))?;
-    let row=sqlx::query("SELECT m.resource,m.duration_ms,m.metadata,m.source_version,s.kind,s.config_encrypted FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND m.available").bind(media).fetch_optional(&app.db).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "media_not_found"))?;
+    let row=sqlx::query("SELECT m.source_id,m.resource,m.duration_ms,m.metadata,m.source_version,s.kind,s.config_encrypted FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND m.available").bind(media).fetch_optional(&app.db).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "media_not_found"))?;
     let kind: String = row.get("kind");
     let config: SourceConfig =
         serde_json::from_value(app.decrypt(&row.get::<String, _>("config_encrypted"))?)
@@ -271,23 +271,30 @@ async fn prepare_playback(
             resource["source_version"] = json!(version);
         }
         "jellyfin" | "emby" => {
-            let info = providers::upstream_plan(
-                &kind,
-                &config,
-                &item,
-                &providers::PlaybackOptions {
-                    position_ms,
-                    audio_index: body.audio_index,
-                    progressive: body
-                        .capabilities
-                        .as_ref()
-                        .is_none_or(|c| c.progressive_h264_aac),
-                    hls: body.capabilities.as_ref().is_none_or(|c| c.supports_hls()),
-                    force_transcode: body.mode.as_deref() == Some("transcode"),
+            let info = upstream::negotiate(
+                app,
+                upstream::Prepare {
+                    reservation,
+                    room: body.room_id,
+                    media,
+                    source: row.get("source_id"),
+                    generation: body.media_generation,
+                    kind: &kind,
+                    config: &config,
+                    item: &item,
+                    options: providers::PlaybackOptions {
+                        position_ms,
+                        audio_index: body.audio_index,
+                        progressive: body
+                            .capabilities
+                            .as_ref()
+                            .is_none_or(|c| c.progressive_h264_aac),
+                        hls: body.capabilities.as_ref().is_none_or(|c| c.supports_hls()),
+                        force_transcode: body.mode.as_deref() == Some("transcode"),
+                    },
                 },
             )
-            .await
-            .map_err(|_| err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"))?;
+            .await?;
             let source = info["MediaSources"]
                 .as_array()
                 .and_then(|v| v.first())
@@ -356,22 +363,33 @@ async fn prepare_playback(
                     ));
                 }
                 mode = "direct";
-                format!(
-                    "{}Videos/{}/stream.mp4?Static=true&MediaSourceId={}",
-                    base,
-                    item,
-                    source["Id"].as_str().unwrap_or(&item)
-                )
+                let mut url = base.clone();
+                url.path_segments_mut()
+                    .map_err(|_| err(StatusCode::BAD_GATEWAY, "invalid_upstream_base"))?
+                    .pop_if_empty()
+                    .extend(["Videos", &item, "stream.mp4"]);
+                url.query_pairs_mut()
+                    .append_pair("Static", "true")
+                    .append_pair("MediaSourceId", source["Id"].as_str().unwrap_or(&item));
+                url.to_string()
             };
-            resource["url"] = json!(url);
+            let device_id = format!("rainsync-{}", reservation.session);
+            let url = providers::bind_playback_identity(
+                providers::validate_url(&url)?,
+                info["PlaySessionId"]
+                    .as_str()
+                    .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"))?,
+                &device_id,
+            )
+            .map_err(|_| err(StatusCode::BAD_GATEWAY, "invalid_upstream_base"))?;
+            resource["url"] = json!(url.as_str());
             resource["upstream_session"] = info["PlaySessionId"].clone();
             resource["upstream_item"] = json!(item);
             resource["upstream_base"] = json!(config.url);
-            resource["headers"] = if kind == "jellyfin" {
-                json!({"Authorization":format!("MediaBrowser Token=\"{}\"",config.token)})
-            } else {
-                json!({"X-Emby-Token":config.token})
-            };
+            resource["upstream_device"] = json!(device_id);
+            resource["upstream_media_source"] = source["Id"].clone();
+            resource["upstream_live_stream"] = source["LiveStreamId"].clone();
+            resource["headers"] = json!(providers::upstream_headers(&kind, &config, &device_id)?);
         }
         _ => {}
     }
@@ -576,6 +594,16 @@ async fn prepare_playback(
     if current["media_generation"].as_u64() != Some(u64::from(body.media_generation)) {
         return Err(err(StatusCode::CONFLICT, "stale_media"));
     }
+    if matches!(kind.as_str(), "jellyfin" | "emby")
+        && sqlx::query("SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR SHARE")
+            .bind(body.room_id)
+            .bind(u.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_none()
+    {
+        return Err(err(StatusCode::FORBIDDEN, "not_a_member"));
+    }
     if kind == "agent"
         && sqlx::query(
             "SELECT id FROM media_items WHERE id=$1 AND available AND source_version=$2 FOR SHARE",
@@ -603,6 +631,20 @@ async fn prepare_playback(
         }
     }
     playback_requests::complete(app, &mut tx, reservation, &plan).await?;
+    if matches!(kind.as_str(), "jellyfin" | "emby")
+        && !persistence::upstream_reservations::activate(
+            &mut tx,
+            id,
+            if transport == "hls" {
+                "Transcode"
+            } else {
+                "DirectPlay"
+            },
+        )
+        .await?
+    {
+        return Err(err(StatusCode::CONFLICT, "playback_request_interrupted"));
+    }
     tx.commit().await?;
     if matches!(kind.as_str(), "jellyfin" | "emby") {
         let _ = upstream::report(app, id, "start").await;
@@ -711,12 +753,24 @@ pub async fn stop(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
     let u = auth(&app, &h, true).await?;
+    let mut tx = app.db.begin().await?;
     sqlx::query("UPDATE playback_sessions SET stopped=true WHERE id=$1 AND user_id=$2")
         .bind(id)
         .bind(u.id)
-        .execute(&app.db)
+        .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id IN(SELECT id FROM playback_sessions WHERE id=$1 AND user_id=$2) AND status IN('queued','running')").bind(id).bind(u.id).execute(&app.db).await?;
+    sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id IN(SELECT id FROM playback_sessions WHERE id=$1 AND user_id=$2) AND status IN('queued','running')").bind(id).bind(u.id).execute(&mut *tx).await?;
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM playback_sessions WHERE id=$1 AND user_id=$2)",
+    )
+    .bind(id)
+    .bind(u.id)
+    .fetch_one(&mut *tx)
+    .await?
+    {
+        persistence::upstream_reservations::close(&mut tx, id, "playback_stopped").await?;
+    }
+    tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }
 pub async fn renew(
