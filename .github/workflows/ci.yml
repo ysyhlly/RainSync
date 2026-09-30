@@ -24,6 +24,7 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo run -p protocol --example export -- --check
       - run: npm ci && npm test && npm run build
+      - run: node tests/postgres-readiness.mjs
       - run: cargo build --workspace --bins --examples --locked && node tests/integration.mjs
       - run: npm run test:priority-remediation
       - run: npm run test:lifecycle-capabilities

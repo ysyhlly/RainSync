@@ -338,6 +338,27 @@ export function isolatedPostgres({
         if (postgresFailure || (postgres && postgres.exitCode !== null))
           throw new Error(`Disposable PostgreSQL failed; inspect ${root}`);
         try {
+          // The official image's temporary initialization postmaster accepts
+          // Unix-socket queries, then stops before the final server starts.
+          // It disables TCP, so this must succeed before the socket SQL probe.
+          // Native fixtures already probe their explicitly bound TCP endpoint.
+          if (!native)
+            docker([
+              "exec",
+              container,
+              "pg_isready",
+              "-h",
+              "127.0.0.1",
+              "-p",
+              "5432",
+              "-U",
+              "rainsync",
+              "-d",
+              database,
+              "-q",
+              "-t",
+              "1",
+            ]);
           sql("SELECT 1", native ? "postgres" : database);
           break;
         } catch {
