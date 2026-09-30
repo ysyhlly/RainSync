@@ -1,5 +1,5 @@
 //! Private adapter helpers. The public dispatch remains owned by the integrator.
-use super::{Item, PlaybackOptions, SourceConfig, client, playback_request, validate_url};
+use super::{Item, PlaybackOptions, SourceConfig, playback_request, validate_url};
 use anyhow::{Result, ensure};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -49,10 +49,10 @@ pub async fn plan(
 ) -> Result<Value> {
     ensure!(!item.is_empty(), "missing_id");
     let url = endpoint(config, &["Items", item, "PlaybackInfo"])?;
-    let mut request = client().post(url).json(&body);
-    for (name, value) in headers {
-        request = request.header(name, value);
-    }
+    let request = super::source_request(config, url.as_str(), reqwest::Method::POST, &headers)
+        .await?
+        .timeout(std::time::Duration::from_secs(30))
+        .json(&body);
     // Preserve the complete response, including SID on a rejected route. The
     // reservation owner must checkpoint it before applying plan validation.
     Ok(request.send().await?.error_for_status()?.json().await?)
@@ -69,18 +69,18 @@ pub async fn list(config: &SourceConfig, headers: BTreeMap<String, String>) -> R
     let mut expected_total = None;
     loop {
         let start = items.len().to_string();
-        let mut request = client().get(url.clone()).query(&[
-            ("Recursive", "true"),
-            ("IncludeItemTypes", "Movie,Episode,Video,MusicVideo"),
-            ("SortBy", "SortName"),
-            ("SortOrder", "Ascending"),
-            ("EnableTotalRecordCount", "true"),
-            ("Limit", "200"),
-            ("StartIndex", start.as_str()),
-        ]);
-        for (name, value) in &headers {
-            request = request.header(name, value);
-        }
+        let request = super::source_request(config, url.as_str(), reqwest::Method::GET, &headers)
+            .await?
+            .timeout(std::time::Duration::from_secs(30))
+            .query(&[
+                ("Recursive", "true"),
+                ("IncludeItemTypes", "Movie,Episode,Video,MusicVideo"),
+                ("SortBy", "SortName"),
+                ("SortOrder", "Ascending"),
+                ("EnableTotalRecordCount", "true"),
+                ("Limit", "200"),
+                ("StartIndex", start.as_str()),
+            ]);
         let page: Value = request.send().await?.error_for_status()?.json().await?;
         let total = page["TotalRecordCount"]
             .as_u64()

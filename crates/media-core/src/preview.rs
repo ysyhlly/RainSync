@@ -66,6 +66,7 @@ pub fn check_webp(bytes: &[u8]) -> Result<()> {
 }
 fn command() -> Command {
     let mut cmd = Command::new("ffmpeg");
+    crate::input_policy::clean_environment(&mut cmd);
     cmd.args([
         "-v",
         "error",
@@ -85,15 +86,15 @@ fn command() -> Command {
 pub async fn generate(
     url: &str,
     poster: bool,
+    rewritten_hls: bool,
     timeout: Duration,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<Vec<u8>> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut cmd = command();
     // Only the task-owned proxy is given to FFmpeg; never an upstream credential.
+    cmd.args(crate::input_policy::args(true, rewritten_hls));
     cmd.args([
-        "-protocol_whitelist",
-        "http,tcp,crypto",
         "-i",
         url,
         "-an",

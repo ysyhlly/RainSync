@@ -299,30 +299,25 @@ fn bounded(response: Response, grant: Arc<Grant>, head: bool) -> Response {
     Response::from_parts(parts, Body::from_stream(stream))
 }
 async fn remote(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     grant: Arc<Grant>,
     registration: Target,
     h: &HeaderMap,
     head: bool,
 ) -> Result<Response> {
-    let original =
-        providers::validate_url(grant.resource["url"].as_str().unwrap_or("")).map_err(failure)?;
     let target = providers::validate_url(&registration.url).map_err(failure)?;
-    if target.origin() != original.origin() {
-        return Err((StatusCode::FORBIDDEN, "cross_origin_media_rejected".into()));
-    }
-    let mut req = if head {
-        client.head(target.clone())
-    } else {
-        client.get(target.clone())
+    let config = providers::resource_config(&grant.resource).map_err(failure)?;
+    let access =
+        providers::access_policy::SourceAccess::new(&config.url, config.access_policy.as_ref())
+            .map_err(failure)?;
+    access
+        .authorize_url(target.as_str())
+        .map_err(|_| (StatusCode::FORBIDDEN, "cross_origin_media_rejected".into()))?;
+    let mut cancel = grant.cancel.subscribe();
+    let mut req = tokio::select! {biased;
+        _=cancel.changed()=>return Err((StatusCode::UNAUTHORIZED,"invalid_resource".into())),
+        result=providers::source_request(&config,target.as_str(),if head {reqwest::Method::HEAD}else{reqwest::Method::GET},&config.headers)=>result.map_err(failure)?,
     };
-    if let Some(headers) = grant.resource["headers"].as_object() {
-        for (k, v) in headers {
-            if let Some(v) = v.as_str() {
-                req = req.header(k, v)
-            }
-        }
-    }
     if !head {
         for name in [header::RANGE, header::IF_RANGE] {
             if let Some(value) = h.get(&name) {
@@ -396,10 +391,44 @@ async fn remote(
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.to_ascii_lowercase().contains("mpegurl"));
+    let key_input = registration.kind == Some(hls_manifest::Kind::Key);
+    // Only AES-128 is accepted by the manifest parser. A key must never
+    // become a manifest or forward an unbounded, unclassified body.
+    if key_input
+        && (playlist
+            || response_headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some_and(|length| length != 16))
+    {
+        return Err(failure("invalid_aes128_key"));
+    }
     let mut source = response.bytes_stream();
     let mut prefix = Vec::new();
     let mut buffered = Vec::new();
-    if !head {
+    if !head && key_input {
+        let mut bytes = Vec::with_capacity(16);
+        loop {
+            let next = tokio::select! {biased;
+                _ = cancel.changed() => return Err((StatusCode::UNAUTHORIZED, "invalid_resource".into())),
+                next = source.next() => next,
+            };
+            let Some(chunk) = next else { break };
+            let chunk = chunk.map_err(failure)?;
+            if chunk.len() > 16 - bytes.len() {
+                return Err(failure("invalid_aes128_key"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() != 16 {
+            return Err(failure("invalid_aes128_key"));
+        }
+        // Wait for EOF before publishing even the first byte. The usual
+        // bounded response below still charges these bytes exactly once and
+        // stops retained bodies when the attempt ends.
+        buffered.push(axum::body::Bytes::from(bytes));
+    } else if !head {
         while prefix.len() < http_delivery::SNIFF_BYTES {
             let next = tokio::select! {biased;
                 _ = cancel.changed() => return Err((StatusCode::UNAUTHORIZED, "invalid_resource".into())),
@@ -412,10 +441,7 @@ async fn remote(
             );
             buffered.push(chunk);
         }
-        // Keys are raw 16-byte cryptographic values, not demuxer input.
-        if registration.kind != Some(hls_manifest::Kind::Key) {
-            playlist |= http_delivery::hls_prefix(&prefix).map_err(failure)?;
-        }
+        playlist |= http_delivery::hls_prefix(&prefix).map_err(failure)?;
     }
     let stream = futures_util::stream::iter(buffered.into_iter().map(Ok)).chain(source);
     {
@@ -512,7 +538,7 @@ async fn remote(
             .map(|reference| {
                 let joined = target.join(reference.uri).map_err(failure)?;
                 let joined = providers::validate_url(joined.as_str()).map_err(failure)?;
-                if joined.origin() != original.origin() {
+                if access.authorize_url(joined.as_str()).is_err() {
                     return Err((StatusCode::FORBIDDEN, "cross_origin_media_rejected".into()));
                 }
                 Ok(joined)
@@ -610,6 +636,13 @@ mod tests {
     fn target(grant: &Grant, url: &str) -> Target {
         let key = grant.target(url.to_owned());
         grant.targets.lock().unwrap().by_key[&key].clone()
+    }
+    fn key_target(grant: &Grant, url: &str) -> Target {
+        let mut targets = grant.targets.lock().unwrap();
+        let key = targets
+            .insert_kind(url.to_owned(), 1, Some(hls_manifest::Kind::Key))
+            .unwrap();
+        targets.by_key[&key].clone()
     }
 
     #[tokio::test]
@@ -1261,16 +1294,17 @@ mod tests {
         .await;
         let url = format!("{source}/secret.bin");
         let (grant, _lifecycle) = http_grant(&url);
-        let registration = {
-            let mut targets = grant.targets.lock().unwrap();
-            let key = targets
-                .insert_kind(url, 1, Some(hls_manifest::Kind::Key))
-                .unwrap();
-            targets.by_key[&key].clone()
-        };
-        let response = remote(&client(), grant, registration, &HeaderMap::new(), false)
-            .await
-            .unwrap();
+        let registration = key_target(&grant, &url);
+        let budget = grant.remaining.load(Ordering::SeqCst);
+        let response = remote(
+            &client(),
+            grant.clone(),
+            registration,
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             response.headers()[header::CACHE_CONTROL],
             "private, no-store"
@@ -1281,6 +1315,221 @@ mod tests {
                 .unwrap(),
             bytes
         );
+        assert_eq!(grant.remaining.load(Ordering::SeqCst), budget - 16);
+        assert!(!*grant.cancel.borrow());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn aes128_keys_reject_short_and_long_declared_lengths_including_head() {
+        let (source, task) = origin(axum::Router::new().fallback(
+            |uri: axum::http::Uri| async move {
+                let length: usize = uri.path().trim_start_matches('/').parse().unwrap();
+                vec![0_u8; length]
+            },
+        ))
+        .await;
+        for length in [0, 15, 17, 64 * 1024] {
+            let url = format!("{source}/{length}");
+            for head in [false, true] {
+                let (grant, _lifecycle) = http_grant(&url);
+                let result = remote(
+                    &client(),
+                    grant.clone(),
+                    key_target(&grant, &url),
+                    &HeaderMap::new(),
+                    head,
+                )
+                .await;
+                assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);
+                assert!(grant.validators.lock().unwrap().is_empty());
+            }
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn aes128_key_metadata_cannot_reclassify_its_grant_as_a_playlist() {
+        let (source, task) = origin(axum::Router::new().fallback(|| async {
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                .body(Body::from("#EXTM3U\nseg.ts\n\n"))
+                .unwrap()
+        }))
+        .await;
+        let url = format!("{source}/key");
+        let (grant, _lifecycle) = http_grant(&url);
+        let registration = key_target(&grant, &url);
+        for head in [false, true] {
+            assert_eq!(
+                remote(
+                    &client(),
+                    grant.clone(),
+                    registration.clone(),
+                    &HeaderMap::new(),
+                    head,
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::BAD_GATEWAY
+            );
+            assert_eq!(key_target(&grant, &url).kind, Some(hls_manifest::Kind::Key));
+            assert_eq!(grant.targets.lock().unwrap().by_key.len(), 1);
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn aes128_keys_require_exact_length_without_content_length() {
+        let (source, task) = origin(axum::Router::new().fallback(
+            |uri: axum::http::Uri| async move {
+                let length: usize = uri.path().trim_start_matches('/').parse().unwrap();
+                let bytes = futures_util::stream::iter(
+                    (0..length)
+                        .map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"<"))),
+                );
+                Response::builder().body(Body::from_stream(bytes)).unwrap()
+            },
+        ))
+        .await;
+        for length in [0, 15, 16, 17] {
+            let url = format!("{source}/{length}");
+            let (grant, _lifecycle) = http_grant(&url);
+            let result = remote(
+                &client(),
+                grant.clone(),
+                key_target(&grant, &url),
+                &HeaderMap::new(),
+                false,
+            )
+            .await;
+            if length == 16 {
+                let response = result.unwrap();
+                assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), 16)
+                        .await
+                        .unwrap(),
+                    vec![b'<'; 16]
+                );
+            } else {
+                assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);
+                assert!(grant.validators.lock().unwrap().is_empty());
+            }
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn aes128_keys_reject_the_seventeenth_byte_without_waiting_for_eof() {
+        let (source, task) = origin(axum::Router::new().fallback(|| async {
+            let bytes = futures_util::stream::iter([
+                Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![0; 16])),
+                Ok(axum::body::Bytes::from_static(b"x")),
+            ])
+            .chain(futures_util::stream::pending());
+            Response::builder().body(Body::from_stream(bytes)).unwrap()
+        }))
+        .await;
+        let url = format!("{source}/key");
+        let (grant, _lifecycle) = http_grant(&url);
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            remote(
+                &client(),
+                grant.clone(),
+                key_target(&grant, &url),
+                &HeaderMap::new(),
+                false,
+            ),
+        )
+        .await
+        .expect("oversized key must fail without draining the source");
+        assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn aes128_key_reads_wait_for_eof_and_cancel_without_publishing_a_prefix() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let observed = entered.clone();
+        let (source, task) = origin(axum::Router::new().fallback(move || {
+            let observed = observed.clone();
+            async move {
+                let bytes = futures_util::stream::once(async move {
+                    observed.notify_one();
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![0; 16]))
+                })
+                .chain(futures_util::stream::pending());
+                Response::builder().body(Body::from_stream(bytes)).unwrap()
+            }
+        }))
+        .await;
+        let url = format!("{source}/key");
+        let (grant, lifecycle) = http_grant(&url);
+        let registration = key_target(&grant, &url);
+        let owned = grant.clone();
+        let mut request = tokio::spawn(async move {
+            remote(&client(), owned, registration, &HeaderMap::new(), false).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut request)
+                .await
+                .is_err(),
+            "sixteen bytes alone do not prove the key body ended"
+        );
+        lifecycle.stop();
+        let result = tokio::time::timeout(Duration::from_millis(500), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().0, StatusCode::UNAUTHORIZED);
+        grant.input_failure.stopped().await;
+        assert!(grant.validators.lock().unwrap().is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn validated_keys_keep_budget_and_retained_body_cancellation() {
+        let (source, task) =
+            origin(axum::Router::new().fallback(|| async { vec![0_u8; 16] })).await;
+        let url = format!("{source}/key");
+        for exhausted in [false, true] {
+            let (grant, lifecycle) = http_grant(&url);
+            let response = remote(
+                &client(),
+                grant.clone(),
+                key_target(&grant, &url),
+                &HeaderMap::new(),
+                false,
+            )
+            .await
+            .unwrap();
+            if exhausted {
+                grant.remaining.store(15, Ordering::SeqCst);
+                assert!(
+                    axum::body::to_bytes(response.into_body(), 16)
+                        .await
+                        .is_err()
+                );
+            } else {
+                lifecycle.stop();
+                assert!(
+                    axum::body::to_bytes(response.into_body(), 16)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            assert!(*grant.cancel.borrow());
+            tokio::time::timeout(Duration::from_millis(500), grant.input_failure.stopped())
+                .await
+                .unwrap();
+        }
         task.abort();
     }
 

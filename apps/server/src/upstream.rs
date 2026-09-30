@@ -1,6 +1,6 @@
 use super::*;
 use persistence::upstream_reservations as ledger;
-use std::{collections::BTreeMap, sync::Weak, time::Duration};
+use std::{sync::Weak, time::Duration};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Default)]
@@ -133,6 +133,7 @@ pub struct Prepare<'a> {
     pub room: Uuid,
     pub media: Uuid,
     pub source: Uuid,
+    pub source_policy_revision: i64,
     pub generation: u32,
     pub kind: &'a str,
     pub config: &'a providers::SourceConfig,
@@ -170,6 +171,7 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
     if state["media_generation"].as_u64() != Some(u64::from(p.generation)) {
         return Err(err(StatusCode::CONFLICT, "stale_media"));
     }
+    source_access::guard(&mut tx, p.source, p.source_policy_revision).await?;
     ledger::reserve(
         &mut tx,
         &ledger::Reservation {
@@ -180,6 +182,7 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
             room: p.room,
             media: p.media,
             source: p.source,
+            source_policy_revision: p.source_policy_revision,
             generation: i64::from(p.generation),
             kind: p.kind,
             device_id: &device_id,
@@ -245,15 +248,6 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
         .map_err(|_| err(StatusCode::CONFLICT, "playback_request_interrupted"))?
 }
 
-fn request_headers(
-    request: reqwest::RequestBuilder,
-    headers: &BTreeMap<String, String>,
-) -> reqwest::RequestBuilder {
-    headers.iter().fold(request, |request, (name, value)| {
-        request.header(name, value)
-    })
-}
-
 fn report_body(app: &App, claim: &ledger::Claim, item: &str) -> anyhow::Result<Value> {
     let unobserved = json!({"position_ms":0.0,"paused":true,"seeking":false,"buffering":false,"playback_rate":1.0});
     if let Some(sample) = claim
@@ -306,7 +300,25 @@ fn report_body(app: &App, claim: &ledger::Claim, item: &str) -> anyhow::Result<V
 
 async fn perform(app: &App, claim: ledger::Claim) -> anyhow::Result<()> {
     let scope = app.decrypt(&claim.scope_encrypted)?;
-    let config: providers::SourceConfig = serde_json::from_value(scope["config"].clone())?;
+    let mut config: providers::SourceConfig = serde_json::from_value(scope["config"].clone())?;
+    let current=tokio::time::timeout(Duration::from_secs(1),database_checks::text(&app.db,
+        sqlx::query_scalar("SELECT COALESCE(s.config_encrypted,'') FROM upstream_reservations u LEFT JOIN source_access_policy_snapshots s ON s.source_id=u.source_id WHERE u.id=$1").bind(claim.id),750)).await??;
+    if current.is_empty() {
+        // Only pre-policy legacy cleanup may lack a retained destination policy.
+        // Modern deletions keep the last effective policy in the durable snapshot.
+        anyhow::ensure!(
+            claim.event == "stop" && config.access_policy.is_none(),
+            "source_changed"
+        );
+    } else {
+        let current: providers::SourceConfig = serde_json::from_value(app.decrypt(&current)?)?;
+        anyhow::ensure!(
+            providers::validate_url(&current.url)?.origin()
+                == providers::validate_url(&config.url)?.origin(),
+            "source_changed"
+        );
+        config.access_policy = current.access_policy;
+    }
     let item = scope["item"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("upstream_scope_invalid"))?;
@@ -322,10 +334,17 @@ async fn perform(app: &App, claim: ledger::Claim) -> anyhow::Result<()> {
     if claim.event != "stop" {
         let successful = matches!(
             tokio::time::timeout(Duration::from_secs(ledger::CLEANUP_SECONDS), async {
-                let response = request_headers(providers::client().post(url).json(&body), &headers)
-                    .send()
-                    .await?;
-                Ok::<_, reqwest::Error>(providers::checkin_confirmed(response.status()))
+                let response = providers::source_request(
+                    &config,
+                    url.as_str(),
+                    reqwest::Method::POST,
+                    &headers,
+                )
+                .await?
+                .json(&body)
+                .send()
+                .await?;
+                Ok::<_, anyhow::Error>(providers::checkin_confirmed(response.status()))
             })
             .await,
             Ok(Ok(true))
@@ -344,9 +363,12 @@ async fn perform(app: &App, claim: ledger::Claim) -> anyhow::Result<()> {
     // A successful Stopped POST alone does not confirm its encoder stopped.
     let _ = tokio::time::timeout(budget, async {
         if !stopped {
-            let response = request_headers(providers::client().post(url).json(&body), &headers)
-                .send()
-                .await?;
+            let response =
+                providers::source_request(&config, url.as_str(), reqwest::Method::POST, &headers)
+                    .await?
+                    .json(&body)
+                    .send()
+                    .await?;
             anyhow::ensure!(
                 providers::checkin_confirmed(response.status()),
                 "upstream_stop_unconfirmed"
@@ -358,9 +380,11 @@ async fn perform(app: &App, claim: ledger::Claim) -> anyhow::Result<()> {
             url.query_pairs_mut()
                 .append_pair("DeviceId", &claim.device_id)
                 .append_pair("PlaySessionId", &claim.sid);
-            let response = request_headers(providers::client().delete(url), &headers)
-                .send()
-                .await?;
+            let response =
+                providers::source_request(&config, url.as_str(), reqwest::Method::DELETE, &headers)
+                    .await?
+                    .send()
+                    .await?;
             anyhow::ensure!(
                 providers::checkin_confirmed(response.status()),
                 "upstream_encoding_stop_unconfirmed"
@@ -442,7 +466,9 @@ pub async fn maintenance(app: App) {
     tokio::spawn(legacy_maintenance(app.clone()));
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        if ledger::reconcile(&app.db, app.epoch).await.is_err() {
+        if source_access::retire(&app.db).await.is_err()
+            || ledger::reconcile(&app.db, app.epoch).await.is_err()
+        {
             tracing::warn!("upstream reconciliation failed");
             continue;
         }
@@ -530,9 +556,7 @@ async fn legacy_report(app: &App, id: Uuid, event: &str) -> anyhow::Result<()> {
         "stop" => "Sessions/Playing/Stopped",
         _ => "Sessions/Playing/Progress",
     };
-    let mut request = providers::client()
-        .post(format!("{}/{endpoint}", base.trim_end_matches('/')))
-        .json(&body);
+    let mut scoped_headers=std::collections::BTreeMap::new();
     if let Some(headers) = resource["headers"].as_object() {
         for (name, value) in headers {
             if let Some(value) = value.as_str() {
@@ -545,10 +569,12 @@ async fn legacy_report(app: &App, id: Uuid, event: &str) -> anyhow::Result<()> {
                 } else {
                     value.into()
                 };
-                request = request.header(name, value);
+                scoped_headers.insert(name.to_owned(), value);
             }
         }
     }
+    let config=providers::resource_config(&resource)?;
+    let request=providers::source_request(&config,&format!("{}/{endpoint}",base.trim_end_matches('/')),reqwest::Method::POST,&scoped_headers).await?.json(&body);
     let timeout = if event == "stop" {
         // The SQL clock supplies remaining total budget. Subtracting elapsed
         // time since before the claim also conservatively covers DB latency.

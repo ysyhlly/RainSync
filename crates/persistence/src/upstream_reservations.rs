@@ -18,6 +18,7 @@ pub struct Reservation<'a> {
     pub room: Uuid,
     pub media: Uuid,
     pub source: Uuid,
+    pub source_policy_revision: i64,
     pub generation: i64,
     pub kind: &'a str,
     pub device_id: &'a str,
@@ -28,10 +29,10 @@ pub struct Reservation<'a> {
 
 pub async fn reserve(tx: &mut Transaction<'_, Postgres>, r: &Reservation<'_>) -> Result<()> {
     let epoch = crate::room_lifecycle::lock_active(tx, r.room).await?;
-    sqlx::query("INSERT INTO upstream_reservations(id,user_id,request_key,owner_epoch,room_id,media_id,source_id,generation,kind,device_id,origin_key,scope_encrypted,observation_version,lifecycle_epoch) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)")
+    sqlx::query("INSERT INTO upstream_reservations(id,user_id,request_key,owner_epoch,room_id,media_id,source_id,generation,kind,device_id,origin_key,scope_encrypted,observation_version,lifecycle_epoch,source_policy_revision) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)")
         .bind(r.id).bind(r.user).bind(r.request_key).bind(r.owner_epoch).bind(r.room)
         .bind(r.media).bind(r.source).bind(r.generation).bind(r.kind).bind(r.device_id)
-        .bind(r.origin_key).bind(r.scope_encrypted).bind(r.observation_version.map(|version| version as i32)).bind(epoch).execute(&mut **tx).await?;
+        .bind(r.origin_key).bind(r.scope_encrypted).bind(r.observation_version.map(|version| version as i32)).bind(epoch).bind(r.source_policy_revision).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -86,7 +87,7 @@ pub async fn begin_negotiation(pool: &PgPool, id: Uuid, epoch: Uuid, token: Uuid
     if !lock_admission(&mut tx, id).await? {
         return Ok(false);
     }
-    let n=sqlx::query("UPDATE upstream_reservations u SET negotiation='running',negotiation_token=$3,negotiation_deadline=clock_timestamp()+interval '30 seconds',io_claim=$3,io_kind='negotiate',io_lease_until=clock_timestamp()+interval '35 seconds',updated_at=clock_timestamp() WHERE u.id=$1 AND u.owner_epoch=$2 AND u.state='preparing' AND u.negotiation='reserved' AND EXISTS(SELECT 1 FROM playback_requests r WHERE r.user_id=u.user_id AND r.idempotency_key=u.request_key AND r.session_id=u.id AND r.owner_epoch=$2 AND r.status='pending' AND r.lease_until>clock_timestamp()) AND EXISTS(SELECT 1 FROM room_snapshots s JOIN room_members m ON m.room_id=s.room_id WHERE s.room_id=u.room_id AND m.user_id=u.user_id AND (s.state->>'media_generation')::bigint=u.generation)")
+    let n=sqlx::query("UPDATE upstream_reservations u SET negotiation='running',negotiation_token=$3,negotiation_deadline=clock_timestamp()+interval '30 seconds',io_claim=$3,io_kind='negotiate',io_lease_until=clock_timestamp()+interval '35 seconds',updated_at=clock_timestamp() WHERE u.id=$1 AND u.owner_epoch=$2 AND u.state='preparing' AND u.negotiation='reserved' AND EXISTS(SELECT 1 FROM sources src WHERE src.id=u.source_id AND src.access_policy_revision=u.source_policy_revision) AND EXISTS(SELECT 1 FROM playback_requests r WHERE r.user_id=u.user_id AND r.idempotency_key=u.request_key AND r.session_id=u.id AND r.owner_epoch=$2 AND r.status='pending' AND r.lease_until>clock_timestamp()) AND EXISTS(SELECT 1 FROM room_snapshots s JOIN room_members m ON m.room_id=s.room_id WHERE s.room_id=u.room_id AND m.user_id=u.user_id AND (s.state->>'media_generation')::bigint=u.generation)")
         .bind(id).bind(epoch).bind(token).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(n.rows_affected() == 1)

@@ -1,3 +1,4 @@
+import { sourceMedia } from "./fixtures/source-grant.mjs";
 import assert from "node:assert/strict";
 import { randomUUID, randomBytes, createCipheriv, createHash } from "node:crypto";
 import { createServer } from "node:http";
@@ -55,7 +56,8 @@ await isolatedMediaStack("room-cleanup", async f => {
   const waitClosed=async id=>until(async()=> (await lifecycle(id)).lifecycle==="closed","room cleanup completed");
   const seed=(id,room,resource)=>{
     const token=randomBytes(24).toString("hex");
-    f.sql(`INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${user.id}','${room}',0,'${createHash("sha256").update(token).digest("hex")}',${quote(JSON.stringify({encrypted:encrypt(resource)}))},now()+interval '1 hour')`);
+    const media=resource.kind==="agent"?"NULL":quote(sourceMedia(f,resource));
+    f.sql(`INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES(${media},'${id}','${user.id}','${room}',0,'${createHash("sha256").update(token).digest("hex")}',${quote(JSON.stringify({encrypted:encrypt(resource)}))},now()+interval '1 hour')`);
     return token;
   };
   let paused=false;

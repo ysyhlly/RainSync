@@ -1,3 +1,4 @@
+import { sourceMedia } from "./fixtures/source-grant.mjs";
 import assert from "node:assert/strict";
 import {
   createCipheriv,
@@ -168,7 +169,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
             ? { kind, root: f.root, resource: "long.mp4" }
             : { kind, url: `${upstreamOrigin}/${id}.mp4`, headers: {} };
         f.sql(
-          `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
+          `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f,resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
         );
         const url = `${f.workerOrigin}/media-delivery/${id}/source?token=${token}`;
         const ranged = revoke === "membership" || revoke === "expiry";
@@ -286,7 +287,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
           : {}),
       };
       f.sql(
-        `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
+        `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f,resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
       );
       const path = mode === "subtitle" ? "subtitle-0.vtt" : "source";
       const url = `${f.workerOrigin}/media-delivery/${id}/${path}?token=${token}`;
@@ -360,7 +361,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
           token = randomBytes(32).toString("hex");
         const resource = { kind: "local", root: f.root, resource: "long.mp4" };
         f.sql(
-          `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
+          `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f,resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
         );
         streams.push(
           start(

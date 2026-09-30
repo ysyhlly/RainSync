@@ -280,6 +280,7 @@ async fn ingest_index(
     acks: tokio::sync::mpsc::Sender<Value>,
 ) -> anyhow::Result<()> {
     let config = providers::SourceConfig {
+        access_policy: None,
         root: String::new(),
         url: String::new(),
         token: String::new(),

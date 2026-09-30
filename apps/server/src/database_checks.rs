@@ -27,3 +27,20 @@ pub async fn boolean(
     drop(connection.0.take());
     Ok(value)
 }
+
+pub async fn text(
+    pool: &PgPool,
+    query: QueryScalar<'_, Postgres, String, PgArguments>,
+    statement_millis: u32,
+) -> Result<String, sqlx::Error> {
+    let mut connection = CheckConnection(Some(pool.acquire().await?));
+    let mut tx = connection.0.as_mut().expect("owned check").begin().await?;
+    sqlx::query("SELECT set_config('statement_timeout',$1,true)")
+        .bind(format!("{statement_millis}ms"))
+        .execute(&mut *tx)
+        .await?;
+    let value = query.fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    drop(connection.0.take());
+    Ok(value)
+}

@@ -1,3 +1,4 @@
+pub mod input_policy;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 pub mod capabilities;
@@ -61,7 +62,15 @@ pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 pub async fn probe(path: &str) -> Result<serde_json::Value> {
+    probe_with_policy(path, false).await
+}
+pub async fn probe_with_policy(path: &str, rewritten_hls: bool) -> Result<serde_json::Value> {
     let mut command = tokio::process::Command::new("ffprobe");
+    input_policy::clean_environment(&mut command);
+    command.args(input_policy::args(
+        path.starts_with("http://"),
+        rewritten_hls,
+    ));
     command.args([
         "-v",
         "error",

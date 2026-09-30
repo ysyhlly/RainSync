@@ -1,3 +1,4 @@
+pub mod access_policy;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -8,6 +9,8 @@ mod upstream_common;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_policy: Option<access_policy::SourceAccessPolicy>,
     #[serde(default)]
     pub root: String,
     #[serde(default)]
@@ -229,6 +232,67 @@ pub fn checkin_confirmed(status: reqwest::StatusCode) -> bool {
         status,
         reqwest::StatusCode::OK | reqwest::StatusCode::NO_CONTENT
     )
+}
+
+/// Source headers are scoped to the configured origin. Authority/hop headers
+/// cannot turn an allowed endpoint into a different routing or framing target.
+pub fn validate_source_headers(headers: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        anyhow::ensure!(
+            !matches!(
+                lower.as_str(),
+                "host"
+                    | "connection"
+                    | "proxy-authorization"
+                    | "proxy-connection"
+                    | "transfer-encoding"
+                    | "content-length"
+                    | "upgrade"
+                    | "te"
+                    | "trailer"
+                    | "keep-alive"
+            ),
+            "invalid_source_header"
+        );
+        reqwest::header::HeaderName::from_bytes(name.as_bytes())?;
+        reqwest::header::HeaderValue::from_str(value)?;
+    }
+    Ok(())
+}
+pub async fn source_request(
+    config: &SourceConfig,
+    target: &str,
+    method: reqwest::Method,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Result<reqwest::RequestBuilder> {
+    validate_source_headers(headers)?;
+    let access = access_policy::SourceAccess::new(&config.url, config.access_policy.as_ref())?;
+    let client = access.client_for(target).await?;
+    let mut request = client.request(method);
+    if client.source_credentials_allowed() {
+        for (name, value) in headers {
+            request = request.header(name, value)
+        }
+    }
+    Ok(request)
+}
+
+/// Internal encrypted resource envelope; old grants retain the legacy origin.
+pub fn resource_config(resource: &Value) -> Result<SourceConfig> {
+    let url = resource["source_url"]
+        .as_str()
+        .or_else(|| resource["upstream_base"].as_str())
+        .or_else(|| resource["url"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid_source_url"))?;
+    let headers = resource
+        .get("headers")
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    Ok(serde_json::from_value(
+        json!({"url":url,"headers":headers,"access_policy":resource.get("access_policy")}),
+    )?)
 }
 
 #[cfg(test)]

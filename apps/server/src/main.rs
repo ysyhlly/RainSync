@@ -21,6 +21,7 @@ mod room_cleanup;
 mod room_lifecycle;
 mod room_ownership;
 mod rooms;
+mod source_access;
 mod upstream;
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use argon2::{
@@ -572,6 +573,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
             get(media::sources).post(media::add_source),
         )
         .route("/api/v1/sources/{id}/test", post(media::scan))
+        .route(
+            "/api/v1/sources/{id}/access-policy",
+            post(source_access::change),
+        )
         .route("/api/v1/media", get(media::library))
         .route(
             "/api/v1/media/previews",

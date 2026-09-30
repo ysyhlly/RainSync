@@ -41,7 +41,7 @@ try {
     const room = await admin.request("/rooms", "POST", { name: "isolated relay unknown renewal" });
     const session = randomUUID(), token = randomBytes(32).toString("hex");
     const encrypted = encrypt({ kind: "agent", agent_id: agentId, resource: "long.mp4", source_version: sourceVersion });
-    f.sql(`INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${session}','${identity.id}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypted}"}',now()+interval '1 hour')`);
+    f.sql(`INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES((SELECT id FROM media_items WHERE source_id='${agentId}' AND resource='long.mp4'),'${session}','${identity.id}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypted}"}',now()+interval '1 hour')`);
     const stream = { response: null, aborted: false, ended: false };
     const req = request(`${f.workerOrigin}/media-delivery/${session}/source?token=${token}`, res => {
       stream.response = res;

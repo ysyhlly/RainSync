@@ -16,15 +16,29 @@ jobs:
           node-version: 24
           cache: npm
       - name: Verify or install fixture dependencies
-        timeout-minutes: 6
+        timeout-minutes: 10
         run: |
           if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
-            sudo timeout 150s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-            sudo timeout 180s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ffmpeg
+            sudo timeout --kill-after=15s 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+            sudo timeout --kill-after=15s 360s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends ffmpeg
           fi
           ffmpeg -version
           ffprobe -version
-          npm ci
+      - name: Install JavaScript dependencies
+        timeout-minutes: 5
+        run: npm ci
+      - name: Pull the pinned upstream fixture images
+        timeout-minutes: 10
+        run: |
+          # Keep these immutable references identical to tests/fixtures/upstream-real.mjs.
+          images=(
+            "jellyfin/jellyfin@sha256:59417f441213e236a9f907d4e71a13472042409d85f9e9310dbdd87ee33d7bd4"
+            "emby/embyserver@sha256:3aafff933d3f28d23ed0bc201022abe71c0aa80deb17177566c726b9bbc686c6"
+          )
+          for image in "${images[@]}"; do
+            timeout --kill-after=15s 240s docker pull "$image"
+            timeout --kill-after=5s 15s docker image inspect "$image" >/dev/null
+          done
       - name: Exercise pinned disposable Jellyfin and Emby products
         env:
           RAINSYNC_FFMPEG_BIN: /usr/bin

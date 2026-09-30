@@ -129,7 +129,7 @@ async fn authorized(pool: &PgPool, id: Uuid, token_hash: &str) -> anyhow::Result
     sqlx::query("SET LOCAL statement_timeout = '2500ms'")
         .execute(&mut *tx)
         .await?;
-    let allowed = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN rooms r ON r.id=p.room_id WHERE r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND p.id=$1 AND p.delivery_token_hash=$2 AND p.expires_at>clock_timestamp() AND NOT p.stopped AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id))")
+    let allowed = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN rooms r ON r.id=p.room_id WHERE r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND p.id=$1 AND p.delivery_token_hash=$2 AND p.expires_at>clock_timestamp() AND NOT p.stopped AND EXISTS(SELECT 1 FROM media_items mi JOIN sources src ON src.id=mi.source_id WHERE mi.id=p.media_id AND COALESCE((p.resource->>'source_policy_revision')::bigint,0)=src.access_policy_revision) AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id))")
         .bind(id).bind(token_hash).fetch_one(&mut *tx).await?;
     tx.commit().await?;
     drop(connection.0.take());
@@ -175,6 +175,7 @@ pub async fn protect(
     id: Uuid,
     token_hash: String,
     registry: Registry,
+    input_cancel: crate::input_failure::Observation,
 ) -> super::Result<Response> {
     let admission = registry
         .admit()
@@ -209,6 +210,7 @@ pub async fn protect(
             biased;
             _ = shutdown(Some(registry.0.stop.subscribe())) => Some(Err(Denied::Unavailable.response())),
             _ = sender.closed() => None,
+            _ = input_cancel.stopped() => Some(Err(Denied::Unavailable.response())),
             result = scope.run(prepare_response(prepare, pool.clone(), id, token_hash.clone())) => Some(result),
         };
         match result {
@@ -225,7 +227,10 @@ pub async fn protect(
                     CHECK_INTERVAL,
                     CHECK_TIMEOUT,
                     MAX_AUTH_AGE,
-                    Some(execution),
+                    SourceOwners {
+                        execution: Some(execution),
+                        input_cancel,
+                    },
                 );
                 // If the waiter vanished, dropping this body signals its owner;
                 // the body producer still drains/acknowledges independently.
@@ -336,6 +341,12 @@ struct Delivery {
     ended: bool,
 }
 
+#[derive(Default)]
+struct SourceOwners {
+    execution: Option<Execution>,
+    input_cancel: crate::input_failure::Observation,
+}
+
 fn guarded_body<F, C>(
     body: Body,
     check: F,
@@ -343,12 +354,16 @@ fn guarded_body<F, C>(
     interval: Duration,
     timeout: Duration,
     max_age: Duration,
-    execution: Option<Execution>,
+    owners: SourceOwners,
 ) -> Body
 where
     F: FnMut() -> C + Send + 'static,
     C: Future<Output = anyhow::Result<bool>> + Send,
 {
+    let SourceOwners {
+        execution,
+        input_cancel,
+    } = owners;
     // One queued 64-KiB chunk. The source's own buffers and kernel/browser
     // buffers are separate; already delivered bytes cannot be recalled.
     let (send, chunks) = mpsc::channel(1);
@@ -386,6 +401,7 @@ where
             biased;
             _ = shutdown(stop) => { let _ = revoke.send(true); },
             _ = send.closed() => {},
+            _ = input_cancel.stopped() => { let _ = revoke.send(true); },
             _ = monitor(check, checked_at, interval, timeout, max_age) => { let _ = revoke.send(true); },
             _ = scope.run(forward) => {},
         }
@@ -471,6 +487,27 @@ mod tests {
             |guard| async { Some((Ok::<_, io::Error>(Bytes::from(vec![0; CHUNK_BYTES])), guard)) },
         ))
     }
+    #[tokio::test]
+    async fn cancelled_execution_drops_retained_source_independently_of_body_polling() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cancel = crate::input_failure::Observation::default();
+        let _retained = guarded_body(
+            source(dropped.clone()),
+            || async { Ok(true) },
+            Instant::now(),
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+            Duration::from_secs(20),
+            SourceOwners {
+                execution: None,
+                input_cancel: cancel.clone(),
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!dropped.load(Ordering::SeqCst));
+        cancel.stop();
+        released(&dropped).await;
+    }
     fn test_body(
         body: Body,
         check: impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<bool>> + Send>>
@@ -484,7 +521,7 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(20),
             Duration::from_millis(30),
-            None,
+            SourceOwners::default(),
         )
     }
     async fn released(dropped: &AtomicBool) {

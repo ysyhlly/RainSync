@@ -1,3 +1,4 @@
+import { sourceMedia } from "./fixtures/source-grant.mjs";
 import assert from "node:assert/strict";
 import {
   createCipheriv,
@@ -85,7 +86,7 @@ await isolatedMediaStack("worker-delivery-shutdown", async (f) => {
             headers: {},
           };
     f.sql(
-      `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${user.id}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}","upstream_closed":true}',now()+interval '1 hour')`,
+      `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f,resource)}','${id}','${user.id}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}","upstream_closed":true}',now()+interval '1 hour')`,
     );
     return {
       kind,

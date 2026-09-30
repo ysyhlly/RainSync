@@ -18,14 +18,14 @@ jobs:
           node-version: 24
           cache: npm
       - name: Verify or install media validation prerequisites
-        timeout-minutes: 6
+        timeout-minutes: 10
         run: |
           packages=()
           if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then packages+=(ffmpeg); fi
           if ! command -v pg_config >/dev/null || ! test -x "$(pg_config --bindir)/initdb"; then packages+=(postgresql); fi
           if ((${#packages[@]})); then
-            sudo timeout 150s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-            sudo timeout 180s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y "${packages[@]}"
+            sudo timeout --kill-after=15s 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+            sudo timeout --kill-after=15s 360s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends "${packages[@]}"
           fi
           ffmpeg -version
           ffprobe -version

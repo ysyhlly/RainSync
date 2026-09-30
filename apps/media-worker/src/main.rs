@@ -3,6 +3,7 @@ mod cache_outputs;
 mod cache_read;
 mod file_delivery;
 use media_core::child_process;
+mod http_media;
 mod input_failure;
 mod output_decode;
 mod output_publish;
@@ -83,8 +84,9 @@ async fn delivery(
     let pool = app.db.clone();
     let deliveries = app.deliveries.clone();
     let token_hash = hash(&q.token);
+    let input_cancel = app.input_failures.observe(id, q.execution);
     let response = delivery_response(app, id, path, q, h, method);
-    playback_access::protect(response, pool, id, token_hash, deliveries).await
+    playback_access::protect(response, pool, id, token_hash, deliveries, input_cancel).await
 }
 async fn delivery_response(
     app: App,
@@ -94,7 +96,7 @@ async fn delivery_response(
     h: HeaderMap,
     method: axum::http::Method,
 ) -> Result<Response> {
-    let row=sqlx::query("SELECT p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN rooms r ON r.id=p.room_id WHERE r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND p.id=$1 AND p.delivery_token_hash=$2 AND p.expires_at>now() AND NOT p.stopped AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)").bind(id).bind(hash(&q.token)).fetch_optional(&app.db).await.map_err(failure)?.ok_or((StatusCode::UNAUTHORIZED,"invalid_playback_session".into()))?;
+    let row=sqlx::query("SELECT p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN rooms r ON r.id=p.room_id WHERE r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND p.id=$1 AND p.delivery_token_hash=$2 AND p.expires_at>now() AND NOT p.stopped AND EXISTS(SELECT 1 FROM media_items mi JOIN sources src ON src.id=mi.source_id WHERE mi.id=p.media_id AND COALESCE((p.resource->>'source_policy_revision')::bigint,0)=src.access_policy_revision) AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)").bind(id).bind(hash(&q.token)).fetch_optional(&app.db).await.map_err(failure)?.ok_or((StatusCode::UNAUTHORIZED,"invalid_playback_session".into()))?;
     let data: Value = row.get("resource");
     let resource = decrypt(&app, data["encrypted"].as_str().unwrap_or("")).map_err(failure)?;
     let head = method == axum::http::Method::HEAD;
@@ -110,7 +112,7 @@ async fn delivery_response(
             source_url(id, &q.token).map_err(failure)?,
             observed.token()
         );
-        let metadata = media_core::probe(&source).await;
+        let metadata = media_core::probe_with_policy(&source, resource["kind"] == "http").await;
         if let Some(reason) = match observed.failure() {
             Some(persistence::media_jobs::JobFailure::SourceChanged) => Some("source_changed"),
             Some(persistence::media_jobs::JobFailure::SourceVersionRequired) => {
@@ -142,14 +144,15 @@ async fn delivery_response(
             if url.origin() != base.origin() {
                 return Err((StatusCode::FORBIDDEN, "cross_origin_subtitle".into()));
             }
-            let mut request = app.client.get(url);
-            if let Some(headers) = resource["headers"].as_object() {
-                for (k, v) in headers {
-                    if let Some(v) = v.as_str() {
-                        request = request.header(k, v);
-                    }
-                }
-            }
+            let config = providers::resource_config(&resource).map_err(failure)?;
+            let request = providers::source_request(
+                &config,
+                url.as_str(),
+                reqwest::Method::GET,
+                &config.headers,
+            )
+            .await
+            .map_err(failure)?;
             let response = request
                 .send()
                 .await
@@ -204,6 +207,11 @@ async fn delivery_response(
             }
         }
         let mut command = tokio::process::Command::new("ffmpeg");
+        media_core::input_policy::clean_environment(&mut command);
+        command.args(media_core::input_policy::args(
+            input.starts_with("http://"),
+            resource["kind"] == "http",
+        ));
         command
             .args(["-v", "error", "-nostdin", "-i"])
             .arg(input)
@@ -412,147 +420,9 @@ async fn delivery_response(
         )
         .await;
     }
-    let original = url::Url::parse(resource["url"].as_str().unwrap_or("")).map_err(failure)?;
-    let target = if let Some(encoded) = q.url.as_deref() {
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(encoded)
-            .map_err(failure)?;
-        if bytes.len() < 12 {
-            return Err((StatusCode::BAD_REQUEST, "invalid_resource".into()));
-        }
-        let plain = app
-            .key
-            .decrypt(bytes[..12].into(), &bytes[12..])
-            .map_err(|_| (StatusCode::FORBIDDEN, "invalid_resource_signature".into()))?;
-        let grant: Value = serde_json::from_slice(&plain).map_err(failure)?;
-        if grant["session"] != id.to_string() {
-            return Err((StatusCode::FORBIDDEN, "wrong_resource_session".into()));
-        }
-        url::Url::parse(grant["url"].as_str().unwrap_or("")).map_err(failure)?
-    } else {
-        original.clone()
-    };
-    // Never forward source credentials to a different origin. Redirects are disabled.
-    if target.origin() != original.origin() || !matches!(target.scheme(), "http" | "https") {
-        return Err((StatusCode::FORBIDDEN, "cross_origin_media_rejected".into()));
-    }
-    let mut request = if head {
-        app.client.head(target.clone())
-    } else {
-        app.client.get(target.clone())
-    };
-    if let Some(headers) = resource["headers"].as_object() {
-        for (k, v) in headers {
-            if let Some(v) = v.as_str() {
-                request = request.header(k, v);
-            }
-        }
-    }
-    if let Some(range) = h.get(header::RANGE) {
-        request = request.header(header::RANGE, range)
-    }
-    let response = request.send().await.map_err(|error| {
-        input_failure.network(&error);
-        failure(error)
-    })?;
-    let status = response.status();
-    input_failure.status(status);
-    if !status.is_success() {
-        return Err((
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            "upstream_media_error".into(),
-        ));
-    }
-    let is_playlist = target.path().ends_with(".m3u8")
-        || response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|s| s.contains("mpegurl"));
-    if is_playlist && !head {
-        if response.content_length().unwrap_or(0) > 2 * 1024 * 1024 {
-            return Err((StatusCode::BAD_GATEWAY, "manifest_too_large".into()));
-        }
-        let mut bytes = Vec::new();
-        let mut stream = response.bytes_stream();
-        use futures_util::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            bytes.extend_from_slice(&chunk.map_err(|error| {
-                input_failure.network(&error);
-                failure(error)
-            })?);
-            if bytes.len() > 2 * 1024 * 1024 {
-                return Err((StatusCode::BAD_GATEWAY, "manifest_too_large".into()));
-            }
-        }
-        let manifest = String::from_utf8(bytes).map_err(failure)?;
-        let text = rewrite_manifest(&manifest, |uri| {
-            let absolute = target.join(uri).map(|v| v.to_string()).unwrap_or_default();
-            let nonce = Uuid::new_v4();
-            let nonce = &nonce.as_bytes()[..12];
-            let data = serde_json::to_vec(&json!({"session":id,"url":absolute})).unwrap();
-            let cipher = app
-                .key
-                .encrypt(nonce.into(), data.as_slice())
-                .expect("valid nonce");
-            let grant = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode([nonce.to_vec(), cipher].concat());
-            let extension = target
-                .join(uri)
-                .ok()
-                .and_then(|url| {
-                    url.path()
-                        .rsplit('.')
-                        .next()
-                        .filter(|ext| {
-                            matches!(*ext, "m3u8" | "ts" | "m4s" | "mp4" | "aac" | "vtt" | "key")
-                        })
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| "bin".into());
-            let execution = q
-                .execution
-                .map(|t| format!("&execution={t}"))
-                .unwrap_or_default();
-            format!(
-                "/media-delivery/{id}/segment.{extension}?token={}&url={grant}{execution}",
-                q.token
-            )
-        });
-        return Ok((
-            [
-                (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            text,
-        )
-            .into_response());
-    }
-    let mut builder = Response::builder().status(status);
-    for key in [
-        header::CONTENT_TYPE,
-        header::CONTENT_LENGTH,
-        header::CONTENT_RANGE,
-        header::ACCEPT_RANGES,
-    ] {
-        if let Some(v) = response.headers().get(&key) {
-            builder = builder.header(key, v)
-        }
-    }
-    builder
-        .header(header::CACHE_CONTROL, "private, no-store")
-        .body(if head {
-            Body::empty()
-        } else {
-            Body::from_stream(response.bytes_stream().map(move |chunk| {
-                if let Err(error) = &chunk {
-                    input_failure.network(error);
-                }
-                chunk
-            }))
-        })
-        .map_err(failure)
+    http_media::response(&app, id, &resource, &q, &h, head, input_failure).await
 }
+
 fn rewrite_manifest(input: &str, mut uri: impl FnMut(&str) -> String) -> String {
     input
         .lines()
@@ -652,9 +522,10 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 let dir = persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt);
                 child_process::blocking({ let dir=dir.clone(); move || std::fs::create_dir_all(dir) }).await?.map_err(cache::write_error)?;
                 let audio_index = spec["audio_index"].as_u64().map(u32::try_from).transpose()?;
-                let args = if let Some(mode)=spec["negotiated_mode"].as_str() {
+                let mut args = if let Some(mode)=spec["negotiated_mode"].as_str() {
                     media_core::capabilities::negotiated_hls_args(&input,dir.join("index.m3u8").to_str().unwrap(),spec["start_seconds"].as_f64().unwrap_or(0.0),mode,audio_index)
                 } else {media_core::hls_args(&input, dir.join("index.m3u8").to_str().unwrap(), spec["start_seconds"].as_f64().unwrap_or(0.0), spec["transcode"].as_bool().unwrap_or(true), audio_index)};
+                media_core::input_policy::constrain(&mut args, input.starts_with("http://"), spec["source_kind"] == "http");
                 let confirmed_until = process::finalization_deadline(Duration::from_secs(3), process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim))).await?
                     .filter(|until| *until > tokio::time::Instant::now())
                     .ok_or_else(|| anyhow::anyhow!("lease_lost_before_spawn"))?;
@@ -670,6 +541,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 let (args, confirmed_until) = prepared?;
                 anyhow::ensure!(!*stop.borrow(), "worker_shutdown");
                 let mut command = tokio::process::Command::new("ffmpeg");
+        media_core::input_policy::clean_environment(&mut command);
                 command.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
                 #[cfg(windows)]
                 command.creation_flags(0x08000000);
