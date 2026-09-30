@@ -61,7 +61,9 @@ await isolatedServer("room-lifecycle", async f => {
     // Reverse ordering: PLAY commits before management takes the room lock.
     // Its newer revision must turn the stale close into a visible conflict.
     const winningTag = `lifecycle-play-first-${randomUUID()}`;
-    const winningLock = f.sqlProcess(`BEGIN; SELECT room_id FROM room_snapshots WHERE room_id='${room.id}' FOR UPDATE; SELECT pg_sleep(2) /* ${winningTag} */; COMMIT;`);
+    // FOR SHARE lets the new replay membership gate finish, then blocks the
+    // final FOR UPDATE commit. Observe that exact boundary before racing close.
+    const winningLock = f.sqlProcess(`BEGIN; SELECT room_id FROM room_snapshots WHERE room_id='${room.id}' FOR SHARE; SELECT pg_sleep(2) /* ${winningTag} */; COMMIT;`);
     await f.waitForSql(`SELECT count(*) FROM pg_stat_activity WHERE wait_event='PgSleep' AND query LIKE '%${winningTag}%'`, "1");
     const winningPlay = command(state, a.snapshot.control_epoch.id);
     a.send(winningPlay);

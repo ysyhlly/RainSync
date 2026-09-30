@@ -10,7 +10,7 @@ pub async fn run(app: App, settings: Settings, mut stop: tokio::sync::watch::Rec
             break;
         }
         while tasks.len() < settings.concurrency {
-            match media_previews::claim(&app.db, owner).await {
+            match media_previews::claim_with_limit(&app.db, owner, settings.queue_limit).await {
                 Ok(Some(a)) => {
                     let app = app.clone();
                     let settings = settings.clone();

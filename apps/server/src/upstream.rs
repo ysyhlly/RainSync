@@ -362,7 +362,7 @@ async fn perform(app: &App, claim: ledger::Claim) -> anyhow::Result<()> {
                 .send()
                 .await?;
             anyhow::ensure!(
-                response.status() == reqwest::StatusCode::OK,
+                providers::checkin_confirmed(response.status()),
                 "upstream_encoding_stop_unconfirmed"
             );
             encoding_stopped = true;

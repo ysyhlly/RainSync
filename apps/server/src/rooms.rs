@@ -2,12 +2,15 @@ use super::*;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use protocol::{Command, PlaybackStatus, RoomState};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
+
+#[path = "room_delivery.rs"]
+mod delivery;
 
 #[derive(Clone)]
 pub struct Handle {
     tx: mpsc::Sender<Request>,
-    events: broadcast::Sender<Value>,
+    events: delivery::Bus,
 }
 impl Handle {
     pub fn command_queue_depth(&self) -> usize {
@@ -64,6 +67,16 @@ async fn owned_snapshot(
         .bind(room)
         .fetch_one(&mut *tx)
         .await?;
+    let membership = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
+    )
+    .bind(room)
+    .bind(user)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if membership.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "not_a_member"));
+    }
     let lifecycle: String = row.get("lifecycle");
     let control_epoch = if lifecycle == "active" {
         let id = Uuid::new_v4();
@@ -90,6 +103,35 @@ fn socket_error(reason: &str, command_id: Option<Uuid>) -> Value {
     json!({"type":"ERROR", "command_id":command_id, "error":error})
 }
 
+async fn socket_membership(
+    app: &App,
+    room: Uuid,
+    user: Uuid,
+) -> std::result::Result<(), &'static str> {
+    // An admission read after a membership deletion commits cannot authorize a
+    // new frame. Release the read before any network write; a slow connection
+    // never holds a database/room lock while sending. Previously admitted bytes
+    // may already be in transport buffers and cannot be recalled.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        database_checks::boolean(
+            &app.db,
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2)",
+            )
+            .bind(room)
+            .bind(user),
+            1500,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false)) => Err("not_a_member"),
+        _ => Err("service_unavailable"),
+    }
+}
+
 async fn reject_socket(
     out: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     reason: &str,
@@ -108,7 +150,7 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
     }
     let mut state = persistence::snapshot(&app.db, id).await?;
     let (tx, mut rx) = mpsc::channel::<Request>(128);
-    let (events, _) = broadcast::channel(128);
+    let events = delivery::Bus::new();
     let h = Handle {
         tx,
         events: events.clone(),
@@ -154,6 +196,7 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                         .await
                         .map_err(|error| match error.to_string().as_str() {
                             "room_not_active" => "room_not_active".to_string(),
+                            "not_a_member" => "not_a_member".to_string(),
                             "control_epoch_expired" => "control_epoch_expired".to_string(),
                             "control_epoch_required" => "control_epoch_required".to_string(),
                             "command_owned_by_another_user" => {
@@ -239,6 +282,7 @@ fn control_error(error: anyhow::Error, fallback: &str) -> String {
         "revision_conflict" => "revision_conflict".into(),
         "controller_required" => "controller_required".into(),
         "room_not_active" => "room_not_active".into(),
+        "not_a_member" => "not_a_member".into(),
         _ => fallback.into(),
     }
 }
@@ -472,6 +516,19 @@ async fn persist_chat(
                 "database_error"
             }
         })?;
+    // JOIN is not a permanent grant. Hold the same membership key-share used
+    // by room management until the message commit, including idempotent replay.
+    let membership = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
+    )
+    .bind(room_id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| "database_error")?;
+    if membership.is_none() {
+        return Err("not_a_member");
+    }
     let inserted = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO chat_messages(id,room_id,user_id,body,client_message_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT (room_id,user_id,client_message_id) DO NOTHING RETURNING id",
     )
@@ -532,12 +589,19 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
         return;
     };
     let mut events = handle.events.subscribe();
-    let Ok((s, owner_id, lifecycle, lifecycle_epoch, control_epoch)) =
-        owned_snapshot(&app, id, user.id).await
-    else {
-        reject_socket(&mut out, "database_error").await;
-        return;
-    };
+    let (s, owner_id, lifecycle, lifecycle_epoch, control_epoch) =
+        match owned_snapshot(&app, id, user.id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let reason = if error.1 == "not_a_member" {
+                    "not_a_member"
+                } else {
+                    "database_error"
+                };
+                reject_socket(&mut out, reason).await;
+                return;
+            }
+        };
     let mut recovery = "snapshot";
     let mut missing = Vec::<Value>::new();
     if v["type"] == "RESUME"
@@ -552,14 +616,16 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
             missing = rows.iter().map(|r| r.get("state")).collect();
         }
     }
-    if out
-        .send(Message::Text(
+    if let Err(reason) = socket_membership(&app, id, user.id).await {
+        reject_socket(&mut out, reason).await;
+        return;
+    }
+    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),
+        out.send(Message::Text(
             json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"recovery":recovery,"events":missing,"control_epoch":control_epoch,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch})
                 .to_string()
                 .into(),
-        ))
-        .await
-        .is_err()
+        ))).await, Ok(Ok(())))
     {
         return;
     }
@@ -571,20 +637,22 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
         let mut value = tokio::select! {
             _=heartbeat.tick()=>{
                 if last_seen.elapsed().as_secs()>45 {break};
-                let valid=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND expires_at>now())").bind(&session_hash).fetch_one(&app.db).await;
+                let valid=tokio::time::timeout(std::time::Duration::from_secs(2),database_checks::boolean(&app.db,sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND expires_at>now())").bind(&session_hash),1500)).await;
                 match valid {
-                    Ok(true) => {},
-                    Ok(false) => {reject_socket(&mut out,"session_expired").await;break},
-                    Err(_) => {reject_socket(&mut out,"service_unavailable").await;break},
+                    Ok(Ok(true)) => {},
+                    Ok(Ok(false)) => {reject_socket(&mut out,"session_expired").await;break},
+                    _ => {reject_socket(&mut out,"service_unavailable").await;break},
                 }
-                let _=out.send(Message::Ping(Vec::new().into())).await;continue;
+                if let Err(reason)=socket_membership(&app,id,user.id).await {reject_socket(&mut out,reason).await;break};
+                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Ping(Vec::new().into()))).await,Ok(Ok(()))) {break};continue;
             }
-            event=events.recv()=>match event {Ok(v)=>v,Err(broadcast::error::RecvError::Lagged(_))=>{match owned_snapshot(&app,id,user.id).await{Ok((s,owner_id,lifecycle,lifecycle_epoch,control_epoch))=>json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch,"control_epoch":control_epoch}),Err(_)=>break}},Err(_)=>break},
+            event=events.recv()=>match event {Ok(v)=>v,Err(delivery::Lag::Control)=>{match owned_snapshot(&app,id,user.id).await{Ok((s,owner_id,lifecycle,lifecycle_epoch,control_epoch))=>json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch,"control_epoch":control_epoch}),Err(_)=>break}},Err(delivery::Lag::Chat | delivery::Lag::Closed)=>break},
             message=input.next()=>{
                 let Some(Ok(message))=message else{break};last_seen=Instant::now();
                 let Message::Text(text)=message else{continue};
                 if window.elapsed().as_secs()>=1{window=Instant::now();count=0} count+=1;if count>30{reject_socket(&mut out,"rate_limited").await;break}
                 let Ok(v)=serde_json::from_str::<Value>(&text)else{reject_socket(&mut out,"invalid_request").await;continue};
+                if let Err(reason)=socket_membership(&app,id,user.id).await {reject_socket(&mut out,reason).await;break};
                 match v["type"].as_str().unwrap_or("") {
                     "CLOCK_SYNC"=>{let t2=app.now();json!({"type":"CLOCK_SYNC_REPLY","t1":v["t1"],"t2":t2,"t3":app.now(),"clock_epoch":app.epoch})},
                     "CLIENT_STATUS"=>{app.metrics.report(&v["status"]);let _=handle.events.send(json!({"type":"CLIENT_STATUS","user_id":user.id,"status":v["status"]}));continue},
@@ -599,11 +667,12 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                         };
                         let (cid,replayed)=match persist_chat(&app.db,id,user.id,body,client_message_id).await {
                             Ok(result)=>result,
-                            Err(reason)=>{reject_socket(&mut out,reason).await;continue},
+                            Err(reason)=>{reject_socket(&mut out,reason).await;if reason=="not_a_member" {break};continue},
                         };
                         let identity=match profile::value(&app,user.id).await{Ok(value)=>value,Err(_)=>{reject_socket(&mut out,"database_error").await;break}};
                         let reply=json!({"type":"CHAT","id":cid,"user_id":user.id,"username":identity["username"],"display_name":identity["display_name"],"avatar_url":identity["avatar_url"],"avatar_version":identity["avatar_version"],"body":body,"client_message_id":client_message_id});
                         if replayed {
+                            if let Err(reason)=socket_membership(&app,id,user.id).await {reject_socket(&mut out,reason).await;break};
                             if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Text(reply.to_string().into()))).await,Ok(Ok(()))) {break}
                         } else {let _=handle.events.send(reply);}
                         continue
@@ -620,15 +689,26 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                 }
             }
         };
-        if (value["action"]["type"] == "TRANSFER_OWNERSHIP"
+        let renew_control = value["action"]["type"] == "TRANSFER_OWNERSHIP"
             || (value["action"]["type"] == "ROOM_LIFECYCLE" && value["lifecycle"] == "active")
             || matches!(
                 value["error"]["code"].as_str(),
                 Some("CONTROL_EPOCH_REQUIRED" | "CONTROL_EPOCH_EXPIRED")
-            ))
-            && let Ok(epoch) = persistence::issue_control_epoch(&app.db, id, user.id).await
-        {
-            value["control_epoch"] = json!(epoch);
+            );
+        if renew_control {
+            if let Err(reason) = socket_membership(&app, id, user.id).await {
+                reject_socket(&mut out, reason).await;
+                break;
+            }
+            if let Ok(epoch) = persistence::issue_control_epoch(&app.db, id, user.id).await {
+                value["control_epoch"] = json!(epoch);
+            }
+        }
+        // Credential renewal above may wait for a management transaction. Check
+        // again at send admission after that wait, before exposing state/epochs.
+        if let Err(reason) = socket_membership(&app, id, user.id).await {
+            reject_socket(&mut out, reason).await;
+            break;
         }
         if !matches!(
             tokio::time::timeout(

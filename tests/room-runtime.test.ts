@@ -400,3 +400,127 @@ it("a delayed lifecycle response cannot replace a newer room or lifecycle revisi
     runtime.$dispose();
   }
 });
+
+it("a missing control revision fences commands and resumes before applying lifecycle metadata", async () => {
+  const { runtime, sockets, state } = lifecycleFixture();
+  try {
+    await runtime.enter({ id: "a", name: "A", owner_id: "user" });
+    const first = sockets[0];
+    first.onopen();
+    const frame = (socket: any, value: unknown) =>
+      socket.onmessage({ data: JSON.stringify(value) });
+    frame(first, {
+      type: "SNAPSHOT",
+      state,
+      owner_id: "user",
+      lifecycle: "active",
+      lifecycle_epoch: 0,
+      control_epoch: { id: "old" },
+    });
+    frame(first, {
+      type: "EVENT",
+      state: { ...state, revision: 3, controller_user_id: "next" },
+      owner_id: "next",
+      lifecycle: "closing",
+      lifecycle_epoch: 1,
+      control_epoch: null,
+    });
+    expect(first.close).toHaveBeenCalledOnce();
+    expect(sockets).toHaveLength(2);
+    expect(runtime.state?.revision).toBe(1);
+    expect(runtime.room?.owner_id).toBe("user");
+    expect(runtime.roomActive).toBe(true);
+    expect(runtime.connected).toBe(false);
+    const previousSends = first.send.mock.calls.length;
+    runtime.send("PLAY");
+    expect(first.send).toHaveBeenCalledTimes(previousSends);
+    // A buffered frame on the superseded physical connection cannot restore
+    // control or overwrite the recovery baseline.
+    frame(first, {
+      type: "SNAPSHOT",
+      state: { ...state, revision: 99 },
+      owner_id: "wrong",
+      control_epoch: { id: "late" },
+    });
+    expect(runtime.state?.revision).toBe(1);
+    const second = sockets[1];
+    second.onopen();
+    expect(JSON.parse(second.send.mock.calls[0][0])).toEqual({
+      type: "RESUME",
+      room_id: "a",
+      revision: 1,
+      clock_epoch: "clock",
+    });
+    frame(second, {
+      type: "SNAPSHOT",
+      recovery: "snapshot",
+      state: { ...state, revision: 3, controller_user_id: "next" },
+      owner_id: "next",
+      lifecycle: "closing",
+      lifecycle_epoch: 1,
+      control_epoch: null,
+    });
+    expect(runtime.state?.revision).toBe(3);
+    expect(runtime.room?.owner_id).toBe("next");
+    expect(runtime.roomActive).toBe(false);
+    expect(runtime.canManageRoom).toBe(false);
+  } finally {
+    runtime.$dispose();
+  }
+});
+
+it("an ACK with a revision gap uses the same snapshot recovery as a missed EVENT", async () => {
+  const { runtime, sockets, state } = lifecycleFixture();
+  try {
+    await runtime.enter({ id: "a", name: "A", owner_id: "user" });
+    const socket = sockets[0];
+    socket.onopen();
+    socket.onmessage({ data: JSON.stringify({ type: "SNAPSHOT", state }) });
+    socket.onmessage({
+      data: JSON.stringify({
+        type: "ACK",
+        state: { ...state, revision: 4 },
+        control_epoch: { id: "gapped" },
+      }),
+    });
+    expect(runtime.state?.revision).toBe(1);
+    expect(sockets).toHaveLength(2);
+    sockets[1].onopen();
+    runtime.send("PLAY");
+    expect(sockets[1].send).toHaveBeenCalledTimes(1);
+  } finally {
+    runtime.$dispose();
+  }
+});
+
+it("a control event from another server clock requires a snapshot and does not replay its action", async () => {
+  const { runtime, sockets, state } = lifecycleFixture();
+  try {
+    await runtime.enter({ id: "a", name: "A", owner_id: "user" });
+    const socket = sockets[0];
+    socket.onopen();
+    socket.onmessage({ data: JSON.stringify({ type: "SNAPSHOT", state }) });
+    socket.onmessage({
+      data: JSON.stringify({
+        type: "EVENT",
+        state: { ...state, revision: 2, clock_epoch: "restarted" },
+        action: { type: "SEEK" },
+      }),
+    });
+    expect(runtime.state).toEqual(state);
+    expect(sockets).toHaveLength(2);
+    const next = sockets[1];
+    next.onopen();
+    next.onmessage({
+      data: JSON.stringify({
+        type: "SNAPSHOT",
+        state: { ...state, revision: 2, clock_epoch: "restarted" },
+        control_epoch: { id: "fresh" },
+      }),
+    });
+    expect(runtime.state?.clock_epoch).toBe("restarted");
+    expect(runtime.state?.revision).toBe(2);
+  } finally {
+    runtime.$dispose();
+  }
+});

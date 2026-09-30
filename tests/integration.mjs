@@ -624,8 +624,10 @@ try {
     method: "HEAD",
     headers: { Range: "bytes=9999-" },
   });
-  assert.equal(r.status, 416);
-  assert.equal(r.headers.get("content-range"), "bytes */2048");
+  // RFC 9110 Range semantics apply to GET only; HEAD describes the full entity.
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get("content-range"), null);
+  assert.equal(r.headers.get("content-length"), "2048");
   assert.equal(await r.text(), "");
   r = await fetch(worker + plan.playback_url, { method: "HEAD" });
   assert.equal(r.headers.get("content-length"), "2048");

@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import {
+  appendFile,
+  chmod,
+  mkdir,
+  readFile,
+  writeFile,
+} from "node:fs/promises";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
@@ -174,21 +180,35 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
   };
   try {
     await save();
-    const imageId = await docker(
-      "image",
-      "inspect",
-      definition.image,
-      "--format",
-      "{{.Id}}",
-    );
-    assert.equal(imageId, definition.image.split("@")[1]);
-    report.image_id = imageId;
-    const original = JSON.parse(
-      await readFile(
-        resolve(ffmpegRoot, "native-validation-report.json"),
-        "utf8",
+    const image = JSON.parse(
+      await docker(
+        "image",
+        "inspect",
+        definition.image,
+        "--format",
+        "{{json .}}",
       ),
     );
+    // The immutable registry manifest digest and the local image configuration
+    // ID identify different artifacts. Check the manifest through RepoDigests.
+    assert.ok(image.RepoDigests?.includes(definition.image));
+    assert.match(image.Id, /^sha256:[0-9a-f]{64}$/);
+    report.image_id = image.Id;
+    report.repo_digests = image.RepoDigests;
+    if (options.ffmpegBin !== undefined)
+      assert.ok(
+        isAbsolute(options.ffmpegBin),
+        "Use an explicit absolute local toolchain directory",
+      );
+    const original =
+      options.ffmpegBin === undefined
+        ? JSON.parse(
+            await readFile(
+              resolve(ffmpegRoot, "native-validation-report.json"),
+              "utf8",
+            ),
+          )
+        : null;
     report.ffmpeg = [];
     for (const tool of ["ffmpeg", "ffprobe"]) {
       const path = resolve(
@@ -196,12 +216,17 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
         `${tool}${process.platform === "win32" ? ".exe" : ""}`,
       );
       const sha256 = await digest(path);
-      assert.ok(JSON.stringify(original).toLowerCase().includes(sha256));
+      if (original)
+        assert.ok(JSON.stringify(original).toLowerCase().includes(sha256));
       const version = (await command(path, ["-version"])).split(/\r?\n/)[0];
-      assert.ok(version.includes("9.0.2"));
+      assert.ok(version.startsWith(`${tool} version `));
+      if (original) assert.ok(version.includes("9.0.2"));
       report.ffmpeg.push({ tool, path, sha256, version });
     }
-    report.archive_sha256 = original.download.expected_sha256;
+    if (original) report.archive_sha256 = original.download.expected_sha256;
+    report.toolchain_provenance = original
+      ? "verified fixed Windows archive"
+      : "explicit existing local executables; version and SHA-256 recorded; no archive claim";
     const media = resolve(root, "media");
     const config = resolve(root, "config");
     const cache = resolve(root, "cache");
@@ -398,6 +423,11 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
     report.subtitle_sha256 = await digest(
       resolve(media, "rainsync-h264.en.srt"),
     );
+    // A restrictive host umask must not hide these owned synthetic samples from
+    // Emby's non-root container user. Never widen the credential/config paths.
+    await chmod(media, 0o755);
+    for (const path of [h264, hevc, resolve(media, "rainsync-h264.en.srt")])
+      await chmod(path, 0o644);
     networkId = await docker(
       "network",
       "create",
@@ -863,6 +893,13 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
         report.source_sha256,
       );
       report.source_unchanged = true;
+      for (const tool of report.ffmpeg ?? [])
+        assert.equal(
+          await digest(tool.path),
+          tool.sha256,
+          "The recorded toolchain did not change during the fixture",
+        );
+      report.toolchain_unchanged = true;
     });
     if (report.final_container_state?.oom_killed) {
       report.result = "failed";

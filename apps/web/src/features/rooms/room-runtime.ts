@@ -321,6 +321,18 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         )
           return;
         if (next.room_id !== room.value?.id) return;
+        if (
+          v.type !== "SNAPSHOT" &&
+          (!old ||
+            old.clock_epoch !== next.clock_epoch ||
+            next.revision > old.revision + 1)
+        ) {
+          // Full state on an EVENT/ACK does not recover missed ownership or
+          // lifecycle metadata. Fence controls and request the existing RESUME
+          // snapshot before applying another revision or playback side effect.
+          if (retryAllowed) connect();
+          return;
+        }
         if (typeof v.owner_id === "string") room.value.owner_id = v.owner_id;
         const wasActive = roomActive.value;
         if (

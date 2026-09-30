@@ -1,0 +1,35 @@
+name: isolated upstream compatibility
+on:
+  push:
+    branches: [integration/v0.1-next]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fixed-products:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install fixture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          npm ci
+      - name: Exercise pinned disposable Jellyfin and Emby products
+        env:
+          RAINSYNC_FFMPEG_BIN: /usr/bin
+          RAINSYNC_RUNTIME_ROOT: ${{ runner.temp }}/rainsync-upstream
+        run: node tests/upstream-real-contracts.mjs
+      - name: Preserve sanitized compatibility reports, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixed-upstream-compatibility-${{ github.sha }}
+          path: ${{ runner.temp }}/rainsync-upstream/**/report.json
+          if-no-files-found: warn
+          retention-days: 7

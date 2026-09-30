@@ -32,6 +32,27 @@ pub async fn snapshot(pool: &PgPool, id: Uuid) -> Result<RoomState> {
             .await?;
     Ok(serde_json::from_value(state)?)
 }
+/// Membership is a transaction gate, not just socket admission. Hold the row
+/// through the caller's commit so DELETE either precedes admission or waits.
+/// Call only after the room and snapshot locks, matching management ordering.
+async fn lock_membership(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    room: Uuid,
+    user: Uuid,
+) -> Result<()> {
+    let present: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
+    )
+    .bind(room)
+    .bind(user)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if present.is_none() {
+        bail!("not_a_member");
+    }
+    Ok(())
+}
+
 pub async fn issue_control_epoch(
     pool: &PgPool,
     room: Uuid,
@@ -45,6 +66,7 @@ pub async fn issue_control_epoch(
         .bind(room)
         .fetch_one(&mut *tx)
         .await?;
+    lock_membership(&mut tx, room, user).await?;
     let id = Uuid::new_v4();
     let expires_at_ms: i64 = sqlx::query_scalar("INSERT INTO control_epochs(id,user_id,room_id) VALUES($1,$2,$3) RETURNING floor(extract(epoch FROM expires_at)*1000)::bigint")
         .bind(id).bind(user).bind(room).fetch_one(&mut *tx).await?;
@@ -83,6 +105,11 @@ pub async fn previous(
 ) -> Result<Option<RoomState>> {
     let mut tx = pool.begin().await?;
     room_lifecycle::lock_active(&mut tx, room).await?;
+    sqlx::query("SELECT room_id FROM room_snapshots WHERE room_id=$1 FOR SHARE")
+        .bind(room)
+        .fetch_one(&mut *tx)
+        .await?;
+    lock_membership(&mut tx, room, user).await?;
     check_control_epoch(&mut *tx, room, user, command.control_epoch).await?;
     let row =
         sqlx::query("SELECT state,user_id,request_payload FROM command_results WHERE room_id=$1 AND command_id=$2")
@@ -127,6 +154,7 @@ pub async fn commit(
             .bind(state.room_id)
             .fetch_one(&mut *tx)
             .await?;
+    lock_membership(&mut tx, state.room_id, user).await?;
     check_control_epoch(&mut *tx, state.room_id, user, command.control_epoch).await?;
     // A management transaction can replace controller ownership outside the
     // in-memory playback actor. Never commit a reduction against an old owner.

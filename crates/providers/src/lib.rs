@@ -1,7 +1,10 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+pub mod emby;
+pub mod jellyfin;
 pub mod preview;
+mod upstream_common;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
@@ -55,12 +58,6 @@ pub fn upstream_url(base: &reqwest::Url, path: &str) -> Result<reqwest::Url> {
     anyhow::ensure!(url.origin() == base.origin(), "upstream_origin_mismatch");
     Ok(url)
 }
-fn base(config: &SourceConfig) -> Result<String> {
-    Ok(validate_url(&config.url)?
-        .as_str()
-        .trim_end_matches('/')
-        .to_string())
-}
 
 pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> {
     match kind {
@@ -112,61 +109,8 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
                 metadata: json!({}),
             }])
         }
-        "jellyfin" | "emby" => {
-            if config.user_id.is_empty() || config.token.is_empty() {
-                bail!("upstream_credentials_required")
-            }
-            let mut result = vec![];
-            let mut start = 0;
-            let mut expected_total = None;
-            loop {
-                let url = format!("{}/Users/{}/Items", base(config)?, config.user_id);
-                let mut req = client().get(url).query(&[
-                    ("Recursive", "true"),
-                    ("IncludeItemTypes", "Movie,Episode,Video,MusicVideo"),
-                    ("Limit", "200"),
-                    ("StartIndex", &start.to_string()),
-                ]);
-                req = if kind == "jellyfin" {
-                    req.header(
-                        "Authorization",
-                        format!("MediaBrowser Token=\"{}\"", config.token),
-                    )
-                } else {
-                    req.header("X-Emby-Token", &config.token)
-                };
-                let value: Value = req.send().await?.error_for_status()?.json().await?;
-                let total = value["TotalRecordCount"]
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("invalid_library_total"))?;
-                anyhow::ensure!(
-                    expected_total.is_none_or(|n| n == total),
-                    "library_changed_during_scan"
-                );
-                expected_total = Some(total);
-                let rows = value["Items"]
-                    .as_array()
-                    .ok_or_else(|| anyhow::anyhow!("invalid_library_response"))?;
-                for v in rows {
-                    result.push(Item {
-                        title: v["Name"].as_str().unwrap_or("Untitled").into(),
-                        resource: v["Id"]
-                            .as_str()
-                            .ok_or_else(|| anyhow::anyhow!("missing_id"))?
-                            .into(),
-                        duration_ms: v["RunTimeTicks"].as_f64().map(|v| v / 10000.0),
-                        metadata: json!({"ImageTags":v["ImageTags"],"BackdropImageTags":v["BackdropImageTags"]}),
-                    });
-                }
-                start += rows.len();
-                anyhow::ensure!(start as u64 <= total, "invalid_library_total");
-                if start as u64 == total {
-                    break;
-                };
-                anyhow::ensure!(!rows.is_empty(), "incomplete_library_response");
-            }
-            Ok(result)
-        }
+        "jellyfin" => jellyfin::list_items(config).await,
+        "emby" => emby::list_items(config).await,
         _ => bail!("source_requires_agent_index"),
     }
 }
@@ -201,17 +145,11 @@ pub async fn upstream_plan(
     options: &PlaybackOptions,
     device_id: &str,
 ) -> Result<Value> {
-    let body = playback_request(config, options);
-    let mut url = validate_url(&format!("{}/", base(config)?))?;
-    url.path_segments_mut()
-        .map_err(|_| anyhow::anyhow!("invalid_upstream_base"))?
-        .pop_if_empty()
-        .extend(["Items", item, "PlaybackInfo"]);
-    let mut req = client().post(url).json(&body);
-    for (name, value) in upstream_headers(kind, config, device_id)? {
-        req = req.header(name, value);
+    match kind {
+        "jellyfin" => jellyfin::upstream_plan(config, item, options, device_id).await,
+        "emby" => emby::upstream_plan(config, item, options, device_id).await,
+        _ => bail!("invalid_upstream_kind"),
     }
-    Ok(req.send().await?.error_for_status()?.json().await?)
 }
 
 /// The same device identity must accompany negotiation, media/subtitle delivery

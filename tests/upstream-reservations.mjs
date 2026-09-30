@@ -275,8 +275,8 @@ const upstream = createServer(async (request, response) => {
         return json({ error: "fixture encoding stop failure" }, 503);
       session.stopped = true;
       session.encoding_active = false;
-      event.response_status = 200;
-      response.writeHead(200).end();
+      event.response_status = session.fault.encoding_stop_status ?? 200;
+      response.writeHead(event.response_status).end();
       return;
     }
     json({ error: "unhandled fixture route" }, 404);
@@ -501,7 +501,7 @@ try {
                 v.kind === "emby" &&
                 v.method === "DELETE" &&
                 v.path === "/Videos/ActiveEncodings" &&
-                v.response_status === 200,
+                [200, 204].includes(v.response_status),
             ),
             "Emby encoding cleanup is independently observed",
           );
@@ -670,6 +670,83 @@ try {
             },
           );
         }
+        for (const kind of ["jellyfin", "emby"]) {
+          await controller.change(media[kind]);
+          await scenario(
+            `${kind}: higher plan generation retires only its same-user viewer's upstream attempt`,
+            async (result) => {
+              const viewerA = randomUUID(),
+                viewerB = randomUUID();
+              const keyA = randomUUID();
+              const a1 = await prepare(keyA, {
+                viewer_id: viewerA,
+                plan_generation: 1,
+              });
+              const b1 = await prepare(randomUUID(), {
+                viewer_id: viewerB,
+                plan_generation: 1,
+              });
+              assert.equal(a1.status, 200);
+              assert.equal(b1.status, 200);
+              assert.equal(a1.body.plan_generation, 1);
+              assert.equal(b1.body.plan_generation, 1);
+              const a1Row = record(a1.body.session_id),
+                b1Row = record(b1.body.session_id);
+              assert.notEqual(a1Row.play_session_id, b1Row.play_session_id);
+              assert.notEqual(a1Row.device_id, b1Row.device_id);
+              const a2 = await prepare(randomUUID(), {
+                viewer_id: viewerA,
+                plan_generation: 2,
+              });
+              assert.equal(a2.status, 200);
+              assert.equal(a2.body.plan_generation, 2);
+              await closed(a1.body.session_id);
+              assertKnownStop(a1.body.session_id);
+              const bReady = await admin.request(
+                `/playback-sessions/${b1.body.session_id}`,
+              );
+              assert.equal(bReady.session_id, b1.body.session_id);
+              assert.equal(bReady.plan_generation, 1);
+              assert.equal(record(b1.body.session_id).state, "active");
+              assert.equal(
+                contract.sessions.get(b1Row.play_session_id).stopped,
+                false,
+              );
+              const negotiations = contract.negotiations.length;
+              const oldRetry = await prepare(keyA, {
+                viewer_id: viewerA,
+                plan_generation: 1,
+              });
+              assert.equal(oldRetry.status, 409);
+              assert.equal(oldRetry.body.error.code, "STALE_PLAYBACK_PLAN");
+              assert.equal(
+                contract.negotiations.length,
+                negotiations,
+                "stale retry has no new upstream side effect",
+              );
+              await admin.request(
+                `/playback-sessions/${b1.body.session_id}`,
+                "POST",
+              );
+              for (const grant of [a2, b1]) {
+                await admin.request(
+                  `/playback-sessions/${grant.body.session_id}`,
+                  "DELETE",
+                );
+                await closed(grant.body.session_id);
+                assertKnownStop(grant.body.session_id);
+              }
+              Object.assign(result, {
+                viewer_a: viewerA,
+                viewer_b: viewerB,
+                retired_session: a1.body.session_id,
+                replacement_session: a2.body.session_id,
+                independent_session: b1.body.session_id,
+                stale_retry_status: oldRetry.status,
+              });
+            },
+          );
+        }
         await controller.change(media.emby);
         await scenario(
           "Emby cleanup retains partial success and retries only the unconfirmed step",
@@ -678,6 +755,7 @@ try {
               name: "emby-partial-confirmation",
               accept_stop_once: true,
               fail_first_encoding_stop: true,
+              encoding_stop_status: 204,
             };
             contract.queue.push(fault);
             const answer = await prepare(randomUUID());
@@ -690,6 +768,15 @@ try {
             assertKnownStop(final.id);
             assert.equal(final.stop_confirmed, true);
             assert.equal(final.encoding_stop_confirmed, true);
+            assert.ok(
+              contract.requests.some(
+                (event) =>
+                  event.play_session_id === final.play_session_id &&
+                  event.path === "/Videos/ActiveEncodings" &&
+                  event.response_status === 204,
+              ),
+              "Real fixed Emby 204 confirms the second cleanup step",
+            );
             assert.equal(final.cleanup_attempts, 2);
             assert.equal(
               contract.stops.filter(
@@ -1350,14 +1437,25 @@ try {
         };
         report.fixture = fixtureIdentity;
         if (fixture.databaseKind === "native") {
-          assert.equal(fixture.container,null,"native runs must not invent a Docker identity");
-          assert.equal(fixtureIdentity.postgres.kind,"native");
-          ownedVolumes=[];
+          assert.equal(
+            fixture.container,
+            null,
+            "native runs must not invent a Docker identity",
+          );
+          assert.equal(fixtureIdentity.postgres.kind, "native");
+          ownedVolumes = [];
         } else {
-          assert.equal(fixture.databaseKind,"docker");
+          assert.equal(fixture.databaseKind, "docker");
           ownedVolumes = JSON.parse(
-            docker("inspect", fixture.container, "--format", "{{json .Mounts}}"),
-          ).filter((mount) => mount.Type === "volume").map((mount) => mount.Name);
+            docker(
+              "inspect",
+              fixture.container,
+              "--format",
+              "{{json .Mounts}}",
+            ),
+          )
+            .filter((mount) => mount.Type === "volume")
+            .map((mount) => mount.Name);
         }
       },
     },

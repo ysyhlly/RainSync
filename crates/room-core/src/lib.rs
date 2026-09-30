@@ -1,3 +1,5 @@
+pub mod replay;
+
 use protocol::{Action, Command, PlaybackStatus, RoomState, VERSION};
 use uuid::Uuid;
 

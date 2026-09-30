@@ -3,6 +3,8 @@ mod account_security;
 mod agents;
 mod avatar_image;
 mod avatars;
+mod database_checks;
+mod health;
 mod limits;
 mod media;
 mod media_previews;
@@ -50,6 +52,7 @@ pub struct App {
     queue_limit: i64,
     preview_settings: persistence::media_previews::Settings,
     metrics: Arc<metrics::Metrics>,
+    readiness: Arc<health::Runtime>,
     db: PgPool,
     origin: String,
     secure: bool,
@@ -359,6 +362,9 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .fetch_one(&mut *lock)
         .await?;
     anyhow::ensure!(acquired, "another RainSync server owns the instance lock");
+    let readiness = Arc::new(health::Runtime::default());
+    readiness.observe(health::Check::InstanceOwnership, health::Outcome::Ready);
+    let lock_readiness = readiness.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -370,12 +376,39 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
                 .await,
                 Ok(Ok(_))
             ) {
+                lock_readiness.observe(health::Check::InstanceOwnership, health::Outcome::Failed);
+                lock_readiness.accepting(false);
                 let _ = lost.send(());
                 // A timed-out connection may still own the lock. Retain it
                 // until the supervisor stops the entire application runtime.
                 std::future::pending::<()>().await;
                 return;
             }
+            // This is the same live connection which owns the advisory lock.
+            lock_readiness.observe(health::Check::InstanceOwnership, health::Outcome::Ready);
+        }
+    });
+    let probe_db = db.clone();
+    let probe_readiness = readiness.clone();
+    tokio::spawn(async move {
+        loop {
+            let healthy = matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    database_checks::boolean(&probe_db, sqlx::query_scalar("SELECT true"), 750)
+                )
+                .await,
+                Ok(Ok(_))
+            );
+            probe_readiness.observe(
+                health::Check::Database,
+                if healthy {
+                    health::Outcome::Ready
+                } else {
+                    health::Outcome::Failed
+                },
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     });
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
@@ -416,6 +449,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         queue_limit: limits::configured("MEDIA_QUEUE_LIMIT", limits::DEFAULT_QUEUE_LIMIT)?,
         preview_settings: persistence::media_previews::Settings::configured()?,
         metrics: Default::default(),
+        readiness: readiness.clone(),
         db: db.clone(),
         secure: public_origin.starts_with("https://"),
         origin: public_origin,
@@ -577,12 +611,14 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route("/api/v1/agents/ws", get(agents::connect))
         .route("/api/v1/ws", get(ws))
         .route("/api/v1/metrics", get(metrics::endpoint))
-        .with_state(app)
         .layer(axum::extract::DefaultBodyLimit::max(65536))
-        .layer(axum::middleware::from_fn(http_api::errors));
+        .layer(axum::middleware::from_fn(http_api::errors))
+        .route("/ready", get(health::endpoint))
+        .with_state(app);
     let listener =
         tokio::net::TcpListener::bind(std::env::var("BIND").unwrap_or("0.0.0.0:8080".into()))
             .await?;
+    readiness.accepting(true);
     tracing::info!("RainSync server ready");
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(
@@ -597,6 +633,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     let server_result = tokio::select! {
         result = &mut server => result,
         signal = media_core::process_signal::wait() => {
+            readiness.accepting(false);
             preparations.close();
             upstream.close_admission();
             let _ = stop.send(());
@@ -608,6 +645,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
             signal.map(|_| ()).and(result)
         },
     };
+    readiness.accepting(false);
     // Fence late HTTP admission and retain the application runtime through
     // reservation commits, scoped resource disposal and durable receipt retries.
     // Instance-lock loss intentionally skips this barrier and remains unknown.

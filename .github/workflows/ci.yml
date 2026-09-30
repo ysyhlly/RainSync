@@ -18,7 +18,7 @@ jobs:
           node-version: 24
           cache: npm
       - name: Install media validation prerequisites
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg postgresql
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -29,6 +29,17 @@ jobs:
       - run: npm run test:priority-remediation
       - run: npm run test:lifecycle-capabilities
       - run: npm run test:playback-generations
+      - name: Verify integrated B-F regressions
+        run: |
+          echo "RAINSYNC_FFMPEG_BIN=/usr/bin" >> "$GITHUB_ENV"
+          export RAINSYNC_NATIVE_POSTGRES_BIN="$(pg_config --bindir)"
+          test -x "$RAINSYNC_NATIVE_POSTGRES_BIN/initdb"
+          echo "RAINSYNC_NATIVE_POSTGRES_BIN=$RAINSYNC_NATIVE_POSTGRES_BIN" >> "$GITHUB_ENV"
+          node scripts/bind-native-backend.mjs > "$RUNNER_TEMP/rainsync-validation/binding-path.txt"
+          BINDING="$(tail -n 1 "$RUNNER_TEMP/rainsync-validation/binding-path.txt")"
+          echo "W03_BACKEND_BINDING=$BINDING" >> "$GITHUB_ENV"
+          export W03_BACKEND_BINDING="$BINDING"
+          npm run test:parallel-integration
       - run: npm run test:accounts
       - name: Verify avatars with the deployment image's FFmpeg
         run: |

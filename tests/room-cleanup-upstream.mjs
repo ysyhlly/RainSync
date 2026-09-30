@@ -15,9 +15,9 @@ await isolatedServer("room-cleanup-upstream",async f=>{
     req.on("end",()=>{
       const url=new URL(req.url,"http://fixture");
       const body=chunks.length?JSON.parse(Buffer.concat(chunks)):null;
-      records.push({method:req.method,path:url.pathname,query:Object.fromEntries(url.searchParams),body});
+      const record={method:req.method,path:url.pathname,query:Object.fromEntries(url.searchParams),body}; records.push(record);
       if(url.pathname.endsWith("/PlaybackInfo")) { res.writeHead(200,{"Content-Type":"application/json"}).end(JSON.stringify({PlaySessionId:randomUUID(),MediaSources:[{Id:"source-fixed",SupportsDirectPlay:true,MediaStreams:[],RunTimeTicks:300000000}]})); return; }
-      if(url.pathname.endsWith("/ActiveEncodings")) { res.writeHead(encodingOkay?200:204).end(); return; }
+      if(url.pathname.endsWith("/ActiveEncodings")) { record.response_status=encodingOkay?204:202; res.writeHead(record.response_status).end(); return; }
       if(url.pathname.endsWith("/Stopped")) { res.writeHead(stopOkay?204:503).end(); return; }
       res.writeHead(204).end();
     });
@@ -58,13 +58,15 @@ await isolatedServer("room-cleanup-upstream",async f=>{
     await until(()=>f.sql(`SELECT stop_confirmed AND NOT encoding_stop_confirmed FROM upstream_reservations WHERE id='${emby.plan.session_id}'`)==="t","separate stop proof captured");
     assert.equal((await view(emby.room.id)).lifecycle,"closing","Stopped204 is insufficient for Emby encoder");
     const deletion=records.find(r=>r.path==="/Videos/ActiveEncodings"&&r.query.PlaySessionId===emby.sid);
+    assert.equal(deletion.response_status,202,"accepted is not positive execution completion");
     assert.equal(deletion.method,"DELETE"); assert.equal(deletion.query.DeviceId,device);
     encodingOkay=true;
     f.sql(`UPDATE upstream_reservations SET cleanup_after=now() WHERE id='${emby.plan.session_id}'`);
     await until(async()=> (await view(emby.room.id)).lifecycle==="closed","Emby both positive receipts");
     assert.equal(records.filter(r=>r.path==="/Sessions/Playing/Stopped"&&r.body?.PlaySessionId===emby.sid).length,1,"retry preserves confirmed check-in");
     assert.equal(f.sql(`SELECT stop_confirmed AND encoding_stop_confirmed AND NOT io_uncertain FROM upstream_reservations WHERE id='${emby.plan.session_id}'`),"t");
-    console.log("PASS: Emby requires check-in plus200 encoding DELETE with exact device/SID; retry preserves individual positive proofs");
+    assert.equal(records.filter(r=>r.path==="/Videos/ActiveEncodings"&&r.query.PlaySessionId===emby.sid).at(-1).response_status,204);
+    console.log("PASS: Emby requires check-in plus confirmed204 encoding DELETE with exact device/SID; 202 remains unconfirmed and retry preserves individual positive proofs");
 
     const retained=await prepare("jellyfin","positive upstream proof retention");
     f.sql(`CREATE FUNCTION reject_test_upstream_marker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id='${retained.plan.session_id}' AND NEW.resource @> '{"upstream_closed":true}'::jsonb THEN RAISE EXCEPTION 'fixture marker write blocked'; END IF; RETURN NEW; END; $$; CREATE TRIGGER reject_test_upstream_marker BEFORE UPDATE ON playback_sessions FOR EACH ROW EXECUTE FUNCTION reject_test_upstream_marker()`);

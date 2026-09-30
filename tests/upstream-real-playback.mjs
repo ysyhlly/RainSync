@@ -31,6 +31,9 @@ import { Client } from "./fixtures/server.mjs";
 import { isolatedUpstreamReal } from "./fixtures/upstream-real.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const runtime = resolve(
+  process.env.RAINSYNC_RUNTIME_ROOT ?? resolve(root, ".runtime"),
+);
 const entry = fileURLToPath(import.meta.url);
 const args = Object.fromEntries(
   process.argv.slice(2).map((arg) => {
@@ -42,7 +45,7 @@ const args = Object.fromEntries(
 const kinds =
   args.kind && args.kind !== "all" ? [args.kind] : ["jellyfin", "emby"];
 const runId = `rainsync-upstream-playback-${randomUUID().slice(0, 8)}`;
-const evidence = resolve(root, ".runtime/upstream-real-playback", runId);
+const evidence = resolve(runtime, "upstream-real-playback", runId);
 const reportPath = resolve(evidence, "report.json");
 const activityPath = resolve(evidence, "activity.jsonl");
 const execute = promisify(execFile);
@@ -236,7 +239,7 @@ async function provenance() {
     "Set an absolute fresh W03_BACKEND_BINDING before real native validation",
   );
   bindingPath = inside(
-    await realpath(resolve(root, ".runtime/w03-viewer-backend")),
+    await realpath(resolve(runtime, "w03-viewer-backend")),
     await realpath(process.env.W03_BACKEND_BINDING),
   );
   binding = JSON.parse(await readFile(bindingPath, "utf8"));
@@ -291,7 +294,12 @@ async function provenance() {
   binaryCopies = new Map();
   for (const binary of binding.binaries) {
     assert.ok(isAbsolute(binary.path));
-    inside(await realpath(root), await realpath(binary.path));
+    inside(
+      await realpath(
+        resolve(process.env.CARGO_TARGET_DIR ?? resolve(root, "target")),
+      ),
+      await realpath(binary.path),
+    );
     assert.equal(
       await digest(binary.path),
       binary.sha256,
@@ -311,7 +319,8 @@ async function provenance() {
   }
   for (const name of ["rainsync-server", "rainsync-media-worker"])
     assert.ok(binaryCopies.has(name), `Binding includes ${name}`);
-  const executable = chromium.executablePath();
+  const executable =
+    process.env.RAINSYNC_CHROMIUM_EXECUTABLE ?? chromium.executablePath();
   files.set(executable, await digest(executable));
   originalProof = files;
   const entries = [...files].map(([path, sha256]) => ({ path, sha256 }));
@@ -697,7 +706,18 @@ async function nativeStack(upstream, product, run) {
         "SELECT max(version) FROM _sqlx_migrations WHERE success",
       ),
     };
-    assert.equal(product.native.migration, "26");
+    const migrations = binding.source
+      .map((file) => /^migrations[\\/](\d+)_.*\.sql$/.exec(file.path))
+      .filter(Boolean)
+      .map((match) => Number(match[1]));
+    assert.equal(product.native.migration, String(Math.max(...migrations)));
+    assert.equal(
+      await fixture.sql(
+        `SELECT count(*) FROM _sqlx_migrations WHERE success AND version IN (${migrations.join(",")})`,
+      ),
+      String(migrations.length),
+      "Every migration in the frozen backend binding is applied",
+    );
     dev = await viteServer({
       root: resolve(root, "apps/web"),
       envDir: resolve(stackRoot, "empty-env"),
@@ -718,6 +738,7 @@ async function nativeStack(upstream, product, run) {
     await dev.listen();
     browserServer = await chromium.launchServer({
       headless: true,
+      executablePath: process.env.RAINSYNC_CHROMIUM_EXECUTABLE,
       args: [
         "--autoplay-policy=no-user-gesture-required",
         "--disable-background-timer-throttling",
@@ -2227,6 +2248,7 @@ try {
         artifactRoot: resolve(evidence, kind, "upstream"),
         activityPath,
         durationSeconds: 90,
+        ffmpegBin: process.env.RAINSYNC_FFMPEG_BIN,
         concurrentRuns:
           "Sequential isolated product matrix; any unrelated host load remains external",
       },
