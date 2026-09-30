@@ -52,3 +52,66 @@ jobs:
           path: ${{ runner.temp }}/rainsync-upstream/**/report.json
           if-no-files-found: warn
           retention-days: 7
+
+  rainsync-account-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install bounded validation prerequisites
+        timeout-minutes: 20
+        run: |
+          packages=()
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then packages+=(ffmpeg); fi
+          if ! command -v pg_config >/dev/null || ! test -x "$(pg_config --bindir)/initdb"; then packages+=(postgresql); fi
+          if ((${#packages[@]})); then
+            sudo timeout --kill-after=15s 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+            sudo timeout --kill-after=15s 900s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends "${packages[@]}"
+          fi
+          ffmpeg -version
+          ffprobe -version
+          test -x "$(pg_config --bindir)/initdb"
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Pull the same immutable product fixtures
+        timeout-minutes: 10
+        run: |
+          images=(
+            "jellyfin/jellyfin@sha256:59417f441213e236a9f907d4e71a13472042409d85f9e9310dbdd87ee33d7bd4"
+            "emby/embyserver@sha256:3aafff933d3f28d23ed0bc201022abe71c0aa80deb17177566c726b9bbc686c6"
+          )
+          for image in "${images[@]}"; do
+            timeout --kill-after=15s 240s docker pull "$image"
+            timeout --kill-after=5s 15s docker image inspect "$image" >/dev/null
+          done
+      - name: Verify RainSync enforcement against both fixed products
+        timeout-minutes: 20
+        env:
+          RAINSYNC_FFMPEG_BIN: /usr/bin
+          RAINSYNC_RUNTIME_ROOT: ${{ runner.temp }}/rainsync-policy-runtime
+          RAINSYNC_ARTIFACT_DIR: ${{ runner.temp }}/rainsync-policy-evidence
+          CARGO_TARGET_DIR: ${{ runner.temp }}/rainsync-policy-target
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+          CARGO_INCREMENTAL: 0
+        run: |
+          mkdir -p "$RAINSYNC_ARTIFACT_DIR"
+          export RAINSYNC_NATIVE_POSTGRES_BIN="$(pg_config --bindir)"
+          node scripts/bind-native-backend.mjs > "$RAINSYNC_ARTIFACT_DIR/binding-path.txt"
+          export W03_BACKEND_BINDING="$(tail -n 1 "$RAINSYNC_ARTIFACT_DIR/binding-path.txt")"
+          node tests/upstream-policy-observation.mjs all
+      - name: Preserve separate RainSync enforcement evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rainsync-account-policy-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/rainsync-policy-evidence/**/report.json
+            ${{ runner.temp }}/rainsync-policy-runtime/**/backend-binding.json
+          if-no-files-found: warn
+          retention-days: 7

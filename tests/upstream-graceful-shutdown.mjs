@@ -10,6 +10,7 @@ await isolatedServer("upstream-graceful-shutdown",async f=>{
   let replyNegotiation,replyStart,replyProgress;
   const upstream=createServer((req,res)=>{
     req.resume();
+    if(req.url==="/Users/fixture") {res.writeHead(200,{"Content-Type":"application/json"}).end(JSON.stringify({Id:"fixture",Policy:{IsDisabled:false,EnableMediaPlayback:true}}));return;}
     if(req.url.endsWith("/PlaybackInfo")) {
       const reply=()=>{if(res.writableEnded||res.destroyed)return;res.writeHead(200,{"Content-Type":"application/json"}).end(JSON.stringify({PlaySessionId:randomUUID(),MediaSources:[{Id:"fixed",SupportsDirectPlay:true,MediaStreams:[],RunTimeTicks:300000000}]}));};
       if(holdNegotiation)replyNegotiation=reply;else reply();return;
@@ -53,7 +54,7 @@ await isolatedServer("upstream-graceful-shutdown",async f=>{
     console.log("PASS: planned SIGTERM waits beyond10s HTTP grace, captures delayed SID and preparation receipt; restart stops known session and closes room without unknown");
 
     const reportRoom=await createRoom("actual Start and Progress owner drain");
-    const plan=await client.request("/playback-sessions","POST",{room_id:reportRoom.id,media_generation:1,mode:"direct",observation_version:1});
+    let plan=await client.request("/playback-sessions","POST",{room_id:reportRoom.id,media_generation:1,mode:"direct",observation_version:1});
     const sample={media_generation:1,seq:1,event:"playing",media_time_ms:1200,paused:false,seeking:false,buffering:false,playback_rate:1,has_played:true};
     holdStart=true;
     await client.request(`/playback-sessions/${plan.session_id}/observations`,"POST",sample);
@@ -62,6 +63,12 @@ await isolatedServer("upstream-graceful-shutdown",async f=>{
     assert.equal(f.sql(`SELECT start_reported AND NOT io_uncertain AND io_claim IS NULL FROM upstream_reservations WHERE id='${plan.session_id}'`),"t");
     assert.equal(f.sql(`SELECT reported_seq FROM playback_observations WHERE session_id='${plan.session_id}'`),"1");
     await f.startServer();
+    assert.equal((await client.raw(`/playback-sessions/${plan.session_id}`)).status,410,"restart invalidates the old account authorization");
+    const originalPlan=plan;
+    plan=await client.request("/playback-sessions","POST",{room_id:reportRoom.id,media_generation:1,mode:"direct",observation_version:1});
+    await client.request(`/playback-sessions/${plan.session_id}/observations`,"POST",sample);
+    await until(()=>f.sql(`SELECT start_reported FROM upstream_reservations WHERE id='${plan.session_id}'`)==="t","new grant Start confirmed");
+    assert.equal(f.sql(`SELECT reported_seq FROM playback_observations WHERE session_id='${originalPlan.session_id}'`),"1","old observation receipt survives restart");
     holdProgress=true;
     await client.request(`/playback-sessions/${plan.session_id}/observations`,"POST",{...sample,seq:2,event:"pause",media_time_ms:2300,paused:true});
     await until(()=>replyProgress,"Progress owner in flight");
@@ -70,6 +77,6 @@ await isolatedServer("upstream-graceful-shutdown",async f=>{
     assert.equal(f.sql(`SELECT reported_seq FROM playback_observations WHERE session_id='${plan.session_id}'`),"2");
     await f.startServer();await close(reportRoom);
     await until(async()=> (await view(reportRoom.id)).lifecycle==="closed","reported room closes after ordinary restarts");
-    console.log("PASS: planned SIGTERM drains delayed Start and Progress through finish_report/observation ACK; restart retains current grant and no fabricated uncertain operation");
+    console.log("PASS: planned SIGTERM drains delayed Start and Progress through finish_report/observation ACK; restart retires old grant while retaining actual report receipts and no fabricated uncertain operation");
   }finally{replyNegotiation?.();replyStart?.();replyProgress?.();upstream.closeAllConnections();await new Promise(done=>upstream.close(done));}
 });

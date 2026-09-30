@@ -185,6 +185,7 @@ const upstream = createServer(async (request, response) => {
         .writeHead(status, { "Content-Type": "application/json" })
         .end(JSON.stringify(value));
     };
+    if (path === "/Users/fixture-user") return json({Id:"fixture-user",Policy:{IsDisabled:false,EnableMediaPlayback:true}});
     if (path === "/Users/fixture-user/Items") {
       return json({
         TotalRecordCount: 1,
@@ -1002,7 +1003,7 @@ try {
           },
         );
         await scenario(
-          "restart resumes known cleanup and preserves another completed grant",
+          "restart resumes known cleanup and invalidates persisted account authorization",
           async (result) => {
             const failure = {
               name: "restart-known-cleanup",
@@ -1036,41 +1037,16 @@ try {
             assertKnownStop(retired.body.session_id);
             const negotiationCount = contract.negotiations.length;
             const survivedRow = record(surviving.body.session_id);
-            const ready = await guest.request(
-              `/playback-sessions/${surviving.body.session_id}`,
-            );
-            assert.equal(ready.status, "ready");
-            assert.equal(ready.session_id, surviving.body.session_id);
-            await guest.request(
-              `/playback-sessions/${surviving.body.session_id}`,
-              "POST",
-            );
-            assert.equal(
-              contract.negotiations.length,
-              negotiationCount,
-              "restart ready/renew reuses the original negotiation",
-            );
-            assert.equal(
-              record(surviving.body.session_id).device_id,
-              survivedRow.device_id,
-            );
-            assert.equal(
-              record(surviving.body.session_id).play_session_id,
-              survivedRow.play_session_id,
-            );
-            assert.equal(record(surviving.body.session_id).state, "active");
-            assert.equal(
-              fixture.sql(
-                `SELECT count(*) FROM playback_sessions WHERE id=${sqlUuid(surviving.body.session_id)} AND NOT stopped AND expires_at>clock_timestamp()`,
-              ),
-              "1",
-            );
-            assert.equal(
-              contract.sessions.get(
-                record(surviving.body.session_id).play_session_id,
-              ).stopped,
-              false,
-            );
+            for (const method of ["GET", "POST"]) {
+              const response = await guest.raw(`/playback-sessions/${surviving.body.session_id}`, {method});
+              assert.equal(response.status, 410, "restart requires fresh account authorization and a new playback plan");
+            }
+            await closed(surviving.body.session_id);
+            assertKnownStop(surviving.body.session_id);
+            assert.equal(contract.negotiations.length, negotiationCount, "rejecting old grants must not negotiate implicitly");
+            assert.equal(record(surviving.body.session_id).device_id, survivedRow.device_id);
+            assert.equal(record(surviving.body.session_id).play_session_id, survivedRow.play_session_id);
+            assert.equal(fixture.sql(`SELECT stopped FROM playback_sessions WHERE id=${sqlUuid(surviving.body.session_id)}`), "t");
             // Reconnect with a new control epoch after the real process restart.
             controller.close();
             await controller.join(room);

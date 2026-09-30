@@ -56,7 +56,7 @@ export async function workerAttempts({
       await writeFile(resolve(dir, "index0.m4s"), segmentBytes(attempt));
     }
     sql(
-      `INSERT INTO media_jobs(id,session_id,status,spec,attempt) VALUES('${id}','${id}','succeeded','{}',1); UPDATE playback_sessions SET resource=jsonb_build_object('encrypted','${encrypted}') WHERE id='${id}'`,
+      `INSERT INTO media_jobs(id,session_id,status,spec,attempt) VALUES('${id}','${id}','succeeded','{}',1); UPDATE playback_sessions SET resource=resource||jsonb_build_object('encrypted','${encrypted}') WHERE id='${id}'`,
     );
     const saved = await readFile(resolve(cache, id, "1", "index.m3u8"));
     const digest = createHash("sha256").update(saved).digest("hex");

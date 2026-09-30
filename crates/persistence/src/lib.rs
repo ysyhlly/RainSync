@@ -12,6 +12,7 @@ pub mod media_queue;
 pub mod playback_observations;
 pub mod room_cleanup;
 pub mod room_lifecycle;
+pub mod source_account_policy;
 pub mod upstream_reservations;
 
 pub async fn connect(url: &str) -> Result<PgPool> {

@@ -102,6 +102,7 @@ export async function isolatedServer(name, run, options = {}) {
     password,
     origin,
     env: null,
+    get serverPid() { return server?.exitCode === null ? server.pid : undefined; },
     target,
     databaseKind: database.kind,
     postgresDiagnostics: database.diagnostics,

@@ -2,7 +2,7 @@
 
 ## Latest fixed-product result: eight of ten cases pass
 
-[Run 36750871494 on adc5f75](https://github.com/ysyhlly/RainSync/actions/runs/36750871494)
+[Run 36753299116 on 1fd61ea](https://github.com/ysyhlly/RainSync/actions/runs/36753299116)
 passes all three actual HLS seeks on both pins: decoded source pixels are exactly
 10,000, 27,000 and 43,000 ms, with requested audio 440/880/440 Hz. Jellyfin measures
 440/880/440 Hz and Emby 439.63/879.27/439.45 Hz. The actual single-item GET supplies
@@ -16,10 +16,7 @@ assertions remain failed; the workflow is not relabeled green. This is distinct
 from RainSync's verified explicit source-policy revision revocation and does not
 prove automatic enforcement of each upstream account policy or browser playback.
 
-A next contract must specify whether explicit RainSync revocation is sufficient,
-or require bounded upstream-policy observation with a defined failure/refresh
-window. SourceConfig currently binds one upstream account per source; per-login
-upstream revocation also requires a RainSync-user to upstream-user mapping.
+The selected follow-on contract is now [bounded upstream-account observation](UPSTREAM_ACCOUNT_POLICY.md): fresh positive results last at most five seconds and inconclusive reads fail closed. SourceConfig binds one upstream account per source; per-login upstream revocation still requires a separate identity mapping. Thirty controlled RainSync enforcement cases pass. The independent fixed-product enforcement job must verify the final published candidate; it does not change these raw upstream behavior failures.
 
 ## Earlier failed evidence and corrections
 

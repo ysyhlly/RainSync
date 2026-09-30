@@ -190,6 +190,7 @@ const upstream = createServer(async (request, response) => {
         .writeHead(200, { "Content-Type": "application/json" })
         .end(JSON.stringify(value));
     };
+    if (url.pathname === "/Users/fixture-user") return json({Id:"fixture-user",Policy:{IsDisabled:false,EnableMediaPlayback:true}});
     if (url.pathname === "/Users/fixture-user/Items") {
       return json({
         TotalRecordCount: 1,

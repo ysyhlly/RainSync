@@ -95,7 +95,7 @@ pub async fn accept(
         .await?
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "observation_version_required"))?;
     // Evaluate expiry after every possibly contended lock, not before its wait.
-    let live = sqlx::query("SELECT p.stopped,p.expires_at>clock_timestamp() AS unexpired,EXISTS(SELECT 1 FROM media_items mi JOIN sources src ON src.id=mi.source_id WHERE mi.id=p.media_id AND COALESCE((p.resource->>'source_policy_revision')::bigint,0)=src.access_policy_revision) AS policy_current FROM playback_sessions p WHERE p.id=$1 AND p.user_id=$2")
+    let live = sqlx::query("SELECT p.stopped,p.expires_at>clock_timestamp() AS unexpired,playback_source_allowed(p.media_id,p.resource) AS policy_current FROM playback_sessions p WHERE p.id=$1 AND p.user_id=$2")
         .bind(id).bind(user).fetch_one(&mut **tx).await?;
     let stopped: bool = live.get("stopped");
     if !live.get::<bool, _>("unexpired")

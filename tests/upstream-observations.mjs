@@ -165,6 +165,7 @@ const upstream = createServer((request, response) => {
         .writeHead(status, { "Content-Type": "application/json" })
         .end(JSON.stringify(value));
     };
+    if (path === "/Users/fixture-user") return json({Id:"fixture-user",Policy:{IsDisabled:false,EnableMediaPlayback:true}});
     if (path === "/Users/fixture-user/Items")
       return json({
         TotalRecordCount: 1,

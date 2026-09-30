@@ -286,7 +286,8 @@ export async function preparePlaybackRestart({ admin, room, state, sql }) {
   sql(
     `UPDATE playback_requests SET status='pending',response_encrypted=NULL WHERE session_id='${preparation.session_id}'`,
   );
-  return { request, completed, pending, preparation };
+  const accountBound = sql(`SELECT s.kind IN ('jellyfin','emby') FROM playback_sessions p JOIN media_items m ON m.id=p.media_id JOIN sources s ON s.id=m.source_id WHERE p.id='${completed.session_id}'`) === "t";
+  return { request, completed, pending, preparation, accountBound };
 }
 
 export async function verifyPlaybackRestart({ admin, sql }, cases) {
@@ -294,15 +295,26 @@ export async function verifyPlaybackRestart({ admin, sql }, cases) {
     "/playback-sessions",
     "POST",
     cases.request,
+    cases.accountBound ? 410 : 200,
   );
-  assert.equal(replay.session_id, cases.completed.session_id);
-  assert.equal(replay.playback_url, cases.completed.playback_url);
+  if (cases.accountBound) {
+    assert.equal(replay.error.code,"PLAYBACK_REQUEST_EXPIRED");
+    assert.equal(sql(`SELECT stopped FROM playback_sessions WHERE id='${cases.completed.session_id}'`),"t","restart invalidates old upstream-account generation");
+  } else {
+    assert.equal(replay.session_id, cases.completed.session_id);
+    assert.equal(replay.playback_url, cases.completed.playback_url);
+  }
   const recovered = await admin.request(
     "/playback-sessions",
     "POST",
     cases.pending,
   );
   assert.notEqual(recovered.session_id, cases.preparation.session_id);
+  if(cases.accountBound) {
+    assert.equal(sql(`SELECT (fresh.resource->>'account_policy_generation')::bigint > (old.resource->>'account_policy_generation')::bigint FROM playback_sessions fresh,playback_sessions old WHERE fresh.id='${recovered.session_id}' AND old.id='${cases.completed.session_id}'`),"t","fresh authorization uses a new generation");
+    assert.equal(sql(`SELECT fresh.play_session_id IS DISTINCT FROM old.play_session_id FROM upstream_reservations fresh,upstream_reservations old WHERE fresh.id='${recovered.session_id}' AND old.id='${cases.completed.session_id}'`),"t","new grant never replays the old upstream SID");
+    await admin.request(`/playback-sessions/${cases.completed.session_id}`,"POST",undefined,410);
+  }
   assert.equal(
     sql(
       `SELECT attempt FROM playback_requests WHERE session_id='${recovered.session_id}'`,
@@ -322,6 +334,6 @@ export async function verifyPlaybackRestart({ admin, sql }, cases) {
     "1",
   );
   console.log(
-    "PASS: completed playback replay survives restart; interrupted preparation recovers with a fenced new grant",
+    "PASS: restart preserves eligible replay and rejects old upstream-account grants; interrupted preparation recovers with a fenced new grant",
   );
 }

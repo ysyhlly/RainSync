@@ -72,7 +72,12 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
         .await?;
         match row.get::<String, _>("status").as_str() {
             "completed" => {
-                let remaining: Option<i64> = sqlx::query_scalar("SELECT CEIL(EXTRACT(EPOCH FROM(p.expires_at-now())))::bigint FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND EXISTS(SELECT 1 FROM media_items mi JOIN sources src ON src.id=mi.source_id WHERE mi.id=p.media_id AND COALESCE((p.resource->>'source_policy_revision')::bigint,0)=src.access_policy_revision) AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation AND p.room_id=$3 AND p.lifecycle_epoch=$4 AND EXISTS(SELECT 1 FROM rooms r WHERE r.id=p.room_id AND r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch)")
+                if !persistence::source_account_policy::lock_session(&mut tx, row.get("session_id"))
+                    .await?
+                {
+                    return Err(err(StatusCode::GONE, "playback_request_expired"));
+                }
+                let remaining: Option<i64> = sqlx::query_scalar("SELECT CEIL(EXTRACT(EPOCH FROM(p.expires_at-now())))::bigint FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource) AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation AND p.room_id=$3 AND p.lifecycle_epoch=$4 AND EXISTS(SELECT 1 FROM rooms r WHERE r.id=p.room_id AND r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch)")
                     .bind(row.get::<Uuid,_>("session_id")).bind(user).bind(body.room_id).bind(lifecycle_epoch).fetch_optional(&mut *tx).await?;
                 let remaining =
                     remaining.ok_or_else(|| err(StatusCode::GONE, "playback_request_expired"))?;
@@ -293,7 +298,10 @@ pub async fn fail(app: &App, reservation: &Reservation, error: &Error) -> Result
         return Err(err(StatusCode::CONFLICT, "playback_request_interrupted"));
     }
     if row.get::<String, _>("status") == "completed" {
-        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions p JOIN rooms r ON r.id=p.room_id JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND EXISTS(SELECT 1 FROM media_items mi JOIN sources src ON src.id=mi.source_id WHERE mi.id=p.media_id AND COALESCE((p.resource->>'source_policy_revision')::bigint,0)=src.access_policy_revision) AND p.expires_at>clock_timestamp() AND r.lifecycle='active' AND r.lifecycle_epoch=$3 AND p.lifecycle_epoch=r.lifecycle_epoch AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id))")
+        if !persistence::source_account_policy::lock_session(&mut tx, reservation.session).await? {
+            return Err(err(StatusCode::GONE, "invalid_playback_session"));
+        }
+        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions p JOIN rooms r ON r.id=p.room_id JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource) AND p.expires_at>clock_timestamp() AND r.lifecycle='active' AND r.lifecycle_epoch=$3 AND p.lifecycle_epoch=r.lifecycle_epoch AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id))")
             .bind(reservation.session).bind(reservation.user).bind(reservation.lifecycle_epoch).fetch_one(&mut *tx).await?;
         if !valid {
             return Err(err(StatusCode::GONE, "invalid_playback_session"));

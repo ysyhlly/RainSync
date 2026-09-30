@@ -28,8 +28,11 @@ pub async fn begin_delivery(
     if row.get::<String, _>("lifecycle") != "active" {
         return Ok(None);
     }
+    if !crate::source_account_policy::lock_session(&mut tx, session).await? {
+        return Ok(None);
+    }
     let id = Uuid::new_v4();
-    let inserted = sqlx::query("INSERT INTO media_executions(id,session_id,kind,owner_id) SELECT $1,p.id,'delivery',$2 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$3 AND p.delivery_token_hash=$4 AND p.lifecycle_epoch=$5 AND p.expires_at>clock_timestamp() AND NOT p.stopped AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
+    let inserted = sqlx::query("INSERT INTO media_executions(id,session_id,kind,owner_id) SELECT $1,p.id,'delivery',$2 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$3 AND p.delivery_token_hash=$4 AND p.lifecycle_epoch=$5 AND p.expires_at>clock_timestamp() AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource) AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
         .bind(id).bind(owner).bind(session).bind(token_hash).bind(row.get::<i64,_>("lifecycle_epoch"))
         .execute(&mut *tx).await?.rows_affected() == 1;
     tx.commit().await?;

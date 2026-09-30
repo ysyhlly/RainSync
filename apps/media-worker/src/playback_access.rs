@@ -5,7 +5,7 @@ use axum::{
     response::Response,
 };
 use futures_util::StreamExt;
-use sqlx::{Acquire, PgPool, Postgres, pool::PoolConnection};
+use sqlx::{Acquire, PgPool, Postgres, Row, pool::PoolConnection};
 use std::{
     future::Future,
     io,
@@ -22,6 +22,117 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_AUTH_AGE: Duration = Duration::from_secs(5);
 const CHUNK_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, PartialEq, Eq)]
+struct AccountIdentity {
+    source: Uuid,
+    revision: i64,
+    generation: i64,
+    observer: Uuid,
+}
+
+struct AccountEvidence {
+    identity: AccountIdentity,
+    sequence: i64,
+    remaining: Duration,
+}
+
+struct Authorization {
+    allowed: bool,
+    account: Option<AccountEvidence>,
+}
+
+impl From<bool> for Authorization {
+    fn from(allowed: bool) -> Self {
+        Self {
+            allowed,
+            account: None,
+        }
+    }
+}
+
+struct ConfirmedAccount {
+    identity: AccountIdentity,
+    sequence: i64,
+    deadline: Instant,
+}
+
+struct Confirmation {
+    checked_at: Instant,
+    account: Option<ConfirmedAccount>,
+}
+
+/// Preparation, its final header check, and body delivery retain the same
+/// observation deadline. Re-reading unchanged positive evidence cannot grant
+/// another five seconds, even if the database wall clock stops advancing.
+#[derive(Clone)]
+struct AuthState(Arc<Mutex<Confirmation>>);
+
+impl From<Instant> for AuthState {
+    fn from(checked_at: Instant) -> Self {
+        Self(Arc::new(Mutex::new(Confirmation {
+            checked_at,
+            account: None,
+        })))
+    }
+}
+
+impl AuthState {
+    fn deadline(&self, max_age: Duration) -> Instant {
+        let state = self.0.lock().expect("authorization confirmation");
+        let deadline = state.checked_at + max_age;
+        state
+            .account
+            .as_ref()
+            .map_or(deadline, |account| deadline.min(account.deadline))
+    }
+
+    fn confirm(&self, authorization: Authorization, began: Instant) -> Result<(), Denied> {
+        if !authorization.allowed {
+            return Err(Denied::Revoked);
+        }
+        let mut state = self.0.lock().expect("authorization confirmation");
+        let now = Instant::now();
+        if state
+            .account
+            .as_ref()
+            .is_some_and(|account| account.deadline <= now)
+        {
+            return Err(Denied::Unavailable);
+        }
+        if let Some(evidence) = authorization.account {
+            // Account evidence is never useful for more than the observer's
+            // positive TTL; charge the whole query/commit round trip to it.
+            let deadline = began + evidence.remaining.min(MAX_AUTH_AGE);
+            if deadline <= now {
+                return Err(Denied::Unavailable);
+            }
+            match state.account.as_mut() {
+                Some(account) if account.identity != evidence.identity => {
+                    return Err(Denied::Revoked);
+                }
+                Some(account) if account.sequence == evidence.sequence => {
+                    account.deadline = account.deadline.min(deadline);
+                }
+                Some(account) if account.sequence > evidence.sequence => {
+                    // A concurrent final-header check may return an older
+                    // observation after the preparation monitor saw a new one.
+                }
+                _ => {
+                    state.account = Some(ConfirmedAccount {
+                        identity: evidence.identity,
+                        sequence: evidence.sequence,
+                        deadline,
+                    });
+                }
+            }
+        } else if state.account.is_some() {
+            return Err(Denied::Revoked);
+        }
+        state.checked_at = state.checked_at.max(began);
+        Ok(())
+    }
+}
 
 /// HTTP connections may outlive the server's drain deadline. Own admission,
 /// source cancellation and receipt persistence separately from those waiters.
@@ -115,7 +226,7 @@ impl Drop for AuthorizationConnection {
     }
 }
 
-async fn authorized(pool: &PgPool, id: Uuid, token_hash: &str) -> anyhow::Result<bool> {
+async fn authorized(pool: &PgPool, id: Uuid, token_hash: &str) -> anyhow::Result<Authorization> {
     let mut connection = AuthorizationConnection(Some(pool.acquire().await?));
     let mut tx = connection
         .0
@@ -129,11 +240,33 @@ async fn authorized(pool: &PgPool, id: Uuid, token_hash: &str) -> anyhow::Result
     sqlx::query("SET LOCAL statement_timeout = '2500ms'")
         .execute(&mut *tx)
         .await?;
-    let allowed = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN rooms r ON r.id=p.room_id WHERE r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND p.id=$1 AND p.delivery_token_hash=$2 AND p.expires_at>clock_timestamp() AND NOT p.stopped AND EXISTS(SELECT 1 FROM media_items mi JOIN sources src ON src.id=mi.source_id WHERE mi.id=p.media_id AND COALESCE((p.resource->>'source_policy_revision')::bigint,0)=src.access_policy_revision) AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id))")
-        .bind(id).bind(token_hash).fetch_one(&mut *tx).await?;
+    let row = sqlx::query("SELECT src.id AS source_id,src.kind,src.access_policy_revision,a.generation,a.observer_epoch,a.observation_seq,EXTRACT(EPOCH FROM(a.valid_until-clock_timestamp()))::double precision AS account_remaining FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN rooms r ON r.id=p.room_id JOIN media_items mi ON mi.id=p.media_id JOIN sources src ON src.id=mi.source_id LEFT JOIN source_account_policies a ON a.source_id=src.id AND src.kind IN('jellyfin','emby') WHERE r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND p.id=$1 AND p.delivery_token_hash=$2 AND p.expires_at>clock_timestamp() AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource) AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
+        .bind(id).bind(token_hash).fetch_optional(&mut *tx).await?;
     tx.commit().await?;
     drop(connection.0.take());
-    Ok(allowed)
+    let Some(row) = row else {
+        return Ok(false.into());
+    };
+    let account = if matches!(row.get::<String, _>("kind").as_str(), "jellyfin" | "emby") {
+        let remaining = Duration::try_from_secs_f64(row.try_get("account_remaining")?)?;
+        anyhow::ensure!(!remaining.is_zero(), "account_policy_expired");
+        Some(AccountEvidence {
+            identity: AccountIdentity {
+                source: row.try_get("source_id")?,
+                revision: row.try_get("access_policy_revision")?,
+                generation: row.try_get("generation")?,
+                observer: row.try_get("observer_epoch")?,
+            },
+            sequence: row.try_get("observation_seq")?,
+            remaining,
+        })
+    } else {
+        None
+    };
+    Ok(Authorization {
+        allowed: true,
+        account,
+    })
 }
 
 // This owner survives its HTTP waiter and only acknowledges after dropping the
@@ -214,7 +347,7 @@ pub async fn protect(
             result = scope.run(prepare_response(prepare, pool.clone(), id, token_hash.clone())) => Some(result),
         };
         match result {
-            Some(Ok((response, checked_at))) => {
+            Some(Ok((response, confirmed))) => {
                 let (parts, body) = response.into_parts();
                 let body = guarded_body(
                     body,
@@ -223,7 +356,7 @@ pub async fn protect(
                         let token_hash = token_hash.clone();
                         async move { authorized(&pool, id, &token_hash).await }
                     },
-                    checked_at,
+                    confirmed,
                     CHECK_INTERVAL,
                     CHECK_TIMEOUT,
                     MAX_AUTH_AGE,
@@ -254,7 +387,7 @@ async fn prepare_response(
     pool: PgPool,
     id: Uuid,
     token_hash: String,
-) -> super::Result<(Response, Instant)> {
+) -> super::Result<(Response, AuthState)> {
     // Header waits and bounded playlist/subtitle buffering also own a source.
     // Revocation must cancel these futures before any response body exists.
     let checker = || {
@@ -262,6 +395,16 @@ async fn prepare_response(
         let token_hash = token_hash.clone();
         async move { authorized(&pool, id, &token_hash).await }
     };
+    // Seed the account deadline before opening any source. The ledger grants
+    // admission, but does not transfer an observer's remaining TTL to us.
+    let began = Instant::now();
+    let confirmed = AuthState::from(began);
+    match tokio::time::timeout(CHECK_TIMEOUT, checker()).await {
+        Ok(Ok(authorization)) => confirmed
+            .confirm(authorization, began)
+            .map_err(Denied::response)?,
+        _ => return Err(Denied::Unavailable.response()),
+    }
     let prepared = async {
         let response = prepare.await?;
         // Preparation can take time (e.g. waiting for an HLS output). Check
@@ -269,22 +412,26 @@ async fn prepare_response(
         // owns its deadline and can drop this already-created response.
         let checked_at = Instant::now();
         match tokio::time::timeout(CHECK_TIMEOUT, authorized(&pool, id, &token_hash)).await {
-            Ok(Ok(true)) => Ok((response, checked_at)),
-            Ok(Ok(false)) => Err(Denied::Revoked.response()),
+            Ok(Ok(authorization)) => {
+                confirmed
+                    .confirm(authorization, checked_at)
+                    .map_err(Denied::response)?;
+                Ok((response, confirmed.clone()))
+            }
             _ => Err(Denied::Unavailable.response()),
         }
     };
-    let (response, checked_at) = tokio::select! {
+    let (response, confirmed) = tokio::select! {
         biased;
-        denied = monitor(checker, Instant::now(), CHECK_INTERVAL, CHECK_TIMEOUT, MAX_AUTH_AGE) => {
+        denied = monitor(checker, confirmed.clone(), CHECK_INTERVAL, CHECK_TIMEOUT, MAX_AUTH_AGE) => {
             return Err(denied.response());
         },
         response = prepared => response?,
     };
-    Ok((response, checked_at))
+    Ok((response, confirmed))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Denied {
     Revoked,
     Unavailable,
@@ -304,29 +451,35 @@ impl Denied {
     }
 }
 
-async fn monitor<F, C>(
+async fn monitor<F, C, A>(
     mut check: F,
-    mut confirmed_at: Instant,
+    confirmed: impl Into<AuthState>,
     interval: Duration,
     timeout: Duration,
     max_age: Duration,
 ) -> Denied
 where
     F: FnMut() -> C,
-    C: Future<Output = anyhow::Result<bool>>,
+    C: Future<Output = anyhow::Result<A>>,
+    A: Into<Authorization>,
 {
+    let confirmed = confirmed.into();
     loop {
-        tokio::time::sleep_until((Instant::now() + interval).min(confirmed_at + max_age)).await;
+        let deadline = confirmed.deadline(max_age);
+        tokio::time::sleep_until((Instant::now() + interval).min(deadline)).await;
         let began = Instant::now();
         // A delayed result cannot extend the lifetime of an older DB snapshot.
         let result = tokio::select! {
             biased;
-            _ = tokio::time::sleep_until(confirmed_at + max_age) => return Denied::Unavailable,
+            _ = tokio::time::sleep_until(confirmed.deadline(max_age)) => return Denied::Unavailable,
             result = tokio::time::timeout(timeout, check()) => result,
         };
         match result {
-            Ok(Ok(true)) => confirmed_at = began,
-            Ok(Ok(false)) => return Denied::Revoked,
+            Ok(Ok(authorization)) => {
+                if let Err(denied) = confirmed.confirm(authorization.into(), began) {
+                    return denied;
+                }
+            }
             _ => return Denied::Unavailable,
         }
     }
@@ -347,10 +500,10 @@ struct SourceOwners {
     input_cancel: crate::input_failure::Observation,
 }
 
-fn guarded_body<F, C>(
+fn guarded_body<F, C, A>(
     body: Body,
     check: F,
-    checked_at: Instant,
+    confirmed: impl Into<AuthState>,
     interval: Duration,
     timeout: Duration,
     max_age: Duration,
@@ -358,8 +511,10 @@ fn guarded_body<F, C>(
 ) -> Body
 where
     F: FnMut() -> C + Send + 'static,
-    C: Future<Output = anyhow::Result<bool>> + Send,
+    C: Future<Output = anyhow::Result<A>> + Send,
+    A: Into<Authorization> + Send,
 {
+    let confirmed = confirmed.into();
     let SourceOwners {
         execution,
         input_cancel,
@@ -402,7 +557,7 @@ where
             _ = shutdown(stop) => { let _ = revoke.send(true); },
             _ = send.closed() => {},
             _ = input_cancel.stopped() => { let _ = revoke.send(true); },
-            _ = monitor(check, checked_at, interval, timeout, max_age) => { let _ = revoke.send(true); },
+            _ = monitor(check, confirmed, interval, timeout, max_age) => { let _ = revoke.send(true); },
             _ = scope.run(forward) => {},
         }
         // The select drops `forward` and its source before any drain ACK.
@@ -450,6 +605,154 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn identity() -> AccountIdentity {
+        AccountIdentity {
+            source: Uuid::nil(),
+            revision: 1,
+            generation: 2,
+            observer: Uuid::nil(),
+        }
+    }
+
+    fn positive(sequence: i64, remaining: Duration) -> Authorization {
+        Authorization {
+            allowed: true,
+            account: Some(AccountEvidence {
+                identity: identity(),
+                sequence,
+                remaining,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_observation_keeps_its_first_monotonic_deadline() {
+        let now = Instant::now();
+        let confirmed = AuthState::from(now);
+        confirmed
+            .confirm(
+                positive(1, Duration::from_secs(2)),
+                now - Duration::from_secs(1),
+            )
+            .unwrap();
+        let deadline = confirmed.deadline(MAX_AUTH_AGE);
+        // A frozen or regressed DB clock can report the same remaining TTL.
+        confirmed
+            .confirm(positive(1, Duration::from_secs(2)), now)
+            .unwrap();
+        assert_eq!(confirmed.deadline(MAX_AUTH_AGE), deadline);
+        // A fresh response for the same observation can conservatively shorten it.
+        confirmed
+            .confirm(positive(1, Duration::from_millis(500)), now)
+            .unwrap();
+        assert_eq!(
+            confirmed.deadline(MAX_AUTH_AGE),
+            now + Duration::from_millis(500)
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_newer_observation_refreshes_the_account_deadline() {
+        let now = Instant::now();
+        let confirmed = AuthState::from(now);
+        confirmed
+            .confirm(
+                positive(1, Duration::from_secs(2)),
+                now - Duration::from_secs(1),
+            )
+            .unwrap();
+        confirmed
+            .confirm(positive(2, Duration::from_secs(2)), now)
+            .unwrap();
+        let refreshed = now + Duration::from_secs(2);
+        assert_eq!(confirmed.deadline(MAX_AUTH_AGE), refreshed);
+        confirmed
+            .confirm(positive(1, Duration::from_secs(4)), now)
+            .unwrap();
+        assert_eq!(confirmed.deadline(MAX_AUTH_AGE), refreshed);
+        let mut changed = positive(3, Duration::from_secs(4));
+        changed.account.as_mut().unwrap().identity.generation += 1;
+        assert_eq!(confirmed.confirm(changed, now), Err(Denied::Revoked));
+    }
+
+    #[tokio::test]
+    async fn elapsed_account_evidence_cannot_be_revived_by_final_headers() {
+        let now = Instant::now();
+        let confirmed = AuthState(Arc::new(Mutex::new(Confirmation {
+            checked_at: now,
+            account: Some(ConfirmedAccount {
+                identity: identity(),
+                sequence: 1,
+                deadline: now - Duration::from_millis(1),
+            }),
+        })));
+        assert_eq!(
+            confirmed.confirm(positive(2, MAX_AUTH_AGE), now),
+            Err(Denied::Unavailable)
+        );
+        let delayed = AuthState::from(now);
+        assert_eq!(
+            delayed.confirm(
+                positive(1, Duration::from_millis(10)),
+                now - Duration::from_millis(20)
+            ),
+            Err(Denied::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_and_body_share_a_frozen_observation_deadline() {
+        let now = Instant::now();
+        let prepared = AuthState::from(now);
+        prepared
+            .confirm(positive(1, Duration::from_millis(80)), now)
+            .unwrap();
+        let deadline = prepared.deadline(MAX_AUTH_AGE);
+        // Simulate the final header check reporting the unchanged positive row.
+        let body_confirmation = prepared.clone();
+        body_confirmation
+            .confirm(positive(1, MAX_AUTH_AGE), Instant::now())
+            .unwrap();
+        assert_eq!(body_confirmation.deadline(MAX_AUTH_AGE), deadline);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let body = guarded_body(
+            source(dropped.clone()),
+            || async { Ok(positive(1, MAX_AUTH_AGE)) },
+            body_confirmation,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            MAX_AUTH_AGE,
+            SourceOwners::default(),
+        );
+        tokio::time::timeout(Duration::from_millis(250), released(&dropped))
+            .await
+            .expect("unchanged DB evidence cannot keep a backpressured source alive");
+        assert!(body.into_data_stream().next().await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn account_deadline_cancels_a_hung_authorization_query() {
+        let now = Instant::now();
+        let confirmed = AuthState::from(now);
+        confirmed
+            .confirm(positive(1, Duration::from_millis(40)), now)
+            .unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let body = guarded_body(
+            source(dropped.clone()),
+            std::future::pending::<anyhow::Result<Authorization>>,
+            confirmed,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            MAX_AUTH_AGE,
+            SourceOwners::default(),
+        );
+        tokio::time::timeout(Duration::from_millis(250), released(&dropped))
+            .await
+            .expect("the account deadline wins over a stalled DB check");
+        assert!(body.into_data_stream().next().await.unwrap().is_err());
+    }
 
     #[tokio::test]
     async fn shutdown_fences_new_admission_and_waits_for_late_owner() {

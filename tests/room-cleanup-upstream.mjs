@@ -16,6 +16,7 @@ await isolatedServer("room-cleanup-upstream",async f=>{
       const url=new URL(req.url,"http://fixture");
       const body=chunks.length?JSON.parse(Buffer.concat(chunks)):null;
       const record={method:req.method,path:url.pathname,query:Object.fromEntries(url.searchParams),body}; records.push(record);
+      if(url.pathname === "/Users/fixture") {res.writeHead(200,{"Content-Type":"application/json"}).end(JSON.stringify({Id:"fixture",Policy:{IsDisabled:false,EnableMediaPlayback:true}}));return;}
       if(url.pathname.endsWith("/PlaybackInfo")) { res.writeHead(200,{"Content-Type":"application/json"}).end(JSON.stringify({PlaySessionId:randomUUID(),MediaSources:[{Id:"source-fixed",SupportsDirectPlay:true,MediaStreams:[],RunTimeTicks:300000000}]})); return; }
       if(url.pathname.endsWith("/ActiveEncodings")) { record.response_status=encodingOkay?204:202; res.writeHead(record.response_status).end(); return; }
       if(url.pathname.endsWith("/Stopped")) { res.writeHead(stopOkay?204:503).end(); return; }

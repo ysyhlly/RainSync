@@ -23,6 +23,7 @@ mod room_ownership;
 mod rooms;
 mod source_access;
 mod upstream;
+mod upstream_policy;
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
@@ -63,6 +64,7 @@ pub struct App {
     rooms: Arc<Mutex<HashMap<Uuid, rooms::Handle>>>,
     agent_controls: Arc<Mutex<HashMap<Uuid, agents::Control>>>,
     upstream: Arc<upstream::Runtime>,
+    upstream_policy: Arc<upstream_policy::Runtime>,
     preparations: Arc<preparation_owner::Registry>,
 }
 impl App {
@@ -460,11 +462,13 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         rooms: Default::default(),
         agent_controls: Default::default(),
         upstream: Default::default(),
+        upstream_policy: Default::default(),
         preparations: Default::default(),
     };
     // Retire previous-process grants before same-key recovery. The instance
     // lock fences new valid publication; it is not positive physical drain
     // proof. Unknown preparation/resource receipts remain unconfirmed.
+    upstream_policy::startup(&app).await?;
     let mut recovery = db.begin().await?;
     sqlx::query("UPDATE playback_requests SET status='failed',error_status=409,error_code='playback_request_interrupted' WHERE status='pending'")
         .execute(&mut *recovery).await?;
@@ -515,6 +519,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         }
     });
     tokio::spawn(upstream::maintenance(app.clone()));
+    tokio::spawn(upstream_policy::maintenance(app.clone()));
     tokio::spawn(room_cleanup::run(app.clone()));
     let preparations = app.preparations.clone();
     let upstream = app.upstream.clone();

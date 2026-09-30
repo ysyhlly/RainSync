@@ -82,6 +82,9 @@ pub enum ErrorCode {
     InvalidMode,
     UnsupportedVideoOrHdr,
     UpstreamPlaybackFailed,
+    UpstreamPolicyDenied,
+    UpstreamPolicyChanged,
+    UpstreamPolicyUnavailable,
     NoMediaSource,
     InvalidUpstreamBase,
     UpstreamNoCompatibleStream,
@@ -179,6 +182,7 @@ impl ErrorCode {
                 | Self::SourceScanFailed
                 | Self::SourceProbeFailed
                 | Self::UpstreamPlaybackFailed
+                | Self::UpstreamPolicyUnavailable
                 | Self::MediaUnavailable
                 | Self::AgentOffline
                 | Self::AgentTimeout
@@ -187,6 +191,11 @@ impl ErrorCode {
 
     fn message(self) -> &'static str {
         match self {
+            Self::UpstreamPolicyChanged => "上游账户授权已变化，请重新准备播放",
+            Self::UpstreamPolicyDenied => "片源绑定的上游账户已禁止播放，请联系片源管理员",
+            Self::UpstreamPolicyUnavailable => {
+                "无法确认上游账户播放权限，已暂停授权；请检查片源账户权限和连接"
+            }
             Self::InvalidPlanGeneration => "播放方案代次格式无效，请更新客户端",
             Self::StalePlaybackPlan => "此播放方案已被新的操作替代，请重新加载当前播放",
             Self::PlaybackViewerLimitExceeded => {

@@ -3,10 +3,10 @@ use providers::SourceConfig;
 
 pub async fn sources(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     admin(&auth(&app, &h, false).await?)?;
-    let rows = sqlx::query("SELECT id,name,kind,access_policy_revision FROM sources ORDER BY name")
+    let rows = sqlx::query("SELECT s.id,s.name,s.kind,s.access_policy_revision,CASE WHEN s.kind NOT IN ('jellyfin','emby') THEN NULL ELSE jsonb_build_object('state',CASE WHEN a.state='allowed' AND a.valid_until<=clock_timestamp() THEN 'unknown' ELSE COALESCE(a.state,'unknown') END,'reason',CASE WHEN a.state='allowed' AND a.valid_until<=clock_timestamp() THEN 'upstream_policy_expired' ELSE COALESCE(a.reason,'upstream_policy_unknown') END) END AS account_policy FROM sources s LEFT JOIN source_account_policies a ON a.source_id=s.id AND a.source_revision=s.access_policy_revision ORDER BY s.name")
         .fetch_all(&app.db)
         .await?;
-    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"kind":r.get::<String,_>("kind"),"access_policy_revision":r.get::<i64,_>("access_policy_revision")})).collect())))
+    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"kind":r.get::<String,_>("kind"),"access_policy_revision":r.get::<i64,_>("access_policy_revision"),"account_policy":r.get::<Option<Value>,_>("account_policy")})).collect())))
 }
 #[derive(Deserialize)]
 pub struct Source {
@@ -278,6 +278,11 @@ async fn prepare_playback(
     let source_version: Option<String> = row.get("source_version");
     let source_policy_revision: i64 = row.get("access_policy_revision");
     let source_id: Uuid = row.get("source_id");
+    let account_policy_generation = if matches!(kind.as_str(), "jellyfin" | "emby") {
+        Some(upstream_policy::ensure(app, source_id, source_policy_revision).await?)
+    } else {
+        None
+    };
     let mut resource = json!({"kind":kind,"resource":item,"root":config.root,"headers":{},"source_url":config.url,"access_policy":config.access_policy,"source_policy_revision":source_policy_revision,"source_id":source_id});
     let mut meta: Value = row.get("metadata");
     let mut duration: Option<f64> = row.get("duration_ms");
@@ -348,6 +353,7 @@ async fn prepare_playback(
                     media,
                     source: row.get("source_id"),
                     source_policy_revision,
+                    account_policy_generation,
                     generation: body.media_generation,
                     kind: &kind,
                     config: &config,
@@ -477,8 +483,15 @@ async fn prepare_playback(
         let mut preparation = app.db.begin().await?;
         playback_requests::guard(app, &mut preparation, reservation).await?;
         source_access::guard(&mut preparation, source_id, source_policy_revision).await?;
+        upstream_policy::guard(
+            &mut preparation,
+            source_id,
+            source_policy_revision,
+            account_policy_generation,
+        )
+        .await?;
         sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch,viewer_id,plan_generation) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '1 minute',$8,$9,$10)")
-            .bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":app.encrypt(&resource)?,"source_policy_revision":source_policy_revision})).bind(reservation.lifecycle_epoch).bind(reservation.viewer_id).bind(reservation.plan_generation.map(i64::from)).execute(&mut *preparation).await?;
+            .bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":app.encrypt(&resource)?,"source_policy_revision":source_policy_revision,"account_policy_generation":account_policy_generation})).bind(reservation.lifecycle_epoch).bind(reservation.viewer_id).bind(reservation.plan_generation.map(i64::from)).execute(&mut *preparation).await?;
         preparation.commit().await?;
         let probe: Result<Value> = async {
             let base = std::env::var("WORKER_URL").unwrap_or("http://127.0.0.1:8081".into());
@@ -690,6 +703,13 @@ async fn prepare_playback(
     let mut tx = app.db.begin().await?;
     playback_requests::guard(app, &mut tx, reservation).await?;
     source_access::guard(&mut tx, source_id, source_policy_revision).await?;
+    upstream_policy::guard(
+        &mut tx,
+        source_id,
+        source_policy_revision,
+        account_policy_generation,
+    )
+    .await?;
     let current: Value =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
             .bind(body.room_id)
@@ -727,7 +747,7 @@ async fn prepare_playback(
     {
         return Err(err(StatusCode::CONFLICT, "source_changed"));
     }
-    sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch,viewer_id,plan_generation) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '30 minutes',$8,$9,$10) ON CONFLICT(id) DO UPDATE SET resource=EXCLUDED.resource,expires_at=EXCLUDED.expires_at,stopped=false,lifecycle_epoch=EXCLUDED.lifecycle_epoch,viewer_id=EXCLUDED.viewer_id,plan_generation=EXCLUDED.plan_generation").bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":encrypted,"source_policy_revision":source_policy_revision})).bind(reservation.lifecycle_epoch).bind(reservation.viewer_id).bind(reservation.plan_generation.map(i64::from)).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch,viewer_id,plan_generation) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '30 minutes',$8,$9,$10) ON CONFLICT(id) DO UPDATE SET resource=EXCLUDED.resource,expires_at=EXCLUDED.expires_at,stopped=false,lifecycle_epoch=EXCLUDED.lifecycle_epoch,viewer_id=EXCLUDED.viewer_id,plan_generation=EXCLUDED.plan_generation").bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":encrypted,"source_policy_revision":source_policy_revision,"account_policy_generation":account_policy_generation})).bind(reservation.lifecycle_epoch).bind(reservation.viewer_id).bind(reservation.plan_generation.map(i64::from)).execute(&mut *tx).await?;
     if body.observation_version == Some(1) {
         persistence::playback_observations::create(&mut tx, u.id, body.room_id, &protocol_plan)
             .await?;
@@ -760,6 +780,13 @@ async fn prepare_playback(
     {
         return Err(err(StatusCode::CONFLICT, "playback_request_interrupted"));
     }
+    upstream_policy::guard(
+        &mut tx,
+        source_id,
+        source_policy_revision,
+        account_policy_generation,
+    )
+    .await?;
     tx.commit().await?;
     if matches!(kind.as_str(), "jellyfin" | "emby") {
         let _ = upstream::report(app, id, "start").await;
@@ -806,7 +833,7 @@ pub async fn readiness(
         return Err(err(StatusCode::BAD_REQUEST, "invalid_position"));
     }
     // One statement gives permission and the current attempt a consistent snapshot.
-    let row = sqlx::query("SELECT p.plan_generation, j.status AS job_status, j.error AS job_error, o.validation_version, o.ready_segments, o.visible_manifest, v.seq AS observation_seq FROM playback_sessions p JOIN rooms r ON r.id=p.room_id JOIN room_snapshots s ON s.room_id=p.room_id LEFT JOIN media_jobs j ON j.session_id=p.id LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt LEFT JOIN playback_observations v ON v.session_id=p.id WHERE p.id=$1 AND p.user_id=$2 AND r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND NOT p.stopped AND EXISTS(SELECT 1 FROM media_items mi JOIN sources src ON src.id=mi.source_id WHERE mi.id=p.media_id AND COALESCE((p.resource->>'source_policy_revision')::bigint,0)=src.access_policy_revision) AND p.expires_at>now() AND (s.state->>'media_generation')::bigint=p.generation AND (p.viewer_id IS NULL OR EXISTS(SELECT 1 FROM playback_viewer_plans g WHERE g.user_id=p.user_id AND g.room_id=p.room_id AND g.viewer_id=p.viewer_id AND g.plan_generation=p.plan_generation)) AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
+    let row = sqlx::query("SELECT p.plan_generation, j.status AS job_status, j.error AS job_error, o.validation_version, o.ready_segments, o.visible_manifest, v.seq AS observation_seq FROM playback_sessions p JOIN rooms r ON r.id=p.room_id JOIN room_snapshots s ON s.room_id=p.room_id LEFT JOIN media_jobs j ON j.session_id=p.id LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt LEFT JOIN playback_observations v ON v.session_id=p.id WHERE p.id=$1 AND p.user_id=$2 AND r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource) AND p.expires_at>now() AND (s.state->>'media_generation')::bigint=p.generation AND (p.viewer_id IS NULL OR EXISTS(SELECT 1 FROM playback_viewer_plans g WHERE g.user_id=p.user_id AND g.room_id=p.room_id AND g.viewer_id=p.viewer_id AND g.plan_generation=p.plan_generation)) AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
         .bind(id).bind(u.id).fetch_optional(&app.db).await?
         .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
     let plan_generation = row
@@ -963,9 +990,12 @@ pub async fn renew(
     if member.is_none() {
         return Err(err(StatusCode::GONE, "invalid_playback_session"));
     }
+    if !persistence::source_account_policy::lock_session(&mut tx, id).await? {
+        return Err(err(StatusCode::GONE, "invalid_playback_session"));
+    }
     sqlx::query("UPDATE playback_requests SET expires_at=GREATEST(expires_at,now()+interval '48 hours') WHERE session_id=$1 AND user_id=$2")
         .bind(id).bind(u.id).execute(&mut *tx).await?;
-    let r=sqlx::query("UPDATE playback_sessions p SET expires_at=now()+interval '30 minutes' FROM room_snapshots s WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND EXISTS(SELECT 1 FROM media_items mi JOIN sources src ON src.id=mi.source_id WHERE mi.id=p.media_id AND COALESCE((p.resource->>'source_policy_revision')::bigint,0)=src.access_policy_revision) AND p.expires_at>now() AND p.lifecycle_epoch=$3 AND s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation AND (p.viewer_id IS NULL OR EXISTS(SELECT 1 FROM playback_viewer_plans g WHERE g.user_id=p.user_id AND g.room_id=p.room_id AND g.viewer_id=p.viewer_id AND g.plan_generation=p.plan_generation))").bind(id).bind(u.id).bind(epoch).execute(&mut *tx).await?;
+    let r=sqlx::query("UPDATE playback_sessions p SET expires_at=now()+interval '30 minutes' FROM room_snapshots s WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource) AND p.expires_at>now() AND p.lifecycle_epoch=$3 AND s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation AND (p.viewer_id IS NULL OR EXISTS(SELECT 1 FROM playback_viewer_plans g WHERE g.user_id=p.user_id AND g.room_id=p.room_id AND g.viewer_id=p.viewer_id AND g.plan_generation=p.plan_generation))").bind(id).bind(u.id).bind(epoch).execute(&mut *tx).await?;
     if r.rows_affected() == 0 {
         return Err(err(StatusCode::GONE, "invalid_playback_session"));
     };
