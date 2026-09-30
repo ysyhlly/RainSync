@@ -14,6 +14,7 @@ mod playback_capabilities;
 mod playback_observations;
 mod playback_requests;
 mod preparation_owner;
+pub mod presence;
 mod profile;
 mod registration;
 mod registration_auth;
@@ -48,6 +49,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct App {
+    pub presence_sequence: presence::Sequence,
     account_security: account_security::Security,
     avatar_settings: avatar_image::Settings,
     session_limit: i64,
@@ -446,6 +448,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     );
     let public_origin = std::env::var("PUBLIC_ORIGIN").unwrap_or("http://localhost:5173".into());
     let app = App {
+        presence_sequence: presence::Sequence::default(),
         account_security: account_security::Security::configured()?,
         avatar_settings: avatar_image::Settings::configured()?,
         session_limit: limits::configured("PLAYBACK_SESSION_LIMIT", limits::DEFAULT_SESSION_LIMIT)?,

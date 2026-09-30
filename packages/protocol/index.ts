@@ -1,5 +1,7 @@
 export type PlaybackStatus = "playing" | "paused" | "ended";
 export type RoomState = { room_id: string, revision: number, media_id: string | null, media_generation: number, playback_status: PlaybackStatus, anchor_position_ms: number, anchor_server_time_ms: number, playback_rate: number, controller_user_id: string, duration_ms: number | null, clock_epoch: string, };
+export type PresenceMember = { user_id: string, connection_count: number, };
+export type PresenceSnapshot = { room_id: string, presence_epoch: string, presence_seq: number, members: Array<PresenceMember>, };
 export type Action = { "type": "PLAY" } | { "type": "PAUSE" } | { "type": "SEEK", "payload": { position_ms: number, } } | { "type": "SET_RATE", "payload": { rate: number, } } | { "type": "CHANGE_MEDIA", "payload": { media_id: string, } } | { "type": "END_MEDIA", "payload": { position_ms: number, } };
 export type Command = { protocol_version: number, room_id: string, command_id: string, control_epoch?: string, expected_revision: number, media_generation: number, } & ({ "type": "PLAY" } | { "type": "PAUSE" } | { "type": "SEEK", "payload": { position_ms: number, } } | { "type": "SET_RATE", "payload": { rate: number, } } | { "type": "CHANGE_MEDIA", "payload": { media_id: string, } } | { "type": "END_MEDIA", "payload": { position_ms: number, } });
 export type ControlEpoch = { id: string, expires_at_ms: number, };

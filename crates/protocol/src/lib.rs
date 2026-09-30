@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
+mod presence;
+pub use presence::{PRESENCE_VERSION, PresenceMember, PresenceSnapshot};
+
 mod errors;
 pub use errors::{ApiError, ErrorCode, ErrorResponse};
 mod playback_candidates;

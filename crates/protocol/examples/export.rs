@@ -20,6 +20,8 @@ fn main() {
     let declarations = [
         PlaybackStatus::decl(),
         RoomState::decl(),
+        PresenceMember::decl(),
+        PresenceSnapshot::decl(),
         Action::decl(),
         Command::decl(),
         ControlEpoch::decl(),
@@ -63,6 +65,7 @@ fn main() {
         ("command", schemars::schema_for!(Command)),
         ("control-epoch", schemars::schema_for!(ControlEpoch)),
         ("room-state", schemars::schema_for!(RoomState)),
+        ("presence-snapshot", schemars::schema_for!(PresenceSnapshot)),
         ("playback-request", schemars::schema_for!(PlaybackRequest)),
         (
             "playback-candidate-request",
