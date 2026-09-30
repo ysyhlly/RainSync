@@ -79,10 +79,12 @@ in-memory collector. No new unauthenticated telemetry route is proposed.
   in rooms.rs. Browser owner: room-runtime connect/onopen/onmessage and
   observation-binding are the future reconnect/presentation/window hook sites.
 
-Byte counter rates over scrape wall time are the supported live layer throughput:
-`rate(rainsync_transfer_bytes_total{layer="worker_egress",outcome="complete"}[5m])`.
-Do not sum layers (the same payload traverses several). Completion counters are
-credited at finish and may be bursty for long transfers. Transfer duration sum
+Live observed I/O throughput uses body-byte deltas as chunks occur:
+`rate(rainsync_transfer_body_bytes_total{layer="worker_egress"}[5m])`.
+This includes streams still active and later failed/cancelled; it is not successful
+receiver goodput. Do not sum layers (the same payload traverses several). Terminal
+`rainsync_transfer_bytes_total{layer,outcome}` remains credited at finish and may
+be bursty for long transfers. Cache-served byte totals update at sample time too. Transfer duration sum
 counts overlapping transfers separately; NEVER divide bytes by that sum and call
 it aggregate goodput. Offline union-duration goodput remains an independent tool.
 
@@ -156,3 +158,14 @@ committed preparation failures excluding replay/cancel/supersession. Browser
 telemetry needs a separate truthful client-reported schema and presentation/
 foreground timing contract before implementation. This checkpoint does NOT
 complete W08 or prove Worker readiness.
+
+
+## Continuation design
+
+See [W08_CLIENT_SAMPLING_PROPOSAL.md](W08_CLIENT_SAMPLING_PROPOSAL.md) for current
+source sites, proposed cumulative client-reported fields, foreground/play-intent
+classification, meter reset/replay requirements, separate room recovery scope,
+and the Server/Worker crate/endpoint decision. No client protocol or ingress was
+changed in this continuation. Live body-byte counters use the same existing hook
+signatures; their sample-time accounting fixes missing throughput during long
+streams. Validation results are recorded after the focused continuation run.
