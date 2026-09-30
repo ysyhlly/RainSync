@@ -71,6 +71,26 @@
       "format": "uint32",
       "minimum": 1
     },
+    "playback_metrics": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PlaybackMetricsIntent"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "playback_metrics_version": {
+      "description": "Optional independent client-reported metrics; observations v1 is unchanged.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1
+    },
     "position_ms": {
       "type": "number",
       "format": "double",
@@ -319,6 +339,31 @@
         "progressive_h264_aac",
         "native_hls",
         "mse_h264_aac"
+      ]
+    },
+    "PlaybackMetricsIntent": {
+      "type": "object",
+      "properties": {
+        "meter_start_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "startup_origin": {
+          "$ref": "#/$defs/PlaybackMetricsOrigin"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "meter_start_generation",
+        "startup_origin"
+      ]
+    },
+    "PlaybackMetricsOrigin": {
+      "type": "string",
+      "enum": [
+        "user_intent",
+        "automatic_load"
       ]
     },
     "VideoCapabilityConfiguration": {

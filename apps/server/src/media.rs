@@ -694,6 +694,8 @@ async fn prepare_playback(
         audio_tracks,
         subtitle_tracks,
         observation_version: body.observation_version,
+        playback_metrics_version: None,
+        playback_metrics: None,
         observation_seq: body.observation_version.map(|_| 0),
         decision_reason: Some(selected.as_ref().map_or_else(
             || "legacy_conservative_transport_negotiation".to_string(),

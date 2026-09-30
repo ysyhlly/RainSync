@@ -1,6 +1,6 @@
 # Next playback metrics contract (frozen design, not yet wired)
 
-This is a separate optional namespace. Current playback observations remain version 1, and their upstream reporting and owned final DELETE body are unchanged. The pure client sampler exists; the DTOs, durable admission and POST receiver below are the next implementation slice.
+This is a separate optional namespace. Current playback observations remain version 1, and their upstream reporting and owned final DELETE body are unchanged. The strict shared DTOs/generated schemas and additive migration0035 are implemented and verified; durable admission, POST receiver and browser transport wiring remain the next implementation slice. The shared-contract checkpoint does not enable a metrics marker or claim live browser sampling.
 
 ## Negotiation and wire shape
 
@@ -43,3 +43,7 @@ The sampler uses one pending snapshot plus one in-flight immutable packet. Never
 Capture and start a bounded best-effort final metrics POST before the existing Stop, but never delay cleanup waiting for metrics. Stop may win and reject the final packet; the last interval can be lost. Preserve the exact observation-v1 DELETE body and its existing late-final-current ownership. Automatic fallback disposes the old grant without finalizing the logical meter.
 
 Playback runtime, a new fenced metrics binding, and a separate bounded sender own this work. The observation-v1 binding/sender and presence room-runtime remain separate. Control reconnect metrics have a room lifetime across media changes and are explicitly deferred from this per-playback contract.
+
+## Shared-contract checkpoint verification
+
+Protocol tests and strict workspace Clippy passed with the new optional fields; legacy constructor defaults remain None. Actual PostgreSQL17.11 schema34→35 tests preserve all legacy row hashes and1,024 high-waters, pass14 upgrade/persistence checks and52 constraint rejections, and verify a real restart plus clean owned-process shutdown. Historical migrations1–34 match the preserved schema34 build binding and committed source. Runtime admission, sample anchoring and browser behavior still require the receiver/integration phase.

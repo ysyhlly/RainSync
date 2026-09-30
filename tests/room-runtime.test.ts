@@ -450,6 +450,7 @@ it("a missing control revision fences commands and resumes before applying lifec
       room_id: "a",
       revision: 1,
       clock_epoch: "clock",
+      presence_version: 1,
     });
     frame(second, {
       type: "SNAPSHOT",

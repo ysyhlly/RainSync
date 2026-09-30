@@ -8,6 +8,8 @@ pub use presence::{PRESENCE_VERSION, PresenceMember, PresenceSnapshot};
 
 mod errors;
 pub use errors::{ApiError, ErrorCode, ErrorResponse};
+mod playback_metrics;
+pub use playback_metrics::*;
 mod playback_candidates;
 pub use playback_candidates::*;
 
@@ -113,6 +115,14 @@ pub struct PlaybackPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub observation_seq: Option<u64>,
+    /// Optional independent client-reported metrics; observations v1 is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1, max = 1))]
+    pub playback_metrics_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub playback_metrics: Option<PlaybackMetricsGrant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
@@ -295,6 +305,14 @@ pub struct PlaybackRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub candidate_report: Option<PlaybackCandidateReport>,
+    /// Optional independent client-reported metrics; observations v1 is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1, max = 1))]
+    pub playback_metrics_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub playback_metrics: Option<PlaybackMetricsIntent>,
 }
 
 impl PlaybackCapabilities {

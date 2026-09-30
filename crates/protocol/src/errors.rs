@@ -9,6 +9,14 @@ use uuid::Uuid;
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
     InvalidRequest,
+    UnsupportedPlaybackMetricsVersion,
+    InvalidPlaybackMetrics,
+    PlaybackMetricsNotNegotiated,
+    StalePlaybackMetrics,
+    PlaybackMetricsSequenceStale,
+    PlaybackMetricsConflict,
+    PlaybackMetricsClosed,
+    PlaybackMetricsTimeInvalid,
     LoginRequired,
     SessionExpired,
     Forbidden,
@@ -192,6 +200,14 @@ impl ErrorCode {
 
     fn message(self) -> &'static str {
         match self {
+            Self::UnsupportedPlaybackMetricsVersion => "播放指标协议版本不受支持",
+            Self::InvalidPlaybackMetrics => "播放指标格式或范围无效",
+            Self::PlaybackMetricsNotNegotiated => "此播放会话未启用独立指标采集",
+            Self::StalePlaybackMetrics => "此播放指标已被新的会话或意图替代",
+            Self::PlaybackMetricsSequenceStale => "播放指标采样序号已过期",
+            Self::PlaybackMetricsConflict => "播放指标与已接收的累计采样冲突",
+            Self::PlaybackMetricsClosed => "此播放指标采集已结束",
+            Self::PlaybackMetricsTimeInvalid => "无法确认播放指标的时间范围",
             Self::UpstreamPolicyChanged => "上游账户授权已变化，请重新准备播放",
             Self::UpstreamPolicyDenied => "片源绑定的上游账户已禁止播放，请联系片源管理员",
             Self::UpstreamPolicyUnavailable => {
