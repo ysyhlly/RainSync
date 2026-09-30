@@ -143,32 +143,27 @@ No ingress or cross-process message is implemented in this slice.
 
 ## Server / Worker integration decision
 
-`apps/server/src/metrics.rs:3` includes the std-only collector as its own module;
-`apps/server/src/main.rs:56` stores its one Server instance. The server package
-currently provides a binary, not an importable metrics library. Worker App at
-`apps/media-worker/src/main.rs:37` currently has no metrics field.
+The controller has approved reuse of the EXISTING media-core crate:
+`crates/media-core/src/runtime_metrics.rs` is the std-only shared implementation.
+`apps/server/src/metrics.rs:2` imports it; controller must add the public module
+export in media-core/lib.rs. No new crate, manifest or lock change is needed.
+Worker's new metrics and metric_stream modules import the same public module;
+controller adds one Worker-local RuntimeMetrics to App and an authenticated route.
+`render_for(Process::Server|Worker)` emits fixed process labels.
 
-Options for total-controller decision:
+Each executable creates its OWN collector instance. Within one process, App
+clones share only its collector's Arc. Sharing a source module or crate never
+shares counters between executables. There is no Worker snapshot imported into
+Server and no aggregate IPC. Both independently protected targets are scraped.
+Actual exports, App initialization and stream hooks are listed in
+[W08_WORKER_METRICS_WIRING.md](W08_WORKER_METRICS_WIRING.md).
 
-1. Extract runtime_metrics into a std-only shared workspace crate; add workspace
-   membership/dependencies/lock changes through the controller. Each process
-   constructs its OWN collector instance. Server keeps its authenticated endpoint;
-   Worker gets an independently protected scrape endpoint through its owner.
-   Prometheus scrapes both targets; target labels identify processes, never room
-   or user. Sharing the crate does not share counters or memory.
-2. As an interim source reuse, Worker can include
-   `#[path = "../../server/src/runtime_metrics.rs"] mod runtime_metrics;`.
-   This compiles the same implementation into another private module; it creates
-   separate Rust type identities and separate process storage. One Worker-local
-   RuntimeMetrics is cloned across its App/tasks so Arc clones share only within
-   that process. It still requires a Worker endpoint and future extraction.
-
-Neither option requires Server polling/proxying Worker metrics. If one combined
-endpoint is required, communication, auth, timeouts, response-size bounds, stale
-state and unavailable-vs-zero behavior need a separate controller-approved
-contract. Do not put the Worker snapshot into Server's collector or claim shared
-Arc memory across executables. The new instance-isolation unit test models these
-independent instances; it does not prove cross-process communications.
+The earlier private `#[path]` workaround and new-crate proposal are superseded.
+The instance-isolation test models independent instances; Worker HTTP/auth fixture
+runs the new production modules against a minimal App and disposable PostgreSQL.
+Neither is evidence that controller-owned production main/App/HTTP hooks are
+already present. If a combined endpoint is later requested, it needs a separate
+communication/auth/timeout/staleness contract; none is implemented here.
 
 ## This turn's independent collector improvement
 

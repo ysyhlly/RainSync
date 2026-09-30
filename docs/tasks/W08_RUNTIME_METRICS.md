@@ -34,12 +34,15 @@ metric is invented; endpoint liveness does not prove Worker readiness.
 ## Concrete hooks for the unique owners
 
 The server exposes `app.metrics.runtime` without changing shared App or main.
-`metrics.rs` owns `#[path = "runtime_metrics.rs"] pub mod runtime`.
-The collector is std-only and can be included by the Worker owner via
-`#[path = "../../server/src/runtime_metrics.rs"] mod runtime_metrics;` pending
-integration approval. Worker must own one process-wide collector and an
-authenticated scrape route; the server cannot scrape Worker bytes from its own
-in-memory collector. No new unauthenticated telemetry route is proposed.
+`metrics.rs` now imports `media_core::runtime_metrics as runtime`; collector and
+its tests have moved to new files under `crates/media-core/src`. The controller
+owns adding `pub mod runtime_metrics;` to media-core/lib.rs. This branch requires
+that export before the Server binary can compile. No crate or dependency is added.
+Worker owns its separate RuntimeMetrics instance and authenticated `/metrics`
+handler; its App/main and real body producer hooks remain controller/HTTP-owner
+wiring. `render_for(Process::Server|Worker)` adds a fixed process label to every
+shared collector sample. No memory, IPC or Worker measurements are shared with
+Server. See [W08_WORKER_METRICS_WIRING.md](W08_WORKER_METRICS_WIRING.md).
 
 - `RuntimeMetrics::begin_transfer(Layer, Cache) -> Option<Transfer>`: call after
   stream authorization/open and before polling the first body chunk. Keep one
@@ -169,3 +172,13 @@ and the Server/Worker crate/endpoint decision. No client protocol or ingress was
 changed in this continuation. Live body-byte counters use the same existing hook
 signatures; their sample-time accounting fixes missing throughput during long
 streams. Validation results are recorded after the focused continuation run.
+
+
+## Controller-approved shared-module follow-up
+
+The approved architecture uses the existing media-core crate, separate process
+instances and separate scrape endpoints. The prior private-module checkpoint and
+its tests remain historical evidence; new shared-module/Worker validation is
+recorded in W08_WORKER_METRICS_WIRING.md. Shared entry-point files are unchanged;
+the Server import awaits the controller-owned module export. No production hook
+or browser sampler is reported as wired by this branch.
