@@ -19,6 +19,7 @@ pub enum Start {
 /// serializes quota decisions across different keys without holding a database
 /// connection while the media source is contacted.
 pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> Result<Start> {
+    playback_metrics::validate(body)?;
     if !matches!(
         (body.viewer_id, body.plan_generation),
         (None, None) | (Some(_), Some(1..))
@@ -84,6 +85,7 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
                 let mut plan = app.decrypt(&row.get::<String, _>("response_encrypted"))?;
                 plan["expires_in_seconds"] = json!(remaining);
                 playback_observations::refresh_plan(&mut tx, &mut plan).await?;
+                playback_metrics::refresh(&mut tx, &mut plan).await?;
                 sqlx::query("UPDATE playback_requests SET expires_at=GREATEST(expires_at,now()+interval '48 hours') WHERE user_id=$1 AND idempotency_key=$2")
                     .bind(user).bind(key).execute(&mut *tx).await?;
                 tx.commit().await?;
@@ -167,6 +169,7 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
         }
         sqlx::query("INSERT INTO playback_viewer_plans(user_id,room_id,viewer_id,plan_generation) VALUES($1,$2,$3,$4) ON CONFLICT(user_id,room_id,viewer_id) DO UPDATE SET plan_generation=EXCLUDED.plan_generation,updated_at=clock_timestamp()")
             .bind(user).bind(body.room_id).bind(viewer).bind(i64::from(generation)).execute(&mut *tx).await?;
+        playback_metrics::admit(&mut tx, user, body, lifecycle_epoch, retry).await?;
         let obsolete: Vec<Uuid> = sqlx::query_scalar("SELECT session_id FROM playback_requests WHERE user_id=$1 AND room_id=$2 AND viewer_id=$3 AND plan_generation<$4 AND status='pending' UNION SELECT id FROM playback_sessions WHERE user_id=$1 AND room_id=$2 AND viewer_id=$3 AND plan_generation<$4 AND NOT stopped")
             .bind(user).bind(body.room_id).bind(viewer).bind(i64::from(generation)).fetch_all(&mut *tx).await?;
         for old in obsolete {
@@ -308,6 +311,7 @@ pub async fn fail(app: &App, reservation: &Reservation, error: &Error) -> Result
         }
         let mut plan = app.decrypt(&row.get::<String, _>("response_encrypted"))?;
         playback_observations::refresh_plan(&mut tx, &mut plan).await?;
+        playback_metrics::refresh(&mut tx, &mut plan).await?;
         return Ok(Some(plan));
     }
     let exhausted = row.get::<String, _>("status") == "pending"

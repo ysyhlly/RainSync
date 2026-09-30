@@ -260,3 +260,406 @@ fn process_labels_are_fixed_and_separate_instances_stay_independent() {
     assert!(!a.contains("process=\"worker\""));
     assert!(!b.contains("process=\"server\""));
 }
+
+fn client_totals(values: [u32; 8]) -> PlaybackMetricsTotals {
+    PlaybackMetricsTotals {
+        startup_ms: values[0],
+        autoplay_blocked_ms: values[1],
+        background_ms: values[2],
+        paused_ms: values[3],
+        seeking_ms: values[4],
+        rebuffer_ms: values[5],
+        playing_ms: values[6],
+        unobserved_ms: values[7],
+    }
+}
+
+fn client_value(output: &str, name: &str, labels: &str) -> u64 {
+    let prefix = format!("{name}{{{labels},process=\"server\"}} ");
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("missing series {prefix}"))
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn client_reports_are_absent_until_observed_and_do_not_invent_a_first_frame() {
+    let metrics = RuntimeMetrics::default();
+    assert_eq!(metrics.render_for(Process::Server), "");
+    assert!(metrics.client_playback_sample(
+        PlaybackMetricsOrigin::UserIntent,
+        &client_totals([7, 0, 0, 0, 0, 0, 0, 0]),
+        None,
+    ));
+    let output = metrics.render_for(Process::Server);
+    assert!(output.contains("rainsync_client_reported_playback_samples_total{origin=\"user_intent\",process=\"server\"} 1\n"));
+    assert!(!output.contains("automatic_load"));
+    assert!(!output.contains("first_frame"));
+    assert!(!output.contains("rainsync_transfer_"));
+    assert!(!output.contains("rainsync_client_reported_playback_dropped_total"));
+    let first = PlaybackMetricsFirstFrame {
+        elapsed_ms: 0,
+        confirmed_elapsed_ms: 0,
+        evidence: PlaybackMetricsFrameEvidence::VideoFrameCallback,
+    };
+    assert!(metrics.client_playback_sample(
+        PlaybackMetricsOrigin::UserIntent,
+        &client_totals([0; 8]),
+        Some(&first),
+    ));
+    let output = metrics.render_for(Process::Server);
+    let labels = "origin=\"user_intent\",evidence=\"video_frame_callback\"";
+    assert_eq!(
+        client_value(
+            &output,
+            "rainsync_client_reported_playback_first_frame_elapsed_milliseconds_count",
+            labels
+        ),
+        1
+    );
+    assert_eq!(
+        client_value(
+            &output,
+            "rainsync_client_reported_playback_first_frame_elapsed_milliseconds_sum",
+            labels
+        ),
+        0
+    );
+    assert_eq!(
+        client_value(
+            &output,
+            "rainsync_client_reported_playback_first_frame_confirmation_lag_milliseconds_count",
+            labels
+        ),
+        1
+    );
+    assert_eq!(
+        client_value(
+            &output,
+            "rainsync_client_reported_playback_first_frame_confirmation_lag_milliseconds_sum",
+            labels
+        ),
+        0
+    );
+    assert!(!output.contains("evidence=\"playing_time_advance\""));
+}
+
+#[test]
+fn client_delta_durations_conserve_cumulative_time_and_frames_are_owner_supplied() {
+    let metrics = RuntimeMetrics::default();
+    let initial = client_totals([20, 30, 40, 50, 60, 70, 80, 90]);
+    let later = client_totals([21, 32, 43, 54, 65, 76, 87, 98]);
+    assert!(metrics.client_playback_sample(PlaybackMetricsOrigin::UserIntent, &initial, None));
+    // A delayed first-frame receipt may refer to an earlier point than this delta.
+    let first = PlaybackMetricsFirstFrame {
+        elapsed_ms: 100,
+        confirmed_elapsed_ms: 150,
+        evidence: PlaybackMetricsFrameEvidence::VideoFrameCallback,
+    };
+    let delta = later.checked_delta(&initial).unwrap();
+    assert!(metrics.client_playback_sample(
+        PlaybackMetricsOrigin::UserIntent,
+        &delta,
+        Some(&first)
+    ));
+    assert!(metrics.client_playback_sample(
+        PlaybackMetricsOrigin::UserIntent,
+        &client_totals([0; 8]),
+        None
+    ));
+    let state = lock(&metrics.inner);
+    let aggregate = state.client_playback[0];
+    assert_eq!(aggregate.samples, 3);
+    assert_eq!(aggregate.duration_ms, later.values().map(u64::from));
+    assert_eq!(aggregate.elapsed_ms, later.sum());
+    assert_eq!(
+        aggregate.duration_ms.iter().sum::<u64>(),
+        aggregate.elapsed_ms
+    );
+    assert_eq!(aggregate.first_frames[0].elapsed.count, 1);
+    assert_eq!(aggregate.first_frames[0].elapsed.milliseconds, 100);
+    assert_eq!(aggregate.first_frames[0].confirmation_lag.milliseconds, 50);
+    assert_eq!(aggregate.first_frames[1].elapsed.count, 0);
+    assert_eq!(state.client_playback[1], ClientPlaybackAggregate::default());
+}
+
+#[test]
+fn client_origin_evidence_and_loss_labels_have_a_fixed_series_limit() {
+    let metrics = RuntimeMetrics::default();
+    for origin in [
+        PlaybackMetricsOrigin::UserIntent,
+        PlaybackMetricsOrigin::AutomaticLoad,
+    ] {
+        for evidence in [
+            PlaybackMetricsFrameEvidence::VideoFrameCallback,
+            PlaybackMetricsFrameEvidence::PlayingTimeAdvance,
+        ] {
+            let first = PlaybackMetricsFirstFrame {
+                elapsed_ms: 3,
+                confirmed_elapsed_ms: 5,
+                evidence,
+            };
+            assert!(metrics.client_playback_sample(
+                origin,
+                &client_totals([1, 2, 3, 4, 5, 6, 7, 8]),
+                Some(&first)
+            ));
+        }
+    }
+    for reason in [
+        ClientMetricsDrop::RateLimited,
+        ClientMetricsDrop::Capacity,
+        ClientMetricsDrop::Invalid,
+        ClientMetricsDrop::Unavailable,
+        ClientMetricsDrop::Overflow,
+    ] {
+        metrics.client_playback_dropped(reason);
+    }
+    let output = metrics.render_for(Process::Server);
+    let data: Vec<_> = output
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    // Two origins * (sample + elapsed + 8 states + 2 evidence * 2 histograms * 12 series), plus 5 loss reasons.
+    assert_eq!(data.len(), 121);
+    assert!(output.len() < 32_000);
+    assert!(std::mem::size_of::<Snapshot>() < 2048);
+    for line in data {
+        assert!(line.starts_with("rainsync_client_reported_playback_"));
+        assert!(line.contains("process=\"server\""));
+        line.rsplit_once(' ').unwrap().1.parse::<u64>().unwrap();
+        for forbidden in [
+            "user_id",
+            "viewer_id",
+            "room_id",
+            "session_id",
+            "token",
+            "url",
+            "path",
+            "mode=",
+            "source=",
+        ] {
+            assert!(!line.contains(forbidden));
+        }
+    }
+    for _ in 0..1000 {
+        assert!(metrics.client_playback_sample(
+            PlaybackMetricsOrigin::AutomaticLoad,
+            &client_totals([0; 8]),
+            None
+        ));
+    }
+    assert_eq!(
+        metrics
+            .render_for(Process::Server)
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .count(),
+        121
+    );
+}
+
+#[test]
+fn client_input_ranges_and_total_prefix_bound_reject_whole_samples() {
+    let metrics = RuntimeMetrics::default();
+    let maximum = PLAYBACK_METRICS_MAX_ELAPSED_MS;
+    let frame = PlaybackMetricsFirstFrame {
+        elapsed_ms: maximum,
+        confirmed_elapsed_ms: maximum,
+        evidence: PlaybackMetricsFrameEvidence::PlayingTimeAdvance,
+    };
+    assert!(metrics.client_playback_sample(
+        PlaybackMetricsOrigin::AutomaticLoad,
+        &client_totals([maximum, 0, 0, 0, 0, 0, 0, 0]),
+        Some(&frame)
+    ));
+    let baseline = lock(&metrics.inner).client_playback;
+    assert!(!metrics.client_playback_sample(
+        PlaybackMetricsOrigin::AutomaticLoad,
+        &client_totals([maximum + 1, 0, 0, 0, 0, 0, 0, 0]),
+        None
+    ));
+    assert!(!metrics.client_playback_sample(
+        PlaybackMetricsOrigin::AutomaticLoad,
+        &client_totals([maximum, 1, 0, 0, 0, 0, 0, 0]),
+        None
+    ));
+    let beyond = PlaybackMetricsFirstFrame {
+        confirmed_elapsed_ms: maximum + 1,
+        ..frame.clone()
+    };
+    assert!(!metrics.client_playback_sample(
+        PlaybackMetricsOrigin::AutomaticLoad,
+        &client_totals([0; 8]),
+        Some(&beyond)
+    ));
+    let reversed = PlaybackMetricsFirstFrame {
+        elapsed_ms: 10,
+        confirmed_elapsed_ms: 9,
+        ..frame
+    };
+    assert!(!metrics.client_playback_sample(
+        PlaybackMetricsOrigin::AutomaticLoad,
+        &client_totals([0; 8]),
+        Some(&reversed)
+    ));
+    let state = lock(&metrics.inner);
+    assert_eq!(state.client_playback, baseline);
+    assert_eq!(state.client_dropped[ClientMetricsDrop::Invalid as usize], 4);
+    assert_eq!(
+        state.client_dropped[ClientMetricsDrop::Overflow as usize],
+        0
+    );
+}
+
+#[test]
+fn client_overflow_rejects_every_partial_duration_and_histogram_update() {
+    let first = PlaybackMetricsFirstFrame {
+        elapsed_ms: 10,
+        confirmed_elapsed_ms: 15,
+        evidence: PlaybackMetricsFrameEvidence::VideoFrameCallback,
+    };
+    for field in 0..9 {
+        let metrics = RuntimeMetrics::default();
+        let baseline = {
+            let mut state = lock(&metrics.inner);
+            let aggregate = &mut state.client_playback[0];
+            match field {
+                0 => aggregate.samples = u64::MAX,
+                1 => aggregate.elapsed_ms = u64::MAX,
+                2 => aggregate.duration_ms[0] = u64::MAX,
+                3 => aggregate.first_frames[0].elapsed.count = u64::MAX,
+                4 => aggregate.first_frames[0].elapsed.milliseconds = u64::MAX,
+                5 => aggregate.first_frames[0].elapsed.buckets[0] = u64::MAX,
+                6 => aggregate.first_frames[0].confirmation_lag.count = u64::MAX,
+                7 => aggregate.first_frames[0].confirmation_lag.milliseconds = u64::MAX,
+                8 => aggregate.first_frames[0].confirmation_lag.buckets[0] = u64::MAX,
+                _ => unreachable!(),
+            }
+            state.client_playback
+        };
+        assert!(!metrics.client_playback_sample(
+            PlaybackMetricsOrigin::UserIntent,
+            &client_totals([1; 8]),
+            Some(&first)
+        ));
+        let state = lock(&metrics.inner);
+        assert_eq!(
+            state.client_playback, baseline,
+            "partial credit for overflow field {field}"
+        );
+        assert_eq!(
+            state.client_dropped[ClientMetricsDrop::Overflow as usize],
+            1
+        );
+    }
+    let metrics = RuntimeMetrics::default();
+    lock(&metrics.inner).client_dropped[ClientMetricsDrop::Overflow as usize] = u64::MAX;
+    metrics.client_playback_dropped(ClientMetricsDrop::Overflow);
+    assert_eq!(
+        lock(&metrics.inner).client_dropped[ClientMetricsDrop::Overflow as usize],
+        u64::MAX
+    );
+    assert!(
+        metrics
+            .render_for(Process::Server)
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .all(|line| line.rsplit_once(' ').unwrap().1.parse::<u64>().is_ok())
+    );
+}
+
+#[test]
+fn client_histogram_bounds_are_cumulative_integer_milliseconds() {
+    let mut histogram = ClientHistogram::default();
+    for duration in [10, 11, 600_001, u64::from(PLAYBACK_METRICS_MAX_ELAPSED_MS)] {
+        assert!(histogram.checked_observe(duration).is_some());
+    }
+    assert_eq!(histogram.count, 4);
+    assert_eq!(histogram.buckets[0], 1);
+    assert!(histogram.buckets[1..].iter().all(|count| *count == 2));
+    assert_eq!(histogram.milliseconds, 604_800_000 + 600_022);
+}
+
+#[test]
+fn client_collectors_share_clones_but_keep_independent_instances_and_io_separate() {
+    let server = RuntimeMetrics::default();
+    let independent = RuntimeMetrics::default();
+    let cloned = server.clone();
+    assert!(cloned.client_playback_sample(
+        PlaybackMetricsOrigin::UserIntent,
+        &client_totals([2; 8]),
+        None
+    ));
+    let output = server.render_for(Process::Server);
+    assert_eq!(
+        client_value(
+            &output,
+            "rainsync_client_reported_playback_elapsed_milliseconds_total",
+            "origin=\"user_intent\""
+        ),
+        16
+    );
+    assert_eq!(independent.render_for(Process::Server), "");
+    assert!(!output.contains("rainsync_transfer_"));
+    let mut transfer = server
+        .begin_transfer(Layer::WorkerEgress, Cache::Hit)
+        .unwrap();
+    transfer.sample(1, 99);
+    transfer.finish(Outcome::Complete);
+    let output = server.render_for(Process::Server);
+    assert_eq!(
+        client_value(
+            &output,
+            "rainsync_client_reported_playback_samples_total",
+            "origin=\"user_intent\""
+        ),
+        1
+    );
+    assert_eq!(lock(&server.inner).transfers[0][0].bytes, 99);
+}
+
+#[test]
+fn client_concurrent_updates_and_scrapes_preserve_one_coherent_aggregate() {
+    let metrics = RuntimeMetrics::default();
+    let threads: Vec<_> = (0..4).map(|_| {
+        let metrics = metrics.clone();
+        std::thread::spawn(move || {
+            let first = PlaybackMetricsFirstFrame {
+                elapsed_ms: 10,
+                confirmed_elapsed_ms: 15,
+                evidence: PlaybackMetricsFrameEvidence::VideoFrameCallback,
+            };
+            for i in 0..250 {
+                assert!(metrics.client_playback_sample(PlaybackMetricsOrigin::UserIntent, &client_totals([1; 8]), Some(&first)));
+                if i % 25 == 0 {
+                    let output = metrics.render_for(Process::Server);
+                    let samples = client_value(&output, "rainsync_client_reported_playback_samples_total", "origin=\"user_intent\"");
+                    assert_eq!(client_value(&output, "rainsync_client_reported_playback_elapsed_milliseconds_total", "origin=\"user_intent\""), samples * 8);
+                    for state in CLIENT_STATES {
+                        assert_eq!(client_value(&output, "rainsync_client_reported_playback_state_duration_milliseconds_total", &format!("origin=\"user_intent\",state=\"{state}\"")), samples);
+                    }
+                    let labels = "origin=\"user_intent\",evidence=\"video_frame_callback\"";
+                    for name in ["rainsync_client_reported_playback_first_frame_elapsed_milliseconds", "rainsync_client_reported_playback_first_frame_confirmation_lag_milliseconds"] {
+                        assert_eq!(client_value(&output, &format!("{name}_count"), labels), samples);
+                        assert_eq!(client_value(&output, &format!("{name}_bucket"), &format!("{labels},le=\"+Inf\"")), samples);
+                        assert_eq!(client_value(&output, &format!("{name}_bucket"), &format!("{labels},le=\"10\"")), samples);
+                    }
+                    assert_eq!(client_value(&output, "rainsync_client_reported_playback_first_frame_elapsed_milliseconds_sum", labels), samples * 10);
+                    assert_eq!(client_value(&output, "rainsync_client_reported_playback_first_frame_confirmation_lag_milliseconds_sum", labels), samples * 5);
+                }
+            }
+        })
+    }).collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let state = lock(&metrics.inner);
+    assert_eq!(state.client_playback[0].samples, 1000);
+    assert_eq!(state.client_playback[0].elapsed_ms, 8000);
+    assert_eq!(state.client_playback[0].duration_ms, [1000; 8]);
+    assert_eq!(state.client_playback[0].first_frames[0].elapsed.count, 1000);
+    assert_eq!(state.client_dropped, [0; 5]);
+}

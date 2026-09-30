@@ -712,7 +712,7 @@ async fn prepare_playback(
         }),
     };
     let protocol_plan = plan;
-    let plan = serde_json::to_value(&protocol_plan).map_err(anyhow::Error::from)?;
+    let mut plan = serde_json::to_value(&protocol_plan).map_err(anyhow::Error::from)?;
     let mut tx = app.db.begin().await?;
     playback_requests::guard(app, &mut tx, reservation).await?;
     source_access::guard(&mut tx, source_id, source_policy_revision).await?;
@@ -734,7 +734,9 @@ async fn prepare_playback(
     if current["media_generation"].as_u64() != Some(u64::from(body.media_generation)) {
         return Err(err(StatusCode::CONFLICT, "stale_media"));
     }
-    if (matches!(kind.as_str(), "jellyfin" | "emby") || body.observation_version == Some(1))
+    if (matches!(kind.as_str(), "jellyfin" | "emby")
+        || body.observation_version == Some(1)
+        || body.playback_metrics_version == Some(1))
         && sqlx::query("SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR SHARE")
             .bind(body.room_id)
             .bind(u.id)
@@ -780,6 +782,10 @@ async fn prepare_playback(
         if !persistence::media_queue::enqueue(&mut tx, id, &spec, app.queue_limit).await? {
             return Err(err(StatusCode::SERVICE_UNAVAILABLE, "media_queue_full"));
         }
+    }
+    if let Some(grant) = playback_metrics::publish(&mut tx, u.id, body, id).await? {
+        plan["playback_metrics_version"] = json!(protocol::PLAYBACK_METRICS_VERSION);
+        plan["playback_metrics"] = serde_json::to_value(grant).map_err(anyhow::Error::from)?;
     }
     playback_requests::complete(app, &mut tx, reservation, &plan).await?;
     if matches!(kind.as_str(), "jellyfin" | "emby")

@@ -12,6 +12,7 @@ mod media_previews;
 mod media_titles;
 mod metrics;
 mod playback_capabilities;
+mod playback_metrics;
 mod playback_observations;
 mod playback_requests;
 mod preparation_owner;
@@ -618,6 +619,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route(
             "/api/v1/playback-sessions/{id}/observations",
             post(playback_observations::observe),
+        )
+        .route(
+            "/api/v1/playback-sessions/{id}/metrics",
+            post(playback_metrics::endpoint).layer(axum::extract::DefaultBodyLimit::max(4096)),
         )
         .route("/api/v1/agents", get(agents::list).post(agents::create))
         .route("/api/v1/agents/pair", post(agents::pair))

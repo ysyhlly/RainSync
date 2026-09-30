@@ -1,20 +1,16 @@
-//! Minimal App harness for owned production modules before controller wiring.
-//! The shared source is included directly because media-core/lib.rs is owned by
-//! integration. This does not claim real Worker routes or HTTP producers are wired.
-extern crate self as media_core;
+//! Minimal App harness for the integrated production metrics modules.
+//! Shared collector types come from the real media-core crate and its dependencies.
 #[path = "../src/metric_stream.rs"]
 mod metric_stream;
 #[path = "../src/metrics.rs"]
 mod metrics;
-#[path = "../../../crates/media-core/src/runtime_metrics.rs"]
-pub mod runtime_metrics;
 use axum::{
     body::{Bytes, to_bytes},
     extract::State,
     http::{HeaderMap, StatusCode, header},
 };
 use futures_util::{StreamExt, stream};
-use runtime_metrics::{Cache, CacheDecision, Layer, Process, RuntimeMetrics};
+use media_core::runtime_metrics::{self, Cache, CacheDecision, Layer, Process, RuntimeMetrics};
 use sqlx::{
     PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},

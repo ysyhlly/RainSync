@@ -1,5 +1,9 @@
-//! Bounded process-local measurements of real body streams. No client telemetry.
-//! Owners must bind these hooks at actual I/O and committed transition sites.
+//! Bounded process-local measurements of real body streams and separately named,
+//! untrusted client reports. Owners bind hooks at actual I/O and committed sites.
+use protocol::{
+    PLAYBACK_METRICS_MAX_ELAPSED_MS, PlaybackMetricsFirstFrame, PlaybackMetricsFrameEvidence,
+    PlaybackMetricsOrigin, PlaybackMetricsTotals,
+};
 use std::fmt::Write;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
@@ -18,6 +22,26 @@ const BOUNDS_US: [u64; 9] = [
 ];
 const LAYERS: [&str; 3] = ["worker_egress", "nas_uplink", "upstream_read"];
 const OUTCOMES: [&str; 3] = ["complete", "failed", "cancelled"];
+const CLIENT_ORIGINS: [&str; 2] = ["user_intent", "automatic_load"];
+const CLIENT_STATES: [&str; 8] = [
+    "startup",
+    "autoplay_blocked",
+    "background",
+    "paused",
+    "seeking",
+    "rebuffer",
+    "playing",
+    "unobserved",
+];
+const CLIENT_EVIDENCE: [&str; 2] = ["video_frame_callback", "playing_time_advance"];
+const CLIENT_DROP_REASONS: [&str; 5] = [
+    "rate_limited",
+    "capacity",
+    "invalid",
+    "unavailable",
+    "overflow",
+];
+const CLIENT_BOUNDS_MS: [u64; 9] = [10, 50, 100, 500, 1_000, 5_000, 30_000, 120_000, 600_000];
 
 #[derive(Clone, Copy, Debug)]
 pub enum Process {
@@ -55,6 +79,75 @@ pub enum Failure {
     Other,
 }
 
+/// Closed telemetry-loss reasons; never include an identity or free-form error.
+#[derive(Clone, Copy, Debug)]
+pub enum ClientMetricsDrop {
+    RateLimited,
+    Capacity,
+    Invalid,
+    Unavailable,
+    Overflow,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClientHistogram {
+    count: u64,
+    milliseconds: u64,
+    buckets: [u64; 9],
+}
+impl ClientHistogram {
+    fn checked_observe(&mut self, milliseconds: u64) -> Option<()> {
+        self.count = self.count.checked_add(1)?;
+        self.milliseconds = self.milliseconds.checked_add(milliseconds)?;
+        for (bucket, bound) in self.buckets.iter_mut().zip(CLIENT_BOUNDS_MS) {
+            if milliseconds <= bound {
+                *bucket = bucket.checked_add(1)?;
+            }
+        }
+        Some(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClientFirstFrame {
+    elapsed: ClientHistogram,
+    confirmation_lag: ClientHistogram,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClientPlaybackAggregate {
+    samples: u64,
+    elapsed_ms: u64,
+    duration_ms: [u64; 8],
+    first_frames: [ClientFirstFrame; 2],
+}
+impl ClientPlaybackAggregate {
+    fn checked_observe(
+        &mut self,
+        values: [u32; 8],
+        elapsed_ms: u64,
+        first: Option<&PlaybackMetricsFirstFrame>,
+    ) -> Option<()> {
+        self.samples = self.samples.checked_add(1)?;
+        self.elapsed_ms = self.elapsed_ms.checked_add(elapsed_ms)?;
+        for (total, delta) in self.duration_ms.iter_mut().zip(values) {
+            *total = total.checked_add(u64::from(delta))?;
+        }
+        if let Some(first) = first {
+            let evidence = match first.evidence {
+                PlaybackMetricsFrameEvidence::VideoFrameCallback => 0,
+                PlaybackMetricsFrameEvidence::PlayingTimeAdvance => 1,
+            };
+            let frame = &mut self.first_frames[evidence];
+            frame.elapsed.checked_observe(u64::from(first.elapsed_ms))?;
+            frame.confirmation_lag.checked_observe(u64::from(
+                first.confirmed_elapsed_ms.checked_sub(first.elapsed_ms)?,
+            ))?;
+        }
+        Some(())
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct Aggregate {
     count: u64,
@@ -88,6 +181,8 @@ struct Snapshot {
     cached_bytes_seen: bool,
     failures: [u64; 4],
     failures_seen: bool,
+    client_playback: [ClientPlaybackAggregate; 2],
+    client_dropped: [u64; 5],
 }
 #[derive(Clone, Default)]
 pub struct RuntimeMetrics {
@@ -134,6 +229,60 @@ impl RuntimeMetrics {
         state.failures_seen = true;
         let n = &mut state.failures[failure as usize];
         *n = n.saturating_add(1);
+    }
+    /// Call only after a newly accepted durable client sample commits. The owner
+    /// supplies the checked cumulative delta and only a newly recorded first
+    /// frame; sequence, replay and lifecycle ownership stay outside this collector.
+    /// Reports do not prove physical display and never carry a delivery-mode label.
+    /// Returns false and records one fixed loss reason if the whole update is dropped.
+    pub fn client_playback_sample(
+        &self,
+        origin: PlaybackMetricsOrigin,
+        delta: &PlaybackMetricsTotals,
+        first: Option<&PlaybackMetricsFirstFrame>,
+    ) -> bool {
+        let values = delta.values();
+        let elapsed_ms = values
+            .iter()
+            .try_fold(0_u64, |sum, value| sum.checked_add(u64::from(*value)));
+        let valid = values
+            .iter()
+            .all(|value| *value <= PLAYBACK_METRICS_MAX_ELAPSED_MS)
+            && elapsed_ms.is_some_and(|sum| sum <= u64::from(PLAYBACK_METRICS_MAX_ELAPSED_MS))
+            && first.is_none_or(|frame| {
+                frame.elapsed_ms <= frame.confirmed_elapsed_ms
+                    && frame.confirmed_elapsed_ms <= PLAYBACK_METRICS_MAX_ELAPSED_MS
+            });
+        let mut state = lock(&self.inner);
+        if !valid {
+            let count = &mut state.client_dropped[ClientMetricsDrop::Invalid as usize];
+            *count = count.saturating_add(1);
+            return false;
+        }
+        let index = match origin {
+            PlaybackMetricsOrigin::UserIntent => 0,
+            PlaybackMetricsOrigin::AutomaticLoad => 1,
+        };
+        // Stage a fixed-size copy: overflow in any duration/histogram cannot
+        // credit a sample or a partial subset of its measurements.
+        let mut next = state.client_playback[index];
+        if next
+            .checked_observe(values, elapsed_ms.expect("validated delta sum"), first)
+            .is_none()
+        {
+            let count = &mut state.client_dropped[ClientMetricsDrop::Overflow as usize];
+            *count = count.saturating_add(1);
+            return false;
+        }
+        state.client_playback[index] = next;
+        true
+    }
+    /// Count known loss at the receiver without storing identities or packets.
+    /// Collector rejection already records Invalid/Overflow; do not count it twice.
+    pub fn client_playback_dropped(&self, reason: ClientMetricsDrop) {
+        let mut state = lock(&self.inner);
+        let count = &mut state.client_dropped[reason as usize];
+        *count = count.saturating_add(1);
     }
     /// Process labels are closed enum values; this never contacts another process.
     pub fn render_for(&self, process: Process) -> String {
@@ -242,8 +391,72 @@ impl RuntimeMetrics {
                 .unwrap();
             }
         }
+        if state
+            .client_playback
+            .iter()
+            .any(|aggregate| aggregate.samples > 0)
+        {
+            out.push_str("# HELP rainsync_client_reported_playback_samples_total Newly committed client reports; untrusted initial prefixes are bounded, and replay is excluded by the owner.\n# TYPE rainsync_client_reported_playback_samples_total counter\n# HELP rainsync_client_reported_playback_elapsed_milliseconds_total Accepted client-reported delta duration, including unobserved time.\n# TYPE rainsync_client_reported_playback_elapsed_milliseconds_total counter\n# HELP rainsync_client_reported_playback_state_duration_milliseconds_total Accepted client-reported deltas by mutually exclusive state; seeking remains separate from playing.\n# TYPE rainsync_client_reported_playback_state_duration_milliseconds_total counter\n");
+            for (origin, aggregate) in CLIENT_ORIGINS.iter().zip(state.client_playback) {
+                if aggregate.samples == 0 {
+                    continue;
+                }
+                writeln!(
+                    out,
+                    "rainsync_client_reported_playback_samples_total{{origin=\"{origin}\"}} {}",
+                    aggregate.samples
+                )
+                .unwrap();
+                writeln!(out, "rainsync_client_reported_playback_elapsed_milliseconds_total{{origin=\"{origin}\"}} {}", aggregate.elapsed_ms).unwrap();
+                for (state, duration) in CLIENT_STATES.iter().zip(aggregate.duration_ms) {
+                    writeln!(out, "rainsync_client_reported_playback_state_duration_milliseconds_total{{origin=\"{origin}\",state=\"{state}\"}} {duration}").unwrap();
+                }
+            }
+        }
+        if state.client_playback.iter().any(|aggregate| {
+            aggregate
+                .first_frames
+                .iter()
+                .any(|frame| frame.elapsed.count > 0)
+        }) {
+            out.push_str("# HELP rainsync_client_reported_playback_first_frame_elapsed_milliseconds Client-reported startup elapsed to first-frame evidence; video_frame_callback is presentation submission, not proof of physical display.\n# TYPE rainsync_client_reported_playback_first_frame_elapsed_milliseconds histogram\n# HELP rainsync_client_reported_playback_first_frame_confirmation_lag_milliseconds Client-reported delay between first-frame evidence and confirmation; absent reports do not contribute zero.\n# TYPE rainsync_client_reported_playback_first_frame_confirmation_lag_milliseconds histogram\n");
+            for (origin, aggregate) in CLIENT_ORIGINS.iter().zip(state.client_playback) {
+                for (evidence, frame) in CLIENT_EVIDENCE.iter().zip(aggregate.first_frames) {
+                    if frame.elapsed.count == 0 {
+                        continue;
+                    }
+                    let labels = format!("origin=\"{origin}\",evidence=\"{evidence}\"");
+                    render_client_histogram(
+                        &mut out,
+                        "rainsync_client_reported_playback_first_frame_elapsed_milliseconds",
+                        &labels,
+                        frame.elapsed,
+                    );
+                    render_client_histogram(
+                        &mut out,
+                        "rainsync_client_reported_playback_first_frame_confirmation_lag_milliseconds",
+                        &labels,
+                        frame.confirmation_lag,
+                    );
+                }
+            }
+        }
+        if state.client_dropped.iter().any(|count| *count > 0) {
+            out.push_str("# HELP rainsync_client_reported_playback_dropped_total Known telemetry loss by fixed reason; playback delivery is unaffected.\n# TYPE rainsync_client_reported_playback_dropped_total counter\n");
+            for (reason, count) in CLIENT_DROP_REASONS.iter().zip(state.client_dropped) {
+                if count > 0 {
+                    writeln!(out, "rainsync_client_reported_playback_dropped_total{{reason=\"{reason}\"}} {count}").unwrap();
+                }
+            }
+        }
         out
     }
+}
+fn render_client_histogram(out: &mut String, name: &str, labels: &str, histogram: ClientHistogram) {
+    for (bound, count) in CLIENT_BOUNDS_MS.iter().zip(histogram.buckets) {
+        writeln!(out, "{name}_bucket{{{labels},le=\"{bound}\"}} {count}").unwrap();
+    }
+    writeln!(out, "{name}_bucket{{{labels},le=\"+Inf\"}} {}\n{name}_count{{{labels}}} {}\n{name}_sum{{{labels}}} {}", histogram.count, histogram.count, histogram.milliseconds).unwrap();
 }
 /// Not Clone: one owner and one terminal accounting event per actual stream.
 pub struct Transfer {

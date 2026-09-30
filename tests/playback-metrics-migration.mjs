@@ -1,4 +1,4 @@
-// Fresh generated data only: real PostgreSQL 1–34 -> 35 and persisted constraints.
+// Fresh generated data only: real PostgreSQL 1–34 -> 35 -> 36 and constraints.
 // Direct SQL migration execution deliberately does not claim SQLx runner coverage.
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
@@ -26,6 +26,8 @@ const db = isolatedPostgres({ root, name: "metrics-migration", id });
 const owner = randomUUID(),
   room = randomUUID(),
   viewer = randomUUID();
+const initialRoom = randomUUID(),
+  initialViewer = randomUUID();
 const legacySession = randomUUID(),
   boundSession = randomUUID();
 const legacyKey = randomUUID(),
@@ -44,6 +46,7 @@ const metricsColumns = [
   "metrics_anchor_received_at",
 ];
 const scope = `user_id='${owner}' AND room_id='${room}' AND viewer_id='${viewer}'`;
+const initialScope = `user_id='${owner}' AND room_id='${initialRoom}' AND viewer_id='${initialViewer}'`;
 const report = {
   schema_version: 1,
   result: "running",
@@ -73,10 +76,10 @@ const reject = (label, sql, constraint) => {
   );
   report.rejections.push({ label, constraint });
 };
-const rejectNull = (column) => {
+const rejectNull = (column, where = scope) => {
   assert.throws(
     () =>
-      db.sql(`UPDATE playback_viewer_plans SET ${column}=NULL WHERE ${scope}`),
+      db.sql(`UPDATE playback_viewer_plans SET ${column}=NULL WHERE ${where}`),
     (error) => {
       assert.equal(error.status, 1);
       assert.match(
@@ -178,12 +181,12 @@ try {
   report.postgres = db.diagnostics();
   const files = (await readdir(resolve(checkout, "migrations")))
     .filter(
-      (name) => /^\d+_.+\.sql$/.test(name) && Number(name.split("_")[0]) <= 35,
+      (name) => /^\d+_.+\.sql$/.test(name) && Number(name.split("_")[0]) <= 36,
     )
     .sort();
   assert.deepEqual(
     files.map((name) => Number(name.split("_")[0])),
-    Array.from({ length: 35 }, (_, i) => i + 1),
+    Array.from({ length: 36 }, (_, i) => i + 1),
   );
   const historical = files.filter((name) => Number(name.split("_")[0]) <= 34);
   for (const name of historical) {
@@ -194,10 +197,14 @@ try {
   db.sql(`
     INSERT INTO users(id,username,password_hash) VALUES('${owner}','generated-metrics-upgrade-owner','not-for-login');
     INSERT INTO rooms(id,name,owner_id,lifecycle_epoch) VALUES('${room}','generated metrics upgrade room','${owner}',5);
+    INSERT INTO rooms(id,name,owner_id) VALUES('${initialRoom}','generated initial epoch room','${owner}');
     INSERT INTO room_members(room_id,user_id) VALUES('${room}','${owner}');
+    INSERT INTO room_members(room_id,user_id) VALUES('${initialRoom}','${owner}');
     INSERT INTO playback_viewer_plans(user_id,room_id,viewer_id,plan_generation)
       SELECT '${owner}','${room}',CASE WHEN g=1 THEN '${viewer}'::uuid ELSE md5('${id}:'||g)::uuid END,
         CASE WHEN g=1 THEN 9 ELSE g END FROM generate_series(1,1024) g;
+    INSERT INTO playback_viewer_plans(user_id,room_id,viewer_id,plan_generation)
+      VALUES('${owner}','${initialRoom}','${initialViewer}',1);
     INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at)
       VALUES('${legacySession}','${owner}','${room}',3,'generated-legacy-metrics-token','{"generated":"legacy"}',now()+interval '1 hour');
     INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch,viewer_id,plan_generation)
@@ -267,7 +274,7 @@ try {
       "t",
     ),
   );
-  for (const [label, fields] of [
+  const grantCases = [
     ["version alone", "playback_metrics_version=1"],
     ["generation alone", "metrics_meter_start_generation=1"],
     [
@@ -294,7 +301,8 @@ try {
       "NULL viewer and plan",
       "playback_metrics_version=1,metrics_meter_start_generation=1,viewer_id=NULL,plan_generation=NULL",
     ],
-  ])
+  ];
+  for (const [label, fields] of grantCases)
     reject(
       `grant rejects ${label}`,
       `UPDATE playback_sessions SET ${fields} WHERE id='${boundSession}'`,
@@ -331,7 +339,7 @@ try {
       "t",
     );
   });
-  for (const [label, fields] of [
+  const emptyCases = [
     ["start only", "metrics_meter_start_generation=1"],
     ["media only", "metrics_media_generation=0"],
     ["epoch only", "metrics_lifecycle_epoch=1"],
@@ -342,7 +350,8 @@ try {
     ["admitted time only", "metrics_admitted_at=clock_timestamp()"],
     ["elapsed anchor only", "metrics_anchor_elapsed_ms=0"],
     ["received anchor only", "metrics_anchor_received_at=clock_timestamp()"],
-  ])
+  ];
+  for (const [label, fields] of emptyCases)
     reject(
       `empty slot rejects ${label}`,
       `UPDATE playback_viewer_plans SET ${fields} WHERE ${scope}`,
@@ -375,7 +384,7 @@ try {
       `UPDATE playback_viewer_plans SET ${column}=NULL WHERE ${scope}`,
       "playback_viewer_metrics_slot",
     );
-  for (const [label, fields] of [
+  const admittedCases = [
     ["zero start", "metrics_meter_start_generation=0"],
     ["future start", "metrics_meter_start_generation=10"],
     ["negative media", "metrics_media_generation=-1"],
@@ -391,7 +400,8 @@ try {
       "zero sequence with received anchor",
       "metrics_anchor_received_at=clock_timestamp()",
     ],
-  ])
+  ];
+  for (const [label, fields] of admittedCases)
     reject(
       `admitted slot rejects ${label}`,
       `UPDATE playback_viewer_plans SET ${fields} WHERE ${scope}`,
@@ -412,7 +422,8 @@ try {
       );
     },
   );
-  for (const [label, fields] of [
+  const sampleCases = [
+    ["overflow sequence with full sample", "metrics_seq=9007199254740992"],
     ["NULL payload", "metrics_payload=NULL"],
     ["JSON null payload", "metrics_payload='null'"],
     ["array payload", "metrics_payload='[]'"],
@@ -426,7 +437,8 @@ try {
     ["overflow elapsed", "metrics_anchor_elapsed_ms=604800001"],
     ["NULL received anchor", "metrics_anchor_received_at=NULL"],
     ["zero sequence with retained sample", "metrics_seq=0"],
-  ])
+  ];
+  for (const [label, fields] of sampleCases)
     reject(
       `sample rejects ${label}`,
       `UPDATE playback_viewer_plans SET ${fields} WHERE ${scope}`,
@@ -491,6 +503,169 @@ try {
       );
     },
   );
+  check("published35 rejects epoch0 in an existing default-epoch room", () => {
+    assert.equal(
+      db.sql(`SELECT lifecycle_epoch FROM rooms WHERE id='${initialRoom}'`),
+      "0",
+    );
+    assert.equal(
+      db.sql(
+        `SELECT ${empty} FROM playback_viewer_plans WHERE ${initialScope}`,
+      ),
+      "t",
+    );
+    reject(
+      "schema35 initial room epoch0",
+      `UPDATE playback_viewer_plans SET
+      metrics_meter_start_generation=1,metrics_media_generation=0,metrics_lifecycle_epoch=0,
+      metrics_startup_origin='automatic_load',metrics_admitted_at=clock_timestamp() WHERE ${initialScope}`,
+      "playback_viewer_metrics_slot",
+    );
+  });
+  const retainedTables = [
+    "playback_viewer_plans",
+    "playback_sessions",
+    "playback_requests",
+    "users",
+    "rooms",
+  ];
+  const before36 = Object.fromEntries(
+    retainedTables.map((table) => [table, snapshot(table)]),
+  );
+  report.before36 = {
+    row_hashes: before36,
+    empty_initial_epoch_slot: true,
+    bounded_viewer_count: 1024,
+  };
+  const slotDefinition = () =>
+    db.sql(`SELECT pg_get_constraintdef(oid) FROM pg_constraint
+    WHERE conrelid='playback_viewer_plans'::regclass AND conname='playback_viewer_metrics_slot'`);
+  const definition35 = slotDefinition();
+  const correctionName = "0036_playback_metrics_initial_epoch.sql";
+  const correctionBytes = await readFile(
+    resolve(checkout, "migrations", correctionName),
+  );
+  db.sql(`BEGIN; ${correctionBytes}; COMMIT;`);
+  report.migrations.push({
+    name: correctionName,
+    sha256: hash(correctionBytes),
+  });
+  const definition36 = slotDefinition();
+  check(
+    "populated35 -> 36 preserves closed samples, empty slots, grants and every high-water",
+    () => {
+      for (const table of retainedTables)
+        assert.equal(snapshot(table), before36[table]);
+      assert.equal(
+        db.sql(
+          `SELECT ${empty} FROM playback_viewer_plans WHERE ${initialScope}`,
+        ),
+        "t",
+      );
+      assert.equal(
+        db.sql(
+          `SELECT count(*) FROM playback_viewer_plans WHERE user_id='${owner}' AND room_id='${room}'`,
+        ),
+        "1024",
+      );
+    },
+  );
+  check("36 changes only the real CHECK's minimum lifecycle epoch", () => {
+    assert.match(definition35, /metrics_lifecycle_epoch >= 1/);
+    assert.equal(
+      definition36,
+      definition35.replace(
+        "metrics_lifecycle_epoch >= 1",
+        "metrics_lifecycle_epoch >= 0",
+      ),
+    );
+  });
+  report.constraints = { schema35: definition35, schema36: definition36 };
+  db.sql(
+    `UPDATE playback_sessions SET playback_metrics_version=NULL,metrics_meter_start_generation=NULL WHERE id='${boundSession}'`,
+  );
+  for (const [label, fields] of grantCases)
+    reject(
+      `schema36 grant rejects ${label}`,
+      `UPDATE playback_sessions SET ${fields} WHERE id='${boundSession}'`,
+      "playback_session_metrics_pair",
+    );
+  db.sql(
+    `UPDATE playback_sessions SET playback_metrics_version=1,metrics_meter_start_generation=9 WHERE id='${boundSession}'`,
+  );
+  for (const [label, fields] of emptyCases)
+    reject(
+      `schema36 empty slot rejects ${label}`,
+      `UPDATE playback_viewer_plans SET ${fields} WHERE ${initialScope}`,
+      "playback_viewer_metrics_slot",
+    );
+  for (const column of ["metrics_seq", "metrics_closed"])
+    rejectNull(column, initialScope);
+  check(
+    "36 admits epoch0 from the existing room while preserving an empty sample",
+    () => {
+      db.sql(`UPDATE playback_viewer_plans SET metrics_meter_start_generation=1,metrics_media_generation=0,
+      metrics_lifecycle_epoch=0,metrics_startup_origin='automatic_load',metrics_admitted_at=clock_timestamp() WHERE ${initialScope}`);
+      assert.equal(
+        db.sql(`SELECT metrics_lifecycle_epoch=0 AND metrics_seq=0 AND metrics_payload IS NULL
+      AND metrics_anchor_elapsed_ms IS NULL AND metrics_anchor_received_at IS NULL FROM playback_viewer_plans WHERE ${initialScope}`),
+        "t",
+      );
+    },
+  );
+  for (const column of [
+    "metrics_meter_start_generation",
+    "metrics_media_generation",
+    "metrics_lifecycle_epoch",
+    "metrics_startup_origin",
+    "metrics_admitted_at",
+  ])
+    reject(
+      `schema36 admitted slot rejects NULL ${column}`,
+      `UPDATE playback_viewer_plans SET ${column}=NULL WHERE ${initialScope}`,
+      "playback_viewer_metrics_slot",
+    );
+  for (const [label, fields] of admittedCases.filter(
+    ([label]) => label !== "zero epoch",
+  ))
+    reject(
+      `schema36 admitted slot rejects ${label}`,
+      `UPDATE playback_viewer_plans SET ${fields} WHERE ${initialScope}`,
+      "playback_viewer_metrics_slot",
+    );
+  check("36 accepts a full boundary sample in epoch0", () => {
+    db.sql(`UPDATE playback_viewer_plans SET metrics_seq=9007199254740991,metrics_media_generation=4294967295,
+      metrics_payload=jsonb_build_object('p',repeat('x',4087)),metrics_anchor_elapsed_ms=604800000,
+      metrics_anchor_received_at=clock_timestamp() WHERE ${initialScope}`);
+    assert.equal(
+      db.sql(`SELECT metrics_lifecycle_epoch=0 AND octet_length(metrics_payload::text)=4096
+      AND metrics_seq=9007199254740991 AND metrics_anchor_elapsed_ms=604800000 FROM playback_viewer_plans WHERE ${initialScope}`),
+      "t",
+    );
+  });
+  for (const [label, fields] of sampleCases)
+    reject(
+      `schema36 sample rejects ${label}`,
+      `UPDATE playback_viewer_plans SET ${fields} WHERE ${initialScope}`,
+      "playback_viewer_metrics_slot",
+    );
+  check(
+    "a rejected epoch0-room row rolls back the whole transaction after36",
+    () => {
+      const baseline = snapshot("playback_viewer_plans"),
+        roomBaseline = snapshot("rooms");
+      reject(
+        "schema36 transaction with negative epoch",
+        `BEGIN;
+      UPDATE rooms SET name='must roll back after36' WHERE id='${initialRoom}';
+      UPDATE playback_viewer_plans SET plan_generation=2 WHERE ${initialScope};
+      UPDATE playback_viewer_plans SET metrics_lifecycle_epoch=-1 WHERE ${initialScope}; COMMIT;`,
+        "playback_viewer_metrics_slot",
+      );
+      assert.equal(snapshot("playback_viewer_plans"), baseline);
+      assert.equal(snapshot("rooms"), roomBaseline);
+    },
+  );
   const durable = {
     viewers: snapshot("playback_viewer_plans"),
     sessions: snapshot("playback_sessions"),
@@ -498,7 +673,7 @@ try {
   };
   await restartOwnedCluster();
   check(
-    "actual PostgreSQL restart preserves closed telemetry, grants, requests and 1,024 high-waters",
+    "actual PostgreSQL restart after36 preserves epoch0 samples, closed telemetry and all high-waters",
     () => {
       assert.equal(snapshot("playback_viewer_plans"), durable.viewers);
       assert.equal(snapshot("playback_sessions"), durable.sessions);
@@ -515,6 +690,11 @@ try {
         ),
         "t",
       );
+      assert.equal(
+        db.sql(`SELECT plan_generation=1 AND metrics_lifecycle_epoch=0 AND metrics_seq=9007199254740991
+        AND NOT metrics_closed FROM playback_viewer_plans WHERE ${initialScope}`),
+        "t",
+      );
     },
   );
   check("post-restart constraint remains effective", () =>
@@ -523,6 +703,16 @@ try {
       `UPDATE playback_sessions SET playback_metrics_version=NULL WHERE id='${boundSession}'`,
       "playback_session_metrics_pair",
     ),
+  );
+  reject(
+    "post-restart schema36 NULL epoch",
+    `UPDATE playback_viewer_plans SET metrics_lifecycle_epoch=NULL WHERE ${initialScope}`,
+    "playback_viewer_metrics_slot",
+  );
+  reject(
+    "post-restart schema36 negative epoch",
+    `UPDATE playback_viewer_plans SET metrics_lifecycle_epoch=-1 WHERE ${initialScope}`,
+    "playback_viewer_metrics_slot",
   );
   check(
     "clearing an optional slot never lowers or deletes the durable high-water",
@@ -559,10 +749,10 @@ try {
     "fixture input changed during run",
   );
   report.checks.push(
-    "all 35 migration input checksums remain unchanged across upgrade and restart",
+    "all 36 migration input checksums remain unchanged across both upgrades and restart",
   );
   report.after = {
-    historical_migration_sha256: report.migrations.slice(0, 34),
+    historical_migration_sha256: report.migrations.slice(0, 35),
     viewer_count: 1024,
     high_water_row_sha256: snapshot("playback_viewer_plans", metricsColumns),
   };
