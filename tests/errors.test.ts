@@ -52,3 +52,15 @@ it("command permission errors do not terminate the watching connection", () => {
     stopsReconnect(new RequestFailure({ error: { code: "NOT_A_MEMBER" } })),
   ).toBe(true);
 });
+
+it("explains locally detected stale playback plans without automatic retry", () => {
+  const failure = new RequestFailure({
+    error: { code: "STALE_PLAYBACK_PLAN" },
+  });
+  expect(failure.message).toContain("新的操作替代");
+  expect(failure.retryable).toBe(false);
+  expect(
+    new RequestFailure({ error: { code: "PLAYBACK_VIEWER_LIMIT_EXCEEDED" } })
+      .message,
+  ).toContain("现有播放器");
+});

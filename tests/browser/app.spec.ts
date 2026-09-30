@@ -379,6 +379,7 @@ test("playback retries a lost HTTP response with the same operation key", async 
       return route.fulfill({
         json: {
           session_id: "one-session",
+          plan_generation: route.request().postDataJSON().plan_generation,
           media_id: "movie",
           media_generation: 1,
           delivery_mode: "direct",
@@ -540,6 +541,7 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
       return route.fulfill({
         json: {
           session_id: id,
+          plan_generation: body.plan_generation,
           media_id: "movie",
           media_generation: 1,
           delivery_mode: "direct",
@@ -721,6 +723,7 @@ test("subtitle identity survives reload and resets on media change", async ({
       return route.fulfill({
         json: {
           session_id: `subtitle-${plans}`,
+          plan_generation: route.request().postDataJSON().plan_generation,
           media_id: state.media_id,
           media_generation: state.media_generation,
           delivery_mode: "direct",

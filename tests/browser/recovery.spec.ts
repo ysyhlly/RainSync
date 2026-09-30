@@ -68,6 +68,7 @@ async function setup(
   });
   const frames: any[] = [],
     preparations: any[] = [],
+    planGenerations = new Map<string, number>(),
     sockets: WebSocketRoute[] = [];
   let replyClock = !opts.holdClock,
     clockFrame: any;
@@ -126,9 +127,14 @@ async function setup(
     }
     if (path.endsWith("/playback-sessions")) {
       preparations.push(r.request().postDataJSON());
+      planGenerations.set(
+        `session-${preparations.length}`,
+        preparations.at(-1).plan_generation,
+      );
       return r.fulfill({
         json: {
           session_id: `session-${preparations.length}`,
+          plan_generation: preparations.at(-1).plan_generation,
           media_id: "movie",
           media_generation: 1,
           delivery_mode: "direct",
@@ -152,6 +158,7 @@ async function setup(
       return r.fulfill({
         json: {
           session_id: path.split("/").at(-1),
+          plan_generation: planGenerations.get(path.split("/").at(-1)!),
           status: mediaReady ? "ready" : "preparing",
           complete: false,
         },
@@ -220,6 +227,7 @@ async function setup(
   return {
     frames,
     preparations,
+    planGenerations,
     sockets,
     history,
     readinessReads: () => readinessReads,
@@ -403,9 +411,11 @@ test("stale HLS attempt refetches entry manifest without a new playback session"
   let hlsPlans = 0;
   await page.route("**/api/v1/playback-sessions", async (r) => {
     hlsPlans++;
+    h.planGenerations.set("hls", r.request().postDataJSON().plan_generation);
     return r.fulfill({
       json: {
         session_id: "hls",
+        plan_generation: r.request().postDataJSON().plan_generation,
         media_id: "movie",
         media_generation: 1,
         delivery_mode: "transcode",
@@ -571,6 +581,7 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
     return route.fulfill({
       json: {
         session_id: "session-1",
+        plan_generation: h.planGenerations.get("session-1"),
         status: position < publishedUntil ? "ready" : "preparing",
         available_until_ms: publishedUntil,
         complete: false,
@@ -807,6 +818,7 @@ test("ending an incomplete generated prefix waits without advancing the room", a
     return r.fulfill({
       json: {
         session_id: "session-1",
+        plan_generation: h.planGenerations.get("session-1"),
         status: reads === 1 ? "ready" : "preparing",
         complete: false,
         available_until_ms: 10000,
@@ -850,6 +862,7 @@ test("a growing output waits for the room position and resumes the same native s
     return r.fulfill({
       json: {
         session_id: "session-1",
+        plan_generation: h.planGenerations.get("session-1"),
         status: ready ? "ready" : "preparing",
         complete: false,
         available_until_ms: ready ? 1900000 : 10000,
@@ -929,6 +942,7 @@ for (const action of [
         await route.fulfill({
           json: {
             session_id: "session-1",
+            plan_generation: h.planGenerations.get("session-1"),
             status: "ready",
             complete: false,
             available_until_ms: 3600000,

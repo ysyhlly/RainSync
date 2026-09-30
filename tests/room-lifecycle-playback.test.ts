@@ -45,6 +45,7 @@ it("same-generation close and reopen destroys old URL, requires a fresh plan, an
         session_id: `session-${plans}`,
         media_id: "media",
         media_generation: 1,
+        plan_generation: JSON.parse(request.body as string).plan_generation,
         delivery_mode: "direct",
         transport: "progressive",
         playback_url: `/authorized-${plans}.mp4`,

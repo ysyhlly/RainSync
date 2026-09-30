@@ -3,6 +3,10 @@ export {
   detectCapabilitiesAsync,
   detectCandidateReport,
 } from "./capabilities";
+export {
+  PlaybackPlanGenerations,
+  matchesPlanGeneration,
+} from "./plan-generation";
 
 export interface PlayerAdapter {
   play(): Promise<void>;

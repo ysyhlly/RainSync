@@ -17,7 +17,8 @@
     "test:avatar-container": "node tests/avatar-container.mjs",
     "test:priority-remediation": "node tests/stream-revocation.mjs && node tests/nas-upgrade.mjs && node tests/room-ownership.mjs && node tests/room-ownership-migration.mjs",
     "test:lifecycle-capabilities": "node tests/room-lifecycle.mjs && node tests/room-lifecycle-migration.mjs && node tests/room-cleanup.mjs && node tests/room-cleanup-migration.mjs && node tests/legacy-nas-scope.mjs && node tests/room-cleanup-upstream.mjs && node tests/upstream-graceful-shutdown.mjs && node tests/worker-delivery-shutdown.mjs && node tests/server-preparation-drain.mjs && node tests/agent-drain-receipts.mjs && node tests/agent-graceful-shutdown.mjs && node tests/agent-index-port.mjs && node tests/playback-candidates.mjs",
-    "test:legacy-nas-scope": "node tests/legacy-nas-scope.mjs"
+    "test:legacy-nas-scope": "node tests/legacy-nas-scope.mjs",
+    "test:playback-generations": "node tests/playback-plan-migration.mjs && node tests/playback-plan-generations.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.55.0",

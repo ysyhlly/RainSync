@@ -4,6 +4,8 @@ import {
   detectCapabilities,
   detectCapabilitiesAsync,
   detectCandidateReport,
+  PlaybackPlanGenerations,
+  matchesPlanGeneration,
 } from "../../../../../packages/player-core";
 import {
   Corrector,
@@ -62,6 +64,9 @@ export function createPlaybackRuntime(ctx: {
     generationWaitFailed = false,
     generatedEnd: number | undefined;
   const corrector = new Corrector();
+  const planGenerations = new PlaybackPlanGenerations();
+  const currentPlan = (p: PlaybackPlan) =>
+    plan === p && planGenerations.current(p);
   let playbackRequests: PlaybackRequests | undefined;
   let playbackUser: string | undefined;
   let playbackEpoch: number | undefined;
@@ -92,8 +97,13 @@ export function createPlaybackRuntime(ctx: {
         const readiness = await readReadiness(
           p.session_id,
           AbortSignal.timeout(5000),
+          0,
+          p.plan_generation,
         );
-        if (plan !== p || state.value?.media_generation !== p.media_generation)
+        if (
+          !currentPlan(p) ||
+          state.value?.media_generation !== p.media_generation
+        )
           return;
         if (!readiness.complete) {
           await waitForGenerated(p);
@@ -101,7 +111,7 @@ export function createPlaybackRuntime(ctx: {
         }
       }
       if (
-        plan === p &&
+        currentPlan(p) &&
         roomIsActive() &&
         el.ended &&
         state.value?.playback_status === "playing"
@@ -110,7 +120,7 @@ export function createPlaybackRuntime(ctx: {
         ctx.ended?.(el.currentTime * 1000 + p.timeline_origin_ms);
       }
     } catch (failure) {
-      if (plan === p)
+      if (currentPlan(p))
         error.value =
           failure instanceof Error ? failure.message : String(failure);
     } finally {
@@ -153,13 +163,19 @@ export function createPlaybackRuntime(ctx: {
     id: string,
     signal: AbortSignal,
     relativePosition = 0,
+    planGeneration?: number,
   ): Promise<PlaybackReadiness> {
     const readiness = await session.api<PlaybackReadiness>(
-      `/playback-sessions/${id}?relative_position_ms=${encodeURIComponent(relativePosition)}`,
+      `/playback-sessions/${id}?relative_position_ms=${encodeURIComponent(relativePosition)}${planGeneration === undefined ? "" : `&plan_generation=${planGeneration}`}`,
       "GET",
       undefined,
       signal,
     );
+    if (
+      readiness.session_id !== id ||
+      !matchesPlanGeneration(planGeneration, readiness.plan_generation)
+    )
+      throw new RequestFailure({ error: { code: "STALE_PLAYBACK_PLAN" } });
     // A running EVENT prefix needs one whole segment ahead of the room clock.
     // Keep polling the real position; a complete or legacy response needs no lead.
     if (
@@ -243,6 +259,7 @@ export function createPlaybackRuntime(ctx: {
       return;
     }
     const serial = ++loadSerial;
+    const intent = planGenerations.next();
     try {
       await stopPlayback();
       await nextTick();
@@ -307,6 +324,7 @@ export function createPlaybackRuntime(ctx: {
         return;
       }
       const request: PlaybackRequest = {
+        ...intent,
         room_id: s.room_id,
         media_generation: s.media_generation,
         mode: mode.value,
@@ -326,7 +344,8 @@ export function createPlaybackRuntime(ctx: {
         session.epoch !== identity ||
         video.value !== element ||
         state.value?.room_id !== s.room_id ||
-        state.value?.media_generation !== s.media_generation
+        state.value?.media_generation !== s.media_generation ||
+        !planGenerations.current(p)
       ) {
         await session.api(`/playback-sessions/${p.session_id}`, "DELETE");
         return;
@@ -338,7 +357,7 @@ export function createPlaybackRuntime(ctx: {
       if (!p.subtitle_tracks.some((t) => t.index === subtitleIndex.value))
         subtitleIndex.value = undefined;
       await nextTick();
-      if (serial !== loadSerial) return;
+      if (serial !== loadSerial || !currentPlan(p)) return;
       applySubtitles();
       const el = video.value;
       if (p.observation_version === 1) {
@@ -348,7 +367,7 @@ export function createPlaybackRuntime(ctx: {
           element: el,
           plan: p,
           current: () =>
-            plan === p &&
+            currentPlan(p) &&
             roomIsActive() &&
             serial === loadSerial &&
             video.value === el &&
@@ -393,6 +412,7 @@ export function createPlaybackRuntime(ctx: {
         const candidate = p.selected_candidate_id;
         if (
           serial !== loadSerial ||
+          !currentPlan(p) ||
           !roomIsActive() ||
           mode.value !== "auto" ||
           !candidate ||
@@ -410,7 +430,7 @@ export function createPlaybackRuntime(ctx: {
         if (
           serial !== loadSerial ||
           !roomIsActive() ||
-          plan !== p ||
+          !currentPlan(p) ||
           !state.value ||
           recoveries >= 3
         )
@@ -445,7 +465,7 @@ export function createPlaybackRuntime(ctx: {
         if (
           serial !== loadSerial ||
           !roomIsActive() ||
-          plan !== p ||
+          !currentPlan(p) ||
           video.value !== el ||
           !el.getAttribute("src") ||
           !el.error ||
@@ -493,7 +513,12 @@ export function createPlaybackRuntime(ctx: {
         hls.loadSource(p.playback_url);
         hls.attachMedia(el);
         hls.on(Hls.Events.ERROR, (_, data) => {
-          if (serial === loadSerial && roomIsActive() && data.fatal) {
+          if (
+            serial === loadSerial &&
+            currentPlan(p) &&
+            roomIsActive() &&
+            data.fatal
+          ) {
             if (data.response?.code === 409 && recover()) return;
             if (data.type === "mediaError" && retryDecode()) return;
             recoveringHls = false;
@@ -506,18 +531,20 @@ export function createPlaybackRuntime(ctx: {
       else el.src = p.playback_url;
       if (p.selected_candidate_id) {
         firstFrameTimer = setTimeout(() => {
-          if (serial !== loadSerial || plan !== p || el.readyState >= 2) return;
+          if (serial !== loadSerial || !currentPlan(p) || el.readyState >= 2)
+            return;
           waiting.value = false;
           error.value = "首帧等待超时，请检查连接或重新加载播放";
         }, 20000);
         el.onloadeddata = () => {
-          if (serial !== loadSerial || plan !== p || el.readyState < 2) return;
+          if (serial !== loadSerial || !currentPlan(p) || el.readyState < 2)
+            return;
           clearTimeout(firstFrameTimer);
           firstFrameTimer = undefined;
         };
       }
       el.onloadedmetadata = () => {
-        if (serial !== loadSerial) return;
+        if (serial !== loadSerial || !currentPlan(p)) return;
         applySubtitles();
         duration.value = p.duration_ms ? p.duration_ms / 1000 : el.duration;
         void run(() => applyState(true));
@@ -554,11 +581,13 @@ export function createPlaybackRuntime(ctx: {
               0,
               target(state.value!, clock.now()) - p.timeline_origin_ms,
             ),
+            p.plan_generation,
           ),
         p.session_id,
         controller.signal,
+        p.plan_generation,
       );
-      if (controller.signal.aborted || plan !== p || !roomIsActive())
+      if (controller.signal.aborted || !currentPlan(p) || !roomIsActive())
         throw new PlaybackCancelled();
       if (ready.complete && ready.available_until_ms != null)
         generatedEnd = ready.available_until_ms / 1000;
@@ -581,7 +610,7 @@ export function createPlaybackRuntime(ctx: {
         video.value.load();
       }
     } catch (e) {
-      if (controller.signal.aborted || plan !== p || !roomIsActive())
+      if (controller.signal.aborted || !currentPlan(p) || !roomIsActive())
         throw new PlaybackCancelled();
       generationWaitFailed = true;
       waiting.value = false;
@@ -600,6 +629,8 @@ export function createPlaybackRuntime(ctx: {
     const s = state.value,
       el = video.value;
     if (!s || !el || !plan || el.readyState < 1) return;
+    const p = plan;
+    if (!currentPlan(p)) return;
     if (el.ended && s.playback_status === "playing" && !userSeek) {
       void completed();
       return;
@@ -662,16 +693,26 @@ export function createPlaybackRuntime(ctx: {
       if (el.paused)
         try {
           await el.play();
+          if (!currentPlan(p) || !roomIsActive() || video.value !== el) return;
           blocked.value = false;
         } catch {
+          if (!currentPlan(p) || !roomIsActive() || video.value !== el) return;
           blocked.value = true;
         }
     } else el.pause();
   }
   async function enablePlayback() {
     if (!roomIsActive()) return;
-    if (video.value) {
-      await video.value.play();
+    const p = plan,
+      el = video.value;
+    if (p && el && currentPlan(p)) {
+      try {
+        await el.play();
+      } catch (failure) {
+        if (!currentPlan(p) || !roomIsActive() || video.value !== el) return;
+        throw failure;
+      }
+      if (!currentPlan(p) || !roomIsActive() || video.value !== el) return;
       blocked.value = false;
       await applyState(true);
     }

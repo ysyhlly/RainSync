@@ -56,6 +56,15 @@
       "format": "uint32",
       "minimum": 0
     },
+    "plan_generation": {
+      "description": "Per-viewer intent generation; absent for legacy grants. Never room revision.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 1
+    },
     "playback_url": {
       "type": "string"
     },

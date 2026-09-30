@@ -31,6 +31,15 @@
       "format": "uint32",
       "minimum": 0
     },
+    "plan_generation": {
+      "description": "Echoes the immutable grant generation, independent of job attempts.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 1
+    },
     "session_id": {
       "type": "string",
       "format": "uuid"

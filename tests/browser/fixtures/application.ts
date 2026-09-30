@@ -146,6 +146,7 @@ export async function appFixture(
       preparations++;
       value = {
         session_id: "playback",
+        plan_generation: route.request().postDataJSON().plan_generation,
         media_id: "movie",
         media_generation: 1,
         delivery_mode: "direct",

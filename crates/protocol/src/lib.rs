@@ -78,6 +78,11 @@ pub struct ControlEpoch {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PlaybackPlan {
     pub session_id: Uuid,
+    /// Per-viewer intent generation; absent for legacy grants. Never room revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1))]
+    pub plan_generation: Option<u32>,
     pub media_id: Uuid,
     pub media_generation: u32,
     pub delivery_mode: String,
@@ -156,6 +161,11 @@ pub enum PreparationStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PlaybackReadiness {
     pub session_id: Uuid,
+    /// Echoes the immutable grant generation, independent of job attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1))]
+    pub plan_generation: Option<u32>,
     pub status: PreparationStatus,
     pub complete: bool,
     /// Exclusive end of the published prefix, relative to the plan's timeline origin.
@@ -253,6 +263,16 @@ pub struct PlaybackCapabilities {
 /// Missing optional fields preserve the original v1 playback request defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PlaybackRequest {
+    /// Opaque per-player identity for ordering only, never authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub viewer_id: Option<Uuid>,
+    /// Positive monotonic intent generation within user/room/viewer scope.
+    /// Must be supplied together with viewer_id; same-key retries retain it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1))]
+    pub plan_generation: Option<u32>,
     #[serde(default)]
     #[ts(optional)]
     pub idempotency_key: Option<Uuid>,
@@ -330,7 +350,31 @@ mod capability_tests {
         assert!(request.capabilities.is_none());
         assert!(request.observation_version.is_none());
         assert!(request.candidate_report.is_none());
+        assert!(request.viewer_id.is_none());
+        assert!(request.plan_generation.is_none());
     }
+    #[test]
+    fn plan_generation_fields_are_additive_and_bounded_on_decode() {
+        let legacy = serde_json::json!({"room_id": Uuid::nil(), "media_generation": 1});
+        let request: PlaybackRequest = serde_json::from_value(legacy.clone()).unwrap();
+        let canonical = serde_json::to_value(request).unwrap();
+        assert!(canonical.get("viewer_id").is_none());
+        assert!(canonical.get("plan_generation").is_none());
+        let mut current = legacy;
+        current["viewer_id"] = serde_json::json!(Uuid::new_v4());
+        current["plan_generation"] = serde_json::json!(u32::MAX);
+        let request: PlaybackRequest = serde_json::from_value(current.clone()).unwrap();
+        assert_eq!(request.plan_generation, Some(u32::MAX));
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(4294967296_u64),
+            serde_json::json!(1.5),
+        ] {
+            current["plan_generation"] = value;
+            assert!(serde_json::from_value::<PlaybackRequest>(current.clone()).is_err());
+        }
+    }
+
     #[test]
     fn refuses_unplayable_output_and_distinguishes_transports() {
         let mut caps = PlaybackCapabilities {

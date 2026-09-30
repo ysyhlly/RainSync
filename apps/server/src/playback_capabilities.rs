@@ -54,6 +54,8 @@ pub async fn candidates(
     tokio::spawn(async move {
         let request = protocol::PlaybackRequest {
             observation_version: None,
+            viewer_id: None,
+            plan_generation: None,
             idempotency_key: Some(Uuid::new_v4()),
             room_id: body.room_id,
             media_generation: body.media_generation,

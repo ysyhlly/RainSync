@@ -2,6 +2,13 @@ import type { ApiError } from "../../../packages/protocol";
 
 /** The new UI accepts both structured errors and the previous alpha's strings
  * so it can be deployed before Server/Worker during a rolling upgrade. */
+const playbackMessages: Record<string, string> = {
+  STALE_PLAYBACK_PLAN: "此播放方案已被新的操作替代，请重新加载当前播放",
+  INVALID_PLAN_GENERATION: "播放方案代次格式无效，请更新客户端",
+  PLAYBACK_VIEWER_LIMIT_EXCEEDED:
+    "此账号在该房间的播放器身份已达上限，现有播放器可继续使用；新播放器需使用新房间",
+};
+
 export class RequestFailure extends Error {
   readonly code: string;
   readonly retryable: boolean;
@@ -33,7 +40,7 @@ export class RequestFailure extends Error {
         ? detail.message
         : typeof error === "string"
           ? error
-          : "请求失败，请稍后重试";
+          : (playbackMessages[code] ?? "请求失败，请稍后重试");
     super(message + (requestId ? `（诊断编号：${requestId}）` : ""));
     this.name = "RequestFailure";
     this.code = code;

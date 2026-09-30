@@ -28,6 +28,7 @@ jobs:
       - run: cargo build --workspace --bins --examples --locked && node tests/integration.mjs
       - run: npm run test:priority-remediation
       - run: npm run test:lifecycle-capabilities
+      - run: npm run test:playback-generations
       - run: npm run test:accounts
       - name: Verify avatars with the deployment image's FFmpeg
         run: |

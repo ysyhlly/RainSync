@@ -4,6 +4,7 @@ import type {
   PlaybackReadiness,
 } from "../../../packages/protocol";
 import { RequestFailure } from "./errors";
+import { matchesPlanGeneration } from "../../../packages/player-core";
 
 export class PlaybackCancelled extends Error {
   constructor() {
@@ -72,6 +73,15 @@ export async function requestPlayback(
         try {
           const plan = await send(request, attempt.signal);
           if (attempt.signal.aborted) throw attempt.signal.reason;
+          if (
+            !matchesPlanGeneration(
+              request.plan_generation,
+              plan.plan_generation,
+            )
+          )
+            throw new RequestFailure({
+              error: { code: "STALE_PLAYBACK_PLAN" },
+            });
           return plan;
         } catch (error) {
           if (attempt.signal.aborted) throw attempt.signal.reason;
@@ -129,6 +139,7 @@ export async function waitPlaybackReady(
   read: (id: string, signal: AbortSignal) => Promise<PlaybackReadiness>,
   id: string,
   signal: AbortSignal,
+  planGeneration?: number,
 ): Promise<PlaybackReadiness> {
   const controller = new AbortController();
   const abort = () => controller.abort(new PlaybackCancelled());
@@ -145,6 +156,8 @@ export async function waitPlaybackReady(
       try {
         const result = await read(id, controller.signal);
         if (controller.signal.aborted) throw controller.signal.reason;
+        if (!matchesPlanGeneration(planGeneration, result.plan_generation))
+          throw new RequestFailure({ error: { code: "STALE_PLAYBACK_PLAN" } });
         if (
           result.session_id !== id ||
           !["queued", "preparing", "ready"].includes(result.status)
@@ -196,6 +209,7 @@ export class PlaybackRequests {
       id: string,
       signal: AbortSignal,
       relativePosition?: number,
+      planGeneration?: number,
     ) => Promise<PlaybackReadiness>,
   ) {
     const saved = JSON.parse(storage.getItem(storageKey) ?? "[]") as string[];
@@ -269,9 +283,11 @@ export class PlaybackRequests {
                 0,
                 (position?.() ?? input.position_ms) - plan.timeline_origin_ms,
               ),
+              plan.plan_generation,
             ),
           plan.session_id,
           controller.signal,
+          plan.plan_generation,
         );
       if (serial !== this.serial) throw new PlaybackCancelled();
       return plan;

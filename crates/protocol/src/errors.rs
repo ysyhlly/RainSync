@@ -73,6 +73,9 @@ pub enum ErrorCode {
     InvalidObservationRate,
     ObservationNotComplete,
     StaleMedia,
+    InvalidPlanGeneration,
+    PlaybackViewerLimitExceeded,
+    StalePlaybackPlan,
     InvalidPosition,
     InvalidRate,
     NoMedia,
@@ -184,6 +187,11 @@ impl ErrorCode {
 
     fn message(self) -> &'static str {
         match self {
+            Self::InvalidPlanGeneration => "播放方案代次格式无效，请更新客户端",
+            Self::StalePlaybackPlan => "此播放方案已被新的操作替代，请重新加载当前播放",
+            Self::PlaybackViewerLimitExceeded => {
+                "此账号在该房间的播放器身份已达上限，现有播放器可继续使用；新播放器需使用新房间"
+            }
             Self::UnsupportedObservationVersion => "播放观测协议版本不受支持，请更新客户端",
             Self::ObservationVersionRequired => "此会话未启用播放观测，请重新准备播放",
             Self::InvalidObservation => "播放观测格式无效，请检查客户端",
@@ -319,6 +327,25 @@ pub struct ErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stale_plan_is_explicit_and_not_blindly_retried() {
+        assert_eq!(
+            ErrorCode::from_reason("stale_playback_plan", 409),
+            ErrorCode::StalePlaybackPlan
+        );
+        assert_eq!(
+            ErrorCode::from_reason("invalid_plan_generation", 400),
+            ErrorCode::InvalidPlanGeneration
+        );
+        assert!(!ErrorCode::StalePlaybackPlan.retryable());
+        assert!(!ErrorCode::InvalidPlanGeneration.retryable());
+        assert_eq!(
+            ErrorCode::from_reason("playback_viewer_limit_exceeded", 429),
+            ErrorCode::PlaybackViewerLimitExceeded
+        );
+        assert!(!ErrorCode::PlaybackViewerLimitExceeded.retryable());
+    }
+
     #[test]
     fn observation_rejections_have_specific_public_codes_and_require_new_action() {
         for (reason, status, expected) in [
