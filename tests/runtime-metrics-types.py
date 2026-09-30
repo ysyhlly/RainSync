@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-source = Path(__file__).resolve().parents[1] / "apps/server/src/runtime_metrics.rs"
+source = Path(__file__).resolve().parents[1] / "crates/media-core/src/runtime_metrics.rs"
 with tempfile.TemporaryDirectory(prefix="rainsync-w08-types-") as temporary:
     root = Path(temporary)
     library = root / "libruntime_metrics.rlib"

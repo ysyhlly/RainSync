@@ -1,7 +1,6 @@
 use super::*;
+pub use media_core::runtime_metrics as runtime;
 use std::sync::Mutex;
-#[path = "runtime_metrics.rs"]
-pub mod runtime;
 
 #[derive(Default)]
 struct ClientSnapshot {
@@ -55,7 +54,7 @@ impl Metrics {
             state.steady, state.steady, state.drift_sum
         );
         drop(state);
-        s.push_str(&self.runtime.render());
+        s.push_str(&self.runtime.render_for(runtime::Process::Server));
         s
     }
 }
@@ -128,8 +127,10 @@ mod tests {
     fn actual_runtime_hook_is_included_in_server_render() {
         let metrics = Metrics::default();
         metrics.runtime.cache_lookup(runtime::CacheDecision::Hit);
-        assert!(metrics
-            .render()
-            .contains("rainsync_cache_lookups_total{result=\"hit\"} 1\n"));
+        assert!(
+            metrics
+                .render()
+                .contains("rainsync_cache_lookups_total{result=\"hit\",process=\"server\"} 1\n")
+        );
     }
 }

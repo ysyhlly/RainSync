@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn unwired_is_absent_not_zero() {
-    assert_eq!(RuntimeMetrics::default().render(), "");
+    assert_eq!(RuntimeMetrics::default().render_for(Process::Worker), "");
 }
 #[test]
 fn cumulative_samples_reject_replays_conflicts_regressions_and_zero_sequence() {
@@ -42,16 +42,22 @@ fn abandoned_transfer_accounts_partial_bytes_and_releases_capacity() {
 #[test]
 fn cache_hit_cannot_be_attached_to_another_layer() {
     let metrics = RuntimeMetrics::default();
-    assert!(metrics
-        .begin_transfer(Layer::UpstreamRead, Cache::Hit)
-        .is_none());
-    assert!(metrics
-        .begin_transfer(Layer::NasUplink, Cache::Hit)
-        .is_none());
+    assert!(
+        metrics
+            .begin_transfer(Layer::UpstreamRead, Cache::Hit)
+            .is_none()
+    );
+    assert!(
+        metrics
+            .begin_transfer(Layer::NasUplink, Cache::Hit)
+            .is_none()
+    );
     assert_eq!(lock(&metrics.inner).dropped, 2);
-    assert!(!metrics
-        .render()
-        .contains("rainsync_cache_served_bytes_total"));
+    assert!(
+        !metrics
+            .render_for(Process::Worker)
+            .contains("rainsync_cache_served_bytes_total")
+    );
 }
 #[test]
 fn admission_and_memory_are_bounded_and_reusable() {
@@ -64,9 +70,11 @@ fn admission_and_memory_are_bounded_and_reusable() {
         })
         .collect();
     for _ in 0..10_000 {
-        assert!(metrics
-            .begin_transfer(Layer::WorkerEgress, Cache::NotHit)
-            .is_none());
+        assert!(
+            metrics
+                .begin_transfer(Layer::WorkerEgress, Cache::NotHit)
+                .is_none()
+        );
     }
     assert_eq!(lock(&metrics.inner).active, MAX_ACTIVE_TRANSFERS);
     assert_eq!(lock(&metrics.inner).dropped, 10_000);
@@ -74,9 +82,11 @@ fn admission_and_memory_are_bounded_and_reusable() {
     assert!(std::mem::size_of::<Transfer>() <= 128);
     drop(handles);
     assert_eq!(lock(&metrics.inner).active, 0);
-    assert!(metrics
-        .begin_transfer(Layer::WorkerEgress, Cache::NotHit)
-        .is_some());
+    assert!(
+        metrics
+            .begin_transfer(Layer::WorkerEgress, Cache::NotHit)
+            .is_some()
+    );
 }
 #[test]
 fn counter_overflow_saturates_instead_of_wrapping() {
@@ -123,11 +133,11 @@ fn independent_layers_and_outcomes_have_a_fixed_series_limit() {
     ] {
         metrics.playback_failure(failure);
     }
-    let text = metrics.render();
+    let text = metrics.render_for(Process::Worker);
     let data: Vec<_> = text.lines().filter(|line| !line.starts_with('#')).collect();
     // 9 combinations * (bytes + 10 buckets + count + sum) + 3 admission + 3 live layer counters + 2 cache + 4 failure.
     assert_eq!(data.len(), 129);
-    assert!(text.len() < 20_000);
+    assert!(text.len() < 24_000);
     for line in data {
         let number: f64 = line.rsplit_once(' ').unwrap().1.parse().unwrap();
         assert!(number.is_finite() && number >= 0.0);
@@ -153,9 +163,9 @@ fn concurrent_updates_and_scrapes_preserve_totals_and_histogram_consistency() {
                 transfer.finish(Outcome::Complete);
                 metrics.cache_lookup(CacheDecision::Hit);
                 if lock(&metrics.inner).admitted % 100 == 0 {
-                    let output = metrics.render();
+                    let output = metrics.render_for(Process::Worker);
                     let value = |prefix: &str| output.lines().find(|s| s.starts_with(prefix)).unwrap().rsplit_once(' ').unwrap().1.parse::<u64>().unwrap();
-                    assert_eq!(value("rainsync_transfer_duration_seconds_bucket{layer=\"worker_egress\",outcome=\"complete\",le=\"+Inf\"}"), value("rainsync_transfer_duration_seconds_count{"));
+                    assert_eq!(value("rainsync_transfer_duration_seconds_bucket{layer=\"worker_egress\",outcome=\"complete\",le=\"+Inf\",process=\"worker\"}"), value("rainsync_transfer_duration_seconds_count{"));
                 }
             }
         })
@@ -180,9 +190,11 @@ fn live_bytes_are_visible_before_eof_and_never_credited_twice() {
         .begin_transfer(Layer::WorkerEgress, Cache::Hit)
         .unwrap();
     assert!(transfer.sample(1, 100));
-    let output = metrics.render();
-    assert!(output.contains("rainsync_transfer_body_bytes_total{layer=\"worker_egress\"} 100\n"));
-    assert!(output.contains("rainsync_cache_served_bytes_total 100\n"));
+    let output = metrics.render_for(Process::Worker);
+    assert!(output.contains(
+        "rainsync_transfer_body_bytes_total{layer=\"worker_egress\",process=\"worker\"} 100\n"
+    ));
+    assert!(output.contains("rainsync_cache_served_bytes_total{process=\"worker\"} 100\n"));
     assert!(!output.contains("rainsync_transfer_bytes_total{layer="));
     assert!(transfer.sample(1, 100));
     assert!(!transfer.sample(1, 200));
@@ -227,10 +239,24 @@ fn cloned_handles_share_one_process_collector_and_new_instances_are_independent(
         .begin_transfer(Layer::UpstreamRead, Cache::NotHit)
         .unwrap();
     transfer.sample(1, 512);
-    assert!(worker
-        .render()
-        .contains("rainsync_transfer_body_bytes_total{layer=\"upstream_read\"} 512\n"));
-    assert_eq!(server.render(), "");
+    assert!(worker.render_for(Process::Worker).contains(
+        "rainsync_transfer_body_bytes_total{layer=\"upstream_read\",process=\"worker\"} 512\n"
+    ));
+    assert_eq!(server.render_for(Process::Worker), "");
     drop(transfer);
     assert_eq!(lock(&worker.inner).transfers[2][2].bytes, 512);
+}
+
+#[test]
+fn process_labels_are_fixed_and_separate_instances_stay_independent() {
+    let server = RuntimeMetrics::default();
+    let worker = RuntimeMetrics::default();
+    server.cache_lookup(CacheDecision::Hit);
+    worker.cache_lookup(CacheDecision::Miss);
+    let a = server.render_for(Process::Server);
+    let b = worker.render_for(Process::Worker);
+    assert!(a.contains("result=\"hit\",process=\"server\"} 1"));
+    assert!(b.contains("result=\"miss\",process=\"worker\"} 1"));
+    assert!(!a.contains("process=\"worker\""));
+    assert!(!b.contains("process=\"server\""));
 }

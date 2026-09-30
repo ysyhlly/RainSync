@@ -20,6 +20,12 @@ const LAYERS: [&str; 3] = ["worker_egress", "nas_uplink", "upstream_read"];
 const OUTCOMES: [&str; 3] = ["complete", "failed", "cancelled"];
 
 #[derive(Clone, Copy, Debug)]
+pub enum Process {
+    Server,
+    Worker,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub enum Layer {
     WorkerEgress,
     NasUplink,
@@ -129,7 +135,29 @@ impl RuntimeMetrics {
         let n = &mut state.failures[failure as usize];
         *n = n.saturating_add(1);
     }
-    pub fn render(&self) -> String {
+    /// Process labels are closed enum values; this never contacts another process.
+    pub fn render_for(&self, process: Process) -> String {
+        let raw = self.render_unlabelled();
+        let label = match process {
+            Process::Server => "server",
+            Process::Worker => "worker",
+        };
+        let mut output = String::with_capacity(raw.len() + 4096);
+        for line in raw.lines() {
+            if line.starts_with('#') {
+                writeln!(output, "{line}").unwrap();
+                continue;
+            }
+            let (name, value) = line.split_once(' ').expect("fixed metric sample");
+            if let Some(name) = name.strip_suffix('}') {
+                writeln!(output, "{name},process=\"{label}\"}} {value}").unwrap();
+            } else {
+                writeln!(output, "{name}{{process=\"{label}\"}} {value}").unwrap();
+            }
+        }
+        output
+    }
+    fn render_unlabelled(&self) -> String {
         let state = lock(&self.inner).clone();
         let mut out = String::with_capacity(16_384);
         if state.admitted > 0 || state.dropped > 0 {
