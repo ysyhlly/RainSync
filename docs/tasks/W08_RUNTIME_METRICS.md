@@ -108,3 +108,51 @@ Implementation and focused validation results will be appended below. Shared
 hook approval and actual owner integration are pending. Unit fixtures must not be
 presented as end-to-end Worker/browser proof. This is a W08 basic metrics slice;
 weak-network, 100-online capacity, mobile devices and 72-hour gates remain open.
+
+## Checkpoint validation (2026-09-30)
+
+Code commit: `ea35dec`; design commit: `1c280c6`. Final documentation checkpoint
+is the next commit on this branch. Remote integration was rechecked after tests
+and still resolves to `9b167ab92e36b373bdb6c46718ced16dfb8070aa`.
+
+| Check | Result |
+| --- | --- |
+| std-only rustc collector tests | 9 passed, 0 failed |
+| `cargo test --locked --offline -p rainsync-server metrics:: -- --nocapture` | 12 passed (includes the 9 collector tests), 0 failed; 28 unrelated tests filtered |
+| `python3 tests/runtime-metrics-types.py` | 3 compile-rejection checks passed: negative, NaN, Infinity bytes |
+| `node --test tests/acceptance-measurements.test.mjs` | 6 passed, 0 failed; confirms offline contract unchanged |
+| rustfmt check on three Rust files; git diff --check | Passed |
+| Actual HTTP scrape/auth, Worker hook E2E, committed preparation failure hook | NOT RUN / not wired by owners |
+| Browser first frame/stall/reconnect, devices, weak network, 100 online, 72 hours | NOT RUN / deferred |
+
+Rust 1.98.0, Cargo 1.98.0, Node 24.19.0. Cargo used a dedicated
+`/workspace/w08-target` with two build jobs and cached dependencies in offline
+mode; no shared build target, database, service, device or production access.
+No dependencies or lockfiles changed. Metrics endpoint retains existing admin
+authentication and does not introduce any HTTP ingestion route.
+
+Current real wiring: CLIENT_STATUS -> legacy bounded snapshot -> existing admin
+metrics endpoint; queue/DB observations -> same endpoint; runtime collector
+renderer -> same endpoint. Transfer/cache/preparation failure producers remain
+UNWIRED pending their unique owners. Render-hook unit tests are synthetic and
+are not advertised as real Worker/browser measurements.
+
+Per user model steering, stop at this reviewed checkpoint for the parent to
+continue with gpt-6.1-sol. No merge, push or deployment performed. The delivery
+ZIP contains an incremental Git bundle (requires exact baseline), complete
+mailbox patch, this design/validation record, and test logs. Import either the
+bundle or patch, not both. After obtaining the baseline:
+
+```sh
+git fetch /path/to/rainsync-w08.bundle feature/w08-runtime-metrics
+git switch -c review/w08 FETCH_HEAD
+# Alternative on a fresh branch at 9b167ab:
+git am /path/to/rainsync-w08.patch
+```
+
+Outstanding owner decisions: authorize Worker process-local collector/export
+wiring, select actual body boundaries and cache-eligible lookups, and wire new
+committed preparation failures excluding replay/cancel/supersession. Browser
+telemetry needs a separate truthful client-reported schema and presentation/
+foreground timing contract before implementation. This checkpoint does NOT
+complete W08 or prove Worker readiness.
