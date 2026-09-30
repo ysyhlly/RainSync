@@ -58,7 +58,13 @@ test("room owner reviews transfer, loses controls and retains the current player
   const prepared = app.preparations();
   await page.getByRole("button", { name: "确认转让" }).click();
   await expect(page.getByRole("dialog", { name: "转让房间" })).toBeHidden();
-  await expect(page.getByText("房间已转让，当前影片继续播放")).toBeVisible();
+  // Closed dialogs remain mounted, so match the single accessible notice,
+  // not the hidden invitation dialog's copy of the shared message.
+  const transferred = page.getByRole("status").filter({
+    hasText: "房间已转让，当前影片继续播放",
+  });
+  await expect(transferred).toHaveCount(1);
+  await expect(transferred).toBeVisible();
   await expect(
     page.getByRole("button", { name: "转让房间", exact: true }),
   ).toHaveCount(0);
