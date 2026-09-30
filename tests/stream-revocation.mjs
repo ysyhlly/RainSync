@@ -389,7 +389,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
       );
       const blockedChecks = Number(
         f.sql(
-          `SELECT count(*) FROM pg_stat_activity WHERE application_name='${workerApplication}' AND wait_event_type='Lock' AND query LIKE 'SELECT EXISTS(SELECT 1 FROM playback_sessions%'`,
+          `SELECT count(*) FROM pg_stat_activity WHERE application_name='${workerApplication}' AND wait_event_type='Lock' AND query LIKE 'SELECT src.id AS source_id,%' AND query LIKE '%p.delivery_token_hash=$2%' AND query LIKE '%playback_source_allowed(p.media_id,p.resource)%'`,
         ),
       );
       assert.ok(
