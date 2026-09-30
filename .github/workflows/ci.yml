@@ -45,7 +45,8 @@ jobs:
           echo "RAINSYNC_FFMPEG_BIN=/usr/bin" >> "$GITHUB_ENV"
           export RAINSYNC_NATIVE_POSTGRES_BIN="$(pg_config --bindir)"
           test -x "$RAINSYNC_NATIVE_POSTGRES_BIN/initdb"
-          echo "RAINSYNC_NATIVE_POSTGRES_BIN=$RAINSYNC_NATIVE_POSTGRES_BIN" >> "$GITHUB_ENV"
+          # Native PostgreSQL belongs to this batch. The later avatar image
+          # fixture intentionally requires its own Docker database/network.
           node scripts/bind-native-backend.mjs > "$RUNNER_TEMP/rainsync-validation/binding-path.txt"
           BINDING="$(tail -n 1 "$RUNNER_TEMP/rainsync-validation/binding-path.txt")"
           echo "W03_BACKEND_BINDING=$BINDING" >> "$GITHUB_ENV"

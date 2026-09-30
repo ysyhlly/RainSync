@@ -63,13 +63,14 @@ async function until(check, label) {
   }
   throw new Error(`deadline: ${label}`);
 }
-function profile(userId, { position = 0, audio = null, direct = false } = {}) {
+function profile(userId, { position = 0, audio = null, direct = false, mediaSourceId = null } = {}) {
   return {
     UserId: userId,
     IsPlayback: true,
     AutoOpenLiveStream: false,
     StartTimeTicks: Math.round(position * 10000),
     AudioStreamIndex: audio,
+    MediaSourceId: mediaSourceId,
     SubtitleStreamIndex: -1,
     EnableDirectPlay: direct,
     EnableDirectStream: !direct,
@@ -511,6 +512,9 @@ for (const kind of kinds) {
                 const grant = await negotiate(clientA, hevc, {
                   position,
                   audio,
+                  // Both products bind a requested stream index to its actual
+                  // media source. This ID is observed, never derived from item ID.
+                  mediaSourceId: seed.source.Id,
                 });
                 assert.equal(
                   grant.source.DefaultAudioStreamIndex,
