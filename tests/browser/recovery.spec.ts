@@ -1,5 +1,7 @@
+import {mediaExtraResponse} from "./fixtures/media";
 import { readFileSync } from "node:fs";
 import { test, expect, type Page, type WebSocketRoute } from "@playwright/test";
+import { navigate, chooseRoom, showOptions } from "./fixtures/navigation";
 
 test("library navigation requests bounded pages and searches beyond the current page", async ({
   page,
@@ -9,8 +11,13 @@ test("library navigation requests bounded pages and searches beyond the current 
   await page.route("**/api/v1/media?*", (r) => {
     const q = new URL(r.request().url()).searchParams;
     queries.push(q);
-    const start = q.get("after") ? 100 : 0;
-    const count = q.get("search") === "needle" ? 1 : start ? 50 : 100;
+    const start = q.get("after")
+      ? Number(q.get("after")!.split("-")[1]) + 1
+      : 0;
+    const count =
+      q.get("search") === "needle"
+        ? 1
+        : Math.min(Number(q.get("limit")), 150 - start);
     return r.fulfill({
       json: Array.from({ length: count }, (_, n) => ({
         id: `item-${start + n}`,
@@ -19,18 +26,22 @@ test("library navigation requests bounded pages and searches beyond the current 
       })),
     });
   });
+  await navigate(page, "媒体库");
   await page.getByLabel("搜索影片").fill("entry");
-  await expect(page.locator(".media-card")).toHaveCount(100);
+  await page.getByLabel("搜索影片").press("Enter");
+  await expect(page.locator(".media-card")).toHaveCount(24);
   await page.getByRole("button", { name: "下一页", exact: true }).click();
-  await expect(page.locator(".media-card")).toHaveCount(50);
-  expect(queries.at(-1)!.get("after")).toBe("item-99");
+  await expect(page.getByText("第 2 页 · 本页 24 部")).toBeVisible();
+  await expect(page.locator(".media-card")).toHaveCount(24);
+  expect(queries.at(-1)!.get("after")).toBe("item-23");
   await page.getByRole("button", { name: "上一页", exact: true }).click();
-  await expect(page.locator(".media-card")).toHaveCount(100);
+  await expect(page.getByText("第 1 页 · 本页 24 部")).toBeVisible();
+  await expect(page.locator(".media-card")).toHaveCount(24);
   await page.getByLabel("搜索影片").fill("needle");
   await expect(page.locator(".media-card")).toHaveCount(1);
   expect(queries.at(-1)!.get("search")).toBe("needle");
   expect(queries.at(-1)!.has("after")).toBe(false);
-  expect(queries.every((q) => q.get("limit") === "100")).toBe(true);
+  expect(queries.every((q) => q.get("limit") === "25")).toBe(true);
 });
 
 async function setup(
@@ -78,6 +89,7 @@ async function setup(
     }),
   );
   await page.route("**/api/v1/**", async (r) => {
+    const extra=mediaExtraResponse(r);if(extra)return extra;
     const url = new URL(r.request().url()),
       path = url.pathname;
     if (path.endsWith("/auth/me"))
@@ -199,8 +211,9 @@ async function setup(
       }
     });
   });
-  await page.goto("/");
-  await page.getByLabel("选择房间").selectOption("a");
+  await page.goto("/rooms/a");
+  await expect(page.locator(".connection-status")).toHaveText("已连接");
+  await expect.poll(() => clockFrame?.type).toBe("CLOCK_SYNC");
   return {
     frames,
     preparations,
@@ -294,8 +307,8 @@ test("slow previous-room history cannot overwrite the new room", async ({
 }) => {
   const h = await setup(page, { holdRoom: true });
   await expect.poll(() => h.preparations.length).toBe(1);
-  await page.getByLabel("选择房间").selectOption("b");
-  await page.getByLabel("选择房间").selectOption("c");
+  await chooseRoom(page, "b");
+  await chooseRoom(page, "c");
   await expect(page.getByText("current-room", { exact: true })).toBeVisible();
   h.releaseRoom();
   await expect(page.getByText("old-room", { exact: true })).toHaveCount(0);
@@ -320,11 +333,12 @@ test("reconnect merges missed chat and an old renewal cannot fail the new plan",
   h.holdRenew();
   await page.clock.fastForward(600000);
   await expect.poll(() => h.hasRenew()).toBe(true);
+  await showOptions(page);
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
   await expect.poll(() => h.preparations.length).toBe(2);
   h.releaseRenew();
   await expect(page.getByRole("alert")).not.toContainText("播放会话已失效");
-  await expect(page.getByLabel("选择房间")).toBeVisible();
+  await expect(page.locator(".room-information h1")).toHaveText("a");
 });
 
 test("rejected chat retains input until its own acknowledgement", async ({
@@ -362,7 +376,8 @@ test("rejected chat retains input until its own acknowledgement", async ({
 test("stale HLS attempt refetches entry manifest without a new playback session", async ({
   page,
 }) => {
-  await page.route("**/node_modules/.vite/deps/hls__js.js*", (r) =>
+  // Vite's dependency cache can live outside node_modules for isolated runs.
+  await page.route(/\/deps\/hls__js\.js(?:\?|$)/, (r) =>
     r.fulfill({
       contentType: "text/javascript",
       body: `
@@ -399,6 +414,7 @@ test("stale HLS attempt refetches entry manifest without a new playback session"
     }),
   );
   await expect.poll(() => h.preparations.length).toBe(1);
+  await showOptions(page);
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
   await expect
     .poll(() => page.evaluate(() => (window as any).hlsSources?.length))
@@ -433,13 +449,15 @@ test("stale HLS attempt refetches entry manifest without a new playback session"
   expect(h.preparations).toHaveLength(1);
 });
 
-test("empty room option preserves the current viewing connection", async ({
+test("room chooser without a selection preserves the current viewing connection", async ({
   page,
 }) => {
   const h = await setup(page, { validMedia: true });
   await expect.poll(() => h.preparations.length).toBe(1);
-  await page.getByLabel("选择房间").selectOption("");
-  await expect(page.getByLabel("选择房间")).toHaveValue("a");
+  await navigate(page, "放映室");
+  await expect(page.locator(".mini-player")).toBeVisible();
+  await page.getByRole("link", { name: "返回房间", exact: true }).click();
+  await expect(page.locator(".room-information h1")).toHaveText("a");
   await page.clock.fastForward(1000);
   expect(h.sockets).toHaveLength(1);
   expect(h.preparations).toHaveLength(1);
@@ -455,6 +473,7 @@ test("native HLS recovery keeps room time and waits for a growing replacement pl
   });
   const h = await setup(page, { validMedia: true, nativeHls: true });
   await expect.poll(() => h.preparations.length).toBe(1);
+  await expect(page.locator("video")).toHaveAttribute("src", /empty-video/);
   await page.evaluate(() => {
     const el = document.querySelector("video")!;
     el.load = () => {};
@@ -529,6 +548,26 @@ test("native recovery can play buffered data before seekable is exposed", async 
     .toBeGreaterThan(0);
   expect(h.preparations).toHaveLength(1);
   await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("ending an incomplete generated prefix waits without advancing the room", async ({ page }) => {
+  await page.addInitScript(() => { HTMLMediaElement.prototype.canPlayType = () => "probably"; });
+  const h = await setup(page, { validMedia: true, nativeHls: true });
+  await expect(page.locator("video")).toHaveAttribute("src", /empty-video/);
+  let reads = 0;
+  await page.route("**/api/v1/playback-sessions/session-1?*", r => {
+    reads++;
+    return r.fulfill({ json: { session_id: "session-1", status: reads === 1 ? "ready" : "preparing", complete: false, available_until_ms: 10000 } });
+  });
+  await page.evaluate(() => {
+    const video = document.querySelector("video")!;
+    Object.defineProperty(video, "ended", { configurable: true, get: () => true });
+    video.dispatchEvent(new Event("ended"));
+  });
+  await expect.poll(() => reads).toBeGreaterThan(1);
+  await page.clock.runFor(6000);
+  expect(h.frames.filter(f => f.type === "END_MEDIA")).toHaveLength(0);
+  expect(h.preparations).toHaveLength(1);
 });
 
 test("a growing output waits for the room position and resumes the same native session", async ({
@@ -653,7 +692,7 @@ for (const action of [
       await page.evaluate(() => {
         Reflect.deleteProperty(document.querySelector("video")!, "seekable");
       });
-      await page.getByLabel("选择房间").selectOption("c");
+      await chooseRoom(page, "c");
     } else {
       h.sockets.at(-1)!.send(
         JSON.stringify({
@@ -713,11 +752,12 @@ test("teardown media errors are silent while an active unsupported resource is r
   const h = await setup(page, { validMedia: true });
   await expect.poll(() => h.preparations.length).toBe(1);
   await expect(page.getByRole("alert")).toHaveCount(0);
+  await showOptions(page);
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
   await expect.poll(() => h.preparations.length).toBe(2);
   await page.clock.fastForward(500);
   await expect(page.getByRole("alert")).toHaveCount(0);
-  await page.getByLabel("选择房间").selectOption("c");
+  await chooseRoom(page, "c");
   await expect.poll(() => h.preparations.length).toBe(3);
   await page.clock.fastForward(500);
   await expect(page.getByRole("alert")).toHaveCount(0);

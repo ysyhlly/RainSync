@@ -5,6 +5,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Isolate validation outputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/rainsync-validation"
+          echo "RAINSYNC_ARTIFACT_DIR=$RUNNER_TEMP/rainsync-validation" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rainsync-validation/cargo-target" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -12,10 +17,21 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Install media validation prerequisites
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo run -p protocol --example export -- --check
       - run: npm ci && npm test && npm run build
       - run: cargo build --workspace --bins --examples --locked && node tests/integration.mjs
+      - run: npm run test:accounts
+      - name: Verify avatars with the deployment image's FFmpeg
+        run: |
+          docker build -f deploy/Dockerfile -t rainsync-server:dev .
+          npm run test:avatar-container
+      - run: npm run test:chat
+      - run: node tests/playlist-scan.mjs
       - run: npx playwright install --with-deps chromium && npm run test:e2e
+      - run: npm run test:browser-real
+      - run: node tests/playlist-real.mjs

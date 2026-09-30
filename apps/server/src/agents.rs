@@ -2,6 +2,61 @@ use super::*;
 use axum::extract::ws::Message;
 use futures_util::{SinkExt, StreamExt};
 
+pub struct Control {
+    connection: Uuid,
+    scans: tokio::sync::mpsc::Sender<Scan>,
+}
+struct Scan {
+    id: Uuid,
+    reply: tokio::sync::oneshot::Sender<&'static str>,
+}
+// Wait for a committed matching snapshot, never report a dispatched request as success.
+pub async fn scan(
+    State(app): State<App>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    admin(&auth(&app, &h, true).await?)?;
+    let valid: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE id=$1 AND NOT revoked)")
+            .bind(id)
+            .fetch_one(&app.db)
+            .await?;
+    if !valid {
+        return Err(err(StatusCode::NOT_FOUND, "invalid_agent"));
+    }
+    let (reply, result) = tokio::sync::oneshot::channel();
+    let controls = app.agent_controls.lock().await;
+    let Some(control) = controls.get(&id) else {
+        return Ok(Json(json!({"status":"offline"})));
+    };
+    if control
+        .scans
+        .try_send(Scan {
+            id: Uuid::new_v4(),
+            reply,
+        })
+        .is_err()
+    {
+        return Ok(Json(json!({"status":"busy"})));
+    }
+    drop(controls);
+    let status = match tokio::time::timeout(std::time::Duration::from_secs(120), result).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => "disconnected",
+        Err(_) => "timeout",
+    };
+    let count: i64 = if status == "complete" {
+        sqlx::query_scalar("SELECT count(*) FROM media_items WHERE source_id=$1 AND available")
+            .bind(id)
+            .fetch_one(&app.db)
+            .await?
+    } else {
+        0
+    };
+    Ok(Json(json!({"status":status,"count":count})))
+}
+
 pub async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     admin(&auth(&app, &h, false).await?)?;
     let rows = sqlx::query("SELECT id,name,revoked,last_seen::text FROM agents")
@@ -60,6 +115,11 @@ pub async fn connect(
     let id = id.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid_agent"))?;
     Ok(upgrade.max_message_size(1024 * 1024).max_frame_size(1024 * 1024).on_upgrade(move |socket| async move {
         let (mut out, mut input) = socket.split();
+        let connection = Uuid::new_v4();
+        let (scan_tx, mut scans) = tokio::sync::mpsc::channel::<Scan>(1);
+        app.agent_controls.lock().await.insert(id, Control { connection, scans: scan_tx });
+        let mut supports_scan = false;
+        let mut pending: Option<Scan> = None;
         let (pages, incoming) = tokio::sync::mpsc::channel(1);
         let (acks, mut completed) = tokio::sync::mpsc::channel(1);
         let ingest_app = app.clone();
@@ -70,9 +130,22 @@ pub async fn connect(
         });
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
         loop { tokio::select! {
+            request = scans.recv() => {
+                let Some(request) = request else { break };
+                if !supports_scan { let _ = request.reply.send("unsupported"); continue; }
+                if pending.is_some() { let _ = request.reply.send("busy"); continue; }
+                let message = json!({"type":"SCAN","snapshot":request.id});
+                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3), out.send(Message::Text(message.to_string().into()))).await, Ok(Ok(()))) { break; }
+                pending = Some(request);
+            }
             ack = completed.recv() => {
                 let Some(ack) = ack else { break };
                 let failed = ack["type"] == "INDEX_ERROR";
+                if failed {
+                    if let Some(request) = pending.take() { let _ = request.reply.send("failed"); }
+                } else if ack["final"] == true && pending.as_ref().is_some_and(|p| ack["snapshot"] == p.id.to_string()) {
+                    let _ = pending.take().unwrap().reply.send("complete");
+                }
                 if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3), out.send(Message::Text(ack.to_string().into()))).await, Ok(Ok(()))) || failed { break }
             }
             _ = tick.tick() => {
@@ -99,6 +172,10 @@ pub async fn connect(
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {},
                     Some(Ok(Message::Text(text))) => {
                         let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
+                        if value["type"] == "HELLO" { supports_scan = value["manual_scan"] == true; }
+                        if value["type"] == "SCAN_BUSY" && pending.as_ref().is_some_and(|p| value["snapshot"] == p.id.to_string()) {
+                            let _ = pending.take().unwrap().reply.send("busy");
+                        }
                         if value["type"] == "INDEX" && pages.try_send(value).is_err() { break }
                     }
                     Some(Ok(Message::Binary(_))) => {},
@@ -109,6 +186,8 @@ pub async fn connect(
         // Dropping the uncommitted snapshot rolls back partial/disconnected indexing.
         ingest.abort();
         let _ = ingest.await;
+        let mut controls = app.agent_controls.lock().await;
+        if controls.get(&id).is_some_and(|c| c.connection == connection) { controls.remove(&id); }
     }))
 }
 
@@ -182,7 +261,7 @@ async fn ingest_index(
                 sqlx::query("UPDATE media_items SET available=false WHERE source_id=$1 AND NOT EXISTS(SELECT 1 FROM agent_index_page i WHERE i.resource=media_items.resource)").bind(id).execute(&mut *tx).await?;
                 sqlx::query("INSERT INTO media_items(id,source_id,title,resource,source_version) SELECT gen_random_uuid(),$1,title,resource,source_version FROM agent_index_page ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,available=true,source_version=EXCLUDED.source_version,metadata=CASE WHEN media_items.source_version IS DISTINCT FROM EXCLUDED.source_version THEN '{}'::jsonb ELSE media_items.metadata END,duration_ms=CASE WHEN media_items.source_version IS DISTINCT FROM EXCLUDED.source_version THEN NULL ELSE media_items.duration_ms END").bind(id).execute(&mut *tx).await?;
                 tx.commit().await?;
-                acks.send(json!({"type":"INDEX_ACK","sequence":sequence,"final":true}))
+                acks.send(json!({"type":"INDEX_ACK","sequence":sequence,"snapshot":snapshot,"final":true}))
                     .await?;
                 break;
             }

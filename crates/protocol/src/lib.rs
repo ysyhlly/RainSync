@@ -48,6 +48,7 @@ pub enum Action {
     Seek { position_ms: f64 },
     SetRate { rate: f64 },
     ChangeMedia { media_id: Uuid },
+    EndMedia { position_ms: f64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]

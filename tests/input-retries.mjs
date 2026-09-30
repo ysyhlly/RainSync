@@ -14,6 +14,7 @@ import { relayCancellation } from "./relay-cancellation.mjs";
 import { agentRelay } from "./agent-relay.mjs";
 const cancellation = process.argv.includes("--relay-cancel");
 const realAgent = process.argv.includes("--agent-relay");
+assert.ok(!(cancellation && realAgent), "Run cancellation and real Agent scenarios separately: cancellation intentionally terminates its Worker");
 const nas = process.argv.includes("--nas") || cancellation || realAgent;
 assert.ok(
   process.argv
@@ -33,7 +34,8 @@ const name = `rainsync-input-${randomUUID().slice(0, 8)}`,
   db = `${name}-db`,
   server = `${name}-server`,
   worker = `${name}-worker`;
-const root = resolve(".runtime/input-retries", name);
+assert.ok(process.env.RAINSYNC_ARTIFACT_DIR, "Set external artifacts directory");
+const root = resolve(process.env.RAINSYNC_ARTIFACT_DIR, "input-retries", name);
 const password = randomBytes(20).toString("hex"),
   key = randomBytes(32);
 const report = {

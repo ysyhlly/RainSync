@@ -85,6 +85,11 @@ pub async fn scan(
                 .and_then(|v| v.parse::<f64>().ok())
                 .map(|v| v * 1000.0);
             item.metadata = meta;
+            if let Ok(file) = std::fs::File::open(&path)
+                && let Ok(snapshot) = media_core::file_version::snapshot_file(&file)
+            {
+                item.metadata["preview_file_version"] = json!(snapshot.version);
+            }
             let mut sidecars = serde_json::Map::new();
             for (i, ext) in ["srt", "vtt"].iter().enumerate() {
                 let relative = std::path::Path::new(&item.resource)
@@ -96,6 +101,9 @@ pub async fn scan(
                 }
             }
             item.metadata["sidecars"] = Value::Object(sidecars);
+        }
+        if row.get::<String, _>("kind") != "local" {
+            item.metadata["preview_scan"] = json!(generation);
         }
         batch.push(item);
         if batch.len() == 32 {
@@ -155,11 +163,13 @@ pub async fn library(
     State(app): State<App>,
     h: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<LibraryQuery>,
-) -> Result<Json<Value>> {
-    auth(&app, &h, false).await?;
-    let rows=sqlx::query("SELECT m.id,m.title,m.duration_ms,s.kind FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.available AND ($1::uuid IS NULL OR m.id>$1) AND strpos(lower(m.title),lower($2))>0 ORDER BY m.id LIMIT $3")
-        .bind(query.after).bind(query.search).bind(query.limit.unwrap_or(100).clamp(1,200)).fetch_all(&app.db).await?;
-    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"title":r.get::<String,_>("title"),"duration_ms":r.get::<Option<f64>,_>("duration_ms"),"kind":r.get::<String,_>("kind")})).collect())))
+) -> Result<Response> {
+    let user = auth(&app, &h, false).await?;
+    let rows=sqlx::query(&format!("{} WHERE {} AND ($2::uuid IS NULL OR m.id>$2) AND strpos(lower(COALESCE(u.title,m.shared_title,m.title)),lower($3))>0 ORDER BY m.id LIMIT $4", media_titles::SELECT, media_titles::VISIBLE))
+        .bind(user.id).bind(query.after).bind(query.search).bind(query.limit.unwrap_or(100).clamp(1,200)).fetch_all(&app.db).await?;
+    Ok(media_titles::private_json(Value::Array(
+        rows.iter().map(media_titles::media).collect(),
+    )))
 }
 pub async fn playback(
     State(app): State<App>,

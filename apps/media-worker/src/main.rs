@@ -7,6 +7,8 @@ mod output_decode;
 mod output_publish;
 mod output_read;
 mod outputs;
+mod preview_input;
+mod previews;
 mod process;
 mod relay;
 mod transfer_state;
@@ -40,6 +42,7 @@ struct App {
     probes: Arc<tokio::sync::Semaphore>,
     output_checks: Arc<output_read::Checks>,
     input_failures: input_failure::Registry,
+    preview_inputs: preview_input::Registry,
 }
 fn hash(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
@@ -785,6 +788,7 @@ async fn main() -> anyhow::Result<()> {
         probes: Arc::new(tokio::sync::Semaphore::new(2)),
         output_checks: Default::default(),
         input_failures: Default::default(),
+        preview_inputs: Default::default(),
         public_url: std::env::var("PUBLIC_ORIGIN").unwrap_or("http://localhost:8088".into()),
     };
     tokio::fs::create_dir_all(&app.cache).await?;
@@ -794,6 +798,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { "ok" }))
         .route("/media-delivery/{id}/{path}", get(delivery).head(delivery))
         .route("/agent-data/{id}", get(relay::connect))
+        .route(
+            "/preview-input/{id}/{key}",
+            get(preview_input::read).head(preview_input::read),
+        )
         .with_state(app)
         .layer(axum::middleware::from_fn(http_api::errors));
     let listener = tokio::net::TcpListener::bind(
@@ -801,6 +809,11 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     let cleaner = tokio::spawn(cache_outputs::run(job_app.clone(), stop.subscribe()));
+    let preview_queue = tokio::spawn(previews::run(
+        job_app.clone(),
+        persistence::media_previews::Settings::configured()?,
+        stop.subscribe(),
+    ));
     let queue = tokio::spawn(jobs(job_app, stop.subscribe()));
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { process::stopped(&mut server_stop).await })
@@ -829,9 +842,11 @@ async fn main() -> anyhow::Result<()> {
     // even when the queue or cleanup task failed.
     let process_result = child_process::shutdown().await;
     let cleaner_result = cleaner.await;
+    let preview_result = preview_queue.await;
     process_result?;
     queue_result?;
     cleaner_result?;
+    preview_result?;
     server_result?;
     signal_result?;
     Ok(())

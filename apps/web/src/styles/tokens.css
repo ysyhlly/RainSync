@@ -1,0 +1,31 @@
+:root {
+  color-scheme: light;
+  --surface-canvas: #fff4d5;
+  --surface-panel: #fff8e5;
+  --surface-muted: #f0e0b5;
+  --text-primary: #30241f;
+  --text-secondary: #65493d;
+  --accent: #d2b49c;
+  --text-on-accent: #30241f;
+  --accent-soft: #eed9b5;
+  --player-text: #fff;
+  --player-progress: #eed9b5;
+  --player-track: rgb(255 255 255 / 0.3);
+  --player-menu: rgb(24 24 24 / 0.96);
+  --navigation-outline: #d6bc96;
+  --navigation-glow: #866250;
+  --navigation-glow-tail: #cfac78;
+  --border-subtle: #dfcda5;
+  --border-control: #866250;
+  --danger: #9a3d32;
+  --focus-ring: #6d5043;
+  --success: #3d613f;
+  --overlay: rgb(48 36 31 / 0.24);
+  --shadow-floating: 0 12px 40px rgb(48 36 31 / 0.14);
+  --radius-control: 11px;
+  --radius-panel: 18px;
+  --sidebar-width: 216px;
+  --mini-height: 112px;
+  --bottom-nav-height: 0px;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
