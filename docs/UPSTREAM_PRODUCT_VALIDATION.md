@@ -1,5 +1,28 @@
 # Fixed product validation: open compatibility gates
 
+## Latest fixed-product result: eight of ten cases pass
+
+[Run 36750871494 on adc5f75](https://github.com/ysyhlly/RainSync/actions/runs/36750871494)
+passes all three actual HLS seeks on both pins: decoded source pixels are exactly
+10,000, 27,000 and 43,000 ms, with requested audio 440/880/440 Hz. Jellyfin measures
+440/880/440 Hz and Emby 439.63/879.27/439.45 Hz. The actual single-item GET supplies
+the observed source ID. Browse, direct H264 decode and independent-device Stop
+also pass. Every captured SID is stopped and owned containers/networks are removed.
+
+The only two failed cases remain media-policy revocation: both products confirm
+`EnableMediaPlayback=false` but return 200 for the same media at immediate, one-
+and three-second samples. The other account still decodes successfully. These
+assertions remain failed; the workflow is not relabeled green. This is distinct
+from RainSync's verified explicit source-policy revision revocation and does not
+prove automatic enforcement of each upstream account policy or browser playback.
+
+A next contract must specify whether explicit RainSync revocation is sufficient,
+or require bounded upstream-policy observation with a defined failure/refresh
+window. SourceConfig currently binds one upstream account per source; per-login
+upstream revocation also requires a RainSync-user to upstream-user mapping.
+
+## Earlier failed evidence and corrections
+
 The isolated 2026-09-30 run on checkpoint `3e8df53` exercised the exact official
 Jellyfin 10.11.0 and Emby 4.10.0.40 image digests declared by the fixture.
 [Run and preserved reports](https://github.com/ysyhlly/RainSync/actions/runs/36746877870)
@@ -17,7 +40,8 @@ The HLS harness now retains probe and bounded segment-window diagnostics and
 decodes up to three adjacent segments from the returned timeline. Requested
 10/27/43-second source pixels (600 ms tolerance) and selected 440/880 Hz audio
 (30 Hz tolerance) remain required; no failed seek position is skipped. This
-correction is not declared passed until its new fixed-product run finishes.
+correction is verified by the later result above, together with explicit source
+binding and bounded codec discovery. Earlier failures remain retained.
 
 The media-policy failure must remain visible. Jellyfin's fixed-version
 [Static video route](https://github.com/jellyfin/jellyfin/blob/v10.11.0/Jellyfin.Api/Controllers/VideosController.cs#L434-L482)

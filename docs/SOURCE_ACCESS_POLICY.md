@@ -136,8 +136,8 @@ Product behavior, single-login revocation, real DNS/CDN deployments, devices and
 long-duration acceptance remain open until their respective evidence exists.
 
 The subsequent explicit-audio discovery checkpoint passes 181 Rust tests with a
-fresh backend/binary binding. On that binding, 33 reservation cases plus two
-separately run graceful-shutdown-during-metadata cases, 24 observation cases,
+fresh backend/binary binding. On that binding, all 35 reservation cases,
+including graceful shutdown during metadata discovery, 24 observation cases,
 ten gateway groups and four policy admission groups pass. The shutdown checks
 observe the real metadata connection close, persisted preparation drain before
 restart, and no PlaybackInfo POST or fabricated Stop. See
