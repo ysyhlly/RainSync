@@ -16,7 +16,7 @@ assertions remain failed; the workflow is not relabeled green. This is distinct
 from RainSync's verified explicit source-policy revision revocation and does not
 prove automatic enforcement of each upstream account policy or browser playback.
 
-The selected follow-on contract is now [bounded upstream-account observation](UPSTREAM_ACCOUNT_POLICY.md): fresh positive results last at most five seconds and inconclusive reads fail closed. SourceConfig binds one upstream account per source; per-login upstream revocation still requires a separate identity mapping. Thirty controlled RainSync enforcement cases pass. The independent fixed-product enforcement job must verify the final published candidate; it does not change these raw upstream behavior failures.
+The selected follow-on contract is now [bounded upstream-account observation](UPSTREAM_ACCOUNT_POLICY.md): fresh positive results last at most five seconds and inconclusive reads fail closed. SourceConfig binds one upstream account per source; per-login upstream revocation still requires a separate identity mapping. Thirty controlled RainSync enforcement cases pass. The independent RainSync enforcement job on [9b167ab](https://github.com/ysyhlly/RainSync/actions/runs/36772747622) also passed all 30 cases on both exact real-product images, including active source closure after an upstream account policy edit. This does not change the raw upstream behavior failures. Detailed timings and limitations are in the observation contract.
 
 ## Earlier failed evidence and corrections
 

@@ -36,6 +36,7 @@ await isolatedMediaStack("room-cleanup", async f => {
   const upstream=createServer((req,res)=>{
     if(req.url==="/source") { sourceRequests++; res.writeHead(200,{"Content-Type":"video/mp4","Content-Length":1024*1024*1024}); res.flushHeaders(); return; }
     req.resume();
+    if(req.url==="/Users/fixture") {res.writeHead(200,{"Content-Type":"application/json"}).end(JSON.stringify({Id:"fixture",Policy:{IsDisabled:false,EnableMediaPlayback:true}}));return;}
     if(req.url.startsWith("/Items/") && req.url.endsWith("/PlaybackInfo")) {
       const reply=()=>res.writeHead(200,{"Content-Type":"application/json"}).end(JSON.stringify({PlaySessionId:randomUUID(),MediaSources:[{Id:"fixture",SupportsDirectPlay:true,MediaStreams:[],RunTimeTicks:300000000}]}));
       if(negotiation==="defer") releaseNegotiation=reply;

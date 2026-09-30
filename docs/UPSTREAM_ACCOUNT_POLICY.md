@@ -82,8 +82,19 @@ GET. Late allocated SIDs retained Stop obligations; a policy denial during audio
 metadata lookup prevented the resource-allocating POST. Recovery, account/config
 replacement, monotonic expiration and restart fencing were exercised.
 
-These are controlled upstream contracts, not actual Jellyfin/Emby execution.
-The last retirement-reason-only refinement has separate focused regression.
-Complete CI and the separate immutable real-product enforcement job remain
-pending for the final published candidate. The prior raw 8/10 product result
-continues to describe the upstream servers themselves.
+The controlled suite is separate from the subsequent real fixed-product result.
+On [9b167ab, run 36772747622](https://github.com/ysyhlly/RainSync/actions/runs/36772747622),
+RainSync enforcement passed all 15 cases on Jellyfin 10.11.0 and all 15 on Emby
+4.10.0.40. Actual policy edit to source closure was 4.004/1.996 seconds; observed
+denial to closure was 1.861/0.013 seconds. Pausing the observer closed sources in
+4.526/4.791 seconds. Twelve database-blocked streams closed within 4.271 seconds,
+while unrelated account media still returned complete bytes. Exact backend and
+test hashes stayed unchanged; owned processes, ports, containers and networks
+were verified released. [Sanitized evidence artifact](https://github.com/ysyhlly/RainSync/actions/runs/36772747622/artifacts/11124258965)
+SHA-256: `0b47e36ed66ae42ae34f2fb757d85d5a58e34bcaf27b966e483eaeb92c2774d5`.
+
+The raw fixed-product job still records the two media-policy failures separately;
+its red workflow result is not relabeled green by RainSync's mitigation. Complete
+repository CI remains separate: the new function's controlled and real-product
+checks pass, while legacy test fixtures are being updated to supply account
+policy responses. Long/device/production acceptance is deferred.
