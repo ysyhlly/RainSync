@@ -1111,9 +1111,19 @@ async function runMatrix(upstream, product) {
           async (record) => {
             const warm = await nextPlan();
             await stop(warm);
-            const item =
+            const listed =
               upstream.item ??
               upstream.items.find((entry) => entry.Name === "rainsync-h264");
+            assert.ok(listed?.Id, "fixture has the selected media identity");
+            // A library-list summary may omit stream indices. Observe the
+            // authenticated single-item detail, matching production discovery.
+            const item =
+              upstream.item ??
+              (await subjectClient.api(
+                `/Users/${encodeURIComponent(subjectClient.userId)}/Items/${encodeURIComponent(listed.Id)}`,
+              ));
+            assert.equal(item.Id, listed.Id);
+            assert.equal(item.MediaSources?.length, 1);
             const audio = item.MediaSources[0].MediaStreams.find(
               (entry) => entry.Type === "Audio",
             );
