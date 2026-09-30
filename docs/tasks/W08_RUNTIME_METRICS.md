@@ -22,7 +22,7 @@ No offline result is loaded into the runtime collector.
 | Reconnect / count | room-runtime has connectionSerial and retries, but server RESUME is also initial join | Deferred. Count successful recovery after an initial connection in one mounted room runtime; deduplicate serial, reset on disposal. Network-restored-to-snapshot duration requires independent test evidence, not socket-open time. |
 | Playback preparation failures / count | playback_requests::fail persists pending-to-failed transition | Typed process-local counter hook, only after committed new transition; replay, supersession and user cancel excluded. This is not decoder failure. |
 | Queue depth / items | RoomHandle::command_queue_depth, connected_receivers; SQL queued jobs | Existing actual instantaneous gauges retained; read each queue once per scrape for total/max coherence. No room labels. |
-| Cache lookup / requests; cached body / bytes | Worker delivery_response selects validated generated output and owns read guard | Hook once per actual cache decision; hit only after successful validated open/lease. Miss only for a cache-eligible lookup, not every direct-stream request. Cached bytes count body chunks actually handed off, including partial failed delivery. |
+| Cache lookup / requests; cached body / bytes | Worker delivery_response selects validated generated output and owns read guard | Hook once per actual cache decision; hit only for output already available at the initial eligible lookup and after successful validated open/lease; waiting for newly generated output is a miss. Miss only for a cache-eligible lookup, not every direct-stream request. Cached bytes count body chunks actually handed off, including partial failed delivery. |
 | Layered body transfer / bytes, seconds | Worker bytes_stream and output body stream; Agent relay stream | Independent bounded transfer handles. Fixed layers worker_egress/nas_uplink/upstream_read. Instant monotonic start through terminal outcome; cumulative byte samples from actual body chunks, not Content-Length/reserved bytes. Body handoff/read is not proof of browser receipt. |
 | Legacy drift / milliseconds | rooms CLIENT_STATUS untrusted JSON | Preserve existing metric names, explicitly label HELP as client-reported. Signed drift becomes absolute error; invalid/nonfinite/out-of-range values rejected. Reports count received messages, including retries; no identity exists for trustworthy deduplication. |
 
@@ -54,7 +54,8 @@ in-memory collector. No new unauthenticated telemetry route is proposed.
   not proof of decode. Outcome labels are complete/failed/cancelled. Histograms
   cover all outcomes, so failed time is not omitted from transfer diagnostics.
 - `RuntimeMetrics::cache_lookup(CacheDecision)`: after validated cache lookup,
-  once per request; fixed hit/miss. Owner prevents callback duplication. Cache
+  once per request; fixed hit/miss. A newly generated output after waiting remains
+  a miss, not a hit retroactively. Owner prevents callback duplication. Cache
   bytes and request counts have separate denominators.
 - `RuntimeMetrics::playback_failure(Failure)`: after playback_requests::fail
   commits a *new* pending-to-failed transition (baseline line 321). Return/use
@@ -62,10 +63,18 @@ in-memory collector. No new unauthenticated telemetry route is proposed.
   transaction rollback, stale plan or cancellation. Fixed prepare/upstream/
   capacity/other enum; no raw error text. Decoder failure needs separate
   client-reported instrumentation and is deferred.
-- Worker baseline `main.rs::delivery_response`: upstream `bytes_stream` (line
-  163), generated output/read lease branch (line 301 onward); new HTTP file
-  delivery owner must place equivalent hooks around its final body producer.
-  Include all chunk and cancellation paths. Do not edit that owner's files here.
+- Worker baseline `http_media.rs` line 263 is the upstream body stream (including
+  prefix sniffing); line 361 chains saved prefix chunks with remaining body.
+  Count UpstreamRead once as chunks are read, not again when replaying that prefix.
+  `main.rs:163` is only the subtitle branch, not primary media throughput.
+- `file_delivery.rs::stream` lines 95/124 read actual file chunks;
+  `playback_access.rs` line 576 owns the outer permission-checked body. Worker
+  owner should count WorkerEgress at the final handoff, not simultaneously at
+  both layers. Generated output/read lease selection is in main.rs line 301.
+  Include HEAD/304 (no body transfer), partial Range, EOF, error and cancellation.
+  NAS relay receipt at Worker is not NAS egress: NasUplink requires actual Agent
+  send-side evidence. Do not populate it from Worker receipt. No owner files are
+  edited here.
 - Room owner: existing metrics endpoint reads queue snapshots; no change needed
   in rooms.rs. Browser owner: room-runtime connect/onopen/onmessage and
   observation-binding are the future reconnect/presentation/window hook sites.
