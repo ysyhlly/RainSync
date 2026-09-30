@@ -496,7 +496,7 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
             window.eventHls = this;
             window.eventHlsInitial ??= this;
             window.eventMediaSourceInitial ??= this.mediaSource;
-            window.eventHlsStats ??= { instances: 0, loads: [], detaches: 0, attaches: 0, starts: [], manifests: [], plays: 0, errors: [] };
+            window.eventHlsStats ??= { instances: 0, loads: [], detaches: 0, attaches: 0, starts: [], manifests: [], plays: 0, errors: [], recoverySequence: [] };
             window.eventHlsStats.instances++;
             this.timer = setInterval(() => { void this.refresh() }, 250);
           }
@@ -507,6 +507,7 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
               const response = await fetch(this.url);
               if (!response.ok) {
                 window.eventHlsStats.errors.push(response.status);
+                window.eventHlsStats.recoverySequence.push("error:" + response.status);
                 this.error?.(Hls.Events.ERROR, { fatal: true, response: { code: response.status }, details: 'manifestLoadError' });
                 return;
               }
@@ -525,6 +526,7 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
           }
           loadSource(url) {
             if (this.media && this.url) {
+              window.eventHlsStats.recoverySequence.push('recovery');
               const media = this.media;
               this.detachMedia();
               this.mediaSource = new MediaSource();
@@ -689,12 +691,25 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
   expect((await stats()).sameMediaSource).toBe(false);
   await expect(page.getByRole("alert")).toHaveCount(0);
   manifestFailures = 3;
-  for (let failure = 2; failure <= 4; failure++) {
-    await page.clock.runFor(250);
-    await expect.poll(async () => (await stats()).errors.length).toBe(failure);
-  }
+  // The installed clock also advances while route responses and polling await.
+  // Consecutive errors can therefore cross an intermediate count between polls.
+  // Keep the burst and exact final sequence/budget assertions; do not require
+  // observing every transient count as if fetch completion were synchronous.
+  await page.clock.runFor(750);
+  await expect
+    .poll(async () => (await stats()).errors)
+    .toEqual([409, 409, 409, 409]);
   const failed = await stats();
   expect(failed.errors).toEqual([409, 409, 409, 409]);
+  expect(failed.recoverySequence).toEqual([
+    "error:409",
+    "recovery",
+    "error:409",
+    "recovery",
+    "error:409",
+    "recovery",
+    "error:409",
+  ]);
   expect(failed.loads).toHaveLength(4);
   expect(failed.detaches).toBe(3);
   expect(failed.attaches).toBe(4);
