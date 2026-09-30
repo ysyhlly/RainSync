@@ -275,9 +275,13 @@ for (const kind of kinds) {
         ) => {
           const path = resolve(root, `${kind}-${name}.media`);
           await writeFile(path, bytes);
+          // Fixed 60-second fixtures can place audio preroll before the video
+          // headers. Bound codec discovery explicitly instead of relying on
+          // FFmpeg's five-second/default packet analysis window.
+          const probeOptions = ["-probesize", "8388608", "-analyzeduration", "60000000", "-max_probe_packets", "32768"];
           const { stdout: probe } = await execute(
             ffprobe,
-            ["-v", "error", "-show_streams", "-show_format", "-of", "json", path],
+            ["-v", "error", ...probeOptions, "-show_streams", "-show_format", "-of", "json", path],
             { encoding: "utf8", timeout: 15000 },
           );
           const probed = JSON.parse(probe);
@@ -287,6 +291,7 @@ for (const kind of kinds) {
             sha256: await digest(path),
             expected_position_ms: expectedPosition,
             seek_in_window_ms: seekMs,
+            probe_limits: { bytes: 8388608, media_microseconds: 60000000, packets: 32768 },
             format_start_time: probed.format?.start_time ?? null,
             format_duration: probed.format?.duration ?? null,
             streams: probed.streams.map(({ index, codec_name, codec_type, width, height, start_time, duration }) =>
@@ -301,6 +306,7 @@ for (const kind of kinds) {
               "-nostdin",
               "-threads",
               "1",
+              ...probeOptions,
               "-i",
               path,
               "-ss",
@@ -342,6 +348,7 @@ for (const kind of kinds) {
                 "-nostdin",
                 "-threads",
                 "1",
+                ...probeOptions,
                 "-i",
                 path,
                 "-ss",
@@ -499,11 +506,15 @@ for (const kind of kinds) {
             "three real HLS seeks and decoded selected audio tracks",
             async (row) => {
               row.outputs = [];
-              const seed = await negotiate(clientA, hevc, { position: 0 });
-              const tracks = seed.source.MediaStreams.filter(
+              const metadata = await clientA.api(`/Users/${clientA.userId}/Items/${hevc.Id}`);
+              assert.equal(metadata.Id, hevc.Id);
+              assert.equal(metadata.MediaSources.length, 1, "Observed single media source is unambiguous");
+              const observedSource = metadata.MediaSources[0];
+              assert.ok(typeof observedSource.Id === "string" && observedSource.Id.length > 0);
+              row.discovered_source_id = observedSource.Id;
+              const tracks = observedSource.MediaStreams.filter(
                 (stream) => stream.Type === "Audio",
               );
-              await stop(seed);
               assert.equal(tracks.length, 2);
               for (const [index, position] of [
                 10_000, 27_000, 43_000,
@@ -514,7 +525,7 @@ for (const kind of kinds) {
                   audio,
                   // Both products bind a requested stream index to its actual
                   // media source. This ID is observed, never derived from item ID.
-                  mediaSourceId: seed.source.Id,
+                  mediaSourceId: observedSource.Id,
                 });
                 assert.equal(
                   grant.source.DefaultAudioStreamIndex,

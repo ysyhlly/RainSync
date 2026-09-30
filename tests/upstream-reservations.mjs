@@ -13,9 +13,11 @@ import { isolatedServer } from "./fixtures/server.mjs";
 const runtime = resolve(process.env.RAINSYNC_RUNTIME_ROOT ?? ".runtime");
 const artifacts = resolve(runtime, "upstream-reservations");
 const crashUnknownOnly = process.argv.slice(2).includes("--crash-unknown-only");
+const metadataShutdownOnly = process.argv.slice(2).includes("--metadata-shutdown-only");
+assert.ok(!(crashUnknownOnly && metadataShutdownOnly), "choose one focused scenario");
 assert.ok(
-  process.argv.slice(2).every((arg) => arg === "--crash-unknown-only"),
-  "only the optional isolated crash scenario selector is supported",
+  process.argv.slice(2).every((arg) => ["--crash-unknown-only", "--metadata-shutdown-only"].includes(arg)),
+  "only documented focused scenario selectors are supported",
 );
 process.env.RAINSYNC_ARTIFACT_DIR = artifacts;
 const runRoot = resolve(artifacts, randomUUID());
@@ -41,7 +43,7 @@ const report = {
   scope:
     "native Server + isolated PostgreSQL; controlled Jellyfin/Emby HTTP contracts; no real upstream/Worker/browser decode claim",
   result: "running",
-  selection: crashUnknownOnly ? "crash-unknown-only" : "all",
+  selection: crashUnknownOnly ? "crash-unknown-only" : metadataShutdownOnly ? "metadata-shutdown-only" : "all",
   entry_sha256: await digest(entry),
   fixture_entry_sha256: await digest(fixtureEntry),
   binary: {
@@ -99,6 +101,7 @@ const sqlUuid = (id) => {
 const token = randomBytes(24).toString("hex");
 const contract = {
   queue: [],
+  metadataQueue: [],
   requests: [],
   negotiations: [],
   stops: [],
@@ -194,6 +197,19 @@ const upstream = createServer(async (request, response) => {
         ],
       });
     }
+    if (path === "/Users/fixture-user/Items/fixture") {
+      assert.equal(request.method, "GET");
+      assert.match(device ?? "", /^rainsync-[0-9a-f-]{36}$/);
+      const fault = contract.metadataQueue.shift() ?? {};
+      fault.received = event;
+      if (fault.hold) await fault.hold.promise;
+      return json({ Id: "fixture", MediaSources: fault.empty ? [] : [{
+        Id: `source-${kind}`,
+        // 999 deliberately disappears from PlaybackInfo: retain the existing
+        // test that response-time validation must not discard an allocated SID.
+        MediaStreams: [{ Type: "Audio", Index: 1 }, { Type: "Audio", Index: 999 }],
+      }] });
+    }
     if (path === "/Items/fixture/PlaybackInfo") {
       assert.match(device ?? "", /^rainsync-[0-9a-f-]{36}$/);
       const fault = contract.queue.shift() ?? { name: "normal" };
@@ -204,6 +220,8 @@ const upstream = createServer(async (request, response) => {
         request: {
           IsPlayback: body.IsPlayback,
           AutoOpenLiveStream: body.AutoOpenLiveStream,
+          MediaSourceId: body.MediaSourceId,
+          AudioStreamIndex: body.AudioStreamIndex,
         },
       });
       contract.negotiations.push(event);
@@ -217,6 +235,7 @@ const upstream = createServer(async (request, response) => {
       fault.received = event;
       if (fault.hold) await fault.hold.promise;
       const value = playbackInfo(sid, kind, upstreamOrigin);
+      value.MediaSources[0].DefaultAudioStreamIndex = fault.wrong_audio ? 2 : (body.AudioStreamIndex ?? 1);
       if (fault.empty_sources) value.MediaSources = [];
       if (fault.no_sid) delete value.PlaySessionId;
       if (fault.conflicting_url_sid)
@@ -506,7 +525,7 @@ try {
             "Emby encoding cleanup is independently observed",
           );
       }
-      if (!crashUnknownOnly) {
+      if (!crashUnknownOnly && !metadataShutdownOnly) {
         for (const kind of ["jellyfin", "emby"]) {
           await controller.change(media[kind]);
           await scenario(
@@ -798,6 +817,68 @@ try {
         );
         for (const kind of ["jellyfin", "emby"]) {
           await controller.change(media[kind]);
+          await scenario(`${kind}: observed audio source uses read-only GET before one owned POST`, async (result) => {
+            const key = randomUUID(), before = contract.negotiations.length;
+            const answer = await prepare(key, { audio_index: 1 });
+            assert.equal(answer.status, 200);
+            const row = byKey(key), post = contract.negotiations[before];
+            assert.equal(contract.negotiations.length, before + 1);
+            assert.equal(post.request.MediaSourceId, `source-${kind}`);
+            assert.equal(post.request.AudioStreamIndex, 1);
+            const get = contract.requests.find((event) => event.device_id === row.device_id && event.path === "/Users/fixture-user/Items/fixture");
+            assert.ok(get && get.monotonic_ms <= post.monotonic_ms);
+            await admin.request(`/playback-sessions/${row.id}`, "DELETE");
+            await closed(row.id); assertKnownStop(row.id);
+            result.session_id = row.id;
+          });
+          await scenario(`${kind}: invalid read-only metadata never creates an unknown SID`, async (result) => {
+            contract.metadataQueue.push({ empty: true });
+            const key = randomUUID(), before = contract.negotiations.length;
+            assert.equal((await prepare(key, { audio_index: 1 })).status, 502);
+            const row = await closed(byKey(key).id);
+            assert.equal(contract.negotiations.length, before);
+            assert.equal(row.negotiation, "not_sent"); assert.equal(row.play_session_id, null);
+            result.session_id = row.id;
+          });
+          await scenario(`${kind}: metadata timeout is positively not sent`, async (result) => {
+            const fault = { hold: deferred() }; contract.metadataQueue.push(fault);
+            const key = randomUUID(), before = contract.negotiations.length, began = performance.now();
+            const answer = await prepare(key, { audio_index: 1 });
+            const elapsed = performance.now() - began; fault.hold.release();
+            assert.equal(answer.status, 502); assert.ok(elapsed >= 9000 && elapsed < 16000);
+            const row = await closed(byKey(key).id);
+            assert.equal(row.negotiation, "not_sent"); assert.equal(row.play_session_id, null);
+            assert.equal(row.cleanup_attempts, 0); assert.equal(row.io_uncertain, false);
+            assert.equal(contract.negotiations.length, before);
+            result.session_id = row.id; result.elapsed_ms = elapsed;
+          });
+          for (const action of ["cancel", "policy"]) {
+            await scenario(`${kind}: ${action} during metadata GET prevents allocation`, async (result) => {
+              const fault = { hold: deferred() }; contract.metadataQueue.push(fault);
+              const key = randomUUID(), before = contract.negotiations.length;
+              const pending = observePending(prepare(key, { audio_index: 1 }));
+              await until(() => fault.received, "read-only metadata request arrives");
+              assert.equal(byKey(key).negotiation, "reserved");
+              if (action === "cancel") await admin.request(`/playback-requests/${key}`, "DELETE");
+              else {
+                const revision = Number(fixture.sql(`SELECT access_policy_revision FROM sources WHERE id=${sqlUuid(sources[kind].id)}`));
+                await admin.request(`/sources/${sources[kind].id}/access-policy`, "POST", {
+                  expected_revision: revision,
+                  policy: { schema_version: 1, origins: [{ origin: upstreamOrigin, cidrs: ["127.0.0.0/8"] }] },
+                });
+              }
+              fault.hold.release(); assert.notEqual((await consumePending(pending)).status, 200);
+              const row = await closed(byKey(key).id);
+              assert.equal(row.negotiation, "not_sent"); assert.equal(row.play_session_id, null);
+              assert.equal(contract.negotiations.length, before); result.session_id = row.id;
+            });
+          }
+          await scenario(`${kind}: ignored audio selection retains SID before rejection`, async (result) => {
+            contract.queue.push({ name: `${kind}-wrong-audio`, wrong_audio: true });
+            const key = randomUUID(); assert.equal((await prepare(key, { audio_index: 1 })).status, 502);
+            const row = byKey(key); assert.ok(row.response_encrypted && row.play_session_id);
+            await closed(row.id); assertKnownStop(row.id); result.session_id = row.id;
+          });
           await scenario(
             `${kind}: audio validation fails after durable SID checkpoint`,
             async (result) => {
@@ -1276,6 +1357,33 @@ try {
           },
         );
       }
+      if (!crashUnknownOnly) {
+        for (const kind of ["jellyfin", "emby"]) {
+          await controller.change(media[kind]);
+          await scenario(`${kind}: shutdown during metadata GET drains preparation without a POST`, async (result) => {
+            const fault = { hold: deferred() }; contract.metadataQueue.push(fault);
+            const key = randomUUID(), before = contract.negotiations.length;
+            const pending = observePending(prepare(key, { audio_index: 1 }));
+            await until(() => fault.received, "read-only metadata request arrives before shutdown");
+            const initial = byKey(key); assert.equal(initial.negotiation, "reserved");
+            const began = performance.now(); await fixture.stopServer();
+            const elapsed = performance.now() - began;
+            const answer = await pending;
+            assert.ok(answer.error || answer.value.status !== 200);
+            await until(() => fault.received.connection_closed_at_ms, "shutdown closes actual metadata connection");
+            assert.equal(fixture.sql(`SELECT drained_at IS NOT NULL FROM playback_preparations WHERE session_id=${sqlUuid(initial.id)}`), "t", "graceful preparation drain is persisted before restart");
+            assert.equal(contract.negotiations.length, before);
+            fault.hold.release(); await fixture.startServer({}, binary);
+            const final = await closed(initial.id);
+            assert.equal(final.negotiation, "not_sent"); assert.equal(final.play_session_id, null);
+            assert.equal(final.cleanup_attempts, 0); assert.equal(final.io_uncertain, false);
+            assert.equal(contract.negotiations.length, before);
+            controller.close(); await controller.join(room);
+            Object.assign(result, { session_id: initial.id, shutdown_ms: elapsed, actual_metadata_connection_closed: true, preparation_drained_before_restart: true, playback_info_requests: 0 });
+          });
+        }
+      }
+      if (!metadataShutdownOnly) {
       await controller.change(media.jellyfin);
       await scenario(
         "process death before SID checkpoint remains unknown after recovery and same-key retry",
@@ -1415,6 +1523,7 @@ try {
           assert.notEqual(current.owner_epoch, initial.owner_epoch);
         },
       );
+      }
       assert.deepEqual(
         contract.failures,
         [],

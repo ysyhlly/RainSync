@@ -355,6 +355,7 @@ async fn prepare_playback(
                     options: providers::PlaybackOptions {
                         position_ms,
                         audio_index: body.audio_index,
+                        media_source_id: None,
                         progressive: body
                             .capabilities
                             .as_ref()

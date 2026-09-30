@@ -5,11 +5,25 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn upstream(replies: Vec<(u16, Value)>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    upstream_with_headers(
+        replies
+            .into_iter()
+            .map(|(status, body)| (status, body, Vec::new()))
+            .collect(),
+    )
+    .await
+}
+
+type HttpReply = (u16, Value, Vec<(&'static str, String)>);
+
+async fn upstream_with_headers(
+    replies: Vec<HttpReply>,
+) -> (String, tokio::task::JoinHandle<Vec<String>>) {
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/emby/", socket.local_addr().unwrap());
     let task = tokio::spawn(async move {
         let mut requests = Vec::new();
-        for (status, body) in replies {
+        for (status, body, extra_headers) in replies {
             let (mut stream, _) = socket.accept().await.unwrap();
             let mut request = Vec::new();
             loop {
@@ -35,7 +49,11 @@ async fn upstream(replies: Vec<(u16, Value)>) -> (String, tokio::task::JoinHandl
             }
             requests.push(String::from_utf8(request).unwrap());
             let text = body.to_string();
-            stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len()).as_bytes()).await.unwrap();
+            let extra_headers = extra_headers
+                .into_iter()
+                .map(|(name, value)| format!("{name}: {value}\r\n"))
+                .collect::<String>();
+            stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{text}", text.len()).as_bytes()).await.unwrap();
         }
         requests
     });
@@ -50,6 +68,7 @@ fn options() -> PlaybackOptions {
     PlaybackOptions {
         position_ms: 12_345.6,
         audio_index: Some(2),
+        media_source_id: Some("observed-source".into()),
         progressive: true,
         hls: true,
         force_transcode: false,
@@ -67,11 +86,13 @@ fn each_product_preserves_seek_audio_and_transport_contracts() {
     ] {
         assert_eq!(body["StartTimeTicks"], 123_456_000);
         assert_eq!(body["AudioStreamIndex"], 2);
+        assert_eq!(body["MediaSourceId"], "observed-source");
         assert_eq!(body["EnableDirectPlay"], false);
         assert_eq!(body["DeviceProfile"]["MaxStreamingBitrate"], 12_000_000);
     }
     let direct = PlaybackOptions {
         audio_index: None,
+        media_source_id: None,
         hls: false,
         ..options()
     };
@@ -114,6 +135,279 @@ fn both_products_reject_invalid_positions_tracks_and_empty_transports() {
         ..options()
     };
     assert!(jellyfin::playback_request(&config("https://owned.invalid"), &unsupported).is_err());
+}
+
+#[test]
+fn explicit_audio_requires_a_valid_observed_media_source() {
+    for source in [
+        None,
+        Some(String::new()),
+        Some(" \t".into()),
+        Some("source\nother".into()),
+        Some("x".repeat(513)),
+    ] {
+        let options = PlaybackOptions {
+            media_source_id: source,
+            ..options()
+        };
+        for result in [
+            jellyfin::playback_request(&config("https://owned.invalid"), &options),
+            emby::playback_request(&config("https://owned.invalid"), &options),
+        ] {
+            assert!(
+                result.is_err(),
+                "explicit audio cannot use an unbound source"
+            );
+        }
+    }
+}
+
+fn audio_metadata(item: &str, source: &str) -> Value {
+    json!({
+        "Id": item,
+        "MediaSources": [{
+            "Id": source,
+            "MediaStreams": [
+                {"Type":"Video","Index":0},
+                {"Type":"Audio","Index":1},
+                {"Type":"Audio","Index":2}
+            ]
+        }]
+    })
+}
+
+#[tokio::test]
+async fn audio_discovery_binds_the_observed_source_before_one_playback_post() {
+    for kind in ["jellyfin", "emby"] {
+        let item = "movie/?#";
+        let source = "observed-source/?#";
+        let reply = json!({
+            "PlaySessionId":"owned-sid",
+            "MediaSources":[{"Id":source,"DefaultAudioStreamIndex":2}]
+        });
+        let (base, task) = upstream(vec![
+            (200, audio_metadata(item, source)),
+            (200, reply.clone()),
+        ])
+        .await;
+        let mut config = config(&format!("{base}?discard=1#discard"));
+        config.user_id = "viewer/?#".into();
+        config.access_policy = Some(
+            serde_json::from_value(json!({
+                "schema_version":1,
+                "origins":[{
+                    "origin":providers::validate_url(&base).unwrap().origin().ascii_serialization(),
+                    "cidrs":["127.0.0.1/32"]
+                }]
+            }))
+            .unwrap(),
+        );
+        let device = "rainsync-audio-viewer";
+        let observed = providers::upstream_audio_source(kind, &config, item, 2, device)
+            .await
+            .unwrap();
+        assert_eq!(observed, source);
+        let options = PlaybackOptions {
+            media_source_id: Some(observed),
+            ..options()
+        };
+        assert_eq!(
+            providers::upstream_plan(kind, &config, item, &options, device)
+                .await
+                .unwrap(),
+            reply
+        );
+        let requests = task.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .starts_with("GET /emby/Users/viewer%2F%3F%23/Items/movie%2F%3F%23 HTTP/1.1\r\n")
+        );
+        assert!(
+            requests[1].starts_with("POST /emby/Items/movie%2F%3F%23/PlaybackInfo HTTP/1.1\r\n")
+        );
+        for request in &requests {
+            let headers = request.split_once("\r\n\r\n").unwrap().0;
+            assert!(headers.contains(&format!("DeviceId=\"{device}\"")));
+            assert!(headers.contains("Token=\"owned-test-token\""));
+            assert_eq!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("x-emby-token: owned-test-token"),
+                kind == "emby"
+            );
+            assert!(!headers.contains("discard"));
+        }
+        assert_eq!(requests[0].split_once("\r\n\r\n").unwrap().1, "");
+        let body: Value =
+            serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["MediaSourceId"], source);
+        assert_ne!(body["MediaSourceId"], item);
+        assert_eq!(body["AudioStreamIndex"], 2);
+        assert_eq!(body["StartTimeTicks"], 123_456_000);
+    }
+}
+
+#[tokio::test]
+async fn audio_discovery_rejects_ambiguous_or_malformed_metadata() {
+    let valid = audio_metadata("item", "observed-source");
+    let mut cases = vec![
+        (
+            "missing item identity",
+            json!({"MediaSources":valid["MediaSources"]}),
+        ),
+        (
+            "wrong item",
+            audio_metadata("other-item", "observed-source"),
+        ),
+        ("missing sources", json!({"Id":"item"})),
+        ("non-array sources", json!({"Id":"item","MediaSources":{}})),
+        ("empty sources", json!({"Id":"item","MediaSources":[]})),
+        (
+            "non-object source",
+            json!({"Id":"item","MediaSources":[null]}),
+        ),
+        (
+            "missing source ID",
+            json!({"Id":"item","MediaSources":[{"MediaStreams":[{"Type":"Audio","Index":2}]}]}),
+        ),
+        (
+            "multiple sources",
+            json!({"Id":"item","MediaSources":[valid["MediaSources"][0],audio_metadata("item","other-source")["MediaSources"][0]]}),
+        ),
+        (
+            "duplicate source IDs",
+            json!({"Id":"item","MediaSources":[valid["MediaSources"][0],valid["MediaSources"][0]]}),
+        ),
+    ];
+    for (name, source) in [
+        ("empty source ID", "".to_owned()),
+        ("blank source ID", "  ".to_owned()),
+        ("control in source ID", "source\nother".to_owned()),
+        ("oversized source ID", "x".repeat(513)),
+    ] {
+        cases.push((name, audio_metadata("item", &source)));
+    }
+    for (name, tracks) in [
+        ("missing tracks", Value::Null),
+        ("non-array tracks", json!({})),
+        (
+            "absent requested track",
+            json!([{"Type":"Audio","Index":1}]),
+        ),
+        (
+            "video index is not audio",
+            json!([{"Type":"Video","Index":2}]),
+        ),
+        ("string audio index", json!([{"Type":"Audio","Index":"2"}])),
+        (
+            "duplicate audio index",
+            json!([{"Type":"Audio","Index":2},{"Type":"Audio","Index":2}]),
+        ),
+    ] {
+        let mut metadata = valid.clone();
+        metadata["MediaSources"][0]["MediaStreams"] = tracks;
+        cases.push((name, metadata));
+    }
+    for kind in ["jellyfin", "emby"] {
+        for (name, metadata) in &cases {
+            let (base, task) = upstream(vec![(200, metadata.clone())]).await;
+            assert!(
+                providers::upstream_audio_source(
+                    kind,
+                    &config(&base),
+                    "item",
+                    2,
+                    "rainsync-viewer"
+                )
+                .await
+                .is_err(),
+                "{kind}: {name} must not bind an audio selection"
+            );
+            let requests = task.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("GET /emby/Users/owned-user/Items/item HTTP/1.1"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn audio_discovery_rejects_http_errors_even_with_valid_metadata() {
+    for kind in ["jellyfin", "emby"] {
+        for status in [401, 403, 404, 500] {
+            let (base, task) =
+                upstream(vec![(status, audio_metadata("item", "observed-source"))]).await;
+            assert!(
+                providers::upstream_audio_source(
+                    kind,
+                    &config(&base),
+                    "item",
+                    2,
+                    "rainsync-viewer"
+                )
+                .await
+                .is_err(),
+                "{kind}: HTTP {status} must not provide a usable source"
+            );
+            assert_eq!(task.await.unwrap().len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn audio_discovery_neither_accepts_nor_follows_redirects() {
+    for kind in ["jellyfin", "emby"] {
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/capture", destination.local_addr().unwrap());
+        let (base, task) = upstream_with_headers(vec![(
+            302,
+            audio_metadata("item", "observed-source"),
+            vec![("Location", target)],
+        )])
+        .await;
+        assert!(
+            providers::upstream_audio_source(kind, &config(&base), "item", 2, "rainsync-viewer")
+                .await
+                .is_err(),
+            "a redirect body is not a successful metadata response"
+        );
+        assert_eq!(task.await.unwrap().len(), 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), destination.accept())
+                .await
+                .is_err(),
+            "discovery must not follow a redirect or forward credentials"
+        );
+    }
+}
+
+#[tokio::test]
+async fn audio_discovery_checks_source_policy_before_connecting() {
+    for kind in ["jellyfin", "emby"] {
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", socket.local_addr().unwrap());
+        let mut config = config(&format!("{origin}/emby/"));
+        config.access_policy = Some(
+            serde_json::from_value(json!({
+                "schema_version":1,
+                "origins":[{"origin":origin,"cidrs":["192.0.2.0/24"]}]
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            providers::upstream_audio_source(kind, &config, "item", 2, "rainsync-viewer")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "source_address_denied"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), socket.accept())
+                .await
+                .is_err(),
+            "denied addresses must receive no request or credential"
+        );
+    }
 }
 
 #[tokio::test]

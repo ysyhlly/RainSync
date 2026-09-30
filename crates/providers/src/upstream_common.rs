@@ -26,7 +26,91 @@ pub fn playback_body(config: &SourceConfig, options: &PlaybackOptions) -> Result
         options.progressive || options.hls,
         "upstream_transport_required"
     );
+    ensure!(
+        options.audio_index.is_none()
+            || options
+                .media_source_id
+                .as_deref()
+                .is_some_and(valid_source_id),
+        "upstream_audio_source_required"
+    );
     Ok(playback_request(config, options))
+}
+
+fn valid_source_id(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
+}
+
+pub async fn audio_source(
+    config: &SourceConfig,
+    item: &str,
+    audio_index: u32,
+    headers: BTreeMap<String, String>,
+) -> Result<String> {
+    ensure!(
+        valid_source_id(item) && valid_source_id(&config.user_id) && !config.token.is_empty(),
+        "missing_id"
+    );
+    ensure!(
+        audio_index <= i32::MAX as u32,
+        "invalid_upstream_audio_index"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let url = endpoint(config, &["Users", &config.user_id, "Items", item])?;
+        let mut response =
+            super::source_request(config, url.as_str(), reqwest::Method::GET, &headers)
+                .await?
+                .send()
+                .await?
+                .error_for_status()?;
+        ensure!(response.status().is_success(), "upstream_metadata_status");
+        const MAX_BYTES: usize = 2 * 1024 * 1024;
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|n| n <= MAX_BYTES as u64),
+            "upstream_metadata_too_large"
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(
+                bytes.len() + chunk.len() <= MAX_BYTES,
+                "upstream_metadata_too_large"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        let metadata: Value = serde_json::from_slice(&bytes)?;
+        ensure!(
+            metadata["Id"].as_str() == Some(item),
+            "upstream_item_mismatch"
+        );
+        let sources = metadata["MediaSources"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("no_media_source"))?;
+        // PlaybackInfo can reorder alternate versions. Until source identity is
+        // explicit in the public track-selection contract, never guess a version.
+        ensure!(sources.len() == 1, "ambiguous_media_source");
+        let source = &sources[0];
+        let id = source["Id"]
+            .as_str()
+            .filter(|id| valid_source_id(id))
+            .ok_or_else(|| anyhow::anyhow!("no_media_source"))?;
+        let tracks = source["MediaStreams"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("invalid_audio_track"))?;
+        ensure!(
+            tracks
+                .iter()
+                .filter(|track| track["Type"] == "Audio"
+                    && track["Index"].as_u64() == Some(u64::from(audio_index)))
+                .count()
+                == 1,
+            "invalid_audio_track"
+        );
+        Ok(id.to_owned())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("upstream_metadata_timeout"))?
 }
 
 fn endpoint(config: &SourceConfig, parts: &[&str]) -> Result<reqwest::Url> {

@@ -198,11 +198,24 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
     let kind = p.kind.to_owned();
     let config = p.config.clone();
     let item = p.item.to_owned();
-    let options = p.options;
+    let mut options = p.options;
     let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let _permits = permits;
         let result: Result<Value> = async {
+            // Read-only discovery cannot allocate a play session. Keep the
+            // ledger reserved so timeout/cancel has a positive no-POST proof.
+            if let Some(audio) = options.audio_index {
+                match providers::upstream_audio_source(&kind, &config, &item, audio, &device_id).await {
+                    Ok(source) => options.media_source_id = Some(source),
+                    Err(_) => {
+                        let mut tx = app.db.begin().await?;
+                        ledger::close(&mut tx, id, "upstream_metadata_failed").await?;
+                        tx.commit().await?;
+                        return Err(err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"));
+                    }
+                }
+            }
             let token = Uuid::new_v4();
             if !ledger::begin_negotiation(&app.db, id, app.epoch, token).await? {
                 let mut tx = app.db.begin().await?;
@@ -227,6 +240,17 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
             let live_stream = source.and_then(|s| identifier(&s["LiveStreamId"]));
             let encrypted = app.encrypt(&info)?;
             if !ledger::checkpoint(&app.db, id, token, &encrypted, sid, media_source, live_stream).await? || sid.is_none() {
+                return Err(err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"));
+            }
+            // Preserve the complete response/SID before rejecting a product
+            // which ignored the observed source/track binding; cleanup owns it.
+            if let Some(audio) = options.audio_index
+                && (media_source != options.media_source_id.as_deref()
+                    || source.and_then(|s| s["DefaultAudioStreamIndex"].as_u64()) != Some(u64::from(audio)))
+            {
+                let mut tx = app.db.begin().await?;
+                ledger::close(&mut tx, id, "upstream_audio_selection_mismatch").await?;
+                tx.commit().await?;
                 return Err(err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"));
             }
             // A late checkpoint is retained after revoke. Only final activation

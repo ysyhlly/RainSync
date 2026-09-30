@@ -94,8 +94,8 @@ network filesystems and long-running acceptance remain separately unverified.
 
 ## Validation checkpoint (2026-09-30 UTC)
 
-The final backend inputs (148 files) and three actual executable hashes are
-recorded by `scripts/bind-native-backend.mjs`. On that binding, fmt, strict
+The source-policy backend inputs (148 files) and three actual executable hashes are
+recorded by `scripts/bind-native-backend.mjs`. On that checkpoint binding, fmt, strict
 Clippy, protocol export, and the Rust workspace pass (175 passed, 5 explicitly
 ignored fixture/helper entries). No ignored test counts as a passed scenario.
 
@@ -134,3 +134,13 @@ failure is relabeled as a product or application pass. The workflow now pulls
 only the two exact fixture digests and bounds lean official dependency installs.
 Product behavior, single-login revocation, real DNS/CDN deployments, devices and
 long-duration acceptance remain open until their respective evidence exists.
+
+The subsequent explicit-audio discovery checkpoint passes 181 Rust tests with a
+fresh backend/binary binding. On that binding, 33 reservation cases plus two
+separately run graceful-shutdown-during-metadata cases, 24 observation cases,
+ten gateway groups and four policy admission groups pass. The shutdown checks
+observe the real metadata connection close, persisted preparation drain before
+restart, and no PlaybackInfo POST or fabricated Stop. See
+[fixed-product validation](UPSTREAM_PRODUCT_VALIDATION.md) for the separate real
+product failures and source-identity limitation; local controlled tests cannot
+replace actual upstream decode acceptance.

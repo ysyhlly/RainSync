@@ -43,3 +43,35 @@ and active-stream evidence. It must not be equated with immediate discovery of
 an upstream account-policy change. No production service, user media or account
 was used. Browser playback, single-login behavior and sustained resource gates
 remain separate requirements.
+
+## Explicit audio source binding
+
+The follow-on real run confirmed that `MediaSourceId` is required alongside an
+explicit audio index. Jellyfin applies the index only when that identity matches
+in [MediaInfoHelper](https://github.com/jellyfin/jellyfin/blob/877251bcaec3780d44b7657c54684dc28646b1c3/Jellyfin.Api/Helpers/MediaInfoHelper.cs#L206-L211).
+Both pinned products selected index 2 after the actual source ID was supplied;
+the 27-second decoded-output case remained failed at that checkpoint, so this is
+not yet full audio/seek acceptance.
+
+RainSync now discovers explicit audio's source through the authenticated
+single-item GET, bounded to ten seconds and two MiB, while its reservation is
+still `reserved`. The existing request/lifecycle/membership/policy admission gate
+runs after discovery and before the sole PlaybackInfo POST. Failed or cancelled
+discovery can retain a positive `not_sent` result; it must not invent an unknown
+allocated SID. A complete POST response and SID are checkpointed before checking
+the returned source ID and selected audio index, so a mismatch still has an
+owned Stop obligation. Errors returned to the API do not include upstream URLs
+or credential headers.
+
+This first contract requires exactly one upstream media source for explicit
+audio selection. Multiple versions are rejected with `UPSTREAM_PLAYBACK_FAILED`
+until the public playback request can carry a selected source identity. The
+implementation never guesses an ID from the item or arbitrarily selects one of
+several versions. Ordinary default-audio playback does not add this GET.
+
+The output harness gives codec discovery explicit finite limits: eight MiB,
+60 seconds of fixture media timestamps and 32,768 packets, while each subprocess
+still has its original 15-second wall deadline. This addresses the observed
+declared H264 stream with unknown dimensions after default probing; actual
+pixel/audio success remains required. FFmpeg documents the separate
+[probe-size and analysis-duration controls](https://ffmpeg.org/ffmpeg-formats.html#Format-Options).

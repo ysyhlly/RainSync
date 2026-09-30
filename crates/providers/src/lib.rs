@@ -122,6 +122,7 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
 pub struct PlaybackOptions {
     pub position_ms: f64,
     pub audio_index: Option<u32>,
+    pub media_source_id: Option<String>,
     pub progressive: bool,
     pub hls: bool,
     pub force_transcode: bool,
@@ -131,7 +132,7 @@ pub fn playback_request(config: &SourceConfig, options: &PlaybackOptions) -> Val
     let direct = options.progressive && !options.force_transcode && options.audio_index.is_none();
     json!({"UserId":config.user_id,"IsPlayback":true,"AutoOpenLiveStream":false,
     "StartTimeTicks":(options.position_ms * 10000.0).round() as i64,
-    "AudioStreamIndex":options.audio_index,"SubtitleStreamIndex":-1,
+    "AudioStreamIndex":options.audio_index,"MediaSourceId":options.media_source_id,"SubtitleStreamIndex":-1,
     "EnableDirectPlay":direct,"EnableDirectStream":options.hls && !options.force_transcode,
     "EnableTranscoding":options.hls,"AllowVideoStreamCopy":!options.force_transcode,
     "DeviceProfile":{"Name":"RainSync Web","MaxStreamingBitrate":12000000,
@@ -153,6 +154,23 @@ pub async fn upstream_plan(
         "emby" => emby::upstream_plan(config, item, options, device_id).await,
         _ => bail!("invalid_upstream_kind"),
     }
+}
+
+/// Discover an explicit audio track's source without allocating a play session.
+pub async fn upstream_audio_source(
+    kind: &str,
+    config: &SourceConfig,
+    item: &str,
+    audio_index: u32,
+    device_id: &str,
+) -> Result<String> {
+    upstream_common::audio_source(
+        config,
+        item,
+        audio_index,
+        upstream_headers(kind, config, device_id)?,
+    )
+    .await
 }
 
 /// The same device identity must accompany negotiation, media/subtitle delivery
@@ -411,6 +429,7 @@ mod playback_tests {
         let options = PlaybackOptions {
             position_ms: 1234.5,
             audio_index: Some(2),
+            media_source_id: Some("observed-source".into()),
             progressive: true,
             hls: true,
             force_transcode: false,
@@ -418,6 +437,7 @@ mod playback_tests {
         let body = playback_request(&config, &options);
         assert_eq!(body["StartTimeTicks"], 12345000);
         assert_eq!(body["AudioStreamIndex"], 2);
+        assert_eq!(body["MediaSourceId"], "observed-source");
         assert_eq!(body["EnableDirectPlay"], false);
         assert_eq!(body["AllowVideoStreamCopy"], true);
         let body = playback_request(
