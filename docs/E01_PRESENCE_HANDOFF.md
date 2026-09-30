@@ -26,10 +26,15 @@ type PresenceSnapshot = {
 // Server envelope: { type: "PRESENCE_SNAPSHOT", ...PresenceSnapshot }
 ```
 
-No RoomState field, control revision, persistent event, or migration. Unknown
-presence versions do not enable presence delivery. Old clients still participate
-in actual connection counts but receive no new envelopes. New clients on old
-servers display unavailable, never infer presence from permanent membership.
+Accepted by integration owner: no RoomState field, control revision, persistent
+event, or migration. Unknown
+presence versions do not enable presence delivery. Only connections declaring `presence_version: 1` enter the presence set and
+consume its quotas. Legacy control connections do not enter this set, receive no
+new envelopes, and keep their existing capacity behavior (including the existing
+100-control-connection smoke). New clients on old servers display unavailable.
+Snapshots cover reported connections, not all room members: absent users have
+unknown status, never definite offline status. The UI explicitly states this
+coverage; no extra coverage field is needed for this fixed v1 contract.
 The server assigns a fresh connection UUID after admission, returns it only to
 that socket, and never accepts a client-selected replacement. Counts describe
 connections (potentially devices or tabs), not unique physical devices. Public
@@ -61,7 +66,8 @@ presence collection and a new process epoch.
 2. `rooms.rs`: each Handle owns a mutex-protected `Presence::new` using the App
    allocator and a connection-to-session admission context. Subscribe before
    capturing the first full snapshot. Register only after auth and membership
-   admission; retain a cleanup guard so aborted tasks drop the connection before
+   admission, and only when presence v1 was negotiated; retain a cleanup guard so
+   aborted tasks drop the connection before
    close-handshake waits. Reconcile revoked memberships and sessions, expire
    leases and publish under serialized room mutation order. Distinguish removing
    one expired login session from removing all connections of a revoked member.
@@ -71,7 +77,10 @@ presence collection and a new process epoch.
    not just authorize its recipient. DB failures fail closed. Never hold a DB
    transaction or room lock over network writes. Already admitted transport bytes
    cannot be recalled. Asynchronous authorization results must not authorize
-   unexamined new connections or restore removed connection IDs.
+   unexamined new connections or restore removed connection IDs. Use
+   `checked_snapshot(checked, authorized, now)`, which returns `None` for a joining
+   connection absent from the completed check; retry without publishing a partial
+   full snapshot under a newer seq.
 4. `room_delivery.rs`: add a separate watch/latest-value slot for full presence
    snapshots. Do not share CLIENT_STATUS's broadcast buffer and do not enqueue
    presence in control. Keep existing control-first scheduling with bounded
@@ -81,7 +90,8 @@ presence collection and a new process epoch.
    internal PresenceState; bind initial snapshot once per socket generation.
    Clear online claims synchronously on disconnect, leave, permission errors and
    new socket construction. Ignore old callbacks and non-increasing seq; unknown
-   epochs request a new connection/snapshot. Do not touch control revision.
+   epochs request a new connection/snapshot; known retired epochs are ignored
+   without clearing the newer snapshot. Do not touch control revision.
 6. Mount `PresencePanel.vue` in the room UI. It is standalone and typechecked but
    not mounted yet; the parent should assign ownership of the existing host view
    or apply a mounting patch. Existing member display names may be supplied, but
@@ -92,14 +102,16 @@ presence collection and a new process epoch.
 
 - `apps/server/src/presence.rs`: monotonic lease set, server-issued IDs, aggregation,
   idempotent disconnect, terminal expiry, user and per-connection revocation,
-  async checked-candidate reconciliation, bounded admission (8/user, 80/room),
+  async checked-candidate reconciliation, bounded admission (8/user, 80/room,
+  4096/process for negotiated presence connections),
   process-shared epoch/sequence allocator.
 - `apps/server/tests/presence.rs`: core expiry, aggregation, revocation, late
   results, reconnection, process restart, actor recreation and quota regressions.
 - `apps/web/src/features/rooms/presence-state.ts`: handshake/socket/epoch/sequence
-  fences, full replacement, disconnect clearing and defensive validation.
+  fences, full replacement, disconnect clearing, 8 retired epochs, bounded
+  identifiers and projection of only known fields.
 - `PresencePanel.vue`: accessible status and connection count presentation.
-- `tests/presence-state.test.ts`: 14 reducer regressions.
+- `tests/presence-state.test.ts`: 19 reducer regressions.
 
 Validation commands (no database or ports used):
 
@@ -120,3 +132,7 @@ revocation races, task cancellation cleanup, room close/reopen/archived permissi
 semantics, independent users/devices, black-holed heartbeats, control revision
 invariance, slow consumers/presence floods/control priority, browser reconnect and
 legacy compatibility. Pure state tests do not prove these integration properties.
+
+The expanded production patch plan is in `E01_PRESENCE_WIRING_PLAN.md`.
+Independent audit validation: 17 Rust tests, 19 frontend tests and Vue typecheck.
+Protocol production wiring and real DB/WS regressions remain pending.
