@@ -1,5 +1,21 @@
 # 本轮验证记录
 
+## 2026-09-30：候选 C、精度回归与完整呈现窗口
+
+C 从 `a9d5ee7` 冻结并实际构建、独立 verify 通过：`.runtime/validation-candidates/w07-w08-20260930-c/candidate.json`，镜像 `sha256:65f18d489cf5a16d527051fc4fc0ca8b4b3b20df405b9ab5d082726309a56c6b`，全源码 `02974c5ab56e910ef3f9b17a6607d5f8f53aac31c333f63ccb6fb9bf22444b2c`，生产 `2d9365348a8c617476aa32bd0f77a3f982e1e51afea10ddb26988af26056165d`，实际前端 `262cb8eb414fdc3861816fee1655cdf0e05a9a538541e83fabd3a0bec41fc54c`。370 份源码、五个 label、只读 A vendor、实际三份二进制及 FFmpeg 5.1.9 全部核验；Rust 产物哈希与 B 相同，前端分支提交仍为 `7f17ab7`，实际前端包含已验证的增长恢复修复。
+
+C 严格 NAS 九十秒短测通过，报告 `C/source/.runtime/nas-soak/rainsync-soak-6a891b01/report.json`：首帧 92.305 秒，实际观察 92.594 秒、呈现时间前进 91.8 秒、真实新增 917 帧，掉帧约 0.22%，缓冲 0.096 秒（约 0.10%）。仅初始装载、零 detach/计数重置/新方案，任务 attempt 1、真实源字节 9,830,400→13,631,488，Agent RSS/FD 无增长；停止 2.770 秒内全部三流、句柄及 FFmpeg 释放，清理通过。该轮前端冻结绑定正确，仍是短测。
+
+C 控制短测十房×十人二十五秒通过（ACK p95 28.6ms，30 条持久命令），五十房×两人刚开始时严格重连状态检查失败：原位置 `32546.403021000006` 重读为 `32546.40302100001`，其余状态相同。失败报告 `C/source/.runtime/control-load/rainsync-load-1c639c70/failed-report.json` 保留；本次隔离容器和网络再次核验已清理。失败后未继续 Ctrl+C 或长测，C 保持原样。
+
+新增 `crates/protocol/tests/room_state_roundtrip.rs` 在原依赖配置精确重现这两个值的 typed JSON 失配，日志 `.runtime/frontend-merge/float-roundtrip/logs/float-roundtrip-before.log`。工作区启用当前锁定 serde_json 1.0.151 的 `float_roundtrip`，不升级依赖或改 Schema；修后 typed JSON 和 PostgreSQL 使用的 JSON Value 往返均严格保留状态与浮点位值。依据为 [该版本解析源码](https://github.com/serde-rs/json/blob/v1.0.151/src/de.rs)，实测日志同目录 `float-roundtrip-after`。最终工作区 67 项通过、两项子进程夹具入口 ignored；Clippy 所有目标、二进制/示例构建、生成协议 `--check` 与格式均通过。D 将重新冻结生产及全部源码。
+
+原生 `tests/room-state-roundtrip.mjs` 最终版在实际 PostgreSQL 17.11、双身份 API/WS 与新 Server 上通过（24.168 秒），报告 `.runtime/frontend-merge/float-roundtrip/room-state-roundtrip/fd3ba80d-42de-48ad-a8f1-4e9ac3b952f8/report.json`。三个精度样本共 66 次独立完整状态和四个 f64 位值核对，覆盖 JOIN/RESUME、六条实际 SEEK/SET_RATE 的 ACK/EVENT、快照/事件/命令结果持久化及逐条重放；原始数据库 JSON 文本由 Node 独立解析，不能用 ACK 自身作为位置预期。入口 SHA `b8c2912b7b2f6b0c0e78225fe86871020d8aac49c99dc6ba01a9a3cd7d0d8ce7`，Server SHA `a4efce0dc7845a4cf369777dba22f37534277db9eebda98789dcde880614e0e9` 前后稳定，失败为零，本次容器及登记匿名卷清理通过。首次夹具取错媒体字段的失败保留、资源也已释放；曾复制的“旧”宿主 exe 实际已含修复，不能算修前证据，修前证明仅为上面的 C 失败及 Rust 回归。独立只读审查确认严格失败断言、身份/epoch 绑定和清理成立；GET /rooms 仅核对成员可见性，不含房间状态精度证明。
+
+活观影入口进一步将 95% 呈现门槛的分母改为完整实际观察窗口×真实源帧率，最终资源采样完成后再读取真实 video 计数，包含尾部停顿；报告请求时长、浏览器计数窗口、完整宿主窗口、首尾计数和公式，不以最后呈现 PTS 截短停顿。旧 C 的 917 帧按完整窗口保守重算为 99.09%，活诊断 57c1b86b 为 96.21%，均仍满足 95%；没有降低门槛。旧报告的计数采于末次样本开始、wall 在样本结束，约有 0.77 秒尾差，新入口补齐尾计数。准备等待原为各自的 readyState 120 秒、API 60 秒、playing/真实帧 30 秒；不存在合并的首帧 120 秒硬门槛，最新入口明确记录各阶段。
+
+Windows 原生 `library-player-real.mjs` 在新精度修复后通过（30.230 秒），报告 `.runtime/library-player-native/runs/da7f8dd6-b2ff-4df9-aa45-51dda2830b1b/report.json`：两个真实 Chromium 用户、实际 Server/Worker/PostgreSQL、真实 FFmpeg/FFprobe 9.0.2，片库封面预览不创建会话，私人名称隔离、实际播放/聊天、路由/资料改名/全屏保留 video 与连接/准备/DB 会话数，倍速同步通过。已有基线累计 WS=2、准备=1、DB 会话=2，后续不增加；不声称初始历史只连接一次。入口、全前端/协议/生产清单及三份原生 exe 前后哈希一致；此本地源用例未启动 Agent。所有本轮服务、浏览器和媒体进程已释放，不能把 Windows 产物证明冒充 C/D Linux 镜像。
+
 ## 2026-09-30：增长清单播放恢复诊断
 
 B 指定前端的严格 NAS 九十秒短测失败，报告 `B/source/.runtime/nas-soak/rainsync-soak-f332b580/report.json`：实际呈现 512/899.52 帧（56.92%），缓冲 39.698 秒（44.1%），同方案/同 attempt 出现 23 次 MSE 重建；首帧约 100 秒、停止约 1.763 秒完成释放。后续活入口+B 镜像的 1.10 读取速率诊断在 64.852 秒失败，报告 `.runtime/nas-soak/rainsync-soak-9a54b4f5/report.json`：累计真实呈现帧仍不足、缓冲 20.152 秒（31.07%），17 次 MSE 重建，停止约 3.787 秒释放。两轮源输入持续活跃，播放会话和任务 attempt 均为 1，没有致命 HLS 错误或 ended；不能把媒体时间前进当成连续呈现通过。

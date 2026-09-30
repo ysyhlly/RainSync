@@ -433,6 +433,14 @@ const report = {
       "near-real-time generation with bounded startup headroom while the normal CHANGE_MEDIA room clock is already Playing",
     applies_to: "real HLS encoding input only",
   },
+  preparation_wait_limits: {
+    video_ready_state_seconds: 120,
+    auto_playback_api_seconds: 60,
+    playing_with_decoded_frame_seconds: 30,
+    combined_first_frame_seconds: null,
+    semantics:
+      "separate phase waits; no combined 120-second first-frame deadline",
+  },
   thresholds: {
     maximum_agent_rss_kib: 131072,
     maximum_worker_rss_kib: 524288,
@@ -1355,9 +1363,15 @@ try {
   await page.waitForFunction(
     () => document.querySelector("video")?.readyState >= 2,
     undefined,
-    { timeout: 120000 },
+    {
+      timeout: report.preparation_wait_limits.video_ready_state_seconds * 1000,
+    },
   );
-  await until(() => sessionId, "normal auto playback API completes");
+  await until(
+    () => sessionId,
+    "normal auto playback API completes",
+    report.preparation_wait_limits.auto_playback_api_seconds * 1000,
+  );
   expectedSessionId = sessionId;
   assert.equal(report.plans.length, 1, "one normal API preparation");
   assert.equal(report.plans[0].request_mode, "auto");
@@ -1404,7 +1418,11 @@ try {
       );
     },
     undefined,
-    { timeout: 30000 },
+    {
+      timeout:
+        report.preparation_wait_limits.playing_with_decoded_frame_seconds *
+        1000,
+    },
   );
   const observeVideo = () =>
     page.locator("video").evaluate((v) => {
@@ -1416,6 +1434,7 @@ try {
           ? 0
           : performance.now() - stats.buffer_since);
       return {
+        observed_at_ms: performance.now(),
         time_seconds: stats.last_presented?.media_time ?? v.currentTime,
         time_measurement:
           "media PTS of the latest actual requestVideoFrameCallback presentation",
@@ -1720,10 +1739,19 @@ try {
     );
     await takeSample("playing");
   }
+  // Include the final sample's resource queries and writes, and any tail stall,
+  // before taking the ending real frame counter. Never end at the last frame PTS.
+  const finalVideo = await observeVideo();
+  report.final_video = finalVideo;
+  report.native_quality_resets = finalVideo.quality_resets;
   report.playback_finished_at = new Date().toISOString();
   report.observed_wall_seconds = (performance.now() - began) / 1000;
   report.observed_media_seconds =
-    previous.video.time_seconds - report.initial_video.time_seconds;
+    finalVideo.time_seconds - report.initial_video.time_seconds;
+  assert.ok(
+    report.observed_media_seconds >= duration,
+    "final actual presentation retains the requested continuous media advancement",
+  );
   assert.ok(
     previous.transmitted_bytes > report.samples[0].transmitted_bytes,
     "real NAS data advances between the first and final observation",
@@ -1735,22 +1763,41 @@ try {
     .split("/")
     .map(Number);
   const sourceFps = numerator / denominator;
-  const frameDelta = previous.video.frames - report.initial_video.frames;
+  const frameDelta = finalVideo.frames - report.initial_video.frames;
   const droppedDelta =
-    previous.video.dropped_frames - report.initial_video.dropped_frames;
+    finalVideo.dropped_frames - report.initial_video.dropped_frames;
+  const frameCounterWindowSeconds =
+    (finalVideo.observed_at_ms - report.initial_video.observed_at_ms) / 1000;
+  const frameWindowSeconds = Math.max(
+    report.observed_wall_seconds,
+    frameCounterWindowSeconds,
+  );
+  const expectedFrames = frameWindowSeconds * sourceFps;
+  const bufferingSeconds = Math.max(
+    0,
+    finalVideo.buffering_seconds - report.initial_video.buffering_seconds,
+  );
   report.decode = {
     source_fps: sourceFps,
+    requested_duration_seconds: duration,
+    actual_frame_window_seconds: frameWindowSeconds,
+    frame_counter_window_seconds: frameCounterWindowSeconds,
+    frame_counter_start: report.initial_video.frames,
+    frame_counter_end: finalVideo.frames,
     frames: frameDelta,
     dropped_frames: droppedDelta,
-    expected_frames: duration * sourceFps,
-    buffering_seconds: previous.video.observation_buffering_seconds,
-    buffering_fraction: previous.video.observation_buffering_fraction,
+    expected_frames: expectedFrames,
+    expected_frames_formula:
+      "max(observed_wall_seconds, frame_counter_window_seconds) * source_fps",
+    presented_frame_fraction: frameDelta / expectedFrames,
+    buffering_seconds: bufferingSeconds,
+    buffering_fraction: bufferingSeconds / frameWindowSeconds,
     quality_resets: report.native_quality_resets,
   };
   assert.ok(
     frameDelta >=
-      duration * sourceFps * report.thresholds.minimum_decoded_frame_fraction,
-    "Chromium actually displays the required duration of decoded frames",
+      expectedFrames * report.thresholds.minimum_decoded_frame_fraction,
+    "Chromium actually displays at least 95% of source frames throughout the complete wall observation",
   );
   assert.ok(
     droppedDelta / (frameDelta + droppedDelta) <=
