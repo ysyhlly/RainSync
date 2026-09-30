@@ -99,7 +99,7 @@ impl Gate {
         }
         reap(&mut state).await?;
         let work = async {
-            let (init, segment) = tokio::task::spawn_blocking(move || {
+            let (init, segment) = media_core::child_process::blocking(move || {
                 Ok::<_, anyhow::Error>((
                     outputs::open_verified(&directory.join("init.mp4"), &proofs[0])?,
                     outputs::open_verified(&directory.join("index0.m4s"), &proofs[1])?,
@@ -146,8 +146,23 @@ impl Gate {
             let mut stdin = child.stdin.take().unwrap();
             let stdout = child.stdout.take().unwrap();
             let feeding = async move {
-                tokio::io::copy(&mut tokio::fs::File::from_std(init), &mut stdin).await?;
-                tokio::io::copy(&mut tokio::fs::File::from_std(segment), &mut stdin).await?;
+                use tokio::io::AsyncWriteExt;
+                for mut file in [init, segment] {
+                    loop {
+                        let (returned, bytes) = media_core::child_process::blocking(move || {
+                            let mut bytes = vec![0; 65536];
+                            let count = std::io::Read::read(&mut file, &mut bytes)?;
+                            bytes.truncate(count);
+                            Ok::<_, std::io::Error>((file, bytes))
+                        })
+                        .await??;
+                        file = returned;
+                        if bytes.is_empty() {
+                            break;
+                        }
+                        stdin.write_all(&bytes).await?;
+                    }
+                }
                 drop(stdin);
                 Ok::<_, anyhow::Error>(())
             };

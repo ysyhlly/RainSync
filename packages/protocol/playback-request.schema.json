@@ -13,6 +13,16 @@
       "default": null,
       "minimum": 0
     },
+    "candidate_report": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PlaybackCandidateReport"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "capabilities": {
       "anyOf": [
         {
@@ -67,6 +77,202 @@
     "media_generation"
   ],
   "$defs": {
+    "AudioCapabilityConfiguration": {
+      "type": "object",
+      "properties": {
+        "bitrate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "channels": {
+          "type": "string"
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "samplerate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "content_type",
+        "channels",
+        "bitrate",
+        "samplerate"
+      ]
+    },
+    "CapabilityReport": {
+      "description": "A small set of concrete sample hints, not a device-wide codec/size guarantee.",
+      "type": "object",
+      "properties": {
+        "candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MediaCapabilityCandidate"
+          }
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "schema_version",
+        "candidates"
+      ]
+    },
+    "MediaCapabilityCandidate": {
+      "type": "object",
+      "properties": {
+        "audio": {
+          "$ref": "#/$defs/AudioCapabilityConfiguration"
+        },
+        "content_type": {
+          "description": "Combined container/codec MIME type tested through canPlayType and MSE.",
+          "type": "string"
+        },
+        "file_decoding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MediaDecodingSupport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mse_decoding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MediaDecodingSupport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mse_supported": {
+          "description": "Omitted means unavailable or failed, not supported.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "progressive": {
+          "$ref": "#/$defs/MediaTypeSupport"
+        },
+        "video": {
+          "$ref": "#/$defs/VideoCapabilityConfiguration"
+        }
+      },
+      "required": [
+        "content_type",
+        "video",
+        "audio",
+        "progressive"
+      ]
+    },
+    "MediaDecodingSupport": {
+      "description": "Estimates apply only to the accompanying configuration and decoding path.",
+      "type": "object",
+      "properties": {
+        "power_efficient": {
+          "type": "boolean"
+        },
+        "smooth": {
+          "type": "boolean"
+        },
+        "supported": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "supported",
+        "smooth",
+        "power_efficient"
+      ]
+    },
+    "MediaTypeSupport": {
+      "description": "Browser MIME-type hints are not guarantees for arbitrary media or hardware.",
+      "type": "string",
+      "enum": [
+        "unknown",
+        "unsupported",
+        "maybe",
+        "probably"
+      ]
+    },
+    "PlaybackCandidateReport": {
+      "type": "object",
+      "properties": {
+        "binding": {
+          "type": "string"
+        },
+        "excluded_candidates": {
+          "description": "Bounded client decode-failure history; never changes authorization.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PlaybackCandidateResult"
+          }
+        }
+      },
+      "required": [
+        "binding",
+        "results"
+      ]
+    },
+    "PlaybackCandidateResult": {
+      "type": "object",
+      "properties": {
+        "candidate_id": {
+          "type": "string"
+        },
+        "file_decoding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MediaDecodingSupport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mse_decoding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MediaDecodingSupport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mse_supported": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "progressive": {
+          "$ref": "#/$defs/MediaTypeSupport"
+        }
+      },
+      "required": [
+        "candidate_id",
+        "progressive"
+      ]
+    },
     "PlaybackCapabilities": {
       "description": "Independently detected transports; MSE support does not imply progressive support.",
       "type": "object",
@@ -79,12 +285,57 @@
         },
         "progressive_h264_aac": {
           "type": "boolean"
+        },
+        "report": {
+          "description": "Optional additive hints. Old clients retain the original transport gates.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CapabilityReport"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
         "progressive_h264_aac",
         "native_hls",
         "mse_h264_aac"
+      ]
+    },
+    "VideoCapabilityConfiguration": {
+      "type": "object",
+      "properties": {
+        "bitrate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "framerate": {
+          "type": "number",
+          "format": "double"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "content_type",
+        "width",
+        "height",
+        "bitrate",
+        "framerate"
       ]
     }
   }

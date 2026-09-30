@@ -6,7 +6,7 @@ dist/
 !.env.example
 playwright-report/
 test-results/
-.runtime/
+/.runtime
 *.log
 /media/
 *.dump
@@ -17,3 +17,7 @@ credentials.json
 .DS_Store
 Thumbs.db
 .cgraphy/
+
+# Completed NAS disposal receipts are runtime state, not source.
+*.drained.json
+*.drained.json.*.tmp

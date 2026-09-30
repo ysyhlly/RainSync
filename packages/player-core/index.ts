@@ -1,16 +1,8 @@
-import type { PlaybackCapabilities } from "../protocol";
-
-export function detectCapabilities(
-  video: Pick<HTMLVideoElement, "canPlayType">,
-  mse?: { isTypeSupported(type: string): boolean },
-): PlaybackCapabilities {
-  const avc = 'video/mp4; codecs="avc1.640028, mp4a.40.2"';
-  return {
-    progressive_h264_aac: video.canPlayType(avc) !== "",
-    native_hls: video.canPlayType("application/vnd.apple.mpegurl") !== "",
-    mse_h264_aac: !!mse?.isTypeSupported(avc),
-  };
-}
+export {
+  detectCapabilities,
+  detectCapabilitiesAsync,
+  detectCandidateReport,
+} from "./capabilities";
 
 export interface PlayerAdapter {
   play(): Promise<void>;

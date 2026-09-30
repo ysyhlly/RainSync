@@ -26,6 +26,7 @@ export async function isolatedMediaStack(name, run, options = {}) {
     f.startWorker = async (extra = {}) => {
       if (worker?.exitCode === null) throw Error("Worker already owned and running");
       worker = start(resolve(f.target, `rainsync-media-worker${process.platform === "win32" ? ".exe" : ""}`), { ...f.env, WORKER_BIND: `127.0.0.1:${workerPort}`, PUBLIC_ORIGIN: f.workerOrigin, ...extra });
+      f.workerPid = worker.pid;
       for (let i=0; i<100; i++) {
         if (worker.failure || worker.exitCode !== null) throw Error("Fixture Worker failed; inspect child log");
         try { if ((await fetch(f.workerOrigin + "/health")).ok) return; } catch {}
@@ -38,6 +39,7 @@ export async function isolatedMediaStack(name, run, options = {}) {
       const admin = f.client(); await admin.login();
       const created = agentPair ??= await admin.request("/agents", "POST", { name: "owned preview agent" });
       agent = start(resolve(f.target, `rainsync-nas-agent${process.platform === "win32" ? ".exe" : ""}`), { ...f.env, SERVER_URL: f.origin, AGENT_DATA_ORIGIN: f.workerOrigin, PAIR_CODE: created.pair_code, MEDIA_ROOT: f.root, AGENT_CREDENTIAL_FILE: resolve(f.root, "agent-token") });
+      f.agentPid = agent.pid;
       return { agentId: created.id };
     };
     f.stopAgent = async () => { await stop(agent); agent = undefined; };

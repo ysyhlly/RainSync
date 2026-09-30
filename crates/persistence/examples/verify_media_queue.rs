@@ -54,6 +54,10 @@ async fn main() -> anyhow::Result<()> {
         admit(db.clone(), loser, Arc::new(Barrier::new(1))).await?,
         "revoked grants do not occupy queue capacity"
     );
+    sqlx::query("DELETE FROM media_executions WHERE job_id=ANY($1)")
+        .bind(vec![a, b])
+        .execute(&db)
+        .await?;
     sqlx::query("DELETE FROM media_jobs WHERE id=ANY($1)")
         .bind(vec![a, b])
         .execute(&db)

@@ -212,15 +212,17 @@ pub fn readable_manifest(text: &str) -> bool {
 }
 
 pub async fn read_manifest(path: &Path) -> Result<String> {
-    use tokio::io::AsyncReadExt;
-    let mut text = String::new();
-    tokio::fs::File::open(path)
-        .await?
-        .take(2 * 1024 * 1024 + 1)
-        .read_to_string(&mut text)
-        .await?;
-    ensure!(text.len() <= 2 * 1024 * 1024, "output_manifest_too_large");
-    Ok(text)
+    let path = path.to_owned();
+    media_core::child_process::blocking(move || {
+        use std::io::Read;
+        let mut text = String::new();
+        std::fs::File::open(path)?
+            .take(2 * 1024 * 1024 + 1)
+            .read_to_string(&mut text)?;
+        ensure!(text.len() <= 2 * 1024 * 1024, "output_manifest_too_large");
+        Ok(text)
+    })
+    .await?
 }
 
 pub fn validate(directory: &Path) -> Result<persistence::media_jobs::Publication> {

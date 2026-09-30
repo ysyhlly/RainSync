@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
@@ -9,7 +8,7 @@ export async function reviewRegressions({
   sql,
   connect,
   origin,
-  container,
+  sqlProcess,
 }) {
   const room = await admin.request("/rooms", "POST", {
     name: "雨".repeat(120),
@@ -51,21 +50,7 @@ export async function reviewRegressions({
   assert.equal(new Set([...first, ...rest].map((m) => m.id)).size, 105);
   viewer.ws.close();
   const invitation = await admin.request(`/rooms/${room.id}/invites`, "POST");
-  const locker = spawn(
-    "docker",
-    [
-      "exec",
-      container,
-      "psql",
-      "-U",
-      "rainsync",
-      "-d",
-      "rainsync",
-      "-c",
-      `BEGIN; SELECT id FROM rooms WHERE id='${room.id}' FOR UPDATE; SELECT pg_sleep(3); COMMIT;`,
-    ],
-    { stdio: "ignore", windowsHide: true },
-  );
+  const locker = sqlProcess(`BEGIN; SELECT id FROM rooms WHERE id='${room.id}' FOR UPDATE; SELECT pg_sleep(3); COMMIT;`);
   const unlocked = new Promise((r, j) => {
     locker.once("exit", (code) =>
       code === 0 ? r() : j(Error("lock fixture failed")),

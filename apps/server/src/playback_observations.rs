@@ -4,6 +4,8 @@ use persistence::playback_observations as observations;
 pub struct Grant {
     pub row: sqlx::postgres::PgRow,
     state: Value,
+    lifecycle: String,
+    lifecycle_epoch: i64,
 }
 
 /// Read ownership first, then acquire the room before the grant. Generation
@@ -22,6 +24,17 @@ pub async fn lock_grant(
     let Some(room) = room else {
         return Ok(None);
     };
+    // Stop is still permitted to retire its owned grant while the room is
+    // inactive; only sample acceptance is gated below. Never early-return here
+    // through lock_active and accidentally skip compensating cleanup.
+    let lifecycle =
+        sqlx::query("SELECT lifecycle,lifecycle_epoch FROM rooms WHERE id=$1 FOR NO KEY UPDATE")
+            .bind(room)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(lifecycle) = lifecycle else {
+        return Ok(None);
+    };
     let state: Option<Value> =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
             .bind(room)
@@ -36,7 +49,12 @@ pub async fn lock_grant(
             .bind(user)
             .fetch_optional(&mut **tx)
             .await?
-            .map(|row| Grant { row, state }),
+            .map(|row| Grant {
+                row,
+                state,
+                lifecycle: lifecycle.get("lifecycle"),
+                lifecycle_epoch: lifecycle.get("lifecycle_epoch"),
+            }),
     )
 }
 
@@ -50,6 +68,11 @@ pub async fn accept(
     let user: Uuid = grant.row.get("user_id");
     let room: Uuid = grant.row.get("room_id");
     let generation: i64 = grant.row.get("generation");
+    if grant.lifecycle != "active"
+        || grant.lifecycle_epoch != grant.row.get::<i64, _>("lifecycle_epoch")
+    {
+        return Err(err(StatusCode::CONFLICT, "room_not_active"));
+    }
     if generation != i64::from(sample.media_generation)
         || grant.state["media_generation"].as_u64() != Some(u64::from(sample.media_generation))
         || grant.state["media_id"].as_str()

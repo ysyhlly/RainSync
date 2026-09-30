@@ -10,6 +10,22 @@ pub fn position(state: &RoomState, now: f64) -> f64 {
     protocol::bounded_position(state.anchor_position_ms + elapsed, state.duration_ms)
 }
 
+/// Room ownership changes do not change the current media activity or timeline.
+/// The caller must check the durable owner and target membership in its transaction.
+pub fn transfer_controller(
+    state: &RoomState,
+    expected_revision: u32,
+    new_owner: Uuid,
+) -> Result<RoomState, &'static str> {
+    if expected_revision != state.revision {
+        return Err("revision_conflict");
+    }
+    let mut next = state.clone();
+    next.controller_user_id = new_owner;
+    next.revision = next.revision.checked_add(1).ok_or("revision_overflow")?;
+    Ok(next)
+}
+
 pub fn reduce(
     state: &RoomState,
     command: &Command,
@@ -190,5 +206,45 @@ mod tests {
             position_ms: f64::NAN,
         };
         assert!(reduce(&s, &c, s.controller_user_id, false, 0.0).is_err());
+    }
+
+    #[test]
+    fn ownership_transfer_preserves_media_and_playback_timeline() {
+        let (state, _) = fixture();
+        let next_owner = Uuid::new_v4();
+        let mut expected = state.clone();
+        expected.controller_user_id = next_owner;
+        expected.revision += 1;
+        assert_eq!(
+            transfer_controller(&state, state.revision, next_owner),
+            Ok(expected)
+        );
+        assert_eq!(
+            transfer_controller(&state, state.revision - 1, next_owner),
+            Err("revision_conflict")
+        );
+        let mut exhausted = state;
+        exhausted.revision = u32::MAX;
+        assert_eq!(
+            transfer_controller(&exhausted, u32::MAX, next_owner),
+            Err("revision_overflow")
+        );
+    }
+
+    #[test]
+    fn transferred_controller_rejects_former_owner_and_old_revision() {
+        let (state, mut command) = fixture();
+        let owner = Uuid::new_v4();
+        let next = transfer_controller(&state, state.revision, owner).unwrap();
+        assert_eq!(
+            reduce(&next, &command, state.controller_user_id, false, 600.0),
+            Err("controller_required")
+        );
+        assert_eq!(
+            reduce(&next, &command, owner, false, 600.0),
+            Err("revision_conflict")
+        );
+        command.expected_revision = next.revision;
+        assert!(reduce(&next, &command, owner, false, 600.0).is_ok());
     }
 }

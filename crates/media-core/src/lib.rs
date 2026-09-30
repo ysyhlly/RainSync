@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
+pub mod capabilities;
 pub mod child_process;
 pub mod file_version;
 pub mod preview;
@@ -66,6 +67,7 @@ pub async fn probe(path: &str) -> Result<serde_json::Value> {
         "error",
         "-show_format",
         "-show_streams",
+        "-show_data",
         "-of",
         "json",
         path,

@@ -44,6 +44,8 @@ pub enum ErrorCode {
     RegistrationBatchAlreadyCreated,
     InvalidInvite,
     RoomFull,
+    RoomNotActive,
+    RoomLifecycleConflict,
     PairCodeInvalid,
     AgentTokenRequired,
     InvalidAgent,
@@ -83,6 +85,7 @@ pub enum ErrorCode {
     SourceProbeFailed,
     SourceChanged,
     SourceVersionRequired,
+    StaleCapabilityReport,
     InvalidAudioTrack,
     DeviceHasNoCompatiblePlaybackTransport,
     UpstreamDeviceProfileRequired,
@@ -195,9 +198,12 @@ impl ErrorCode {
             Self::MediaPreviewStale => "预览版本已更新，请刷新媒体资料",
             Self::MediaPreviewQueueFull => "预览队列已满，请稍后重试",
             Self::MediaPreviewUnavailable => "暂无法生成预览",
-            Self::SourceChanged => "源文件已变化，请重新连接 NAS Agent 更新索引后重新播放",
+            Self::SourceChanged => "源文件已变化，请重新扫描片源后重新发起播放",
+            Self::StaleCapabilityReport => "播放能力报告已过期或片源已改变，请重新检测后加载",
+            Self::RoomNotActive => "房间已关闭或正在清理，请刷新房间状态",
+            Self::RoomLifecycleConflict => "房间生命周期已改变，请刷新后重试",
             Self::SourceVersionRequired => {
-                "NAS Agent 缺少文件版本信息，请升级 Agent 并重新连接以更新索引"
+                "NAS 索引缺少文件版本，请管理员升级 NAS Agent 并重新连接或扫描片源，完成后重新发起播放"
             }
             Self::MediaQueueFull => "媒体处理队列已满，请稍后使用相同请求编号重试",
             Self::CacheCapacityExceeded => "媒体缓存空间不足，请联系管理员清理后重新发起播放",
@@ -387,6 +393,8 @@ mod tests {
             ErrorCode::RevisionConflict,
             ErrorCode::CommandPayloadConflict,
             ErrorCode::CommitFailed,
+            ErrorCode::SourceChanged,
+            ErrorCode::SourceVersionRequired,
         ] {
             assert!(!ApiError::new(code, Uuid::nil()).retryable);
         }

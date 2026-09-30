@@ -51,9 +51,12 @@ impl ReadGuard {
             .is_some_and(|at| at.elapsed() < Duration::from_secs(25))
     }
 
-    pub fn body(self, file: tokio::io::Take<tokio::fs::File>) -> axum::body::Body {
+    pub fn body<S>(self, stream: S) -> axum::body::Body
+    where
+        S: futures_util::Stream<Item = std::io::Result<axum::body::Bytes>> + Send + 'static,
+    {
         use futures_util::StreamExt;
-        let stream = tokio_util::io::ReaderStream::with_capacity(file, 65536);
+        let stream = Box::pin(stream);
         axum::body::Body::from_stream(futures_util::stream::try_unfold(
             (stream, self),
             |(mut stream, mut guard)| async move {

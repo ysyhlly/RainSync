@@ -8,11 +8,16 @@ mod media;
 mod media_previews;
 mod media_titles;
 mod metrics;
+mod playback_capabilities;
 mod playback_observations;
 mod playback_requests;
+mod preparation_owner;
 mod profile;
 mod registration;
 mod registration_auth;
+mod room_cleanup;
+mod room_lifecycle;
+mod room_ownership;
 mod rooms;
 mod upstream;
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
@@ -54,6 +59,7 @@ pub struct App {
     rooms: Arc<Mutex<HashMap<Uuid, rooms::Handle>>>,
     agent_controls: Arc<Mutex<HashMap<Uuid, agents::Control>>>,
     upstream: Arc<upstream::Runtime>,
+    preparations: Arc<preparation_owner::Registry>,
 }
 impl App {
     fn now(&self) -> f64 {
@@ -419,9 +425,11 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         rooms: Default::default(),
         agent_controls: Default::default(),
         upstream: Default::default(),
+        preparations: Default::default(),
     };
-    // A previous process cannot still own preparations after the instance lock
-    // has been acquired. Retire their grants before same-key recovery.
+    // Retire previous-process grants before same-key recovery. The instance
+    // lock fences new valid publication; it is not positive physical drain
+    // proof. Unknown preparation/resource receipts remain unconfirmed.
     let mut recovery = db.begin().await?;
     sqlx::query("UPDATE playback_requests SET status='failed',error_status=409,error_code='playback_request_interrupted' WHERE status='pending'")
         .execute(&mut *recovery).await?;
@@ -455,18 +463,26 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
                 "DELETE FROM login_attempts WHERE window_started<=now()-interval '60 seconds'",
                 "DELETE FROM account_rate_limits WHERE expires_at<=clock_timestamp()",
                 "DELETE FROM agent_transfers WHERE expires_at<now()",
-                "UPDATE agent_transfer_runs SET status='failed',reason='transfer_owner_lost',updated_at=now(),finished_at=now() WHERE finished_at IS NULL AND lease_until<=now()",
-                "DELETE FROM agent_transfer_runs WHERE finished_at<now()-interval '24 hours'",
+                "UPDATE agent_transfer_runs SET status='failed',reason='transfer_owner_lost',updated_at=now(),finished_at=now(),agent_drained_at=CASE WHEN dispatched_at IS NULL AND NOT legacy_unconfirmed THEN COALESCE(agent_drained_at,clock_timestamp()) ELSE agent_drained_at END WHERE finished_at IS NULL AND lease_until<=now()",
+                "DELETE FROM agent_transfer_runs WHERE NOT legacy_unconfirmed AND finished_at<now()-interval '24 hours' AND (session_id IS NULL OR agent_drained_at IS NOT NULL)",
                 "DELETE FROM playback_requests r WHERE r.expires_at<now() AND NOT EXISTS(SELECT 1 FROM playback_sessions p WHERE p.id=r.session_id AND NOT p.stopped AND p.expires_at>now())",
-                "DELETE FROM upstream_reservations WHERE state='closed' AND closed_at<now()-interval '48 hours'",
+                // Preserve the positive ledger proof across a failed marker write.
+                // These statements acquire session rows only; do not invert the
+                // session-before-upstream lock order used by Stop/close.
+                "UPDATE playback_sessions p SET stopped=true,resource=resource||'{\"upstream_closed\":true}'::jsonb WHERE NOT(p.resource @> '{\"upstream_closed\":true}'::jsonb) AND EXISTS(SELECT 1 FROM upstream_reservations u WHERE u.id=p.id AND u.state='closed')",
+                "DELETE FROM upstream_reservations u WHERE u.state='closed' AND u.closed_at<now()-interval '48 hours' AND NOT EXISTS(SELECT 1 FROM room_cleanup_tasks c WHERE c.room_id=u.room_id AND c.completed_at IS NULL) AND NOT EXISTS(SELECT 1 FROM playback_sessions p WHERE p.id=u.id AND NOT(p.resource @> '{\"upstream_closed\":true}'::jsonb))",
                 "DELETE FROM playback_observations o WHERE o.created_at<now()-interval '48 hours' AND NOT EXISTS(SELECT 1 FROM playback_sessions p WHERE p.id=o.session_id AND NOT p.stopped AND p.expires_at>now()) AND NOT EXISTS(SELECT 1 FROM upstream_reservations u WHERE u.id=o.session_id AND u.state<>'closed')",
             ] {
                 let _ = sqlx::query(query).execute(&cleanup).await;
             }
             let _ = persistence::cleanup_control_history(&cleanup).await;
+            let _ = persistence::room_cleanup::prune_receipts(&cleanup).await;
         }
     });
     tokio::spawn(upstream::maintenance(app.clone()));
+    tokio::spawn(room_cleanup::run(app.clone()));
+    let preparations = app.preparations.clone();
+    let upstream = app.upstream.clone();
     let router = Router::new()
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/api/v1/auth/login", post(login))
@@ -496,6 +512,12 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
             delete(registration::revoke),
         )
         .route("/api/v1/rooms", get(rooms::list).post(rooms::create))
+        .route("/api/v1/rooms/{id}/members", get(room_ownership::members))
+        .route("/api/v1/rooms/{id}/owner", post(room_ownership::transfer))
+        .route("/api/v1/rooms/{id}/lifecycle", get(room_lifecycle::status))
+        .route("/api/v1/rooms/{id}/close", post(room_lifecycle::close))
+        .route("/api/v1/rooms/{id}/reopen", post(room_lifecycle::reopen))
+        .route("/api/v1/rooms/{id}/archive", post(room_lifecycle::archive))
         .route("/api/v1/rooms/{id}/join", post(rooms::join))
         .route("/api/v1/rooms/{id}/invites", post(rooms::invite))
         .route(
@@ -530,6 +552,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route(
             "/api/v1/admin/media/{id}/shared-title",
             axum::routing::put(media_titles::shared),
+        )
+        .route(
+            "/api/v1/playback-candidates",
+            post(playback_capabilities::candidates),
         )
         .route("/api/v1/playback-sessions", post(media::playback))
         .route(
@@ -571,6 +597,8 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     let server_result = tokio::select! {
         result = &mut server => result,
         signal = media_core::process_signal::wait() => {
+            preparations.close();
+            upstream.close_admission();
             let _ = stop.send(());
             // A stalled request or long-lived connection cannot delay process
             // shutdown indefinitely. Keep the instance lock throughout draining.
@@ -580,9 +608,15 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
             signal.map(|_| ()).and(result)
         },
     };
+    // Fence late HTTP admission and retain the application runtime through
+    // reservation commits, scoped resource disposal and durable receipt retries.
+    // Instance-lock loss intentionally skips this barrier and remains unknown.
+    upstream.close_admission();
+    let (_, upstream_result) = tokio::join!(preparations.drain(), upstream.drain());
     // Also drain after listener failure: cancelling a request does not itself
     // wait for the independent ffprobe process owner to reap its descendants.
     media_core::child_process::shutdown().await?;
+    upstream_result?;
     server_result?;
     Ok(())
 }

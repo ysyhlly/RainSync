@@ -13,10 +13,19 @@ export interface Identity extends Profile {
   admin: boolean;
   csrf: string;
 }
+export type RoomLifecycle = "active" | "closing" | "closed" | "archived";
 export interface Room {
   id: string;
   name: string;
   owner_id: string;
+  /** Missing only when connected to a pre-lifecycle server. */
+  lifecycle?: RoomLifecycle;
+  lifecycle_epoch?: number;
+}
+export interface RoomMember {
+  id: string;
+  username: string;
+  display_name: string;
 }
 export interface Media {
   id: string;
@@ -46,6 +55,15 @@ export interface Agent {
   name: string;
   revoked: boolean;
   last_seen: string | null;
+  /** Optional for compatibility with servers predating readiness reporting. */
+  connected?: boolean;
+  manual_scan?: boolean;
+  source_versions?: boolean | null;
+  drain_receipts?: boolean | null;
+  indexed_count?: number;
+  unversioned_count?: number;
+  source_version_status?:
+    "empty" | "ready" | "rescan_required" | "upgrade_required";
 }
 export interface Message extends Partial<Avatar> {
   id: string;

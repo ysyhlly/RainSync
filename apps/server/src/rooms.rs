@@ -23,6 +23,66 @@ struct Request {
     reply: oneshot::Sender<Value>,
 }
 
+pub async fn ownership_changed(app: &App, state: &RoomState, owner: Uuid, event_id: Uuid) {
+    if let Some(handle) = app.rooms.lock().await.get(&state.room_id) {
+        let _ = handle.events.send(json!({
+            "type":"EVENT", "state":state, "owner_id":owner,
+            "event_id":event_id, "action":{"type":"TRANSFER_OWNERSHIP"}
+        }));
+    }
+}
+
+pub async fn lifecycle_changed(
+    app: &App,
+    state: &RoomState,
+    lifecycle: &str,
+    lifecycle_epoch: i64,
+    event_id: Uuid,
+) {
+    if let Some(handle) = app.rooms.lock().await.get(&state.room_id) {
+        let _ = handle.events.send(json!({
+            "type":"EVENT", "state":state, "lifecycle":lifecycle,
+            "lifecycle_epoch":lifecycle_epoch, "event_id":event_id,
+            "control_epoch":null, "action":{"type":"ROOM_LIFECYCLE"}
+        }));
+    }
+}
+
+async fn owned_snapshot(
+    app: &App,
+    room: Uuid,
+    user: Uuid,
+) -> Result<(RoomState, Uuid, String, i64, Option<protocol::ControlEpoch>)> {
+    let mut tx = app.db.begin().await?;
+    let row = sqlx::query(
+        "SELECT owner_id,lifecycle,lifecycle_epoch FROM rooms WHERE id=$1 FOR NO KEY UPDATE",
+    )
+    .bind(room)
+    .fetch_one(&mut *tx)
+    .await?;
+    let state: Value = sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1")
+        .bind(room)
+        .fetch_one(&mut *tx)
+        .await?;
+    let lifecycle: String = row.get("lifecycle");
+    let control_epoch = if lifecycle == "active" {
+        let id = Uuid::new_v4();
+        let expires_at_ms: i64 = sqlx::query_scalar("INSERT INTO control_epochs(id,user_id,room_id) VALUES($1,$2,$3) RETURNING floor(extract(epoch FROM expires_at)*1000)::bigint")
+            .bind(id).bind(user).bind(room).fetch_one(&mut *tx).await?;
+        Some(protocol::ControlEpoch { id, expires_at_ms })
+    } else {
+        None
+    };
+    tx.commit().await?;
+    Ok((
+        serde_json::from_value(state).map_err(anyhow::Error::from)?,
+        row.get("owner_id"),
+        lifecycle,
+        row.get("lifecycle_epoch"),
+        control_epoch,
+    ))
+}
+
 fn socket_error(reason: &str, command_id: Option<Uuid>) -> Value {
     let code = protocol::ErrorCode::from_reason(reason, 400);
     let error = protocol::ApiError::new(code, Uuid::new_v4());
@@ -74,6 +134,13 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                 if req.command.room_id != id {
                     return Err("room_mismatch".to_string());
                 }
+                // REST management can replace ownership while this actor stays
+                // alive. The persisted snapshot is authoritative for every command.
+                state = persistence::snapshot(&app.db, id)
+                    .await.map_err(|_| "database_error".to_string())?;
+                let active: bool = sqlx::query_scalar("SELECT lifecycle='active' FROM rooms WHERE id=$1")
+                    .bind(id).fetch_one(&app.db).await.map_err(|_| "database_error".to_string())?;
+                if !active { return Err("room_not_active".to_string()); }
                 persistence::check_control_epoch(
                     &app.db,
                     id,
@@ -86,6 +153,9 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                     persistence::previous(&app.db, id, &req.command, req.user.id)
                         .await
                         .map_err(|error| match error.to_string().as_str() {
+                            "room_not_active" => "room_not_active".to_string(),
+                            "control_epoch_expired" => "control_epoch_expired".to_string(),
+                            "control_epoch_required" => "control_epoch_required".to_string(),
                             "command_owned_by_another_user" => {
                                 "command_owned_by_another_user".to_string()
                             }
@@ -148,6 +218,9 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                     json!({"type":"ACK","command_id":req.command.command_id,"state":s,"action":req.command.action})
                 }
                 Err(error) => {
+                    if let Ok(current) = persistence::snapshot(&app.db, id).await {
+                        state = current;
+                    }
                     let mut message = socket_error(&error, Some(req.command.command_id));
                     message["state"] = json!(state);
                     message
@@ -163,14 +236,17 @@ fn control_error(error: anyhow::Error, fallback: &str) -> String {
     match error.to_string().as_str() {
         "control_epoch_required" => "control_epoch_required".into(),
         "control_epoch_expired" => "control_epoch_expired".into(),
+        "revision_conflict" => "revision_conflict".into(),
+        "controller_required" => "controller_required".into(),
+        "room_not_active" => "room_not_active".into(),
         _ => fallback.into(),
     }
 }
 
 pub async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     let u = auth(&app, &h, false).await?;
-    let rows=sqlx::query("SELECT r.id,r.name,r.owner_id FROM rooms r JOIN room_members m ON m.room_id=r.id WHERE m.user_id=$1 ORDER BY r.created_at DESC").bind(u.id).fetch_all(&app.db).await?;
-    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"owner_id":r.get::<Uuid,_>("owner_id")})).collect())))
+    let rows=sqlx::query("SELECT r.id,r.name,r.owner_id,r.lifecycle,r.lifecycle_epoch FROM rooms r JOIN room_members m ON m.room_id=r.id WHERE m.user_id=$1 ORDER BY r.created_at DESC").bind(u.id).fetch_all(&app.db).await?;
+    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"owner_id":r.get::<Uuid,_>("owner_id"),"lifecycle":r.get::<String,_>("lifecycle"),"lifecycle_epoch":r.get::<i64,_>("lifecycle_epoch")})).collect())))
 }
 #[derive(Deserialize)]
 pub struct Name {
@@ -228,10 +304,9 @@ async fn controller<'a>(
     member(app, &u, id).await?;
     let mut tx = app.db.begin().await?;
     // Same order as joining: room first, then snapshot/invitation.
-    sqlx::query("SELECT id FROM rooms WHERE id=$1 FOR UPDATE")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
+    persistence::room_lifecycle::lock_active(&mut tx, id)
+        .await
+        .map_err(room_lifecycle::gate_error)?;
     let value: Value =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
             .bind(id)
@@ -284,10 +359,9 @@ pub async fn join(
 ) -> Result<Json<Value>> {
     let u = auth(&app, &h, true).await?;
     let mut tx = app.db.begin().await?;
-    sqlx::query("SELECT id FROM rooms WHERE id=$1 FOR UPDATE")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
+    persistence::room_lifecycle::lock_active(&mut tx, id)
+        .await
+        .map_err(room_lifecycle::gate_error)?;
     let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM invites WHERE room_id=$1 AND token_hash=$2 AND expires_at>now() AND NOT revoked)").bind(id).bind(hash(&body.token)).fetch_one(&mut *tx).await?;
     if !valid {
         return Err(err(StatusCode::FORBIDDEN, "invalid_invite"));
@@ -388,6 +462,16 @@ async fn persist_chat(
     body: &str,
     client_message_id: Option<Uuid>,
 ) -> std::result::Result<(Uuid, bool), &'static str> {
+    let mut tx = db.begin().await.map_err(|_| "database_error")?;
+    persistence::room_lifecycle::lock_active(&mut tx, room_id)
+        .await
+        .map_err(|error| {
+            if error.to_string() == "room_not_active" {
+                "room_not_active"
+            } else {
+                "database_error"
+            }
+        })?;
     let inserted = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO chat_messages(id,room_id,user_id,body,client_message_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT (room_id,user_id,client_message_id) DO NOTHING RETURNING id",
     )
@@ -396,10 +480,11 @@ async fn persist_chat(
     .bind(user_id)
     .bind(body)
     .bind(client_message_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|_| "database_error")?;
     if let Some(id) = inserted {
+        tx.commit().await.map_err(|_| "database_error")?;
         return Ok((id, false));
     }
     // The unique-index conflict waits for the concurrent insertion to commit.
@@ -410,12 +495,13 @@ async fn persist_chat(
     .bind(room_id)
     .bind(user_id)
     .bind(client_message_id)
-    .fetch_one(db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|_| "database_error")?;
     if existing.get::<String, _>("body") != body {
         return Err("invalid_request");
     }
+    tx.commit().await.map_err(|_| "database_error")?;
     Ok((existing.get("id"), true))
 }
 
@@ -446,7 +532,9 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
         return;
     };
     let mut events = handle.events.subscribe();
-    let Ok(s) = persistence::snapshot(&app.db, id).await else {
+    let Ok((s, owner_id, lifecycle, lifecycle_epoch, control_epoch)) =
+        owned_snapshot(&app, id, user.id).await
+    else {
         reject_socket(&mut out, "database_error").await;
         return;
     };
@@ -464,13 +552,9 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
             missing = rows.iter().map(|r| r.get("state")).collect();
         }
     }
-    let Ok(control_epoch) = persistence::issue_control_epoch(&app.db, id, user.id).await else {
-        reject_socket(&mut out, "database_error").await;
-        return;
-    };
     if out
         .send(Message::Text(
-            json!({"type":"SNAPSHOT","state":s,"recovery":recovery,"events":missing,"control_epoch":control_epoch})
+            json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"recovery":recovery,"events":missing,"control_epoch":control_epoch,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch})
                 .to_string()
                 .into(),
         ))
@@ -495,7 +579,7 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                 }
                 let _=out.send(Message::Ping(Vec::new().into())).await;continue;
             }
-            event=events.recv()=>match event {Ok(v)=>v,Err(broadcast::error::RecvError::Lagged(_))=>{match persistence::snapshot(&app.db,id).await{Ok(s)=>json!({"type":"SNAPSHOT","state":s}),Err(_)=>break}},Err(_)=>break},
+            event=events.recv()=>match event {Ok(v)=>v,Err(broadcast::error::RecvError::Lagged(_))=>{match owned_snapshot(&app,id,user.id).await{Ok((s,owner_id,lifecycle,lifecycle_epoch,control_epoch))=>json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch,"control_epoch":control_epoch}),Err(_)=>break}},Err(_)=>break},
             message=input.next()=>{
                 let Some(Ok(message))=message else{break};last_seen=Instant::now();
                 let Message::Text(text)=message else{continue};
@@ -536,10 +620,13 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                 }
             }
         };
-        if matches!(
-            value["error"]["code"].as_str(),
-            Some("CONTROL_EPOCH_REQUIRED" | "CONTROL_EPOCH_EXPIRED")
-        ) && let Ok(epoch) = persistence::issue_control_epoch(&app.db, id, user.id).await
+        if (value["action"]["type"] == "TRANSFER_OWNERSHIP"
+            || (value["action"]["type"] == "ROOM_LIFECYCLE" && value["lifecycle"] == "active")
+            || matches!(
+                value["error"]["code"].as_str(),
+                Some("CONTROL_EPOCH_REQUIRED" | "CONTROL_EPOCH_EXPIRED")
+            ))
+            && let Ok(epoch) = persistence::issue_control_epoch(&app.db, id, user.id).await
         {
             value["control_epoch"] = json!(epoch);
         }

@@ -321,6 +321,7 @@ async function startWorker(
   existingId,
   attempt = 1,
   tinyCache = false,
+  identity,
 ) {
   const id = existingId ?? randomUUID(),
     worker = `${name}-${scenario}`;
@@ -328,7 +329,7 @@ async function startWorker(
     sql(
       // Deliberately underestimate the tiny-volume case to retain actual ENOSPC
       // coverage after admission control; this is not the Server's estimate.
-      `INSERT INTO playback_sessions(id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}',0,'${id}','{}',now()+interval '1 hour'); INSERT INTO media_jobs(id,session_id,status,spec) VALUES('${id}','${id}','queued','{"root":"/media","resource":"source.mp4","transcode":true,"estimated_output_bytes":${tinyCache ? 1048576 : 268435456},"start_seconds":${tinyCache ? 150 : 0}}')`,
+      `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}',${identity ? `'${identity.user}'` : "NULL"},${identity ? `'${identity.room}'` : "NULL"},0,'${id}','{}',now()+interval '1 hour'); INSERT INTO media_jobs(id,session_id,status,spec) VALUES('${id}','${id}','queued','{"root":"/media","resource":"source.mp4","transcode":true,"estimated_output_bytes":${tinyCache ? 1048576 : 268435456},"start_seconds":${tinyCache ? 150 : 0}}')`,
     );
   children.push(worker);
   docker(
@@ -755,9 +756,14 @@ try {
   console.log(
     "PASS: actual ENOSPC during encoding persists capacity failure after FFmpeg exits and is reaped",
   );
-  const completed = await startWorker("complete", undefined, 1, true);
   const room = randomUUID();
   const user = sql("SELECT id FROM users WHERE admin LIMIT 1");
+  // Room ownership is fixed when the grant is created; a synthetic anonymous
+  // grant must not be moved into a room after its encoder has already started.
+  sql(`INSERT INTO rooms(id,name,owner_id) VALUES('${room}','Output validation','${user}');
+    INSERT INTO room_members(room_id,user_id) VALUES('${room}','${user}');
+    INSERT INTO room_snapshots(room_id,state) VALUES('${room}','{"media_generation":0}')`);
+  const completed = await startWorker("complete", undefined, 1, true, { room, user });
   const deliveryToken = randomBytes(24).toString("hex");
   const nonce = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", sourceKey, nonce);
@@ -767,10 +773,7 @@ try {
     cipher.final(),
     cipher.getAuthTag(),
   ]).toString("base64");
-  sql(`INSERT INTO rooms(id,name,owner_id) VALUES('${room}','Output validation','${user}');
-    INSERT INTO room_members(room_id,user_id) VALUES('${room}','${user}');
-    INSERT INTO room_snapshots(room_id,state) VALUES('${room}','{"media_generation":0}');
-    UPDATE playback_sessions SET user_id='${user}',room_id='${room}',delivery_token_hash='${createHash("sha256").update(deliveryToken).digest("hex")}',resource=jsonb_build_object('encrypted','${encrypted}') WHERE id='${completed.id}'`);
+  sql(`UPDATE playback_sessions SET delivery_token_hash='${createHash("sha256").update(deliveryToken).digest("hex")}',resource=jsonb_build_object('encrypted','${encrypted}') WHERE id='${completed.id}'`);
   const deliveryOrigin = `http://${docker("port", completed.worker, "8081/tcp")}`;
   const deliveryPath = `/media-delivery/${completed.id}/index.m3u8?token=${deliveryToken}`;
   const encoderPid = completed.pid.split("/")[2];

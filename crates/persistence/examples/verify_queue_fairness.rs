@@ -111,6 +111,10 @@ async fn main() -> anyhow::Result<()> {
         .execute(&db)
         .await?;
     assert_eq!(claim(&db, Uuid::new_v4()).await?.unwrap().id, a5);
+    sqlx::query("DELETE FROM media_executions WHERE job_id=ANY($1)")
+        .bind(&ids)
+        .execute(&db)
+        .await?;
     sqlx::query("DELETE FROM media_jobs WHERE id=ANY($1)")
         .bind(&ids)
         .execute(&db)

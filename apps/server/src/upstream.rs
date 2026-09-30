@@ -10,6 +10,7 @@ struct Lane {
 
 /// Cleanup has independent capacity: stalled negotiations cannot occupy it.
 pub struct Runtime {
+    closing: tokio::sync::watch::Sender<bool>,
     negotiations: Arc<Semaphore>,
     reports: Arc<Semaphore>,
     cleanup: Arc<Semaphore>,
@@ -21,6 +22,7 @@ pub struct Runtime {
 impl Default for Runtime {
     fn default() -> Self {
         Self {
+            closing: tokio::sync::watch::channel(false).0,
             negotiations: Arc::new(Semaphore::new(4)),
             reports: Arc::new(Semaphore::new(4)),
             cleanup: Arc::new(Semaphore::new(4)),
@@ -50,24 +52,66 @@ struct Permits {
 }
 
 impl Runtime {
-    async fn negotiate_permit(&self, key: &str) -> Result<Permits> {
-        let origin = self
-            .negotiate_lane
-            .origin(key)
-            .await
-            .acquire_owned()
-            .await
-            .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "upstream_playback_failed"))?;
-        let global = self
-            .negotiations
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "upstream_playback_failed"))?;
-        Ok(Permits {
-            _global: global,
-            _origin: origin,
+    /// Close admission synchronously before HTTP/application shutdown begins.
+    /// Already admitted owners retain their permits through checkpoint/finish.
+    pub fn close_admission(&self) {
+        self.closing.send_replace(true);
+        self.negotiations.close();
+        self.reports.close();
+        self.cleanup.close();
+    }
+
+    /// No positive ledger receipt is inferred here. Successful drain means all
+    /// actual owners returned their permits after their normal finish paths.
+    /// A stalled database owner fails shutdown visibly instead of forging ACKs.
+    pub async fn drain(&self) -> anyhow::Result<()> {
+        self.close_admission();
+        tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                if self.negotiations.available_permits() == 4
+                    && self.reports.available_permits() == 4
+                    && self.cleanup.available_permits() == 4
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         })
+        .await
+        .map_err(|_| anyhow::anyhow!("upstream_owner_drain_unconfirmed"))?;
+        Ok(())
+    }
+
+    async fn negotiate_permit(&self, key: &str) -> Result<Permits> {
+        let mut closing = self.closing.subscribe();
+        let admission = async {
+            let origin = self
+                .negotiate_lane
+                .origin(key)
+                .await
+                .acquire_owned()
+                .await
+                .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "upstream_playback_failed"))?;
+            let global = self
+                .negotiations
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "upstream_playback_failed"))?;
+            Ok(Permits {
+                _global: global,
+                _origin: origin,
+            })
+        };
+        tokio::select! {
+            biased;
+            _ = async {
+                while !*closing.borrow_and_update() {
+                    if closing.changed().await.is_err() { break; }
+                }
+            } => Err(err(StatusCode::SERVICE_UNAVAILABLE,"upstream_playback_failed")),
+            result = admission => result,
+        }
     }
     async fn try_permit(&self, key: &str, stop: bool) -> Option<Permits> {
         let (lane, global) = if stop {
@@ -117,12 +161,12 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
     let permits = app.upstream.negotiate_permit(&origin_key).await?;
     let scope = app.encrypt(&json!({"config":p.config,"item":p.item}))?;
     let mut tx = app.db.begin().await?;
+    playback_requests::guard(app, &mut tx, p.reservation).await?;
     let state: Value =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
             .bind(p.room)
             .fetch_one(&mut *tx)
             .await?;
-    playback_requests::guard(app, &mut tx, p.reservation).await?;
     if state["media_generation"].as_u64() != Some(u64::from(p.generation)) {
         return Err(err(StatusCode::CONFLICT, "stale_media"));
     }
@@ -184,7 +228,7 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
             }
             // A late checkpoint is retained after revoke. Only final activation
             // can grant media, and its transaction still checks request ownership.
-            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM upstream_reservations u JOIN playback_requests r ON r.session_id=u.id JOIN room_snapshots s ON s.room_id=u.room_id JOIN room_members m ON m.room_id=u.room_id AND m.user_id=u.user_id WHERE u.id=$1 AND u.state='preparing' AND r.status='pending' AND r.owner_epoch=$2 AND r.lease_until>clock_timestamp() AND (s.state->>'media_generation')::bigint=u.generation)")
+            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM upstream_reservations u JOIN playback_requests r ON r.session_id=u.id JOIN room_snapshots s ON s.room_id=u.room_id JOIN rooms life ON life.id=u.room_id AND life.lifecycle='active' AND life.lifecycle_epoch=u.lifecycle_epoch JOIN room_members m ON m.room_id=u.room_id AND m.user_id=u.user_id WHERE u.id=$1 AND u.state='preparing' AND r.status='pending' AND r.owner_epoch=$2 AND r.lease_until>clock_timestamp() AND (s.state->>'media_generation')::bigint=u.generation)")
                 .bind(id).bind(app.epoch).fetch_one(&app.db).await?;
             if !valid {
                 let mut tx = app.db.begin().await?;
@@ -351,7 +395,32 @@ pub async fn report(app: &App, id: Uuid, event: &str) -> anyhow::Result<()> {
             // A negotiated local/HTTP/NAS grant has no upstream reporter.
             return Ok(());
         }
-        return legacy_report(app, id, event).await;
+        let encrypted: Option<Value> =
+            sqlx::query_scalar("SELECT resource FROM playback_sessions WHERE id=$1")
+                .bind(id)
+                .fetch_optional(&app.db)
+                .await?;
+        let origin = encrypted
+            .and_then(|value| app.decrypt(value["encrypted"].as_str().unwrap_or("")).ok())
+            .and_then(|resource| {
+                resource["upstream_base"]
+                    .as_str()
+                    .and_then(|base| providers::validate_url(base).ok())
+            })
+            .map_or_else(
+                || format!("legacy-{id}"),
+                |url| hash(&url.origin().ascii_serialization()),
+            );
+        let Some(permits) = app.upstream.try_permit(&origin, event == "stop").await else {
+            return Ok(());
+        };
+        let app = app.clone();
+        let event = event.to_owned();
+        return tokio::spawn(async move {
+            let _permits = permits;
+            legacy_report(&app, id, &event).await
+        })
+        .await?;
     };
     let Some(permits) = app.upstream.try_permit(&origin, false).await else {
         return Ok(());
@@ -409,10 +478,23 @@ pub async fn maintenance(app: App) {
 async fn legacy_report(app: &App, id: Uuid, event: &str) -> anyhow::Result<()> {
     // Claim the I/O and retry budget together. A selected row can become busy,
     // renewed or stopped before this task runs; that does not spend an attempt.
+    let mut admission = app.db.begin().await?;
+    if event != "stop" {
+        let grant: Option<(Uuid, i64)> =
+            sqlx::query_as("SELECT room_id,lifecycle_epoch FROM playback_sessions WHERE id=$1")
+                .bind(id)
+                .fetch_optional(&mut *admission)
+                .await?;
+        let Some((room, epoch)) = grant else {
+            return Ok(());
+        };
+        persistence::room_lifecycle::lock_epoch(&mut admission, room, epoch).await?;
+    }
     let claim_started = tokio::time::Instant::now();
     let token = Uuid::new_v4().to_string();
     let claimed: Option<Value> = sqlx::query_scalar("UPDATE playback_sessions p SET stopped=stopped OR $3::text='stop',resource=resource||jsonb_build_object('upstream_io_claim',$2::text,'upstream_io_kind',$3::text,'upstream_io_lease_until',CASE WHEN $3::text='stop' THEN LEAST(clock_timestamp()+interval '10 seconds',COALESCE((resource->>'upstream_cleanup_deadline')::timestamptz,clock_timestamp()+interval '60 seconds')) ELSE clock_timestamp()+interval '10 seconds' END,'upstream_io_pending',true,'upstream_io_uncertain',COALESCE((resource->>'upstream_io_uncertain')::boolean,false) OR (COALESCE((resource->>'upstream_io_pending')::boolean,false) AND COALESCE(resource->>'upstream_io_kind','progress')<>'stop'))||CASE WHEN $3::text='stop' THEN jsonb_build_object('upstream_cleanup_attempts',COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)+1,'upstream_cleanup_deadline',COALESCE((resource->>'upstream_cleanup_deadline')::timestamptz,clock_timestamp()+interval '60 seconds'),'upstream_cleanup_after',clock_timestamp()+make_interval(secs=>LEAST(16,power(2,COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)+1)::integer))) ELSE jsonb_build_object('upstream_last_report_at',clock_timestamp()) END WHERE id=$1 AND NOT(resource ? 'upstream_closed') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id) AND (NOT(resource ? 'upstream_io_claim') OR (resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp()) AND CASE WHEN $3::text='stop' THEN COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)<5 AND (NOT(resource ? 'upstream_cleanup_deadline') OR (resource->>'upstream_cleanup_deadline')::timestamptz>clock_timestamp()) AND (NOT(resource ? 'upstream_cleanup_after') OR (resource->>'upstream_cleanup_after')::timestamptz<=clock_timestamp()) AND (stopped OR expires_at<=clock_timestamp() OR EXISTS(SELECT 1 FROM room_snapshots s WHERE s.room_id=p.room_id AND (s.state->>'media_generation')::bigint<>p.generation)) ELSE NOT stopped AND expires_at>clock_timestamp() AND NOT COALESCE((resource->>'upstream_io_pending')::boolean,false) AND NOT COALESCE((resource->>'upstream_io_uncertain')::boolean,false) AND ($3::text='start' OR NOT(resource ? 'upstream_last_report_at') OR (resource->>'upstream_last_report_at')::timestamptz<=clock_timestamp()-interval '10 seconds') AND EXISTS(SELECT 1 FROM room_snapshots s WHERE s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation) END RETURNING jsonb_build_object('resource',resource,'cleanup_remaining_ms',CASE WHEN $3::text='stop' THEN EXTRACT(epoch FROM ((resource->>'upstream_cleanup_deadline')::timestamptz-clock_timestamp()))*1000 ELSE 3000 END)")
-        .bind(id).bind(&token).bind(event).fetch_optional(&app.db).await?;
+        .bind(id).bind(&token).bind(event).fetch_optional(&mut *admission).await?;
+    admission.commit().await?;
     let Some(claimed) = claimed else {
         return Ok(());
     };
@@ -570,6 +652,37 @@ mod tests {
         assert_eq!(identifier(&wire["PlaySessionId"]), Some("session-known"));
         assert!(wire["MediaSources"].as_array().unwrap().is_empty());
     }
+    #[tokio::test]
+    async fn runtime_shutdown_cancels_waiting_admission_and_waits_for_actual_holders() {
+        let runtime = std::sync::Arc::new(Runtime::default());
+        let first = runtime.negotiate_permit("held").await.unwrap();
+        let second = runtime.negotiate_permit("held").await.unwrap();
+        let waiting_runtime = runtime.clone();
+        let waiting = tokio::spawn(async move { waiting_runtime.negotiate_permit("held").await });
+        tokio::task::yield_now().await;
+        runtime.close_admission();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(runtime.try_permit("fresh", true).await.is_none());
+        assert!(runtime.try_permit("fresh", false).await.is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), runtime.drain())
+                .await
+                .is_err()
+        );
+        drop(first);
+        drop(second);
+        tokio::time::timeout(std::time::Duration::from_secs(1), runtime.drain())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn stalled_negotiations_cannot_occupy_cleanup_capacity() {
         let runtime = Runtime::default();

@@ -33,7 +33,9 @@ onMounted(bottom);
   <aside class="chat-panel panel">
     <header>
       <h2>房间聊天</h2>
-      <span class="helper">{{ r.connected ? "已连接" : "连接中断" }}</span>
+      <span class="helper">{{
+        !r.roomActive ? "只读" : r.connected ? "已连接" : "连接中断"
+      }}</span>
     </header>
     <div
       ref="log"
@@ -76,12 +78,14 @@ onMounted(bottom);
         v-model="r.chat"
         :maxlength="4000"
         placeholder="发送消息"
-        :disabled="!r.connected"
+        :disabled="!r.connected || !r.roomActive"
         autocomplete="off"
       /><button
         class="primary icon-button"
         :aria-label="r.chatFailed ? '重试发送' : '发送消息'"
-        :disabled="!r.connected || r.chatPending || !r.chat.trim()"
+        :disabled="
+          !r.connected || !r.roomActive || r.chatPending || !r.chat.trim()
+        "
       >
         <AppIcon :name="r.chatFailed ? 'refresh' : 'send'" />
       </button>

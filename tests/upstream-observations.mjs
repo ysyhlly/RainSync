@@ -14,7 +14,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const entry = fileURLToPath(import.meta.url);
 const fixtureEntry = resolve(root, "tests/fixtures/server.mjs");
 const runId = randomUUID();
-const evidence = resolve(root, ".runtime/upstream-observations", runId);
+const runtime = resolve(process.env.RAINSYNC_RUNTIME_ROOT ?? resolve(root, ".runtime"));
+const evidence = resolve(runtime, "upstream-observations", runId);
 await mkdir(evidence, { recursive: true });
 process.env.RAINSYNC_ARTIFACT_DIR = evidence;
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -352,7 +353,7 @@ class Controller {
   }
 }
 
-let bindingPath, binding, nativeSource, nativeCopy, controller, fixtureIdentity;
+let bindingPath, binding, nativeSource, nativeCopy, controller, fixtureIdentity, ownedFixture;
 let fixtureHash,
   entryHash,
   bindingHash,
@@ -384,7 +385,7 @@ try {
   );
   bindingPath = resolve(process.env.W03_BACKEND_BINDING);
   const bindingRelative = relative(
-    resolve(root, ".runtime/w03-viewer-backend"),
+    resolve(runtime, "w03-viewer-backend"),
     bindingPath,
   );
   assert.ok(!isAbsolute(bindingRelative) && !bindingRelative.startsWith(".."));
@@ -431,9 +432,17 @@ try {
   await isolatedServer(
     "upstream-observations",
     async (fixture) => {
+      const boundMigrations=binding.source.map(file=>/^migrations[\/](\d+)_.*\.sql$/.exec(file.path)).filter(Boolean).map(match=>Number(match[1])).sort((a,b)=>a-b);
+      assert.ok(boundMigrations.includes(26),"observation migration26 remains bound");
       assert.equal(
         fixture.sql("SELECT max(version) FROM _sqlx_migrations WHERE success"),
-        "26",
+        String(Math.max(...boundMigrations)),
+        "database matches the successful bound backend's latest migration",
+      );
+      assert.equal(
+        fixture.sql(`SELECT count(*) FROM _sqlx_migrations WHERE success AND version IN(${boundMigrations.join(",")})`),
+        String(boundMigrations.length),
+        "every migration in the bound source is applied successfully",
       );
       const admin = fixture.client();
       const adminUser = await admin.login();
@@ -1552,11 +1561,22 @@ try {
     {
       binary: nativeCopy,
       beforeStart: (fixture) => {
+        ownedFixture=fixture;
         fixtureIdentity = {
           id: fixture.id,
           container: fixture.container,
           root: fixture.root,
+          database_kind: fixture.databaseKind,
+          postgres: fixture.postgresDiagnostics(),
         };
+        if (fixture.databaseKind === "native") {
+          assert.equal(fixture.container,null,"native runs must not invent a Docker identity");
+          assert.equal(fixtureIdentity.postgres.kind,"native");
+          ownedVolumes=[];
+          report.fixture={...fixtureIdentity,owned_volume_names:[]};
+          return;
+        }
+        assert.equal(fixture.databaseKind,"docker");
         const mounts = JSON.parse(
           docker("inspect", "--format", "{{json .Mounts}}", fixture.container),
         );
@@ -1604,6 +1624,10 @@ try {
     });
   if (fixtureIdentity)
     await cleanupStep("owned PostgreSQL and anonymous volumes", async () => {
+      if (fixtureIdentity.database_kind === "native") {
+        report.cleanup.native=await ownedFixture.verifyStopped();
+        return;
+      }
       assert.match(
         fixtureIdentity.container,
         /^rainsync-upstream-observations-[0-9a-f]{8}$/,
@@ -1702,7 +1726,7 @@ try {
       name: "fixture creation identity",
       result: "failed",
       error:
-        "fixture did not reach its Mounts registration; owned volume cleanup is unknown",
+        "fixture did not reach its backend identity registration; owned database cleanup is unknown",
     });
     report.result = "failed";
     process.exitCode = 1;

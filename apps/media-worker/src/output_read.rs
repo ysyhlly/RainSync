@@ -45,7 +45,7 @@ impl Checks {
         // The permit lives inside the blocking closure: cancelling the request
         // must not admit more scans while its disk work is still running.
         let permit = self.slots.clone().acquire_owned().await?;
-        tokio::task::spawn_blocking(move || {
+        media_core::child_process::blocking(move || {
             let _permit = permit;
             progress
                 .lock()
@@ -60,9 +60,9 @@ impl Checks {
         &self,
         path: PathBuf,
         proof: Option<persistence::media_outputs::FileProof>,
-    ) -> Result<tokio::fs::File> {
+    ) -> Result<std::fs::File> {
         let permit = self.slots.clone().acquire_owned().await?;
-        let file = tokio::task::spawn_blocking(move || {
+        let file = media_core::child_process::blocking(move || {
             let _permit = permit;
             match proof {
                 Some(proof) => outputs::open_verified(&path, &proof),
@@ -70,6 +70,6 @@ impl Checks {
             }
         })
         .await??;
-        Ok(tokio::fs::File::from_std(file))
+        Ok(file)
     }
 }

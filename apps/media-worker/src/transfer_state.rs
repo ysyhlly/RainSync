@@ -76,6 +76,7 @@ impl State {
 pub struct Offer {
     pub id: Uuid,
     pub agent: Uuid,
+    pub session_id: Option<Uuid>,
     pub token_hash: String,
     pub request: Value,
     pub resource_hash: String,
@@ -103,13 +104,25 @@ pub async fn own(
 ) {
     let result: std::result::Result<(), sqlx::Error> = async {
         let mut tx = db.begin().await?;
+        if let Some(session) = offer.session_id {
+            // Offer persistence has its own detached owner. Serialize its late
+            // INSERT with close too: delivery cancellation may have already
+            // dropped the registration and acknowledged the local response.
+            let room: Uuid = sqlx::query_scalar("SELECT room_id FROM playback_sessions WHERE id=$1")
+                .bind(session).fetch_one(&mut *tx).await?;
+            let epoch: i64 = sqlx::query_scalar("SELECT lifecycle_epoch FROM rooms WHERE id=$1 AND lifecycle='active' FOR NO KEY UPDATE")
+                .bind(room).fetch_one(&mut *tx).await?;
+            let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions WHERE id=$1 AND lifecycle_epoch=$2 AND NOT stopped AND expires_at>clock_timestamp())")
+                .bind(session).bind(epoch).fetch_one(&mut *tx).await?;
+            if !active { return Err(sqlx::Error::RowNotFound); }
+        }
         sqlx::query("INSERT INTO agent_transfers VALUES($1,$2,$3,$4,false,now()+interval '30 seconds')")
             .bind(offer.id).bind(offer.agent).bind(&offer.token_hash).bind(&offer.request)
             .execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO agent_transfer_runs(id,agent_id,resource_hash,head,byte_range) VALUES($1,$2,$3,$4,$5)")
+        sqlx::query("INSERT INTO agent_transfer_runs(id,agent_id,resource_hash,head,byte_range,session_id,legacy_unconfirmed) VALUES($1,$2,$3,$4,$5,$6,false)")
             .bind(offer.id).bind(offer.agent).bind(&offer.resource_hash)
             .bind(offer.request["head"].as_bool().unwrap_or(false))
-            .bind(offer.request["range"].as_str()).execute(&mut *tx).await?;
+            .bind(offer.request["range"].as_str()).bind(offer.session_id).execute(&mut *tx).await?;
         tx.commit().await
     }.await;
     let inserted = result.is_ok();
@@ -159,7 +172,7 @@ pub async fn own(
         let mut tx = db.begin().await?;
         sqlx::query("DELETE FROM agent_transfers WHERE id=$1").bind(offer.id).execute(&mut *tx).await?;
         lock(&mut tx, offer.id).await?;
-        sqlx::query("UPDATE agent_transfer_runs SET status=$2,reason=$3,bytes_delivered=$4,updated_at=clock_timestamp(),finished_at=clock_timestamp() WHERE id=$1 AND finished_at IS NULL AND lease_until>clock_timestamp()")
+        sqlx::query("UPDATE agent_transfer_runs SET status=$2,reason=$3,bytes_delivered=$4,updated_at=clock_timestamp(),finished_at=clock_timestamp(),agent_drained_at=CASE WHEN dispatched_at IS NULL AND NOT legacy_unconfirmed THEN COALESCE(agent_drained_at,clock_timestamp()) ELSE agent_drained_at END WHERE id=$1 AND finished_at IS NULL AND lease_until>clock_timestamp()")
             .bind(offer.id).bind(status).bind(reason).bind(bytes).execute(&mut *tx).await?;
         tx.commit().await
     }).await;

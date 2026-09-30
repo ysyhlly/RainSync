@@ -69,6 +69,10 @@ async fn main() -> anyhow::Result<()> {
     );
     assert!(media_jobs::renew(&db, &second).await?);
     cache::release(&db, current_reader).await?;
+    sqlx::query("DELETE FROM media_executions WHERE job_id=$1")
+        .bind(id)
+        .execute(&db)
+        .await?;
     sqlx::query("DELETE FROM media_jobs WHERE id=$1")
         .bind(id)
         .execute(&db)

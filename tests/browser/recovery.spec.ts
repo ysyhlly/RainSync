@@ -385,7 +385,7 @@ test("stale HLS attempt refetches entry manifest without a new playback session"
       contentType: "text/javascript",
       body: `
     export default class Hls {
-      static Events={ERROR:'error'}; static isSupported(){return true}
+      static Events={ERROR:'error'}; static isSupported(){return true} static getMediaSource(){return MediaSource}
       constructor(config){this.config=config;this.mediaSource=new MediaSource();window.hlsTest=this;window.hlsInitialSource=this.mediaSource;window.hlsSources=[];window.hlsStarts=[];window.hlsDetaches=0;window.hlsAttachments=0}
       loadSource(url){if(this.media&&this.url){const media=this.media;this.detachMedia();this.mediaSource=new MediaSource();this.attachMedia(media)}this.url=url;window.hlsSources.push(url)}
       attachMedia(media){this.media=media;window.hlsAttachments++} detachMedia(){this.media=null;window.hlsDetaches++}
@@ -478,6 +478,7 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
         export default class Hls {
           static Events = { ERROR: 'error' };
           static isSupported() { return true }
+          static getMediaSource() { return MediaSource }
           constructor(config) {
             this.config = config;
             this.mediaSource = new MediaSource();

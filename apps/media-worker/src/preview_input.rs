@@ -162,9 +162,12 @@ pub async fn read(
             if resource["read_version"] != version.version {
                 return Err((StatusCode::CONFLICT, "source_changed".into()));
             }
-            file_response(&path, &h, head, None, Some(tokio::fs::File::from_std(file))).await?
+            file_delivery::response(&path, &h, head, None, Some(file), Some(version.version))
+                .await?
         }
-        "agent" => relay::fetch(&app, resource, &h, head, grant.input_failure.clone()).await?,
+        "agent" => {
+            relay::fetch(&app, resource, &h, head, grant.input_failure.clone(), None).await?
+        }
         _ => return remote(&app, grant, target, &h, head).await,
     };
     Ok(bounded(response, grant, head))

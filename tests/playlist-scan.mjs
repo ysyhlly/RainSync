@@ -12,11 +12,12 @@ const report = {
   result: "running",
   cases: [],
 };
-let artifactRoot;
+let artifactRoot, fixture;
 try {
   await isolatedMediaStack("playlist-scan", async (f) => {
     artifactRoot = f.root;
-    report.fixture = { id: f.id, container: f.container };
+    fixture = f;
+    report.fixture = { id: f.id, container: f.databaseKind === "docker" ? f.container : null, postgres: f.postgresDiagnostics() };
     report.binaries = {};
     for (const binary of ["rainsync-server", "rainsync-nas-agent"]) {
       const bytes = await readFile(
@@ -227,7 +228,8 @@ try {
       );
       const seeded = await initialOutcome;
       if (seeded.error) throw seeded.error;
-      assert.equal(seeded.value.status, "complete");
+      assert.equal(seeded.value.status, "upgrade_required");
+      assert.equal(seeded.value.unversioned_count, 1);
       assert.equal(seeded.value.count, 1);
       const interrupted = admin.request(`/agents/${old.id}/scan`, "POST");
       const interruptedOutcome = interrupted.then(
@@ -313,7 +315,8 @@ try {
       );
       const recovered = await recoveryOutcome;
       if (recovered.error) throw recovered.error;
-      assert.equal(recovered.value.status, "complete");
+      assert.equal(recovered.value.status, "upgrade_required");
+      assert.equal(recovered.value.unversioned_count, 2);
       assert.equal(recovered.value.count, 2);
       assert.equal(
         f.sql(
@@ -345,21 +348,16 @@ try {
       for (const ws of sockets) ws.terminate();
     }
   });
-  report.cleanup = {
-    remaining_fixture_containers: execFileSync(
+  report.cleanup = { evidence: await fixture.verifyStopped() };
+  if (fixture.databaseKind === "docker") {
+    report.cleanup.remaining_fixture_containers = execFileSync(
       "docker",
-      [
-        "ps",
-        "-a",
-        "--filter",
-        `name=${report.fixture.container}`,
-        "--format",
-        "{{.Names}}",
-      ],
+      ["ps", "-a", "--filter", `name=${report.fixture.container}`, "--format", "{{.Names}}"],
       { encoding: "utf8", timeout: 10000, windowsHide: true },
-    ).trim(),
-  };
-  assert.equal(report.cleanup.remaining_fixture_containers, "");
+    ).trim();
+    assert.equal(report.cleanup.remaining_fixture_containers, "");
+  }
+  assert.equal(report.cleanup.evidence.completed, true);
   report.result = "passed";
 } catch (error) {
   report.result = "failed";

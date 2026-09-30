@@ -16,7 +16,7 @@ pub fn write_error(error: std::io::Error) -> anyhow::Error {
 /// freeing space would hide the failure we are trying to classify.
 pub async fn check_output_capacity(app: &App) -> anyhow::Result<()> {
     let root = app.cache.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    media_core::child_process::blocking(move || -> anyhow::Result<()> {
         let max = std::env::var("CACHE_MAX_BYTES")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -52,7 +52,7 @@ pub async fn reserve_output(
     for _ in 0..4 {
         let revision = cache_budget::snapshot(&app.db).await?;
         let root = app.cache.clone();
-        let headroom = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+        let headroom = media_core::child_process::blocking(move || -> anyhow::Result<u64> {
             let max = std::env::var("CACHE_MAX_BYTES")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -109,15 +109,16 @@ async fn ensure_headroom(app: &App, needed: u64) -> anyhow::Result<()> {
     persistence::cache::cleanup(&app.db).await?;
     let root = app.cache.canonicalize()?;
     let scan_root = root.clone();
-    let (mut total, candidates) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let candidates = std::fs::read_dir(&scan_root)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink()))
-            .filter_map(|e| Uuid::parse_str(&e.file_name().to_string_lossy()).ok())
-            .collect::<Vec<_>>();
-        Ok((size(&scan_root)?, candidates))
-    })
-    .await??;
+    let (mut total, candidates) =
+        media_core::child_process::blocking(move || -> anyhow::Result<_> {
+            let candidates = std::fs::read_dir(&scan_root)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink()))
+                .filter_map(|e| Uuid::parse_str(&e.file_name().to_string_lossy()).ok())
+                .collect::<Vec<_>>();
+            Ok((size(&scan_root)?, candidates))
+        })
+        .await??;
     sqlx::query("INSERT INTO cache_entries(id,cache_key,path) SELECT v,v::text,v::text FROM unnest($1::uuid[]) AS v ON CONFLICT DO NOTHING")
         .bind(&candidates)
         .execute(&app.db)
@@ -152,7 +153,7 @@ async fn ensure_headroom(app: &App, needed: u64) -> anyhow::Result<()> {
             continue;
         };
         let root = root.clone();
-        let removed = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+        let removed = media_core::child_process::blocking(move || -> anyhow::Result<u64> {
             let candidate = root.join(id.to_string());
             if !candidate.exists() {
                 return Ok(0);
@@ -184,7 +185,7 @@ async fn ensure_headroom(app: &App, needed: u64) -> anyhow::Result<()> {
     }
     check_output_capacity(app).await?;
     let root = root.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    media_core::child_process::blocking(move || -> anyhow::Result<()> {
         anyhow::ensure!(
             size(&root)?.saturating_add(needed) < max
                 && fs2::available_space(&root)?.saturating_sub(needed)

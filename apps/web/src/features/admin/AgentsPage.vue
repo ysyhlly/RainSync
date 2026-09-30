@@ -7,6 +7,11 @@ import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import Notice from "../../shared/ui/Notice.vue";
 import CopyField from "../../shared/ui/CopyField.vue";
+import {
+  agentConnectionLabel,
+  agentReadinessLabel,
+  agentDrainLabel,
+} from "./agent-readiness";
 const session = useSession(),
   { busy, error, message, run } = useAction(),
   rows = ref<Agent[]>([]),
@@ -80,8 +85,8 @@ onBeforeUnmount(() => {
       :message="message"
     />
     <p v-if="busy && !loaded" role="status">正在加载设备…</p>
-    <button v-if="error && !open && !revokeOpen" @click="run(load)">
-      重新加载
+    <button v-if="!open && !revokeOpen" :disabled="busy" @click="run(load)">
+      {{ busy ? "正在刷新…" : "刷新设备状态" }}
     </button>
     <div v-if="loaded && !rows.length" class="empty-state">
       <AppIcon name="server" :size="40" />
@@ -93,14 +98,12 @@ onBeforeUnmount(() => {
         <div class="row-main">
           <h2>{{ row.name }}</h2>
           <p class="helper">
-            {{
-              row.revoked
-                ? "已撤销"
-                : row.last_seen
-                  ? "已配对记录"
-                  : "等待首次连接"
-            }}
+            {{ agentConnectionLabel(row) }}
             · 最后联系：{{ formatDate(row.last_seen) }}
+          </p>
+          <p class="helper">{{ agentReadinessLabel(row) }}</p>
+          <p v-if="agentDrainLabel(row)" class="helper">
+            {{ agentDrainLabel(row) }}
           </p>
         </div>
         <button
@@ -116,7 +119,7 @@ onBeforeUnmount(() => {
       </article>
     </div>
     <p v-if="rows.length" class="helper">
-      最后联系时间是历史记录，不表示设备此刻一定在线。
+      连接状态以最近一次刷新为准；文件版本索引就绪不代表设备当前在线或所有影片均可播放。
     </p>
     <AppDialog v-model="open" title="添加NAS设备" drawer :busy="busy"
       ><template v-if="code"
@@ -154,9 +157,7 @@ onBeforeUnmount(() => {
     ><AppDialog v-model="revokeOpen" title="撤销设备" :busy="busy"
       ><p>
         撤销
-        {{
-          revoking?.name
-        }}
+        {{ revoking?.name }}
         后，设备凭据失效，无法继续同步和读取设备片源。现有账号不受影响。
       </p>
       <Notice :message="error" error />

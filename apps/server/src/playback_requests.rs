@@ -4,6 +4,8 @@ pub struct Reservation {
     pub key: Uuid,
     pub session: Uuid,
     pub user: Uuid,
+    pub room_id: Uuid,
+    pub lifecycle_epoch: i64,
 }
 
 pub enum Start {
@@ -21,13 +23,27 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
     canonical.mode = Some(body.mode.as_deref().unwrap_or("auto").into());
     let digest = hash(&serde_json::to_string(&canonical).map_err(anyhow::Error::from)?);
     let mut tx = app.db.begin().await?;
+    // Room management, reservation and final publication share this first lock.
+    let lifecycle_epoch = persistence::room_lifecycle::lock_active(&mut tx, body.room_id)
+        .await
+        .map_err(lifecycle_error)?;
+    let member: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
+    )
+    .bind(body.room_id)
+    .bind(user)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if member.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "not_a_member"));
+    }
     // Serialize quota decisions without blocking FK KEY SHARE locks taken by
     // an in-flight preparation inserting its playback session.
     sqlx::query("SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE")
         .bind(user)
         .fetch_one(&mut *tx)
         .await?;
-    let previous = sqlx::query("SELECT *,expires_at>now() AS retained,lease_until>now() AS live FROM playback_requests WHERE user_id=$1 AND idempotency_key=$2 FOR UPDATE")
+    let previous = sqlx::query("SELECT *,expires_at>clock_timestamp() AS retained,lease_until>clock_timestamp() AS live FROM playback_requests WHERE user_id=$1 AND idempotency_key=$2 FOR UPDATE")
         .bind(user).bind(key).fetch_optional(&mut *tx).await?;
     if let Some(row) = previous {
         if row.get::<Option<String>, _>("error_code").as_deref()
@@ -40,8 +56,8 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
         }
         match row.get::<String, _>("status").as_str() {
             "completed" => {
-                let remaining: Option<i64> = sqlx::query_scalar("SELECT CEIL(EXTRACT(EPOCH FROM(p.expires_at-now())))::bigint FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND p.expires_at>now() AND (s.state->>'media_generation')::bigint=p.generation")
-                    .bind(row.get::<Uuid,_>("session_id")).bind(user).fetch_optional(&mut *tx).await?;
+                let remaining: Option<i64> = sqlx::query_scalar("SELECT CEIL(EXTRACT(EPOCH FROM(p.expires_at-now())))::bigint FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation AND p.room_id=$3 AND p.lifecycle_epoch=$4 AND EXISTS(SELECT 1 FROM rooms r WHERE r.id=p.room_id AND r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch)")
+                    .bind(row.get::<Uuid,_>("session_id")).bind(user).bind(body.room_id).bind(lifecycle_epoch).fetch_optional(&mut *tx).await?;
                 let remaining =
                     remaining.ok_or_else(|| err(StatusCode::GONE, "playback_request_expired"))?;
                 let mut plan = app.decrypt(&row.get::<String, _>("response_encrypted"))?;
@@ -101,10 +117,18 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
         ));
     }
     let session = Uuid::new_v4();
-    sqlx::query("INSERT INTO playback_requests(user_id,idempotency_key,request_hash,session_id,owner_epoch,status,lease_until,expires_at) VALUES($1,$2,$3,$4,$5,'pending',now()+interval '60 seconds',now()+interval '48 hours') ON CONFLICT(user_id,idempotency_key) DO UPDATE SET session_id=EXCLUDED.session_id,owner_epoch=EXCLUDED.owner_epoch,status='pending',response_encrypted=NULL,error_status=NULL,error_code=NULL,lease_until=EXCLUDED.lease_until,expires_at=EXCLUDED.expires_at,attempt=playback_requests.attempt+1")
-        .bind(user).bind(key).bind(digest).bind(session).bind(app.epoch).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO playback_requests(user_id,idempotency_key,request_hash,session_id,owner_epoch,status,lease_until,expires_at,room_id,lifecycle_epoch,preparation_drained_at) VALUES($1,$2,$3,$4,$5,'pending',clock_timestamp()+interval '60 seconds',now()+interval '48 hours',$6,$7,NULL) ON CONFLICT(user_id,idempotency_key) DO UPDATE SET session_id=EXCLUDED.session_id,owner_epoch=EXCLUDED.owner_epoch,status='pending',response_encrypted=NULL,error_status=NULL,error_code=NULL,lease_until=EXCLUDED.lease_until,expires_at=EXCLUDED.expires_at,attempt=playback_requests.attempt+1,room_id=EXCLUDED.room_id,lifecycle_epoch=EXCLUDED.lifecycle_epoch,preparation_drained_at=NULL")
+        .bind(user).bind(key).bind(digest).bind(session).bind(app.epoch).bind(body.room_id).bind(lifecycle_epoch).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO playback_preparations(session_id,room_id,lifecycle_epoch,owner_epoch) VALUES($1,$2,$3,$4)")
+        .bind(session).bind(body.room_id).bind(lifecycle_epoch).bind(app.epoch).execute(&mut *tx).await?;
     tx.commit().await?;
-    Ok(Start::Reserved(Reservation { key, session, user }))
+    Ok(Start::Reserved(Reservation {
+        key,
+        session,
+        user,
+        room_id: body.room_id,
+        lifecycle_epoch,
+    }))
 }
 
 /// The response contains playback bearer URLs, so persist it encrypted using
@@ -116,7 +140,7 @@ pub async fn complete(
     plan: &Value,
 ) -> Result<()> {
     let response = app.encrypt(plan)?;
-    let result = sqlx::query("UPDATE playback_requests SET status='completed',response_encrypted=$4 WHERE user_id=$1 AND idempotency_key=$2 AND owner_epoch=$3 AND session_id=$5 AND status='pending' AND lease_until>now()")
+    let result = sqlx::query("UPDATE playback_requests SET status='completed',response_encrypted=$4 WHERE user_id=$1 AND idempotency_key=$2 AND owner_epoch=$3 AND session_id=$5 AND status='pending' AND lease_until>clock_timestamp()")
         .bind(reservation.user).bind(reservation.key).bind(app.epoch).bind(response).bind(reservation.session).execute(&mut **tx).await?;
     if result.rows_affected() != 1 {
         return Err(err(StatusCode::CONFLICT, "playback_request_interrupted"));
@@ -129,7 +153,23 @@ pub async fn guard(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     reservation: &Reservation,
 ) -> Result<()> {
-    let valid = sqlx::query("SELECT session_id FROM playback_requests WHERE user_id=$1 AND idempotency_key=$2 AND session_id=$3 AND owner_epoch=$4 AND status='pending' AND lease_until>now() FOR UPDATE")
+    let epoch = persistence::room_lifecycle::lock_active(tx, reservation.room_id)
+        .await
+        .map_err(lifecycle_error)?;
+    if epoch != reservation.lifecycle_epoch {
+        return Err(err(StatusCode::CONFLICT, "room_not_active"));
+    }
+    let member: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
+    )
+    .bind(reservation.room_id)
+    .bind(reservation.user)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if member.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "not_a_member"));
+    }
+    let valid = sqlx::query("SELECT session_id FROM playback_requests WHERE user_id=$1 AND idempotency_key=$2 AND session_id=$3 AND owner_epoch=$4 AND status='pending' AND lease_until>clock_timestamp() FOR UPDATE")
         .bind(reservation.user).bind(reservation.key).bind(reservation.session).bind(app.epoch).fetch_optional(&mut **tx).await?;
     if valid.is_none() {
         return Err(err(StatusCode::CONFLICT, "playback_request_interrupted"));
@@ -141,12 +181,21 @@ pub async fn guard(
 /// was lost. A pending preparation grant is revoked when failure is recorded.
 pub async fn fail(app: &App, reservation: &Reservation, error: &Error) -> Result<Option<Value>> {
     let mut tx = app.db.begin().await?;
+    sqlx::query("SELECT id FROM rooms WHERE id=$1 FOR NO KEY UPDATE")
+        .bind(reservation.room_id)
+        .fetch_one(&mut *tx)
+        .await?;
     let row = sqlx::query("SELECT status,response_encrypted,session_id,attempt FROM playback_requests WHERE user_id=$1 AND idempotency_key=$2 FOR UPDATE")
         .bind(reservation.user).bind(reservation.key).fetch_one(&mut *tx).await?;
     if row.get::<Uuid, _>("session_id") != reservation.session {
         return Err(err(StatusCode::CONFLICT, "playback_request_interrupted"));
     }
     if row.get::<String, _>("status") == "completed" {
+        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions p JOIN rooms r ON r.id=p.room_id JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND p.expires_at>clock_timestamp() AND r.lifecycle='active' AND r.lifecycle_epoch=$3 AND p.lifecycle_epoch=r.lifecycle_epoch AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id))")
+            .bind(reservation.session).bind(reservation.user).bind(reservation.lifecycle_epoch).fetch_one(&mut *tx).await?;
+        if !valid {
+            return Err(err(StatusCode::GONE, "invalid_playback_session"));
+        }
         let mut plan = app.decrypt(&row.get::<String, _>("response_encrypted"))?;
         playback_observations::refresh_plan(&mut tx, &mut plan).await?;
         return Ok(Some(plan));
@@ -181,28 +230,69 @@ pub async fn cancel(
     Path(key): Path<Uuid>,
 ) -> Result<Json<Value>> {
     let user = auth(&app, &h, true).await?;
-    let mut tx = app.db.begin().await?;
-    sqlx::query("SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE")
-        .bind(user.id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let room: Option<Uuid> = sqlx::query_scalar("SELECT COALESCE((SELECT p.room_id FROM playback_requests r JOIN playback_sessions p ON p.id=r.session_id WHERE r.user_id=$1 AND r.idempotency_key=$2),(SELECT u.room_id FROM playback_requests r JOIN upstream_reservations u ON u.id=r.session_id WHERE r.user_id=$1 AND r.idempotency_key=$2))")
-        .bind(user.id).bind(key).fetch_one(&mut *tx).await?;
-    if let Some(room) = room {
-        sqlx::query("SELECT room_id FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
-            .bind(room)
-            .fetch_optional(&mut *tx)
+    // Resolve the room before taking the per-user quota lock. If a concurrent
+    // reservation appeared in that gap, retry without ever inverting room→user.
+    for _ in 0..4 {
+        let mut tx = app.db.begin().await?;
+        let room = cancellation_room(&mut tx, user.id, key).await?;
+        if let Some(room) = room {
+            sqlx::query("SELECT id FROM rooms WHERE id=$1 FOR NO KEY UPDATE")
+                .bind(room)
+                .fetch_optional(&mut *tx)
+                .await?;
+            sqlx::query("SELECT room_id FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
+                .bind(room)
+                .fetch_optional(&mut *tx)
+                .await?;
+        }
+        sqlx::query("SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE")
+            .bind(user.id)
+            .fetch_one(&mut *tx)
             .await?;
+        if cancellation_room(&mut tx, user.id, key).await? != room {
+            tx.rollback().await?;
+            continue;
+        }
+        let session: Uuid = sqlx::query_scalar("INSERT INTO playback_requests(user_id,idempotency_key,request_hash,session_id,owner_epoch,status,error_status,error_code,lease_until,expires_at) VALUES($1,$2,'',$3,$4,'failed',410,'playback_request_cancelled',now(),now()+interval '48 hours') ON CONFLICT(user_id,idempotency_key) DO UPDATE SET status='failed',response_encrypted=NULL,error_status=410,error_code='playback_request_cancelled',lease_until=now(),expires_at=GREATEST(playback_requests.expires_at,now()+interval '48 hours') RETURNING session_id")
+            .bind(user.id).bind(key).bind(Uuid::new_v4()).bind(app.epoch).fetch_one(&mut *tx).await?;
+        sqlx::query("UPDATE playback_sessions SET stopped=true WHERE id=$1")
+            .bind(session)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')")
+            .bind(session).execute(&mut *tx).await?;
+        persistence::upstream_reservations::close(&mut tx, session, "playback_request_cancelled")
+            .await?;
+        tx.commit().await?;
+        return Ok(Json(json!({"ok":true})));
     }
-    let session: Uuid = sqlx::query_scalar("INSERT INTO playback_requests(user_id,idempotency_key,request_hash,session_id,owner_epoch,status,error_status,error_code,lease_until,expires_at) VALUES($1,$2,'',$3,$4,'failed',410,'playback_request_cancelled',now(),now()+interval '48 hours') ON CONFLICT(user_id,idempotency_key) DO UPDATE SET status='failed',response_encrypted=NULL,error_status=410,error_code='playback_request_cancelled',lease_until=now(),expires_at=GREATEST(playback_requests.expires_at,now()+interval '48 hours') RETURNING session_id")
-        .bind(user.id).bind(key).bind(Uuid::new_v4()).bind(app.epoch).fetch_one(&mut *tx).await?;
-    sqlx::query("UPDATE playback_sessions SET stopped=true WHERE id=$1")
-        .bind(session)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')").bind(session).execute(&mut *tx).await?;
-    persistence::upstream_reservations::close(&mut tx, session, "playback_request_cancelled")
-        .await?;
+    Err(err(StatusCode::CONFLICT, "playback_request_interrupted"))
+}
+
+async fn cancellation_room(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: Uuid,
+    key: Uuid,
+) -> Result<Option<Uuid>> {
+    Ok(sqlx::query_scalar::<_, Option<Uuid>>("SELECT COALESCE(r.room_id,p.room_id,u.room_id) FROM playback_requests r LEFT JOIN playback_sessions p ON p.id=r.session_id LEFT JOIN upstream_reservations u ON u.id=r.session_id WHERE r.user_id=$1 AND r.idempotency_key=$2")
+        .bind(user).bind(key).fetch_optional(&mut **tx).await?.flatten())
+}
+
+/// Only the executor that has dropped its preparation and drained its scoped
+/// subprocesses may acknowledge. Status failure/cancellation alone is not proof.
+pub async fn drained(app: &App, reservation: &Reservation) -> Result<()> {
+    let mut tx = app.db.begin().await?;
+    sqlx::query("UPDATE playback_preparations SET drained_at=COALESCE(drained_at,clock_timestamp()) WHERE session_id=$1 AND owner_epoch=$2")
+        .bind(reservation.session).bind(app.epoch).execute(&mut *tx).await?;
+    sqlx::query("UPDATE playback_requests SET preparation_drained_at=COALESCE(preparation_drained_at,clock_timestamp()) WHERE session_id=$1 AND owner_epoch=$2")
+        .bind(reservation.session).bind(app.epoch).execute(&mut *tx).await?;
     tx.commit().await?;
-    Ok(Json(json!({"ok":true})))
+    Ok(())
+}
+
+fn lifecycle_error(error: anyhow::Error) -> Error {
+    match error.to_string().as_str() {
+        "room_not_active" => err(StatusCode::CONFLICT, "room_not_active"),
+        _ => error.into(),
+    }
 }

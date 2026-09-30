@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount } from "vue";
+import { ref, computed, onMounted, onBeforeUnmount } from "vue";
 import { useRouter } from "vue-router";
 import { useSession } from "../auth/session.store";
 import { useRoomRuntime } from "./room-runtime";
@@ -8,6 +8,12 @@ import type { Room } from "../../shared/api/types";
 import { useAction } from "../../shared/use-action";
 import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
+import AppSelect from "../../shared/ui/AppSelect.vue";
+import {
+  filterRooms,
+  lifecycleLabels,
+  type RoomFilter,
+} from "./room-lifecycle";
 import Notice from "../../shared/ui/Notice.vue";
 const session = useSession(),
   runtime = useRoomRuntime(),
@@ -22,6 +28,17 @@ const rooms = ref<Room[]>([]),
   roomId = ref(""),
   token = ref(""),
   pasted = ref("");
+const lifecycleFilter = ref<RoomFilter>("all");
+const visibleRooms = computed(() =>
+  filterRooms(rooms.value, lifecycleFilter.value),
+);
+const lifecycleOptions = [
+  { value: "all", label: "全部房间" },
+  ...Object.entries(lifecycleLabels).map(([value, label]) => ({
+    value,
+    label,
+  })),
+];
 let alive = true;
 onBeforeUnmount(() => {
   alive = false;
@@ -104,11 +121,29 @@ onMounted(() => run(load));
       <p>注册邀请码只用于创建账号。加入房间需要独立的房间邀请。</p>
       <button class="primary" @click="createOpen = true">创建第一个房间</button>
     </div>
+    <AppSelect
+      v-if="loaded && rooms.length"
+      v-model="lifecycleFilter"
+      :options="lifecycleOptions"
+      label="房间状态"
+    />
+    <p v-if="loaded && rooms.length && !visibleRooms.length" class="helper">
+      当前状态下没有房间，可切换筛选查看历史房间。
+    </p>
     <div class="room-list">
-      <article v-for="room in rooms" :key="room.id" class="room-card">
+      <article v-for="room in visibleRooms" :key="room.id" class="room-card">
         <div class="room-symbol"><AppIcon name="rooms" :size="28" /></div>
         <div>
           <h2>{{ room.name }}</h2>
+          <span
+            v-if="room.lifecycle && room.lifecycle !== 'active'"
+            class="helper"
+            >{{
+              { closing: "正在关闭", closed: "已关闭", archived: "已归档" }[
+                room.lifecycle
+              ]
+            }}</span
+          >
           <p>
             {{
               room.owner_id === session.user?.id

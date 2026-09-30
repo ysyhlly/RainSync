@@ -8,6 +8,7 @@ import {
 import type { RoomState } from "../../../../../packages/protocol";
 import type {
   Room,
+  RoomLifecycle,
   Message,
   QueueItem,
   RoomInvitation,
@@ -19,6 +20,7 @@ import { PlaybackCancelled } from "../../playback-request";
 import { useMediaCatalog } from "../library/media-catalog.store";
 import { useSession } from "../auth/session.store";
 import { createPlaybackRuntime } from "../playback/playback-runtime";
+import { lifecycleLabels } from "./room-lifecycle";
 
 export const useRoomRuntime = defineStore("room-runtime", () => {
   const session = useSession(),
@@ -87,10 +89,18 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
   const chatPending = ref(false),
     chatFailed = ref(false);
   const clockSamples = new Set<ReturnType<typeof setTimeout>>();
+  const roomActive = computed(
+    () => !!room.value && (room.value.lifecycle ?? "active") === "active",
+  );
+  const lifecycleLabel = computed(
+    () => lifecycleLabels[room.value?.lifecycle ?? "active"],
+  );
+  const cleanupError = ref("");
   const playback = createPlaybackRuntime({
     session,
     state,
     connected,
+    active: roomActive,
     clock,
     error,
     run,
@@ -99,9 +109,15 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
   const { video, position, waiting, blocked, applyState, loadMedia } = playback;
   const owner = computed(
     () =>
+      roomActive.value &&
       !!state.value &&
       (state.value.controller_user_id === session.user?.id ||
         !!session.user?.admin),
+  );
+  const canManageRoom = computed(
+    () =>
+      !!room.value &&
+      (room.value.owner_id === session.user?.id || !!session.user?.admin),
   );
   let actionSerial = 0;
   async function run(action: () => Promise<void>) {
@@ -133,6 +149,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     connectionStopped.value = false;
     controlEpoch = undefined;
     room.value = null;
+    cleanupError.value = "";
     state.value = null;
     playlist.value = [];
     messages.value = [];
@@ -263,7 +280,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     socket.onmessage = (event) => {
       if (serial !== connectionSerial) return;
       const v = JSON.parse(event.data);
-      if (typeof v.control_epoch?.id === "string")
+      if (!v.state && typeof v.control_epoch?.id === "string")
         controlEpoch = v.control_epoch.id;
       if (v.type === "CLOCK_SYNC_REPLY") {
         if (clock.sample(v.t1, v.t2, v.t3, performance.now()))
@@ -304,12 +321,37 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         )
           return;
         if (next.room_id !== room.value?.id) return;
+        if (typeof v.owner_id === "string") room.value.owner_id = v.owner_id;
+        const wasActive = roomActive.value;
+        if (
+          typeof v.lifecycle === "string" &&
+          ["active", "closing", "closed", "archived"].includes(v.lifecycle)
+        ) {
+          room.value.lifecycle = v.lifecycle;
+          room.value.lifecycle_epoch = v.lifecycle_epoch;
+        }
+        if (v.control_epoch === null || !roomActive.value)
+          controlEpoch = undefined;
+        else if (typeof v.control_epoch?.id === "string")
+          controlEpoch = v.control_epoch.id;
         if (old && old.clock_epoch !== next.clock_epoch) {
           clock.reset();
           sampleClock();
         }
         state.value = next;
-        if (!old || old.media_generation !== next.media_generation) {
+        if (!roomActive.value) {
+          clearTimeout(chatTimer);
+          chatPending.value = false;
+          chatFailed.value = false;
+          pendingChat = undefined;
+          if (wasActive || !old) void playback.reset().catch(() => {});
+          return;
+        }
+        if (
+          !wasActive ||
+          !old ||
+          old.media_generation !== next.media_generation
+        ) {
           playback.mediaChanged();
           const serial = roomSerial,
             selected = next.room_id;
@@ -356,8 +398,27 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
   async function choose(id: string) {
     send("CHANGE_MEDIA", { media_id: id });
   }
+  async function transferOwnership(ownerId: string) {
+    const current = state.value,
+      serial = roomSerial;
+    if (!current || !canManageRoom.value || !roomActive.value)
+      throw Error("当前无法转让房间");
+    const result = await session.api<{ owner_id: string; state: RoomState }>(
+      `/rooms/${current.room_id}/owner`,
+      "POST",
+      { owner_id: ownerId, expected_revision: current.revision },
+    );
+    if (
+      serial !== roomSerial ||
+      room.value?.id !== result.state.room_id ||
+      (state.value && state.value.revision > result.state.revision)
+    )
+      return;
+    room.value.owner_id = result.owner_id;
+    state.value = result.state;
+  }
   async function makeInvite() {
-    if (!room.value) throw Error("请先进入房间");
+    if (!room.value || !roomActive.value) throw Error("房间当前未开放");
     return session.api<RoomInvitation>(
       "/rooms/" + room.value.id + "/invites",
       "POST",
@@ -373,6 +434,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     );
   }
   async function addQueue(id: string) {
+    if (!roomActive.value) throw Error("房间当前未开放");
     const selected = room.value!.id,
       serial = roomSerial;
     await session.api(`/rooms/${selected}/playlist`, "POST", {
@@ -382,7 +444,13 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     if (serial === roomSerial) playlist.value = items;
   }
   function sendChat() {
-    if (!chat.value.trim() || !connected.value || chatPending.value) return;
+    if (
+      !roomActive.value ||
+      !chat.value.trim() ||
+      !connected.value ||
+      chatPending.value
+    )
+      return;
     if ([...chat.value].length > 2000) {
       error.value = "聊天消息不能超过 2000 个字符";
       return;
@@ -408,6 +476,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     );
   }
   async function removeQueue(id: string) {
+    if (!roomActive.value) throw Error("房间当前未开放");
     const selected = room.value?.id,
       serial = roomSerial;
     if (!selected) return;
@@ -417,13 +486,89 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     );
     if (serial === roomSerial) playlist.value = rows;
   }
+  type LifecycleView = {
+    lifecycle: RoomLifecycle;
+    lifecycle_epoch: number;
+    owner_id: string;
+    state: RoomState;
+    cleanup?: {
+      attempts: number;
+      last_error: string | null;
+      completed: boolean;
+    } | null;
+  };
+  function acceptLifecycle(value: LifecycleView, serial: number) {
+    if (
+      serial !== roomSerial ||
+      value.state.room_id !== room.value?.id ||
+      (state.value &&
+        state.value.clock_epoch === value.state.clock_epoch &&
+        state.value.revision > value.state.revision)
+    )
+      return false;
+    room.value.lifecycle = value.lifecycle;
+    room.value.lifecycle_epoch = value.lifecycle_epoch;
+    room.value.owner_id = value.owner_id;
+    state.value = value.state;
+    cleanupError.value = value.cleanup?.last_error
+      ? "清理尚未完成，服务端将继续重试。"
+      : "";
+    if (!roomActive.value) {
+      controlEpoch = undefined;
+      clearTimeout(chatTimer);
+      chatPending.value = false;
+      chatFailed.value = false;
+      pendingChat = undefined;
+      void playback.reset().catch(() => {});
+    }
+    return true;
+  }
+  async function refreshLifecycle() {
+    const selected = room.value?.id,
+      serial = roomSerial;
+    if (!selected) return;
+    const value = await session.api<LifecycleView>(
+      `/rooms/${selected}/lifecycle`,
+    );
+    acceptLifecycle(value, serial);
+  }
+  async function changeLifecycle(action: "close" | "reopen" | "archive") {
+    const current = state.value,
+      serial = roomSerial;
+    if (!current || !canManageRoom.value) throw Error("当前无法管理房间");
+    try {
+      const value = await session.api<LifecycleView>(
+        `/rooms/${current.room_id}/${action}`,
+        "POST",
+        { expected_revision: current.revision },
+      );
+      if (acceptLifecycle(value, serial) && action === "reopen") connect();
+    } catch (failure) {
+      if (
+        serial === roomSerial &&
+        failure instanceof RequestFailure &&
+        ["REVISION_CONFLICT", "ROOM_LIFECYCLE_CONFLICT"].includes(failure.code)
+      ) {
+        await refreshLifecycle().catch(() => {});
+      }
+      throw failure;
+    }
+  }
   function seek(event: Event) {
     position.value = Number((event.target as HTMLInputElement).value);
     playback.dragging.value = false;
     send("SEEK", { position_ms: position.value * 1000 });
   }
   const statusTimer = setInterval(() => {
-    if (clock.ready && connected.value && state.value && video.value)
+    if (room.value?.lifecycle === "closing")
+      void refreshLifecycle().catch(() => {});
+    if (
+      roomActive.value &&
+      clock.ready &&
+      connected.value &&
+      state.value &&
+      video.value
+    )
       socket?.send(
         JSON.stringify({
           type: "CLIENT_STATUS",
@@ -438,7 +583,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
   function wake() {
     if (document.visibilityState === "visible") {
       sampleClock();
-      void run(() => applyState(true));
+      if (roomActive.value) void run(() => applyState(true));
     }
   }
   document.addEventListener("visibilitychange", wake);
@@ -461,6 +606,12 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     error,
     busy,
     owner,
+    canManageRoom,
+    roomActive,
+    lifecycleLabel,
+    cleanupError,
+    refreshLifecycle,
+    changeLifecycle,
     currentTitle,
     refreshMetadata,
     remember,
@@ -470,6 +621,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     send,
     sendChat,
     choose,
+    transferOwnership,
     addQueue,
     removeQueue,
     makeInvite,

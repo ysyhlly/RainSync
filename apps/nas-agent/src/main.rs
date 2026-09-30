@@ -1,3 +1,4 @@
+mod drain;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -23,6 +24,25 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
+
+async fn send_control(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    value: Value,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let mut shutdown = shutdown.clone();
+    tokio::select! {
+        biased;
+        _ = drain::cancelled(&mut shutdown) => anyhow::bail!("agent_shutdown"),
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            socket.send(Message::Text(value.to_string().into())),
+        ) => result??,
+    }
+    Ok(())
+}
 
 fn content_type(path: &std::path::Path) -> &'static str {
     match path
@@ -68,13 +88,21 @@ where
     }
 }
 
-async fn transfer(root: PathBuf, request: Value) -> Result<()> {
+async fn transfer(
+    root: PathBuf,
+    request: Value,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let url = request["data_url"].as_str().context("data_url")?;
-    let (socket, _) =
-        tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(url)).await??;
+    let (socket, _) = tokio::select! {
+        biased;
+        _ = drain::cancelled(&mut cancel) => return Ok(()),
+        connected = tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(url)) => connected??,
+    };
     let (mut writer, mut reader) = socket.split();
     let (liveness, mut signals) = tokio::sync::watch::channel(tokio::time::Instant::now());
     let mut headers_started = false;
+    let operations = drain::FileOps::default();
     let work = async {
         if request["busy"].as_bool().unwrap_or(false) {
             headers_started = true;
@@ -91,16 +119,17 @@ async fn transfer(root: PathBuf, request: Value) -> Result<()> {
         }
         let resource = request["resource"].as_str().context("resource")?.to_owned();
         let expected = request["source_version"].as_str().map(str::to_owned);
-        let (path, file, snapshot) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let path = media_core::safe_path(&root, &resource)?;
-            let file = std::fs::File::open(&path)?;
-            let snapshot = media_core::file_version::snapshot_file(&file)?;
-            if expected.as_ref().is_some_and(|v| *v != snapshot.version) {
-                return Err(SourceChanged.into());
-            }
-            Ok((path, Arc::new(file), snapshot))
-        })
-        .await??;
+        let (path, file, snapshot) = operations
+            .run(move || -> Result<_> {
+                let path = media_core::safe_path(&root, &resource)?;
+                let file = std::fs::File::open(&path)?;
+                let snapshot = media_core::file_version::snapshot_file(&file)?;
+                if expected.as_ref().is_some_and(|v| *v != snapshot.version) {
+                    return Err(SourceChanged.into());
+                }
+                Ok((path, Arc::new(file), snapshot))
+            })
+            .await?;
         let size = snapshot.len;
         let range = match media_core::byte_range(request["range"].as_str(), size) {
             Ok(value) => value,
@@ -124,30 +153,31 @@ async fn transfer(root: PathBuf, request: Value) -> Result<()> {
         .await??;
         if !request["head"].as_bool().unwrap_or(false) {
             let seek_file = file.clone();
-            tokio::task::spawn_blocking(move || {
-                (&*seek_file).seek(std::io::SeekFrom::Start(start))
-            })
-            .await??;
+            operations
+                .run(move || Ok((&*seek_file).seek(std::io::SeekFrom::Start(start))?))
+                .await?;
             let mut remaining = len;
             while remaining > 0 {
                 let wanted = remaining.min(65536) as usize;
                 let read_file = file.clone();
                 let version = snapshot.version.clone();
-                let buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-                    if media_core::file_version::snapshot_file(&read_file)?.version != version {
-                        return Err(SourceChanged.into());
-                    }
-                    let mut bytes = vec![0; wanted];
-                    let n = (&*read_file).read(&mut bytes)?;
-                    if n == 0
-                        || media_core::file_version::snapshot_file(&read_file)?.version != version
-                    {
-                        return Err(SourceChanged.into());
-                    }
-                    bytes.truncate(n);
-                    Ok(bytes)
-                })
-                .await??;
+                let buf = operations
+                    .run(move || -> Result<Vec<u8>> {
+                        if media_core::file_version::snapshot_file(&read_file)?.version != version {
+                            return Err(SourceChanged.into());
+                        }
+                        let mut bytes = vec![0; wanted];
+                        let n = (&*read_file).read(&mut bytes)?;
+                        if n == 0
+                            || media_core::file_version::snapshot_file(&read_file)?.version
+                                != version
+                        {
+                            return Err(SourceChanged.into());
+                        }
+                        bytes.truncate(n);
+                        Ok(bytes)
+                    })
+                    .await?;
                 let n = buf.len();
                 send_with_backpressure_health(
                     writer.send(Message::Binary(buf.into())),
@@ -162,6 +192,8 @@ async fn transfer(root: PathBuf, request: Value) -> Result<()> {
     // Poll the peer while file I/O or a backpressured write is pending. Merely
     // sending frames does not observe a Close promptly on every socket state.
     let result: Result<()> = tokio::select! {
+        biased;
+        _ = drain::cancelled(&mut cancel) => Ok(()),
         result = work => result,
         _ = async {
             while let Some(Ok(message)) = reader.next().await {
@@ -195,6 +227,9 @@ async fn transfer(root: PathBuf, request: Value) -> Result<()> {
     // Once headers have been sent, failure terminates the stream; never send a
     // second metadata response as if it were media bytes.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(1), writer.close()).await;
+    drop(writer);
+    drop(reader);
+    operations.drain().await?;
     result
 }
 type IndexPage = (Vec<Value>, bool);
@@ -323,11 +358,39 @@ fn index_interval_seconds() -> Result<u64> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().init();
+    let (signal, shutdown) = tokio::sync::watch::channel(false);
+    let listener = tokio::spawn(async move {
+        let result = media_core::process_signal::wait().await;
+        signal.send_replace(true);
+        result
+    });
+    let result = run(shutdown.clone()).await;
+    if *shutdown.borrow() {
+        listener.await??;
+    } else {
+        listener.abort();
+    }
+    result
+}
+
+async fn retry_or_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    tokio::select! {
+        biased;
+        _ = drain::cancelled(shutdown) => true,
+        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => false,
+    }
+}
+
+async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
     let server = std::env::var("SERVER_URL")?;
     let root = PathBuf::from(std::env::var("MEDIA_ROOT")?).canonicalize()?;
     let credential = PathBuf::from(
         std::env::var("AGENT_CREDENTIAL_FILE").unwrap_or("agent-credentials.json".into()),
     );
+    let token = tokio::select! {
+        biased;
+        _ = drain::cancelled(&mut shutdown) => return Ok(()),
+        token = async {
     let token = if let Ok(token) = std::env::var("AGENT_TOKEN") {
         token
     } else if credential.is_file() {
@@ -353,6 +416,10 @@ async fn main() -> Result<()> {
         }
         v["token"].as_str().context("pair token")?.to_string()
     };
+            Ok::<_, anyhow::Error>(token)
+        } => token?,
+    };
+    let mut receipts = drain::Receipts::load(&credential).await?;
     let slots = Arc::new(Semaphore::new(16));
     let rejections = Arc::new(Semaphore::new(4));
     let scans = Arc::new(Semaphore::new(1));
@@ -367,30 +434,29 @@ async fn main() -> Result<()> {
         let mut req = url.into_client_request()?;
         req.headers_mut()
             .insert("Authorization", format!("Bearer {token}").parse()?);
-        if let Ok((mut socket, _)) = connect_async(req).await {
-            if !matches!(
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    socket.send(Message::Text(
-                        json!({"type":"HELLO","manual_scan":true})
-                            .to_string()
-                            .into()
-                    ))
-                )
-                .await,
-                Ok(Ok(()))
-            ) {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let connection = tokio::select! {
+            biased;
+            _ = drain::cancelled(&mut shutdown) => break,
+            result = tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(req)) => result,
+        };
+        if let Ok(Ok((mut socket, _))) = connection {
+            if send_control(&mut socket, json!({"type":"HELLO","manual_scan":true,"source_versions":true,"drain_receipts":true}), &shutdown).await.is_err() {
+                if retry_or_shutdown(&mut shutdown).await { break; }
                 continue;
             }
             let mut transfers = tokio::task::JoinSet::new();
+            let (cancel_transfers, cancelled_transfers) = tokio::sync::watch::channel(false);
             let mut scan: Option<IndexScan> = None;
             let mut refresh = tokio::time::interval(index_interval);
             refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
-                    _ = transfers.join_next(), if !transfers.is_empty() => {}
+                    biased;
+                    _ = drain::cancelled(&mut shutdown) => break,
+                    ended = transfers.join_next(), if !transfers.is_empty() => {
+                        if let Some(Ok(Some(id))) = ended && receipts.add(id).await.is_err() { tracing::warn!("drain receipt persistence failed"); }
+                    }
                     _ = refresh.tick() => {
                         if scan.is_none() { scan = start_index(root.clone(), scans.clone()); }
                     }
@@ -407,24 +473,34 @@ async fn main() -> Result<()> {
                                 json!({"type":"INDEX_ABORT","snapshot":current.snapshot,"sequence":current.sequence})
                             }
                         };
-                        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3), socket.send(Message::Text(message.to_string().into()))).await, Ok(Ok(()))) { break }
+                        if send_control(&mut socket, message, &shutdown).await.is_err() { break }
                         current.awaiting_ack = true;
                         current.sent_at = tokio::time::Instant::now();
                     }
                     _=heartbeat.tick()=>{
+                        let mut receipt_failed=false;
+                        for id in receipts.batch() {
+                            if send_control(&mut socket, json!({"type":"TRANSFER_DRAINED","id":id}), &shutdown).await.is_err() { receipt_failed=true; break; }
+                        }
+                        if receipt_failed { break; }
                         if scan.as_ref().is_some_and(|s| s.awaiting_ack && s.sent_at.elapsed().as_secs() > 60) { break }
-                        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3), socket.send(Message::Text(json!({"type":"HEARTBEAT"}).to_string().into()))).await, Ok(Ok(()))) { break }
+                        if send_control(&mut socket, json!({"type":"HEARTBEAT"}), &shutdown).await.is_err() { break }
                     }
                     message=socket.next()=>{let text = match message { Some(Ok(Message::Text(text))) => text, Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue, _ => break };let Ok(v)=serde_json::from_str::<Value>(&text)else{continue};
+                        if v["type"] == "TRANSFER_DRAINED_ACK" && (v["accepted"] == true || v["rejected_permanently"] == true) {
+                            if let Some(id)=v["id"].as_str().and_then(|id|uuid::Uuid::parse_str(id).ok()) && receipts.acknowledged(id).await.is_err() { tracing::warn!("drain receipt acknowledgement persistence failed"); }
+                            continue;
+                        }
                         if v["type"] == "INDEX_ERROR" { break }
                         if v["type"] == "SCAN" {
+
                             let Some(request_id) = v["snapshot"].as_str() else { continue };
                             if request_id.is_empty() || request_id.len() > 64 { continue; }
                             let requested = if scan.is_none() { start_index(root.clone(), scans.clone()) } else { None };
                             if let Some(mut requested) = requested {
                                 requested.snapshot = request_id.to_owned();
                                 scan = Some(requested);
-                            } else if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3), socket.send(Message::Text(json!({"type":"SCAN_BUSY","snapshot":request_id}).to_string().into()))).await, Ok(Ok(()))) { break }
+                            } else if send_control(&mut socket, json!({"type":"SCAN_BUSY","snapshot":request_id}), &shutdown).await.is_err() { break }
                             continue;
                         }
                         if v["type"] == "INDEX_ACK" || v["type"] == "INDEX_ABORT_ACK" {
@@ -437,30 +513,73 @@ async fn main() -> Result<()> {
                             continue
                         }
                         if v["type"]=="TRANSFER"{let mut request=v["request"].clone();
+                        let receipt = if request["drain_receipt_required"] == true {
+                            v["id"].as_str().and_then(|id| uuid::Uuid::parse_str(id).ok())
+                        } else { None };
+                        // Bound receipt persistence before opening more files. A
+                        // peer that never acknowledges causes conservative backpressure.
+                        if receipts.full() {
+                            // This dispatch is already durable at the Server,
+                            // but we have not opened any resource for it.
+                            if let Some(id)=receipt { let _=receipts.add(id).await; }
+                            break;
+                        }
                         // Data ingress shares the configured service origin; localhost in server configuration is not the NAS host.
                         if let Some(value)=request["data_url"].as_str() {
-                            let Ok(mut url)=reqwest::Url::parse(&std::env::var("AGENT_DATA_ORIGIN").unwrap_or_else(|_|server.clone())) else {continue};
-                            let Ok(data)=reqwest::Url::parse(value) else {continue};
+                            let Ok(mut url)=reqwest::Url::parse(&std::env::var("AGENT_DATA_ORIGIN").unwrap_or_else(|_|server.clone())) else { if let Some(id)=receipt { let _=receipts.add(id).await; } continue };
+                            let Ok(data)=reqwest::Url::parse(value) else { if let Some(id)=receipt { let _=receipts.add(id).await; } continue };
                             url.set_path(data.path());url.set_query(data.query());
                             let scheme=if url.scheme()=="https" {"wss"} else {"ws"};
-                            if url.set_scheme(scheme).is_err(){continue}
+                            if url.set_scheme(scheme).is_err(){ if let Some(id)=receipt { let _=receipts.add(id).await; } continue }
                             request["data_url"]=json!(url.as_str());
                         }
                         let root=root.clone();
                         let permit = match slots.clone().try_acquire_owned() {
                             Ok(permit) => permit,
-                            Err(_) => { let Ok(permit) = rejections.clone().try_acquire_owned() else { continue }; request["busy"] = json!(true); permit }
+                            Err(_) => { let Ok(permit) = rejections.clone().try_acquire_owned() else {
+                                if let Some(id)=receipt { let _=receipts.add(id).await; }
+                                continue
+                            }; request["busy"] = json!(true); permit }
                         };
-                        transfers.spawn(async move { let _permit=permit; if transfer(root,request).await.is_err(){tracing::warn!("transfer ended with error")} });}}
+                        let cancel=cancelled_transfers.clone();
+                        transfers.spawn(async move {
+                            let _permit=permit;
+                            let result=transfer(root,request,cancel).await;
+                            let confirmed=!result.as_ref().is_err_and(|error|error.is::<drain::DrainUnconfirmed>());
+                            if result.is_err(){tracing::warn!("transfer ended with error")}
+                            receipt.filter(|_|confirmed)
+                        });}}
                 }
             }
+            // End control admission before draining accepted work. Shutdown
+            // must not leave a live socket accepting further dispatches while
+            // this process is waiting for old file owners or receipt writes.
+            drop(socket);
             drop(scan);
             // Control loss includes revoked credentials. No old transfer may
             // outlive that authorized connection or retain its admission slot.
-            transfers.shutdown().await;
+            let _ = cancel_transfers.send(true);
+            // Never abort a waiter that still owns a blocking file operation.
+            while let Some(result) = transfers.join_next().await {
+                if let Ok(Some(id)) = result
+                    && receipts.add(id).await.is_err()
+                {
+                    tracing::warn!("drain receipt persistence failed");
+                }
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if retry_or_shutdown(&mut shutdown).await {
+            break;
+        }
     }
+    // Only already-drained IDs enter Receipts. A planned exit must not lose
+    // these truthful acknowledgements merely because their last save failed.
+    // A stuck filesystem keeps shutdown pending; it never fabricates a receipt.
+    while receipts.flush().await.is_err() {
+        tracing::warn!("drain receipt persistence retry during shutdown");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

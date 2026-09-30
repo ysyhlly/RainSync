@@ -33,6 +33,7 @@ pub async fn fetch(
     h: &HeaderMap,
     head: bool,
     input_failure: input_failure::Observation,
+    session_id: Option<Uuid>,
 ) -> Result<Response> {
     let agent = Uuid::parse_str(resource["agent_id"].as_str().unwrap_or("")).map_err(failure)?;
     let state: Option<(bool, bool)> = sqlx::query_as("SELECT revoked,COALESCE(last_seen>now()-interval '15 seconds',false) FROM agents WHERE id=$1").bind(agent).fetch_optional(&app.db).await.map_err(failure)?;
@@ -73,7 +74,7 @@ pub async fn fetch(
             .replace("https://", "wss://")
             .replace("http://", "ws://")
     );
-    let request = json!({"data_url":data_url,"resource":resource["resource"],"source_version":source_version,"range":h.get(header::RANGE).and_then(|v|v.to_str().ok()),"head":head});
+    let request = json!({"data_url":data_url,"resource":resource["resource"],"source_version":source_version,"range":h.get(header::RANGE).and_then(|v|v.to_str().ok()),"head":head,"drain_receipt_required":session_id.is_some()});
     let (cancel, cancelled) = oneshot::channel();
     let registration = Registration {
         id,
@@ -87,6 +88,7 @@ pub async fn fetch(
         transfer_state::Offer {
             id,
             agent,
+            session_id,
             token_hash: hash(&token),
             request,
             resource_hash: hash(&resource.to_string()),

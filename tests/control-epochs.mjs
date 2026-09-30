@@ -1,6 +1,6 @@
+import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { spawn, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -12,7 +12,7 @@ export async function controlEpochs({
   admin,
   friend,
   sql,
-  container,
+  sqlProcess,
   env,
 }) {
   const current = {
@@ -110,23 +110,7 @@ export async function controlEpochs({
   await rejected(command, "CONTROL_EPOCH_EXPIRED");
 
   // Expire a valid command while its final transaction waits for the room lock.
-  const lock = spawn(
-    "docker",
-    [
-      "exec",
-      "-i",
-      container,
-      "psql",
-      "-U",
-      "rainsync",
-      "-d",
-      "rainsync",
-      "-At",
-      "-v",
-      "ON_ERROR_STOP=1",
-    ],
-    { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
-  );
+  const lock = sqlProcess(undefined, { interactive: true });
   const locked = new Promise((resolve, reject) => {
     lock.stdout.on("data", (data) => {
       if (data.toString().includes("epoch-lock-ready")) resolve();
@@ -150,7 +134,7 @@ export async function controlEpochs({
     let blocked = "0";
     for (let i = 0; i < 30 && blocked === "0"; i++) {
       blocked = sql(
-        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT room_id FROM room_snapshots%FOR UPDATE%'",
+        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT state FROM room_snapshots%FOR UPDATE%'",
       );
       if (blocked === "0")
         await new Promise((resolve) => setTimeout(resolve, 25));

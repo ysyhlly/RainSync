@@ -308,9 +308,8 @@ test("NAS history is not claimed online; pairing and revoke preserve actual cont
     return route.fulfill({ json: rows });
   });
   await page.goto(appBase + "/admin/agents");
-  await expect(
-    page.getByText("最后联系时间是历史记录，不表示设备此刻一定在线。"),
-  ).toBeVisible();
+  await expect(page.locator(".admin-row")).toContainText("已配对记录");
+  await expect(page.locator(".admin-row")).toContainText("文件版本索引状态未知");
   await page.getByRole("button", { name: "添加设备", exact: true }).click();
   await page.getByLabel("设备名称").fill("第二设备");
   await page.getByRole("button", { name: "生成配对码" }).click();

@@ -1,16 +1,19 @@
 mod cache;
 mod cache_outputs;
 mod cache_read;
+mod file_delivery;
 use media_core::child_process;
 mod input_failure;
 mod output_decode;
 mod output_publish;
 mod output_read;
 mod outputs;
+mod playback_access;
 mod preview_input;
 mod previews;
 mod process;
 mod relay;
+mod source_version;
 mod transfer_state;
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use axum::{
@@ -27,8 +30,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::{path::PathBuf, sync::Arc};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -43,6 +44,7 @@ struct App {
     output_checks: Arc<output_read::Checks>,
     input_failures: input_failure::Registry,
     preview_inputs: preview_input::Registry,
+    deliveries: playback_access::Registry,
 }
 fn hash(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
@@ -78,7 +80,21 @@ async fn delivery(
     h: HeaderMap,
     method: axum::http::Method,
 ) -> Result<Response> {
-    let row=sqlx::query("SELECT p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$1 AND p.delivery_token_hash=$2 AND p.expires_at>now() AND NOT p.stopped AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)").bind(id).bind(hash(&q.token)).fetch_optional(&app.db).await.map_err(failure)?.ok_or((StatusCode::UNAUTHORIZED,"invalid_playback_session".into()))?;
+    let pool = app.db.clone();
+    let deliveries = app.deliveries.clone();
+    let token_hash = hash(&q.token);
+    let response = delivery_response(app, id, path, q, h, method);
+    playback_access::protect(response, pool, id, token_hash, deliveries).await
+}
+async fn delivery_response(
+    app: App,
+    id: Uuid,
+    path: String,
+    q: Params,
+    h: HeaderMap,
+    method: axum::http::Method,
+) -> Result<Response> {
+    let row=sqlx::query("SELECT p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN rooms r ON r.id=p.room_id WHERE r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND p.id=$1 AND p.delivery_token_hash=$2 AND p.expires_at>now() AND NOT p.stopped AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)").bind(id).bind(hash(&q.token)).fetch_optional(&app.db).await.map_err(failure)?.ok_or((StatusCode::UNAUTHORIZED,"invalid_playback_session".into()))?;
     let data: Value = row.get("resource");
     let resource = decrypt(&app, data["encrypted"].as_str().unwrap_or("")).map_err(failure)?;
     let head = method == axum::http::Method::HEAD;
@@ -177,7 +193,12 @@ async fn delivery(
             source_url(id, &q.token).map_err(failure)?
         };
         if sidecar.is_some() {
-            let size = tokio::fs::metadata(&input).await.map_err(failure)?.len();
+            let input = input.clone();
+            let size = child_process::blocking(move || std::fs::metadata(input))
+                .await
+                .map_err(failure)?
+                .map_err(failure)?
+                .len();
             if size > media_core::subtitles::MAX_BYTES as u64 {
                 return Err(failure("subtitle_too_large"));
             }
@@ -370,10 +391,10 @@ async fn delivery(
             )
                 .into_response());
         }
-        return file_response(&file, &h, head, Some(reader), opened).await;
+        return file_delivery::response(&file, &h, head, Some(reader), opened, None).await;
     }
     if resource["kind"] == "agent" {
-        return relay::fetch(&app, &resource, &h, head, input_failure).await;
+        return relay::fetch(&app, &resource, &h, head, input_failure, Some(id)).await;
     }
     if resource["kind"] == "local" {
         let p = media_core::safe_path(
@@ -381,7 +402,15 @@ async fn delivery(
             resource["resource"].as_str().unwrap_or(""),
         )
         .map_err(failure)?;
-        return file_response(&p, &h, head, None, None).await;
+        return file_delivery::response(
+            &p,
+            &h,
+            head,
+            None,
+            None,
+            resource["source_version"].as_str().map(str::to_owned),
+        )
+        .await;
     }
     let original = url::Url::parse(resource["url"].as_str().unwrap_or("")).map_err(failure)?;
     let target = if let Some(encoded) = q.url.as_deref() {
@@ -571,59 +600,6 @@ fn rewrite_manifest(input: &str, mut uri: impl FnMut(&str) -> String) -> String 
         .join("\n")
         + "\n"
 }
-async fn file_response(
-    path: &std::path::Path,
-    h: &HeaderMap,
-    head: bool,
-    reader: Option<cache_read::ReadGuard>,
-    checked_file: Option<tokio::fs::File>,
-) -> Result<Response> {
-    let mut file = match checked_file {
-        Some(file) => file,
-        None => tokio::fs::File::open(path).await.map_err(failure)?,
-    };
-    let size = file.metadata().await.map_err(failure)?.len();
-    let range =
-        match media_core::byte_range(h.get(header::RANGE).and_then(|v| v.to_str().ok()), size) {
-            Ok(v) => v,
-            Err(_) => {
-                return Ok(Response::builder()
-                    .status(416)
-                    .header(header::CONTENT_RANGE, format!("bytes */{size}"))
-                    .body(Body::empty())
-                    .unwrap());
-            }
-        };
-    let (start, len) = range.map(|(a, b)| (a, b - a + 1)).unwrap_or((0, size));
-    file.seek(std::io::SeekFrom::Start(start))
-        .await
-        .map_err(failure)?;
-    let mime = match path.extension().and_then(|x| x.to_str()).unwrap_or("") {
-        "m3u8" => "application/vnd.apple.mpegurl",
-        "m4s" => "video/iso.segment",
-        "vtt" => "text/vtt",
-        "webm" => "video/webm",
-        _ => "video/mp4",
-    };
-    let mut b = Response::builder()
-        .status(if range.is_some() { 206 } else { 200 })
-        .header(header::CONTENT_TYPE, mime)
-        .header(header::CONTENT_LENGTH, len)
-        .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CACHE_CONTROL, "private, no-store");
-    if let Some((a, z)) = range {
-        b = b.header(header::CONTENT_RANGE, format!("bytes {a}-{z}/{size}"))
-    }
-    b.body(if head {
-        Body::empty()
-    } else {
-        match reader {
-            Some(reader) => reader.body(file.take(len)),
-            None => Body::from_stream(ReaderStream::with_capacity(file.take(len), 65536)),
-        }
-    })
-    .map_err(failure)
-}
 fn source_url(id: Uuid, token: &str) -> anyhow::Result<String> {
     let bind = std::env::var("WORKER_BIND")
         .unwrap_or("0.0.0.0:8081".into())
@@ -647,7 +623,8 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
         let mut reservation = None;
         let mut writer_stopped = true;
         let output_decoder = output_decode::Gate::default();
-        let result: anyhow::Result<()> = async {
+        let execution_scope = child_process::Scope::new();
+        let result: anyhow::Result<()> = execution_scope.run(async {
             let claim = tokio::select! {
                 biased;
                 _ = process::stopped(&mut stop) => return Ok(()),
@@ -663,17 +640,21 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 cache::ensure_capacity(&app).await?;
                 cache::reserve_output(&app, &claim).await?;
                 let spec = &claim.spec;
+                source_version::verify(spec).await?;
                 let input = if let Some(ticket) = spec["input_ticket"].as_str() {
                     let ticket = decrypt(&app, ticket)?;
                     let token = ticket["token"].as_str().ok_or_else(|| anyhow::anyhow!("invalid_input_ticket"))?;
                     format!("{}&execution={}", source_url(claim.id, token)?, input_failure.token())
                 } else {
-                    media_core::safe_path(std::path::Path::new(spec["root"].as_str().unwrap_or("")), spec["resource"].as_str().unwrap_or(""))?.to_str().ok_or_else(|| anyhow::anyhow!("path"))?.to_owned()
+                    let path = media_core::safe_path(std::path::Path::new(spec["root"].as_str().unwrap_or("")), spec["resource"].as_str().unwrap_or(""))?;
+                    path.to_str().ok_or_else(|| anyhow::anyhow!("path"))?.to_owned()
                 };
                 let dir = persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt);
-                tokio::fs::create_dir_all(&dir).await.map_err(cache::write_error)?;
+                child_process::blocking({ let dir=dir.clone(); move || std::fs::create_dir_all(dir) }).await?.map_err(cache::write_error)?;
                 let audio_index = spec["audio_index"].as_u64().map(u32::try_from).transpose()?;
-                let args = media_core::hls_args(&input, dir.join("index.m3u8").to_str().unwrap(), spec["start_seconds"].as_f64().unwrap_or(0.0), spec["transcode"].as_bool().unwrap_or(true), audio_index);
+                let args = if let Some(mode)=spec["negotiated_mode"].as_str() {
+                    media_core::capabilities::negotiated_hls_args(&input,dir.join("index.m3u8").to_str().unwrap(),spec["start_seconds"].as_f64().unwrap_or(0.0),mode,audio_index)
+                } else {media_core::hls_args(&input, dir.join("index.m3u8").to_str().unwrap(), spec["start_seconds"].as_f64().unwrap_or(0.0), spec["transcode"].as_bool().unwrap_or(true), audio_index)};
                 let confirmed_until = process::finalization_deadline(Duration::from_secs(3), process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim))).await?
                     .filter(|until| *until > tokio::time::Instant::now())
                     .ok_or_else(|| anyhow::anyhow!("lease_lost_before_spawn"))?;
@@ -700,6 +681,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                     process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim)).await
                 }, async {
                     tokio::select! {
+                        error = source_version::monitor(&claim.spec) => error,
                         error = cache::monitor(&app) => error,
                         error = output_publish::monitor(&app.db, &claim, persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt), output_builder.clone(), &output_decoder) => error,
                     }
@@ -733,7 +715,9 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             if result.is_ok() && !*stop.borrow() {
                 let directory = persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt);
                 result = match process::finalization_deadline(Duration::from_secs(10), async {
-                    output_publish::prepare(output_builder.clone(), directory, true, &output_decoder).await
+                    let proof=output_publish::prepare(output_builder.clone(), directory, true, &output_decoder).await?;
+                    source_version::verify(&claim.spec).await?;
+                    Ok(proof)
                 }).await {
                     Ok(proof) => { publication = Some(proof); Ok(()) },
                     Err(error) => Err(error),
@@ -752,7 +736,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 }
             }
             Ok(())
-        }.await;
+        }).await;
         if output_decoder.stop().await.is_err() {
             tracing::error!("first segment decoder could not be reaped");
             // Keep the gate alive and retry cleanup before accepting more work.
@@ -760,7 +744,28 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
+        if execution_scope.shutdown().await.is_err() {
+            writer_stopped = false;
+            tracing::error!("media execution resource drain unconfirmed");
+        }
         if writer_stopped && let Some((id, owner, attempt)) = reservation {
+            // Both encoder and decoder have positive OS-tree reaping evidence.
+            // Persist the receipt independently of job cancellation/lease state.
+            // Retain ownership through transient DB failures (also on shutdown).
+            loop {
+                if matches!(
+                    tokio::time::timeout(
+                        Duration::from_secs(3),
+                        persistence::media_executions::acknowledge_job(&app.db, id, attempt, owner)
+                    )
+                    .await,
+                    Ok(Ok(()))
+                ) {
+                    break;
+                }
+                tracing::warn!("media execution drain acknowledgement retry");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             // Completion/error/exit all release only after the child is reaped.
             // On database failure, the next budget snapshot reclaims dead jobs.
             let _ = tokio::time::timeout(
@@ -806,11 +811,13 @@ async fn main() -> anyhow::Result<()> {
         output_checks: Default::default(),
         input_failures: Default::default(),
         preview_inputs: Default::default(),
+        deliveries: Default::default(),
         public_url: std::env::var("PUBLIC_ORIGIN").unwrap_or("http://localhost:8088".into()),
     };
     tokio::fs::create_dir_all(&app.cache).await?;
     let (stop, mut server_stop) = tokio::sync::watch::channel(false);
     let job_app = app.clone();
+    let deliveries = app.deliveries.clone();
     let router = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/media-delivery/{id}/{path}", get(delivery).head(delivery))
@@ -840,6 +847,9 @@ async fn main() -> anyhow::Result<()> {
         result = &mut server => (Some(result), Ok(media_core::process_signal::Reason::Normal)),
         signal = media_core::process_signal::wait() => (None, signal),
     };
+    // Fence even handlers already accepted by Axum, then cancel paused sources
+    // independently of the HTTP drain and retain their receipt owners.
+    deliveries.close();
     let _ = stop.send(true);
     let grace = signal_result
         .as_ref()
@@ -854,6 +864,9 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(Ok(())),
         }
     });
+    // Includes late INSERT/COMMIT admission and receipt retries. An unavailable
+    // DB or uninterruptible file read cannot be converted to a positive ACK.
+    deliveries.drain().await;
     // HTTP draining may stop before a cancelled probe/subtitle owner finishes.
     // Close admission and reap every registered owner before returning from main,
     // even when the queue or cleanup task failed.

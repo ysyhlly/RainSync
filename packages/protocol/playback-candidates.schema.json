@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaybackCandidateSet",
+  "type": "object",
+  "properties": {
+    "binding": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PlaybackCandidate"
+      }
+    },
+    "decision_reason": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "schema_version",
+    "candidates",
+    "decision_reason"
+  ],
+  "$defs": {
+    "AudioCapabilityConfiguration": {
+      "type": "object",
+      "properties": {
+        "bitrate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "channels": {
+          "type": "string"
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "samplerate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "content_type",
+        "channels",
+        "bitrate",
+        "samplerate"
+      ]
+    },
+    "PlaybackCandidate": {
+      "description": "A server-issued exact input/output configuration, not an arbitrary device profile.",
+      "type": "object",
+      "properties": {
+        "audio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AudioCapabilityConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "delivery_mode": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "transport": {
+          "type": "string"
+        },
+        "video": {
+          "$ref": "#/$defs/VideoCapabilityConfiguration"
+        }
+      },
+      "required": [
+        "id",
+        "delivery_mode",
+        "transport",
+        "content_type",
+        "video"
+      ]
+    },
+    "VideoCapabilityConfiguration": {
+      "type": "object",
+      "properties": {
+        "bitrate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "framerate": {
+          "type": "number",
+          "format": "double"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "content_type",
+        "width",
+        "height",
+        "bitrate",
+        "framerate"
+      ]
+    }
+  }
+}

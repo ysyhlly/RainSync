@@ -74,7 +74,7 @@ pub async fn prepare(
 ) -> Result<Snapshot> {
     let text = outputs::read_manifest(&directory.join("index.m3u8")).await?;
     let decode_directory = directory.clone();
-    let (snapshot, proofs) = tokio::task::spawn_blocking(move || {
+    let (snapshot, proofs) = media_core::child_process::blocking(move || {
         let mut builder = builder
             .lock()
             .map_err(|_| anyhow::anyhow!("output_check_interrupted"))?;

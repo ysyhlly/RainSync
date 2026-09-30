@@ -167,6 +167,10 @@ async fn main() -> anyhow::Result<()> {
         row.get::<String, _>("visible_manifest")
             .ends_with("#EXT-X-ENDLIST\n")
     );
+    sqlx::query("DELETE FROM media_executions WHERE job_id=$1")
+        .bind(id)
+        .execute(&db)
+        .await?;
     sqlx::query("DELETE FROM media_jobs WHERE id=$1")
         .bind(id)
         .execute(&db)

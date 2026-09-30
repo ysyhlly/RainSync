@@ -1,3 +1,4 @@
+import { isolatedPostgres } from "./fixtures/postgres.mjs";
 import { reviewRegressions } from "./review-regressions.mjs";
 import { libraryScans } from "./library-scans.mjs";
 import { queueCapacity } from "./queue-capacity.mjs";
@@ -21,8 +22,8 @@ import {
 const root = resolve(process.env.RAINSYNC_ARTIFACT_DIR ?? ".runtime", "integration", randomUUID());
 const target = resolve(process.env.CARGO_TARGET_DIR ?? "target", "debug");
 await mkdir(root, { recursive: true });
-const password = randomBytes(24).toString("hex"),
-  container = `rainsync-test-${randomUUID().slice(0, 8)}`;
+const password = randomBytes(24).toString("hex");
+const database = isolatedPostgres({ root, name: "integration", password });
 const children = [];
 const origin = "http://127.0.0.1:18080";
 const worker = "http://127.0.0.1:18081";
@@ -32,7 +33,6 @@ const env = {
   ...process.env,
   PLAYBACK_SESSION_LIMIT: "8",
   MEDIA_QUEUE_LIMIT: "20",
-  DATABASE_URL: `postgres://rainsync:${password}@127.0.0.1:15439/rainsync?sslmode=disable`,
   ADMIN_PASSWORD: password,
   SOURCE_ENCRYPTION_KEY: randomBytes(32).toString("base64"),
   PUBLIC_ORIGIN: origin,
@@ -45,25 +45,8 @@ const env = {
   RUST_LOG: "warn",
 };
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-const sql = (query) =>
-  execFileSync(
-    "docker",
-    [
-      "exec",
-      container,
-      "psql",
-      "-U",
-      "rainsync",
-      "-d",
-      "rainsync",
-      "-At",
-      "-v",
-      "ON_ERROR_STOP=1",
-      "-c",
-      query,
-    ],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-  ).trim();
+const sql = database.sql;
+const sqlProcess = database.sqlProcess;
 function assertError(value, code, response) {
   assert.equal(value.error.code, code);
   assert.equal(typeof value.error.message, "string");
@@ -212,38 +195,8 @@ async function connect(client, room) {
 }
 let mock;
 try {
-  execFileSync(
-    "docker",
-    [
-      "run",
-      "--detach",
-      "--name",
-      container,
-      "-p",
-      "127.0.0.1:15439:5432",
-      "-e",
-      "POSTGRES_USER=rainsync",
-      "-e",
-      "POSTGRES_DB=rainsync",
-      "-e",
-      `POSTGRES_PASSWORD=${password}`,
-      "postgres:17",
-    ],
-    { stdio: "pipe" },
-  );
-  for (let i = 0; i < 60; i++) {
-    try {
-      execFileSync(
-        "docker",
-        ["exec", container, "pg_isready", "-U", "rainsync"],
-        { stdio: "pipe" },
-      );
-      break;
-    } catch {
-      await delay(500);
-    }
-  }
-  await delay(2000);
+  await database.start();
+  env.DATABASE_URL = database.url;
   let server = launch("rainsync-server");
   await ready(origin + "/health");
   execFileSync(
@@ -417,23 +370,7 @@ try {
   await libraryScans({ admin, sql });
   const inv = await admin.request(`/rooms/${room.id}/invites`, "POST");
   await friend.request(`/rooms/${room.id}/join`, "POST", { token: inv.token });
-  const lock = spawn(
-    "docker",
-    [
-      "exec",
-      "-i",
-      container,
-      "psql",
-      "-U",
-      "rainsync",
-      "-d",
-      "rainsync",
-      "-At",
-      "-v",
-      "ON_ERROR_STOP=1",
-    ],
-    { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
-  );
+  const lock = sqlProcess(undefined, { interactive: true });
   children.push(lock);
   const locked = new Promise((resolve, reject) => {
     lock.stdout.on("data", (data) => {
@@ -1226,21 +1163,7 @@ try {
     "PASS: Jellyfin/Emby mock contract, credential isolation, start/stop report (not real server compatibility)",
   );
   // Force a real database transaction failure and prove the state cannot advance.
-  execFileSync(
-    "docker",
-    [
-      "exec",
-      container,
-      "psql",
-      "-U",
-      "rainsync",
-      "-d",
-      "rainsync",
-      "-c",
-      "ALTER TABLE room_events ADD CONSTRAINT test_reject CHECK (revision < 0) NOT VALID",
-    ],
-    { stdio: "pipe" },
-  );
+  sql("ALTER TABLE room_events ADD CONSTRAINT test_reject CHECK (revision < 0) NOT VALID");
   a.ws.send(
     JSON.stringify({
       ...command,
@@ -1254,21 +1177,7 @@ try {
   const rejected = await a.wait((v) => v.type === "ERROR");
   assertError(rejected, "COMMIT_FAILED");
   assert.equal(rejected.state.revision, state.revision);
-  execFileSync(
-    "docker",
-    [
-      "exec",
-      container,
-      "psql",
-      "-U",
-      "rainsync",
-      "-d",
-      "rainsync",
-      "-c",
-      "ALTER TABLE room_events DROP CONSTRAINT test_reject",
-    ],
-    { stdio: "pipe" },
-  );
+  sql("ALTER TABLE room_events DROP CONSTRAINT test_reject");
   a.ws.send(
     JSON.stringify({
       ...command,
@@ -1337,21 +1246,7 @@ try {
     recoveredState,
     "valid retry after restart returns current epoch without executing again",
   );
-  execFileSync(
-    "docker",
-    [
-      "exec",
-      container,
-      "psql",
-      "-U",
-      "rainsync",
-      "-d",
-      "rainsync",
-      "-c",
-      `UPDATE command_results SET request_payload=NULL WHERE command_id='${command.command_id}'`,
-    ],
-    { stdio: "pipe" },
-  );
+  sql(`UPDATE command_results SET request_payload=NULL WHERE command_id='${command.command_id}'`);
   recovered.ws.send(JSON.stringify(command));
   const legacyReplay = await recovered.wait((v) => v.type === "ERROR");
   assertError(legacyReplay, "COMMAND_REPLAY_UNVERIFIABLE");
@@ -1364,7 +1259,7 @@ try {
     admin,
     friend,
     sql,
-    container,
+    sqlProcess,
     env,
   });
   recovered.ws.close();
@@ -1400,7 +1295,7 @@ try {
   console.log(
     "PASS: fixed-window WebSocket rate limit delivers ERROR and closes gracefully under unread bursts",
   );
-  await reviewRegressions({ admin, friend, sql, connect, origin, container });
+  await reviewRegressions({ admin, friend, sql, sqlProcess, connect, origin });
   const started = performance.now();
   const clients = await Promise.all(
     Array.from({ length: 100 }, () => connect(admin, room.id)),
@@ -1408,21 +1303,9 @@ try {
   await Promise.all(clients.map((c) => c.wait((v) => v.type === "SNAPSHOT")));
   const connectionMs = performance.now() - started;
   for (const c of clients) c.ws.close();
-  for (const args of [
-    ["pg_dump", "-U", "rainsync", "-Fc", "-f", "/tmp/backup.dump", "rainsync"],
-    ["createdb", "-U", "rainsync", "rainsync_restore"],
-    [
-      "pg_restore",
-      "-U",
-      "rainsync",
-      "-d",
-      "rainsync_restore",
-      "/tmp/backup.dump",
-    ],
-  ])
-    execFileSync("docker", ["exec", container, ...args], { stdio: "pipe" });
+  const restoredDatabaseUrl = database.backupRestore();
   launch("rainsync-server", {
-    DATABASE_URL: env.DATABASE_URL.replace("/rainsync?", "/rainsync_restore?"),
+    DATABASE_URL: restoredDatabaseUrl,
     BIND: "127.0.0.1:18084",
   });
   await ready("http://127.0.0.1:18084/health");
@@ -1455,5 +1338,5 @@ try {
   mock?.close();
   for (const child of children) child.kill();
   await delay(400);
-  execFileSync("docker", ["rm", "-f", container], { stdio: "pipe" });
+  await database.stop();
 }

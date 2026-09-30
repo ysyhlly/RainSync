@@ -28,6 +28,7 @@ export const useSourceScans = defineStore("source-scans", () => {
   const labels: Record<string, string> = {
     offline: "NAS 设备离线，请连接后重试",
     unsupported: "请更新 NAS Agent 后再手动扫描",
+    upgrade_required: "请升级 NAS Agent 并重新扫描，现有索引缺少文件版本",
     busy: "设备正在扫描，请稍后重试",
     disconnected: "扫描期间设备断开，结果未确认",
     timeout: "扫描尚未确认完成，请稍后刷新媒体库",

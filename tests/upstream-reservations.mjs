@@ -10,7 +10,8 @@ import { performance } from "node:perf_hooks";
 import WS from "ws";
 import { isolatedServer } from "./fixtures/server.mjs";
 
-const artifacts = resolve(".runtime/upstream-reservations");
+const runtime = resolve(process.env.RAINSYNC_RUNTIME_ROOT ?? ".runtime");
+const artifacts = resolve(runtime, "upstream-reservations");
 const crashUnknownOnly = process.argv.slice(2).includes("--crash-unknown-only");
 assert.ok(
   process.argv.slice(2).every((arg) => arg === "--crash-unknown-only"),
@@ -344,7 +345,7 @@ class Controller {
   }
 }
 
-let fixtureIdentity;
+let fixtureIdentity, ownedFixture;
 let ownedVolumes = [];
 let controller;
 async function scenario(name, run) {
@@ -364,7 +365,7 @@ async function scenario(name, run) {
 try {
   const bindingPath = resolve(
     process.env.W03_BACKEND_BINDING ??
-      ".runtime/w03-backend/backend-binding.json",
+      resolve(runtime, "w03-backend/backend-binding.json"),
   );
   const binding = JSON.parse(await readFile(bindingPath, "utf8"));
   report.backend_binding = {
@@ -1205,7 +1206,10 @@ try {
           assert.equal(initial.negotiation, "running");
           assert.equal(initial.play_session_id, null);
           assert.equal(initial.response_encrypted, null);
-          await fixture.stopServer();
+          // This scenario proves process death, not graceful owner draining.
+          // Windows default termination was abrupt; make that explicit for the
+          // native Linux backend now that SIGTERM has owned graceful cleanup.
+          await fixture.stopServer({ signal: "SIGKILL" });
           const interrupted = await pending;
           assert.ok(
             interrupted.error || interrupted.value.status !== 200,
@@ -1336,17 +1340,25 @@ try {
     {
       binary,
       beforeStart(fixture) {
+        ownedFixture = fixture;
         fixtureIdentity = {
           id: fixture.id,
           container: fixture.container,
           root: fixture.root,
+          database_kind: fixture.databaseKind,
+          postgres: fixture.postgresDiagnostics(),
         };
         report.fixture = fixtureIdentity;
-        ownedVolumes = JSON.parse(
-          docker("inspect", fixture.container, "--format", "{{json .Mounts}}"),
-        )
-          .filter((mount) => mount.Type === "volume")
-          .map((mount) => mount.Name);
+        if (fixture.databaseKind === "native") {
+          assert.equal(fixture.container,null,"native runs must not invent a Docker identity");
+          assert.equal(fixtureIdentity.postgres.kind,"native");
+          ownedVolumes=[];
+        } else {
+          assert.equal(fixture.databaseKind,"docker");
+          ownedVolumes = JSON.parse(
+            docker("inspect", fixture.container, "--format", "{{json .Mounts}}"),
+          ).filter((mount) => mount.Type === "volume").map((mount) => mount.Name);
+        }
       },
     },
   );
@@ -1376,7 +1388,10 @@ try {
     await new Promise((done) => upstream.close(done));
   });
   try {
-    if (fixtureIdentity) {
+    if (fixtureIdentity?.database_kind === "native") {
+      report.cleanup.native = await ownedFixture.verifyStopped();
+      report.cleanup.completed = true;
+    } else if (fixtureIdentity) {
       assert.equal(
         docker(
           "ps",

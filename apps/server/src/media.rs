@@ -187,30 +187,55 @@ pub async fn playback(
     // Dropping an HTTP waiter must not drop the reservation's executor. Start
     // ownership before begin(), including its commit/acknowledgement window.
     // Explicit cancellation still fences probe grants and final publication.
-    tokio::spawn(owned_playback(app, u, body))
+    let owner = app.preparations.admit().ok_or_else(|| {
+        err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "playback_request_interrupted",
+        )
+    })?;
+    tokio::spawn(owned_playback(app, u, body, owner))
         .await
         .map_err(anyhow::Error::from)?
 }
 
-async fn owned_playback(app: App, u: User, body: protocol::PlaybackRequest) -> Result<Json<Value>> {
+async fn owned_playback(
+    app: App,
+    u: User,
+    body: protocol::PlaybackRequest,
+    owner: preparation_owner::Owner,
+) -> Result<Json<Value>> {
     let reservation = match playback_requests::begin(&app, u.id, &body).await? {
         playback_requests::Start::Replay(plan) => return Ok(Json(plan)),
         playback_requests::Start::Reserved(reservation) => reservation,
     };
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(45),
-        prepare_playback(&app, &u, &body, &reservation),
-    )
-    .await;
-    let error = match result {
-        Ok(Ok(plan)) => return Ok(Json(plan)),
-        Ok(Err(error)) => error,
-        Err(_) => err(StatusCode::GATEWAY_TIMEOUT, "playback_request_interrupted"),
+    let scope = media_core::child_process::Scope::new();
+    let result = scope.run(async {
+        tokio::select! {
+            biased;
+            _ = owner.cancelled() => Err(err(StatusCode::SERVICE_UNAVAILABLE, "playback_request_interrupted")),
+            result = tokio::time::timeout(
+                std::time::Duration::from_secs(45),
+                prepare_playback(&app, &u, &body, &reservation),
+            ) => result.unwrap_or_else(|_| Err(err(StatusCode::GATEWAY_TIMEOUT, "playback_request_interrupted"))),
+        }
+    }).await;
+    let outcome = match result {
+        Ok(plan) => Ok(Json(plan)),
+        Err(error) => match playback_requests::fail(&app, &reservation, &error).await {
+            Ok(Some(plan)) => Ok(Json(plan)),
+            Ok(None) => Err(error),
+            Err(error) => Err(error),
+        },
     };
-    if let Some(plan) = playback_requests::fail(&app, &reservation, &error).await? {
-        return Ok(Json(plan));
-    }
-    Err(error)
+    // Timeout/cancel only drops the public waiter; positively drain every local
+    // process owner before acknowledging this durable preparation as stopped.
+    scope.shutdown().await.map_err(anyhow::Error::from)?;
+    // Return the HTTP result promptly, but keep the registry lease in the ACK
+    // task so graceful shutdown cannot abort a delayed acknowledgement.
+    tokio::spawn(async move {
+        owner.acknowledge(&app, &reservation).await;
+    });
+    outcome
 }
 
 async fn prepare_playback(
@@ -231,6 +256,9 @@ async fn prepare_playback(
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no_media"))?;
     let row=sqlx::query("SELECT m.source_id,m.resource,m.duration_ms,m.metadata,m.source_version,s.kind,s.config_encrypted FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND m.available").bind(media).fetch_optional(&app.db).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "media_not_found"))?;
     let kind: String = row.get("kind");
+    if body.candidate_report.is_some() && !matches!(kind.as_str(), "local" | "agent") {
+        return Err(err(StatusCode::CONFLICT, "stale_capability_report"));
+    }
     let config: SourceConfig =
         serde_json::from_value(app.decrypt(&row.get::<String, _>("config_encrypted"))?)
             .map_err(anyhow::Error::from)?;
@@ -246,6 +274,27 @@ async fn prepare_playback(
     if !["auto", "direct", "remux", "transcode"].contains(&mode) {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_mode"));
     }
+    let selected = if body.candidate_report.is_some() {
+        let version = if kind == "local" {
+            playback_capabilities::current_local_version(&config.root, &item)?
+        } else if kind == "agent" {
+            source_version
+                .clone()
+                .ok_or_else(|| err(StatusCode::CONFLICT, "source_version_required"))?
+        } else {
+            return Err(err(StatusCode::CONFLICT, "stale_capability_report"));
+        };
+        playback_capabilities::select(
+            app,
+            u.id,
+            body,
+            media,
+            reservation.lifecycle_epoch,
+            &version,
+        )?
+    } else {
+        None
+    };
     if mode == "auto" {
         mode = if kind == "local" {
             media_core::compatible_mode(&meta, body.audio_index.is_some())
@@ -294,7 +343,7 @@ async fn prepare_playback(
                         progressive: body
                             .capabilities
                             .as_ref()
-                            .is_none_or(|c| c.progressive_h264_aac),
+                            .is_none_or(|c| c.supports_progressive()),
                         hls: body.capabilities.as_ref().is_none_or(|c| c.supports_hls()),
                         force_transcode: body.mode.as_deref() == Some("transcode"),
                     },
@@ -355,7 +404,7 @@ async fn prepare_playback(
                 && body
                     .capabilities
                     .as_ref()
-                    .is_none_or(|c| c.progressive_h264_aac);
+                    .is_none_or(|c| c.supports_progressive());
             let url = if !use_direct && let Some(path) = source["TranscodingUrl"].as_str() {
                 transport = "hls";
                 mode = "transcode";
@@ -403,13 +452,16 @@ async fn prepare_playback(
     let id = reservation.session;
     let t = token();
     let mut timeline = 0.0;
-    if matches!(kind.as_str(), "http" | "agent") && requested_mode != "direct" {
+    if matches!(kind.as_str(), "http" | "agent")
+        && requested_mode != "direct"
+        && !(kind == "agent" && selected.is_some())
+    {
         // Auto HTTP/NAS must probe even when the provisional mode above is direct.
         // A short-lived session lets the worker probe through the same authorized relay as playback.
         let mut preparation = app.db.begin().await?;
         playback_requests::guard(app, &mut preparation, reservation).await?;
-        sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '1 minute')")
-            .bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":app.encrypt(&resource)?})).execute(&mut *preparation).await?;
+        sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '1 minute',$8)")
+            .bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":app.encrypt(&resource)?})).bind(reservation.lifecycle_epoch).execute(&mut *preparation).await?;
         preparation.commit().await?;
         let probe: Result<Value> = async {
             let base = std::env::var("WORKER_URL").unwrap_or("http://127.0.0.1:8081".into());
@@ -449,6 +501,9 @@ async fn prepare_playback(
             .execute(&app.db)
             .await?;
         meta = probe?;
+        if kind == "agent" {
+            meta["capability_source_version"] = json!(source_version);
+        }
         duration = meta["format"]["duration"]
             .as_str()
             .and_then(|v| v.parse::<f64>().ok())
@@ -539,7 +594,11 @@ async fn prepare_playback(
         mode = media_core::compatible_mode(&meta, true)
             .map_err(|_| err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_video_or_hdr"))?;
     }
-    if let Some(caps) = &body.capabilities {
+    if let Some(selection) = &selected {
+        mode = &selection.candidate.delivery_mode;
+        transport = &selection.candidate.transport;
+        resource["source_version"] = json!(selection.source_version);
+    } else if let Some(caps) = &body.capabilities {
         let (selected_mode, selected_transport) =
             caps.negotiate(mode, transport).ok_or_else(|| {
                 err(
@@ -559,7 +618,10 @@ async fn prepare_playback(
     position_ms = protocol::bounded_position(position_ms, duration);
     let local_job = matches!(kind.as_str(), "local" | "http" | "agent") && mode != "direct";
     if local_job {
-        if mode == "remux" && (position_ms > 0.0 || media_core::hls_needs_video_transform(&meta)) {
+        if selected.is_none()
+            && mode == "remux"
+            && (position_ms > 0.0 || media_core::hls_needs_video_transform(&meta))
+        {
             mode = "transcode";
         }
         transport = "hls";
@@ -591,16 +653,29 @@ async fn prepare_playback(
         subtitle_tracks,
         observation_version: body.observation_version,
         observation_seq: body.observation_version.map(|_| 0),
+        decision_reason: Some(selected.as_ref().map_or_else(
+            || "legacy_conservative_transport_negotiation".to_string(),
+            |s| format!("actual_media_{}", s.candidate.id),
+        )),
+        selected_candidate_id: selected.as_ref().map(|s| s.candidate.id.clone()),
+        selected_audio_track: body.audio_index.or_else(|| {
+            meta["streams"]
+                .as_array()?
+                .iter()
+                .find(|s| s["codec_type"] == "audio")?["index"]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+        }),
     };
     let protocol_plan = plan;
     let plan = serde_json::to_value(&protocol_plan).map_err(anyhow::Error::from)?;
     let mut tx = app.db.begin().await?;
+    playback_requests::guard(app, &mut tx, reservation).await?;
     let current: Value =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
             .bind(body.room_id)
             .fetch_one(&mut *tx)
             .await?;
-    playback_requests::guard(app, &mut tx, reservation).await?;
     if current["media_generation"].as_u64() != Some(u64::from(body.media_generation)) {
         return Err(err(StatusCode::CONFLICT, "stale_media"));
     }
@@ -626,20 +701,27 @@ async fn prepare_playback(
     {
         return Err(err(StatusCode::CONFLICT, "source_changed"));
     }
-    sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '30 minutes') ON CONFLICT(id) DO UPDATE SET resource=EXCLUDED.resource,expires_at=EXCLUDED.expires_at,stopped=false").bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":encrypted})).execute(&mut *tx).await?;
+    if kind == "local"
+        && let Some(selection) = &selected
+        && playback_capabilities::current_local_version(&config.root, &item)?
+            != selection.source_version
+    {
+        return Err(err(StatusCode::CONFLICT, "source_changed"));
+    }
+    sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '30 minutes',$8) ON CONFLICT(id) DO UPDATE SET resource=EXCLUDED.resource,expires_at=EXCLUDED.expires_at,stopped=false,lifecycle_epoch=EXCLUDED.lifecycle_epoch").bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":encrypted})).bind(reservation.lifecycle_epoch).execute(&mut *tx).await?;
     if body.observation_version == Some(1) {
         persistence::playback_observations::create(&mut tx, u.id, body.room_id, &protocol_plan)
             .await?;
     }
     if local_job {
-        let input_ticket = if kind != "local" {
+        let input_ticket = if kind != "local" || selected.is_some() {
             Some(app.encrypt(&json!({"token":t}))?)
         } else {
             None
         };
         let estimated_output_bytes =
             media_core::estimated_output_bytes(&meta, duration, timeline, mode == "transcode");
-        let spec = json!({"root":config.root,"resource":item,"input_ticket":input_ticket,"start_seconds":timeline/1000.0,"transcode":mode=="transcode","audio_index":body.audio_index,"estimated_output_bytes":estimated_output_bytes});
+        let spec = json!({"root":config.root,"resource":item,"source_kind":kind,"input_ticket":input_ticket,"start_seconds":timeline/1000.0,"transcode":mode=="transcode","audio_index":body.audio_index,"estimated_output_bytes":estimated_output_bytes,"negotiated_mode":selected.as_ref().map(|s|&s.candidate.delivery_mode),"source_version":selected.as_ref().map(|s|&s.source_version)});
         if !persistence::media_queue::enqueue(&mut tx, id, &spec, app.queue_limit).await? {
             return Err(err(StatusCode::SERVICE_UNAVAILABLE, "media_queue_full"));
         }
@@ -704,7 +786,7 @@ pub async fn readiness(
         return Err(err(StatusCode::BAD_REQUEST, "invalid_position"));
     }
     // One statement gives permission and the current attempt a consistent snapshot.
-    let row = sqlx::query("SELECT j.status AS job_status, j.error AS job_error, o.validation_version, o.ready_segments, o.visible_manifest, v.seq AS observation_seq FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id LEFT JOIN media_jobs j ON j.session_id=p.id LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt LEFT JOIN playback_observations v ON v.session_id=p.id WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND p.expires_at>now() AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
+    let row = sqlx::query("SELECT j.status AS job_status, j.error AS job_error, o.validation_version, o.ready_segments, o.visible_manifest, v.seq AS observation_seq FROM playback_sessions p JOIN rooms r ON r.id=p.room_id JOIN room_snapshots s ON s.room_id=p.room_id LEFT JOIN media_jobs j ON j.session_id=p.id LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt LEFT JOIN playback_observations v ON v.session_id=p.id WHERE p.id=$1 AND p.user_id=$2 AND r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND NOT p.stopped AND p.expires_at>now() AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
         .bind(id).bind(u.id).fetch_optional(&app.db).await?
         .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
     use protocol::PreparationStatus::{Preparing, Queued, Ready};
@@ -830,10 +912,33 @@ pub async fn renew(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
     let u = auth(&app, &h, true).await?;
+    let session = sqlx::query(
+        "SELECT room_id,lifecycle_epoch FROM playback_sessions WHERE id=$1 AND user_id=$2",
+    )
+    .bind(id)
+    .bind(u.id)
+    .fetch_optional(&app.db)
+    .await?
+    .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
+    let room: Uuid = session.get("room_id");
+    let epoch: i64 = session.get("lifecycle_epoch");
     let mut tx = app.db.begin().await?;
+    persistence::room_lifecycle::lock_epoch(&mut tx, room, epoch)
+        .await
+        .map_err(|_| err(StatusCode::GONE, "invalid_playback_session"))?;
+    let member = sqlx::query(
+        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
+    )
+    .bind(room)
+    .bind(u.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if member.is_none() {
+        return Err(err(StatusCode::GONE, "invalid_playback_session"));
+    }
     sqlx::query("UPDATE playback_requests SET expires_at=GREATEST(expires_at,now()+interval '48 hours') WHERE session_id=$1 AND user_id=$2")
         .bind(id).bind(u.id).execute(&mut *tx).await?;
-    let r=sqlx::query("UPDATE playback_sessions p SET expires_at=now()+interval '30 minutes' FROM room_snapshots s WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND p.expires_at>now() AND s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation").bind(id).bind(u.id).execute(&mut *tx).await?;
+    let r=sqlx::query("UPDATE playback_sessions p SET expires_at=now()+interval '30 minutes' FROM room_snapshots s WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND p.expires_at>now() AND p.lifecycle_epoch=$3 AND s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation").bind(id).bind(u.id).bind(epoch).execute(&mut *tx).await?;
     if r.rows_affected() == 0 {
         return Err(err(StatusCode::GONE, "invalid_playback_session"));
     };

@@ -5,10 +5,13 @@ use uuid::Uuid;
 pub mod cache;
 pub mod cache_budget;
 pub mod cache_outputs;
+pub mod media_executions;
 pub mod media_jobs;
 pub mod media_outputs;
 pub mod media_queue;
 pub mod playback_observations;
+pub mod room_cleanup;
+pub mod room_lifecycle;
 pub mod upstream_reservations;
 
 pub async fn connect(url: &str) -> Result<PgPool> {
@@ -34,9 +37,18 @@ pub async fn issue_control_epoch(
     room: Uuid,
     user: Uuid,
 ) -> Result<protocol::ControlEpoch> {
+    let mut tx = pool.begin().await?;
+    // Serialize credential issuance with ownership changes. An issuance queued
+    // behind a transfer must belong to the new authorization window.
+    room_lifecycle::lock_active(&mut tx, room).await?;
+    sqlx::query("SELECT room_id FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
+        .bind(room)
+        .fetch_one(&mut *tx)
+        .await?;
     let id = Uuid::new_v4();
     let expires_at_ms: i64 = sqlx::query_scalar("INSERT INTO control_epochs(id,user_id,room_id) VALUES($1,$2,$3) RETURNING floor(extract(epoch FROM expires_at)*1000)::bigint")
-        .bind(id).bind(user).bind(room).fetch_one(pool).await?;
+        .bind(id).bind(user).bind(room).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
     Ok(protocol::ControlEpoch { id, expires_at_ms })
 }
 pub async fn check_control_epoch<'e, E: sqlx::Executor<'e, Database = sqlx::Postgres>>(
@@ -69,12 +81,16 @@ pub async fn previous(
     command: &Command,
     user: Uuid,
 ) -> Result<Option<RoomState>> {
+    let mut tx = pool.begin().await?;
+    room_lifecycle::lock_active(&mut tx, room).await?;
+    check_control_epoch(&mut *tx, room, user, command.control_epoch).await?;
     let row =
         sqlx::query("SELECT state,user_id,request_payload FROM command_results WHERE room_id=$1 AND command_id=$2")
             .bind(room)
             .bind(command.command_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await?;
+    tx.commit().await?;
     match row {
         None => Ok(None),
         Some(row) => {
@@ -101,13 +117,26 @@ pub async fn commit(
     previous_revision: u32,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
+    // Match room management's room -> snapshot lock order before inserting
+    // rows whose foreign keys also need a key-share lock on rooms.
+    room_lifecycle::lock_active(&mut tx, state.room_id).await?;
     // Validate wall-clock expiry after acquiring the state lock, so a command
     // that expired while waiting cannot execute when that lock is released.
-    sqlx::query("SELECT room_id FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
-        .bind(state.room_id)
-        .fetch_one(&mut *tx)
-        .await?;
+    let current: serde_json::Value =
+        sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
+            .bind(state.room_id)
+            .fetch_one(&mut *tx)
+            .await?;
     check_control_epoch(&mut *tx, state.room_id, user, command.control_epoch).await?;
+    // A management transaction can replace controller ownership outside the
+    // in-memory playback actor. Never commit a reduction against an old owner.
+    let current: RoomState = serde_json::from_value(current)?;
+    if current.revision != previous_revision {
+        bail!("revision_conflict");
+    }
+    if current.controller_user_id != state.controller_user_id {
+        bail!("controller_required");
+    }
     let value = serde_json::to_value(state)?;
     let result = sqlx::query(
         "UPDATE room_snapshots SET state=$2 WHERE room_id=$1 AND (state->>'revision')::bigint=$3",

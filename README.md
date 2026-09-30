@@ -4,6 +4,24 @@
 
 当前为 **v0.1.0-alpha.1 开发预览**，不是完成全部 24 周验收的正式版本。已实现代码与尚未完成的验收见 [实施状态](docs/STATUS.md) 和 [发布说明](CHANGELOG.md)。此版本仅发布源码，不提供已验收的生产镜像。
 
+## 现有部署升级前必读
+
+**当前补强已在 main `399d699` 的独立本地工作树上整合。保留上游 0025/0026 预约/观测迁移，新增为 0027 房主、0028 生命周期、0029 清理，以及本轮 0030 旧 NAS 影响范围。此前 0027–0029 的 131 文件交付包和通过证据保留为历史；含0030的新源码绑定、基础与列明的最终组合复验全部通过；存量对账和真实环境门槛仍未解除，不能据此宣布发布就绪。**
+
+本分支加入房间关闭/重开与真实资源释放回执。**未知旧 NAS 传输仍以 `legacy_agent_drain_unconfirmed` 阻挡其可能关联的房间关闭；0030 只豁免可证明在该传输之后创建的房间，不生成释放回执。0030 前已有的所有房间仍在旧记录的可能范围内，可能长期停在 closing；当前没有受支持的人工对账写入或 force-close 入口，这仍是受影响存量部署的升级/发布阻断。**
+
+房间出生序号和旧传输的不可变范围上限由同一事务计数器排序，判断不依赖墙钟或 created_at。范围外的新房间仍须满足自身所有释放证明；晚到的旧 Worker INSERT 会取得当时的新上限，可能再次涵盖这些房间。停止旧服务、普通 Agent ACK 或记录过期不会清除未知项。升级仍须停止并排空旧组件，使用匹配的 Server/Worker/Agent；任意旧 Worker 在最终关闭检查后继续写入不在保证范围内。
+
+无损诊断顺序：
+
+1. 保全数据库、关联密钥、服务版本和日志，先在隔离恢复库验证；诊断材料不含密钥/令牌
+2. 授权读取 `/api/v1/rooms/{id}/lifecycle` 的 epoch、revision、cleanup attempts/last_error/completed，保留准备、执行、Agent transfer 和上游身份等不可变 ID；legacy_agent_drain_unconfirmed 要在授权只读诊断中核对 rooms.cleanup_birth_ordinal 与旧记录 possible_room_cutoff，保留范围证据，不能只按 session 关联查找
+3. 将完整 Agent 身份映射到全部主机/容器和服务管理器，禁止旧签发及自动重启并保留冻结的 legacy ID 集合；核对整个进程树的 supervisor 正向退出或可验证主机启动代次，再启配套组件。新心跳、在线状态、租约到期或 PID 不存在都不足以证明旧所有者退出
+4. 核对已分发 Agent UUID 回执、上游 stop/操作确认，让仍能报告的当前版所有者完成回执后再观察状态。旧 24 小时清理可能已删除历史行，查不到旧记录也不等于旧资源已释放；当前没有用户生产环境完成上述核验的证明
+5. 范围内无法证明的房间保持 closing，等待另行实现、审计和验证的对账方案。不删数据/迁移历史，不改序号/范围、不手填 ACK/reaped 或直接改 closed；当前未提供解除未知旧资源阻断的写入工具
+
+仅输出 transfer ID/Agent ID/范围上限的管理员只读 SQL、验证和完整检查清单见 [第二阶段报告](docs/PHASE2_LIFECYCLE_NEGOTIATION.md) 与 [清理协议](docs/ROOM_CLEANUP.md)。当前候选的浏览器、部署镜像、真实硬件与长期发布门槛仍待验收。上游历史浏览器/镜像和两种各 60 分钟控制拓扑通过保留；NAS 两小时尝试在 103.2 分钟失败，不能写成从未运行或已经通过。原证据见 [计划审计](docs/PLAN_AUDIT.md) 和 [验证记录](docs/VALIDATION.md)。
+
 ## 本地启动
 
 需要 Docker Compose 和 Node.js 24。首次构建会下载 Rust、FFmpeg 和前端依赖。
@@ -58,6 +76,10 @@ Windows 本地后端开发需 PostgreSQL、FFmpeg/ffprobe；运行二进制前�
 
 ## 文档
 
+- [当前：第二阶段生命周期、清理回执与实际媒体协商](docs/PHASE2_LIFECYCLE_NEGOTIATION.md)
+- [房间生命周期](docs/ROOM_LIFECYCLE.md) / [关闭清理与旧库边界](docs/ROOM_CLEANUP.md)
+- [实际媒体候选与有限回退](docs/PLAYBACK_CAPABILITIES.md) / [NAS 传输与释放回执](docs/AGENT_TRANSFERS.md)
+- [第一阶段优先项修复与验证（历史）](docs/PRIORITY_REMEDIATION.md)
 - [本次完整修改与验收报告](docs/IMPLEMENTATION_REPORT.md)
 - [四项P2审计修复与新一轮回归](docs/AUDIT_FIXES.md)
 - [账号接口与注册规则](docs/ACCOUNT_REGISTRATION_API.md) / [头像接口](docs/AVATAR_API.md)

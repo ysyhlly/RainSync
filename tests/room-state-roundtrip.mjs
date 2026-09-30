@@ -47,6 +47,9 @@ const report = {
   fixture_entry_sha256: sha(
     await readFile(new URL("./fixtures/server.mjs", import.meta.url)),
   ),
+  postgres_fixture_entry_sha256: sha(
+    await readFile(new URL("./fixtures/postgres.mjs", import.meta.url)),
+  ),
   cases: [],
   failures: [],
   cleanup: { completed: false },
@@ -204,16 +207,25 @@ try {
         bytes: before.length,
         source_build_manifest: "not inferred from mutable checkout",
       };
-      report.fixture = { id: f.id, container: f.container };
-      report.postgresql = {
-        version: f.sql("SELECT version()"),
-        image_id: docker("inspect", "--format", "{{.Image}}", f.container),
+      report.fixture = {
+        id: f.id,
+        database_kind: f.databaseKind,
+        container: f.container,
       };
-      report.cleanup.anonymous_volumes = JSON.parse(
-        docker("inspect", "--format", "{{json .Mounts}}", f.container),
-      )
-        .filter((mount) => mount.Type === "volume")
-        .map((mount) => mount.Name);
+      const diagnostic = f.postgresDiagnostics();
+      assert.equal(diagnostic.ready, true);
+      report.postgresql = {
+        ...diagnostic,
+        version: diagnostic.server_version,
+        image_id: diagnostic.docker?.image_id ?? null,
+      };
+      if (f.databaseKind === "docker") {
+        report.cleanup.anonymous_volumes = JSON.parse(
+          docker("inspect", "--format", "{{json .Mounts}}", f.container),
+        )
+          .filter((mount) => mount.Type === "volume")
+          .map((mount) => mount.Name);
+      }
       console.log(`Evidence: ${resolve(f.root, "report.json")}`);
     },
   };
@@ -271,6 +283,9 @@ try {
             id: room.id,
             name: `exact-f64-${position}`,
             owner_id: owner.id,
+            ...("lifecycle" in listed
+              ? { lifecycle: "active", lifecycle_epoch: 0 }
+              : {}),
           });
         }
         const snapshotText = () =>
@@ -482,7 +497,12 @@ try {
   report.final_fixture_entry_sha256 = sha(
     await readFile(new URL("./fixtures/server.mjs", import.meta.url)),
   );
+  report.final_postgres_fixture_entry_sha256 = sha(
+    await readFile(new URL("./fixtures/postgres.mjs", import.meta.url)),
+  );
   if (
+    report.postgres_fixture_entry_sha256 !==
+      report.final_postgres_fixture_entry_sha256 ||
     report.entry_sha256 !== report.final_entry_sha256 ||
     report.fixture_entry_sha256 !== report.final_fixture_entry_sha256
   ) {
@@ -491,23 +511,26 @@ try {
   }
   if (fixture) {
     try {
-      assert.equal(
-        docker("ps", "-aq", "--filter", `name=^/${fixture.container}$`),
-        "",
-        "isolated PostgreSQL container removed",
-      );
-      for (const volume of report.cleanup.anonymous_volumes ?? []) {
-        // The shared native fixture removes its container without --volumes.
-        // These names came only from that isolated container's own Mounts.
-        if (docker("volume", "ls", "-q", "--filter", `name=^${volume}$`)) {
-          docker("volume", "rm", volume);
-        }
+      if (fixture.databaseKind === "docker") {
         assert.equal(
-          docker("volume", "ls", "-q", "--filter", `name=^${volume}$`),
+          docker("ps", "-aq", "--filter", `name=^/${fixture.container}$`),
           "",
+          "isolated PostgreSQL container removed",
         );
+        for (const volume of report.cleanup.anonymous_volumes ?? []) {
+          // The shared native fixture removes its container without --volumes.
+          // These names came only from that isolated container's own Mounts.
+          if (docker("volume", "ls", "-q", "--filter", `name=^${volume}$`)) {
+            docker("volume", "rm", volume);
+          }
+          assert.equal(
+            docker("volume", "ls", "-q", "--filter", `name=^${volume}$`),
+            "",
+          );
+        }
       }
-      report.cleanup.completed = true;
+      report.cleanup.evidence = await fixture.verifyStopped();
+      report.cleanup.completed = report.cleanup.evidence.completed;
     } catch (error) {
       report.cleanup.error = error.message;
       failure ??= error;

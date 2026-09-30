@@ -14,6 +14,14 @@
 
 邀请链接可复用，24 小时过期或由控制者撤销，房间最多 10 位成员；当前不支持 max_uses。路径安全检查要求根目录与目标媒体已经存在，Windows/Linux 都会拒绝不存在路径，不应绕过 canonicalize 检查。
 
+## 旧 NAS 记录与房间关闭升级门槛
+
+0029 保留未知旧资源；0030 用数据库分配的不可变房间出生序号和旧传输范围上限，只排除可证明晚于该旧传输的新房间，不补造释放回执。迁移前全部既有房间仍在迁移前旧 NAS 行的可能范围内，可能长期 closing。晚到旧 Worker 写入会捕获当时范围，可能涵盖此前新建房间；升级须先停止并排空旧 Server/Worker/Agent，再迁移并启动配套版本，不支持旧写入在最终关闭检查后继续出现。
+
+必须将完整 Agent 身份映射到所有主机/容器及服务管理器，禁止旧签发和自动重启、保存冻结的 legacy ID 集合，再取得整个进程树的 supervisor 正向退出或可验证主机启动代次证据。新心跳、状态、租约过期和 PID 不存在都不足够；迁移前 24 小时历史清理可能已删行，空查询也不是旧资源释放证明。当前没有真实生产部署完成此核验的记录。
+
+遇到 `legacy_agent_drain_unconfirmed`，保全数据库、服务版本、房间和 transfer ID；授权只读检查 `rooms.cleanup_birth_ordinal` 与 `agent_transfer_runs.possible_room_cutoff`，同时保留不可变执行/上游身份和日志。不要仅凭时间戳或无 session 关联判定无关，不要删除旧行、改计数器/范围、手填 ACK/reaped 或直接改 closed。当前没有人工对账写入或 force-close；普通 ACK 和保留期也不能解除旧记录门槛。范围外房间仍须完成自身全部资源释放证明。详见 [无损诊断清单](PHASE2_LIFECYCLE_NEGOTIATION.md#2-升级门槛与无损诊断) 与 [清理协议](ROOM_CLEANUP.md)。
+
 ## 备份
 
 停止媒体写入窗口内进行数据库备份；示例使用容器内部文件，避免 Windows shell 二进制重定向差异：
@@ -51,6 +59,23 @@ FFmpeg 通过 Worker 自身地址读取原片：WORKER_BIND 为通配地址时�
 Agent 默认将数据连接指向 `SERVER_URL` 的同一入口，Caddy 必须同时代理 `/api/v1/agents/ws` 和 `/agent-data/*`。如控制与数据部署在不同入口，可在 Agent 设置 `AGENT_DATA_ORIGIN`，其值为可达的 HTTP(S) 基址。Agent 不需要开放入站端口。
 
 `node tests/remote-playback.mjs` 使用本机 Compose、20 秒演示文件和 Docker FFmpeg，创建临时源站及 NAS 容器，验证远程自动选择、转封装、转码、非零时间起点和会话撤销。测试源配置与验证房间会保留；临时容器在结束时移除，设备凭据撤销。勿在正式用户正在使用的实例执行验收脚本。
+
+
+## NAS Agent 升级与 0019 迁移
+
+`0019_agent_source_versions.sql` 保留已有 NAS 媒体及其 ID，但旧行的 `source_version` 为 `NULL`。服务器不能从路径、旧探测信息或文件名推断文件版本；在完整的新版 Agent 索引提交前，播放会返回 HTTP 409 / `SOURCE_VERSION_REQUIRED`，不会授予无版本的播放或 relay 权限。不要通过 SQL 填入虚构版本或绕过该检查。
+
+升级步骤：
+
+1. 按上面的备份流程保存数据库、站点密钥和 Agent 凭据。升级 Server、Worker 和 NAS Agent，保留原有 Agent 凭据及媒体目录。
+2. 启动或重新连接新版 NAS Agent。Agent 每次连接会自动提交完整索引；已连接的新版 Agent 也可通过管理员“扫描所有片源”或 `POST /api/v1/agents/{id}/scan` 重新扫描。
+3. 管理员读取 `GET /api/v1/agents`，确认该设备 `source_version_status=ready` 且 `unversioned_count=0`。`connected` 只表示本 Server 的活动控制连接，`ready` 只表示已有索引均具有版本，两者不能互相替代。`empty` 表示没有可用索引，不能证明成功找到媒体。
+4. `rescan_required` 表示尚有旧的无版本索引，需要新版 Agent 完整扫描；若运行的仍是旧 Agent，先升级。`upgrade_required` 表示本次连接已提交缺少版本的旧格式索引。扫描接口也会返回 `status=upgrade_required` 及 `unversioned_count`，不能将它作为播放恢复成功。`unsupported` 表示不支持手动扫描，需升级并重新连接；`offline` 表示先恢复设备连接。
+5. 扫描完成后重新发起播放。之前以 `SOURCE_VERSION_REQUIRED` 失败的幂等请求编号不会自动变成新授权，须使用新的播放操作。相同媒体 ID、播放列表引用和用户改名保留；首次补充版本或文件版本变化会清除旧探测元数据。
+
+`source_versions` 是当前连接的能力线索（`null` 表示未知），不是授权依据。能力声明、未完成的分页索引、断线回滚都不会解除旧行的版本限制。文件变化后原播放授权仍返回 `SOURCE_CHANGED`；重新扫描并发起新播放后才能读取新版本。
+
+隔离回归：先 `cargo build --workspace --bins --examples --locked`，设置外部 `RAINSYNC_ARTIFACT_DIR` 后运行 `node tests/nas-upgrade.mjs`。脚本从真实 0001–0018 迁移及旧 NAS 数据启动，再由最新 Server 应用后续迁移，覆盖旧 Agent 缺版本、分页中断、新版真实 Agent 完整扫描、完整/Range/HEAD relay，以及同大小文件变化后的拒绝与重扫恢复。仅操作脚本创建的临时数据库、文件和进程，需要 FFmpeg 与已构建的三个 Rust 二进制。默认使用 Docker 创建 PostgreSQL；也可设置 `RAINSYNC_NATIVE_POSTGRES_BIN` 指向 PostgreSQL 可执行目录，使用隔离的本地临时集群。
 
 
 ## Jellyfin 隔离兼容测试

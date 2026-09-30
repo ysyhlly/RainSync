@@ -9,9 +9,16 @@ export default defineConfig({
   }]],
   testDir: "./tests/browser",
   fullyParallel: true,
-  use: { baseURL: "http://127.0.0.1:5173", trace: "retain-on-failure" },
+  use: {
+    baseURL: "http://127.0.0.1:5173",
+    trace: "retain-on-failure",
+    // Opt in to an already installed browser; bundled Playwright stays default.
+    launchOptions: {
+      executablePath: process.env.RAINSYNC_CHROMIUM_EXECUTABLE || undefined,
+    },
+  },
   webServer: {
-    command: "npm run dev",
+    command: "npm run dev -w apps/web -- --host 127.0.0.1",
     url: "http://127.0.0.1:5173",
     reuseExistingServer: !process.env.CI && !artifacts,
   },

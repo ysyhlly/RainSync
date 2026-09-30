@@ -9,6 +9,12 @@
         "$ref": "#/$defs/MediaTrack"
       }
     },
+    "decision_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "delivery_mode": {
       "type": "string"
     },
@@ -55,6 +61,20 @@
     },
     "rebuild_on_seek": {
       "type": "boolean"
+    },
+    "selected_audio_track": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "selected_candidate_id": {
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "session_id": {
       "type": "string",

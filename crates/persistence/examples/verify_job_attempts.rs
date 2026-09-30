@@ -165,6 +165,12 @@ async fn main() -> anyhow::Result<()> {
         .bind(id)
         .execute(&db)
         .await?;
+    // This isolated fixture deliberately reuses a synthetic job at attempt zero.
+    // No real resource was started; discard only this fixture's old identities.
+    sqlx::query("DELETE FROM media_executions WHERE job_id=$1")
+        .bind(id)
+        .execute(&db)
+        .await?;
     sqlx::query("UPDATE media_jobs SET status='queued',attempt=0,max_attempts=3,available_at=now() WHERE id=$1").bind(id).execute(&db).await?;
     for attempt in 1..=3 {
         let execution = claim(&db, owner).await?.unwrap();
@@ -206,6 +212,12 @@ async fn main() -> anyhow::Result<()> {
     // Explicit transport failures retry atomically, with bounded jitter and
     // abandoned output isolation; repeating a finish cannot postpone backoff.
     sqlx::query("DELETE FROM media_outputs WHERE job_id=$1")
+        .bind(id)
+        .execute(&db)
+        .await?;
+    // This isolated fixture deliberately reuses a synthetic job at attempt zero.
+    // No real resource was started; discard only this fixture's old identities.
+    sqlx::query("DELETE FROM media_executions WHERE job_id=$1")
         .bind(id)
         .execute(&db)
         .await?;
@@ -279,6 +291,10 @@ async fn main() -> anyhow::Result<()> {
         persistence::media_jobs::terminal_error(Some("upstream_transport_retry_exhausted")),
         (502, "media_job_retry_exhausted")
     );
+    sqlx::query("DELETE FROM media_executions WHERE job_id=$1")
+        .bind(id)
+        .execute(&db)
+        .await?;
     sqlx::query("DELETE FROM media_jobs WHERE id=$1")
         .bind(id)
         .execute(&db)

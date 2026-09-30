@@ -36,10 +36,10 @@ impl std::error::Error for JobFailure {}
 /// Stored task errors are untrusted diagnostic text, never an arbitrary public code.
 pub fn terminal_error(reason: Option<&str>) -> (u16, &'static str) {
     match reason {
+        Some("source_changed") => (409, "source_changed"),
         Some("cache_capacity_exceeded") => (503, "cache_capacity_exceeded"),
         Some("cache_read_only") => (503, "cache_read_only"),
         Some("cache_permission_denied") => (503, "cache_permission_denied"),
-        Some("source_changed") => (409, "source_changed"),
         Some("source_version_required") => (409, "source_version_required"),
         Some("upstream_transport_retry_exhausted" | "media_job_retry_exhausted") => {
             (502, "media_job_retry_exhausted")
@@ -91,6 +91,10 @@ pub async fn claim(pool: &PgPool, owner: Uuid) -> Result<Option<Claim>> {
     if let Some(claim) = &claim {
         sqlx::query("INSERT INTO media_outputs(job_id,attempt,owner_id,status,relative_dir) VALUES($1,$2,$3,'writing',$4)")
             .bind(claim.id).bind(claim.attempt).bind(owner).bind(format!("{}/{}",claim.id,claim.attempt)).execute(&mut *tx).await?;
+        // Scheduling state may be cancelled/reclaimed while the old owner is
+        // still alive. Keep one independent drain receipt for every attempt.
+        sqlx::query("INSERT INTO media_executions(id,session_id,kind,job_id,attempt,owner_id) SELECT gen_random_uuid(),session_id,'job',id,attempt,owner_id FROM media_jobs WHERE id=$1")
+            .bind(claim.id).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     Ok(claim)

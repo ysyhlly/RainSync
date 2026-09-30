@@ -4,6 +4,18 @@ import { nextTick } from "vue";
 import { useSession } from "../apps/web/src/features/auth/session.store";
 import { useSourceScans } from "../apps/web/src/features/admin/source-scans.store";
 afterEach(() => vi.unstubAllGlobals());
+it("reports a completed legacy NAS index as needing upgrade rather than successful playback readiness", async () => {
+  setActivePinia(createPinia());
+  const scans = useSourceScans();
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+    status: "upgrade_required", count: 4, unversioned_count: 4,
+  })));
+  await scans.scan({ id: "nas", name: "NAS", kind: "agent" });
+  expect(scans.results.nas.failed).toBe(true);
+  expect(scans.results.nas.busy).toBe(false);
+  expect(scans.results.nas.message).toBe("请升级 NAS Agent 并重新扫描，现有索引缺少文件版本");
+  scans.$dispose();
+});
 it("a delayed previous identity scan cannot remove a new identity result", async () => {
   setActivePinia(createPinia());
   const session = useSession(), scans = useSourceScans();

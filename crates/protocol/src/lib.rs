@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 mod errors;
 pub use errors::{ApiError, ErrorCode, ErrorResponse};
+mod playback_candidates;
+pub use playback_candidates::*;
 
 pub const VERSION: u8 = 1;
 /// Unknown-duration media is bounded to one week. Known durations are authoritative.
@@ -87,6 +89,15 @@ pub struct PlaybackPlan {
     pub rebuild_on_seek: bool,
     pub audio_tracks: Vec<MediaTrack>,
     pub subtitle_tracks: Vec<MediaTrack>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub decision_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub selected_audio_track: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub selected_candidate_id: Option<String>,
     /// Present only when this grant negotiated actual viewer observations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -166,12 +177,77 @@ pub struct MediaTrack {
     pub url: Option<String>,
 }
 
+/// Browser MIME-type hints are not guarantees for arbitrary media or hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaTypeSupport {
+    Unknown,
+    Unsupported,
+    Maybe,
+    Probably,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+pub struct VideoCapabilityConfiguration {
+    pub content_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub bitrate: u32,
+    pub framerate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+pub struct AudioCapabilityConfiguration {
+    pub content_type: String,
+    pub channels: String,
+    pub bitrate: u32,
+    pub samplerate: u32,
+}
+
+/// Estimates apply only to the accompanying configuration and decoding path.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+pub struct MediaDecodingSupport {
+    pub supported: bool,
+    pub smooth: bool,
+    pub power_efficient: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+pub struct MediaCapabilityCandidate {
+    /// Combined container/codec MIME type tested through canPlayType and MSE.
+    pub content_type: String,
+    pub video: VideoCapabilityConfiguration,
+    pub audio: AudioCapabilityConfiguration,
+    pub progressive: MediaTypeSupport,
+    /// Omitted means unavailable or failed, not supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mse_supported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub file_decoding: Option<MediaDecodingSupport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mse_decoding: Option<MediaDecodingSupport>,
+}
+
+/// A small set of concrete sample hints, not a device-wide codec/size guarantee.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+pub struct CapabilityReport {
+    pub schema_version: u32,
+    pub candidates: Vec<MediaCapabilityCandidate>,
+}
+
 /// Independently detected transports; MSE support does not imply progressive support.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PlaybackCapabilities {
     pub progressive_h264_aac: bool,
     pub native_hls: bool,
     pub mse_h264_aac: bool,
+    /// Optional additive hints. Old clients retain the original transport gates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub report: Option<CapabilityReport>,
 }
 
 /// Missing optional fields preserve the original v1 playback request defaults.
@@ -193,17 +269,45 @@ pub struct PlaybackRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub observation_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub candidate_report: Option<PlaybackCandidateReport>,
 }
 
 impl PlaybackCapabilities {
+    fn h264_aac_sample(&self) -> Option<&MediaCapabilityCandidate> {
+        self.report
+            .as_ref()
+            .filter(|report| report.schema_version == 1)?
+            .candidates
+            .iter()
+            .find(|candidate| {
+                candidate.content_type == "video/mp4; codecs=\"avc1.640028, mp4a.40.2\""
+            })
+    }
+    pub fn supports_progressive(&self) -> bool {
+        self.progressive_h264_aac
+            && self.h264_aac_sample().is_none_or(|sample| {
+                matches!(
+                    sample.progressive,
+                    MediaTypeSupport::Maybe | MediaTypeSupport::Probably
+                )
+            })
+    }
     pub fn supports_hls(&self) -> bool {
-        self.native_hls || self.mse_h264_aac
+        // Native HLS is independent of progressive and MSE MP4 decoding.
+        // Sample-specific decodingInfo estimates cannot blacklist a codec family.
+        self.native_hls
+            || (self.mse_h264_aac
+                && self
+                    .h264_aac_sample()
+                    .is_none_or(|sample| sample.mse_supported == Some(true)))
     }
     pub fn negotiate<'a>(&self, mode: &'a str, transport: &'a str) -> Option<(&'a str, &'a str)> {
         if transport == "hls" || mode != "direct" {
             return self.supports_hls().then_some((mode, "hls"));
         }
-        if self.progressive_h264_aac {
+        if self.supports_progressive() {
             Some((mode, transport))
         } else {
             self.supports_hls().then_some(("remux", "hls"))
@@ -225,6 +329,7 @@ mod capability_tests {
         assert!(request.audio_index.is_none());
         assert!(request.capabilities.is_none());
         assert!(request.observation_version.is_none());
+        assert!(request.candidate_report.is_none());
     }
     #[test]
     fn refuses_unplayable_output_and_distinguishes_transports() {
@@ -232,6 +337,7 @@ mod capability_tests {
             progressive_h264_aac: true,
             native_hls: false,
             mse_h264_aac: false,
+            report: None,
         };
         assert_eq!(
             caps.negotiate("direct", "progressive"),
@@ -266,5 +372,50 @@ mod capability_tests {
             }
             assert!(serde_json::from_value::<PlaybackObservation>(candidate).is_err());
         }
+    }
+    #[test]
+    fn legacy_capabilities_keep_their_transport_gates() {
+        let caps: PlaybackCapabilities = serde_json::from_value(serde_json::json!({
+            "progressive_h264_aac": true, "native_hls": false, "mse_h264_aac": false
+        }))
+        .unwrap();
+        assert!(caps.report.is_none());
+        assert!(caps.supports_progressive());
+        assert_eq!(
+            caps.negotiate("direct", "progressive"),
+            Some(("direct", "progressive"))
+        );
+        assert!(serde_json::to_value(caps).unwrap().get("report").is_none());
+    }
+    #[test]
+    fn concrete_mime_hints_constrain_negotiation_without_assuming_native_support() {
+        let mut caps: PlaybackCapabilities = serde_json::from_value(serde_json::json!({
+            "progressive_h264_aac": true, "native_hls": false, "mse_h264_aac": true,
+            "report": {"schema_version": 1, "candidates": [{
+                "content_type": "video/mp4; codecs=\"avc1.640028, mp4a.40.2\"",
+                "video": {"content_type": "video/mp4; codecs=\"avc1.640028\"",
+                    "width": 1920, "height": 1080, "bitrate": 8000000, "framerate": 30.0},
+                "audio": {"content_type": "audio/mp4; codecs=\"mp4a.40.2\"",
+                    "channels": "2", "bitrate": 128000, "samplerate": 48000},
+                "progressive": "unsupported", "mse_supported": true,
+                "mse_decoding": {"supported": false, "smooth": false, "power_efficient": false}
+            }]}
+        }))
+        .unwrap();
+        assert!(!caps.supports_progressive());
+        assert_eq!(
+            caps.negotiate("direct", "progressive"),
+            Some(("remux", "hls"))
+        );
+        caps.report.as_mut().unwrap().candidates[0].mse_supported = Some(false);
+        assert_eq!(caps.negotiate("direct", "progressive"), None);
+        caps.native_hls = true;
+        assert_eq!(
+            caps.negotiate("direct", "progressive"),
+            Some(("remux", "hls"))
+        );
+        // Future report semantics must not break existing transport negotiation.
+        caps.report.as_mut().unwrap().schema_version = 2;
+        assert!(caps.supports_progressive());
     }
 }

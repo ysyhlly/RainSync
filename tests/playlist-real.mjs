@@ -47,6 +47,7 @@ await isolatedMediaStack(
       });
       await dev.listen();
       browser = await chromium.launch({
+        executablePath: process.env.RAINSYNC_CHROMIUM_EXECUTABLE || undefined,
         args: ["--autoplay-policy=no-user-gesture-required"],
       });
       const page = await browser.newPage({

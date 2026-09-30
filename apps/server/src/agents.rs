@@ -5,6 +5,9 @@ use futures_util::{SinkExt, StreamExt};
 pub struct Control {
     connection: Uuid,
     scans: tokio::sync::mpsc::Sender<Scan>,
+    manual_scan: bool,
+    source_versions: Option<bool>,
+    drain_receipts: Option<bool>,
 }
 struct Scan {
     id: Uuid,
@@ -41,29 +44,72 @@ pub async fn scan(
         return Ok(Json(json!({"status":"busy"})));
     }
     drop(controls);
-    let status = match tokio::time::timeout(std::time::Duration::from_secs(120), result).await {
+    let mut status = match tokio::time::timeout(std::time::Duration::from_secs(120), result).await {
         Ok(Ok(status)) => status,
         Ok(Err(_)) => "disconnected",
         Err(_) => "timeout",
     };
-    let count: i64 = if status == "complete" {
-        sqlx::query_scalar("SELECT count(*) FROM media_items WHERE source_id=$1 AND available")
+    let (count, unversioned_count) = if status == "complete" {
+        let row = sqlx::query("SELECT count(*) AS count,count(*) FILTER (WHERE source_version IS NULL OR source_version !~ '^stat-v1:[0-9a-f]{64}$') AS unversioned_count FROM media_items WHERE source_id=$1 AND available")
             .bind(id)
             .fetch_one(&app.db)
-            .await?
+            .await?;
+        (
+            row.get::<i64, _>("count"),
+            row.get::<i64, _>("unversioned_count"),
+        )
     } else {
-        0
+        (0, 0)
     };
-    Ok(Json(json!({"status":status,"count":count})))
+    // A legacy snapshot is still useful for browsing, but must never be
+    // reported as a successful recovery of version-bound playback.
+    if unversioned_count > 0 {
+        status = "upgrade_required";
+    }
+    Ok(Json(
+        json!({"status":status,"count":count,"unversioned_count":unversioned_count}),
+    ))
+}
+
+fn source_version_status(
+    count: i64,
+    unversioned_count: i64,
+    capable: Option<bool>,
+) -> &'static str {
+    if count == 0 {
+        "empty"
+    } else if unversioned_count == 0 {
+        "ready"
+    } else if capable == Some(false) {
+        "upgrade_required"
+    } else {
+        "rescan_required"
+    }
 }
 
 pub async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     admin(&auth(&app, &h, false).await?)?;
-    let rows = sqlx::query("SELECT id,name,revoked,last_seen::text FROM agents")
+    let rows = sqlx::query("SELECT a.id,a.name,a.revoked,a.last_seen::text,count(m.id) AS indexed_count,count(m.id) FILTER (WHERE m.source_version IS NULL OR m.source_version !~ '^stat-v1:[0-9a-f]{64}$') AS unversioned_count FROM agents a LEFT JOIN media_items m ON m.source_id=a.id AND m.available GROUP BY a.id ORDER BY a.name,a.id")
         .fetch_all(&app.db)
         .await?;
-    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"revoked":r.get::<bool,_>("revoked"),"last_seen":r.get::<Option<String>,_>("last_seen")})).collect())))
+    let controls = app.agent_controls.lock().await;
+    Ok(Json(Value::Array(rows.iter().map(|r| {
+        let id: Uuid = r.get("id");
+        let revoked: bool = r.get("revoked");
+        let control = controls.get(&id).filter(|_| !revoked);
+        let count: i64 = r.get("indexed_count");
+        let unversioned_count: i64 = r.get("unversioned_count");
+        let capable = control.and_then(|c| c.source_versions);
+        json!({
+            "id":id,"name":r.get::<String,_>("name"),"revoked":revoked,
+            "last_seen":r.get::<Option<String>,_>("last_seen"),
+            "connected":control.is_some(),"manual_scan":control.is_some_and(|c| c.manual_scan),
+            "source_versions":capable,"drain_receipts":control.and_then(|c|c.drain_receipts),"indexed_count":count,"unversioned_count":unversioned_count,
+            "source_version_status":source_version_status(count, unversioned_count, capable)
+        })
+    }).collect())))
 }
+
 pub async fn create(
     State(app): State<App>,
     h: HeaderMap,
@@ -117,7 +163,7 @@ pub async fn connect(
         let (mut out, mut input) = socket.split();
         let connection = Uuid::new_v4();
         let (scan_tx, mut scans) = tokio::sync::mpsc::channel::<Scan>(1);
-        app.agent_controls.lock().await.insert(id, Control { connection, scans: scan_tx });
+        app.agent_controls.lock().await.insert(id, Control { connection, scans: scan_tx, manual_scan: false, source_versions: None, drain_receipts: None });
         let mut supports_scan = false;
         let mut pending: Option<Scan> = None;
         let (pages, incoming) = tokio::sync::mpsc::channel(1);
@@ -141,6 +187,12 @@ pub async fn connect(
             ack = completed.recv() => {
                 let Some(ack) = ack else { break };
                 let failed = ack["type"] == "INDEX_ERROR";
+                if ack["final"] == true && ack["count"].as_i64().is_some_and(|n| n > 0) {
+                    let mut controls = app.agent_controls.lock().await;
+                    if let Some(control) = controls.get_mut(&id).filter(|c| c.connection == connection) {
+                        control.source_versions = Some(ack["unversioned_count"] == 0);
+                    }
+                }
                 if failed {
                     if let Some(request) = pending.take() { let _ = request.reply.send("failed"); }
                 } else if pending.as_ref().is_some_and(|p| ack["snapshot"] == p.id.to_string()) {
@@ -155,7 +207,7 @@ pub async fn connect(
             _ = tick.tick() => {
                 let valid = sqlx::query("UPDATE agents SET last_seen=now() WHERE id=$1 AND NOT revoked RETURNING id").bind(id).fetch_optional(&app.db).await;
                 if !matches!(valid, Ok(Some(_))) { break }
-                // Lock only the next transfer. Unsent rows never become claimed.
+                // Lock only the next transfer; claimed means dispatch attempted, not peer receipt.
                 let result: anyhow::Result<()> = async {
                     // One bounded send per select iteration keeps heartbeats,
                     // index acknowledgements and incoming frames responsive.
@@ -164,9 +216,13 @@ pub async fn connect(
                         let Some(row) = row else { return Ok(()) };
                         let transfer: Uuid = row.get("id");
                         let request: Value = row.get("request");
-                        tokio::time::timeout(std::time::Duration::from_secs(3), out.send(Message::Text(json!({"type":"TRANSFER","id":transfer,"request":request}).to_string().into()))).await??;
+                        // Persist exposure intent before network send. A failed
+                        // send is uncertain, never evidence the Agent saw nothing.
                         sqlx::query("UPDATE agent_transfers SET claimed=true WHERE id=$1").bind(transfer).execute(&mut *tx).await?;
+                        sqlx::query("UPDATE agent_transfer_runs SET dispatched_at=COALESCE(dispatched_at,clock_timestamp()) WHERE id=$1")
+                            .bind(transfer).execute(&mut *tx).await?;
                         tx.commit().await?;
+                        tokio::time::timeout(std::time::Duration::from_secs(3), out.send(Message::Text(json!({"type":"TRANSFER","id":transfer,"request":request}).to_string().into()))).await??;
                     Ok(())
                 }.await;
                 if result.is_err() { break }
@@ -176,7 +232,29 @@ pub async fn connect(
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {},
                     Some(Ok(Message::Text(text))) => {
                         let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
-                        if value["type"] == "HELLO" { supports_scan = value["manual_scan"] == true; }
+                        if value["type"] == "TRANSFER_DRAINED" {
+                            let Some(transfer) = value["id"].as_str().and_then(|value|Uuid::parse_str(value).ok()) else { continue };
+                            // The authenticated control identity may only settle
+                            // its own previously exposed transfer. Terminal status
+                            // alone (completed/cancelled) is not a drain receipt.
+                            let accepted = sqlx::query("UPDATE agent_transfer_runs SET agent_drained_at=COALESCE(agent_drained_at,clock_timestamp()) WHERE id=$1 AND agent_id=$2 AND dispatched_at IS NOT NULL")
+                                .bind(transfer).bind(id).execute(&app.db).await;
+                            let Ok(accepted) = accepted else { continue };
+                            let ack=json!({"type":"TRANSFER_DRAINED_ACK","id":transfer,"accepted":accepted.rows_affected()==1,"rejected_permanently":accepted.rows_affected()==0});
+                            if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3),out.send(Message::Text(ack.to_string().into()))).await,Ok(Ok(()))) { break; }
+                            continue;
+                        }
+                        if value["type"] == "HELLO" {
+                            supports_scan = value["manual_scan"] == true;
+                            let mut controls = app.agent_controls.lock().await;
+                            if let Some(control) = controls.get_mut(&id).filter(|c| c.connection == connection) {
+                                control.manual_scan = supports_scan;
+                                control.drain_receipts = Some(value["drain_receipts"] == true);
+                                // Absence is unknown: pre-capability Agents can still
+                                // prove support by committing a versioned snapshot.
+                                if value["source_versions"] == true { control.source_versions = Some(true); }
+                            }
+                        }
                         if value["type"] == "SCAN_BUSY" && pending.as_ref().is_some_and(|p| value["snapshot"] == p.id.to_string()) {
                             let _ = pending.take().unwrap().reply.send("busy");
                         }
@@ -285,8 +363,12 @@ async fn ingest_index(
             if final_page {
                 sqlx::query("UPDATE media_items SET available=false WHERE source_id=$1 AND NOT EXISTS(SELECT 1 FROM agent_index_page i WHERE i.resource=media_items.resource)").bind(id).execute(&mut *tx).await?;
                 sqlx::query("INSERT INTO media_items(id,source_id,title,resource,source_version,available) SELECT gen_random_uuid(),$1,title,resource,source_version,available FROM agent_index_page ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,available=EXCLUDED.available,source_version=EXCLUDED.source_version,metadata=CASE WHEN media_items.source_version IS DISTINCT FROM EXCLUDED.source_version THEN '{}'::jsonb ELSE media_items.metadata END,duration_ms=CASE WHEN media_items.source_version IS DISTINCT FROM EXCLUDED.source_version THEN NULL ELSE media_items.duration_ms END").bind(id).execute(&mut *tx).await?;
+                let counts = sqlx::query("SELECT count(*) FILTER (WHERE available) AS count,count(*) FILTER (WHERE available AND source_version IS NULL) AS unversioned_count FROM agent_index_page")
+                    .fetch_one(&mut *tx).await?;
+                let count: i64 = counts.get("count");
+                let unversioned_count: i64 = counts.get("unversioned_count");
                 tx.commit().await?;
-                acks.send(json!({"type":"INDEX_ACK","snapshot":snapshot,"sequence":sequence,"final":true}))
+                acks.send(json!({"type":"INDEX_ACK","sequence":sequence,"snapshot":snapshot,"final":true,"count":count,"unversioned_count":unversioned_count}))
                     .await?;
                 break;
             }
@@ -299,5 +381,19 @@ async fn ingest_index(
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("index_disconnected"))?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_version_status;
+
+    #[test]
+    fn version_readiness_requires_a_committed_version_for_every_available_item() {
+        assert_eq!(source_version_status(0, 0, None), "empty");
+        assert_eq!(source_version_status(2, 0, None), "ready");
+        assert_eq!(source_version_status(2, 1, None), "rescan_required");
+        assert_eq!(source_version_status(2, 1, Some(true)), "rescan_required");
+        assert_eq!(source_version_status(2, 1, Some(false)), "upgrade_required");
     }
 }

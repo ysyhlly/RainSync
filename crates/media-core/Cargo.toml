@@ -8,6 +8,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 sha2 = "0.10"
+protocol.workspace = true
 [dev-dependencies]
 uuid.workspace = true
 

@@ -191,8 +191,130 @@ impl Drop for Child {
     }
 }
 
+/// A resource-level drain boundary, independent of cancellation of its waiter.
+/// Spawned subtasks must explicitly enter the same scope; task locals are not
+/// inherited by tokio::spawn. The global process registry still owns all trees.
+#[derive(Clone, Default)]
+pub struct Scope(std::sync::Arc<std::sync::Mutex<ScopeState>>);
+
+#[derive(Default)]
+struct ScopeState {
+    closing: bool,
+    children: Vec<(watch::Sender<bool>, watch::Receiver<Option<Outcome>>)>,
+    blocking: Vec<watch::Receiver<bool>>,
+}
+
+tokio::task_local! { static PROCESS_SCOPE: Scope; }
+
+impl Scope {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn run<F: std::future::Future>(&self, work: F) -> F::Output {
+        PROCESS_SCOPE.scope(self.clone(), work).await
+    }
+
+    /// A positive result proves every process tree admitted to this scope was
+    /// reaped. It does not infer exit from a lease, PID or abandoned waiter.
+    pub async fn shutdown(&self) -> io::Result<()> {
+        let (children, blocking) = {
+            let mut scope = self.0.lock().expect("process scope lock");
+            scope.closing = true;
+            for (stop, _) in &scope.children {
+                let _ = stop.send(true);
+            }
+            (scope.children.clone(), scope.blocking.clone())
+        };
+        for mut completed in blocking {
+            while !*completed.borrow_and_update() {
+                completed.changed().await.map_err(|_| {
+                    io::Error::other("blocking operation owner stopped without receipt")
+                })?;
+            }
+        }
+        for (_, mut result) in children {
+            loop {
+                let outcome = result.borrow_and_update().clone();
+                if let Some(outcome) = outcome {
+                    outcome.map_err(|(kind, text)| io::Error::new(kind, text))?;
+                    break;
+                }
+                result
+                    .changed()
+                    .await
+                    .map_err(|_| io::Error::other("process owner stopped without reaping"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Execute non-interruptible file work under the current resource scope.
+/// Cancelling the waiter does not detach disposal evidence: shutdown waits for
+/// the operation, including disposal of an undelivered return value. The caller
+/// must drop any successfully returned resource before acknowledging its scope.
+pub async fn blocking<F, T>(work: F) -> io::Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    struct Completed(watch::Sender<bool>);
+    impl Drop for Completed {
+        fn drop(&mut self) {
+            self.0.send_replace(true);
+        }
+    }
+    let scope = PROCESS_SCOPE.try_with(Clone::clone).ok();
+    let (complete, completed) = watch::channel(false);
+    let (send, receive) = tokio::sync::oneshot::channel();
+    let owner = Completed(complete);
+    // Registration is synchronous with admission. No blocking task exists
+    // outside the ledger, even if its caller is cancelled immediately.
+    if let Some(scope) = &scope {
+        let mut state = scope.0.lock().expect("process scope lock");
+        if state.closing {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "process scope is closing",
+            ));
+        }
+        state.blocking.retain(|receipt| !*receipt.borrow());
+        state.blocking.push(completed);
+        tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            // Failed delivery drops T before _owner records completion.
+            let _ = send.send(work());
+        });
+    } else {
+        tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            let _ = send.send(work());
+        });
+    }
+    receive
+        .await
+        .map_err(|_| io::Error::other("blocking operation failed"))
+}
+
 pub fn spawn(command: Command) -> io::Result<Child> {
-    spawn_registered(command, registry())
+    if let Ok(scope) = PROCESS_SCOPE.try_with(Clone::clone) {
+        // Admission and shutdown serialize, including clones used concurrently.
+        let mut state = scope.0.lock().expect("process scope lock");
+        if state.closing {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "process scope is closing",
+            ));
+        }
+        let child = spawn_registered(command, registry())?;
+        state
+            .children
+            .push((child.stop.clone(), child.status.clone()));
+        Ok(child)
+    } else {
+        spawn_registered(command, registry())
+    }
 }
 
 fn spawn_registered(mut command: Command, registry: std::sync::Arc<Registry>) -> io::Result<Child> {
@@ -634,6 +756,98 @@ mod tests {
             (unsafe { libc::kill(self.0, 0) }) != 0
                 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
         }
+    }
+
+    #[tokio::test]
+    async fn scope_receipt_survives_cancelled_waiter_and_closes_admission() {
+        let root = std::env::temp_dir().join(format!("rainsync-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let scope = Scope::new();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--ignored", "--exact", "child_process::tests::tree_fixture"])
+            .env("RAINSYNC_TREE_FIXTURE", &root)
+            .env_remove("RAINSYNC_TREE_LEAF")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = scope.run(async { spawn(command).unwrap() }).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !root.join("leaf.pid").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let witness = Witness::open(
+            std::fs::read_to_string(root.join("leaf.pid"))
+                .unwrap()
+                .parse()
+                .unwrap(),
+        );
+        assert!(!witness.exited());
+        drop(child); // Public cancellation only requests stop; no false receipt.
+        tokio::time::timeout(Duration::from_secs(5), scope.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(witness.exited());
+        scope.shutdown().await.unwrap(); // Idempotent, positive receipt survives.
+        assert_eq!(
+            scope
+                .run(async { spawn(Command::new("never-spawned")) })
+                .await
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_waits_for_cancelled_blocking_io_and_disposes_late_result() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Resource(Arc<AtomicBool>);
+        impl Drop for Resource {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let disposed = Arc::new(AtomicBool::new(false));
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let scope = Scope::new();
+        let task_scope = scope.clone();
+        let witness = disposed.clone();
+        let waiter = tokio::spawn(async move {
+            task_scope
+                .run(blocking(move || {
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                    Resource(witness)
+                }))
+                .await
+        });
+        ready.await.unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), scope.shutdown())
+                .await
+                .is_err()
+        );
+        assert!(!disposed.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+        scope.shutdown().await.unwrap();
+        assert!(disposed.load(Ordering::SeqCst));
+        assert_eq!(
+            scope.run(blocking(|| 1)).await.unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
     }
 
     #[test]

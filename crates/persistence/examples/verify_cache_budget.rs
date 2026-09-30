@@ -78,6 +78,10 @@ async fn main() -> anyhow::Result<()> {
         Admission::Reserved
     );
     let old_measurement = snapshot(&db).await?;
+    sqlx::query("DELETE FROM media_executions WHERE job_id=$1")
+        .bind(winner.id)
+        .execute(&db)
+        .await?;
     sqlx::query("DELETE FROM media_jobs WHERE id=$1")
         .bind(winner.id)
         .execute(&db)
@@ -87,6 +91,10 @@ async fn main() -> anyhow::Result<()> {
         "missing job reclaim must invalidate measurements too"
     );
     for claim in [&a, &b] {
+        sqlx::query("DELETE FROM media_executions WHERE job_id=$1")
+            .bind(claim.id)
+            .execute(&db)
+            .await?;
         sqlx::query("DELETE FROM media_jobs WHERE id=$1")
             .bind(claim.id)
             .execute(&db)
