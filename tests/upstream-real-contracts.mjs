@@ -274,6 +274,24 @@ for (const kind of kinds) {
         ) => {
           const path = resolve(root, `${kind}-${name}.media`);
           await writeFile(path, bytes);
+          const { stdout: probe } = await execute(
+            ffprobe,
+            ["-v", "error", "-show_streams", "-show_format", "-of", "json", path],
+            { encoding: "utf8", timeout: 15000 },
+          );
+          const probed = JSON.parse(probe);
+          const diagnostic = {
+            name,
+            byte_length: bytes.length,
+            sha256: await digest(path),
+            expected_position_ms: expectedPosition,
+            seek_in_window_ms: seekMs,
+            format_start_time: probed.format?.start_time ?? null,
+            format_duration: probed.format?.duration ?? null,
+            streams: probed.streams.map(({ index, codec_name, codec_type, width, height, start_time, duration }) =>
+              ({ index, codec_name, codec_type, width, height, start_time, duration })),
+          };
+          (product.decode_attempts ??= []).push(diagnostic);
           const { stdout } = await execute(
             ffmpeg,
             [
@@ -298,12 +316,7 @@ for (const kind of kinds) {
             ],
             { encoding: "buffer", timeout: 15000, maxBuffer: 1024 * 1024 },
           );
-          const { stdout: probe } = await execute(
-            ffprobe,
-            ["-v", "error", "-show_streams", "-of", "json", path],
-            { encoding: "utf8", timeout: 15000 },
-          );
-          const video = JSON.parse(probe).streams.find(
+          const video = probed.streams.find(
             (stream) => stream.codec_type === "video",
           );
           assert.ok(video && stdout.length >= video.width * video.height);
@@ -396,10 +409,10 @@ for (const kind of kinds) {
               256 * 1024,
             );
           }
-          let start = 0,
-            pendingDuration = null,
-            segment,
-            segmentStart;
+          assert.equal(lines.includes("#EXT-X-DISCONTINUITY"), false, "Owned VOD window has one continuous timeline");
+          assert.equal(lines.some((line) => line.startsWith("#EXT-X-BYTERANGE:")), false, "Owned fixture uses complete TS/fMP4 segments");
+          let start = 0, pendingDuration = null;
+          const segments = [];
           for (const line of lines) {
             if (line.startsWith("#EXTINF:")) {
               pendingDuration = Number(line.slice(8).split(",")[0]) * 1000;
@@ -408,33 +421,43 @@ for (const kind of kinds) {
               );
             } else if (line && !line.startsWith("#")) {
               assert.ok(pendingDuration !== null);
-              if (grant.position < start + pendingDuration) {
-                segment = line;
-                segmentStart = start;
-                break;
-              }
+              segments.push({ uri: line, start, duration: pendingDuration });
               start += pendingDuration;
               pendingDuration = null;
             }
           }
-          assert.ok(segment, "Real HLS has a media segment");
+          const selected = segments.findIndex((segment) => grant.position < segment.start + segment.duration);
+          assert.ok(selected >= 0, "Real HLS covers the requested timestamp");
+          // Decode the returned HLS timeline, including bounded adjacent data for
+          // decoder initialization and segment-boundary samples. A lone TS file
+          // is not the same input as the contiguous HLS stream a player consumes.
+          const window = segments.slice(Math.max(0, selected - 1), selected + 2);
+          const segmentStart = segments[selected].start;
+          const windowStart = window[0].start;
+          const diagnostic = { name, requested_position_ms: grant.position,
+            selected_segment_start_ms: segmentStart, window_start_ms: windowStart,
+            media_sequence: lines.find((line) => line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) ?? null,
+            segments: [] };
+          (product.hls_windows ??= []).push(diagnostic);
           const init = /URI="([^"]+)"/.exec(
             lines.find((line) => line.startsWith("#EXT-X-MAP:")) ?? "",
           )?.[1];
-          const media = await read(grant.client, segment, manifest.url);
-          const bytes = init
-            ? Buffer.concat([
-                (await read(grant.client, init, manifest.url)).bytes,
-                media.bytes,
-              ])
-            : media.bytes;
+          const chunks = init ? [(await read(grant.client, init, manifest.url, 1024 * 1024)).bytes] : [];
+          for (const segment of window) {
+            const media = await read(grant.client, segment.uri, manifest.url);
+            chunks.push(media.bytes);
+            diagnostic.segments.push({ start_ms: segment.start, duration_ms: segment.duration,
+              byte_length: media.bytes.length, sha256: createHash("sha256").update(media.bytes).digest("hex") });
+          }
+          const bytes = Buffer.concat(chunks);
+          assert.ok(bytes.length <= 25 * 1024 * 1024, "At most three bounded segments and one initialization section");
           return {
             segment_start_ms: segmentStart,
             ...(await decode(
               bytes,
               name,
               grant.position,
-              grant.position - segmentStart,
+              grant.position - windowStart,
               audioHz,
             )),
           };
@@ -552,7 +575,7 @@ for (const kind of kinds) {
             "real upstream media-policy revocation does not revoke another account",
             async (row) => {
               const grant = await negotiate(clientA, h264, { direct: true });
-              await upstream.revokeClient(clientA);
+              row.policy_change = await upstream.revokeClient(clientA);
               const denied = await clientA.raw(
                 `/Items/${h264.Id}/PlaybackInfo`,
                 {
@@ -573,14 +596,34 @@ for (const kind of kinds) {
               const deniedMedia = await clientA.raw(ownedPath(resource).path);
               row.media_status = deniedMedia.status;
               await deniedMedia.body?.cancel();
+              row.media_status_samples = [{ after_ms: 0, status: deniedMedia.status }];
+              const firstSampleAt = Date.now();
+              for (const waitMs of [1000, 2000]) {
+                await delay(waitMs);
+                const sample = await clientA.raw(ownedPath(resource).path);
+                row.media_status_samples.push({ after_ms: Date.now() - firstSampleAt, status: sample.status });
+                await sample.body?.cancel();
+              }
+              // Measure the unrelated account even when A's product permission
+              // semantics fail the denial assertion. Do not replace media-policy
+              // revocation with account disablement or logout to make it green.
+              const other = await negotiate(clientB, h264, { direct: true });
+              assert.equal(other.source.SupportsDirectPlay, true);
+              const otherResource = new URL(`Videos/${h264.Id}/stream.mp4`, base);
+              otherResource.searchParams.set("Static", "true");
+              otherResource.searchParams.set("MediaSourceId", other.source.Id);
+              otherResource.searchParams.set("PlaySessionId", other.sid);
+              otherResource.searchParams.set("DeviceId", clientB.deviceId);
+              row.other_account_output = await decode(
+                (await read(clientB, otherResource, base)).bytes,
+                "other-account-after-media-policy-revocation", 0,
+              );
+              await stop(grant);
+              await stop(other);
               assert.ok(
                 [401, 403].includes(deniedMedia.status),
                 "Revoked policy denies actual media access, even when PlaybackInfo still returns metadata",
               );
-              const other = await negotiate(clientB, h264, { direct: true });
-              assert.equal(other.source.SupportsDirectPlay, true);
-              await stop(grant);
-              await stop(other);
             },
           );
         } finally {

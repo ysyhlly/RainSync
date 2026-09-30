@@ -778,7 +778,12 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
           false,
           "Real upstream policy is revoked",
         );
-        return { user_id: scope.userId, enable_media_playback: false };
+        return {
+          user_id: scope.userId,
+          before_enable_media_playback: current.Policy.EnableMediaPlayback,
+          enable_media_playback: checked.Policy.EnableMediaPlayback,
+          readback_verified: true,
+        };
       },
       items: listing.Items,
       addRainSyncSource: async (rainsyncClient, upstreamClient = admin) => {

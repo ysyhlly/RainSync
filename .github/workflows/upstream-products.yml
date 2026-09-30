@@ -16,11 +16,11 @@ jobs:
           node-version: 24
           cache: npm
       - name: Verify or install fixture dependencies
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
             sudo timeout --kill-after=15s 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-            sudo timeout --kill-after=15s 360s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends ffmpeg
+            sudo timeout --kill-after=15s 900s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends ffmpeg
           fi
           ffmpeg -version
           ffprobe -version
