@@ -1413,6 +1413,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http-api",
+ "httpdate",
  "media-core",
  "persistence",
  "providers",

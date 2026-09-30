@@ -75,8 +75,11 @@ impl Observation {
     pub fn source_version_required(&self) {
         self.0.fetch_max(3, Ordering::Relaxed);
     }
-    pub fn source_changed(&self) {
+    pub fn source_seek_unsupported(&self) {
         self.0.fetch_max(4, Ordering::Relaxed);
+    }
+    pub fn source_changed(&self) {
+        self.0.fetch_max(5, Ordering::Relaxed);
     }
     pub fn status(&self, status: reqwest::StatusCode) {
         if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
@@ -110,7 +113,8 @@ impl Guard {
             1 => Some(JobFailure::UpstreamTransient),
             2 => Some(JobFailure::ExecutionFailed),
             3 => Some(JobFailure::SourceVersionRequired),
-            4 => Some(JobFailure::SourceChanged),
+            4 => Some(JobFailure::SourceSeekUnsupported),
+            5 => Some(JobFailure::SourceChanged),
             _ => None,
         }
     }

@@ -145,6 +145,7 @@ struct OwnerState {
     active: usize,
 }
 struct Owners {
+    readiness: Option<crate::readiness::Runtime>,
     state: Mutex<OwnerState>,
     count: watch::Sender<usize>,
     stop: watch::Sender<bool>,
@@ -152,6 +153,7 @@ struct Owners {
 impl Default for Owners {
     fn default() -> Self {
         Self {
+            readiness: None,
             state: Default::default(),
             count: watch::channel(0).0,
             stop: watch::channel(false).0,
@@ -174,6 +176,12 @@ impl Drop for Admission {
     }
 }
 impl Registry {
+    pub fn with_readiness(readiness: crate::readiness::Runtime) -> Self {
+        Self(Arc::new(Owners {
+            readiness: Some(readiness),
+            ..Owners::default()
+        }))
+    }
     fn admit(&self) -> Option<Admission> {
         let mut state = self.0.state.lock().expect("delivery owner registry");
         if state.closing {
@@ -283,6 +291,9 @@ struct Execution {
 impl Execution {
     async fn finish(self) {
         if self.scope.shutdown().await.is_err() {
+            if let Some(readiness) = &self.admission.registry.0.readiness {
+                readiness.drain_failed();
+            }
             tracing::error!(execution = %self.id, "delivery process drain unconfirmed");
             return;
         }

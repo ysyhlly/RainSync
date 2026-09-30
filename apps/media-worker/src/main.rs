@@ -3,6 +3,7 @@ mod cache_outputs;
 mod cache_read;
 mod file_delivery;
 use media_core::child_process;
+mod http_identity;
 mod http_media;
 mod input_failure;
 mod output_decode;
@@ -13,6 +14,7 @@ mod playback_access;
 mod preview_input;
 mod previews;
 mod process;
+mod readiness;
 mod relay;
 mod source_version;
 mod transfer_state;
@@ -35,6 +37,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 struct App {
+    readiness: readiness::Runtime,
     db: PgPool,
     key: Arc<Aes256Gcm>,
     cache: PathBuf,
@@ -113,14 +116,19 @@ async fn delivery_response(
             observed.token()
         );
         let metadata = media_core::probe_with_policy(&source, resource["kind"] == "http").await;
-        if let Some(reason) = match observed.failure() {
-            Some(persistence::media_jobs::JobFailure::SourceChanged) => Some("source_changed"),
+        if let Some((status, reason)) = match observed.failure() {
+            Some(persistence::media_jobs::JobFailure::SourceChanged) => {
+                Some((StatusCode::CONFLICT, "source_changed"))
+            }
             Some(persistence::media_jobs::JobFailure::SourceVersionRequired) => {
-                Some("source_version_required")
+                Some((StatusCode::CONFLICT, "source_version_required"))
+            }
+            Some(persistence::media_jobs::JobFailure::SourceSeekUnsupported) => {
+                Some((StatusCode::UNPROCESSABLE_ENTITY, "source_seek_unsupported"))
             }
             _ => None,
         } {
-            return Err((StatusCode::CONFLICT, reason.into()));
+            return Err((status, reason.into()));
         }
         let metadata = metadata.map_err(failure)?;
         return Ok(axum::Json(metadata).into_response());
@@ -488,6 +496,7 @@ fn source_url_for_bind(mut bind: std::net::SocketAddr, id: Uuid, token: &str) ->
 }
 async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
     use std::time::Duration;
+    let _claim_loop = app.readiness.claim_loop_guard();
     let worker = Uuid::new_v4();
     loop {
         let mut reservation = None;
@@ -498,7 +507,10 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             let claim = tokio::select! {
                 biased;
                 _ = process::stopped(&mut stop) => return Ok(()),
-                claim = tokio::time::timeout(Duration::from_secs(3), persistence::media_jobs::claim(&app.db, worker)) => claim??,
+                claim = tokio::time::timeout(Duration::from_secs(3), persistence::media_jobs::claim(&app.db, worker)) => {
+                    match &claim { Ok(Ok(value)) => app.readiness.claim_succeeded(value.is_some()), _ => app.readiness.claim_failed() }
+                    claim??
+                },
             };
             let Some(claim) = claim else { return Ok(()) };
             reservation = Some((claim.id, claim.owner, claim.attempt));
@@ -526,7 +538,8 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                     media_core::capabilities::negotiated_hls_args(&input,dir.join("index.m3u8").to_str().unwrap(),spec["start_seconds"].as_f64().unwrap_or(0.0),mode,audio_index)
                 } else {media_core::hls_args(&input, dir.join("index.m3u8").to_str().unwrap(), spec["start_seconds"].as_f64().unwrap_or(0.0), spec["transcode"].as_bool().unwrap_or(true), audio_index)};
                 media_core::input_policy::constrain(&mut args, input.starts_with("http://"), spec["source_kind"] == "http");
-                let confirmed_until = process::finalization_deadline(Duration::from_secs(3), process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim))).await?
+                let confirmation = app.readiness.check_lease(process::finalization_deadline(Duration::from_secs(3), process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim)))).await;
+                let confirmed_until = confirmation?
                     .filter(|until| *until > tokio::time::Instant::now())
                     .ok_or_else(|| anyhow::anyhow!("lease_lost_before_spawn"))?;
                 Ok::<_, anyhow::Error>((args, confirmed_until))
@@ -550,7 +563,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 writer_stopped = false;
                 execution_stopped = false;
                 let result = process::supervise(&mut child, &mut stop, confirmed_until, || async {
-                    process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim)).await
+                    app.readiness.check_lease(process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim))).await
                 }, async {
                     tokio::select! {
                         error = source_version::monitor(&claim.spec) => error,
@@ -609,7 +622,11 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             }
             Ok(())
         }).await;
+        if reservation.is_some() {
+            app.readiness.receipt_pending(true);
+        }
         if output_decoder.stop().await.is_err() {
+            app.readiness.drain_failed();
             tracing::error!("first segment decoder could not be reaped");
             // Keep the gate alive and retry cleanup before accepting more work.
             while output_decoder.stop().await.is_err() {
@@ -617,6 +634,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             }
         }
         if execution_scope.shutdown().await.is_err() {
+            app.readiness.drain_failed();
             writer_stopped = false;
             tracing::error!("media execution resource drain unconfirmed");
         }
@@ -646,6 +664,9 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             )
             .await;
         }
+        if writer_stopped {
+            app.readiness.receipt_pending(false);
+        }
         if *stop.borrow() {
             break;
         }
@@ -666,7 +687,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let db = persistence::connect(&std::env::var("DATABASE_URL")?).await?;
     let key = STANDARD.decode(std::env::var("SOURCE_ENCRYPTION_KEY")?)?;
+    let runtime_readiness = readiness::Runtime::default();
     let app = App {
+        readiness: runtime_readiness.clone(),
         db,
         key: Arc::new(
             Aes256Gcm::new_from_slice(&key)
@@ -683,12 +706,14 @@ async fn main() -> anyhow::Result<()> {
         output_checks: Default::default(),
         input_failures: Default::default(),
         preview_inputs: Default::default(),
-        deliveries: Default::default(),
+        deliveries: playback_access::Registry::with_readiness(runtime_readiness.clone()),
         public_url: std::env::var("PUBLIC_ORIGIN").unwrap_or("http://localhost:8088".into()),
     };
     tokio::fs::create_dir_all(&app.cache).await?;
     let (stop, mut server_stop) = tokio::sync::watch::channel(false);
     let job_app = app.clone();
+    let readiness_db = app.db.clone();
+    let readiness_cache = app.cache.clone();
     let deliveries = app.deliveries.clone();
     let router = Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -698,18 +723,36 @@ async fn main() -> anyhow::Result<()> {
             "/preview-input/{id}/{key}",
             get(preview_input::read).head(preview_input::read),
         )
-        .with_state(app)
-        .layer(axum::middleware::from_fn(http_api::errors));
+        .layer(axum::middleware::from_fn(http_api::errors))
+        .route(
+            "/ready",
+            get(|State(app): State<App>| async move { app.readiness.response() }),
+        )
+        .with_state(app);
     let listener = tokio::net::TcpListener::bind(
         std::env::var("WORKER_BIND").unwrap_or("0.0.0.0:8081".into()),
     )
     .await?;
-    let cleaner = tokio::spawn(cache_outputs::run(job_app.clone(), stop.subscribe()));
-    let preview_queue = tokio::spawn(previews::run(
-        job_app.clone(),
-        persistence::media_previews::Settings::configured()?,
-        stop.subscribe(),
-    ));
+    let preview_settings = persistence::media_previews::Settings::configured()?;
+    let readiness_monitor =
+        readiness::start(runtime_readiness.clone(), readiness_db, readiness_cache);
+    runtime_readiness.accepting(true);
+    let cleaner_app = job_app.clone();
+    let cleaner_readiness = runtime_readiness.clone();
+    let cleaner_stop = stop.subscribe();
+    let cleaner = tokio::spawn(async move {
+        let _lifetime =
+            cleaner_readiness.background_task_guard(readiness::BackgroundTask::CacheCleaner);
+        cache_outputs::run(cleaner_app, cleaner_stop).await
+    });
+    let preview_app = job_app.clone();
+    let preview_readiness = runtime_readiness.clone();
+    let preview_stop = stop.subscribe();
+    let preview_queue = tokio::spawn(async move {
+        let _lifetime =
+            preview_readiness.background_task_guard(readiness::BackgroundTask::PreviewQueue);
+        previews::run(preview_app, preview_settings, preview_stop).await
+    });
     let queue = tokio::spawn(jobs(job_app, stop.subscribe()));
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { process::stopped(&mut server_stop).await })
@@ -721,6 +764,8 @@ async fn main() -> anyhow::Result<()> {
     };
     // Fence even handlers already accepted by Axum, then cancel paused sources
     // independently of the HTTP drain and retain their receipt owners.
+    runtime_readiness.accepting(false);
+    readiness_monitor.stop();
     deliveries.close();
     let _ = stop.send(true);
     let grace = signal_result
@@ -742,9 +787,11 @@ async fn main() -> anyhow::Result<()> {
     // HTTP draining may stop before a cancelled probe/subtitle owner finishes.
     // Close admission and reap every registered owner before returning from main,
     // even when the queue or cleanup task failed.
+    let readiness_result = readiness_monitor.shutdown().await;
     let process_result = child_process::shutdown().await;
     let cleaner_result = cleaner.await;
     let preview_result = preview_queue.await;
+    readiness_result?;
     process_result?;
     queue_result?;
     cleaner_result?;

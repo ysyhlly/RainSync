@@ -12,6 +12,7 @@ pub enum JobFailure {
     UpstreamTransient,
     SourceChanged,
     SourceVersionRequired,
+    SourceSeekUnsupported,
 }
 impl JobFailure {
     pub fn reason(self) -> &'static str {
@@ -23,6 +24,7 @@ impl JobFailure {
             Self::UpstreamTransient => "upstream_transport_failed",
             Self::SourceChanged => "source_changed",
             Self::SourceVersionRequired => "source_version_required",
+            Self::SourceSeekUnsupported => "source_seek_unsupported",
         }
     }
 }
@@ -41,6 +43,7 @@ pub fn terminal_error(reason: Option<&str>) -> (u16, &'static str) {
         Some("cache_read_only") => (503, "cache_read_only"),
         Some("cache_permission_denied") => (503, "cache_permission_denied"),
         Some("source_version_required") => (409, "source_version_required"),
+        Some("source_seek_unsupported") => (422, "source_seek_unsupported"),
         Some("upstream_transport_retry_exhausted" | "media_job_retry_exhausted") => {
             (502, "media_job_retry_exhausted")
         }

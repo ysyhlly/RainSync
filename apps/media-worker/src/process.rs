@@ -141,6 +141,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stalled_active_renewal_marks_readiness_failed_before_lease_expiry() {
+        let mut child = child();
+        let (sender, mut stop) = watch::channel(false);
+        let readiness = crate::readiness::Runtime::default();
+        readiness.claim_succeeded(true);
+        let until = lease();
+        readiness.observe_lease(&Ok::<_, ()>(Some(until)));
+        let inspected = readiness.clone();
+        let observer = async move {
+            tokio::time::timeout(Duration::from_secs(9), async {
+                loop {
+                    if inspected.snapshot().checks["task_ownership"]
+                        == crate::readiness::Outcome::Failed
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(Instant::now() < until);
+            sender.send(true).unwrap();
+        };
+        let execution = supervise(
+            &mut child,
+            &mut stop,
+            until,
+            || readiness.check_lease(std::future::pending::<anyhow::Result<Option<Instant>>>()),
+            std::future::pending::<anyhow::Error>(),
+        );
+        let (_, result) = tokio::join!(observer, execution);
+        assert!(result.is_err());
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn confirmation_deducts_the_complete_request_round_trip() {
         let began = Instant::now();
         let until = confirmed_deadline(async {

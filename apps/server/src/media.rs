@@ -502,7 +502,11 @@ async fn prepare_playback(
                 .send()
                 .await
                 .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_probe_failed"))?;
-            if response.status() == StatusCode::CONFLICT {
+            if matches!(
+                response.status(),
+                StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY
+            ) {
+                let status = response.status();
                 let reason = match response.json::<protocol::ErrorResponse>().await {
                     Ok(response) if response.error.code == protocol::ErrorCode::SourceChanged => {
                         "source_changed"
@@ -512,9 +516,16 @@ async fn prepare_playback(
                     {
                         "source_version_required"
                     }
+                    Ok(response)
+                        if status == StatusCode::UNPROCESSABLE_ENTITY
+                            && response.error.code
+                                == protocol::ErrorCode::SourceSeekUnsupported =>
+                    {
+                        "source_seek_unsupported"
+                    }
                     _ => return Err(err(StatusCode::BAD_GATEWAY, "source_probe_failed")),
                 };
-                return Err(err(StatusCode::CONFLICT, reason));
+                return Err(err(status, reason));
             }
             if !response.status().is_success() {
                 return Err(err(StatusCode::BAD_GATEWAY, "source_probe_failed"));
@@ -710,6 +721,9 @@ async fn prepare_playback(
         account_policy_generation,
     )
     .await?;
+    if kind == "http" {
+        http_representation::guard(&mut tx, id).await?;
+    }
     let current: Value =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
             .bind(body.room_id)

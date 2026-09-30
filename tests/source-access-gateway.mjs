@@ -387,10 +387,8 @@ try {
         originErrors.push("source authorization missing or changed");
       res.setHeader("Content-Type", "application/octet-stream");
       if (path === "/hidden.mp4")
-        res.end(
-          "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100000\nnested/variant\n",
-        );
-      else if (path === "/nested/variant") res.end(playlist);
+        sendBytes(req, res, Buffer.from("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100000\nnested/variant\n"));
+      else if (path === "/nested/variant") sendBytes(req, res, playlist);
       else if (path.startsWith("/nested/") && media.has(path.slice(8)))
         sendBytes(req, res, media.get(path.slice(8)));
       else if (path === "/range.mp4") {
@@ -402,9 +400,9 @@ try {
       } else if (path === "/redirect.mp4") {
         res.writeHead(302, { Location: `${foreignOrigin}/video.mp4` });
         res.end();
-      } else if (path === "/foreign.mp4") res.end(badHls);
+      } else if (path === "/foreign.mp4") sendBytes(req, res, Buffer.from(badHls));
       else if (path === "/foreign-master.mp4")
-        res.end("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100000\nforeign.mp4\n");
+        sendBytes(req, res, Buffer.from("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100000\nforeign.mp4\n"));
       else if (path === "/dash.mp4") res.end(`<?xml version="1.0"?>${dash}`);
       else if (path === "/latin1-dash.mp4")
         res.end(
@@ -417,13 +415,13 @@ try {
         res.end(` ${" ".repeat(1400)}${dash}`);
       else if (path.startsWith("/deep/")) {
         const n = Number(path.slice(6));
-        res.end(`#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100000\n${n + 1}\n`);
+        sendBytes(req, res, Buffer.from(`#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100000\n${n + 1}\n`));
       } else if (/^\/key-(16|15|17|alias)\.mp4$/.test(path)) {
         const size = path.slice(5, -4),
           key = size === "alias" ? "16" : size;
-        res.end(
+        sendBytes(req, res, Buffer.from(
           `#EXTM3U\n#EXT-X-TARGETDURATION:3\n#EXT-X-KEY:METHOD=AES-128,URI="key/${key}"\n#EXTINF:3,\n${size === "alias" ? `key/${key}` : "nested/segment0.m4s"}\n#EXT-X-ENDLIST\n`,
-        );
+        ));
       } else if (/^\/key\/(15|16|17)$/.test(path)) {
         // All bodies begin like HLS; only a typed, exactly 16-byte key may bypass sniffing.
         const body = Buffer.concat([
@@ -603,7 +601,7 @@ try {
       "hidden HLS, typed extensionless child, fMP4 initialization and real decode",
       async () => {
         const response = await get(old.url);
-        assert.equal(response.status, 200);
+        assert.equal(response.status, 200, response.status === 200 ? undefined : await response.clone().text());
         assert.match(response.headers.get("content-type"), /mpegurl/);
         const master = await response.text();
         assert.equal(master.includes(upstreamOrigin), false);
@@ -704,7 +702,7 @@ try {
         assert.equal(requests.at(-1).method, "HEAD");
         assert.equal(requests.at(-1).range, null);
         response = await get(ranged.url, {
-          headers: { Range: "bytes=0-31", "If-Range": '"fixture-version-1"' },
+          headers: { Range: "bytes=0-31", "If-Range": '"different-version"' },
         });
         assert.equal(response.status, 200);
         assert.equal(response.headers.get("content-range"), null);

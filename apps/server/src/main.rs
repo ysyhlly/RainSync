@@ -5,6 +5,7 @@ mod avatar_image;
 mod avatars;
 mod database_checks;
 mod health;
+mod http_representation;
 mod limits;
 mod media;
 mod media_previews;
@@ -502,6 +503,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
                 "DELETE FROM room_events WHERE created_at<now()-interval '24 hours'",
                 "DELETE FROM chat_messages WHERE created_at<now()-interval '7 days'",
                 "DELETE FROM sessions WHERE expires_at<now()",
+                "DELETE FROM playback_http_representations WHERE (session_id,target_sha256) IN (SELECT h.session_id,h.target_sha256 FROM playback_http_representations h JOIN playback_sessions p ON p.id=h.session_id WHERE p.stopped AND p.expires_at<clock_timestamp()-interval '48 hours' AND NOT EXISTS(SELECT 1 FROM playback_preparations prep WHERE prep.session_id=p.id AND prep.drained_at IS NULL) LIMIT 1000)",
                 "DELETE FROM login_attempts WHERE window_started<=now()-interval '60 seconds'",
                 "DELETE FROM account_rate_limits WHERE expires_at<=clock_timestamp()",
                 "DELETE FROM agent_transfers WHERE expires_at<now()",
