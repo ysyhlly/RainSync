@@ -183,6 +183,7 @@ export class PlaybackRequests {
   private keys: Set<string>;
   private controller?: AbortController;
   private serial = 0;
+  private finalization: Promise<void> = Promise.resolve();
   constructor(
     private send: (
       body: PlaybackRequest,
@@ -215,12 +216,22 @@ export class PlaybackRequests {
     }
   }
   private async cleanup() {
+    await this.finalization;
     for (const key of [...this.keys]) await this.revoke(key);
   }
-  async stop() {
+  async stop(beforeCleanup?: () => Promise<void>) {
     this.serial++;
     this.controller?.abort();
-    await this.cleanup();
+    // Snapshot before the barrier: a late DELETE must not revoke a successor.
+    const keys = [...this.keys];
+    const finalization = beforeCleanup
+      ? this.finalization.then(beforeCleanup)
+      : this.finalization;
+    // Successor preparations and repeated stops must also wait for the final
+    // grant sample, before any key cancellation can close the same grant.
+    this.finalization = finalization.catch(() => {});
+    await finalization;
+    for (const key of keys) await this.revoke(key);
   }
   async prepare(
     input: PlaybackRequest,

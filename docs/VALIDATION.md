@@ -1,5 +1,35 @@
 # 本轮验证记录
 
+## 2026-09-30：版本 1 实际播放观测与 Worker 健康检查
+
+本批新增实际 video 观测、数据库固定起点/时长及序号、Start/Progress 领取序号、Stop 最终样本和网页请求取消顺序；未协商的旧客户端保持兼容。具体设计和仍待真实上游/撤权验证的范围见 [上游会话核对](UPSTREAM_SESSION_AUDIT.md)。此前候选 D 和 W03 第一批证据均保持原身份，本批没有新两小时或七十二小时结果。
+
+网页最终播放器回归 `.runtime/w03-viewer-frontend/frontend-final-verification.json`（SHA `97a0420f2a78b0b5f51baa27944b9d32cd92f018ef07452b288c206e97fabf5a`）记录构建、七十七单测和三十八浏览器场景全通过，106 个输入前后稳定；使用实际 MP4 解码和正确 Range 206，受控 REST/WS。桌面和移动 viewport 不代表移动实机、原生 Server 或真实 Jellyfin/Emby。新增错误允许列表只改变前端绑定中的生成 TS/Error Schema 两文件，增量构建与七十七单测再次通过，`.runtime/w03-viewer-frontend/public-errors-retry/report.json` 的 106 个输入前后稳定；没有改播放器或挪用旧绑定声明新浏览器重跑。初次增量 wrapper 因 PowerShell 将 Vite stderr 的分块提示当成异常提前退出，原日志和 `public-errors/wrapper-failure.json` 保留，修正 wrapper 后才得到实际退出码。
+
+Worker 最后一次故障入口 `.runtime/worker-health/rainsync-worker-health-c88da2a7/report.json` 通过六场景：真实行锁跨越三秒查询期限后仍同 attempt 恢复；发布未知不提前暴露分片、后续完整证明事务恢复；确认会话撤销停止；阻塞查询期间主动停止及时回收；连续未知不超过最后已确认数据库租期；旧 owner/attempt 拒绝。普通二十九项测试通过，两项 PostgreSQL 入口平时 ignored 的场景由该真实入口执行。Clippy/fmt 通过。确认租期扣除整个 SQL 往返，过期后的迟到成功不能复活；这些结果证明受控阻塞下的修复，不确定原 D 阻塞的具体根因。owned PG/匿名卷及实际子进程清理已核对。
+
+首次版本 1 原生集成 `.runtime/w03-viewer-backend/native-integration/50223841-2af0-4e19-9720-ed208412e4ef/report.json` 全通过（187.588 秒），旧绑定 SHA `334d6fce63aa0257b67a2aa89229b20192ec118903770b424a3ae66336d4b722`、121 源及三 exe/十六示例前后稳定，38 个 owned 后代及 PG/匿名卷清理。首次严格 API `.runtime/upstream-observations/5b99319b-c813-464a-a462-93c24f30fefc/report.json` 前三组通过，第 4 组相同序号不同正文已正确返回 409，但新增原因缺少公开枚举而回退 `REVISION_CONFLICT`，按精确公开码断言失败；原证据保留。另一次绑定目录 preflight 失败未启动 PG 或 Server，不能计作业务测试。
+
+补齐九个公开码、安全固定说明及精确映射单测后，受影响十九项 Rust、全工作区 Clippy、fmt、生成协议 `--check` 和 workspace bins/examples `--locked -j2` 构建通过。最终绑定 `.runtime/w03-viewer-backend/public-errors/backend-binding.json` SHA `7a7f0c23bde32b428f0bf70856726c4d5c6a73cb69d716c56c9eb617ba7f9497`；121 源摘要 `f460d3e58e70a0c3f0df477b9375a62ee82f19c9245d31ed7999bd8daea4360e`，Server `e070f491ed643ff5c2634a4e28fdb45fba32a87b8126584b7efc66ed388ad851`，Worker `b663f7d27851f721cab5ae7f26198fb8813a8fb69056fb1fc0a10672edb615af`，Agent `5cd04b9df03303a3b570e91d44871d57f3a23d352a19564a0c03fdb1b5cbed8e`。正式构建 `04:49:59.212Z–04:50:37.451Z`；旧绑定、副本和报告未覆盖。
+
+最终原生集成 `.runtime/w03-viewer-backend/native-integration/fdc529c8-532e-4728-ac9d-b60e429cb173/report.json` 通过（173.847 秒），SHA `55ecd224d9dcea725b8cf4e6747c256a013a34724b6057b97a6394a763880950`；121 源、三实际 exe 副本、十六预构建示例和十二入口输入前后稳定，35 个观察的 owned 后代、PG 及匿名卷全部查空。完整媒体、缓存、控制 epoch、NAS、10001 条索引和备份恢复门槛执行；100 连接 267ms 为共享宿主短测。根入口十九场景在同一新绑定也全通过（`04:59:41.520Z–05:01:39.043Z`），`.runtime/upstream-reservations/841a10f8-70ad-402f-8506-68844c4f1770/report.json` SHA `54b36f7a41989bb2d3d3a9260dbe3e7767e70dc54b9902207989045349d405e0`；旧客户端、实际协商超时、IO 迟到、重启未知 SID 及 Stop 预算均保留，隔离清理通过。
+
+公开码修后 API `.runtime/upstream-observations/214edeed-96d9-470b-af88-b3dcd4203b66/report.json` 前九组通过，第十组夹具错误要求永久 `NO_MEDIA_SOURCE` 的同 key 重试变成成功，实际按既有不可重试契约返回相同 502。只加强夹具：保留该 502/no 新协商与已知 SID 补偿检查，另用真实 PlaybackInfo 503 验证临时错误的同 key 新 UUID/seq 0 恢复、旧未知 SID 不假闭合和停止墓碑。原失败保留，生产和新绑定不变。
+
+修后唯一完整 API 入口最终二十四组全通过，`.runtime/upstream-observations/7d942359-adb9-4baa-89b1-3b0365f79416/report.json` SHA `218fac7f8a136efabbaf04466b1dbb0b26d352241195cc9f3db69bdb7228dce9`，实际 `05:00:47.306Z–05:03:08.905Z`。两种提供者分别覆盖版本拒绝、未播放不 Start、独立暂停/seek、相同/旧序号、位置/速率范围、最终 Stop、外部用户隔离、代次与成员撤销、迟到 IO 不确定、失败准备及重启后序号。所有精确公开码、数据库状态、受控上游实际 HTTP 正文/响应和旧失败证据保留；入口、导入、新绑定、121 源和实际副本前后稳定，owned PG/匿名卷与控制/上游资源清理通过。这是真实认证 API/数据库/原生 Server 的受控上游验证，未宣称真实产品解码。
+
+最终升级入口 `.runtime/upstream-reservations-upgrade/00213c90-5b94-4d97-b8e3-d5592a46527f/report.json` 五十项检查通过（162.323 秒，`05:10:03.013Z–05:12:45.336Z`），SHA `6896afdc6a9dfbee1613da6a075f87df2a551a46aad38ff0ac9732af86e61f6a`。真实旧 Server `a4efce0d…` 创建四十六个授权后迁移 1–24→26；同 key 重放保留原 UUID/加密 scope、不重新协商、不增加观测字段，0026 表开始/结束均为零，不回填为真实播放。四十二个活跃旧授权仍公平收到 Progress，高 UUID 停止不受四十四个低 UUID 活跃授权阻挡；已知 Jellyfin、未知 SID、旧 Emby 不可恢复设备和实际 Stop 失败均保持原边界、最多五次与稳定窗内无第六次。新绑定和旧/新实际 exe、入口/导入及 121 源前后核对稳定，137 个收尾/身份核对步骤全通过、PG/匿名卷释放。所有本批回归使用隔离随机命名空间；与用户服务共享宿主，不能当作独占 SLO。
+
+`tests/fixtures/upstream-real.mjs` 与 `tests/upstream-real-playback.mjs` 提供固定隔离产品的后续真实播放入口，新增九十秒/源帧时码/受限非管理员/撤权及完整四模式矩阵目前仅做语法、格式和独立静态安全审查，未启动实际产品服务。最终摘要分别为 `f478355633dcff63ffa859fbefbc60565e07b50b5214b43dba4158012c561458` / `57c65df92ba298943d8e90915f4728550e4b300e730e4274d8757ac33628dd66`。先前二十秒管理员 setup 的旧摘要证据另存，不作为这些新方法或真实播放兼容通过证明。执行完整矩阵仍须新绑定、真实版本/镜像/源码、时间轴源帧和所有 owned 资源前后核对。实跑前还需补强两处诊断失败路径：原生日志排空超时可能跳过后续 PG 回收，上游日志写盘失败可能跳过该 owned 容器删除；均会失败而非假通过，也不能宣称所有异常清理已经验证。
+
+## 2026-09-30：候选 D 持续控制终态与联合证据
+
+原控制进程正常 exit 0，`rainsync-load-f01d14c6/report.json` 终态 `sustained-passed`，SHA `4002e01d5cb62037050a2fdd9cf1e44f4cb63df56b660abda2905d5231830759`。十房×十人实际 `01:04:30.742Z` 至 `02:04:30.7598975Z`（3600.0179 秒）、3600 条持久命令，ACK p95 12.233ms；五十房×两人实际 `02:05:11.079Z` 至 `03:05:11.121777Z`（3600.0428 秒）、18000 条持久命令，ACK p95 33.1ms。每种拓扑一百个独立身份，完整状态/重连/每条持久命令检查通过；属于控制面容量，不是视频容量。
+
+原只读观察器 15448 自主 exit 0，于 `03:06:03.578Z` 确认两入口终态及 owned 容器/网络全部释放，共 491 份采样，没有重启。独立冻结汇总 `.runtime/validation-joint/w07-w08-20260930-d/final-20260930T031456860Z/assessment.json` SHA `9b63f4fb85296814f41b40e1ee5d030c7d24b24aa07428718f515260573361e7`，十二份原输入的 pre/post/copy 哈希全部匹配，原报告/采样器未修改。
+
+失败 NAS 报告缺少完整播放区间字段，不能把联合原测量区间为空解释为没有重叠。另以起播 `01:07:00.126Z` 和最后实际观测 `02:50:12.3287798Z` 求得控制重叠 6151.8837 秒；若严格截止于真实源取消 `02:49:56.589Z`，重叠为 6136.1439 秒。二者都不是完整两小时。六次 Docker stats、两次 Docker state 和不可直接识别的控制当前阶段保持 unknown；开发 sidecar 的十二条缺 UTC 记录保留为 unattributed，编译、隔离原生 PG 测试及其它共享负载如实说明。这轮证明两项控制六十分钟门槛，NAS/完整联合时长门槛仍失败，不能作为独占 SLO 或拼接后续候选时间。
+
 ## 2026-09-30：候选 D 两小时 NAS 失败
 
 原 `rainsync-soak-a38b55a9` 于 `02:50:16.976Z` 终态失败，未重启或拼接时长。实际观察 6192.203 秒（103.2 分钟）、呈现 61917 帧，仍是原 session/attempt 1，十次网页续租成功，无计数重置或控制断连。`02:49:56.589Z` 源因 consumer_cancelled 结束，早于测试 DELETE；失败采样源文件已关闭、FFmpeg 已退出，严格持续传输门槛失败。报告 `D/source/.runtime/nas-soak/rainsync-soak-a38b55a9/report.json` SHA `1435cd5759483fea1ae67700fe29ea892b9176a40857f80ca0550b71780101b1`，日志、截图和原始采样保留。

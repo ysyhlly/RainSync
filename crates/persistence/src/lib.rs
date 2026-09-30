@@ -8,6 +8,7 @@ pub mod cache_outputs;
 pub mod media_jobs;
 pub mod media_outputs;
 pub mod media_queue;
+pub mod playback_observations;
 pub mod upstream_reservations;
 
 pub async fn connect(url: &str) -> Result<PgPool> {

@@ -1,4 +1,4 @@
-// Real pre-W03 native Server -> migration 25, with isolated PostgreSQL and
+// Real pre-W03 native Server -> migration 26, with isolated PostgreSQL and
 // controlled HTTP contracts. This does not claim real Jellyfin/Emby decoding.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
@@ -27,17 +27,10 @@ const oldSha =
   "a4efce0dc7845a4cf369777dba22f37534277db9eebda98789dcde880614e0e9";
 const bindingPath = resolve(
   process.env.W03_BACKEND_BINDING ??
-    ".runtime/w03-backend/backend-binding.json",
-);
-const bindingBoundary = relative(resolve(".runtime/w03-backend"), bindingPath);
-assert.ok(
-  bindingBoundary &&
-    !bindingBoundary.startsWith("..") &&
-    !isAbsolute(bindingBoundary),
-  "backend binding stays inside the explicit W03 evidence directory",
+    ".runtime/w03-viewer-backend/backend-binding.json",
 );
 const oldCopy = resolve(runRoot, "pre-w03-server.exe");
-const newCopy = resolve(runRoot, "migration25-server.exe");
+const newCopy = resolve(runRoot, "migration26-server.exe");
 const entry = resolve("tests/upstream-reservations-upgrade.mjs");
 const fixtureEntry = resolve("tests/fixtures/server.mjs");
 const digest = async (path) =>
@@ -48,7 +41,7 @@ const report = {
   started_at: new Date().toISOString(),
   result: "running",
   scope:
-    "actual pre-W03 Windows Server, real migrations 1-24 -> 25 and real API/DB/WS; isolated controlled upstream HTTP contracts, no real Jellyfin/Emby or decode claim",
+    "actual pre-W03 Windows Server, real migrations 1-24 -> 26 and real API/DB/WS; isolated controlled upstream HTTP contracts, no real Jellyfin/Emby or decode claim",
   old_binary_identity: {
     source: oldSource,
     tested_copy: oldCopy,
@@ -375,6 +368,16 @@ try {
   );
   report.entry_sha256 = await digest(entry);
   report.fixture_entry_sha256 = await digest(fixtureEntry);
+  const bindingBoundary = relative(
+    resolve(".runtime/w03-viewer-backend"),
+    bindingPath,
+  );
+  assert.ok(
+    bindingBoundary &&
+      !bindingBoundary.startsWith("..") &&
+      !isAbsolute(bindingBoundary),
+    "backend binding stays inside the explicit current viewer-batch evidence directory",
+  );
   assert.equal(
     await digest(oldSource),
     oldSha,
@@ -382,6 +385,12 @@ try {
   );
   bindingSha = await digest(bindingPath);
   binding = JSON.parse(await readFile(bindingPath, "utf8"));
+  assert.ok(
+    binding.source.some((item) =>
+      item.path.replaceAll("\\", "/").startsWith("migrations/0026_"),
+    ),
+    "new native executable binds observation migration 26",
+  );
   const binary = binding.binaries.find(
     (item) => item.name === "rainsync-server",
   );
@@ -524,13 +533,18 @@ try {
             token: group.invite.token,
           });
         contract.queue.push(fault);
-        const plan = await client.request("/playback-sessions", "POST", {
+        const request = {
           room_id: group.room.id,
           media_generation: group.controller.state.media_generation,
           idempotency_key: randomUUID(),
           mode: "auto",
           position_ms: 1200,
-        });
+        };
+        const plan = await client.request(
+          "/playback-sessions",
+          "POST",
+          request,
+        );
         const row = record(plan.session_id),
           resource = decryptResource(fixture, row.resource);
         assert.equal(row.stopped, false);
@@ -562,7 +576,13 @@ try {
               ),
             "old native Start confirmed",
           );
-        grants.push({ fault, client, plan, encrypted: row.resource.encrypted });
+        grants.push({
+          fault,
+          client,
+          request,
+          plan,
+          encrypted: row.resource.encrypted,
+        });
         report.cases.push({
           name: `old API creates ${fault.name}`,
           result: "passed",
@@ -589,15 +609,20 @@ try {
       report.migrations_after = versions();
       assert.deepEqual(
         report.migrations_after,
-        Array.from({ length: 25 }, (_, i) => i + 1),
+        Array.from({ length: 26 }, (_, i) => i + 1),
       );
       assert.equal(
         fixture.sql("SELECT count(*) FROM upstream_reservations"),
         "0",
         "migration 25 keeps legacy resources out of the new ledger",
       );
+      assert.equal(
+        fixture.sql("SELECT count(*) FROM playback_observations"),
+        "0",
+        "migration 26 does not backfill observations or inferred play state for legacy grants",
+      );
       await scenario(
-        "all 46 legacy grants survive the actual 1-24 -> 25 upgrade without negotiation",
+        "all 46 legacy grants survive the actual 1-24 -> 26 upgrade without negotiation or hash changes",
         async (result) => {
           for (const grant of grants) {
             const ready = await grant.client.request(
@@ -605,6 +630,16 @@ try {
             );
             assert.equal(ready.session_id, grant.plan.session_id);
             assert.equal(ready.status, "ready");
+            assert.equal(ready.observation_version, undefined);
+            assert.equal(ready.observation_seq, undefined);
+            const replay = await grant.client.request(
+              "/playback-sessions",
+              "POST",
+              grant.request,
+            );
+            assert.equal(replay.session_id, grant.plan.session_id);
+            assert.equal(replay.observation_version, undefined);
+            assert.equal(replay.observation_seq, undefined);
             const oldExpiry = Date.parse(
               record(grant.plan.session_id).expires_at,
             );
@@ -627,7 +662,13 @@ try {
             );
           }
           assert.equal(contract.negotiations.length, beforeNegotiations);
+          assert.equal(
+            fixture.sql("SELECT count(*) FROM playback_observations"),
+            "0",
+          );
           result.sessions = grants.map((g) => g.plan.session_id);
+          result.same_key_replay_preserved = grants.length;
+          result.legacy_observation_rows = 0;
         },
       );
       const get = (name) => grants.find((g) => g.fault.name === name);
@@ -918,6 +959,10 @@ try {
         contract.failures.length,
         0,
         "controlled HTTP handler assertions all pass",
+      );
+      assert.equal(
+        fixture.sql("SELECT count(*) FROM playback_observations"),
+        "0",
       );
       report.result = "passed";
     },

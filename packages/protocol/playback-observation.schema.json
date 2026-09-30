@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaybackObservation",
+  "description": "An immutable sample of the actual media element, relative to its plan.\n`has_played` is cumulative for that grant, even when the latest sample pauses.",
+  "type": "object",
+  "properties": {
+    "buffering": {
+      "type": "boolean"
+    },
+    "event": {
+      "$ref": "#/$defs/PlaybackObservationEvent"
+    },
+    "has_played": {
+      "type": "boolean"
+    },
+    "media_generation": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "media_time_ms": {
+      "type": "number",
+      "format": "double"
+    },
+    "paused": {
+      "type": "boolean"
+    },
+    "playback_rate": {
+      "type": "number",
+      "format": "double"
+    },
+    "seeking": {
+      "type": "boolean"
+    },
+    "seq": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "media_generation",
+    "seq",
+    "event",
+    "media_time_ms",
+    "paused",
+    "seeking",
+    "buffering",
+    "playback_rate",
+    "has_played"
+  ],
+  "$defs": {
+    "PlaybackObservationEvent": {
+      "type": "string",
+      "enum": [
+        "playing",
+        "pause",
+        "progress",
+        "seeking",
+        "seeked",
+        "buffering",
+        "ended"
+      ]
+    }
+  }
+}

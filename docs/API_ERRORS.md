@@ -2,6 +2,8 @@
 
 Server 的 REST、媒体 Worker 的 HTTP 和房间 WebSocket 共用 `protocol::ApiError`。定义与枚举见 `crates/protocol/src/errors.rs`；生成类型为 `packages/protocol/index.ts`，JSON Schema 为 `packages/protocol/error-response.schema.json`。新增公开错误码必须进入该枚举并重新导出。
 
+版本 1 播放观测的版本、位置、速率、序号、相同序号载荷冲突和过期序号均使用独立公开错误码，固定说明且 `retryable: false`。请求失败时不能把当前样本改号盲重试；相同样本的网络重试沿用原序号。属于当前观看者的停止请求即使最终样本非法，也会先完成本地停止再返回样本错误。具体观测与兼容边界见 [上游会话核对](UPSTREAM_SESSION_AUDIT.md)。
+
 ```json
 {
   "error": {

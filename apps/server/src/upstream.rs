@@ -94,6 +94,7 @@ pub struct Prepare<'a> {
     pub config: &'a providers::SourceConfig,
     pub item: &'a str,
     pub options: providers::PlaybackOptions,
+    pub observation_version: Option<u32>,
 }
 
 fn identifier(value: &Value) -> Option<&str> {
@@ -116,12 +117,12 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
     let permits = app.upstream.negotiate_permit(&origin_key).await?;
     let scope = app.encrypt(&json!({"config":p.config,"item":p.item}))?;
     let mut tx = app.db.begin().await?;
-    playback_requests::guard(app, &mut tx, p.reservation).await?;
     let state: Value =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
             .bind(p.room)
             .fetch_one(&mut *tx)
             .await?;
+    playback_requests::guard(app, &mut tx, p.reservation).await?;
     if state["media_generation"].as_u64() != Some(u64::from(p.generation)) {
         return Err(err(StatusCode::CONFLICT, "stale_media"));
     }
@@ -140,6 +141,7 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
             device_id: &device_id,
             origin_key: &origin_key,
             scope_encrypted: &scope,
+            observation_version: p.observation_version,
         },
     )
     .await?;
@@ -209,6 +211,39 @@ fn request_headers(
 }
 
 fn report_body(app: &App, claim: &ledger::Claim, item: &str) -> anyhow::Result<Value> {
+    let unobserved = json!({"position_ms":0.0,"paused":true,"seeking":false,"buffering":false,"playback_rate":1.0});
+    if let Some(sample) = claim
+        .observation
+        .as_ref()
+        .or_else(|| (claim.observation_version == Some(1)).then_some(&unobserved))
+    {
+        let position = sample["position_ms"]
+            .as_f64()
+            .filter(|position| {
+                position.is_finite()
+                    && (0.0..=persistence::playback_observations::MAX_POSITION_MS)
+                        .contains(position)
+            })
+            .ok_or_else(|| anyhow::anyhow!("upstream_observation_invalid"))?;
+        let paused = sample["paused"].as_bool().unwrap_or(true)
+            || sample["seeking"].as_bool().unwrap_or(false)
+            || sample["buffering"].as_bool().unwrap_or(false);
+        let rate = sample["playback_rate"]
+            .as_f64()
+            .filter(|rate| {
+                rate.is_finite()
+                    && (persistence::playback_observations::MIN_ACTUAL_RATE
+                        ..=persistence::playback_observations::MAX_ACTUAL_RATE)
+                        .contains(rate)
+            })
+            .ok_or_else(|| anyhow::anyhow!("upstream_observation_invalid"))?;
+        return Ok(json!({
+            "ItemId":item,"PlaySessionId":claim.sid,"MediaSourceId":claim.media_source,
+            "LiveStreamId":claim.live_stream,"PositionTicks":(position*10000.0).round() as u64,
+            "IsPaused":paused,"PlaybackRate":rate,"EventName":if paused {"Pause"} else {"TimeUpdate"},
+            "CanSeek":true,"PlayMethod":claim.play_method.as_deref().unwrap_or("DirectPlay")
+        }));
+    }
     let state = claim
         .state
         .clone()
@@ -256,9 +291,14 @@ async fn perform(app: &App, claim: ledger::Claim) -> anyhow::Result<()> {
     }
     let mut stopped = claim.stop_confirmed;
     let mut encoding_stopped = claim.encoding_stop_confirmed;
+    let budget = claim.network_budget();
+    if budget.is_zero() {
+        ledger::finish_stop(&app.db, &claim, stopped, encoding_stopped).await?;
+        return Ok(());
+    }
     // One attempt has a total three-second budget, including both Emby calls.
     // A successful Stopped POST alone does not confirm its encoder stopped.
-    let _ = tokio::time::timeout(Duration::from_secs(ledger::CLEANUP_SECONDS), async {
+    let _ = tokio::time::timeout(budget, async {
         if !stopped {
             let response = request_headers(providers::client().post(url).json(&body), &headers)
                 .send()
@@ -301,6 +341,16 @@ pub async fn report(app: &App, id: Uuid, event: &str) -> anyhow::Result<()> {
             .fetch_optional(&app.db)
             .await?;
     let Some(origin) = origin else {
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=$1)",
+        )
+        .bind(id)
+        .fetch_one(&app.db)
+        .await?
+        {
+            // A negotiated local/HTTP/NAS grant has no upstream reporter.
+            return Ok(());
+        }
         return legacy_report(app, id, event).await;
     };
     let Some(permits) = app.upstream.try_permit(&origin, false).await else {
@@ -361,7 +411,7 @@ async fn legacy_report(app: &App, id: Uuid, event: &str) -> anyhow::Result<()> {
     // renewed or stopped before this task runs; that does not spend an attempt.
     let claim_started = tokio::time::Instant::now();
     let token = Uuid::new_v4().to_string();
-    let claimed: Option<Value> = sqlx::query_scalar("UPDATE playback_sessions p SET stopped=stopped OR $3::text='stop',resource=resource||jsonb_build_object('upstream_io_claim',$2::text,'upstream_io_kind',$3::text,'upstream_io_lease_until',CASE WHEN $3::text='stop' THEN LEAST(clock_timestamp()+interval '10 seconds',COALESCE((resource->>'upstream_cleanup_deadline')::timestamptz,clock_timestamp()+interval '60 seconds')) ELSE clock_timestamp()+interval '10 seconds' END,'upstream_io_pending',true,'upstream_io_uncertain',COALESCE((resource->>'upstream_io_uncertain')::boolean,false) OR (COALESCE((resource->>'upstream_io_pending')::boolean,false) AND COALESCE(resource->>'upstream_io_kind','progress')<>'stop'))||CASE WHEN $3::text='stop' THEN jsonb_build_object('upstream_cleanup_attempts',COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)+1,'upstream_cleanup_deadline',COALESCE((resource->>'upstream_cleanup_deadline')::timestamptz,clock_timestamp()+interval '60 seconds'),'upstream_cleanup_after',clock_timestamp()+make_interval(secs=>LEAST(16,power(2,COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)+1)::integer))) ELSE jsonb_build_object('upstream_last_report_at',clock_timestamp()) END WHERE id=$1 AND NOT(resource ? 'upstream_closed') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND (NOT(resource ? 'upstream_io_claim') OR (resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp()) AND CASE WHEN $3::text='stop' THEN COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)<5 AND (NOT(resource ? 'upstream_cleanup_deadline') OR (resource->>'upstream_cleanup_deadline')::timestamptz>clock_timestamp()) AND (NOT(resource ? 'upstream_cleanup_after') OR (resource->>'upstream_cleanup_after')::timestamptz<=clock_timestamp()) AND (stopped OR expires_at<=clock_timestamp() OR EXISTS(SELECT 1 FROM room_snapshots s WHERE s.room_id=p.room_id AND (s.state->>'media_generation')::bigint<>p.generation)) ELSE NOT stopped AND expires_at>clock_timestamp() AND NOT COALESCE((resource->>'upstream_io_uncertain')::boolean,false) AND ($3::text='start' OR NOT(resource ? 'upstream_last_report_at') OR (resource->>'upstream_last_report_at')::timestamptz<=clock_timestamp()-interval '10 seconds') AND EXISTS(SELECT 1 FROM room_snapshots s WHERE s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation) END RETURNING jsonb_build_object('resource',resource,'cleanup_remaining_ms',CASE WHEN $3::text='stop' THEN EXTRACT(epoch FROM ((resource->>'upstream_cleanup_deadline')::timestamptz-clock_timestamp()))*1000 ELSE 3000 END)")
+    let claimed: Option<Value> = sqlx::query_scalar("UPDATE playback_sessions p SET stopped=stopped OR $3::text='stop',resource=resource||jsonb_build_object('upstream_io_claim',$2::text,'upstream_io_kind',$3::text,'upstream_io_lease_until',CASE WHEN $3::text='stop' THEN LEAST(clock_timestamp()+interval '10 seconds',COALESCE((resource->>'upstream_cleanup_deadline')::timestamptz,clock_timestamp()+interval '60 seconds')) ELSE clock_timestamp()+interval '10 seconds' END,'upstream_io_pending',true,'upstream_io_uncertain',COALESCE((resource->>'upstream_io_uncertain')::boolean,false) OR (COALESCE((resource->>'upstream_io_pending')::boolean,false) AND COALESCE(resource->>'upstream_io_kind','progress')<>'stop'))||CASE WHEN $3::text='stop' THEN jsonb_build_object('upstream_cleanup_attempts',COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)+1,'upstream_cleanup_deadline',COALESCE((resource->>'upstream_cleanup_deadline')::timestamptz,clock_timestamp()+interval '60 seconds'),'upstream_cleanup_after',clock_timestamp()+make_interval(secs=>LEAST(16,power(2,COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)+1)::integer))) ELSE jsonb_build_object('upstream_last_report_at',clock_timestamp()) END WHERE id=$1 AND NOT(resource ? 'upstream_closed') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id) AND (NOT(resource ? 'upstream_io_claim') OR (resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp()) AND CASE WHEN $3::text='stop' THEN COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)<5 AND (NOT(resource ? 'upstream_cleanup_deadline') OR (resource->>'upstream_cleanup_deadline')::timestamptz>clock_timestamp()) AND (NOT(resource ? 'upstream_cleanup_after') OR (resource->>'upstream_cleanup_after')::timestamptz<=clock_timestamp()) AND (stopped OR expires_at<=clock_timestamp() OR EXISTS(SELECT 1 FROM room_snapshots s WHERE s.room_id=p.room_id AND (s.state->>'media_generation')::bigint<>p.generation)) ELSE NOT stopped AND expires_at>clock_timestamp() AND NOT COALESCE((resource->>'upstream_io_pending')::boolean,false) AND NOT COALESCE((resource->>'upstream_io_uncertain')::boolean,false) AND ($3::text='start' OR NOT(resource ? 'upstream_last_report_at') OR (resource->>'upstream_last_report_at')::timestamptz<=clock_timestamp()-interval '10 seconds') AND EXISTS(SELECT 1 FROM room_snapshots s WHERE s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation) END RETURNING jsonb_build_object('resource',resource,'cleanup_remaining_ms',CASE WHEN $3::text='stop' THEN EXTRACT(epoch FROM ((resource->>'upstream_cleanup_deadline')::timestamptz-clock_timestamp()))*1000 ELSE 3000 END)")
         .bind(id).bind(&token).bind(event).fetch_optional(&app.db).await?;
     let Some(claimed) = claimed else {
         return Ok(());
@@ -375,7 +425,7 @@ async fn legacy_report(app: &App, id: Uuid, event: &str) -> anyhow::Result<()> {
     let cleanup_remaining = Duration::from_secs_f64(remaining_ms / 1000.0);
     let mut can_close = false;
     let result = async {
-    let row = sqlx::query("SELECT p.resource,s.state FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$1 AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id)")
+    let row = sqlx::query("SELECT p.resource,s.state FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$1 AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id)")
         .bind(id).fetch_one(&app.db).await?;
     let resource = app.decrypt(encrypted["encrypted"].as_str().unwrap_or(""))?;
     let Some(base) = resource["upstream_base"].as_str() else {
@@ -451,11 +501,16 @@ async fn legacy_maintenance(app: App) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let _=sqlx::query("UPDATE playback_sessions SET resource=resource||jsonb_build_object('upstream_cleanup_failed',true,'upstream_cleanup_error','upstream_cleanup_deadline') WHERE NOT(resource ? 'upstream_closed') AND (resource->>'upstream_cleanup_deadline')::timestamptz<=clock_timestamp() AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=playback_sessions.id)").execute(&app.db).await;
+        // An expired local reporter may still execute remotely. Retire its
+        // lease before another report is considered; Stop may compensate but
+        // cannot turn this uncertain remote ordering into a confirmed closure.
+        let _ = sqlx::query("UPDATE playback_sessions p SET resource=(resource-'upstream_io_pending'-'upstream_io_claim'-'upstream_io_kind'-'upstream_io_lease_until')||jsonb_build_object('upstream_io_uncertain',COALESCE((resource->>'upstream_io_uncertain')::boolean,false) OR COALESCE(resource->>'upstream_io_kind','progress')<>'stop') WHERE resource ? 'upstream_io_claim' AND (resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp() AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id)")
+            .execute(&app.db).await;
         for stop in [true, false] {
             let query = if stop {
-                "SELECT p.id,p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE NOT(p.resource ? 'upstream_closed') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND (p.stopped OR p.expires_at<=clock_timestamp() OR (s.state->>'media_generation')::bigint<>p.generation) AND COALESCE((p.resource->>'upstream_cleanup_attempts')::integer,0)<5 AND (NOT(p.resource ? 'upstream_cleanup_deadline') OR (p.resource->>'upstream_cleanup_deadline')::timestamptz>clock_timestamp()) AND (NOT(p.resource ? 'upstream_cleanup_after') OR (p.resource->>'upstream_cleanup_after')::timestamptz<=clock_timestamp()) AND (NOT(p.resource ? 'upstream_io_claim') OR (p.resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp()) ORDER BY (p.resource->>'upstream_cleanup_after')::timestamptz NULLS FIRST,p.id LIMIT 32"
+                "SELECT p.id,p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE NOT(p.resource ? 'upstream_closed') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id) AND (p.stopped OR p.expires_at<=clock_timestamp() OR (s.state->>'media_generation')::bigint<>p.generation) AND COALESCE((p.resource->>'upstream_cleanup_attempts')::integer,0)<5 AND (NOT(p.resource ? 'upstream_cleanup_deadline') OR (p.resource->>'upstream_cleanup_deadline')::timestamptz>clock_timestamp()) AND (NOT(p.resource ? 'upstream_cleanup_after') OR (p.resource->>'upstream_cleanup_after')::timestamptz<=clock_timestamp()) AND (NOT(p.resource ? 'upstream_io_claim') OR (p.resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp()) ORDER BY (p.resource->>'upstream_cleanup_after')::timestamptz NULLS FIRST,p.id LIMIT 32"
             } else {
-                "SELECT p.id,p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE NOT(p.resource ? 'upstream_closed') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT p.stopped AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation AND NOT COALESCE((p.resource->>'upstream_io_uncertain')::boolean,false) AND (NOT(p.resource ? 'upstream_last_report_at') OR (p.resource->>'upstream_last_report_at')::timestamptz<=clock_timestamp()-interval '10 seconds') AND (NOT(p.resource ? 'upstream_io_claim') OR (p.resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp()) ORDER BY (p.resource->>'upstream_last_report_at')::timestamptz NULLS FIRST,p.id LIMIT 32"
+                "SELECT p.id,p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE NOT(p.resource ? 'upstream_closed') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id) AND NOT p.stopped AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation AND NOT COALESCE((p.resource->>'upstream_io_uncertain')::boolean,false) AND (NOT(p.resource ? 'upstream_last_report_at') OR (p.resource->>'upstream_last_report_at')::timestamptz<=clock_timestamp()-interval '10 seconds') AND (NOT(p.resource ? 'upstream_io_claim') OR (p.resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp()) ORDER BY (p.resource->>'upstream_last_report_at')::timestamptz NULLS FIRST,p.id LIMIT 32"
             };
             let rows = sqlx::query(query)
                 .fetch_all(&app.db)

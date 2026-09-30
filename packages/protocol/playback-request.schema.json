@@ -44,6 +44,14 @@
       ],
       "default": null
     },
+    "observation_version": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
     "position_ms": {
       "type": "number",
       "format": "double",

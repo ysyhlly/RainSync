@@ -46,6 +46,7 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
                     remaining.ok_or_else(|| err(StatusCode::GONE, "playback_request_expired"))?;
                 let mut plan = app.decrypt(&row.get::<String, _>("response_encrypted"))?;
                 plan["expires_in_seconds"] = json!(remaining);
+                playback_observations::refresh_plan(&mut tx, &mut plan).await?;
                 sqlx::query("UPDATE playback_requests SET expires_at=GREATEST(expires_at,now()+interval '48 hours') WHERE user_id=$1 AND idempotency_key=$2")
                     .bind(user).bind(key).execute(&mut *tx).await?;
                 tx.commit().await?;
@@ -146,9 +147,9 @@ pub async fn fail(app: &App, reservation: &Reservation, error: &Error) -> Result
         return Err(err(StatusCode::CONFLICT, "playback_request_interrupted"));
     }
     if row.get::<String, _>("status") == "completed" {
-        return Ok(Some(
-            app.decrypt(&row.get::<String, _>("response_encrypted"))?,
-        ));
+        let mut plan = app.decrypt(&row.get::<String, _>("response_encrypted"))?;
+        playback_observations::refresh_plan(&mut tx, &mut plan).await?;
+        return Ok(Some(plan));
     }
     let exhausted = row.get::<String, _>("status") == "pending"
         && row.get::<i32, _>("attempt") >= 3
@@ -185,6 +186,14 @@ pub async fn cancel(
         .bind(user.id)
         .fetch_one(&mut *tx)
         .await?;
+    let room: Option<Uuid> = sqlx::query_scalar("SELECT COALESCE((SELECT p.room_id FROM playback_requests r JOIN playback_sessions p ON p.id=r.session_id WHERE r.user_id=$1 AND r.idempotency_key=$2),(SELECT u.room_id FROM playback_requests r JOIN upstream_reservations u ON u.id=r.session_id WHERE r.user_id=$1 AND r.idempotency_key=$2))")
+        .bind(user.id).bind(key).fetch_one(&mut *tx).await?;
+    if let Some(room) = room {
+        sqlx::query("SELECT room_id FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
+            .bind(room)
+            .fetch_optional(&mut *tx)
+            .await?;
+    }
     let session: Uuid = sqlx::query_scalar("INSERT INTO playback_requests(user_id,idempotency_key,request_hash,session_id,owner_epoch,status,error_status,error_code,lease_until,expires_at) VALUES($1,$2,'',$3,$4,'failed',410,'playback_request_cancelled',now(),now()+interval '48 hours') ON CONFLICT(user_id,idempotency_key) DO UPDATE SET status='failed',response_encrypted=NULL,error_status=410,error_code='playback_request_cancelled',lease_until=now(),expires_at=GREATEST(playback_requests.expires_at,now()+interval '48 hours') RETURNING session_id")
         .bind(user.id).bind(key).bind(Uuid::new_v4()).bind(app.epoch).fetch_one(&mut *tx).await?;
     sqlx::query("UPDATE playback_sessions SET stopped=true WHERE id=$1")

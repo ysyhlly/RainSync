@@ -89,6 +89,25 @@ pub async fn prepare(
     Ok(snapshot)
 }
 
+/// Some is a confirmed database outcome. Unknown transport/deadline results
+/// must never acknowledge a snapshot, including an ambiguous commit reply.
+pub(crate) async fn publish_confirmed(
+    db: &sqlx::PgPool,
+    claim: &Claim,
+    snapshot: &Snapshot,
+) -> Result<Option<bool>> {
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        persistence::media_outputs::publish(db, claim, snapshot, false),
+    )
+    .await
+    {
+        Ok(Ok(published)) => Ok(Some(published)),
+        Ok(Err(error)) if error.downcast_ref::<sqlx::Error>().is_none() => Err(error),
+        _ => Ok(None),
+    }
+}
+
 pub async fn monitor(
     db: &sqlx::PgPool,
     claim: &Claim,
@@ -113,21 +132,24 @@ pub async fn monitor(
         if let Some(snapshot) = snapshot
             && snapshot.manifest != previous
         {
-            match tokio::time::timeout(
-                Duration::from_secs(3),
-                persistence::media_outputs::publish(db, claim, &snapshot, false),
-            )
-            .await
-            {
-                Ok(Ok(true)) => {
+            match publish_confirmed(db, claim, &snapshot).await {
+                Ok(Some(true)) => {
                     if let Ok(mut builder) = builder.lock() {
                         builder.acknowledge(snapshot.segment_count);
                     }
                     previous = snapshot.manifest;
                 }
-                // A failed database fence must stop this writer, not silently
-                // keep encoding behind an obsolete visible snapshot.
-                _ => return process::LeaseInterrupted.into(),
+                // A confirmed failed fence stops the writer immediately.
+                Ok(Some(false)) => return process::LeaseInterrupted.into(),
+                Err(error) => return error,
+                // A timeout/transport error may have committed or rolled back.
+                // Do not acknowledge it or advance the known visible prefix;
+                // retry the full fenced proof transaction. Process supervision
+                // independently stops all work at the last confirmed lease.
+                _ => {
+                    tracing::warn!("output publication unknown; retaining confirmed snapshot");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;

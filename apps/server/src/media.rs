@@ -177,6 +177,12 @@ pub async fn playback(
     Json(body): Json<protocol::PlaybackRequest>,
 ) -> Result<Json<Value>> {
     let u = auth(&app, &h, true).await?;
+    if body.observation_version.is_some_and(|version| version != 1) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "unsupported_observation_version",
+        ));
+    }
     member(&app, &u, body.room_id).await?;
     // Dropping an HTTP waiter must not drop the reservation's executor. Start
     // ownership before begin(), including its commit/acknowledgement window.
@@ -292,6 +298,7 @@ async fn prepare_playback(
                         hls: body.capabilities.as_ref().is_none_or(|c| c.supports_hls()),
                         force_transcode: body.mode.as_deref() == Some("transcode"),
                     },
+                    observation_version: body.observation_version,
                 },
             )
             .await?;
@@ -582,19 +589,22 @@ async fn prepare_playback(
         rebuild_on_seek: local_job,
         audio_tracks,
         subtitle_tracks,
+        observation_version: body.observation_version,
+        observation_seq: body.observation_version.map(|_| 0),
     };
-    let plan = serde_json::to_value(plan).map_err(anyhow::Error::from)?;
+    let protocol_plan = plan;
+    let plan = serde_json::to_value(&protocol_plan).map_err(anyhow::Error::from)?;
     let mut tx = app.db.begin().await?;
-    playback_requests::guard(app, &mut tx, reservation).await?;
     let current: Value =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
             .bind(body.room_id)
             .fetch_one(&mut *tx)
             .await?;
+    playback_requests::guard(app, &mut tx, reservation).await?;
     if current["media_generation"].as_u64() != Some(u64::from(body.media_generation)) {
         return Err(err(StatusCode::CONFLICT, "stale_media"));
     }
-    if matches!(kind.as_str(), "jellyfin" | "emby")
+    if (matches!(kind.as_str(), "jellyfin" | "emby") || body.observation_version == Some(1))
         && sqlx::query("SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR SHARE")
             .bind(body.room_id)
             .bind(u.id)
@@ -617,6 +627,10 @@ async fn prepare_playback(
         return Err(err(StatusCode::CONFLICT, "source_changed"));
     }
     sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '30 minutes') ON CONFLICT(id) DO UPDATE SET resource=EXCLUDED.resource,expires_at=EXCLUDED.expires_at,stopped=false").bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":encrypted})).execute(&mut *tx).await?;
+    if body.observation_version == Some(1) {
+        persistence::playback_observations::create(&mut tx, u.id, body.room_id, &protocol_plan)
+            .await?;
+    }
     if local_job {
         let input_ticket = if kind != "local" {
             Some(app.encrypt(&json!({"token":t}))?)
@@ -690,7 +704,7 @@ pub async fn readiness(
         return Err(err(StatusCode::BAD_REQUEST, "invalid_position"));
     }
     // One statement gives permission and the current attempt a consistent snapshot.
-    let row = sqlx::query("SELECT j.status AS job_status, j.error AS job_error, o.validation_version, o.ready_segments, o.visible_manifest FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id LEFT JOIN media_jobs j ON j.session_id=p.id LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND p.expires_at>now() AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
+    let row = sqlx::query("SELECT j.status AS job_status, j.error AS job_error, o.validation_version, o.ready_segments, o.visible_manifest, v.seq AS observation_seq FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id LEFT JOIN media_jobs j ON j.session_id=p.id LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt LEFT JOIN playback_observations v ON v.session_id=p.id WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND p.expires_at>now() AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
         .bind(id).bind(u.id).fetch_optional(&app.db).await?
         .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
     use protocol::PreparationStatus::{Preparing, Queued, Ready};
@@ -744,6 +758,10 @@ pub async fn readiness(
         status,
         complete,
         available_until_ms,
+        observation_version: row.get::<Option<i64>, _>("observation_seq").map(|_| 1),
+        observation_seq: row
+            .get::<Option<i64>, _>("observation_seq")
+            .map(|seq| seq as u64),
     }))
 }
 
@@ -751,9 +769,37 @@ pub async fn stop(
     State(app): State<App>,
     h: HeaderMap,
     Path(id): Path<Uuid>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>> {
     let u = auth(&app, &h, true).await?;
+    let final_sample = if body.is_empty() {
+        Ok(None)
+    } else {
+        serde_json::from_slice::<protocol::PlaybackObservation>(&body)
+            .map(Some)
+            .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_observation"))
+    };
     let mut tx = app.db.begin().await?;
+    let grant = playback_observations::lock_grant(&mut tx, id, u.id).await?;
+    let final_error = match final_sample {
+        Ok(None) => None,
+        candidate => {
+            let grant = grant
+                .as_ref()
+                .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
+            match candidate {
+                Ok(Some(sample)) => {
+                    match playback_observations::accept(&mut tx, grant, &sample, true).await {
+                        Ok(_) => None,
+                        Err(error) if error.0.is_client_error() => Some(error),
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => Some(error),
+                Ok(None) => unreachable!(),
+            }
+        }
+    };
     sqlx::query("UPDATE playback_sessions SET stopped=true WHERE id=$1 AND user_id=$2")
         .bind(id)
         .bind(u.id)
@@ -771,6 +817,11 @@ pub async fn stop(
         persistence::upstream_reservations::close(&mut tx, id, "playback_stopped").await?;
     }
     tx.commit().await?;
+    if let Some(error) = final_error {
+        // Ownership authorizes stopping independently of accepting a sample.
+        // Reject invalid final data without retaining the caller's resources.
+        return Err(error);
+    }
     Ok(Json(json!({"ok":true})))
 }
 pub async fn renew(

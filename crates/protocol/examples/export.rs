@@ -29,6 +29,9 @@ fn main() {
         PlaybackReadiness::decl(),
         PlaybackCapabilities::decl(),
         PlaybackRequest::decl(),
+        PlaybackObservationEvent::decl(),
+        PlaybackObservation::decl(),
+        PlaybackObservationReceipt::decl(),
         ErrorCode::decl(),
         ApiError::decl(),
         ErrorResponse::decl(),
@@ -52,6 +55,14 @@ fn main() {
         ("playback-request", schemars::schema_for!(PlaybackRequest)),
         ("error-response", schemars::schema_for!(ErrorResponse)),
         ("playback-plan", schemars::schema_for!(PlaybackPlan)),
+        (
+            "playback-observation",
+            schemars::schema_for!(PlaybackObservation),
+        ),
+        (
+            "playback-observation-receipt",
+            schemars::schema_for!(PlaybackObservationReceipt),
+        ),
         (
             "playback-readiness",
             schemars::schema_for!(PlaybackReadiness),

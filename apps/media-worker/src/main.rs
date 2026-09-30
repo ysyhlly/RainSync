@@ -674,8 +674,10 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 tokio::fs::create_dir_all(&dir).await.map_err(cache::write_error)?;
                 let audio_index = spec["audio_index"].as_u64().map(u32::try_from).transpose()?;
                 let args = media_core::hls_args(&input, dir.join("index.m3u8").to_str().unwrap(), spec["start_seconds"].as_f64().unwrap_or(0.0), spec["transcode"].as_bool().unwrap_or(true), audio_index);
-                anyhow::ensure!(persistence::media_jobs::renew(&app.db, &claim).await?, "lease_lost_before_spawn");
-                Ok::<_, anyhow::Error>(args)
+                let confirmed_until = process::finalization_deadline(Duration::from_secs(3), process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim))).await?
+                    .filter(|until| *until > tokio::time::Instant::now())
+                    .ok_or_else(|| anyhow::anyhow!("lease_lost_before_spawn"))?;
+                Ok::<_, anyhow::Error>((args, confirmed_until))
             };
             let prepared = tokio::select! {
                 biased;
@@ -684,17 +686,18 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             };
             let mut execution_stopped = true;
             let mut result = async {
-                let args = prepared?;
+                let (args, confirmed_until) = prepared?;
                 anyhow::ensure!(!*stop.borrow(), "worker_shutdown");
                 let mut command = tokio::process::Command::new("ffmpeg");
                 command.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
                 #[cfg(windows)]
                 command.creation_flags(0x08000000);
+                anyhow::ensure!(confirmed_until > tokio::time::Instant::now(), "lease_lost_before_spawn");
                 let mut child = child_process::spawn(command)?;
                 writer_stopped = false;
                 execution_stopped = false;
-                let result = process::supervise(&mut child, &mut stop, || async {
-                    persistence::media_jobs::renew(&app.db, &claim).await
+                let result = process::supervise(&mut child, &mut stop, confirmed_until, || async {
+                    process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim)).await
                 }, async {
                     tokio::select! {
                         error = cache::monitor(&app) => error,

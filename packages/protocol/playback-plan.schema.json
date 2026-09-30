@@ -33,6 +33,23 @@
       "type": "string",
       "format": "uuid"
     },
+    "observation_seq": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "observation_version": {
+      "description": "Present only when this grant negotiated actual viewer observations.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
     "playback_url": {
       "type": "string"
     },

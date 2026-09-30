@@ -61,6 +61,15 @@ pub enum ErrorCode {
     PlaybackRequestExpired,
     PlaybackRequestRetryExhausted,
     PlaybackRequestCancelled,
+    UnsupportedObservationVersion,
+    ObservationVersionRequired,
+    InvalidObservation,
+    InvalidObservationSequence,
+    ObservationSequenceStale,
+    ObservationConflict,
+    InvalidObservationPosition,
+    InvalidObservationRate,
+    ObservationNotComplete,
     StaleMedia,
     InvalidPosition,
     InvalidRate,
@@ -172,6 +181,15 @@ impl ErrorCode {
 
     fn message(self) -> &'static str {
         match self {
+            Self::UnsupportedObservationVersion => "播放观测协议版本不受支持，请更新客户端",
+            Self::ObservationVersionRequired => "此会话未启用播放观测，请重新准备播放",
+            Self::InvalidObservation => "播放观测格式无效，请检查客户端",
+            Self::InvalidObservationSequence => "播放观测序号无效，请检查客户端",
+            Self::ObservationSequenceStale => "播放观测已过时，请发送新的实际播放样本",
+            Self::ObservationConflict => "此观测序号已用于其他播放样本，请使用新序号",
+            Self::InvalidObservationPosition => "播放观测超出此会话授权的时间范围",
+            Self::InvalidObservationRate => "实际播放倍速超出支持范围",
+            Self::ObservationNotComplete => "媒体尚未完整生成，不能报告自然播放结束",
             Self::MediaTitleInvalid => "名称需为 1—200 个字符，不能包含换行或控制字符",
             Self::MediaTitleConflict => "名称已被其他操作修改，请核对最新名称后再次保存",
             Self::MediaPreviewStale => "预览版本已更新，请刷新媒体资料",
@@ -295,6 +313,59 @@ pub struct ErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observation_rejections_have_specific_public_codes_and_require_new_action() {
+        for (reason, status, expected) in [
+            (
+                "unsupported_observation_version",
+                400,
+                ErrorCode::UnsupportedObservationVersion,
+            ),
+            (
+                "observation_version_required",
+                400,
+                ErrorCode::ObservationVersionRequired,
+            ),
+            ("invalid_observation", 400, ErrorCode::InvalidObservation),
+            (
+                "invalid_observation_sequence",
+                400,
+                ErrorCode::InvalidObservationSequence,
+            ),
+            (
+                "observation_sequence_stale",
+                409,
+                ErrorCode::ObservationSequenceStale,
+            ),
+            ("observation_conflict", 409, ErrorCode::ObservationConflict),
+            (
+                "invalid_observation_position",
+                400,
+                ErrorCode::InvalidObservationPosition,
+            ),
+            (
+                "invalid_observation_rate",
+                400,
+                ErrorCode::InvalidObservationRate,
+            ),
+            (
+                "observation_not_complete",
+                400,
+                ErrorCode::ObservationNotComplete,
+            ),
+        ] {
+            let response = ErrorResponse {
+                error: ApiError::new(ErrorCode::from_reason(reason, status), Uuid::nil()),
+            };
+            assert_eq!(response.error.code, expected);
+            assert!(!response.error.retryable);
+            assert!(!response.error.message.is_empty());
+            assert!(!response.error.message.contains(reason));
+            assert!(response.error.retry_after_ms.is_none());
+            let wire = serde_json::to_value(&response).unwrap();
+            assert_eq!(wire["error"]["code"], reason.to_ascii_uppercase());
+        }
+    }
     #[test]
     fn never_exposes_arbitrary_internal_text_or_invents_retry_delays() {
         let secret = "https://private.invalid/?token=secret /home/private/media.mkv";

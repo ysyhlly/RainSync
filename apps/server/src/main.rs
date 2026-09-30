@@ -8,6 +8,7 @@ mod media;
 mod media_previews;
 mod media_titles;
 mod metrics;
+mod playback_observations;
 mod playback_requests;
 mod profile;
 mod registration;
@@ -458,6 +459,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
                 "DELETE FROM agent_transfer_runs WHERE finished_at<now()-interval '24 hours'",
                 "DELETE FROM playback_requests r WHERE r.expires_at<now() AND NOT EXISTS(SELECT 1 FROM playback_sessions p WHERE p.id=r.session_id AND NOT p.stopped AND p.expires_at>now())",
                 "DELETE FROM upstream_reservations WHERE state='closed' AND closed_at<now()-interval '48 hours'",
+                "DELETE FROM playback_observations o WHERE o.created_at<now()-interval '48 hours' AND NOT EXISTS(SELECT 1 FROM playback_sessions p WHERE p.id=o.session_id AND NOT p.stopped AND p.expires_at>now()) AND NOT EXISTS(SELECT 1 FROM upstream_reservations u WHERE u.id=o.session_id AND u.state<>'closed')",
             ] {
                 let _ = sqlx::query(query).execute(&cleanup).await;
             }
@@ -537,6 +539,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route(
             "/api/v1/playback-sessions/{id}",
             get(media::readiness).delete(media::stop).post(media::renew),
+        )
+        .route(
+            "/api/v1/playback-sessions/{id}/observations",
+            post(playback_observations::observe),
         )
         .route("/api/v1/agents", get(agents::list).post(agents::create))
         .route("/api/v1/agents/pair", post(agents::pair))

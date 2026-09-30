@@ -15,6 +15,22 @@
     "complete": {
       "type": "boolean"
     },
+    "observation_seq": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "observation_version": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
     "session_id": {
       "type": "string",
       "format": "uuid"

@@ -11,6 +11,53 @@ import type { PlaybackPlan, PlaybackRequest } from "../packages/protocol";
 
 afterEach(() => vi.useRealTimers());
 
+it("final grant deletion precedes concurrent key cleanup and never cancels the successor", async () => {
+  const saved = new Map<string, string>();
+  const events: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const requests = new PlaybackRequests(
+    async (body) => {
+      events.push(`prepare:${body.idempotency_key}`);
+      return {
+        session_id: body.idempotency_key,
+        rebuild_on_seek: false,
+      } as PlaybackPlan;
+    },
+    async (key) => {
+      events.push(`cancel:${key}`);
+    },
+    {
+      getItem: (key) => saved.get(key) ?? null,
+      setItem: (key, value) => saved.set(key, value),
+    },
+    "playback",
+  );
+  const input = { idempotency_key: "old" } as PlaybackRequest;
+  await requests.prepare(input);
+  const stopping = requests.stop(async () => {
+    await gate;
+    events.push("final-sample-and-stop");
+  });
+  const repeatedStop = requests.stop();
+  const successor = requests.prepare({ ...input, idempotency_key: "new" });
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(events).toEqual(["prepare:old"]);
+  release();
+  await Promise.all([stopping, repeatedStop, successor]);
+  const final = events.indexOf("final-sample-and-stop");
+  expect(final).toBeGreaterThan(0);
+  expect(
+    events.filter((event) => event === "cancel:old").length,
+  ).toBeGreaterThan(0);
+  expect(
+    events.slice(0, final).some((event) => event.startsWith("cancel:")),
+  ).toBe(false);
+  expect(events).not.toContain("cancel:new");
+  expect(JSON.parse(saved.get("playback")!)).toEqual(["new"]);
+});
+
 it("waits for published readiness on one session, tolerating a transient read failure", async () => {
   vi.useFakeTimers();
   const read = vi

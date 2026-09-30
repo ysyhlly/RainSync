@@ -20,6 +20,7 @@ import {
   waitPlaybackReady,
 } from "../../playback-request";
 import type { useSession } from "../auth/session.store";
+import { bindPlaybackObservations } from "./observation-binding";
 
 export function createPlaybackRuntime(ctx: {
   session: ReturnType<typeof useSession>;
@@ -55,6 +56,7 @@ export function createPlaybackRuntime(ctx: {
   let playbackRequests: PlaybackRequests | undefined;
   let playbackUser: string | undefined;
   let playbackEpoch: number | undefined;
+  let observations: ReturnType<typeof bindPlaybackObservations> | undefined;
   let checkingEnd = false,
     endAttempt = -Infinity;
   async function completed() {
@@ -88,8 +90,14 @@ export function createPlaybackRuntime(ctx: {
           return;
         }
       }
-      if (plan === p && el.ended && state.value?.playback_status === "playing")
+      if (
+        plan === p &&
+        el.ended &&
+        state.value?.playback_status === "playing"
+      ) {
+        observations?.completed();
         ctx.ended?.(el.currentTime * 1000 + p.timeline_origin_ms);
+      }
     } catch (failure) {
       if (plan === p)
         error.value =
@@ -156,6 +164,9 @@ export function createPlaybackRuntime(ctx: {
     return readiness;
   }
   async function stopPlayback() {
+    // Capture the old element before teardown changes its time or identity.
+    const finalObservation = observations?.stop();
+    observations = undefined;
     generationWait?.abort();
     generationWait = undefined;
     generationWaitFailed = false;
@@ -179,27 +190,32 @@ export function createPlaybackRuntime(ctx: {
     // Capture and cancel this operation before the first asynchronous wait.
     // A late session DELETE must never call stop() on a newer preparation.
     const previous = playbackRequests;
+    const deletePrevious = async () => {
+      if (old)
+        await session
+          .api(
+            `/playback-sessions/${old.session_id}`,
+            "DELETE",
+            finalObservation,
+            AbortSignal.timeout(5000),
+          )
+          .catch(() => {});
+    };
+    // The final sample and Stop commit together before key cancellation can
+    // close the grant. Preparing work is still aborted synchronously in stop().
+    const beforeCleanup = finalObservation ? deletePrevious : undefined;
     const cancellation = (
       previous
-        ? previous.stop()
+        ? previous.stop(beforeCleanup)
         : session.user
-          ? requests().stop()
+          ? requests().stop(beforeCleanup)
           : Promise.resolve()
     ).catch((e) => {
       if (!(e instanceof StaleIdentity)) throw e;
     });
     await Promise.all([
       cancellation,
-      old
-        ? session
-            .api(
-              `/playback-sessions/${old.session_id}`,
-              "DELETE",
-              undefined,
-              AbortSignal.timeout(5000),
-            )
-            .catch(() => {})
-        : Promise.resolve(),
+      beforeCleanup ? Promise.resolve() : deletePrevious(),
     ]);
   }
   async function loadMedia() {
@@ -228,6 +244,7 @@ export function createPlaybackRuntime(ctx: {
           video.value,
           Hls.isSupported() ? window.MediaSource : undefined,
         ),
+        observation_version: 1,
       };
       waiting.value = true;
       const p = await requests().prepare(request, () =>
@@ -247,6 +264,38 @@ export function createPlaybackRuntime(ctx: {
       if (serial !== loadSerial) return;
       applySubtitles();
       const el = video.value;
+      if (p.observation_version === 1) {
+        const user = session.user!.id;
+        const epoch = session.epoch;
+        observations = bindPlaybackObservations({
+          element: el,
+          plan: p,
+          current: () =>
+            plan === p &&
+            serial === loadSerial &&
+            video.value === el &&
+            session.user?.id === user &&
+            session.epoch === epoch &&
+            state.value?.room_id === s.room_id &&
+            state.value?.media_generation === p.media_generation,
+          finalCurrent: () =>
+            plan === p &&
+            video.value === el &&
+            session.user?.id === user &&
+            session.epoch === epoch,
+          send: async (body, signal) => {
+            if (session.epoch !== epoch) throw new StaleIdentity();
+            await session.api(
+              `/playback-sessions/${p.session_id}/observations`,
+              "POST",
+              body,
+              signal,
+            );
+          },
+          storage: sessionStorage,
+          storageKey: `rainsync:observation:${user}:${p.session_id}`,
+        });
+      }
       endAttempt = -Infinity;
       el.onended = () => {
         void completed();
@@ -596,6 +645,7 @@ export function createPlaybackRuntime(ctx: {
     video.value = element;
   }
   const timer = setInterval(tick, 500);
+  const observationTimer = setInterval(() => observations?.progress(), 5000);
   const renewTimer = setInterval(() => {
     const current = plan?.session_id;
     if (current)
@@ -614,6 +664,7 @@ export function createPlaybackRuntime(ctx: {
   }, 600000);
   onScopeDispose(() => {
     clearInterval(timer);
+    clearInterval(observationTimer);
     clearInterval(renewTimer);
     void reset().catch(() => {});
   });

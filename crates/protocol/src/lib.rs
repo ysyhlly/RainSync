@@ -87,6 +87,50 @@ pub struct PlaybackPlan {
     pub rebuild_on_seek: bool,
     pub audio_tracks: Vec<MediaTrack>,
     pub subtitle_tracks: Vec<MediaTrack>,
+    /// Present only when this grant negotiated actual viewer observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub observation_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub observation_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackObservationEvent {
+    Playing,
+    Pause,
+    Progress,
+    Seeking,
+    Seeked,
+    Buffering,
+    Ended,
+}
+
+/// An immutable sample of the actual media element, relative to its plan.
+/// `has_played` is cumulative for that grant, even when the latest sample pauses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct PlaybackObservation {
+    pub media_generation: u32,
+    #[ts(type = "number")]
+    pub seq: u64,
+    pub event: PlaybackObservationEvent,
+    pub media_time_ms: f64,
+    pub paused: bool,
+    pub seeking: bool,
+    pub buffering: bool,
+    pub playback_rate: f64,
+    pub has_played: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PlaybackObservationReceipt {
+    pub session_id: Uuid,
+    #[ts(type = "number")]
+    pub observation_seq: u64,
+    pub has_played: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
@@ -106,6 +150,12 @@ pub struct PlaybackReadiness {
     /// Exclusive end of the published prefix, relative to the plan's timeline origin.
     /// None means this source/legacy output has no measured generated interval.
     pub available_until_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub observation_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub observation_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
@@ -140,6 +190,9 @@ pub struct PlaybackRequest {
     pub audio_index: Option<u32>,
     #[serde(default)]
     pub capabilities: Option<PlaybackCapabilities>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub observation_version: Option<u32>,
 }
 
 impl PlaybackCapabilities {
@@ -171,6 +224,7 @@ mod capability_tests {
         assert!(request.mode.is_none());
         assert!(request.audio_index.is_none());
         assert!(request.capabilities.is_none());
+        assert!(request.observation_version.is_none());
     }
     #[test]
     fn refuses_unplayable_output_and_distinguishes_transports() {
@@ -191,5 +245,26 @@ mod capability_tests {
             caps.negotiate("direct", "progressive"),
             Some(("remux", "hls"))
         );
+    }
+
+    #[test]
+    fn observation_contract_requires_actual_flags_and_integral_sequence() {
+        let payload = serde_json::json!({
+            "media_generation":1,"seq":1,"event":"pause","media_time_ms":10.25,
+            "paused":true,"seeking":false,"buffering":false,"playback_rate":1.5,"has_played":true
+        });
+        let sample: PlaybackObservation = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(serde_json::to_value(sample).unwrap(), payload);
+        for invalid in ["extra", "missing", "fractional_seq"] {
+            let mut candidate = payload.clone();
+            match invalid {
+                "extra" => candidate["room_clock"] = serde_json::json!(50),
+                "missing" => {
+                    candidate.as_object_mut().unwrap().remove("has_played");
+                }
+                _ => candidate["seq"] = serde_json::json!(1.5),
+            }
+            assert!(serde_json::from_value::<PlaybackObservation>(candidate).is_err());
+        }
     }
 }

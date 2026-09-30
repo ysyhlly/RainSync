@@ -97,8 +97,29 @@ pub async fn claim(pool: &PgPool, owner: Uuid) -> Result<Option<Claim>> {
 }
 
 pub async fn renew(pool: &PgPool, claim: &Claim) -> Result<bool> {
-    Ok(sqlx::query("UPDATE media_jobs j SET lease_until=clock_timestamp()+interval '30 seconds' FROM playback_sessions p WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND p.id=j.session_id AND NOT p.stopped AND p.expires_at>clock_timestamp()")
-        .bind(claim.id).bind(claim.owner).bind(claim.attempt).execute(pool).await?.rows_affected() == 1)
+    Ok(renew_remaining(pool, claim).await?.is_some())
+}
+
+/// None is a confirmed failed fence; an error is an unknown database result.
+/// The caller must subtract the complete request round trip from this database
+/// measured remainder before using it as a local execution deadline.
+pub async fn renew_remaining(pool: &PgPool, claim: &Claim) -> Result<Option<std::time::Duration>> {
+    let mut tx = pool.begin().await?;
+    let owned = sqlx::query("SELECT id FROM media_jobs WHERE id=$1 AND owner_id=$2 AND attempt=$3 AND status='running' FOR UPDATE")
+        .bind(claim.id).bind(claim.owner).bind(claim.attempt).fetch_optional(&mut *tx).await?;
+    if owned.is_none() {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    // Recheck the live lease/session after acquiring the row lock. A query
+    // delayed by a lock must never revive an execution whose lease expired.
+    let remaining: Option<f64> = sqlx::query_scalar("UPDATE media_jobs j SET lease_until=clock_timestamp()+interval '30 seconds' FROM playback_sessions p WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND p.id=j.session_id AND NOT p.stopped AND p.expires_at>clock_timestamp() RETURNING extract(epoch FROM j.lease_until-clock_timestamp())::float8")
+        .bind(claim.id).bind(claim.owner).bind(claim.attempt).fetch_optional(&mut *tx).await?;
+    tx.commit().await?;
+    remaining
+        .map(std::time::Duration::try_from_secs_f64)
+        .transpose()
+        .map_err(Into::into)
 }
 
 pub async fn finish(

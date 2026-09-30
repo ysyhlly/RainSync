@@ -23,13 +23,14 @@ pub struct Reservation<'a> {
     pub device_id: &'a str,
     pub origin_key: &'a str,
     pub scope_encrypted: &'a str,
+    pub observation_version: Option<u32>,
 }
 
 pub async fn reserve(tx: &mut Transaction<'_, Postgres>, r: &Reservation<'_>) -> Result<()> {
-    sqlx::query("INSERT INTO upstream_reservations(id,user_id,request_key,owner_epoch,room_id,media_id,source_id,generation,kind,device_id,origin_key,scope_encrypted) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
+    sqlx::query("INSERT INTO upstream_reservations(id,user_id,request_key,owner_epoch,room_id,media_id,source_id,generation,kind,device_id,origin_key,scope_encrypted,observation_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)")
         .bind(r.id).bind(r.user).bind(r.request_key).bind(r.owner_epoch).bind(r.room)
         .bind(r.media).bind(r.source).bind(r.generation).bind(r.kind).bind(r.device_id)
-        .bind(r.origin_key).bind(r.scope_encrypted).execute(&mut **tx).await?;
+        .bind(r.origin_key).bind(r.scope_encrypted).bind(r.observation_version.map(|version| version as i32)).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -75,7 +76,7 @@ pub async fn checkpoint(
 }
 
 pub async fn negotiation_unknown(pool: &PgPool, id: Uuid, token: Uuid) -> Result<()> {
-    sqlx::query("UPDATE upstream_reservations SET state='cleanup_failed',negotiation='unknown',close_reason=COALESCE(close_reason,'upstream_negotiation_unknown'),last_error='upstream_session_unknown',cleanup_after=NULL,cleanup_deadline=COALESCE(cleanup_deadline,clock_timestamp()+interval '60 seconds'),io_claim=NULL,io_kind=NULL,io_lease_until=NULL,updated_at=clock_timestamp() WHERE id=$1 AND negotiation_token=$2 AND negotiation='running' AND io_claim=$2")
+    sqlx::query("UPDATE upstream_reservations SET state='cleanup_failed',negotiation='unknown',close_reason=COALESCE(close_reason,'upstream_negotiation_unknown'),last_error='upstream_session_unknown',cleanup_after=NULL,cleanup_deadline=COALESCE(cleanup_deadline,clock_timestamp()+interval '60 seconds'),io_claim=NULL,io_kind=NULL,io_lease_until=NULL,io_observation_seq=NULL,io_observation=NULL,updated_at=clock_timestamp() WHERE id=$1 AND negotiation_token=$2 AND negotiation='running' AND io_claim=$2")
         .bind(id).bind(token).execute(pool).await?;
     Ok(())
 }
@@ -97,13 +98,13 @@ pub async fn reconcile(pool: &PgPool, epoch: Uuid) -> Result<()> {
         .bind(epoch).execute(pool).await?;
     sqlx::query("UPDATE upstream_reservations SET state='closed',negotiation='not_sent',close_reason=COALESCE(close_reason,'upstream_authorization_lost'),closed_at=clock_timestamp(),updated_at=clock_timestamp() WHERE state='closing' AND negotiation='reserved'")
         .execute(pool).await?;
-    sqlx::query("UPDATE upstream_reservations SET state='cleanup_failed',negotiation='unknown',close_reason=COALESCE(close_reason,'upstream_negotiation_unknown'),last_error='upstream_session_unknown',io_claim=NULL,io_kind=NULL,io_lease_until=NULL,updated_at=clock_timestamp() WHERE negotiation='running' AND io_lease_until<=clock_timestamp()")
+    sqlx::query("UPDATE upstream_reservations SET state='cleanup_failed',negotiation='unknown',close_reason=COALESCE(close_reason,'upstream_negotiation_unknown'),last_error='upstream_session_unknown',io_claim=NULL,io_kind=NULL,io_lease_until=NULL,io_observation_seq=NULL,io_observation=NULL,updated_at=clock_timestamp() WHERE negotiation='running' AND io_lease_until<=clock_timestamp()")
         .execute(pool).await?;
     sqlx::query("UPDATE upstream_reservations SET state='cleanup_failed',last_error='upstream_session_unknown',updated_at=clock_timestamp() WHERE state='closing' AND negotiation IN('received','unknown') AND play_session_id IS NULL")
         .execute(pool).await?;
     // A lost local reporter may already be executing remotely. Keep that fact
     // even when a later successful Stop is observed.
-    sqlx::query("UPDATE upstream_reservations SET io_uncertain=io_uncertain OR io_kind IN('start','progress'),io_claim=NULL,io_kind=NULL,io_lease_until=NULL,updated_at=clock_timestamp() WHERE io_kind<>'negotiate' AND io_lease_until<=clock_timestamp()")
+    sqlx::query("UPDATE upstream_reservations SET io_uncertain=io_uncertain OR io_kind IN('start','progress'),io_claim=NULL,io_kind=NULL,io_lease_until=NULL,io_observation_seq=NULL,io_observation=NULL,updated_at=clock_timestamp() WHERE io_kind<>'negotiate' AND io_lease_until<=clock_timestamp()")
         .execute(pool).await?;
     sqlx::query("UPDATE upstream_reservations SET state='cleanup_failed',last_error=COALESCE(last_error,'upstream_cleanup_deadline'),updated_at=clock_timestamp() WHERE state='closing' AND (cleanup_attempts>=5 OR cleanup_deadline<=clock_timestamp()) AND io_claim IS NULL AND negotiation<>'running'")
         .execute(pool).await?;
@@ -113,9 +114,9 @@ pub async fn reconcile(pool: &PgPool, epoch: Uuid) -> Result<()> {
 pub async fn recover(tx: &mut Transaction<'_, Postgres>, epoch: Uuid) -> Result<()> {
     // Instance-lock acquisition proves the previous process is gone, but does
     // not prove its already submitted upstream requests stopped executing.
-    sqlx::query("UPDATE upstream_reservations SET state='cleanup_failed',negotiation='unknown',last_error='upstream_session_unknown',close_reason=COALESCE(close_reason,'upstream_owner_lost'),io_claim=NULL,io_kind=NULL,io_lease_until=NULL,updated_at=clock_timestamp() WHERE negotiation='running' AND owner_epoch<>$1")
+    sqlx::query("UPDATE upstream_reservations SET state='cleanup_failed',negotiation='unknown',last_error='upstream_session_unknown',close_reason=COALESCE(close_reason,'upstream_owner_lost'),io_claim=NULL,io_kind=NULL,io_lease_until=NULL,io_observation_seq=NULL,io_observation=NULL,updated_at=clock_timestamp() WHERE negotiation='running' AND owner_epoch<>$1")
         .bind(epoch).execute(&mut **tx).await?;
-    sqlx::query("UPDATE upstream_reservations SET io_uncertain=io_uncertain OR io_kind IN('start','progress'),io_claim=NULL,io_kind=NULL,io_lease_until=NULL,updated_at=clock_timestamp() WHERE io_kind<>'negotiate'")
+    sqlx::query("UPDATE upstream_reservations SET io_uncertain=io_uncertain OR io_kind IN('start','progress'),io_claim=NULL,io_kind=NULL,io_lease_until=NULL,io_observation_seq=NULL,io_observation=NULL,updated_at=clock_timestamp() WHERE io_kind<>'negotiate'")
         .execute(&mut **tx).await?;
     Ok(())
 }
@@ -135,10 +136,15 @@ pub struct Claim {
     pub stop_confirmed: bool,
     pub encoding_stop_confirmed: bool,
     pub state: Option<serde_json::Value>,
+    pub observation_seq: Option<u64>,
+    pub observation: Option<serde_json::Value>,
+    pub observation_version: Option<u32>,
+    pub cleanup_remaining_ms: Option<f64>,
+    claimed_at: std::time::Instant,
 }
 
 impl Claim {
-    fn from_row(row: PgRow, token: Uuid, event: &str) -> Self {
+    fn from_row(row: PgRow, token: Uuid, event: &str, claimed_at: std::time::Instant) -> Self {
         Self {
             id: row.get("id"),
             token,
@@ -153,7 +159,30 @@ impl Claim {
             stop_confirmed: row.get("stop_confirmed"),
             encoding_stop_confirmed: row.get("encoding_stop_confirmed"),
             state: row.get("room_state"),
+            observation_seq: row
+                .get::<Option<i64>, _>("io_observation_seq")
+                .map(|seq| seq as u64),
+            observation: row.get("io_observation"),
+            observation_version: row
+                .get::<Option<i32>, _>("observation_version")
+                .map(|version| version as u32),
+            cleanup_remaining_ms: row.get("cleanup_remaining_ms"),
+            claimed_at,
         }
+    }
+
+    pub fn network_budget(&self) -> std::time::Duration {
+        let maximum = std::time::Duration::from_secs(CLEANUP_SECONDS);
+        self.cleanup_remaining_ms.map_or(maximum, |remaining| {
+            if !remaining.is_finite() || remaining <= 0.0 {
+                return std::time::Duration::ZERO;
+            }
+            std::time::Duration::from_secs_f64(
+                (remaining / 1000.0 - self.claimed_at.elapsed().as_secs_f64())
+                    .max(0.0)
+                    .min(maximum.as_secs_f64()),
+            )
+        })
     }
 }
 
@@ -161,7 +190,7 @@ pub async fn ready(pool: &PgPool, stop: bool) -> Result<Vec<(Uuid, String)>> {
     let query = if stop {
         "SELECT id,origin_key FROM upstream_reservations WHERE state='closing' AND negotiation='received' AND play_session_id IS NOT NULL AND io_claim IS NULL AND cleanup_after<=clock_timestamp() AND cleanup_deadline>clock_timestamp() AND cleanup_attempts<5 ORDER BY cleanup_after LIMIT 32"
     } else {
-        "SELECT id,origin_key FROM upstream_reservations WHERE state='active' AND NOT io_uncertain AND io_claim IS NULL AND (NOT start_reported OR last_report_at IS NULL OR last_report_at<=clock_timestamp()-interval '10 seconds') ORDER BY last_report_at NULLS FIRST LIMIT 32"
+        "SELECT u.id,u.origin_key FROM upstream_reservations u LEFT JOIN playback_observations o ON o.session_id=u.id WHERE u.state='active' AND NOT u.io_uncertain AND u.io_claim IS NULL AND ((u.observation_version IS NULL AND o.session_id IS NULL AND (NOT u.start_reported OR u.last_report_at IS NULL OR u.last_report_at<=clock_timestamp()-interval '10 seconds')) OR (o.has_played AND o.seq>o.reported_seq)) ORDER BY u.last_report_at NULLS FIRST,u.created_at LIMIT 32"
     };
     Ok(sqlx::query(query)
         .fetch_all(pool)
@@ -173,26 +202,49 @@ pub async fn ready(pool: &PgPool, stop: bool) -> Result<Vec<(Uuid, String)>> {
 
 pub async fn claim_io(pool: &PgPool, id: Uuid, stop: bool) -> Result<Option<Claim>> {
     let token = Uuid::new_v4();
+    let capture = "io_observation_seq=(SELECT seq FROM playback_observations WHERE session_id=u.id),io_observation=(SELECT jsonb_build_object('seq',seq,'position_ms',COALESCE(position_ms,timeline_origin_ms),'paused',COALESCE((payload->>'paused')::boolean,true),'seeking',COALESCE((payload->>'seeking')::boolean,false),'buffering',COALESCE((payload->>'buffering')::boolean,false),'playback_rate',COALESCE((payload->>'playback_rate')::double precision,1),'has_played',has_played) FROM playback_observations WHERE session_id=u.id)";
     let query = if stop {
-        "UPDATE upstream_reservations u SET io_claim=$2,io_kind='stop',io_lease_until=LEAST(clock_timestamp()+interval '10 seconds',cleanup_deadline),cleanup_attempts=cleanup_attempts+1,updated_at=clock_timestamp() WHERE id=$1 AND state='closing' AND negotiation='received' AND play_session_id IS NOT NULL AND io_claim IS NULL AND cleanup_after<=clock_timestamp() AND cleanup_deadline>clock_timestamp() AND cleanup_attempts<5 RETURNING u.*,(SELECT state FROM room_snapshots WHERE room_id=u.room_id) AS room_state"
+        format!(
+            "UPDATE upstream_reservations u SET io_claim=$2,io_kind='stop',io_lease_until=LEAST(clock_timestamp()+interval '10 seconds',cleanup_deadline),cleanup_attempts=cleanup_attempts+1,{capture},updated_at=clock_timestamp() WHERE id=$1 AND state='closing' AND negotiation='received' AND play_session_id IS NOT NULL AND io_claim IS NULL AND cleanup_after<=clock_timestamp() AND cleanup_deadline>clock_timestamp() AND cleanup_attempts<5 RETURNING u.*,(SELECT state FROM room_snapshots WHERE room_id=u.room_id) AS room_state,EXTRACT(EPOCH FROM(cleanup_deadline-clock_timestamp()))::double precision*1000 AS cleanup_remaining_ms"
+        )
     } else {
-        "UPDATE upstream_reservations u SET io_claim=$2,io_kind=CASE WHEN start_reported THEN 'progress' ELSE 'start' END,io_lease_until=clock_timestamp()+interval '10 seconds',updated_at=clock_timestamp() WHERE id=$1 AND state='active' AND NOT io_uncertain AND io_claim IS NULL AND (NOT start_reported OR last_report_at IS NULL OR last_report_at<=clock_timestamp()-interval '10 seconds') AND EXISTS(SELECT 1 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN room_members m ON m.room_id=p.room_id AND m.user_id=p.user_id WHERE p.id=u.id AND NOT p.stopped AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation) RETURNING u.*,(SELECT state FROM room_snapshots WHERE room_id=u.room_id) AS room_state"
+        format!(
+            "UPDATE upstream_reservations u SET io_claim=$2,io_kind=CASE WHEN start_reported THEN 'progress' ELSE 'start' END,io_lease_until=clock_timestamp()+interval '10 seconds',{capture},updated_at=clock_timestamp() WHERE id=$1 AND state='active' AND NOT io_uncertain AND io_claim IS NULL AND ((u.observation_version IS NULL AND NOT EXISTS(SELECT 1 FROM playback_observations o WHERE o.session_id=u.id) AND (NOT start_reported OR last_report_at IS NULL OR last_report_at<=clock_timestamp()-interval '10 seconds')) OR EXISTS(SELECT 1 FROM playback_observations o WHERE o.session_id=u.id AND o.has_played AND o.seq>o.reported_seq)) AND EXISTS(SELECT 1 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN room_members m ON m.room_id=p.room_id AND m.user_id=p.user_id WHERE p.id=u.id AND NOT p.stopped AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation) RETURNING u.*,(SELECT state FROM room_snapshots WHERE room_id=u.room_id) AS room_state,NULL::double precision AS cleanup_remaining_ms"
+        )
     };
-    Ok(sqlx::query(query)
+    let claimed_at = std::time::Instant::now();
+    Ok(sqlx::query(&query)
         .bind(id)
         .bind(token)
         .fetch_optional(pool)
         .await?
         .map(|r| {
             let event: String = r.get("io_kind");
-            Claim::from_row(r, token, &event)
+            Claim::from_row(r, token, &event, claimed_at)
         }))
 }
 
 pub async fn finish_report(pool: &PgPool, claim: &Claim, successful: bool) -> Result<bool> {
-    let n=sqlx::query("UPDATE upstream_reservations SET start_reported=start_reported OR ($3 AND io_kind='start'),io_uncertain=io_uncertain OR NOT $3,last_error=CASE WHEN $3 THEN last_error ELSE 'upstream_io_uncertain' END,last_report_at=clock_timestamp(),io_claim=NULL,io_kind=NULL,io_lease_until=NULL,updated_at=clock_timestamp() WHERE id=$1 AND io_claim=$2 AND io_kind IN('start','progress') AND io_lease_until>clock_timestamp()")
-        .bind(claim.id).bind(claim.token).bind(successful).execute(pool).await?;
-    Ok(n.rows_affected() == 1)
+    let mut tx = pool.begin().await?;
+    // Same observation-before-ledger order as final sample plus Stop. No room
+    // or grant lock is held while executing upstream I/O.
+    sqlx::query("SELECT session_id FROM playback_observations WHERE session_id=$1 FOR UPDATE")
+        .bind(claim.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let n=sqlx::query("UPDATE upstream_reservations SET start_reported=start_reported OR ($3 AND io_kind='start'),io_uncertain=io_uncertain OR NOT $3,last_error=CASE WHEN $3 THEN last_error ELSE 'upstream_io_uncertain' END,last_report_at=clock_timestamp(),io_claim=NULL,io_kind=NULL,io_lease_until=NULL,io_observation_seq=NULL,io_observation=NULL,updated_at=clock_timestamp() WHERE id=$1 AND io_claim=$2 AND io_kind IN('start','progress') AND io_lease_until>clock_timestamp() AND io_observation_seq IS NOT DISTINCT FROM $4")
+        .bind(claim.id).bind(claim.token).bind(successful).bind(claim.observation_seq.map(|seq| seq as i64))
+        .execute(&mut *tx).await?;
+    let matched = n.rows_affected() == 1;
+    if matched
+        && successful
+        && let Some(seq) = claim.observation_seq
+    {
+        sqlx::query("UPDATE playback_observations SET reported_seq=GREATEST(reported_seq,$2) WHERE session_id=$1 AND seq>=$2")
+            .bind(claim.id).bind(seq as i64).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(matched)
 }
 
 pub async fn finish_stop(
@@ -201,7 +253,7 @@ pub async fn finish_stop(
     stopped: bool,
     encoding_stopped: bool,
 ) -> Result<bool> {
-    let n=sqlx::query("UPDATE upstream_reservations SET stop_confirmed=stop_confirmed OR $3,encoding_stop_confirmed=encoding_stop_confirmed OR $4,state=CASE WHEN $3 AND (kind='jellyfin' OR $4) AND NOT io_uncertain THEN 'closed' WHEN $3 AND (kind='jellyfin' OR $4) AND io_uncertain THEN 'cleanup_failed' WHEN cleanup_attempts>=5 OR cleanup_deadline<=clock_timestamp() THEN 'cleanup_failed' ELSE 'closing' END,closed_at=CASE WHEN $3 AND (kind='jellyfin' OR $4) AND NOT io_uncertain THEN clock_timestamp() ELSE NULL END,last_error=CASE WHEN io_uncertain THEN 'upstream_io_uncertain' WHEN $3 AND (kind='jellyfin' OR $4) THEN NULL ELSE 'upstream_stop_failed' END,cleanup_after=clock_timestamp()+make_interval(secs=>LEAST(16,power(2,cleanup_attempts)::integer)),io_claim=NULL,io_kind=NULL,io_lease_until=NULL,updated_at=clock_timestamp() WHERE id=$1 AND io_claim=$2 AND io_kind='stop' AND io_lease_until>clock_timestamp()")
+    let n=sqlx::query("UPDATE upstream_reservations SET stop_confirmed=stop_confirmed OR $3,encoding_stop_confirmed=encoding_stop_confirmed OR $4,state=CASE WHEN $3 AND (kind='jellyfin' OR $4) AND NOT io_uncertain THEN 'closed' WHEN $3 AND (kind='jellyfin' OR $4) AND io_uncertain THEN 'cleanup_failed' WHEN cleanup_attempts>=5 OR cleanup_deadline<=clock_timestamp() THEN 'cleanup_failed' ELSE 'closing' END,closed_at=CASE WHEN $3 AND (kind='jellyfin' OR $4) AND NOT io_uncertain THEN clock_timestamp() ELSE NULL END,last_error=CASE WHEN io_uncertain THEN 'upstream_io_uncertain' WHEN $3 AND (kind='jellyfin' OR $4) THEN NULL ELSE 'upstream_stop_failed' END,cleanup_after=clock_timestamp()+make_interval(secs=>LEAST(16,power(2,cleanup_attempts)::integer)),io_claim=NULL,io_kind=NULL,io_lease_until=NULL,io_observation_seq=NULL,io_observation=NULL,updated_at=clock_timestamp() WHERE id=$1 AND io_claim=$2 AND io_kind='stop' AND io_lease_until>clock_timestamp()")
         .bind(claim.id).bind(claim.token).bind(stopped).bind(encoding_stopped).execute(pool).await?;
     Ok(n.rows_affected() == 1)
 }
