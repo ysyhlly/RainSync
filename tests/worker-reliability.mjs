@@ -80,6 +80,10 @@ try {
     await copyFile(resolve(process.env.CARGO_TARGET_DIR ?? "target", "debug/examples", `${name}${process.platform === "win32" ? ".exe" : ""}`), path);
     return { name, path, sha256: await sha256(path) };
   }));
+  // Package-scoped tests can relink the non-test Worker with a narrower
+  // dependency feature set. Keep the owned test/example copies, then restore
+  // the workspace services before later fixtures verify their build binding.
+  await execute("cargo", ["build", "--workspace", "--bins", "--examples", "--locked", "-j1"], "workspace-build", process.env, 300000);
   await db.start();
   report.postgresql = db.diagnostics();
   assert.equal(db.database, `rainsync_${id}`);

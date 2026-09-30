@@ -1,4 +1,4 @@
-import { ref, nextTick, onScopeDispose, type Ref } from "vue";
+import { ref, nextTick, onScopeDispose, watch, type Ref } from "vue";
 import Hls from "hls.js";
 import {
   detectCapabilities,
@@ -18,6 +18,7 @@ import type {
   PlaybackRequest,
   PlaybackReadiness,
   PlaybackCandidateSet,
+  PlaybackMetricsReceipt,
 } from "../../../../../packages/protocol";
 import { RequestFailure } from "../../errors";
 import { StaleIdentity } from "../../shared/api/client";
@@ -28,6 +29,16 @@ import {
 } from "../../playback-request";
 import type { useSession } from "../auth/session.store";
 import { bindPlaybackObservations } from "./observation-binding";
+import {
+  createPlaybackMetrics,
+  PLAYBACK_METRICS_MAX_ELAPSED_MS,
+  type PlaybackMetrics,
+  type PlaybackMetricsFence,
+  type PlaybackMetricsOrigin,
+  type PlaybackMetricsSnapshot,
+} from "./playback-metrics";
+import { bindPlaybackMetricEvents } from "./metrics-binding";
+import { createPlaybackMetricsSender } from "./metrics-sender";
 
 export function createPlaybackRuntime(ctx: {
   session: ReturnType<typeof useSession>;
@@ -71,6 +82,176 @@ export function createPlaybackRuntime(ctx: {
   let playbackUser: string | undefined;
   let playbackEpoch: number | undefined;
   let observations: ReturnType<typeof bindPlaybackObservations> | undefined;
+  type MetricIntent = {
+    t0: number;
+    identity: object;
+    fence: PlaybackMetricsFence;
+    startGeneration: number;
+    origin: PlaybackMetricsOrigin;
+    user: string | undefined;
+    epoch: number;
+    room: string;
+    media: number;
+    element?: HTMLVideoElement;
+    meter?: PlaybackMetrics;
+    last?: PlaybackMetricsSnapshot;
+    disabled: boolean;
+    enabledPlan?: PlaybackPlan;
+  };
+  let metricIntent: MetricIntent | undefined;
+  let metricSource: ReturnType<typeof bindPlaybackMetricEvents> | undefined;
+  let pendingLoad:
+    | {
+        metrics: MetricIntent;
+        intent: ReturnType<PlaybackPlanGenerations["next"]>;
+        failed: string[];
+      }
+    | undefined;
+  const metricSender = createPlaybackMetricsSender((binding, body, signal) =>
+    session.api<PlaybackMetricsReceipt>(
+      `/playback-sessions/${binding.sessionId}/metrics`,
+      "POST",
+      body,
+      signal,
+    ),
+  );
+  const foreground = () =>
+    typeof document === "undefined" || document.visibilityState !== "hidden";
+  const metricCurrent = (m: MetricIntent) =>
+    metricIntent === m &&
+    roomIsActive() &&
+    session.user?.id === m.user &&
+    session.epoch === m.epoch &&
+    state.value?.room_id === m.room &&
+    state.value?.media_generation === m.media &&
+    (!m.element || video.value === m.element);
+  const metricState = () => ({
+    foreground: foreground(),
+    expectedPlaying: state.value?.playback_status === "playing",
+    autoplayBlocked: blocked.value,
+    buffering: !!generationWait || recoveringHls,
+  });
+  const metricRead = () =>
+    metricSource?.read() ?? {
+      ...metricState(),
+      paused: video.value?.paused ?? true,
+      seeking: video.value?.seeking ?? false,
+    };
+  function observeMetrics() {
+    const m = metricIntent;
+    if (m && metricCurrent(m)) m.meter?.observe(m.fence, metricRead());
+  }
+  function finishMetrics() {
+    const m = metricIntent;
+    if (m && metricCurrent(m)) {
+      const final = m.meter?.dispose(m.fence, metricRead());
+      if (final && !m.disabled) metricSender.offer(final);
+    }
+    metricIntent = undefined;
+    pendingLoad = undefined;
+    metricSource?.stop();
+    metricSource = undefined;
+    metricSender.unbind(true);
+  }
+  function advanceMetricAttempt(m: MetricIntent) {
+    metricSource?.stop();
+    metricSource = undefined;
+    m.fence = { identity: m.identity, generation: m.fence.generation + 1 };
+    m.meter?.beginAttempt(m.fence, metricRead());
+  }
+  function bindMetricSource(
+    p: PlaybackPlan,
+    el: HTMLVideoElement,
+    restart = false,
+  ) {
+    const m = metricIntent;
+    if (!m?.meter || !metricCurrent(m) || m.enabledPlan !== p) return;
+    if (restart) advanceMetricAttempt(m);
+    const fence = m.fence;
+    metricSource = bindPlaybackMetricEvents({
+      element: el,
+      meter: m.meter,
+      fence,
+      current: () =>
+        metricCurrent(m) &&
+        m.fence === fence &&
+        currentPlan(p) &&
+        video.value === el,
+      state: metricState,
+    });
+  }
+  function bindMetricGrant(p: PlaybackPlan) {
+    const m = metricIntent,
+      grant = p.playback_metrics;
+    if (
+      !m ||
+      !metricCurrent(m) ||
+      m.disabled ||
+      p.playback_metrics_version !== 1 ||
+      !grant ||
+      grant.closed !== false ||
+      grant.meter_start_generation !== m.startGeneration ||
+      grant.startup_origin !== m.origin ||
+      !Number.isSafeInteger(grant.metrics_seq) ||
+      grant.metrics_seq < 0 ||
+      grant.metrics_seq > (m.last?.seq ?? 0)
+    ) {
+      if (
+        m &&
+        grant &&
+        (grant.closed || grant.metrics_seq > (m.last?.seq ?? 0))
+      )
+        m.disabled = true;
+      return;
+    }
+    m.enabledPlan = p;
+    metricSender.bind({
+      sessionId: p.session_id,
+      planGeneration: p.plan_generation!,
+      mediaGeneration: p.media_generation,
+      meterStartGeneration: m.startGeneration,
+      startupOrigin: m.origin,
+      current: () => metricCurrent(m) && currentPlan(p),
+    });
+  }
+  function sampleMetrics() {
+    const m = metricIntent;
+    if (!m || !metricCurrent(m)) return;
+    if (
+      Math.floor(performance.now()) - Math.floor(m.t0) >
+      PLAYBACK_METRICS_MAX_ELAPSED_MS
+    ) {
+      m.disabled = true;
+      metricSender.unbind();
+      metricSource?.stop();
+      metricSource = undefined;
+      return;
+    }
+    metricSource?.progress();
+    const snapshot = m.meter?.sample(m.fence, metricRead());
+    if (snapshot) {
+      m.last = snapshot;
+      if (!m.disabled) metricSender.offer(snapshot);
+    }
+  }
+  // Accepted intent/visibility edges remain separate from observation-v1 flags.
+  watch(
+    () => [
+      session.epoch,
+      session.user?.id,
+      roomIsActive(),
+      state.value?.room_id,
+      state.value?.media_generation,
+      state.value?.playback_status,
+    ],
+    () => {
+      if (metricIntent && !metricCurrent(metricIntent)) finishMetrics();
+      else observeMetrics();
+    },
+    { flush: "sync" },
+  );
+  if (typeof document !== "undefined")
+    document.addEventListener("visibilitychange", observeMetrics);
   let checkingEnd = false,
     endAttempt = -Infinity;
   async function completed() {
@@ -191,6 +372,11 @@ export function createPlaybackRuntime(ctx: {
     return readiness;
   }
   async function stopPlayback() {
+    // Grant teardown alone (including automatic fallback) never ends its meter.
+    metricSource?.stop();
+    metricSource = undefined;
+    metricSender.unbind(true);
+    if (metricIntent) metricIntent.enabledPlan = undefined;
     // Capture the old element before teardown changes its time or identity.
     const finalObservation = observations?.stop();
     observations = undefined;
@@ -250,25 +436,77 @@ export function createPlaybackRuntime(ctx: {
       beforeCleanup ? Promise.resolve() : deletePrevious(),
     ]);
   }
-  async function loadMedia(failedCandidates: string[] = []) {
+  function beginLoad(origin: PlaybackMetricsOrigin) {
     if (!roomIsActive()) return;
     const s = state.value;
     if (!s?.media_id) return;
+    const t0 = performance.now();
+    finishMetrics();
+    ++loadSerial;
+    const intent = planGenerations.next();
+    const identity = {};
+    const m: MetricIntent = {
+      t0,
+      identity,
+      fence: { identity, generation: 1 },
+      startGeneration: intent.plan_generation,
+      origin,
+      user: session.user?.id,
+      epoch: session.epoch,
+      room: s.room_id,
+      media: s.media_generation,
+      element: video.value,
+      disabled: false,
+    };
+    metricIntent = m;
+    m.meter = createPlaybackMetrics({
+      t0: m.t0,
+      startupOrigin: origin,
+      fence: m.fence,
+      current: () => (metricCurrent(m) ? m.fence : undefined),
+      initial: metricRead(),
+    });
+    return loadAttempt([], intent, m);
+  }
+  async function loadMedia() {
+    await beginLoad("user_intent");
+  }
+  async function fallbackLoad(failed: string[] = []) {
+    const m = metricIntent;
+    if (!m || !metricCurrent(m)) return;
+    const intent = planGenerations.next();
+    advanceMetricAttempt(m);
+    await loadAttempt(failed, intent, m);
+  }
+  async function loadAttempt(
+    failedCandidates: string[],
+    intent: ReturnType<PlaybackPlanGenerations["next"]>,
+    metrics: MetricIntent,
+  ) {
+    if (!metricCurrent(metrics)) return;
+    const s = state.value!;
+    pendingLoad = { metrics, intent, failed: failedCandidates };
     if (!clock.ready) {
       clockAction = "load";
       return;
     }
     const serial = ++loadSerial;
-    const intent = planGenerations.next();
     try {
       await stopPlayback();
       await nextTick();
-      if (serial !== loadSerial || !roomIsActive() || !video.value) return;
+      if (
+        serial !== loadSerial ||
+        !metricCurrent(metrics) ||
+        !roomIsActive() ||
+        !video.value
+      )
+        return;
       if (!clock.ready) {
         clockAction = "load";
         return;
       }
       const element = video.value;
+      metrics.element = element;
       const identity = session.epoch;
       waiting.value = true;
       const probe = new AbortController();
@@ -310,6 +548,7 @@ export function createPlaybackRuntime(ctx: {
       // for an old identity, element or media after a newer load/reset wins.
       if (
         serial !== loadSerial ||
+        !metricCurrent(metrics) ||
         session.epoch !== identity ||
         !roomIsActive() ||
         probe.signal.aborted ||
@@ -333,6 +572,11 @@ export function createPlaybackRuntime(ctx: {
         capabilities,
         ...(candidateReport ? { candidate_report: candidateReport } : {}),
         observation_version: 1,
+        playback_metrics_version: 1,
+        playback_metrics: {
+          meter_start_generation: metrics.startGeneration,
+          startup_origin: metrics.origin,
+        },
       };
       waiting.value = true;
       const p = await requests().prepare(request, () =>
@@ -340,6 +584,7 @@ export function createPlaybackRuntime(ctx: {
       );
       if (
         serial !== loadSerial ||
+        !metricCurrent(metrics) ||
         !roomIsActive() ||
         session.epoch !== identity ||
         video.value !== element ||
@@ -351,6 +596,7 @@ export function createPlaybackRuntime(ctx: {
         return;
       }
       plan = p;
+      pendingLoad = undefined;
       sessionId.value = p.session_id;
       tracks.value = p.audio_tracks;
       subtitles.value = p.subtitle_tracks;
@@ -358,6 +604,7 @@ export function createPlaybackRuntime(ctx: {
         subtitleIndex.value = undefined;
       await nextTick();
       if (serial !== loadSerial || !currentPlan(p)) return;
+      bindMetricGrant(p);
       applySubtitles();
       const el = video.value;
       if (p.observation_version === 1) {
@@ -423,7 +670,7 @@ export function createPlaybackRuntime(ctx: {
           return false;
         // Only real decoder failures may move to another route. Authorization,
         // network errors and ordinary timeouts never trigger extra transcoding.
-        void run(() => loadMedia([...failedCandidates, candidate]));
+        void run(() => fallbackLoad([...failedCandidates, candidate]));
         return true;
       };
       const recover = () => {
@@ -445,6 +692,7 @@ export function createPlaybackRuntime(ctx: {
         const position = playbackPosition();
         if (mse && hls) {
           hls.stopLoad();
+          bindMetricSource(p, el, true);
           hls.config.startPosition = position;
           hls.loadSource(p.playback_url);
           hls.startLoad(position);
@@ -452,6 +700,7 @@ export function createPlaybackRuntime(ctx: {
           // Native media errors do not expose the failing HTTP status. Retry the
           // unfenced entry with a bounded cache-busting URL and room-time fragment.
           const url = new URL(p.playback_url, location.href);
+          bindMetricSource(p, el, true);
           url.searchParams.set("recovery", String(recoveries));
           url.hash = `t=${position}`;
           el.src = url.href;
@@ -487,8 +736,10 @@ export function createPlaybackRuntime(ctx: {
             recoveringHls = true;
             waiting.value = true;
             el.pause();
+            metricSource?.stop();
             el.removeAttribute("src");
             el.load();
+            bindMetricSource(p, el, true);
             attachHls();
             return;
           }
@@ -527,6 +778,7 @@ export function createPlaybackRuntime(ctx: {
           }
         });
       };
+      bindMetricSource(p, el);
       if (mse) attachHls();
       else el.src = p.playback_url;
       if (p.selected_candidate_id) {
@@ -569,6 +821,7 @@ export function createPlaybackRuntime(ctx: {
     if (generationWait || generationWaitFailed) return;
     const controller = new AbortController();
     generationWait = controller;
+    observeMetrics();
     waiting.value = true;
     video.value?.pause();
     try {
@@ -604,6 +857,7 @@ export function createPlaybackRuntime(ctx: {
         // applyState seeks once the local manifest covers the room position.
         hls.startLoad(position);
       } else if (video.value) {
+        bindMetricSource(p, video.value, true);
         const url = new URL(p.playback_url, location.href);
         url.hash = `t=${position}`;
         video.value.src = url.href;
@@ -617,6 +871,7 @@ export function createPlaybackRuntime(ctx: {
       throw e;
     } finally {
       if (generationWait === controller) generationWait = undefined;
+      observeMetrics();
     }
   }
   function availableRange(el: HTMLVideoElement): TimeRanges {
@@ -625,6 +880,7 @@ export function createPlaybackRuntime(ctx: {
     return el.seekable.length ? el.seekable : el.buffered;
   }
   async function applyState(force = false, userSeek = false) {
+    observeMetrics();
     if (!roomIsActive()) return;
     const s = state.value,
       el = video.value;
@@ -683,7 +939,8 @@ export function createPlaybackRuntime(ctx: {
       (relative < -0.5 ||
         (userSeek && Number.isFinite(end) && expected > end + 0.1))
     ) {
-      await loadMedia();
+      if (userSeek) await beginLoad("automatic_load");
+      else await fallbackLoad();
       return;
     }
     if (force || s.playback_status !== "playing") {
@@ -695,9 +952,11 @@ export function createPlaybackRuntime(ctx: {
           await el.play();
           if (!currentPlan(p) || !roomIsActive() || video.value !== el) return;
           blocked.value = false;
+          observeMetrics();
         } catch {
           if (!currentPlan(p) || !roomIsActive() || video.value !== el) return;
           blocked.value = true;
+          observeMetrics();
         }
     } else el.pause();
   }
@@ -714,6 +973,7 @@ export function createPlaybackRuntime(ctx: {
       }
       if (!currentPlan(p) || !roomIsActive() || video.value !== el) return;
       blocked.value = false;
+      observeMetrics();
       await applyState(true);
     }
   }
@@ -762,7 +1022,7 @@ export function createPlaybackRuntime(ctx: {
         plan.rebuild_on_seek &&
         (expected < -0.5 || expected > el.duration + 1)
       ) {
-        if (expected < -0.5) void run(loadMedia);
+        if (expected < -0.5) void run(() => fallbackLoad());
         else void run(() => applyState(true));
       } else el.currentTime = Math.max(0, expected);
     }
@@ -772,16 +1032,24 @@ export function createPlaybackRuntime(ctx: {
     if (clockAction) {
       const action = clockAction;
       clockAction = undefined;
-      void run(action === "load" ? loadMedia : () => applyState(true));
+      const pending = pendingLoad;
+      void run(
+        action === "load" && pending
+          ? () => loadAttempt(pending.failed, pending.intent, pending.metrics)
+          : () => applyState(true),
+      );
     }
   }
   function mediaChanged() {
     corrector.reset();
     audioIndex.value = undefined;
     subtitleIndex.value = undefined;
-    void run(loadMedia);
+    void run(async () => {
+      await beginLoad("automatic_load");
+    });
   }
   async function reset() {
+    finishMetrics();
     ++loadSerial;
     clockAction = undefined;
     dragging.value = false;
@@ -803,6 +1071,7 @@ export function createPlaybackRuntime(ctx: {
   }
   const timer = setInterval(tick, 500);
   const observationTimer = setInterval(() => observations?.progress(), 5000);
+  const metricsTimer = setInterval(sampleMetrics, 5000);
   const renewTimer = setInterval(() => {
     const current = plan?.session_id;
     if (current && roomIsActive())
@@ -822,8 +1091,12 @@ export function createPlaybackRuntime(ctx: {
   onScopeDispose(() => {
     clearInterval(timer);
     clearInterval(observationTimer);
+    clearInterval(metricsTimer);
     clearInterval(renewTimer);
     void reset().catch(() => {});
+    metricSender.stop();
+    if (typeof document !== "undefined")
+      document.removeEventListener("visibilitychange", observeMetrics);
   });
   return {
     video,

@@ -11,6 +11,7 @@
  */
 export const PLAYBACK_METRICS_SAMPLE_MS = 5_000;
 export const PLAYBACK_METRICS_MAX_GAP_MS = 15_000;
+export const PLAYBACK_METRICS_MAX_ELAPSED_MS = 604_800_000;
 
 export type PlaybackMetricsFence = Readonly<{
   identity: object;
@@ -110,6 +111,8 @@ export function createPlaybackMetrics(config: PlaybackMetricsConfig) {
     !validTime(config.t0) ||
     !validTime(created) ||
     config.t0 > created ||
+    Math.floor(created) - Math.floor(config.t0) >
+      PLAYBACK_METRICS_MAX_ELAPSED_MS ||
     !validFence(config.fence) ||
     !validObservation(config.initial) ||
     !["user_intent", "automatic_load"].includes(config.startupOrigin)
@@ -160,6 +163,13 @@ export function createPlaybackMetrics(config: PlaybackMetricsConfig) {
   function time(): number | undefined {
     try {
       const value = clock();
+      if (
+        validTime(value) &&
+        Math.floor(value) - Math.floor(t0) > PLAYBACK_METRICS_MAX_ELAPSED_MS
+      ) {
+        active = false;
+        return undefined;
+      }
       return validTime(value) && value >= reliableAt ? value : undefined;
     } catch {
       return undefined;

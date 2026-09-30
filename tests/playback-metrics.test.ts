@@ -2,6 +2,7 @@ import { expect, test } from "vitest";
 import {
   createPlaybackMetrics,
   PLAYBACK_METRICS_MAX_GAP_MS,
+  PLAYBACK_METRICS_MAX_ELAPSED_MS,
   PLAYBACK_METRICS_SAMPLE_MS,
   type PlaybackMetricsFence,
   type PlaybackMetricsObservation,
@@ -465,16 +466,17 @@ test("throwing clock/current suppliers fail closed without changing coverage or 
   conserved(snapshot);
 });
 
-test("maximum accepted time retains exact bounded totals and rejects overflow", () => {
+test("seven-day horizon accepts its exact boundary and permanently stops beyond it", () => {
   const { meter, fence, at } = setup();
-  at(Number.MAX_SAFE_INTEGER);
+  at(PLAYBACK_METRICS_MAX_ELAPSED_MS);
   const snapshot = meter.sample(fence, playing)!;
-  expect(snapshot.totals.unobserved_ms).toBe(Number.MAX_SAFE_INTEGER);
+  expect(snapshot.totals.unobserved_ms).toBe(PLAYBACK_METRICS_MAX_ELAPSED_MS);
   conserved(snapshot);
-  at(Number.MAX_SAFE_INTEGER + 1);
+  at(PLAYBACK_METRICS_MAX_ELAPSED_MS + 1);
   expect(meter.dispose(fence, playing)).toBeUndefined();
-  at(Number.MAX_SAFE_INTEGER);
-  conserved(meter.dispose(fence, playing)!);
+  at(PLAYBACK_METRICS_MAX_ELAPSED_MS);
+  expect(meter.dispose(fence, playing)).toBeUndefined();
+  expect(meter.observe(fence, playing)).toBe(false);
 });
 
 test("one meter retains finite state across many events without identity/sample history", () => {
