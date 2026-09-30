@@ -130,17 +130,30 @@ export function createPlaybackRuntime(ctx: {
     }
     return playbackRequests;
   }
-  function readReadiness(
+  async function readReadiness(
     id: string,
     signal: AbortSignal,
     relativePosition = 0,
-  ) {
-    return session.api<PlaybackReadiness>(
+  ): Promise<PlaybackReadiness> {
+    const readiness = await session.api<PlaybackReadiness>(
       `/playback-sessions/${id}?relative_position_ms=${encodeURIComponent(relativePosition)}`,
       "GET",
       undefined,
       signal,
     );
+    // A running EVENT prefix needs one whole segment ahead of the room clock.
+    // Keep polling the real position; a complete or legacy response needs no lead.
+    if (
+      state.value?.playback_status === "playing" &&
+      readiness.status === "ready" &&
+      readiness.complete === false &&
+      readiness.available_until_ms != null &&
+      Number.isFinite(readiness.available_until_ms) &&
+      readiness.available_until_ms - relativePosition < 4_000
+    ) {
+      return { ...readiness, status: "preparing" };
+    }
+    return readiness;
   }
   async function stopPlayback() {
     generationWait?.abort();
@@ -397,9 +410,8 @@ export function createPlaybackRuntime(ctx: {
       );
       recoveringHls = true;
       if (hls) {
-        hls.stopLoad();
-        hls.config.startPosition = position;
-        hls.loadSource(p.playback_url);
+        // The same attempt grows through EVENT polling. Retain its MSE buffers;
+        // applyState seeks once the local manifest covers the room position.
         hls.startLoad(position);
       } else if (video.value) {
         const url = new URL(p.playback_url, location.href);

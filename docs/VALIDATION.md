@@ -1,5 +1,33 @@
 # 本轮验证记录
 
+## 2026-09-30：增长清单播放恢复诊断
+
+B 指定前端的严格 NAS 九十秒短测失败，报告 `B/source/.runtime/nas-soak/rainsync-soak-f332b580/report.json`：实际呈现 512/899.52 帧（56.92%），缓冲 39.698 秒（44.1%），同方案/同 attempt 出现 23 次 MSE 重建；首帧约 100 秒、停止约 1.763 秒完成释放。后续活入口+B 镜像的 1.10 读取速率诊断在 64.852 秒失败，报告 `.runtime/nas-soak/rainsync-soak-9a54b4f5/report.json`：累计真实呈现帧仍不足、缓冲 20.152 秒（31.07%），17 次 MSE 重建，停止约 3.787 秒释放。两轮源输入持续活跃，播放会话和任务 attempt 均为 1，没有致命 HLS 错误或 ended；不能把媒体时间前进当成连续呈现通过。
+
+诊断捕获完整因果链：新分片已 BUFFERED，readiness 返回同 attempt 的 ready/complete=false，`waitForGenerated` 随即对相同 URL 调用 `loadSource`，hls.js detach MediaSource，原生计数归零。后端所有公开清单均为 growing EVENT，未误标完整。活前端改为保留同 attempt 的 Hls/MSE/缓冲，继续清单轮询；正在播放且未完整的任务须有一个四秒分片的公开余量才结束准备等待，查询与房间目标时间保持真实位置。409 换代恢复仍保留原有限重建路径。构建及 58 项单元测试通过；新增浏览器增长回归继续，尚未冻结 C 或启动两小时。
+
+观影入口改用 rVFC 的实际 mediaTime，并保留 DOM currentTime、呈现时间和计数重置证据，避免 MSE 重载瞬态 DOM=0 造成错误时间回退判断。实际呈现至少 95%、原生掉帧最多 2%、首帧与五秒释放门槛均未下调；缓冲时长和比例如实记录，原入口未设独立缓冲比例门槛。名义读取 1.10 下，上一轮实际公开区间增长约 1.044 倍；读取设置不能代替实际呈现证明。
+
+活前端修正+B 不可变镜像的严格九十秒诊断通过，报告 `.runtime/nas-soak/rainsync-soak-57c1b86b/report.json`：首帧 88.560 秒，实际呈现 873/899.523 帧（97.05%），掉帧 3/876（0.34%），缓冲 2.733 秒（3.04%）；只有一次初始 loadSource/attach，没有 detach、计数重置或新播放方案。连续观察真实输入/有效租约/源句柄与字节增长，任务 attempt 1；停止后 2.784 秒释放全部三条预览/探测/播放传输、源句柄和 FFmpeg，清理通过。Agent RSS/FD 均未增长，Worker 约 1.46MiB，Server 约 4KiB。此轮是活源码诊断，不能代替 C 冻结绑定或两小时门槛。
+
+修后全部浏览器文件分别验证：其余十五文件 120 项通过、两项移动不适用跳过（1.6 分钟），报告 `.runtime/frontend-merge/playback-growth/other-browser/playwright-report/index.html`；恢复文件桌面/移动尺寸共 32 项通过（30.7 秒），报告 `.runtime/frontend-growth-regression-final/playwright-report/index.html`。新增组件回归真实 GET/解析三轮 EVENT 追加，验证初次和增长时四秒余量、同 Hls 与实际 MediaSource 对象身份、零多余 loadSource/detach/准备请求/END_MEDIA，并继续四个实际 HTTP 409 验证原三次换代重建上限。该 Hls 替身不解码，真实呈现证据来自上面的 NAS 诊断。恢复文件 SHA-256 `3ce139024075c05dffe4fce3163bc08fdc6fa952103a4f84741acaef94434fa3`。
+
+原生 `tests/registration.mjs` 在指定分支配套服务端通过，原始记录 `.runtime/frontend-merge/7f17ab7/logs/frontend-registration.{json,log}`：邀请注册/自动会话/资料/聊天、非消耗校验、响应丢失、事务回滚、同码竞争、撤销/过期锁竞争、用户名不可变、普通身份、Origin/JSON、重启持久共享限速和可信代理链。独立 `account-rules.mjs`（15.4 秒）、`registration-invites.mjs`（8.8 秒）、`avatar-upload.mjs`（16.9 秒）也通过，日志同目录 `frontend-account-rules`、`frontend-registration-invites`、`frontend-avatar-upload`：真实规则和密码空格、普通角色、邀请批量/幂等/回滚/撤销/权限/重启、实际 PNG→512×512 WebP 编解码、畸形/动画/尺寸拒绝、头像版本与操作幂等/并发/tombstone/超时回收、昵称与重启持久化。原生头像仅在子进程 PATH 使用已验证的 FFmpeg 9.0.2。
+
+`avatar-container.mjs` 在 B 的不可变 Linux Server 镜像另行通过（6.3 秒），原始日志同目录 `frontend-avatar-container`：透明头像和详细大输出均为完整 RIFF WebP，实际容器 FFmpeg 5.1.9。两平台头像结果分别记录；隔离测试容器已清理。
+
+## 2026-09-30：候选 B 与验证入口预算
+
+B 已从 `7271c78` 冻结并真实构建，`candidate.json` 位于 `.runtime/validation-candidates/w07-w08-20260930-b`。镜像 `sha256:f75d4095c8464f64ad8fb49e5f1d9499a98cfd3026369c7edfc63da40322ff30`；全源码摘要 `82cef71aceb27c1707919fa98acb25db9c30eb512dbc2489dc3372d40b4321d3`，生产摘要 `2d9365348a8c617476aa32bd0f77a3f982e1e51afea10ddb26988af26056165d`，前端摘要 `1183cbb025efa4e876a73efc4c2cd7f3f95c729c188b25625bb9496a7663e790`。前端分支固定 `7f17ab7`；独立 verify 核对源码、只读 A vendor、五个镜像 label 与三份实际二进制哈希全部通过。容器 FFmpeg 5.1.9-0+deb12u1。
+
+B 控制短测在正常 API 账号准备阶段失败（`B/source/.runtime/control-load/rainsync-load-32d5dccc/failed-report.json`）：五路同时建号/登录触发新后端默认共享密码哈希并发预算，接口返回 429，尚未进入持续控制测量。隔离容器已清理。活入口改为测量前串行准备账号；测量仍为 100 独立身份，次数/调度/ACK/事件/数据库门槛不变，生产预算未修改。B 冻结副本保留原样，后续 C 需重新绑定全源码。
+
+修正后的活控制入口使用 B 不可变镜像完成两种拓扑二十五秒短测，报告 `.runtime/control-load/rainsync-load-83746a94/report.json`：100 个独立正常 API 身份，十房×十人 ACK p95 25.9ms/30 条命令，五十房×两人 37.0ms/150 条命令，动作/全状态/事件/持久化/调度与清理通过。活源码仅作为此轮诊断，不代替 C 全清单绑定。真实 Ctrl+C 在排队 ACK 期间通过，报告 `.runtime/control-interrupt/82883d59-f248-41c3-926a-b9cebc1ed173/report.json`：约 1647ms 非零退出，failed 测量报告且资源全部清理；每拓扑六十分钟仍待运行。
+
+B 强化背压五场景通过：健康信号 21 次、43.753 秒存活，恢复准确交付 64MiB；Close 前和控制断开前均先收到健康信号，源句柄分别 167ms/172ms 释放，控制重连约 2.107 秒；停健康信号后约 29.306 秒退出。绑定证据 `.runtime/candidate-backpressure/132afbcb-8190-4223-8ebb-30084d633d82/binding.json` 及 `B/source/.runtime/agent-backpressure/rainsync-agent-backpressure-6c8f8c7f/report.json`。前后完整冻结候选核查通过，容器/volume 已清理。
+
+隔离准备 Windows FFmpeg/FFprobe 9.0.2 及公开 SHA-256 后，仅设置本次子进程 PATH；真实原生 `media-preview-sources.mjs`（107 秒）及 `playlist-real.mjs`（29.8 秒）均通过。前者覆盖本地/HTTP/HLS/NAS、错误与恢复、撤销及没有播放会话；上游海报是协议夹具。后者用真实 Chromium 自然结束后自动下一项、循环及空列表重播，保持同一 video 和单个 WebSocket。完整证据 `.runtime/tooling/windows-ffmpeg/ffmpeg-9.0.2-1f9837cfbc4b44fab9db3ad46b57f1b6/native-validation-report.json` 保存下载来源/摘要、实际版本与原生二进制前后哈希；两轮容器已清理，未改全局 PATH。
+
 ## 2026-09-30：指定前端分支集成
 
 `git fetch origin` 后 `origin/main` 仍为 `d699418`；指定前端为 `origin/front/rainsync-implementation`，提交 `7f17ab7`。先将 NAS 索引、源版本、执行取消和持续验证入口保存为本地检查点 `8b3d5de`，再合入前端及配套服务端/Worker 接口。合并冲突集中在 Agent、Server 索引控制和输入回归入口；保留现有 ACK 分页、周期扫描、全局扫描许可、单文件隔离及目录失败回滚，补入 HELLO/SCAN/SCAN_BUSY，并让匹配的 INDEX_ABORT_ACK 结束手工扫描为 failed。

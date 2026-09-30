@@ -33,6 +33,7 @@ const duration = Number(options["duration-seconds"] ?? 7200);
 const sampleSeconds = Number(
   options["sample-seconds"] ?? (duration < 120 ? 5 : 30),
 );
+const controlledReadrate = 1.1;
 assert.ok(Number.isInteger(duration) && duration >= 10 && duration <= 86400);
 assert.ok(
   Number.isInteger(sampleSeconds) && sampleSeconds >= 2 && sampleSeconds <= 30,
@@ -426,7 +427,10 @@ const report = {
   database_image: dbImage,
   started_at: new Date().toISOString(),
   pacing: {
-    ffmpeg_input_readrate: 1.05,
+    ffmpeg_input_readrate: controlledReadrate,
+    generation_headroom_fraction: controlledReadrate - 1,
+    reason:
+      "near-real-time generation with bounded startup headroom while the normal CHANGE_MEDIA room clock is already Playing",
     applies_to: "real HLS encoding input only",
   },
   thresholds: {
@@ -568,7 +572,7 @@ await writeFile(
   `#!/bin/sh
 for last do :; done
 case "$last" in
-  */index.m3u8) exec /usr/bin/ffmpeg -readrate 1.05 "$@" ;;
+  */index.m3u8) exec /usr/bin/ffmpeg -readrate ${controlledReadrate.toFixed(2)} "$@" ;;
   *) exec /usr/bin/ffmpeg "$@" ;;
 esac
 `,
@@ -681,7 +685,11 @@ try {
   // seeks to turn a short clip into an apparent two-hour observation.
   // Even a short smoke fixture must exceed socket/read-ahead buffers, otherwise
   // it would finish NAS transmission before the first browser observation.
-  const sampleDuration = Math.max(900, Math.ceil(duration * 1.15 + 60));
+  const sampleDuration = Math.max(
+    900,
+    Math.ceil(duration * 1.15 + 60),
+    Math.ceil(controlledReadrate * (duration + 180) + 1),
+  );
   fixture(
     ...mount,
     image,
@@ -722,6 +730,17 @@ try {
   assert.ok(
     Number(report.sample.probe.format.duration) >= sampleDuration - 1,
     "fixture really contains the requested long timeline",
+  );
+  report.pacing.actual_source_duration_seconds = Number(
+    report.sample.probe.format.duration,
+  );
+  report.pacing.estimated_paced_source_lifetime_seconds =
+    report.pacing.actual_source_duration_seconds / controlledReadrate;
+  report.pacing.coverage_margin_seconds =
+    report.pacing.estimated_paced_source_lifetime_seconds - duration;
+  assert.ok(
+    report.pacing.coverage_margin_seconds >= 180,
+    "paced real NAS source remains longer than the observation plus the full bounded preparation window",
   );
   console.log(`Evidence: ${resolve(root, "report.json")}`);
   console.log(
@@ -1226,6 +1245,7 @@ try {
           media_time: metadata.mediaTime,
           presented_frames: metadata.presentedFrames,
           presentation_time: metadata.presentationTime,
+          observed_at_ms: performance.now(),
         };
         readQuality();
         arm();
@@ -1317,6 +1337,7 @@ try {
     v.muted = true;
   });
   await page.getByRole("link", { name: "选择影片", exact: true }).click();
+  const selectionBegan = performance.now();
   await page
     .locator(`.media-card[data-media-id="${indexed.id}"]`)
     .getByRole("button", { name: /^播放 / })
@@ -1395,7 +1416,13 @@ try {
           ? 0
           : performance.now() - stats.buffer_since);
       return {
-        time_seconds: v.currentTime,
+        time_seconds: stats.last_presented?.media_time ?? v.currentTime,
+        time_measurement:
+          "media PTS of the latest actual requestVideoFrameCallback presentation",
+        dom_current_time_seconds: v.currentTime,
+        last_presented_age_seconds: stats.last_presented
+          ? (performance.now() - stats.last_presented.observed_at_ms) / 1000
+          : null,
         paused: v.paused,
         seeking: v.seeking,
         ready_state: v.readyState,
@@ -1451,6 +1478,11 @@ try {
       };
     });
   report.initial_video = await observeVideo();
+  report.pacing.selection_to_actual_first_frame_seconds =
+    (performance.now() - selectionBegan) / 1000;
+  report.pacing.conservative_coverage_after_preparation_seconds =
+    report.pacing.coverage_margin_seconds -
+    report.pacing.selection_to_actual_first_frame_seconds;
   assert.equal(report.initial_video.source_kind, "mse");
   const began = performance.now();
   report.playback_started_at = new Date().toISOString();

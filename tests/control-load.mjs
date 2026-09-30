@@ -623,21 +623,19 @@ try {
   }
   const admin = new Client();
   await admin.login("admin");
-  for (let batch = 0; batch < 100; batch += 5) {
-    await Promise.all(
-      Array.from({ length: 5 }, async (_, offset) => {
-        const index = batch + offset;
-        await admin.request("/users", "POST", {
-          username: "load-" + index,
-          password,
-        });
-        const client = new Client();
-        await client.login("load-" + index);
-        clients[index] = client;
-      }),
-    );
-    if (batch % 20 === 0)
-      console.log("Setup: " + (batch + 5) + " distinct users");
+  // Account creation and login share the server's bounded password-hash budget.
+  // Prepare identities sequentially, before starting any measured load phase.
+  report.setup_identity_concurrency = 1;
+  for (let index = 0; index < 100; index++) {
+    await admin.request("/users", "POST", {
+      username: "load-" + index,
+      password,
+    });
+    const client = new Client();
+    await client.login("load-" + index);
+    clients[index] = client;
+    if ((index + 1) % 20 === 0)
+      console.log("Setup: " + (index + 1) + " distinct users");
   }
   assert.equal(
     new Set(clients.map((client) => client.userId)).size,
