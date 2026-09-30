@@ -8,6 +8,7 @@ import {
 import type { RoomState } from "../../../../../packages/protocol";
 import type {
   Room,
+  RoomMember,
   RoomLifecycle,
   Message,
   QueueItem,
@@ -21,6 +22,11 @@ import { useMediaCatalog } from "../library/media-catalog.store";
 import { useSession } from "../auth/session.store";
 import { createPlaybackRuntime } from "../playback/playback-runtime";
 import { lifecycleLabels } from "./room-lifecycle";
+import {
+  PresenceState,
+  readPresenceSnapshot,
+  type OnlineSnapshot,
+} from "./presence-state";
 
 export const useRoomRuntime = defineStore("room-runtime", () => {
   const session = useSession(),
@@ -31,6 +37,48 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     state = ref<RoomState | null>(null),
     connected = ref(false),
     connectionStopped = ref(false);
+  const presence = ref<OnlineSnapshot>(),
+    presenceNames = ref<Record<string, string>>({});
+  const presenceState = new PresenceState();
+  let namesRequest = 0,
+    namesPending = false;
+  function clearPresence() {
+    presenceState.begin("");
+    presence.value = undefined;
+  }
+  async function refreshPresenceNames(serial: number) {
+    const selected = room.value?.id;
+    if (
+      !selected ||
+      namesPending ||
+      !presence.value?.members.some(
+        (member) => !presenceNames.value[member.userId],
+      )
+    )
+      return;
+    namesPending = true;
+    const request = ++namesRequest;
+    try {
+      const members = await session.api<RoomMember[]>(
+        `/rooms/${selected}/members`,
+      );
+      if (
+        request !== namesRequest ||
+        serial !== connectionSerial ||
+        room.value?.id !== selected
+      )
+        return;
+      presenceNames.value = Object.fromEntries(
+        members
+          .slice(0, 80)
+          .map((member) => [member.id, member.display_name || member.username]),
+      );
+    } catch {
+      /* Names are optional; membership never establishes online status. */
+    } finally {
+      if (request === namesRequest) namesPending = false;
+    }
+  }
   const messages = ref<Message[]>([]),
     playlist = ref<QueueItem[]>([]),
     chat = ref("");
@@ -138,6 +186,10 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     }
   }
   async function leave() {
+    clearPresence();
+    presenceNames.value = {};
+    ++namesRequest;
+    namesPending = false;
     ++roomSerial;
     ++connectionSerial;
     clearTimeout(retry);
@@ -202,6 +254,9 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     } while (after);
   }
   function connect() {
+    clearPresence();
+    ++namesRequest;
+    namesPending = false;
     controlEpoch = undefined;
     clockSamples.forEach(clearTimeout);
     clockSamples.clear();
@@ -214,6 +269,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     connectionStopped.value = false;
     if (!room.value) return;
     const selected = room.value.id;
+    const presenceGeneration = presenceState.begin(selected);
     socket = new WebSocket(
       `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/v1/ws`,
     );
@@ -225,6 +281,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       socket!.send(
         JSON.stringify({
           type: "RESUME",
+          presence_version: 1,
           room_id: selected,
           revision: state.value?.revision ?? 0,
           clock_epoch: state.value?.clock_epoch,
@@ -248,6 +305,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     };
     socket.onclose = async () => {
       if (serial !== connectionSerial) return;
+      presenceState.end(presenceGeneration);
+      presence.value = undefined;
       clearTimeout(chatTimer);
       chatPending.value = false;
       chatFailed.value = !!pendingChat;
@@ -279,7 +338,42 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     };
     socket.onmessage = (event) => {
       if (serial !== connectionSerial) return;
-      const v = JSON.parse(event.data);
+      let v;
+      try {
+        v = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (!v || typeof v !== "object") return;
+      if (
+        v.type === "PRESENCE_SNAPSHOT" ||
+        (v.type === "SNAPSHOT" &&
+          typeof v.presence_connection_id === "string" &&
+          v.presence)
+      ) {
+        const snapshot = readPresenceSnapshot(
+          v.type === "PRESENCE_SNAPSHOT" ? v : v.presence,
+        );
+        if (snapshot) {
+          const result =
+            v.type === "PRESENCE_SNAPSHOT"
+              ? presenceState.accept(presenceGeneration, snapshot)
+              : presenceState.bind(
+                  presenceGeneration,
+                  v.presence_connection_id,
+                  snapshot,
+                );
+          if (result === "resync") {
+            connect();
+            return;
+          }
+          if (result === "applied") {
+            presence.value = presenceState.current;
+            void refreshPresenceNames(serial);
+          }
+        }
+        if (v.type === "PRESENCE_SNAPSHOT") return;
+      }
       if (!v.state && typeof v.control_epoch?.id === "string")
         controlEpoch = v.control_epoch.id;
       if (v.type === "CLOCK_SYNC_REPLY") {
@@ -306,6 +400,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         chatFailed.value = !!pendingChat;
         error.value = failure.message;
         if (stopsReconnect(failure)) {
+          clearPresence();
           retryAllowed = false;
           socket?.close();
           if (failure.code === "NOT_A_MEMBER") void leave();
@@ -610,6 +705,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     state,
     connected,
     connectionStopped,
+    presence,
+    presenceNames,
     messages,
     playlist,
     chat,

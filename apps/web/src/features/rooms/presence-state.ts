@@ -1,4 +1,37 @@
-/** Internal view model; the protocol adapter is installed after contract approval. */
+import type { PresenceSnapshot } from "../../../../../packages/protocol";
+
+/** Bounded projection of the shared wire DTO into the internal view model. */
+export function readPresenceSnapshot(
+  value: unknown,
+): OnlineSnapshot | undefined {
+  if (!value || typeof value !== "object") return;
+  const wire = value as PresenceSnapshot;
+  if (
+    typeof wire.room_id !== "string" ||
+    typeof wire.presence_epoch !== "string" ||
+    typeof wire.presence_seq !== "number" ||
+    !Array.isArray(wire.members) ||
+    wire.members.length > 80 ||
+    !wire.members.every(
+      (member) =>
+        !!member &&
+        typeof member.user_id === "string" &&
+        typeof member.connection_count === "number",
+    )
+  )
+    return;
+  return {
+    roomId: wire.room_id,
+    epoch: wire.presence_epoch,
+    sequence: wire.presence_seq,
+    members: wire.members.map((member) => ({
+      userId: member.user_id,
+      connections: member.connection_count,
+    })),
+  };
+}
+
+/** Internal view model, independent of room control state. */
 export interface OnlineMember {
   userId: string;
   connections: number;

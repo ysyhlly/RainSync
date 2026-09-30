@@ -1,9 +1,11 @@
 # E01 presence production patch plan
 
-This extends the existing independent implementation. It is a reviewable patch
-plan, not a claim that protocol or production wiring has landed. Only integration
-owns protocol, generated schemas, main/lib, manifests and migrations. This lane
-waits for the shared protocol commit before production integration.
+This records the approved design now implemented relative to shared contract
+`79cff19718f94d053d69f5b969147ae540921d9e`. Startup/protocol wiring belongs
+to integration and is already present in that baseline; the room, heartbeat,
+delivery and client patches below are implemented by this lane. See
+[E01_PRESENCE_HANDOFF.md](E01_PRESENCE_HANDOFF.md) for regression evidence and
+remaining acceptance scope. No new main/lib or migration patch is pending.
 
 ## Stable startup API for integration owner
 
@@ -21,7 +23,7 @@ presence connection quota. A room constructs
 socket and no database storage. Its synchronous API remains compatible with the
 first checkpoint; this audit adds
 `checked_snapshot(&[Uuid], &HashSet<Uuid>, Instant) -> Option<Snapshot>` and
-`AdmissionError::ProcessLimit`. `Snapshot` is internal (`epoch`, `seq`, `members`);
+`AdmissionError::ProcessCapacity`. `Snapshot` is internal (`epoch`, `seq`, `members`);
 `rooms.rs` maps it to the approved protocol and supplies room_id.
 
 ## Bounded state and explicit coverage
@@ -139,9 +141,9 @@ an older unknown epoch may cause a conservative reconnect, never become accepted
 state. Large/malformed collections and IDs are ignored without state changes.
 Do not route presence gaps into control revision recovery or playback effects.
 
-Only the panel is owned here. Mounting in an existing room host view requires a
-parent-applied small patch or explicit ownership assignment. The host may provide
-existing member display names; those names never establish presence.
+The parent authorized the minimal RoomPage.vue import/mount during production
+integration. That mount is implemented. The host supplies existing member
+display names as optional labels; those names never establish presence.
 
 ## Sequence exhaustion and process restart
 
@@ -154,9 +156,9 @@ snapshot even if its members did not change; clients reconnect. Cached old
 values must pass current-epoch/subject checks at send admission. Empty rooms need
 no notification. A restarted process creates a fresh allocator and empty lease
 sets. This preserves bounded memory without a permanent per-room seq registry.
-Integration owner still needs to confirm exhaustion behavior in the contract.
+The shared contract confirms this exhaustion behavior.
 
-## Required integration regressions after protocol arrives
+## Integration regression scope
 
 Keep the existing legacy 100-connection smoke unchanged. Add a mixed-room case
 with many legacy connections and two v1 connections: only the two are counted,

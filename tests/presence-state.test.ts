@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   PresenceState,
+  readPresenceSnapshot,
   type OnlineSnapshot,
 } from "../apps/web/src/features/rooms/presence-state";
 const snapshot = (sequence = 1, epoch = "process-a"): OnlineSnapshot => ({
@@ -8,6 +9,50 @@ const snapshot = (sequence = 1, epoch = "process-a"): OnlineSnapshot => ({
   epoch,
   sequence,
   members: [{ userId: "user", connections: 2 }],
+});
+
+describe("shared presence wire projection", () => {
+  it("projects only known fields and keeps control revision out of presence", () => {
+    const value = readPresenceSnapshot({
+      room_id: "room",
+      presence_epoch: "process-a",
+      presence_seq: 100,
+      members: [
+        { user_id: "user", connection_count: 2, device_name: "unused" },
+      ],
+      revision: 999,
+    });
+    expect(value).toEqual(snapshot(100));
+    const state = new PresenceState(),
+      generation = state.begin("room");
+    expect(state.bind(generation, "connection", value!)).toBe("applied");
+    expect(state.current?.sequence).toBe(100);
+  });
+
+  it.each([
+    null,
+    { members: [] },
+    {
+      room_id: "room",
+      presence_epoch: "process",
+      presence_seq: 1,
+      members: [null],
+    },
+    {
+      room_id: "room",
+      presence_epoch: "process",
+      presence_seq: 1,
+      members: [{ user_id: "user", connection_count: "2" }],
+    },
+    {
+      room_id: "room",
+      presence_epoch: "process",
+      presence_seq: 1,
+      members: Array(81).fill({ user_id: "user", connection_count: 1 }),
+    },
+  ])("ignores malformed and oversized wire input: %j", (value) => {
+    expect(readPresenceSnapshot(value)).toBeUndefined();
+  });
 });
 describe("presence connection and epoch fencing", () => {
   it("requires a handshake and accepts replaceable snapshots with sequence gaps", () => {

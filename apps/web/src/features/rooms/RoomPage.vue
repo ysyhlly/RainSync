@@ -8,6 +8,7 @@ import type { RoomInvitation, RoomMember } from "../../shared/api/types";
 import { useAction } from "../../shared/use-action";
 import PlaybackInformation from "../playback/PlaybackInformation.vue";
 import ChatPanel from "./ChatPanel.vue";
+import PresencePanel from "./PresencePanel.vue";
 import AppSegmented from "../../shared/ui/AppSegmented.vue";
 import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
@@ -150,6 +151,12 @@ async function transferOwnership() {
         class="room-chat"
         :class="{ 'mobile-hidden': mobilePanel !== 'chat' }"
       >
+        <PresencePanel
+          class="panel"
+          :snapshot="r.presence"
+          :names="r.presenceNames"
+          :self-id="session.user?.id"
+        />
         <ChatPanel />
       </div>
       <section

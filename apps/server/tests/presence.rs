@@ -41,7 +41,9 @@ fn expires_at_exact_boundary_and_late_heartbeat_cannot_resurrect() {
             .members
             .is_empty()
     );
+    assert_eq!(p.deadline(id), Some(now + LEASE));
     assert!(!p.renew(id, now + LEASE));
+    assert_eq!(p.deadline(id), None);
     assert!(p.snapshot(now + LEASE).members.is_empty());
 }
 
@@ -243,7 +245,7 @@ fn process_capacity_is_shared_and_released_on_disconnect_expiry_revocation_and_r
     let before = extra.snapshot(now);
     assert_eq!(
         extra.connect(Uuid::new_v4(), now),
-        Err(AdmissionError::ProcessLimit)
+        Err(AdmissionError::ProcessCapacity)
     );
     assert_eq!(extra.snapshot(now), before);
 
@@ -304,7 +306,7 @@ fn concurrent_rooms_cannot_overbook_process_capacity() {
     let mut extra = Presence::new(sequence);
     assert_eq!(
         extra.connect(Uuid::new_v4(), now),
-        Err(AdmissionError::ProcessLimit)
+        Err(AdmissionError::ProcessCapacity)
     );
     drop(rooms);
     extra.connect(Uuid::new_v4(), now).unwrap();

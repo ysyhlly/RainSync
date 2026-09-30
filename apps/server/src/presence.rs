@@ -30,7 +30,7 @@ pub struct Snapshot {
 pub enum AdmissionError {
     UserLimit,
     RoomLimit,
-    ProcessLimit,
+    ProcessCapacity,
 }
 
 struct Connection {
@@ -92,7 +92,7 @@ impl Sequence {
     fn acquire(&self) -> Result<ConnectionPermit, AdmissionError> {
         let mut clock = self.0.lock().expect("presence sequence poisoned");
         if clock.connections >= PROCESS_LIMIT {
-            return Err(AdmissionError::ProcessLimit);
+            return Err(AdmissionError::ProcessCapacity);
         }
         clock.connections += 1;
         Ok(ConnectionPermit(self.clone()))
@@ -179,6 +179,12 @@ impl Presence {
             .iter()
             .map(|(id, c)| (*id, c.user))
             .collect()
+    }
+
+    pub fn deadline(&self, id: Uuid) -> Option<Instant> {
+        self.connections
+            .get(&id)
+            .map(|connection| connection.deadline)
     }
 
     pub fn reconcile(&mut self, checked: &[Uuid], authorized: &HashSet<Uuid>) -> bool {
