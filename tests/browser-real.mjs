@@ -429,7 +429,9 @@ await isolatedServer(
       );
       await expect(admin.locator(".queue-row")).toHaveCount(2);
       await admin.locator("video").hover();
-      await expect(admin.getByRole("button", { name: "暂停", exact: true })).toBeEnabled();
+      await expect(
+        admin.getByRole("button", { name: "暂停", exact: true }),
+      ).toBeEnabled();
       await expect
         .poll(() => admin.locator("video").evaluate((el) => el.currentTime), {
           timeout: 20000,
@@ -579,9 +581,23 @@ await isolatedServer(
         .click();
       await admin.getByRole("button", { name: "确认撤销设备" }).click();
       await expect(admin.getByRole("dialog")).not.toBeVisible();
-      await expect(admin.locator(".admin-row .helper")).toContainText("已撤销");
+      const revokedAgent = admin.getByRole("article").filter({
+        has: admin.getByRole("heading", {
+          name: "联调未配对设备",
+          exact: true,
+        }),
+      });
+      await expect(revokedAgent).toHaveCount(1);
       await expect(
-        admin.getByRole("button", { name: "撤销设备", exact: true }),
+        revokedAgent.getByText(/^已撤销\s*· 最后联系：/),
+      ).toBeVisible();
+      await expect(
+        revokedAgent.getByText("设备凭据已失效，无法继续读取片源", {
+          exact: true,
+        }),
+      ).toBeVisible();
+      await expect(
+        revokedAgent.getByRole("button", { name: "撤销设备", exact: true }),
       ).toBeDisabled();
       stage(
         "ordinary route/API denied, admin manual account ordinary-only, real NAS creation/revoke interface",
