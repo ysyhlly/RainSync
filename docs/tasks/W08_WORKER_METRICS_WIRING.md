@@ -142,3 +142,15 @@ RAINSYNC_METRICS_TEST_DATABASE_URL=... cargo test --locked --offline \
 
 This module slice does not complete W08, prove Worker readiness or replace
 weak-network/100-online/device/72-hour acceptance.
+
+## Remote advancement recorded at handoff
+
+Final fetch found integration at `79cff19718f94d053d69f5b969147ae540921d9e`,
+two commits ahead of the fixed base: `95a271c` (account policy cleanup fixture and
+validation record), `79cff19` (compiled presence contract/shared sequence).
+Those commits change presence/protocol/Web presence files, Server main.rs and
+associated documentation/tests. They do not change this slice's metrics,
+media-core collector or Worker module paths. No merge/rebase/reset was performed;
+feature history still starts at exact `9b167ab`. Controller must apply its shared
+exports/App/route changes against the advanced integration branch. Complete
+remote diff path/stat evidence is included in the downloadable delivery package.
