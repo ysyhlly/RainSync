@@ -73,6 +73,8 @@ struct Snapshot {
     active: usize,
     admitted: u64,
     dropped: u64,
+    body_bytes: [u64; 3],
+    body_seen: [bool; 3],
     transfers: [[Aggregate; 3]; 3],
     cache: [u64; 2],
     cache_seen: bool,
@@ -167,6 +169,19 @@ impl RuntimeMetrics {
                 }
             }
         }
+        if state.body_seen.iter().any(|seen| *seen) {
+            out.push_str("# HELP rainsync_transfer_body_bytes_total Actual body bytes observed as chunks are read or handed off, including streams still active; not receiver acknowledgement.\n# TYPE rainsync_transfer_body_bytes_total counter\n");
+            for (index, layer) in LAYERS.iter().enumerate() {
+                if state.body_seen[index] {
+                    writeln!(
+                        out,
+                        "rainsync_transfer_body_bytes_total{{layer=\"{layer}\"}} {}",
+                        state.body_bytes[index]
+                    )
+                    .unwrap();
+                }
+            }
+        }
         if state.cache_seen {
             out.push_str("# HELP rainsync_cache_lookups_total Actual cache-eligible lookups; hit requires validated open and read lease.\n# TYPE rainsync_cache_lookups_total counter\n");
             for (result, count) in ["hit", "miss"].iter().zip(state.cache) {
@@ -220,6 +235,15 @@ impl Transfer {
         if sequence == self.sequence {
             return cumulative_bytes == self.bytes;
         }
+        let delta = cumulative_bytes - self.bytes;
+        let mut state = lock(&self.inner);
+        let index = self.layer as usize;
+        state.body_seen[index] = true;
+        state.body_bytes[index] = state.body_bytes[index].saturating_add(delta);
+        if self.cache == Cache::Hit {
+            state.cached_bytes_seen = true;
+            state.cached_bytes = state.cached_bytes.saturating_add(delta);
+        }
         self.sequence = sequence;
         self.bytes = cumulative_bytes;
         true
@@ -236,10 +260,6 @@ impl Transfer {
         let mut state = lock(&self.inner);
         state.active -= 1;
         state.transfers[self.layer as usize][outcome as usize].observe(self.bytes, micros);
-        if self.cache == Cache::Hit {
-            state.cached_bytes_seen = true;
-            state.cached_bytes = state.cached_bytes.saturating_add(self.bytes);
-        }
     }
 }
 impl Drop for Transfer {

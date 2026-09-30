@@ -125,8 +125,8 @@ fn independent_layers_and_outcomes_have_a_fixed_series_limit() {
     }
     let text = metrics.render();
     let data: Vec<_> = text.lines().filter(|line| !line.starts_with('#')).collect();
-    // 9 combinations * (bytes + 10 buckets + count + sum) + 3 admission + 2 cache + 4 failure.
-    assert_eq!(data.len(), 126);
+    // 9 combinations * (bytes + 10 buckets + count + sum) + 3 admission + 3 live layer counters + 2 cache + 4 failure.
+    assert_eq!(data.len(), 129);
     assert!(text.len() < 20_000);
     for line in data {
         let number: f64 = line.rsplit_once(' ').unwrap().1.parse().unwrap();
@@ -167,6 +167,70 @@ fn concurrent_updates_and_scrapes_preserve_totals_and_histogram_consistency() {
     assert_eq!(state.active, 0);
     assert_eq!(state.transfers[0][0].count, 16_000);
     assert_eq!(state.transfers[0][0].bytes, 1_600_000);
+    assert_eq!(state.body_bytes[0], 1_600_000);
+    assert_eq!(state.cached_bytes, 1_600_000);
     assert_eq!(state.cache[0], 16_000);
     assert_eq!(state.dropped, 0);
+}
+
+#[test]
+fn live_bytes_are_visible_before_eof_and_never_credited_twice() {
+    let metrics = RuntimeMetrics::default();
+    let mut transfer = metrics
+        .begin_transfer(Layer::WorkerEgress, Cache::Hit)
+        .unwrap();
+    assert!(transfer.sample(1, 100));
+    let output = metrics.render();
+    assert!(output.contains("rainsync_transfer_body_bytes_total{layer=\"worker_egress\"} 100\n"));
+    assert!(output.contains("rainsync_cache_served_bytes_total 100\n"));
+    assert!(!output.contains("rainsync_transfer_bytes_total{layer="));
+    assert!(transfer.sample(1, 100));
+    assert!(!transfer.sample(1, 200));
+    assert!(!transfer.sample(0, 0));
+    assert!(!transfer.sample(2, 99));
+    assert_eq!(lock(&metrics.inner).body_bytes[0], 100);
+    assert!(transfer.sample(3, 250));
+    transfer.finish(Outcome::Failed);
+    let state = lock(&metrics.inner);
+    assert_eq!(state.body_bytes[0], 250);
+    assert_eq!(state.cached_bytes, 250);
+    assert_eq!(state.transfers[0][1].bytes, 250);
+    assert_eq!(state.transfers[0][2].count, 0);
+}
+
+#[test]
+fn live_bytes_saturate_across_transfers_and_cancel_keeps_observed_bytes() {
+    let metrics = RuntimeMetrics::default();
+    let mut first = metrics
+        .begin_transfer(Layer::WorkerEgress, Cache::Hit)
+        .unwrap();
+    let mut second = metrics
+        .begin_transfer(Layer::WorkerEgress, Cache::Hit)
+        .unwrap();
+    assert!(first.sample(1, u64::MAX));
+    assert!(second.sample(1, 1));
+    drop(first);
+    drop(second);
+    let state = lock(&metrics.inner);
+    assert_eq!(state.body_bytes[0], u64::MAX);
+    assert_eq!(state.cached_bytes, u64::MAX);
+    assert_eq!(state.transfers[0][2].bytes, u64::MAX);
+    assert_eq!(state.active, 0);
+}
+
+#[test]
+fn cloned_handles_share_one_process_collector_and_new_instances_are_independent() {
+    let server = RuntimeMetrics::default();
+    let worker = RuntimeMetrics::default();
+    let cloned_worker = worker.clone();
+    let mut transfer = cloned_worker
+        .begin_transfer(Layer::UpstreamRead, Cache::NotHit)
+        .unwrap();
+    transfer.sample(1, 512);
+    assert!(worker
+        .render()
+        .contains("rainsync_transfer_body_bytes_total{layer=\"upstream_read\"} 512\n"));
+    assert_eq!(server.render(), "");
+    drop(transfer);
+    assert_eq!(lock(&worker.inner).transfers[2][2].bytes, 512);
 }
