@@ -19,13 +19,50 @@ export function bindPlaybackMetricEvents(ctx: {
   const { element: el, meter, fence } = ctx;
   const now = ctx.now ?? (() => performance.now());
   let active = true;
+  const attached: [string, EventListener][] = [];
   let waiting = false;
   let played = false;
   let first = false;
   let lastTime = el.currentTime;
   let frameId: number | undefined;
   const current = () => active && ctx.current();
+  function close() {
+    if (!active) return;
+    active = false;
+    const pendingFrame = frameId;
+    frameId = undefined;
+    try {
+      if (pendingFrame !== undefined) el.cancelVideoFrameCallback(pendingFrame);
+    } catch {
+      // The late callback remains inert even if the browser cannot cancel it.
+    }
+    for (const [event, listener] of attached.splice(0)) {
+      try {
+        el.removeEventListener(event, listener);
+      } catch {
+        // Continue removing the other listeners; active fences any remainder.
+      }
+    }
+  }
+  function guard(action: () => void) {
+    if (!active) return;
+    try {
+      action();
+    } catch {
+      close();
+    }
+  }
   const read = (): PlaybackMetricsObservation => {
+    try {
+      return readObservation();
+    } catch (failure) {
+      close();
+      // Preserve the API's real observation contract. Runtime read callers
+      // already isolate errors; do not invent substitute metrics evidence.
+      throw failure;
+    }
+  };
+  const readObservation = (): PlaybackMetricsObservation => {
     const state = ctx.state();
     return {
       ...state,
@@ -98,9 +135,10 @@ export function bindPlaybackMetricEvents(ctx: {
     ["canplay", observe],
     ["ratechange", observe],
   ];
-  for (const [event, listener] of listeners)
-    el.addEventListener(event, listener);
   function frame(_at: number, metadata: VideoFrameCallbackMetadata) {
+    guard(() => observeFrame(metadata));
+  }
+  function observeFrame(metadata: VideoFrameCallbackMetadata) {
     frameId = undefined;
     if (!current()) return;
     if (
@@ -116,17 +154,21 @@ export function bindPlaybackMetricEvents(ctx: {
       first = true;
     } else if (current()) frameId = el.requestVideoFrameCallback(frame);
   }
-  if (typeof el.requestVideoFrameCallback === "function")
-    frameId = el.requestVideoFrameCallback(frame);
+  try {
+    for (const [event, listener] of listeners) {
+      if (!active) break;
+      const guarded: EventListener = (value) => guard(() => listener(value));
+      attached.push([event, guarded]);
+      el.addEventListener(event, guarded);
+    }
+    if (active && typeof el.requestVideoFrameCallback === "function")
+      frameId = el.requestVideoFrameCallback(frame);
+  } catch {
+    close();
+  }
   return {
     read,
-    progress,
-    stop() {
-      active = false;
-      if (frameId !== undefined) el.cancelVideoFrameCallback(frameId);
-      frameId = undefined;
-      for (const [event, listener] of listeners)
-        el.removeEventListener(event, listener);
-    },
+    progress: () => guard(progress),
+    stop: close,
   };
 }

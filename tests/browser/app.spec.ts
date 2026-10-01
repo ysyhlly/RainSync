@@ -130,7 +130,7 @@ test("room, library, invitation and settings are usable", async ({
     page.getByRole("heading", { name: "放映室", exact: true }),
   ).toBeVisible();
   await page.getByRole("button", { name: "进入房间", exact: true }).click();
-  await expect(page.locator(".connection-status")).toHaveText("已连接");
+  await expect(page.locator(".connection-status")).toHaveText("房间连接正常");
   await navigate(page, "媒体库");
   await page
     .getByRole("button", { name: "播放 山海之间", exact: true })
@@ -201,7 +201,7 @@ test("room, library, invitation and settings are usable", async ({
       }),
     );
     await expect(page.getByRole("alert")).toContainText("当前没有控制权限");
-    await expect(page.locator(".connection-status")).toHaveText("已连接");
+    await expect(page.locator(".connection-status")).toHaveText("房间连接正常");
     await page.getByLabel("聊天消息").fill(code);
     await page.getByLabel("聊天消息").press("Enter");
     await expect(page.getByText(code, { exact: true })).toBeVisible();
@@ -221,7 +221,7 @@ test("room, library, invitation and settings are usable", async ({
   await expect(page.locator(".connection-status")).toHaveText("正在重连");
   await page.clock.fastForward(10000);
   await expect.poll(() => connectionCount).toBe(2);
-  await expect(page.locator(".connection-status")).toHaveText("已连接");
+  await expect(page.locator(".connection-status")).toHaveText("房间连接正常");
   controlSocket!.send(
     JSON.stringify({
       type: "ERROR",
@@ -406,6 +406,7 @@ test("playback retries a lost HTTP response with the same operation key", async 
             t1: sample.t1,
             t2: sample.t1,
             t3: sample.t1,
+            clock_epoch: "epoch",
           }),
         );
       if (sample.type === "RESUME")
@@ -571,6 +572,7 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
             t1: frame.t1,
             t2: frame.t1,
             t3: frame.t1,
+            clock_epoch: "epoch",
           }),
         );
       if (frame.type === "RESUME")
@@ -751,6 +753,7 @@ test("subtitle identity survives reload and resets on media change", async ({
             t1: frame.t1,
             t2: frame.t1,
             t3: frame.t1,
+            clock_epoch: state.clock_epoch,
           }),
         );
       if (frame.type === "RESUME")

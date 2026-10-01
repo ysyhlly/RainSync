@@ -1216,6 +1216,7 @@ dependencies = [
  "anyhow",
  "hex",
  "protocol",
+ "serde",
  "serde_json",
  "sha2",
  "sqlx",

@@ -185,6 +185,7 @@ export async function appFixture(
             t1: frame.t1,
             t2: frame.t1,
             t3: frame.t1,
+            clock_epoch: state.clock_epoch,
           }),
         );
       else if (frame.type === "CHAT")

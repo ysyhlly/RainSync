@@ -53,6 +53,8 @@ async function setup(
     nativeHls?: boolean;
     holdReady?: boolean;
     playbackUrl?: string;
+    anchorServerTimeMs?: number;
+    playbackStatus?: "playing" | "paused";
   } = {},
 ) {
   await page.clock.install();
@@ -72,6 +74,7 @@ async function setup(
     sockets: WebSocketRoute[] = [];
   let replyClock = !opts.holdClock,
     clockFrame: any;
+  const clockEpoch = "epoch";
   let releaseHistory: (() => void) | undefined,
     releasePlaylist: (() => void) | undefined;
   let renewal: (() => void) | undefined,
@@ -197,13 +200,13 @@ async function setup(
               revision: 1,
               media_id: "movie",
               media_generation: 1,
-              playback_status: "playing",
+              playback_status: opts.playbackStatus ?? "playing",
               anchor_position_ms: 0,
-              anchor_server_time_ms: 200000,
+              anchor_server_time_ms: opts.anchorServerTimeMs ?? 200000,
               playback_rate: 1,
               controller_user_id: "owner",
               duration_ms: 3600000,
-              clock_epoch: "epoch",
+              clock_epoch: clockEpoch,
             },
           }),
         );
@@ -216,14 +219,16 @@ async function setup(
               t1: v.t1,
               t2: 2000000,
               t3: 2000000,
+              clock_epoch: clockEpoch,
             }),
           );
       }
     });
   });
   await page.goto("/rooms/a");
-  await expect(page.locator(".connection-status")).toHaveText("已连接");
+  await expect(page.locator(".connection-status")).toHaveText("房间连接正常");
   await expect.poll(() => clockFrame?.type).toBe("CLOCK_SYNC");
+  const heldClockFrame = clockFrame;
   return {
     frames,
     preparations,
@@ -234,15 +239,25 @@ async function setup(
     releaseReady() {
       mediaReady = true;
     },
-    releaseClock() {
-      replyClock = true;
+    replyHeldClock() {
       sockets.at(-1)!.send(
         JSON.stringify({
           type: "CLOCK_SYNC_REPLY",
-          t1: clockFrame.t1,
+          t1: heldClockFrame.t1,
           t2: 2000000,
           t3: 2000000,
+          clock_epoch: clockEpoch,
         }),
+      );
+    },
+    async releaseClock() {
+      replyClock = true;
+      // Solicit a fresh round through the real bfcache wake path. A held reply
+      // can expire while fixture setup runs and must not bypass the pending TTL.
+      await page.evaluate(() =>
+        window.dispatchEvent(
+          new PageTransitionEvent("pageshow", { persisted: true }),
+        ),
       );
     },
     releaseRoom() {
@@ -275,13 +290,22 @@ test("does not load unpublished media or allocate a second session while waiting
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
-test("playing snapshot waits for clock; visibility preserves offset and dragging survives ticks", async ({
+test("playing snapshot rejects expired clock replies; a fresh wake unlocks playback and visible-only events preserve it", async ({
   page,
 }) => {
   const h = await setup(page, { holdClock: true });
-  await page.clock.fastForward(1000);
+  await page.clock.runFor(6000);
   expect(h.preparations).toHaveLength(0);
-  h.releaseClock();
+  await expect(page.locator(".playback-host [role=status]")).toHaveText(
+    "正在重新校准房间时间…",
+  );
+  h.replyHeldClock();
+  await page.clock.runFor(100);
+  expect(h.preparations).toHaveLength(0);
+  await expect(page.locator(".playback-host [role=status]")).toHaveText(
+    "正在重新校准房间时间…",
+  );
+  await h.releaseClock();
   await expect.poll(() => h.preparations.length).toBe(1);
   expect(h.preparations[0].position_ms).toBeGreaterThan(1799000);
   await page
@@ -628,7 +652,7 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
         paused: document.querySelector("video")!.paused,
       };
     });
-  h.releaseClock();
+  await h.releaseClock();
   await expect.poll(() => reads.length).toBe(1);
   await page.clock.runFor(1000);
   expect(await page.evaluate(() => (window as any).eventHls)).toBeUndefined();
@@ -721,7 +745,10 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
 test("room chooser without a selection preserves the current viewing connection", async ({
   page,
 }) => {
-  const h = await setup(page, { validMedia: true });
+  const h = await setup(page, {
+    validMedia: true,
+    anchorServerTimeMs: 2000000,
+  });
   await expect.poll(() => h.preparations.length).toBe(1);
   await navigate(page, "放映室");
   await expect(page.locator(".mini-player")).toBeVisible();
@@ -732,6 +759,28 @@ test("room chooser without a selection preserves the current viewing connection"
   expect(h.preparations).toHaveLength(1);
   await expect(page.locator("video")).toHaveAttribute("src", /empty-video/);
   await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("mini player keeps calibration visible until a fresh clock reply arrives", async ({
+  page,
+}, info) => {
+  const h = await setup(page, {
+    holdClock: true,
+    validMedia: true,
+    anchorServerTimeMs: 2000000,
+  });
+  await navigate(page, "放映室");
+  const mini = page.locator(".mini-player");
+  await expect(mini).toBeVisible();
+  const status = mini.getByRole("status");
+  await expect(status).toBeVisible();
+  await expect(status).toHaveText("正在重新校准房间时间…");
+  expect(h.preparations).toHaveLength(0);
+  await page.screenshot({ path: info.outputPath("mini-calibration.png") });
+  await h.releaseClock();
+  await expect.poll(() => h.preparations.length).toBe(1);
+  await expect(mini.locator("video")).toHaveAttribute("src", /empty-video/);
+  expect(h.sockets).toHaveLength(1);
 });
 
 test("native HLS recovery keeps room time and waits for a growing replacement playlist", async ({
@@ -1035,7 +1084,10 @@ test("teardown media errors are silent while an active unsupported resource is r
       if (empty) queueMicrotask(() => this.dispatchEvent(new Event("error")));
     };
   });
-  const h = await setup(page, { validMedia: true });
+  const h = await setup(page, {
+    validMedia: true,
+    playbackStatus: "paused",
+  });
   await expect.poll(() => h.preparations.length).toBe(1);
   await expect(page.getByRole("alert")).toHaveCount(0);
   await showOptions(page);

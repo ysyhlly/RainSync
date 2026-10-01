@@ -37,9 +37,18 @@ pub async fn lock(
 /// Caller holds its room/lifecycle admission lock through commit. This locks
 /// source authority only; the final statement must also recheck stopped/expiry.
 pub async fn lock_session(tx: &mut Transaction<'_, Postgres>, session: Uuid) -> Result<bool> {
-    let row = sqlx::query("SELECT m.source_id,COALESCE((p.resource->>'source_policy_revision')::bigint,0) AS revision,(p.resource->>'account_policy_generation')::bigint AS generation FROM playback_sessions p JOIN media_items m ON m.id=p.media_id WHERE p.id=$1")
+    let row = sqlx::query("SELECT m.source_id,p.resource,p.user_id,p.room_id,COALESCE((p.resource->>'source_policy_revision')::bigint,0) AS revision,(p.resource->>'account_policy_generation')::bigint AS generation FROM playback_sessions p JOIN media_items m ON m.id=p.media_id WHERE p.id=$1")
         .bind(session).fetch_optional(&mut **tx).await?;
     let Some(row) = row else { return Ok(false) };
+    let resource = row.get("resource");
+    if !crate::http_file_authorization::resource_scope_matches(
+        &resource,
+        row.get("user_id"),
+        row.get("room_id"),
+    ) || !crate::http_file_authorization::lock_resource(tx, &resource).await?
+    {
+        return Ok(false);
+    }
     let Some(source) = row.get::<Option<Uuid>, _>("source_id") else {
         return Ok(false);
     };

@@ -1,4 +1,4 @@
-import { ref, nextTick, onScopeDispose, watch, type Ref } from "vue";
+import { computed, ref, nextTick, onScopeDispose, watch, type Ref } from "vue";
 import Hls from "hls.js";
 import {
   detectCapabilities,
@@ -6,6 +6,9 @@ import {
   detectCandidateReport,
   PlaybackPlanGenerations,
   matchesPlanGeneration,
+  PlaybackRateSupport,
+  availablePlaybackRanges,
+  containsPlaybackPosition,
 } from "../../../../../packages/player-core";
 import {
   Corrector,
@@ -40,12 +43,24 @@ import {
 import { bindPlaybackMetricEvents } from "./metrics-binding";
 import { createPlaybackMetricsSender } from "./metrics-sender";
 
+export type PlaybackRecoveryState =
+  | "idle"
+  | "calibrating"
+  | "catching_up"
+  | "waiting"
+  | "blocked"
+  | "unsupported_rate"
+  | "reconnecting"
+  | "background"
+  | "failed";
+
 export function createPlaybackRuntime(ctx: {
   session: ReturnType<typeof useSession>;
   state: Ref<RoomState | null>;
   connected: Ref<boolean>;
   active?: Ref<boolean>;
   clock: Clock;
+  checkClock?: () => void;
   error: Ref<string>;
   run: (action: () => Promise<void>) => Promise<void>;
   ended?: (positionMs: number) => void;
@@ -64,17 +79,100 @@ export function createPlaybackRuntime(ctx: {
   const duration = ref(0),
     position = ref(0),
     sessionId = ref<string | null>(null);
+  const recoveryState = ref<PlaybackRecoveryState>("idle");
+  const recoveryLabel = computed(() => {
+    switch (recoveryState.value) {
+      case "calibrating":
+        return "正在重新校准房间时间…";
+      case "catching_up":
+        return "正在追赶房间进度…";
+      case "waiting":
+        return "等待播放就绪后追赶…";
+      case "blocked":
+        return "等待点击加入播放";
+      case "unsupported_rate":
+        return "本地播放器不支持此速率";
+      case "reconnecting":
+        return "正在重连，连接后重新校准…";
+      default:
+        return "";
+    }
+  });
+  let recoveryPending = false,
+    confirmedBaseRate: number | undefined,
+    rejectedBaseRate: number | undefined;
   let hls: Hls | undefined,
     plan: PlaybackPlan | undefined,
     loadSerial = 0,
     clockAction: "load" | "apply" | undefined;
   let recoveringHls = false,
+    terminalEnd = false,
     firstFrameTimer: ReturnType<typeof setTimeout> | undefined,
     capabilityProbe: AbortController | undefined,
     generationWait: AbortController | undefined,
     generationWaitFailed = false,
     generatedEnd: number | undefined;
   const corrector = new Corrector();
+  let rates: PlaybackRateSupport | undefined,
+    applySerial = 0,
+    pendingUserSeek = false,
+    pendingForce = false,
+    seekSerial = 0;
+  let pendingPlay: object | undefined;
+  const clockRevision = () => clock.revision ?? 0;
+  const clockUsable = () => {
+    ctx.checkClock?.();
+    return clock.ready && connected.value && foreground();
+  };
+  function bestEffort<T>(action: () => T): T | undefined {
+    try {
+      return action();
+    } catch {
+      // Local telemetry must never prevent a media action or grant teardown.
+      return undefined;
+    }
+  }
+  const unsupportedRateError =
+    "本地播放器不支持此速率，请调整房间倍速或重新加载";
+  function reportUnsupportedRate() {
+    rejectedBaseRate = state.value?.playback_rate;
+    if (!error.value || error.value === unsupportedRateError)
+      error.value = unsupportedRateError;
+  }
+  function runAutomaticApply(force = false, userSeek = false) {
+    const previousError = error.value;
+    return run(async () => {
+      // The room's action runner clears errors for user actions. Automatic
+      // convergence must preserve unrelated authentication/media failures.
+      if (
+        previousError &&
+        previousError !== unsupportedRateError &&
+        !error.value
+      )
+        error.value = previousError;
+      await applyState(force, userSeek);
+    });
+  }
+  function baseRate() {
+    const rate = state.value?.playback_rate;
+    if (rate === undefined || !rates) return false;
+    const supported = rates.ensureBase(rate);
+    if (!supported) reportUnsupportedRate();
+    else {
+      confirmedBaseRate = rate;
+      rejectedBaseRate = undefined;
+      if (error.value === unsupportedRateError) error.value = "";
+    }
+    return supported;
+  }
+  function restoreBaseRate() {
+    if (baseRate() && !rates!.restoreBase()) reportUnsupportedRate();
+  }
+  function queueApply(force = false, userSeek = false) {
+    pendingForce ||= force;
+    pendingUserSeek ||= userSeek;
+    clockAction ??= "apply";
+  }
   const planGenerations = new PlaybackPlanGenerations();
   const currentPlan = (p: PlaybackPlan) =>
     plan === p && planGenerations.current(p);
@@ -117,6 +215,83 @@ export function createPlaybackRuntime(ctx: {
   );
   const foreground = () =>
     typeof document === "undefined" || document.visibilityState !== "hidden";
+  function refreshRecovery() {
+    const s = state.value,
+      el = video.value;
+    const ownsPlan =
+      !!plan &&
+      currentPlan(plan) &&
+      !!metricIntent &&
+      metricCurrent(metricIntent);
+    const ownsLoad = !!pendingLoad && metricCurrent(pendingLoad.metrics);
+    const prefixEnded = el?.ended && plan?.rebuild_on_seek && !terminalEnd;
+    if (
+      !roomIsActive() ||
+      !s?.media_id ||
+      !el ||
+      (!ownsPlan && !ownsLoad) ||
+      (ownsPlan && plan!.media_generation !== s.media_generation) ||
+      (el.ended && !prefixEnded)
+    ) {
+      recoveryPending = false;
+      recoveryState.value = "idle";
+    } else if (rejectedBaseRate === s.playback_rate) {
+      recoveryState.value = "unsupported_rate";
+    } else if (error.value && error.value !== unsupportedRateError) {
+      // Authentication/media failures stay in their existing error UI.
+      recoveryState.value = "failed";
+    } else if (!connected.value) {
+      recoveryState.value = "reconnecting";
+    } else if (!foreground()) {
+      recoveryState.value = "background";
+    } else if (!clock.ready) {
+      recoveryState.value = "calibrating";
+    } else if (prefixEnded) {
+      // A growing HLS prefix ending is not a completed film or recovery.
+      recoveryPending = true;
+      recoveryState.value = "waiting";
+    } else if (!recoveryPending) {
+      recoveryState.value = "idle";
+    } else if (blocked.value) {
+      recoveryState.value = "blocked";
+    } else if (
+      !ownsPlan ||
+      ownsLoad ||
+      waiting.value ||
+      el.readyState < 2 ||
+      el.seeking ||
+      generationWait ||
+      generationWaitFailed ||
+      recoveringHls ||
+      pendingForce ||
+      pendingUserSeek ||
+      pendingPlay ||
+      confirmedBaseRate !== s.playback_rate ||
+      !rates?.baseSupported
+    ) {
+      recoveryState.value = "waiting";
+    } else {
+      const expected = Math.min(
+        generatedEnd ?? Infinity,
+        Math.max(0, (target(s, clock.now()) - plan!.timeline_origin_ms) / 1000),
+      );
+      if (!containsPlaybackPosition(availablePlaybackRanges(el), expected)) {
+        recoveryState.value = "waiting";
+        return;
+      }
+      const drift = Math.abs(expected - el.currentTime) * 1000;
+      const window = rates.fineUnsupported ? 500 : 150;
+      const matchesStatus =
+        s.playback_status === "playing" ? !el.paused : el.paused;
+      if (matchesStatus && Number.isFinite(drift) && drift <= window) {
+        recoveryPending = false;
+        recoveryState.value = "idle";
+      } else recoveryState.value = "catching_up";
+    }
+  }
+  // Only actions update the status; rendering never samples the clock or writes
+  // a rate. Ordinary drift does not reopen an already completed recovery.
+  const updateRecovery = () => bestEffort(refreshRecovery);
   const metricCurrent = (m: MetricIntent) =>
     metricIntent === m &&
     roomIsActive() &&
@@ -132,32 +307,33 @@ export function createPlaybackRuntime(ctx: {
     buffering: !!generationWait || recoveringHls,
   });
   const metricRead = () =>
-    metricSource?.read() ?? {
+    bestEffort(() => metricSource?.read()) ?? {
       ...metricState(),
       paused: video.value?.paused ?? true,
       seeking: video.value?.seeking ?? false,
     };
   function observeMetrics() {
     const m = metricIntent;
-    if (m && metricCurrent(m)) m.meter?.observe(m.fence, metricRead());
+    if (m && metricCurrent(m))
+      bestEffort(() => m.meter?.observe(m.fence, metricRead()));
   }
   function finishMetrics() {
     const m = metricIntent;
     if (m && metricCurrent(m)) {
-      const final = m.meter?.dispose(m.fence, metricRead());
-      if (final && !m.disabled) metricSender.offer(final);
+      const final = bestEffort(() => m.meter?.dispose(m.fence, metricRead()));
+      if (final && !m.disabled) bestEffort(() => metricSender.offer(final));
     }
     metricIntent = undefined;
     pendingLoad = undefined;
-    metricSource?.stop();
+    bestEffort(() => metricSource?.stop());
     metricSource = undefined;
-    metricSender.unbind(true);
+    bestEffort(() => metricSender.unbind(true));
   }
   function advanceMetricAttempt(m: MetricIntent) {
-    metricSource?.stop();
+    bestEffort(() => metricSource?.stop());
     metricSource = undefined;
     m.fence = { identity: m.identity, generation: m.fence.generation + 1 };
-    m.meter?.beginAttempt(m.fence, metricRead());
+    bestEffort(() => m.meter?.beginAttempt(m.fence, metricRead()));
   }
   function bindMetricSource(
     p: PlaybackPlan,
@@ -168,17 +344,20 @@ export function createPlaybackRuntime(ctx: {
     if (!m?.meter || !metricCurrent(m) || m.enabledPlan !== p) return;
     if (restart) advanceMetricAttempt(m);
     const fence = m.fence;
-    metricSource = bindPlaybackMetricEvents({
-      element: el,
-      meter: m.meter,
-      fence,
-      current: () =>
-        metricCurrent(m) &&
-        m.fence === fence &&
-        currentPlan(p) &&
-        video.value === el,
-      state: metricState,
-    });
+    const meter = m.meter;
+    metricSource = bestEffort(() =>
+      bindPlaybackMetricEvents({
+        element: el,
+        meter,
+        fence,
+        current: () =>
+          metricCurrent(m) &&
+          m.fence === fence &&
+          currentPlan(p) &&
+          video.value === el,
+        state: metricState,
+      }),
+    );
   }
   function bindMetricGrant(p: PlaybackPlan) {
     const m = metricIntent,
@@ -205,14 +384,16 @@ export function createPlaybackRuntime(ctx: {
       return;
     }
     m.enabledPlan = p;
-    metricSender.bind({
-      sessionId: p.session_id,
-      planGeneration: p.plan_generation!,
-      mediaGeneration: p.media_generation,
-      meterStartGeneration: m.startGeneration,
-      startupOrigin: m.origin,
-      current: () => metricCurrent(m) && currentPlan(p),
-    });
+    bestEffort(() =>
+      metricSender.bind({
+        sessionId: p.session_id,
+        planGeneration: p.plan_generation!,
+        mediaGeneration: p.media_generation,
+        meterStartGeneration: m.startGeneration,
+        startupOrigin: m.origin,
+        current: () => metricCurrent(m) && currentPlan(p),
+      }),
+    );
   }
   function sampleMetrics() {
     const m = metricIntent;
@@ -222,16 +403,16 @@ export function createPlaybackRuntime(ctx: {
       PLAYBACK_METRICS_MAX_ELAPSED_MS
     ) {
       m.disabled = true;
-      metricSender.unbind();
-      metricSource?.stop();
+      bestEffort(() => metricSender.unbind());
+      bestEffort(() => metricSource?.stop());
       metricSource = undefined;
       return;
     }
-    metricSource?.progress();
-    const snapshot = m.meter?.sample(m.fence, metricRead());
+    bestEffort(() => metricSource?.progress());
+    const snapshot = bestEffort(() => m.meter?.sample(m.fence, metricRead()));
     if (snapshot) {
       m.last = snapshot;
-      if (!m.disabled) metricSender.offer(snapshot);
+      if (!m.disabled) bestEffort(() => metricSender.offer(snapshot));
     }
   }
   // Accepted intent/visibility edges remain separate from observation-v1 flags.
@@ -297,7 +478,10 @@ export function createPlaybackRuntime(ctx: {
         el.ended &&
         state.value?.playback_status === "playing"
       ) {
-        observations?.completed();
+        terminalEnd = true;
+        recoveryPending = false;
+        updateRecovery();
+        bestEffort(() => observations?.completed());
         ctx.ended?.(el.currentTime * 1000 + p.timeline_origin_ms);
       }
     } catch (failure) {
@@ -372,13 +556,18 @@ export function createPlaybackRuntime(ctx: {
     return readiness;
   }
   async function stopPlayback() {
+    recoveryPending = false;
+    recoveryState.value = "idle";
+    terminalEnd = false;
+    ++applySerial;
+    pendingPlay = undefined;
     // Grant teardown alone (including automatic fallback) never ends its meter.
-    metricSource?.stop();
+    bestEffort(() => metricSource?.stop());
     metricSource = undefined;
-    metricSender.unbind(true);
+    bestEffort(() => metricSender.unbind(true));
     if (metricIntent) metricIntent.enabledPlan = undefined;
     // Capture the old element before teardown changes its time or identity.
-    const finalObservation = observations?.stop();
+    const finalObservation = bestEffort(() => observations?.stop());
     observations = undefined;
     clearTimeout(firstFrameTimer);
     firstFrameTimer = undefined;
@@ -459,13 +648,18 @@ export function createPlaybackRuntime(ctx: {
       disabled: false,
     };
     metricIntent = m;
-    m.meter = createPlaybackMetrics({
-      t0: m.t0,
-      startupOrigin: origin,
-      fence: m.fence,
-      current: () => (metricCurrent(m) ? m.fence : undefined),
-      initial: metricRead(),
-    });
+    rates?.reset();
+    confirmedBaseRate = rejectedBaseRate = undefined;
+    corrector.reset();
+    m.meter = bestEffort(() =>
+      createPlaybackMetrics({
+        t0: m.t0,
+        startupOrigin: origin,
+        fence: m.fence,
+        current: () => (metricCurrent(m) ? m.fence : undefined),
+        initial: metricRead(),
+      }),
+    );
     return loadAttempt([], intent, m);
   }
   async function loadMedia() {
@@ -486,10 +680,13 @@ export function createPlaybackRuntime(ctx: {
     if (!metricCurrent(metrics)) return;
     const s = state.value!;
     pendingLoad = { metrics, intent, failed: failedCandidates };
-    if (!clock.ready) {
+    recoveryPending = true;
+    updateRecovery();
+    if (!clockUsable()) {
       clockAction = "load";
       return;
     }
+    const revision = clockRevision();
     const serial = ++loadSerial;
     try {
       await stopPlayback();
@@ -501,7 +698,9 @@ export function createPlaybackRuntime(ctx: {
         !video.value
       )
         return;
-      if (!clock.ready) {
+      recoveryPending = true;
+      updateRecovery();
+      if (!clockUsable() || revision !== clockRevision()) {
         clockAction = "load";
         return;
       }
@@ -557,7 +756,7 @@ export function createPlaybackRuntime(ctx: {
         state.value?.media_generation !== s.media_generation
       )
         return;
-      if (!clock.ready) {
+      if (!clockUsable() || revision !== clockRevision()) {
         waiting.value = false;
         clockAction = "load";
         return;
@@ -568,7 +767,7 @@ export function createPlaybackRuntime(ctx: {
         media_generation: s.media_generation,
         mode: mode.value,
         audio_index: audioIndex.value ?? null,
-        position_ms: target(s, clock.now()),
+        position_ms: target(state.value ?? s, clock.now()),
         capabilities,
         ...(candidateReport ? { candidate_report: candidateReport } : {}),
         observation_version: 1,
@@ -579,9 +778,14 @@ export function createPlaybackRuntime(ctx: {
         },
       };
       waiting.value = true;
-      const p = await requests().prepare(request, () =>
-        target(state.value ?? s, clock.now()),
-      );
+      const requestedSeek = seekSerial;
+      const p = await requests().prepare(request, () => {
+        if (!clockUsable() || revision !== clockRevision()) {
+          clockAction = "load";
+          throw new PlaybackCancelled();
+        }
+        return target(state.value ?? s, clock.now());
+      });
       if (
         serial !== loadSerial ||
         !metricCurrent(metrics) ||
@@ -597,6 +801,12 @@ export function createPlaybackRuntime(ctx: {
       }
       plan = p;
       pendingLoad = undefined;
+      // A new plan request has consumed the latest explicit target. Its own
+      // metadata reconcile must not replay a pre-load seek as another rebuild.
+      if (requestedSeek === seekSerial) {
+        pendingUserSeek = false;
+        pendingForce = false;
+      }
       sessionId.value = p.session_id;
       tracks.value = p.audio_tracks;
       subtitles.value = p.subtitle_tracks;
@@ -610,35 +820,37 @@ export function createPlaybackRuntime(ctx: {
       if (p.observation_version === 1) {
         const user = session.user!.id;
         const epoch = session.epoch;
-        observations = bindPlaybackObservations({
-          element: el,
-          plan: p,
-          current: () =>
-            currentPlan(p) &&
-            roomIsActive() &&
-            serial === loadSerial &&
-            video.value === el &&
-            session.user?.id === user &&
-            session.epoch === epoch &&
-            state.value?.room_id === s.room_id &&
-            state.value?.media_generation === p.media_generation,
-          finalCurrent: () =>
-            plan === p &&
-            video.value === el &&
-            session.user?.id === user &&
-            session.epoch === epoch,
-          send: async (body, signal) => {
-            if (session.epoch !== epoch) throw new StaleIdentity();
-            await session.api(
-              `/playback-sessions/${p.session_id}/observations`,
-              "POST",
-              body,
-              signal,
-            );
-          },
-          storage: sessionStorage,
-          storageKey: `rainsync:observation:${user}:${p.session_id}`,
-        });
+        observations = bestEffort(() =>
+          bindPlaybackObservations({
+            element: el,
+            plan: p,
+            current: () =>
+              currentPlan(p) &&
+              roomIsActive() &&
+              serial === loadSerial &&
+              video.value === el &&
+              session.user?.id === user &&
+              session.epoch === epoch &&
+              state.value?.room_id === s.room_id &&
+              state.value?.media_generation === p.media_generation,
+            finalCurrent: () =>
+              plan === p &&
+              video.value === el &&
+              session.user?.id === user &&
+              session.epoch === epoch,
+            send: async (body, signal) => {
+              if (session.epoch !== epoch) throw new StaleIdentity();
+              await session.api(
+                `/playback-sessions/${p.session_id}/observations`,
+                "POST",
+                body,
+                signal,
+              );
+            },
+            storage: sessionStorage,
+            storageKey: `rainsync:observation:${user}:${p.session_id}`,
+          }),
+        );
       }
       endAttempt = -Infinity;
       el.onended = () => {
@@ -650,11 +862,16 @@ export function createPlaybackRuntime(ctx: {
         p.transport === "hls" &&
         !el.canPlayType("application/vnd.apple.mpegurl") &&
         Hls.isSupported();
-      const playbackPosition = () =>
-        Math.max(
+      const playbackPosition = () => {
+        if (!clockUsable()) {
+          queueApply();
+          return el.currentTime;
+        }
+        return Math.max(
           0,
           (target(state.value!, clock.now()) - p.timeline_origin_ms) / 1000,
         );
+      };
       const retryDecode = () => {
         const candidate = p.selected_candidate_id;
         if (
@@ -679,7 +896,8 @@ export function createPlaybackRuntime(ctx: {
           !roomIsActive() ||
           !currentPlan(p) ||
           !state.value ||
-          recoveries >= 3
+          recoveries >= 3 ||
+          !clockUsable()
         )
           return false;
         recoveries++;
@@ -736,7 +954,7 @@ export function createPlaybackRuntime(ctx: {
             recoveringHls = true;
             waiting.value = true;
             el.pause();
-            metricSource?.stop();
+            bestEffort(() => metricSource?.stop());
             el.removeAttribute("src");
             el.load();
             bindMetricSource(p, el, true);
@@ -799,7 +1017,7 @@ export function createPlaybackRuntime(ctx: {
         if (serial !== loadSerial || !currentPlan(p)) return;
         applySubtitles();
         duration.value = p.duration_ms ? p.duration_ms / 1000 : el.duration;
-        void run(() => applyState(true));
+        void runAutomaticApply(true);
       };
     } catch (e) {
       if (serial !== loadSerial || e instanceof PlaybackCancelled) return;
@@ -819,6 +1037,11 @@ export function createPlaybackRuntime(ctx: {
   }
   async function waitForGenerated(p: PlaybackPlan) {
     if (generationWait || generationWaitFailed) return;
+    if (!clockUsable()) {
+      queueApply();
+      return;
+    }
+    const revision = clockRevision();
     const controller = new AbortController();
     generationWait = controller;
     observeMetrics();
@@ -826,8 +1049,12 @@ export function createPlaybackRuntime(ctx: {
     video.value?.pause();
     try {
       const ready = await waitPlaybackReady(
-        (id, signal) =>
-          readReadiness(
+        (id, signal) => {
+          if (!clockUsable() || revision !== clockRevision()) {
+            queueApply();
+            throw new PlaybackCancelled();
+          }
+          return readReadiness(
             id,
             signal,
             Math.max(
@@ -835,13 +1062,18 @@ export function createPlaybackRuntime(ctx: {
               target(state.value!, clock.now()) - p.timeline_origin_ms,
             ),
             p.plan_generation,
-          ),
+          );
+        },
         p.session_id,
         controller.signal,
         p.plan_generation,
       );
       if (controller.signal.aborted || !currentPlan(p) || !roomIsActive())
         throw new PlaybackCancelled();
+      if (!clockUsable() || revision !== clockRevision()) {
+        queueApply();
+        return;
+      }
       if (ready.complete && ready.available_until_ms != null)
         generatedEnd = ready.available_until_ms / 1000;
       const position = Math.min(
@@ -853,8 +1085,7 @@ export function createPlaybackRuntime(ctx: {
       );
       recoveringHls = true;
       if (hls) {
-        // The same attempt grows through EVENT polling. Retain its MSE buffers;
-        // applyState seeks once the local manifest covers the room position.
+        // Retain the growing EVENT attempt and wait for an actual local interval.
         hls.startLoad(position);
       } else if (video.value) {
         bindMetricSource(p, video.value, true);
@@ -866,6 +1097,10 @@ export function createPlaybackRuntime(ctx: {
     } catch (e) {
       if (controller.signal.aborted || !currentPlan(p) || !roomIsActive())
         throw new PlaybackCancelled();
+      if (revision !== clockRevision() || !clockUsable()) {
+        queueApply();
+        return;
+      }
       generationWaitFailed = true;
       waiting.value = false;
       throw e;
@@ -874,170 +1109,274 @@ export function createPlaybackRuntime(ctx: {
       observeMetrics();
     }
   }
-  function availableRange(el: HTMLVideoElement): TimeRanges {
-    // Native EVENT playback can expose decoded buffers before seekable ranges.
-    // Requiring seekable first can deadlock a paused recovery before play().
-    return el.seekable.length ? el.seekable : el.buffered;
+  function actionCurrent(
+    p: PlaybackPlan,
+    el: HTMLVideoElement,
+    revision: number,
+    serial: number,
+  ) {
+    return (
+      clockUsable() &&
+      revision === clockRevision() &&
+      serial === applySerial &&
+      currentPlan(p) &&
+      roomIsActive() &&
+      video.value === el
+    );
+  }
+  function afterPlay(
+    p: PlaybackPlan,
+    el: HTMLVideoElement,
+    revision: number,
+    serial: number,
+  ) {
+    // A play promise may settle after a newer PAUSE. Enforce the latest state,
+    // but never pause a replacement grant or pause merely for clock recovery.
+    if (
+      currentPlan(p) &&
+      video.value === el &&
+      state.value?.playback_status !== "playing"
+    )
+      el.pause();
+    return (
+      actionCurrent(p, el, revision, serial) &&
+      state.value?.playback_status === "playing"
+    );
   }
   async function applyState(force = false, userSeek = false) {
+    try {
+      await reconcileState(force, userSeek);
+    } finally {
+      updateRecovery();
+    }
+  }
+  async function reconcileState(force = false, userSeek = false) {
+    if (userSeek) ++seekSerial;
+    pendingUserSeek ||= userSeek;
+    const serial = ++applySerial;
     observeMetrics();
     if (!roomIsActive()) return;
     const s = state.value,
       el = video.value;
-    if (!s || !el || !plan || el.readyState < 1) return;
+    if (!s || !el || !plan) return;
     const p = plan;
     if (!currentPlan(p)) return;
+    if (s.playback_status !== "playing") {
+      el.pause();
+      restoreBaseRate();
+    }
+    if (!clockUsable()) {
+      restoreBaseRate();
+      queueApply(force, userSeek);
+      return;
+    }
+    if (el.readyState < 1) return;
+    userSeek ||= pendingUserSeek;
+    force ||= pendingForce;
+    pendingUserSeek = false;
+    pendingForce = false;
     if (el.ended && s.playback_status === "playing" && !userSeek) {
       void completed();
       return;
     }
-    if (!clock.ready) {
-      clockAction ??= "apply";
-      return;
-    }
+    if (!baseRate()) return;
+    const revision = clockRevision();
     if (userSeek) {
       generationWaitFailed = false;
       generatedEnd = undefined;
       recoveringHls = false;
-    }
-    const relative = (target(s, clock.now()) - plan.timeline_origin_ms) / 1000;
-    const expected = Math.min(generatedEnd ?? Infinity, Math.max(0, relative));
-    if (userSeek && generationWait) {
-      generationWait.abort();
+      generationWait?.abort();
       generationWait = undefined;
     }
     if (generationWait || generationWaitFailed) return;
-    const range = availableRange(el);
-    const end = range.length ? range.end(range.length - 1) : el.duration;
-    if (
-      plan.rebuild_on_seek &&
-      !userSeek &&
-      !recoveringHls &&
-      generatedEnd === undefined &&
-      Number.isFinite(end) &&
-      expected > end + 0.1
-    ) {
-      await waitForGenerated(plan);
-      return;
-    }
-    if (recoveringHls) {
-      // A replacement EVENT playlist may still be growing toward the room time.
-      // Waiting here must not create another playback session or jump to its edge.
-      const seekable = Array.from({ length: range.length }, (_, i) => i).some(
-        (i) => expected >= range.start(i) && expected <= range.end(i),
-      );
-      if (
-        !seekable &&
-        (!Number.isFinite(el.duration) || expected > el.duration)
-      )
-        return;
-      recoveringHls = false;
-    }
+    const relative = (target(s, clock.now()) - p.timeline_origin_ms) / 1000;
+    const expected = Math.min(generatedEnd ?? Infinity, Math.max(0, relative));
+    const ranges = availablePlaybackRanges(el);
+    const seekable = containsPlaybackPosition(ranges, expected);
+    const end = ranges.length
+      ? Math.max(...ranges.map(([, end]) => end))
+      : undefined;
     if (
       force &&
-      plan.rebuild_on_seek &&
-      (relative < -0.5 ||
-        (userSeek && Number.isFinite(end) && expected > end + 0.1))
+      p.rebuild_on_seek &&
+      (relative < -0.5 || (userSeek && !seekable))
     ) {
       if (userSeek) await beginLoad("automatic_load");
       else await fallbackLoad();
       return;
     }
+    if (recoveringHls && !seekable) {
+      if (end !== undefined && expected <= end) {
+        recoveringHls = false;
+        waiting.value = false;
+        error.value = "目标进度尚不可定位，请稍后重试或重新加载";
+      }
+      return;
+    }
+    if (
+      p.rebuild_on_seek &&
+      !userSeek &&
+      !recoveringHls &&
+      generatedEnd === undefined &&
+      !seekable &&
+      (end === undefined || expected > end + 0.1)
+    ) {
+      await waitForGenerated(p);
+      return;
+    }
+    // Neither a finite duration nor a later interval authorizes a seek into a
+    // hole. Generated holes stay on the finite recovery/reload path.
+    if (!seekable && Math.abs(el.currentTime - expected) > 0.15) {
+      restoreBaseRate();
+      error.value = "目标进度尚不可定位，请稍后重试或重新加载";
+      // Initial playback may need play() to expose any local intervals. Keep
+      // the metadata seek pending, and never assign an unavailable position.
+      if (!ranges.length && force && !userSeek) pendingForce = true;
+      if (userSeek || ranges.length) return;
+    }
+    if (recoveringHls) recoveringHls = false;
+    if (seekable && error.value === "目标进度尚不可定位，请稍后重试或重新加载")
+      error.value = "";
     if (force || s.playback_status !== "playing") {
-      if (Math.abs(el.currentTime - expected) > 0.15) el.currentTime = expected;
+      if (seekable && Math.abs(el.currentTime - expected) > 0.15)
+        el.currentTime = expected;
     }
     if (s.playback_status === "playing") {
-      if (el.paused)
+      if (el.paused && !blocked.value && !pendingPlay) {
+        const playing = {};
+        pendingPlay = playing;
         try {
           await el.play();
-          if (!currentPlan(p) || !roomIsActive() || video.value !== el) return;
+          if (!afterPlay(p, el, revision, serial)) return;
           blocked.value = false;
           observeMetrics();
         } catch {
-          if (!currentPlan(p) || !roomIsActive() || video.value !== el) return;
+          if (!afterPlay(p, el, revision, serial)) return;
           blocked.value = true;
           observeMetrics();
+        } finally {
+          if (pendingPlay === playing) pendingPlay = undefined;
         }
-    } else el.pause();
+      }
+    }
   }
   async function enablePlayback() {
     if (!roomIsActive()) return;
     const p = plan,
       el = video.value;
-    if (p && el && currentPlan(p)) {
+    if (!clockUsable()) {
+      queueApply();
+      return;
+    }
+    if (p && el && currentPlan(p) && baseRate() && !pendingPlay) {
+      const serial = ++applySerial,
+        revision = clockRevision();
+      const playing = {};
+      pendingPlay = playing;
       try {
         await el.play();
       } catch (failure) {
-        if (!currentPlan(p) || !roomIsActive() || video.value !== el) return;
+        if (!afterPlay(p, el, revision, serial)) return;
         throw failure;
+      } finally {
+        if (pendingPlay === playing) pendingPlay = undefined;
       }
-      if (!currentPlan(p) || !roomIsActive() || video.value !== el) return;
+      if (!afterPlay(p, el, revision, serial)) return;
       blocked.value = false;
       observeMetrics();
       await applyState(true);
     }
   }
   function tick() {
+    try {
+      tickPlayback();
+    } finally {
+      updateRecovery();
+    }
+  }
+  function tickPlayback() {
+    const usable = clockUsable();
     if (!roomIsActive()) return;
     const s = state.value,
       el = video.value;
     if (!s || !el || !plan) return;
+    if (!dragging.value)
+      position.value = el.currentTime + plan.timeline_origin_ms / 1000;
+    if (!usable || s.playback_status !== "playing") {
+      corrector.reset();
+      restoreBaseRate();
+      return;
+    }
+    if (!baseRate()) return;
     if (el.ended) {
       void completed();
       return;
     }
     if (generationWait || generationWaitFailed) return;
     if (recoveringHls) {
-      void run(() => applyState(true));
+      void runAutomaticApply(true);
       return;
     }
-    if (!dragging.value)
-      position.value = el.currentTime + plan.timeline_origin_ms / 1000;
-    if (!clock.ready || !connected.value || s.playback_status !== "playing")
-      return;
     const expected = Math.min(
       generatedEnd ?? Infinity,
       (target(s, clock.now()) - plan.timeline_origin_ms) / 1000,
     );
-    const range = availableRange(el);
-    const end = range.length ? range.end(range.length - 1) : el.duration;
-    if (
-      plan.rebuild_on_seek &&
-      generatedEnd === undefined &&
-      Number.isFinite(end) &&
-      expected > end + 0.1
-    ) {
-      void run(() => applyState(true));
+    const ranges = availablePlaybackRanges(el);
+    if (!containsPlaybackPosition(ranges, expected)) {
+      restoreBaseRate();
+      corrector.reset();
+      if (plan.rebuild_on_seek) void runAutomaticApply(true);
       return;
     }
+    if (
+      !blocked.value &&
+      !pendingPlay &&
+      (el.paused || pendingForce || pendingUserSeek)
+    ) {
+      void runAutomaticApply(pendingForce, pendingUserSeek);
+      return;
+    }
+    const drift = (expected - el.currentTime) * 1000;
+    const pausedCorrection =
+      waiting.value || el.seeking || blocked.value || el.readyState < 2;
     const adjustment = corrector.step(
-      (expected - el.currentTime) * 1000,
+      rates!.fineUnsupported && Math.abs(drift) <= 500 ? 0 : drift,
       s.playback_rate,
       performance.now(),
-      waiting.value || el.seeking || blocked.value || el.readyState < 2,
+      pausedCorrection,
     );
-    el.playbackRate = adjustment.rate;
-    if (adjustment.seek) {
-      if (
-        plan.rebuild_on_seek &&
-        (expected < -0.5 || expected > el.duration + 1)
-      ) {
-        if (expected < -0.5) void run(() => fallbackLoad());
-        else void run(() => applyState(true));
-      } else el.currentTime = Math.max(0, expected);
+    if (pausedCorrection || adjustment.seek) restoreBaseRate();
+    else if (!rates!.fineUnsupported) rates!.applyCorrection(adjustment.rate);
+    if (!rates!.baseSupported) {
+      reportUnsupportedRate();
+      corrector.reset();
+      return;
     }
+    if (adjustment.seek) el.currentTime = expected;
+  }
+  function onClockInvalidated() {
+    ++applySerial;
+    corrector.reset();
+    restoreBaseRate();
+    generationWait?.abort();
+    generationWait = undefined;
+    generationWaitFailed = false;
+    queueApply();
+    recoveryPending = !!plan || !!pendingLoad;
+    updateRecovery();
   }
   function onClockReady() {
-    if (!roomIsActive()) return;
+    if (!roomIsActive() || !clockUsable()) return;
+    updateRecovery();
     if (clockAction) {
       const action = clockAction;
       clockAction = undefined;
       const pending = pendingLoad;
-      void run(
-        action === "load" && pending
-          ? () => loadAttempt(pending.failed, pending.intent, pending.metrics)
-          : () => applyState(true),
-      );
+      if (action === "load" && pending)
+        void run(() =>
+          loadAttempt(pending.failed, pending.intent, pending.metrics),
+        );
+      else void runAutomaticApply(pendingForce, pendingUserSeek);
     }
   }
   function mediaChanged() {
@@ -1052,6 +1391,11 @@ export function createPlaybackRuntime(ctx: {
     finishMetrics();
     ++loadSerial;
     clockAction = undefined;
+    pendingUserSeek = false;
+    pendingForce = false;
+    corrector.reset();
+    rates?.reset();
+    confirmedBaseRate = rejectedBaseRate = undefined;
     dragging.value = false;
     tracks.value = [];
     subtitles.value = [];
@@ -1068,9 +1412,29 @@ export function createPlaybackRuntime(ctx: {
     if (video.value === element) return;
     if (video.value) throw new Error("播放器已绑定；需先显式停止");
     video.value = element;
+    rates = new PlaybackRateSupport(element);
+    confirmedBaseRate = rejectedBaseRate = undefined;
   }
+  watch(
+    () => [
+      roomIsActive(),
+      state.value?.room_id,
+      state.value?.media_id,
+      state.value?.media_generation,
+      session.epoch,
+      connected.value,
+      waiting.value,
+      blocked.value,
+      error.value,
+    ],
+    updateRecovery,
+    { flush: "sync" },
+  );
   const timer = setInterval(tick, 500);
-  const observationTimer = setInterval(() => observations?.progress(), 5000);
+  const observationTimer = setInterval(
+    () => bestEffort(() => observations?.progress()),
+    5000,
+  );
   const metricsTimer = setInterval(sampleMetrics, 5000);
   const renewTimer = setInterval(() => {
     const current = plan?.session_id;
@@ -1094,7 +1458,7 @@ export function createPlaybackRuntime(ctx: {
     clearInterval(metricsTimer);
     clearInterval(renewTimer);
     void reset().catch(() => {});
-    metricSender.stop();
+    bestEffort(() => metricSender.stop());
     if (typeof document !== "undefined")
       document.removeEventListener("visibilitychange", observeMetrics);
   });
@@ -1111,12 +1475,15 @@ export function createPlaybackRuntime(ctx: {
     duration,
     position,
     sessionId,
+    recoveryState,
+    recoveryLabel,
     loadMedia,
     applyState,
     enablePlayback,
     applySubtitles,
     reset,
     onClockReady,
+    onClockInvalidated,
     mediaChanged,
     resetClockAction,
     attach,

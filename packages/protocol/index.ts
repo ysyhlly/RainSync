@@ -9,6 +9,7 @@ export type MediaTrack = { index: number, label: string, language: string, url: 
 export type SubtitleDeliveryMode = "none" | "external_vtt";
 export type DecoderFallbackMode = "remux" | "transcode";
 export type PlaybackMediaRange = { start_ms: number, end_ms: number, };
+export type HttpFileFallback = { parent_session_id: string, final_observation?: PlaybackObservation, };
 export type PlaybackPlan = { session_id: string,
 /**
  * Per-viewer intent generation; absent for legacy grants. Never room revision.
@@ -30,6 +31,11 @@ pending_job_id?: string,
  * Evidence-backed next request modes, never access or decode guarantees.
  */
 decoder_fallback_modes?: Array<DecoderFallbackMode>,
+/**
+ * This live root grant supports one same-representation HTTP file→transcode
+ * transition. Absent for legacy, unsupported inputs and successor grants.
+ */
+http_file_fallback_version?: number,
 /**
  * Present only when this grant negotiated actual viewer observations.
  */
@@ -82,6 +88,10 @@ export type PlaybackCapabilities = { progressive_h264_aac: boolean, native_hls: 
  */
 report?: CapabilityReport, };
 export type PlaybackRequest = {
+/**
+ * Negotiate single-hop verified HTTP-file continuation; absence is legacy.
+ */
+http_file_fallback_version?: number, http_file_fallback?: HttpFileFallback,
 /**
  * Opaque per-player identity for ordering only, never authorization.
  */

@@ -40,6 +40,16 @@
       "format": "uint32",
       "minimum": 0
     },
+    "http_file_fallback_version": {
+      "description": "This live root grant supports one same-representation HTTP file→transcode\ntransition. Absent for legacy, unsupported inputs and successor grants.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1
+    },
     "media_generation": {
       "type": "integer",
       "format": "uint32",

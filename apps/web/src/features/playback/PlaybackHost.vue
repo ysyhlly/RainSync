@@ -140,10 +140,13 @@ onBeforeUnmount(() => {
       >
         点击加入播放</button
       ><span
-        v-if="r.waiting && r.state?.media_id"
+        v-if="
+          ((full || fullscreen) && r.recoveryLabel) ||
+          (!r.recoveryLabel && r.waiting && r.state?.media_id)
+        "
         class="buffering"
         role="status"
-        >正在准备影片…</span
+        >{{ r.recoveryLabel || "正在准备影片…" }}</span
       >
 
       <PlaybackInformation
@@ -186,6 +189,9 @@ onBeforeUnmount(() => {
       <div>
         <h2>{{ r.currentTitle }}</h2>
         <p>{{ r.room?.name }}</p>
+        <span v-if="!full && !fullscreen && r.recoveryLabel" role="status">{{
+          r.recoveryLabel
+        }}</span>
       </div>
       <RouterLink class="button return-room" :to="'/rooms/' + r.room?.id"
         >返回房间<AppIcon name="next"

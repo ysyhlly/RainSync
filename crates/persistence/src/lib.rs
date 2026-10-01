@@ -5,6 +5,7 @@ use uuid::Uuid;
 pub mod cache;
 pub mod cache_budget;
 pub mod cache_outputs;
+pub mod http_file_authorization;
 pub mod media_executions;
 pub mod media_jobs;
 pub mod media_outputs;

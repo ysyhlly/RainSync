@@ -51,6 +51,7 @@ async function reportedFixture(page: Page) {
             t1: frame.t1,
             t2: frame.t1,
             t3: frame.t1,
+            clock_epoch: app.state.clock_epoch,
           }),
         );
       } else if (frame.command_id) app.commands.push(frame);
@@ -152,17 +153,15 @@ test("server without negotiated fields is unavailable and never inferred offline
   await page.goto("/rooms/room");
   const panel = page.getByRole("region", { name: "已上报在线状态的连接" });
   await expect(panel).toContainText("在线状态不可用");
-  app
-    .socket()!
-    .send(
-      JSON.stringify({
-        type: "PRESENCE_SNAPSHOT",
-        room_id: "room",
-        presence_epoch: "unbound",
-        presence_seq: 1,
-        members: [],
-      }),
-    );
+  app.socket()!.send(
+    JSON.stringify({
+      type: "PRESENCE_SNAPSHOT",
+      room_id: "room",
+      presence_epoch: "unbound",
+      presence_seq: 1,
+      members: [],
+    }),
+  );
   await expect(panel).toContainText("在线状态不可用");
   await expect(panel).not.toContainText("离线");
   expect(app.errors).toEqual([]);

@@ -53,6 +53,8 @@ pub async fn candidates(
     // The server owns the probe to completion even if its HTTP waiter disconnects.
     tokio::spawn(async move {
         let request = protocol::PlaybackRequest {
+            http_file_fallback_version: None,
+            http_file_fallback: None,
             observation_version: None,
             playback_metrics_version: None,
             playback_metrics: None,

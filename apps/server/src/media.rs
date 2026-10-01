@@ -189,6 +189,11 @@ pub async fn playback(
     Json(body): Json<protocol::PlaybackRequest>,
 ) -> Result<Json<Value>> {
     let u = auth(&app, &h, true).await?;
+    // Contract checkpoint: until the atomic continuation owner is wired, never
+    // interpret a continuation request as an unrelated fresh playback intent.
+    if body.http_file_fallback.is_some() {
+        return Err(err(StatusCode::CONFLICT, "source_version_required"));
+    }
     if body.observation_version.is_some_and(|version| version != 1) {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -719,6 +724,7 @@ async fn prepare_playback(
     };
     let encrypted = app.encrypt(&resource)?;
     let plan = protocol::PlaybackPlan {
+        http_file_fallback_version: None,
         session_id: id,
         media_id: media,
         media_generation: body.media_generation,

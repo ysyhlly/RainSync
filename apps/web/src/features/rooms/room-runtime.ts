@@ -137,6 +137,50 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
   const chatPending = ref(false),
     chatFailed = ref(false);
   const clockSamples = new Set<ReturnType<typeof setTimeout>>();
+  let snapshotReady = false;
+  let visibility = document.visibilityState;
+  let lastClockCheck = { monotonic: performance.now(), wall: Date.now() };
+  function clearClockSamples() {
+    clockSamples.forEach(clearTimeout);
+    clockSamples.clear();
+  }
+  function invalidateClock() {
+    clearClockSamples();
+    clock.reset();
+    playback.onClockInvalidated();
+    lastClockCheck = { monotonic: performance.now(), wall: Date.now() };
+  }
+  function calibrateClock() {
+    invalidateClock();
+    if (!snapshotReady || !connected.value || !roomActive.value) return;
+    const serial = connectionSerial,
+      revision = clock.revision;
+    sampleClock();
+    for (let i = 1; i < 8; i++) {
+      const timer = setTimeout(() => {
+        clockSamples.delete(timer);
+        if (serial === connectionSerial && revision === clock.revision)
+          sampleClock();
+      }, i * 150);
+      clockSamples.add(timer);
+    }
+  }
+  function checkClockContinuity() {
+    const now = { monotonic: performance.now(), wall: Date.now() },
+      monotonicGap = now.monotonic - lastClockCheck.monotonic,
+      wallGap = now.wall - lastClockCheck.wall;
+    lastClockCheck = now;
+    // performance.now() can stop on suspended systems. A long monotonic gap,
+    // backwards clock, or a long wall gap absent from it is evidence to resample.
+    if (
+      roomActive.value &&
+      document.visibilityState !== "hidden" &&
+      (monotonicGap < 0 ||
+        monotonicGap > 10000 ||
+        (wallGap > 10000 && wallGap - monotonicGap > 5000))
+    )
+      calibrateClock();
+  }
   const roomActive = computed(
     () => !!room.value && (room.value.lifecycle ?? "active") === "active",
   );
@@ -150,6 +194,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     connected,
     active: roomActive,
     clock,
+    checkClock: checkClockContinuity,
     error,
     run,
     ended: (position_ms) => send("END_MEDIA", { position_ms }),
@@ -168,9 +213,9 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       (room.value.owner_id === session.user?.id || !!session.user?.admin),
   );
   let actionSerial = 0;
-  async function run(action: () => Promise<void>) {
+  async function run(action: () => Promise<void>, preserveError = false) {
     const serial = ++actionSerial;
-    error.value = "";
+    if (!preserveError) error.value = "";
     busy.value = true;
     try {
       await action();
@@ -193,8 +238,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     ++roomSerial;
     ++connectionSerial;
     clearTimeout(retry);
-    clockSamples.forEach(clearTimeout);
-    clockSamples.clear();
+    snapshotReady = false;
+    invalidateClock();
     socket?.close();
     socket = undefined;
     connected.value = false;
@@ -210,7 +255,6 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     chatPending.value = false;
     chatFailed.value = false;
     chat.value = "";
-    clock.reset();
     await playback.reset();
   }
   watch(
@@ -258,8 +302,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     ++namesRequest;
     namesPending = false;
     controlEpoch = undefined;
-    clockSamples.forEach(clearTimeout);
-    clockSamples.clear();
+    snapshotReady = false;
+    invalidateClock();
     clearTimeout(retry);
     connectionSerial++;
     const serial = connectionSerial;
@@ -273,7 +317,6 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     socket = new WebSocket(
       `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/v1/ws`,
     );
-    clock.reset();
     socket.onopen = () => {
       if (serial !== connectionSerial) return;
       connected.value = true;
@@ -295,13 +338,6 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         if (serial === connectionSerial)
           error.value = e instanceof Error ? e.message : String(e);
       });
-      for (let i = 0; i < 8; i++) {
-        const timer = setTimeout(() => {
-          clockSamples.delete(timer);
-          if (serial === connectionSerial) sampleClock();
-        }, i * 150);
-        clockSamples.add(timer);
-      }
     };
     socket.onclose = async () => {
       if (serial !== connectionSerial) return;
@@ -311,6 +347,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       chatPending.value = false;
       chatFailed.value = !!pendingChat;
       connected.value = false;
+      snapshotReady = false;
+      invalidateClock();
       if (retryAllowed) {
         // Browsers do not expose a rejected upgrade's HTTP status. Check the
         // login session before reconnecting so expired cookies cannot loop.
@@ -377,7 +415,13 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       if (!v.state && typeof v.control_epoch?.id === "string")
         controlEpoch = v.control_epoch.id;
       if (v.type === "CLOCK_SYNC_REPLY") {
-        if (clock.sample(v.t1, v.t2, v.t3, performance.now()))
+        checkClockContinuity();
+        if (
+          connected.value &&
+          snapshotReady &&
+          state.value &&
+          clock.acceptReply(v, state.value.clock_epoch, performance.now())
+        )
           playback.onClockReady();
         return;
       }
@@ -418,7 +462,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         if (next.room_id !== room.value?.id) return;
         if (
           v.type !== "SNAPSHOT" &&
-          (!old ||
+          (!snapshotReady ||
+            !old ||
             old.clock_epoch !== next.clock_epoch ||
             next.revision > old.revision + 1)
         ) {
@@ -441,11 +486,11 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           controlEpoch = undefined;
         else if (typeof v.control_epoch?.id === "string")
           controlEpoch = v.control_epoch.id;
-        if (old && old.clock_epoch !== next.clock_epoch) {
-          clock.reset();
-          sampleClock();
-        }
+        const needsCalibration =
+          !snapshotReady || old?.clock_epoch !== next.clock_epoch;
+        snapshotReady = true;
         state.value = next;
+        if (needsCalibration) calibrateClock();
         if (!roomActive.value) {
           clearTimeout(chatTimer);
           chatPending.value = false;
@@ -469,7 +514,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
             })
             .catch(() => {});
         } else if (v.action?.type === "SEEK")
-          void run(() => applyState(true, true));
+          void run(() => applyState(true, true), true);
         else {
           const serial = roomSerial;
           void applyState().catch((e) => {
@@ -481,10 +526,27 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     };
   }
   function sampleClock() {
-    if (socket?.readyState === WebSocket.OPEN)
-      socket.send(
-        JSON.stringify({ type: "CLOCK_SYNC", t1: performance.now() }),
-      );
+    if (
+      !snapshotReady ||
+      !connected.value ||
+      !state.value ||
+      !roomActive.value ||
+      document.visibilityState === "hidden" ||
+      socket?.readyState !== WebSocket.OPEN
+    )
+      return;
+    const t1 = clock.registerRequest(
+      state.value.clock_epoch,
+      performance.now(),
+    );
+    if (t1 !== undefined) {
+      try {
+        socket.send(JSON.stringify({ type: "CLOCK_SYNC", t1 }));
+      } catch {
+        // An upgrade can close between readyState and send; reconnect will
+        // invalidate the pending request. Sampling never stops local playback.
+      }
+    }
   }
   function send(type: string, payload?: unknown) {
     if (!connected.value || !owner.value || !state.value || !controlEpoch)
@@ -518,11 +580,13 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     if (
       serial !== roomSerial ||
       room.value?.id !== result.state.room_id ||
-      (state.value && state.value.revision > result.state.revision)
+      (state.value &&
+        state.value.clock_epoch === result.state.clock_epoch &&
+        state.value.revision > result.state.revision)
     )
       return;
     room.value.owner_id = result.owner_id;
-    state.value = result.state;
+    acceptHttpState(result.state);
   }
   async function makeInvite() {
     if (!room.value || !roomActive.value) throw Error("房间当前未开放");
@@ -604,6 +668,17 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       completed: boolean;
     } | null;
   };
+  function acceptHttpState(next: RoomState) {
+    const epochChanged = state.value?.clock_epoch !== next.clock_epoch;
+    state.value = next;
+    if (epochChanged) {
+      snapshotReady = false;
+      // A newer HTTP epoch must be confirmed by this socket's RESUME snapshot
+      // before any calibration or controls can use it.
+      if (connected.value && roomActive.value) connect();
+      else invalidateClock();
+    }
+  }
   function acceptLifecycle(value: LifecycleView, serial: number) {
     if (
       serial !== roomSerial ||
@@ -616,7 +691,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     room.value.lifecycle = value.lifecycle;
     room.value.lifecycle_epoch = value.lifecycle_epoch;
     room.value.owner_id = value.owner_id;
-    state.value = value.state;
+    acceptHttpState(value.state);
     cleanupError.value = value.cleanup?.last_error
       ? "清理尚未完成，服务端将继续重试。"
       : "";
@@ -667,6 +742,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     send("SEEK", { position_ms: position.value * 1000 });
   }
   const statusTimer = setInterval(() => {
+    checkClockContinuity();
     if (room.value?.lifecycle === "closing")
       void refreshLifecycle().catch(() => {});
     if (
@@ -686,18 +762,27 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         }),
       );
   }, 5000);
-  const clockTimer = setInterval(sampleClock, 30000);
+  const clockTimer = setInterval(() => {
+    checkClockContinuity();
+    sampleClock();
+  }, 30000);
   function wake() {
-    if (document.visibilityState === "visible") {
-      sampleClock();
-      if (roomActive.value) void run(() => applyState(true));
-    }
+    const previous = visibility;
+    visibility = document.visibilityState;
+    if (previous !== visibility)
+      lastClockCheck = { monotonic: performance.now(), wall: Date.now() };
+    if (previous === "hidden" && visibility === "visible") calibrateClock();
+  }
+  function pageShown(event: PageTransitionEvent) {
+    if (event.persisted) calibrateClock();
   }
   document.addEventListener("visibilitychange", wake);
+  window.addEventListener("pageshow", pageShown);
   onScopeDispose(() => {
     clearInterval(statusTimer);
     clearInterval(clockTimer);
     document.removeEventListener("visibilitychange", wake);
+    window.removeEventListener("pageshow", pageShown);
     void leave().catch(() => {});
   });
   return {

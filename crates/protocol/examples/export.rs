@@ -29,6 +29,7 @@ fn main() {
         SubtitleDeliveryMode::decl(),
         DecoderFallbackMode::decl(),
         PlaybackMediaRange::decl(),
+        HttpFileFallback::decl(),
         PlaybackPlan::decl(),
         PreparationStatus::decl(),
         PlaybackReadiness::decl(),

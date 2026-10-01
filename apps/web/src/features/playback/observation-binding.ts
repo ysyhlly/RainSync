@@ -17,6 +17,9 @@ export function bindPlaybackObservations(ctx: {
 }) {
   const { element, plan, current, storage, storageKey } = ctx;
   let active = true;
+  let stopping = false;
+  let localFailure: unknown;
+  const attached: [string, EventListener][] = [];
   let hasPlayed = false;
   let buffering = false;
   let ended = false;
@@ -29,7 +32,7 @@ export function bindPlaybackObservations(ctx: {
   }
   const sender = createObservationSender<Omit<PlaybackObservation, "seq">>(
     async (packet, signal) => {
-      if (!active || !current()) return;
+      if (!guard(() => current())) return;
       await ctx.send(
         { ...packet.sample, seq: packet.seq },
         AbortSignal.any([signal, AbortSignal.timeout(5000)]),
@@ -44,6 +47,34 @@ export function bindPlaybackObservations(ctx: {
       }
     },
   );
+
+  function close() {
+    if (!active) return;
+    active = false;
+    for (const [event, listener] of attached.splice(0)) {
+      try {
+        element.removeEventListener(event, listener);
+      } catch {
+        // A failed removal must not prevent cancellation or the other removals.
+        // Every retained callback is fenced by active before reading media.
+      }
+    }
+    try {
+      sender.stop();
+    } catch (failure) {
+      localFailure ??= failure;
+    }
+  }
+  function guard<T>(action: () => T): T | undefined {
+    if (!active || stopping) return;
+    try {
+      return action();
+    } catch (failure) {
+      localFailure = failure;
+      close();
+      return undefined;
+    }
+  }
 
   function sample(event: PlaybackObservationEvent, final = false) {
     if (!active || !(final ? ctx.finalCurrent() : current())) return;
@@ -102,31 +133,50 @@ export function bindPlaybackObservations(ctx: {
     ],
     ["ratechange", () => capture("progress")],
   ];
-  for (const [event, listener] of listeners)
-    element.addEventListener(event, listener);
+  try {
+    for (const [event, listener] of listeners) {
+      if (!active) break;
+      const guarded: EventListener = (value) => guard(() => listener(value));
+      // Track before add: an adapter can attach the listener and then throw.
+      attached.push([event, guarded]);
+      element.addEventListener(event, guarded);
+    }
+  } catch (failure) {
+    localFailure = failure;
+    close();
+  }
 
   return {
     progress() {
       // Independent of sync correction and readiness polling. A growing HLS
       // prefix ending never creates an ended report without complete readiness.
-      capture(ended ? "ended" : "progress");
+      guard(() => capture(ended ? "ended" : "progress"));
     },
     completed() {
-      ended = true;
-      capture("ended");
+      guard(() => {
+        ended = true;
+        capture("ended");
+      });
     },
     stop(): PlaybackObservation | undefined {
-      const value = sample(ended ? "ended" : "progress", true);
-      const packet = value ? sender.reserve(value) : undefined;
-      active = false;
-      for (const [event, listener] of listeners)
-        element.removeEventListener(event, listener);
-      sender.stop();
-      return packet ? { ...packet.sample, seq: packet.seq } : undefined;
+      if (!active || stopping) return;
+      stopping = true;
+      try {
+        // Keep finalCurrent semantics and reserve exactly once before teardown;
+        // no separate POST is created for this final DELETE observation.
+        const value = sample(ended ? "ended" : "progress", true);
+        const packet = value ? sender.reserve(value) : undefined;
+        return packet ? { ...packet.sample, seq: packet.seq } : undefined;
+      } catch (failure) {
+        localFailure = failure;
+        return undefined;
+      } finally {
+        close();
+      }
     },
     flush: () => sender.flush(),
     get failure() {
-      return sender.failure;
+      return localFailure ?? sender.failure;
     },
   };
 }

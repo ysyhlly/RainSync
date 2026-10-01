@@ -369,7 +369,7 @@ pub async fn create(
         .bind(u.id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO room_members VALUES($1,$2)")
+    sqlx::query("INSERT INTO room_members(room_id,user_id) VALUES($1,$2)")
         .bind(id)
         .bind(u.id)
         .execute(&mut *tx)
@@ -462,7 +462,7 @@ pub async fn join(
     if count >= 10 {
         return Err(err(StatusCode::CONFLICT, "room_full"));
     }
-    sqlx::query("INSERT INTO room_members VALUES($1,$2) ON CONFLICT DO NOTHING")
+    sqlx::query("INSERT INTO room_members(room_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
         .bind(id)
         .bind(u.id)
         .execute(&mut *tx)

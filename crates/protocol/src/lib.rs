@@ -14,6 +14,8 @@ mod playback_candidates;
 pub use playback_candidates::*;
 mod playback_facts;
 pub use playback_facts::*;
+mod http_file_fallback;
+pub use http_file_fallback::*;
 
 pub const VERSION: u8 = 1;
 /// Unknown-duration media is bounded to one week. Known durations are authoritative.
@@ -126,6 +128,12 @@ pub struct PlaybackPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub decoder_fallback_modes: Option<Vec<DecoderFallbackMode>>,
+    /// This live root grant supports one same-representation HTTP file→transcode
+    /// transition. Absent for legacy, unsupported inputs and successor grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1, max = 1))]
+    pub http_file_fallback_version: Option<u32>,
     /// Present only when this grant negotiated actual viewer observations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -301,6 +309,14 @@ pub struct PlaybackCapabilities {
 /// Missing optional fields preserve the original v1 playback request defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PlaybackRequest {
+    /// Negotiate single-hop verified HTTP-file continuation; absence is legacy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1, max = 1))]
+    pub http_file_fallback_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub http_file_fallback: Option<HttpFileFallback>,
     /// Opaque per-player identity for ordering only, never authorization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

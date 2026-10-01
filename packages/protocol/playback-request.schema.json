@@ -34,6 +34,26 @@
       ],
       "default": null
     },
+    "http_file_fallback": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HttpFileFallback"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "http_file_fallback_version": {
+      "description": "Negotiate single-hop verified HTTP-file continuation; absence is legacy.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1
+    },
     "idempotency_key": {
       "type": [
         "string",
@@ -160,6 +180,30 @@
       "required": [
         "schema_version",
         "candidates"
+      ]
+    },
+    "HttpFileFallback": {
+      "description": "A parent ID is only an authenticated lookup key, never a bearer grant.\nThe final observation is captured once before detaching the parent's media.",
+      "type": "object",
+      "properties": {
+        "final_observation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlaybackObservation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parent_session_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "parent_session_id"
       ]
     },
     "MediaCapabilityCandidate": {
@@ -364,6 +408,69 @@
       "enum": [
         "user_intent",
         "automatic_load"
+      ]
+    },
+    "PlaybackObservation": {
+      "description": "An immutable sample of the actual media element, relative to its plan.\n`has_played` is cumulative for that grant, even when the latest sample pauses.",
+      "type": "object",
+      "properties": {
+        "buffering": {
+          "type": "boolean"
+        },
+        "event": {
+          "$ref": "#/$defs/PlaybackObservationEvent"
+        },
+        "has_played": {
+          "type": "boolean"
+        },
+        "media_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "media_time_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "paused": {
+          "type": "boolean"
+        },
+        "playback_rate": {
+          "type": "number",
+          "format": "double"
+        },
+        "seeking": {
+          "type": "boolean"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "media_generation",
+        "seq",
+        "event",
+        "media_time_ms",
+        "paused",
+        "seeking",
+        "buffering",
+        "playback_rate",
+        "has_played"
+      ]
+    },
+    "PlaybackObservationEvent": {
+      "type": "string",
+      "enum": [
+        "playing",
+        "pause",
+        "progress",
+        "seeking",
+        "seeked",
+        "buffering",
+        "ended"
       ]
     },
     "VideoCapabilityConfiguration": {

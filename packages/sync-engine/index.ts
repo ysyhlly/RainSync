@@ -7,19 +7,60 @@ export interface PlaybackState {
 }
 export class Clock {
   private samples: { rtt: number; offset: number }[] = [];
+  private pending = new Map<number, { epoch: string; sent: number }>();
+  private lastRequest = -Infinity;
+  revision = 0;
   offset = 0;
   get ready() {
     return this.samples.length > 0;
   }
   reset() {
     this.samples = [];
+    this.pending.clear();
     this.offset = 0;
+    ++this.revision;
+  }
+  registerRequest(epoch: string, sent: number) {
+    if (!epoch || !Number.isFinite(sent) || sent < 0) return undefined;
+    // The server echoes t1 unchanged. Keep that key unique even with coarsened
+    // or backwards client clocks; offset/RTT use the recorded real send time.
+    const t1 = Math.max(sent, this.lastRequest + 1);
+    this.lastRequest = t1;
+    for (const [key, request] of this.pending) {
+      if (sent - request.sent > 5000) this.pending.delete(key);
+    }
+    if (this.pending.size >= 24)
+      this.pending.delete(this.pending.keys().next().value!);
+    this.pending.set(t1, { epoch, sent });
+    return t1;
+  }
+  acceptReply(
+    reply: { t1: number; t2: number; t3: number; clock_epoch: string },
+    currentEpoch: string,
+    t4: number,
+  ) {
+    const request = this.pending.get(reply.t1);
+    if (!request) return false;
+    // Consume even an invalid reply, so neither duplicates nor a later corrected
+    // payload can establish calibration using the same request.
+    this.pending.delete(reply.t1);
+    if (
+      request.epoch !== currentEpoch ||
+      reply.clock_epoch !== currentEpoch ||
+      !Number.isFinite(t4) ||
+      t4 < request.sent ||
+      t4 - request.sent > 5000
+    )
+      return false;
+    return this.sample(request.sent, reply.t2, reply.t3, t4);
   }
   sample(t1: number, t2: number, t3: number, t4: number) {
     const rtt = t4 - t1 - (t3 - t2);
     if (
       ![t1, t2, t3, t4].every(Number.isFinite) ||
       !Number.isFinite(rtt) ||
+      t4 < t1 ||
+      t3 < t2 ||
       rtt < 0
     )
       return false;
