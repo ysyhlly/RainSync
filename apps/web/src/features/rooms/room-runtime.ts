@@ -27,6 +27,10 @@ import {
   readPresenceSnapshot,
   type OnlineSnapshot,
 } from "./presence-state";
+import {
+  createControlRecoveryMetrics,
+  type ControlRecoveryMetricsFence,
+} from "./control-recovery-metrics";
 
 export const useRoomRuntime = defineStore("room-runtime", () => {
   const session = useSession(),
@@ -132,6 +136,15 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     connectionSerial = 0,
     roomSerial = 0,
     controlEpoch: string | undefined;
+  let recoveryIdentity: object | undefined,
+    recoveryAuthEpoch = -1;
+  const recovery = createControlRecoveryMetrics({
+    current: () =>
+      room.value && recoveryIdentity && recoveryAuthEpoch === session.epoch
+        ? { identity: recoveryIdentity, generation: connectionSerial }
+        : undefined,
+    foreground: () => document.visibilityState !== "hidden",
+  });
   let pendingChat: { id: string; body: string } | undefined;
   let chatTimer: ReturnType<typeof setTimeout> | undefined;
   const chatPending = ref(false),
@@ -231,6 +244,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     }
   }
   async function leave() {
+    recovery.reset();
+    recoveryIdentity = undefined;
     clearPresence();
     presenceNames.value = {};
     ++namesRequest;
@@ -272,6 +287,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     await cleanup;
     if (serial !== roomSerial) return;
     room.value = r;
+    recoveryIdentity = {};
+    recoveryAuthEpoch = session.epoch;
     connect();
     const items = await session.api<QueueItem[]>(
       "/rooms/" + r.id + "/playlist",
@@ -313,18 +330,26 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     connectionStopped.value = false;
     if (!room.value) return;
     const selected = room.value.id;
+    const recoveryFence: ControlRecoveryMetricsFence | undefined =
+      recoveryIdentity && recoveryAuthEpoch === session.epoch
+        ? { identity: recoveryIdentity, generation: serial }
+        : undefined;
+    if (recoveryFence) recovery.beginAttempt(recoveryFence);
     const presenceGeneration = presenceState.begin(selected);
-    socket = new WebSocket(
+    const connection = new WebSocket(
       `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/v1/ws`,
     );
+    socket = connection;
     socket.onopen = () => {
       if (serial !== connectionSerial) return;
+      if (recoveryFence) recovery.opened(recoveryFence);
       connected.value = true;
       attempt = 0;
       socket!.send(
         JSON.stringify({
           type: "RESUME",
           presence_version: 1,
+          control_recovery_metrics_version: 1,
           room_id: selected,
           revision: state.value?.revision ?? 0,
           clock_epoch: state.value?.clock_epoch,
@@ -341,6 +366,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     };
     socket.onclose = async () => {
       if (serial !== connectionSerial) return;
+      if (recoveryFence) recovery.disconnected(recoveryFence, retryAllowed);
       presenceState.end(presenceGeneration);
       presence.value = undefined;
       clearTimeout(chatTimer);
@@ -366,6 +392,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           }
           if (failure instanceof RequestFailure && stopsReconnect(failure)) {
             retryAllowed = false;
+            recovery.reset();
             error.value = failure.message;
           }
         }
@@ -444,6 +471,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         chatFailed.value = !!pendingChat;
         error.value = failure.message;
         if (stopsReconnect(failure)) {
+          recovery.reset();
           clearPresence();
           retryAllowed = false;
           socket?.close();
@@ -490,6 +518,38 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           !snapshotReady || old?.clock_epoch !== next.clock_epoch;
         snapshotReady = true;
         state.value = next;
+        if (v.type === "SNAPSHOT" && recoveryFence) {
+          // State/owner/lifecycle/control epoch are now applied. Calibration and
+          // media work are independent; telemetry cannot delay either of them.
+          try {
+            const sample = recovery.snapshotApplied(
+              recoveryFence,
+              v.control_recovery_metrics_version,
+            );
+            if (
+              sample &&
+              retryAllowed &&
+              serial === connectionSerial &&
+              recoveryIdentity === recoveryFence.identity &&
+              recoveryAuthEpoch === session.epoch &&
+              room.value?.id === selected &&
+              connected.value &&
+              socket === connection &&
+              connection.readyState === WebSocket.OPEN
+            ) {
+              const payload = JSON.stringify(sample);
+              // Best effort once: a busy/closing socket drops measurement.
+              if (
+                Number.isSafeInteger(connection.bufferedAmount) &&
+                connection.bufferedAmount >= 0 &&
+                connection.bufferedAmount + payload.length <= 65_536
+              )
+                connection.send(payload);
+            }
+          } catch {
+            /* Optional measurement must never change control recovery. */
+          }
+        }
         if (needsCalibration) calibrateClock();
         if (!roomActive.value) {
           clearTimeout(chatTimer);
@@ -767,6 +827,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     sampleClock();
   }, 30000);
   function wake() {
+    recovery.visibilityChanged(document.visibilityState !== "hidden");
     const previous = visibility;
     visibility = document.visibilityState;
     if (previous !== visibility)
@@ -774,11 +835,15 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     if (previous === "hidden" && visibility === "visible") calibrateClock();
   }
   function pageShown(event: PageTransitionEvent) {
-    if (event.persisted) calibrateClock();
+    if (event.persisted) {
+      recovery.suspended();
+      calibrateClock();
+    }
   }
   document.addEventListener("visibilitychange", wake);
   window.addEventListener("pageshow", pageShown);
   onScopeDispose(() => {
+    recovery.dispose();
     clearInterval(statusTimer);
     clearInterval(clockTimer);
     document.removeEventListener("visibilitychange", wake);

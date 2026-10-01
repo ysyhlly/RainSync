@@ -22,6 +22,11 @@ fn main() {
         RoomState::decl(),
         PresenceMember::decl(),
         PresenceSnapshot::decl(),
+        ControlRecoveryMessageType::decl(),
+        ControlRecoveryMetricsSample::decl(),
+        NasUplinkOutcomeTotals::decl(),
+        NasUplinkTotals::decl(),
+        NasUplinkMetricsSample::decl(),
         Action::decl(),
         Command::decl(),
         ControlEpoch::decl(),
@@ -78,6 +83,14 @@ fn main() {
         ("control-epoch", schemars::schema_for!(ControlEpoch)),
         ("room-state", schemars::schema_for!(RoomState)),
         ("presence-snapshot", schemars::schema_for!(PresenceSnapshot)),
+        (
+            "control-recovery-metrics",
+            schemars::schema_for!(ControlRecoveryMetricsSample),
+        ),
+        (
+            "nas-uplink-metrics",
+            schemars::schema_for!(NasUplinkMetricsSample),
+        ),
         ("playback-request", schemars::schema_for!(PlaybackRequest)),
         (
             "playback-metrics-sample",

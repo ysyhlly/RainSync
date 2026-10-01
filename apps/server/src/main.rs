@@ -1,9 +1,11 @@
 mod account_rules;
 mod account_security;
 mod agent_drain;
+mod agent_metrics;
 mod agents;
 mod avatar_image;
 mod avatars;
+mod control_recovery_metrics;
 mod database_checks;
 mod health;
 mod http_representation;

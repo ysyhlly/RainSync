@@ -1,7 +1,10 @@
 mod drain;
 mod receipt_mode;
+mod uplink_metrics;
+mod uplink_reporter;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use media_core::runtime_metrics::{NasUplinkMetrics, Outcome};
 use serde_json::{Value, json};
 use std::io::{Read, Seek};
 use std::{
@@ -93,6 +96,7 @@ async fn transfer(
     root: PathBuf,
     request: Value,
     mut cancel: tokio::sync::watch::Receiver<bool>,
+    metrics: Option<NasUplinkMetrics>,
 ) -> Result<()> {
     let url = request["data_url"].as_str().context("data_url")?;
     let (socket, _) = tokio::select! {
@@ -104,6 +108,7 @@ async fn transfer(
     let (liveness, mut signals) = tokio::sync::watch::channel(tokio::time::Instant::now());
     let mut headers_started = false;
     let operations = drain::FileOps::default();
+    let mut measurement = uplink_metrics::BodyMeasurement::default();
     let work = async {
         if request["busy"].as_bool().unwrap_or(false) {
             headers_started = true;
@@ -153,6 +158,7 @@ async fn transfer(
         )
         .await??;
         if !request["head"].as_bool().unwrap_or(false) {
+            measurement = uplink_metrics::BodyMeasurement::begin(metrics.as_ref(), len);
             let seek_file = file.clone();
             operations
                 .run(move || Ok((&*seek_file).seek(std::io::SeekFrom::Start(start))?))
@@ -180,36 +186,46 @@ async fn transfer(
                     })
                     .await?;
                 let n = buf.len();
-                send_with_backpressure_health(
-                    writer.send(Message::Binary(buf.into())),
-                    &mut signals,
-                )
-                .await?;
+                measurement
+                    .send_frame(
+                        n,
+                        send_with_backpressure_health(
+                            writer.send(Message::Binary(buf.into())),
+                            &mut signals,
+                        ),
+                    )
+                    .await?;
                 remaining -= n as u64;
             }
         }
-        Ok(())
+        Ok::<(), anyhow::Error>(())
     };
     // Poll the peer while file I/O or a backpressured write is pending. Merely
     // sending frames does not observe a Close promptly on every socket state.
-    let result: Result<()> = tokio::select! {
+    let (result, outcome): (Result<()>, Outcome) = tokio::select! {
         biased;
-        _ = drain::cancelled(&mut cancel) => Ok(()),
-        result = work => result,
-        _ = async {
-            while let Some(Ok(message)) = reader.next().await {
-                match message {
-                    Message::Ping(payload) => {
+        _ = drain::cancelled(&mut cancel) => (Ok(()), Outcome::Cancelled),
+        result = work => {
+            let outcome = if result.is_err() { Outcome::Failed } else { Outcome::Complete };
+            (result, outcome)
+        },
+        outcome = async {
+            loop {
+                match reader.next().await {
+                    Some(Ok(Message::Ping(payload))) => {
                         if payload.as_ref() == BACKPRESSURE_HEARTBEAT {
                             liveness.send_replace(tokio::time::Instant::now());
                         }
                     }
-                    Message::Pong(_) => {},
-                    _ => break,
+                    Some(Ok(Message::Pong(_))) => {},
+                    Some(Err(_)) => return Outcome::Failed,
+                    _ => return Outcome::Cancelled,
                 }
             }
-        } => Ok(()),
+        } => (Ok(()), outcome),
     };
+    // End byte observation independently, before socket/file disposal is proved.
+    measurement.finish(outcome);
     if result.is_err() && !headers_started {
         let changed = result
             .as_ref()
@@ -404,6 +420,7 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
     let rejections = Arc::new(Semaphore::new(4));
     let scans = Arc::new(Semaphore::new(1));
     let index_interval = std::time::Duration::from_secs(index_interval_seconds()?);
+    let uplink = NasUplinkMetrics::default();
     loop {
         let Some(root) = root_check
             .validated(&configured_root, &mut shutdown)
@@ -487,8 +504,14 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
             result = tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(req)) => result,
         };
         if let Ok(Ok((mut socket, _))) = connection {
-            if send_control(&mut socket, json!({"type":"HELLO","manual_scan":true,"source_versions":true,"drain_receipts":true}), &shutdown).await.is_err() {
-                if retry_or_shutdown(&mut shutdown).await { break; }
+            let mut reporter = uplink_reporter::Reporter::new(uplink.snapshot());
+            if send_control(&mut socket, reporter.hello(), &shutdown)
+                .await
+                .is_err()
+            {
+                if retry_or_shutdown(&mut shutdown).await {
+                    break;
+                }
                 continue;
             }
             let mut transfers = tokio::task::JoinSet::new();
@@ -531,9 +554,13 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
                         }
                         if receipt_failed { break; }
                         if scan.as_ref().is_some_and(|s| s.awaiting_ack && s.sent_at.elapsed().as_secs() > 60) { break }
-                        if send_control(&mut socket, json!({"type":"HEARTBEAT"}), &shutdown).await.is_err() { break }
+                        if send_control(&mut socket, reporter.heartbeat(uplink.snapshot()), &shutdown).await.is_err() { break }
                     }
                     message=socket.next()=>{let text = match message { Some(Ok(Message::Text(text))) => text, Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue, _ => break };let Ok(v)=serde_json::from_str::<Value>(&text)else{continue};
+                        if v["type"] == "NAS_METRICS_READY" {
+                            reporter.ready(&text);
+                            continue;
+                        }
                         if v["type"] == "TRANSFER_DRAINED_ACK" && (v["accepted"] == true || v["rejected_permanently"] == true) {
                             if let Some(id)=v["id"].as_str().and_then(|id|uuid::Uuid::parse_str(id).ok()) && receipts.acknowledged(id).await.is_err() { tracing::warn!("drain receipt acknowledgement persistence failed"); }
                             continue;
@@ -589,9 +616,10 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
                             }; request["busy"] = json!(true); permit }
                         };
                         let cancel=cancelled_transfers.clone();
+                        let metrics=reporter.is_ready().then(||uplink.clone());
                         transfers.spawn(async move {
                             let _permit=permit;
-                            let result=transfer(root,request,cancel).await;
+                            let result=transfer(root,request,cancel,metrics).await;
                             let confirmed=!result.as_ref().is_err_and(|error|error.is::<drain::DrainUnconfirmed>());
                             if result.is_err(){tracing::warn!("transfer ended with error")}
                             receipt.filter(|_|confirmed)

@@ -451,6 +451,7 @@ it("a missing control revision fences commands and resumes before applying lifec
       revision: 1,
       clock_epoch: "clock",
       presence_version: 1,
+      control_recovery_metrics_version: 1,
     });
     frame(second, {
       type: "SNAPSHOT",
@@ -467,6 +468,346 @@ it("a missing control revision fences commands and resumes before applying lifec
     expect(runtime.canManageRoom).toBe(false);
   } finally {
     runtime.$dispose();
+  }
+});
+
+async function recoveryFixture() {
+  vi.useFakeTimers({
+    toFake: [
+      "setTimeout",
+      "clearTimeout",
+      "setInterval",
+      "clearInterval",
+      "performance",
+      "Date",
+    ],
+  });
+  setActivePinia(createPinia());
+  const document = Object.assign(new EventTarget(), {
+    visibilityState: "visible",
+  });
+  const window = new EventTarget();
+  vi.stubGlobal("document", document);
+  vi.stubGlobal("window", window);
+  vi.stubGlobal("location", { protocol: "http:", host: "localhost" });
+  vi.stubGlobal("sessionStorage", { getItem: () => null, setItem: vi.fn() });
+  const identity = { id: "user", username: "user", admin: false, csrf: "csrf" };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) =>
+      Response.json(url.endsWith("/auth/me") ? identity : []),
+    ),
+  );
+  const sockets: any[] = [];
+  class Socket {
+    static OPEN = 1;
+    readyState = 1;
+    bufferedAmount = 0;
+    send = vi.fn();
+    close = vi.fn();
+    constructor() {
+      sockets.push(this);
+    }
+  }
+  vi.stubGlobal("WebSocket", Socket);
+  const session = useSession();
+  session.accept(identity);
+  const runtime = useRoomRuntime();
+  await runtime.enter({ id: "a", name: "A", owner_id: "user" });
+  const state = {
+    room_id: "a",
+    revision: 1,
+    media_id: null,
+    media_generation: 0,
+    playback_status: "paused",
+    anchor_position_ms: 0,
+    anchor_server_time_ms: 0,
+    playback_rate: 1,
+    controller_user_id: "user",
+    duration_ms: null,
+    clock_epoch: "clock",
+  };
+  const frame = (socket: any, value: unknown) =>
+    socket.onmessage({ data: JSON.stringify(value) });
+  const snapshot = (socket = sockets.at(-1), extra: any = {}) =>
+    frame(socket, {
+      type: "SNAPSHOT",
+      state,
+      owner_id: "user",
+      lifecycle: "active",
+      lifecycle_epoch: 0,
+      control_epoch: { id: "control" },
+      control_recovery_metrics_version: 1,
+      ...extra,
+    });
+  const packets = (socket = sockets.at(-1)) =>
+    socket.send.mock.calls
+      .map(([value]: [string]) => JSON.parse(value))
+      .filter((v: any) => v.type === "CONTROL_RECOVERY_METRICS");
+  return {
+    runtime,
+    session,
+    sockets,
+    state,
+    frame,
+    snapshot,
+    packets,
+    document,
+    window,
+  };
+}
+
+it("negotiates and reports once after all authoritative snapshot fields are applied, before clock sampling", async () => {
+  const s = await recoveryFixture();
+  try {
+    const socket = s.sockets[0];
+    socket.onopen();
+    expect(
+      JSON.parse(socket.send.mock.calls[0][0]).control_recovery_metrics_version,
+    ).toBe(1);
+    await vi.advanceTimersByTimeAsync(25);
+    socket.send.mockImplementation((payload: string) => {
+      if (JSON.parse(payload).type === "CONTROL_RECOVERY_METRICS") {
+        expect(s.runtime.state?.revision).toBe(1);
+        expect(s.runtime.room?.owner_id).toBe("user");
+        expect(s.runtime.room?.lifecycle).toBe("active");
+      }
+    });
+    s.snapshot(socket);
+    expect(s.packets(socket)).toEqual([
+      {
+        type: "CONTROL_RECOVERY_METRICS",
+        version: 1,
+        socket_open_to_state_applied_ms: 25,
+        background: false,
+      },
+    ]);
+    const types = socket.send.mock.calls.map(
+      ([value]: [string]) => JSON.parse(value).type,
+    );
+    expect(types.indexOf("CONTROL_RECOVERY_METRICS")).toBeLessThan(
+      types.indexOf("CLOCK_SYNC"),
+    );
+    s.snapshot(socket);
+    s.frame(socket, { type: "EVENT", state: { ...s.state, revision: 2 } });
+    expect(s.packets(socket)).toHaveLength(1);
+  } finally {
+    s.runtime.$dispose();
+  }
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it.each([undefined, 0, 2, "1"])(
+  "a server marker %j preserves control recovery without telemetry",
+  async (marker) => {
+    const s = await recoveryFixture();
+    try {
+      const socket = s.sockets[0];
+      socket.onopen();
+      s.snapshot(socket, { control_recovery_metrics_version: marker });
+      expect(s.runtime.state?.revision).toBe(1);
+      expect(s.packets(socket)).toHaveLength(0);
+      s.snapshot(socket);
+      expect(s.packets(socket)).toHaveLength(0);
+    } finally {
+      s.runtime.$dispose();
+    }
+  },
+);
+
+it("reconnect reports the observed close separately and ignores stale callbacks and browser online hints", async () => {
+  const s = await recoveryFixture();
+  try {
+    const first = s.sockets[0];
+    first.onopen();
+    s.snapshot(first);
+    await vi.advanceTimersByTimeAsync(10);
+    await first.onclose();
+    await vi.advanceTimersByTimeAsync(100);
+    s.runtime.connect();
+    const second = s.sockets.at(-1);
+    second.onopen();
+    s.window.dispatchEvent(new Event("online"));
+    s.snapshot(first, { state: { ...s.state, revision: 100 } });
+    await vi.advanceTimersByTimeAsync(20);
+    s.snapshot(second, { recovery: "delta", events: [] });
+    expect(s.packets(second)).toEqual([
+      {
+        type: "CONTROL_RECOVERY_METRICS",
+        version: 1,
+        socket_open_to_state_applied_ms: 20,
+        disconnect_observed_to_state_applied_ms: 120,
+        background: false,
+      },
+    ]);
+    expect(s.runtime.state?.revision).toBe(1);
+  } finally {
+    s.runtime.$dispose();
+  }
+});
+
+it("a rejected EVENT resync measures its new snapshot without inventing a disconnect", async () => {
+  const s = await recoveryFixture();
+  try {
+    const first = s.sockets[0];
+    first.onopen();
+    s.snapshot(first);
+    s.frame(first, {
+      type: "EVENT",
+      state: { ...s.state, revision: 5 },
+      control_recovery_metrics_version: 1,
+    });
+    const second = s.sockets[1];
+    second.onopen();
+    s.frame(second, { type: "PRESENCE_SNAPSHOT" });
+    s.frame(second, {
+      type: "CLOCK_SYNC_REPLY",
+      t1: 0,
+      t2: 0,
+      t3: 0,
+      clock_epoch: "clock",
+    });
+    expect(s.packets(second)).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(10);
+    s.snapshot(second, {
+      state: { ...s.state, revision: 5, clock_epoch: "restarted" },
+    });
+    expect(s.packets(second)).toEqual([
+      {
+        type: "CONTROL_RECOVERY_METRICS",
+        version: 1,
+        socket_open_to_state_applied_ms: 10,
+        background: false,
+      },
+    ]);
+  } finally {
+    s.runtime.$dispose();
+  }
+});
+
+it("paused control recovery retains hidden time and persisted pageshow discards timing", async () => {
+  const s = await recoveryFixture();
+  try {
+    const first = s.sockets[0];
+    first.onopen();
+    await vi.advanceTimersByTimeAsync(10);
+    s.document.visibilityState = "hidden";
+    s.document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(50);
+    s.document.visibilityState = "visible";
+    s.document.dispatchEvent(new Event("visibilitychange"));
+    s.snapshot(first);
+    expect(s.packets(first)[0]).toMatchObject({
+      socket_open_to_state_applied_ms: 60,
+      background: true,
+    });
+    s.runtime.connect();
+    const second = s.sockets[1];
+    second.onopen();
+    s.window.dispatchEvent(
+      Object.assign(new Event("pageshow"), { persisted: true }),
+    );
+    s.snapshot(second);
+    expect(s.packets(second)).toHaveLength(0);
+    expect(s.runtime.state?.revision).toBe(1);
+  } finally {
+    s.runtime.$dispose();
+  }
+});
+
+it.each([65_536, Infinity, -1])(
+  "a socket buffer %j drops telemetry without changing recovery",
+  async (buffered) => {
+    const s = await recoveryFixture();
+    try {
+      const socket = s.sockets[0];
+      socket.onopen();
+      socket.bufferedAmount = buffered;
+      s.snapshot(socket);
+      expect(s.packets(socket)).toHaveLength(0);
+      expect(s.runtime.state?.revision).toBe(1);
+      socket.bufferedAmount = 0;
+      s.snapshot(socket);
+      expect(s.packets(socket)).toHaveLength(0);
+    } finally {
+      s.runtime.$dispose();
+    }
+  },
+);
+
+it("a telemetry send failure cannot escape, alter state, or suppress calibration", async () => {
+  const s = await recoveryFixture();
+  try {
+    const socket = s.sockets[0];
+    socket.onopen();
+    socket.send.mockImplementation((value: string) => {
+      if (JSON.parse(value).type === "CONTROL_RECOVERY_METRICS")
+        throw Error("closed during send");
+    });
+    expect(() => s.snapshot(socket)).not.toThrow();
+    expect(s.runtime.state?.revision).toBe(1);
+    expect(s.runtime.error).toBe("");
+    expect(
+      socket.send.mock.calls.some(
+        ([value]: [string]) => JSON.parse(value).type === "CLOCK_SYNC",
+      ),
+    ).toBe(true);
+  } finally {
+    s.runtime.$dispose();
+  }
+});
+
+it("a closed authoritative snapshot reports applied state without restoring commands or clock sampling", async () => {
+  const s = await recoveryFixture();
+  try {
+    const socket = s.sockets[0];
+    socket.onopen();
+    s.snapshot(socket, {
+      lifecycle: "closed",
+      lifecycle_epoch: 1,
+      control_epoch: null,
+    });
+    expect(s.packets(socket)).toHaveLength(1);
+    expect(s.runtime.roomActive).toBe(false);
+    expect(s.runtime.owner).toBe(false);
+    const sent = socket.send.mock.calls.length;
+    s.runtime.send("PLAY");
+    expect(socket.send).toHaveBeenCalledTimes(sent);
+    expect(
+      socket.send.mock.calls.some(
+        ([value]: [string]) => JSON.parse(value).type === "CLOCK_SYNC",
+      ),
+    ).toBe(false);
+  } finally {
+    s.runtime.$dispose();
+  }
+});
+
+it("fatal membership loss and auth changes discard current telemetry before stale snapshots", async () => {
+  const s = await recoveryFixture();
+  try {
+    const first = s.sockets[0];
+    first.onopen();
+    s.frame(first, {
+      type: "ERROR",
+      error: {
+        code: "NOT_A_MEMBER",
+        message: "revoked",
+        retryable: false,
+        request_id: "r",
+      },
+    });
+    s.snapshot(first);
+    expect(s.packets(first)).toHaveLength(0);
+    expect(s.runtime.room).toBeNull();
+    await s.runtime.enter({ id: "b", name: "B", owner_id: "user" });
+    const second = s.sockets.at(-1);
+    second.onopen();
+    s.session.clear();
+    s.snapshot(second, { state: { ...s.state, room_id: "b" } });
+    expect(s.packets(second)).toHaveLength(0);
+  } finally {
+    s.runtime.$dispose();
   }
 });
 

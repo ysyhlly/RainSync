@@ -1,6 +1,81 @@
 use super::*;
 
 #[test]
+fn nas_wrapper_has_exact_capacity_and_coherent_fixed_snapshots() {
+    let metrics = NasUplinkMetrics::default();
+    assert!(metrics.snapshot().valid());
+    let mut bodies = (0..16)
+        .map(|_| metrics.begin_transfer().unwrap())
+        .collect::<Vec<_>>();
+    assert!(metrics.begin_transfer().is_none());
+    assert!(bodies[0].sample(1, 64));
+    let active = metrics.snapshot();
+    assert!(active.valid());
+    assert_eq!(
+        (
+            active.active,
+            active.admitted,
+            active.dropped,
+            active.body_bytes
+        ),
+        (16, 16, 1, 64)
+    );
+    bodies.remove(0).finish(Outcome::Complete);
+    drop(bodies);
+    let final_state = metrics.snapshot();
+    assert!(final_state.valid());
+    assert_eq!(final_state.complete.transfers, 1);
+    assert_eq!(final_state.complete.bytes, 64);
+    assert_eq!(final_state.cancelled.transfers, 15);
+    assert_eq!(final_state.active, 0);
+}
+
+#[test]
+fn reported_namespaces_do_not_impersonate_local_io_or_network_restoration() {
+    let runtime = RuntimeMetrics::default();
+    let agent = NasUplinkMetrics::default();
+    let baseline = agent.snapshot();
+    let mut transfer = agent.begin_transfer().unwrap();
+    assert!(transfer.sample(1, 23));
+    transfer.finish(Outcome::Failed);
+    assert!(runtime.agent_nas_sample(&agent.snapshot().checked_delta(&baseline).unwrap()));
+    assert!(
+        runtime.client_control_recovery(&ControlRecoveryMetricsSample {
+            kind: protocol::ControlRecoveryMessageType::ControlRecoveryMetrics,
+            version: 1,
+            socket_open_to_state_applied_ms: 5,
+            disconnect_observed_to_state_applied_ms: None,
+            background: false,
+        })
+    );
+    let output = runtime.render_for(Process::Server);
+    assert!(output.contains("rainsync_agent_reported_nas_body_bytes_total{process=\"server\"} 23"));
+    assert!(output.contains("boundary=\"socket_open_to_state_applied\""));
+    assert!(!output.contains("boundary=\"disconnect_observed_to_state_applied\""));
+    assert!(!output.contains("rainsync_transfer_body_bytes_total{"));
+    assert!(!output.contains("room_id") && !output.contains("agent_id"));
+}
+
+#[test]
+fn received_counter_overflow_drops_whole_sample_without_partial_credit() {
+    let runtime = RuntimeMetrics::default();
+    lock(&runtime.inner).agent_nas.body_bytes = u64::MAX;
+    let agent = NasUplinkMetrics::default();
+    let baseline = agent.snapshot();
+    let mut body = agent.begin_transfer().unwrap();
+    assert!(body.sample(1, 1));
+    body.finish(Outcome::Complete);
+    assert!(!runtime.agent_nas_sample(&agent.snapshot().checked_delta(&baseline).unwrap()));
+    let state = lock(&runtime.inner);
+    assert_eq!(state.agent_nas.samples, 0);
+    assert_eq!(state.agent_nas.outcomes[0].count, 0);
+    assert_eq!(
+        state.agent_nas_dropped[TransportMetricDrop::Overflow as usize],
+        1
+    );
+}
+
+#[test]
 fn unwired_is_absent_not_zero() {
     assert_eq!(RuntimeMetrics::default().render_for(Process::Worker), "");
 }
@@ -78,7 +153,7 @@ fn admission_and_memory_are_bounded_and_reusable() {
     }
     assert_eq!(lock(&metrics.inner).active, MAX_ACTIVE_TRANSFERS);
     assert_eq!(lock(&metrics.inner).dropped, 10_000);
-    assert!(std::mem::size_of::<Snapshot>() < 2048);
+    assert!(std::mem::size_of::<Snapshot>() < MAX_METRIC_SNAPSHOT_BYTES);
     assert!(std::mem::size_of::<Transfer>() <= 128);
     drop(handles);
     assert_eq!(lock(&metrics.inner).active, 0);
@@ -425,7 +500,7 @@ fn client_origin_evidence_and_loss_labels_have_a_fixed_series_limit() {
     // Two origins * (sample + elapsed + 8 states + 2 evidence * 2 histograms * 12 series), plus 5 loss reasons.
     assert_eq!(data.len(), 121);
     assert!(output.len() < 32_000);
-    assert!(std::mem::size_of::<Snapshot>() < 2048);
+    assert!(std::mem::size_of::<Snapshot>() < MAX_METRIC_SNAPSHOT_BYTES);
     for line in data {
         assert!(line.starts_with("rainsync_client_reported_playback_"));
         assert!(line.contains("process=\"server\""));

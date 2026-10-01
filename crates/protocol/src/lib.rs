@@ -16,6 +16,8 @@ mod playback_facts;
 pub use playback_facts::*;
 mod http_file_fallback;
 pub use http_file_fallback::*;
+mod transport_metrics;
+pub use transport_metrics::*;
 
 pub const VERSION: u8 = 1;
 /// Unknown-duration media is bounded to one week. Known durations are authoritative.

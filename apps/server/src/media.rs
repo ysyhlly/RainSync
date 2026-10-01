@@ -1,6 +1,25 @@
 use super::*;
 use providers::SourceConfig;
 
+fn upstream_track_title(stream: &Value) -> Value {
+    // These negotiated text subtitles are requested as Stream.vtt below. Keep
+    // the conversion warning in the existing label, before the codec is replaced.
+    let styled_text = stream["Type"] == "Subtitle"
+        && stream["IsTextSubtitleStream"] == true
+        && stream["Codec"].as_str().is_some_and(|codec| {
+            let codec = codec.trim();
+            codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa")
+        });
+    if styled_text {
+        json!(format!(
+            "{}（ASS/SSA 转为 WebVTT 普通文本：样式、字体、定位和动画无法完整保留）",
+            stream["DisplayTitle"].as_str().unwrap_or("Subtitle")
+        ))
+    } else {
+        stream["DisplayTitle"].clone()
+    }
+}
+
 pub async fn sources(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     admin(&auth(&app, &h, false).await?)?;
     let rows = sqlx::query("SELECT s.id,s.name,s.kind,s.access_policy_revision,CASE WHEN s.kind NOT IN ('jellyfin','emby') THEN NULL ELSE jsonb_build_object('state',CASE WHEN a.state='allowed' AND a.valid_until<=clock_timestamp() THEN 'unknown' ELSE COALESCE(a.state,'unknown') END,'reason',CASE WHEN a.state='allowed' AND a.valid_until<=clock_timestamp() THEN 'upstream_policy_expired' ELSE COALESCE(a.reason,'upstream_policy_unknown') END) END AS account_policy FROM sources s LEFT JOIN source_account_policies a ON a.source_id=s.id AND a.source_revision=s.access_policy_revision ORDER BY s.name")
@@ -482,7 +501,7 @@ async fn prepare_playback(
                             ]);
                         subtitle_urls.insert(index.to_string(), json!(url.as_str()));
                     }
-                    tracks.push(json!({"codec_type":if audio {"audio"} else {"subtitle"},"index":stream["Index"],"codec_name":if audio {stream["Codec"].clone()}else{json!("webvtt")},"tags":{"title":stream["DisplayTitle"],"language":stream["Language"]}}));
+                    tracks.push(json!({"codec_type":if audio {"audio"} else {"subtitle"},"index":stream["Index"],"codec_name":if audio {stream["Codec"].clone()}else{json!("webvtt")},"tags":{"title":upstream_track_title(stream),"language":stream["Language"]}}));
                 }
                 meta["streams"] = json!(tracks);
                 resource["subtitle_urls"] = Value::Object(subtitle_urls);
@@ -1164,6 +1183,87 @@ pub async fn renew(
     };
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
+}
+
+#[cfg(test)]
+mod upstream_subtitle_label_tests {
+    use super::upstream_track_title;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn known_styled_text_subtitles_explain_the_webvtt_downgrade() {
+        for codec in ["ass", "ASS", "ssa", " sSa "] {
+            let stream = json!({
+                "Type": "Subtitle",
+                "IsTextSubtitleStream": true,
+                "Codec": codec,
+                "Index": 17,
+                "DisplayTitle": "中文",
+                "Language": "zho"
+            });
+            assert_eq!(
+                upstream_track_title(&stream),
+                json!("中文（ASS/SSA 转为 WebVTT 普通文本：样式、字体、定位和动画无法完整保留）")
+            );
+            // Label generation neither changes the provider's identity nor its metadata.
+            assert_eq!(stream["Index"], 17);
+            assert_eq!(stream["Language"], "zho");
+            assert_eq!(stream["Codec"], codec);
+        }
+    }
+
+    #[test]
+    fn other_and_unknown_codecs_preserve_the_original_title() {
+        for codec in [
+            json!("subrip"),
+            json!("webvtt"),
+            json!("mov_text"),
+            json!("unknown"),
+            json!("ass_variant"),
+            Value::Null,
+            json!(7),
+        ] {
+            for title in [json!("Original"), Value::Null, json!(7)] {
+                let stream = json!({
+                    "Type": "Subtitle",
+                    "IsTextSubtitleStream": true,
+                    "Codec": codec,
+                    "DisplayTitle": title
+                });
+                assert_eq!(upstream_track_title(&stream), title);
+            }
+        }
+    }
+
+    #[test]
+    fn only_confirmed_upstream_text_subtitles_receive_the_warning() {
+        for (kind, text) in [
+            (json!("Audio"), json!(true)),
+            (json!("Subtitle"), json!(false)),
+            (json!("Subtitle"), Value::Null),
+            (json!("Subtitle"), json!("true")),
+        ] {
+            let stream = json!({
+                "Type": kind,
+                "IsTextSubtitleStream": text,
+                "Codec": "ass",
+                "DisplayTitle": "Original"
+            });
+            assert_eq!(upstream_track_title(&stream), "Original");
+        }
+    }
+
+    #[test]
+    fn missing_titles_use_the_existing_fallback_and_titles_remain_plain_text() {
+        let mut stream = json!({
+            "Type": "Subtitle", "IsTextSubtitleStream": true, "Codec": "ssa"
+        });
+        let suffix = "（ASS/SSA 转为 WebVTT 普通文本：样式、字体、定位和动画无法完整保留）";
+        assert_eq!(upstream_track_title(&stream), format!("Subtitle{suffix}"));
+        let title = "<img src=x onerror=alert(1)> & 中文";
+        stream["DisplayTitle"] = json!(title);
+        assert_eq!(upstream_track_title(&stream), format!("{title}{suffix}"));
+    }
 }
 
 #[cfg(test)]

@@ -142,7 +142,7 @@ function parseMetrics(text, processLabel) {
       assert.notEqual(
         labels.layer,
         "nas_uplink",
-        "NAS send instrumentation is absent",
+        "This HTTP-only fixture must not emit NAS send measurements",
       );
     }
     rows.push({ name: match[1], labels, value });
@@ -1191,7 +1191,7 @@ try {
     report.limitations = [
       "Finite public HTTP/Server/Worker verification with generated owned H264 and native PostgreSQL; no browser/device/long-run acceptance",
       "Exact body boundary counts are process-local handoff evidence, not receiver acknowledgements or decoded media throughput",
-      "NAS send-side and browser telemetry remain unobserved",
+      "This HTTP-only fixture does not exercise NAS send-side or browser telemetry",
     ];
     const reportPath = resolve(fixture.root, "report.json");
     await writeFile(reportPath, JSON.stringify(report, null, 2) + "\n");

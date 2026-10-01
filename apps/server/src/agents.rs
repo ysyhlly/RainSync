@@ -3,7 +3,7 @@ use axum::extract::ws::Message;
 use futures_util::{SinkExt, StreamExt};
 
 pub struct Control {
-    connection: Uuid,
+    pub(super) connection: Uuid,
     scans: tokio::sync::mpsc::Sender<Scan>,
     manual_scan: bool,
     source_versions: Option<bool>,
@@ -153,15 +153,17 @@ pub async fn connect(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "agent_token_required"))?;
+    let token_hash = hash(t);
     let id: Option<Uuid> =
         sqlx::query_scalar("SELECT id FROM agents WHERE token_hash=$1 AND NOT revoked")
-            .bind(hash(t))
+            .bind(&token_hash)
             .fetch_optional(&app.db)
             .await?;
     let id = id.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid_agent"))?;
     Ok(upgrade.max_message_size(1024 * 1024).max_frame_size(1024 * 1024).on_upgrade(move |socket| async move {
         let (mut out, mut input) = socket.split();
         let connection = Uuid::new_v4();
+        let mut uplink_metrics = crate::agent_metrics::Receiver::new(app.metrics.runtime.clone(), id, connection, token_hash);
         let (scan_tx, mut scans) = tokio::sync::mpsc::channel::<Scan>(1);
         app.agent_controls.lock().await.insert(id, Control { connection, scans: scan_tx, manual_scan: false, source_versions: None, drain_receipts: None });
         let mut supports_scan = false;
@@ -176,6 +178,7 @@ pub async fn connect(
         });
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
         loop { tokio::select! {
+            _ = uplink_metrics.poll_pending() => {},
             request = scans.recv() => {
                 let Some(request) = request else { break };
                 if !supports_scan { let _ = request.reply.send("unsupported"); continue; }
@@ -246,14 +249,25 @@ pub async fn connect(
                         }
                         if value["type"] == "HELLO" {
                             supports_scan = value["manual_scan"] == true;
-                            let mut controls = app.agent_controls.lock().await;
-                            if let Some(control) = controls.get_mut(&id).filter(|c| c.connection == connection) {
-                                control.manual_scan = supports_scan;
-                                control.drain_receipts = Some(value["drain_receipts"] == true);
-                                // Absence is unknown: pre-capability Agents can still
-                                // prove support by committing a versioned snapshot.
-                                if value["source_versions"] == true { control.source_versions = Some(true); }
+                            let ready = {
+                                let mut controls = app.agent_controls.lock().await;
+                                if let Some(control) = controls.get_mut(&id).filter(|c| c.connection == connection) {
+                                    control.manual_scan = supports_scan;
+                                    control.drain_receipts = Some(value["drain_receipts"] == true);
+                                    // Absence is unknown: pre-capability Agents can still
+                                    // prove support by committing a versioned snapshot.
+                                    if value["source_versions"] == true { control.source_versions = Some(true); }
+                                    uplink_metrics.hello(&text, &value)
+                                } else { None }
+                            };
+                            // Optional negotiation never holds a database/control
+                            // lock during a WebSocket send or changes ordinary auth.
+                            if let Some(ready) = ready {
+                                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), out.send(Message::Text(ready.to_string().into()))).await;
                             }
+                        }
+                        if value["type"] == "HEARTBEAT" {
+                            uplink_metrics.heartbeat(&app, &text, &value);
                         }
                         if value["type"] == "SCAN_BUSY" && pending.as_ref().is_some_and(|p| value["snapshot"] == p.id.to_string()) {
                             let _ = pending.take().unwrap().reply.send("busy");
@@ -265,6 +279,8 @@ pub async fn connect(
                 }
             }
         }}
+        // Abort owned optional telemetry before any socket cleanup awaits.
+        drop(uplink_metrics);
         // Dropping the uncommitted snapshot rolls back partial/disconnected indexing.
         ingest.abort();
         let _ = ingest.await;

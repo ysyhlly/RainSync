@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NasUplinkMetricsSample",
+  "type": "object",
+  "properties": {
+    "connection_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "seq": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "totals": {
+      "$ref": "#/$defs/NasUplinkTotals"
+    },
+    "version": {
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "connection_id",
+    "seq",
+    "totals"
+  ],
+  "$defs": {
+    "NasUplinkOutcomeTotals": {
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "duration_buckets": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "maxItems": 9,
+          "minItems": 9
+        },
+        "duration_us": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "transfers": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "transfers",
+        "bytes",
+        "duration_us",
+        "duration_buckets"
+      ]
+    },
+    "NasUplinkTotals": {
+      "description": "Cumulative measurements from one fixed Agent collector. No identities,\narbitrary dimensions, source fields, credentials, or authoritative claims.",
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "admitted": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "body_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "body_seen": {
+          "type": "boolean"
+        },
+        "cancelled": {
+          "$ref": "#/$defs/NasUplinkOutcomeTotals"
+        },
+        "complete": {
+          "$ref": "#/$defs/NasUplinkOutcomeTotals"
+        },
+        "dropped": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "failed": {
+          "$ref": "#/$defs/NasUplinkOutcomeTotals"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "admitted",
+        "dropped",
+        "active",
+        "body_seen",
+        "body_bytes",
+        "complete",
+        "failed",
+        "cancelled"
+      ]
+    }
+  }
+}

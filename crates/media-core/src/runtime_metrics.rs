@@ -1,14 +1,17 @@
 //! Bounded process-local measurements of real body streams and separately named,
 //! untrusted client reports. Owners bind hooks at actual I/O and committed sites.
 use protocol::{
-    PLAYBACK_METRICS_MAX_ELAPSED_MS, PlaybackMetricsFirstFrame, PlaybackMetricsFrameEvidence,
-    PlaybackMetricsOrigin, PlaybackMetricsTotals,
+    ControlRecoveryMetricsSample, NAS_METRIC_MAX_ACTIVE, NasUplinkDelta, NasUplinkOutcomeTotals,
+    NasUplinkTotals, PLAYBACK_METRICS_MAX_ELAPSED_MS, PlaybackMetricsFirstFrame,
+    PlaybackMetricsFrameEvidence, PlaybackMetricsOrigin, PlaybackMetricsTotals,
 };
 use std::fmt::Write;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 pub const MAX_ACTIVE_TRANSFERS: usize = 1024;
+/// Fixed aggregate storage, including the two separately named report families.
+pub const MAX_METRIC_SNAPSHOT_BYTES: usize = 4096;
 const BOUNDS_US: [u64; 9] = [
     10_000,
     50_000,
@@ -183,6 +186,82 @@ struct Snapshot {
     failures_seen: bool,
     client_playback: [ClientPlaybackAggregate; 2],
     client_dropped: [u64; 5],
+    control_recovery: [ControlRecoveryAggregate; 2],
+    control_dropped: [u64; 7],
+    agent_nas: AgentNasAggregate,
+    agent_nas_dropped: [u64; 7],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum TransportMetricDrop {
+    Invalid,
+    Stale,
+    RateLimited,
+    Capacity,
+    Unavailable,
+    Unauthorized,
+    Overflow,
+}
+const TRANSPORT_DROP_REASONS: [&str; 7] = [
+    "invalid",
+    "stale",
+    "rate_limited",
+    "capacity",
+    "unavailable",
+    "unauthorized",
+    "overflow",
+];
+
+#[derive(Clone, Copy, Default)]
+struct ControlRecoveryAggregate {
+    socket: ClientHistogram,
+    disconnect: ClientHistogram,
+}
+
+#[derive(Clone, Copy, Default)]
+struct AgentNasAggregate {
+    samples: u64,
+    admitted: u64,
+    dropped: u64,
+    body_bytes: u64,
+    body_seen: bool,
+    outcomes: [Aggregate; 3],
+}
+
+/// A sealed NAS-only collector. It cannot admit other layers or cache events,
+/// so its fixed snapshot does not confuse shared process-wide totals with NAS.
+#[derive(Clone, Default)]
+pub struct NasUplinkMetrics(RuntimeMetrics);
+impl NasUplinkMetrics {
+    pub fn begin_transfer(&self) -> Option<Transfer> {
+        let transfer = self.0.begin_transfer_with_limit(
+            Layer::NasUplink,
+            Cache::NotHit,
+            NAS_METRIC_MAX_ACTIVE as usize,
+        )?;
+        lock(&self.0.inner).body_seen[Layer::NasUplink as usize] = true;
+        Some(transfer)
+    }
+    pub fn snapshot(&self) -> NasUplinkTotals {
+        let state = lock(&self.0.inner);
+        let [complete, failed, cancelled] =
+            state.transfers[Layer::NasUplink as usize].map(|value| NasUplinkOutcomeTotals {
+                transfers: value.count,
+                bytes: value.bytes,
+                duration_us: value.micros,
+                duration_buckets: value.buckets,
+            });
+        NasUplinkTotals {
+            admitted: state.admitted,
+            dropped: state.dropped,
+            active: state.active as u32,
+            body_seen: state.body_seen[Layer::NasUplink as usize],
+            body_bytes: state.body_bytes[Layer::NasUplink as usize],
+            complete,
+            failed,
+            cancelled,
+        }
+    }
 }
 #[derive(Clone, Default)]
 pub struct RuntimeMetrics {
@@ -197,10 +276,16 @@ impl RuntimeMetrics {
     /// Admission failure must never fail media delivery. Hit is only meaningful
     /// on Worker egress; invalid layer/cache combinations are rejected too.
     pub fn begin_transfer(&self, layer: Layer, cache: Cache) -> Option<Transfer> {
+        self.begin_transfer_with_limit(layer, cache, MAX_ACTIVE_TRANSFERS)
+    }
+    fn begin_transfer_with_limit(
+        &self,
+        layer: Layer,
+        cache: Cache,
+        limit: usize,
+    ) -> Option<Transfer> {
         let mut state = lock(&self.inner);
-        if state.active == MAX_ACTIVE_TRANSFERS
-            || (cache == Cache::Hit && !matches!(layer, Layer::WorkerEgress))
-        {
+        if state.active >= limit || (cache == Cache::Hit && !matches!(layer, Layer::WorkerEgress)) {
             state.dropped = state.dropped.saturating_add(1);
             return None;
         }
@@ -215,6 +300,86 @@ impl RuntimeMetrics {
             bytes: 0,
             finished: false,
         })
+    }
+
+    pub fn client_control_recovery(&self, sample: &ControlRecoveryMetricsSample) -> bool {
+        let mut state = lock(&self.inner);
+        if !sample.valid() {
+            state.control_dropped[TransportMetricDrop::Invalid as usize] =
+                state.control_dropped[TransportMetricDrop::Invalid as usize].saturating_add(1);
+            return false;
+        }
+        let target = &mut state.control_recovery[usize::from(sample.background)];
+        let mut candidate = *target;
+        let accepted = candidate
+            .socket
+            .checked_observe(u64::from(sample.socket_open_to_state_applied_ms))
+            .is_some()
+            && sample
+                .disconnect_observed_to_state_applied_ms
+                .is_none_or(|value| {
+                    candidate
+                        .disconnect
+                        .checked_observe(u64::from(value))
+                        .is_some()
+                });
+        if accepted {
+            *target = candidate;
+        } else {
+            state.control_dropped[TransportMetricDrop::Overflow as usize] =
+                state.control_dropped[TransportMetricDrop::Overflow as usize].saturating_add(1);
+        }
+        accepted
+    }
+    pub fn client_control_dropped(&self, reason: TransportMetricDrop) {
+        let mut state = lock(&self.inner);
+        state.control_dropped[reason as usize] =
+            state.control_dropped[reason as usize].saturating_add(1);
+    }
+
+    /// Receiver owns current-connection authentication, sequence and baseline.
+    /// This namespace remains authenticated Agent self-report, not local I/O.
+    pub fn agent_nas_sample(&self, delta: &NasUplinkDelta) -> bool {
+        let mut state = lock(&self.inner);
+        if !delta.valid() {
+            state.agent_nas_dropped[TransportMetricDrop::Invalid as usize] =
+                state.agent_nas_dropped[TransportMetricDrop::Invalid as usize].saturating_add(1);
+            return false;
+        }
+        let mut next = state.agent_nas;
+        let updated = (|| -> Option<()> {
+            next.samples = next.samples.checked_add(1)?;
+            next.admitted = next.admitted.checked_add(delta.admitted)?;
+            next.dropped = next.dropped.checked_add(delta.dropped)?;
+            next.body_bytes = next.body_bytes.checked_add(delta.body_bytes)?;
+            next.body_seen |= delta.body_seen;
+            for (target, value) in
+                next.outcomes
+                    .iter_mut()
+                    .zip([delta.complete, delta.failed, delta.cancelled])
+            {
+                target.count = target.count.checked_add(value.transfers)?;
+                target.bytes = target.bytes.checked_add(value.bytes)?;
+                target.micros = target.micros.checked_add(value.duration_us)?;
+                for (target, value) in target.buckets.iter_mut().zip(value.duration_buckets) {
+                    *target = target.checked_add(value)?;
+                }
+            }
+            Some(())
+        })();
+        if updated.is_some() {
+            state.agent_nas = next;
+            true
+        } else {
+            state.agent_nas_dropped[TransportMetricDrop::Overflow as usize] =
+                state.agent_nas_dropped[TransportMetricDrop::Overflow as usize].saturating_add(1);
+            false
+        }
+    }
+    pub fn agent_nas_dropped(&self, reason: TransportMetricDrop) {
+        let mut state = lock(&self.inner);
+        state.agent_nas_dropped[reason as usize] =
+            state.agent_nas_dropped[reason as usize].saturating_add(1);
     }
     /// Exactly once per cache-eligible lookup, after its actual decision.
     pub fn cache_lookup(&self, decision: CacheDecision) {
@@ -446,6 +611,89 @@ impl RuntimeMetrics {
             for (reason, count) in CLIENT_DROP_REASONS.iter().zip(state.client_dropped) {
                 if count > 0 {
                     writeln!(out, "rainsync_client_reported_playback_dropped_total{{reason=\"{reason}\"}} {count}").unwrap();
+                }
+            }
+        }
+        if state
+            .control_recovery
+            .iter()
+            .any(|value| value.socket.count > 0)
+        {
+            out.push_str("# HELP rainsync_client_reported_control_recovery_milliseconds Successful client-reported socket/disconnect to applied authoritative state; not verified network restoration or playback recovery; unreported failures are absent.\n# TYPE rainsync_client_reported_control_recovery_milliseconds histogram\n");
+            for (background, value) in ["false", "true"].iter().zip(state.control_recovery) {
+                for (boundary, histogram) in [
+                    ("socket_open_to_state_applied", value.socket),
+                    ("disconnect_observed_to_state_applied", value.disconnect),
+                ] {
+                    if histogram.count > 0 {
+                        render_client_histogram(
+                            &mut out,
+                            "rainsync_client_reported_control_recovery_milliseconds",
+                            &format!("boundary=\"{boundary}\",background=\"{background}\""),
+                            histogram,
+                        );
+                    }
+                }
+            }
+        }
+        if state.agent_nas.samples > 0 {
+            out.push_str("# HELP rainsync_agent_reported_nas_samples_total Accepted current-connection Agent reports; uncredited baselines and lost tails are excluded.\n# TYPE rainsync_agent_reported_nas_samples_total counter\n# HELP rainsync_agent_reported_nas_body_bytes_total Agent-reported successful WebSocket body handoff, including active transfers; not Server-observed I/O, peer acknowledgement or billing authority.\n# TYPE rainsync_agent_reported_nas_body_bytes_total counter\n# TYPE rainsync_agent_reported_nas_admissions_total counter\n# TYPE rainsync_agent_reported_nas_measurements_dropped_total counter\n");
+            writeln!(
+                out,
+                "rainsync_agent_reported_nas_samples_total {}",
+                state.agent_nas.samples
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "rainsync_agent_reported_nas_admissions_total {}",
+                state.agent_nas.admitted
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "rainsync_agent_reported_nas_measurements_dropped_total {}",
+                state.agent_nas.dropped
+            )
+            .unwrap();
+            if state.agent_nas.body_seen {
+                writeln!(
+                    out,
+                    "rainsync_agent_reported_nas_body_bytes_total {}",
+                    state.agent_nas.body_bytes
+                )
+                .unwrap();
+            }
+            if state.agent_nas.outcomes.iter().any(|value| value.count > 0) {
+                out.push_str("# HELP rainsync_agent_reported_nas_transfer_bytes_total Agent-reported bytes in completed body observations; a terminal aggregate can span its connection baseline.\n# TYPE rainsync_agent_reported_nas_transfer_bytes_total counter\n# HELP rainsync_agent_reported_nas_transfer_duration_seconds Agent-reported monotonic body lifetime; successful handoff is not resource disposal or peer acknowledgement.\n# TYPE rainsync_agent_reported_nas_transfer_duration_seconds histogram\n");
+                for (outcome, value) in OUTCOMES.iter().zip(state.agent_nas.outcomes) {
+                    if value.count == 0 {
+                        continue;
+                    }
+                    writeln!(out, "rainsync_agent_reported_nas_transfer_bytes_total{{outcome=\"{outcome}\"}} {}", value.bytes).unwrap();
+                    for (bound, count) in BOUNDS_US.iter().zip(value.buckets) {
+                        writeln!(out, "rainsync_agent_reported_nas_transfer_duration_seconds_bucket{{outcome=\"{outcome}\",le=\"{}\"}} {count}", *bound as f64 / 1_000_000.0).unwrap();
+                    }
+                    writeln!(out, "rainsync_agent_reported_nas_transfer_duration_seconds_bucket{{outcome=\"{outcome}\",le=\"+Inf\"}} {}\nrainsync_agent_reported_nas_transfer_duration_seconds_count{{outcome=\"{outcome}\"}} {}\nrainsync_agent_reported_nas_transfer_duration_seconds_sum{{outcome=\"{outcome}\"}} {}", value.count, value.count, value.micros as f64 / 1_000_000.0).unwrap();
+                }
+            }
+        }
+        for (name, values) in [
+            (
+                "rainsync_client_reported_control_recovery_dropped_total",
+                state.control_dropped,
+            ),
+            (
+                "rainsync_agent_reported_nas_dropped_total",
+                state.agent_nas_dropped,
+            ),
+        ] {
+            if values.iter().any(|value| *value > 0) {
+                writeln!(out, "# TYPE {name} counter").unwrap();
+                for (reason, count) in TRANSPORT_DROP_REASONS.iter().zip(values) {
+                    if count > 0 {
+                        writeln!(out, "{name}{{reason=\"{reason}\"}} {count}").unwrap();
+                    }
                 }
             }
         }

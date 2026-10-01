@@ -634,6 +634,10 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
     };
     let negotiated_presence =
         v["presence_version"].as_u64() == Some(u64::from(protocol::PRESENCE_VERSION));
+    let negotiated_control_metrics = v["control_recovery_metrics_version"].as_u64()
+        == Some(u64::from(protocol::TRANSPORT_METRICS_VERSION));
+    let mut control_metrics_slot = control_recovery_metrics::Slot::default();
+    let mut control_metrics_pending = tokio::task::JoinSet::new();
     let mut events = handle.events.subscribe_with_presence(negotiated_presence);
     let (s, owner_id, lifecycle, lifecycle_epoch, control_epoch) =
         match owned_snapshot(&app, id, user.id).await {
@@ -662,7 +666,14 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
             missing = rows.iter().map(|r| r.get("state")).collect();
         }
     }
-    if let Err(reason) = socket_access(&app, id, user.id, &session_hash, negotiated_presence).await
+    if let Err(reason) = socket_access(
+        &app,
+        id,
+        user.id,
+        &session_hash,
+        negotiated_presence || negotiated_control_metrics,
+    )
+    .await
     {
         reject_socket(&mut out, reason).await;
         return;
@@ -679,6 +690,9 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
         None
     };
     let mut initial = json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"recovery":recovery,"events":missing,"control_epoch":control_epoch,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch});
+    if negotiated_control_metrics {
+        initial["control_recovery_metrics_version"] = json!(protocol::TRANSPORT_METRICS_VERSION);
+    }
     if let Some(lease) = &presence_lease {
         match handle
             .presence
@@ -727,6 +741,7 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
     let mut count = 0;
     loop {
         let mut value = tokio::select! {
+            _ = control_metrics_pending.join_next(), if !control_metrics_pending.is_empty() => { continue; },
             _ = &mut lease_expiry, if negotiated_presence => { break; },
             _=heartbeat.tick()=>{
                 if !negotiated_presence && last_seen.elapsed().as_secs()>45 {break};
@@ -747,8 +762,9 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
             }
             event=events.recv()=>match event {Ok(v)=>v,Err(delivery::Lag::Control)=>{match owned_snapshot(&app,id,user.id).await{Ok((s,owner_id,lifecycle,lifecycle_epoch,control_epoch))=>json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch,"control_epoch":control_epoch}),Err(_)=>break}},Err(delivery::Lag::Chat | delivery::Lag::Closed)=>break},
             message=input.next()=>{
-                let Some(Ok(message))=message else{break};last_seen=Instant::now();
+                let Some(Ok(message))=message else{break};
                 if let Message::Pong(payload) = &message {
+                    last_seen=Instant::now();
                     if let Some(lease) = &presence_lease && let Some(index) = probes.iter().position(|probe| probe.as_slice() == payload.as_ref()) {
                             probes.remove(index);
                             if let Err(reason) = socket_access(&app,id,user.id,&session_hash,true).await { reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break; }
@@ -757,9 +773,16 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                     }
                     continue;
                 }
-                let Message::Text(text)=message else{continue};
+                let Message::Text(text)=message else{last_seen=Instant::now();continue};
                 if window.elapsed().as_secs()>=1{window=Instant::now();count=0} count+=1;if count>30{reject_with_presence(&mut out, "rate_limited", presence_lease.as_ref()).await;break}
-                let Ok(v)=serde_json::from_str::<Value>(&text)else{reject_with_presence(&mut out, "invalid_request", presence_lease.as_ref()).await;continue};
+                let Ok(v)=serde_json::from_str::<Value>(&text)else{last_seen=Instant::now();reject_with_presence(&mut out, "invalid_request", presence_lease.as_ref()).await;continue};
+                if v["type"] == "CONTROL_RECOVERY_METRICS" {
+                    if let Some(task) = control_metrics_slot.begin(&app,id,user.id,&session_hash,negotiated_control_metrics,&text) {
+                        control_metrics_pending.spawn(task);
+                    }
+                    continue;
+                }
+                last_seen=Instant::now();
                 if let Err(reason)=socket_access(&app,id,user.id,&session_hash,negotiated_presence).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
                 match v["type"].as_str().unwrap_or("") {
                     "CLOCK_SYNC"=>{let t2=app.now();json!({"type":"CLOCK_SYNC_REPLY","t1":v["t1"],"t2":t2,"t3":app.now(),"clock_epoch":app.epoch})},
@@ -858,6 +881,8 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
             break;
         }
     }
+    // Abort optional owned authorization work before waiting on close transport.
+    drop(control_metrics_pending);
     drop(presence_lease);
     // Do not drop a TCP socket with unread burst frames immediately after its
     // terminal ERROR. Complete the WebSocket close handshake so the peer can
