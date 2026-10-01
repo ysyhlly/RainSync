@@ -1,5 +1,6 @@
 pub mod http_range;
 pub mod input_policy;
+pub mod job_health;
 pub mod runtime_metrics;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};

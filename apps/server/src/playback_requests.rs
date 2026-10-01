@@ -1,4 +1,5 @@
 use super::*;
+use media_core::job_health::PendingJobHealth;
 
 #[path = "http_file_fallback.rs"]
 pub mod http_file_fallback;
@@ -46,6 +47,7 @@ pub async fn begin_authenticated(
     canonical.mode = Some(body.mode.as_deref().unwrap_or("auto").into());
     let digest = hash(&serde_json::to_string(&canonical).map_err(anyhow::Error::from)?);
     let mut tx = app.db.begin().await?;
+    let mut job_health = PendingJobHealth::default();
     // Room management, reservation and final publication share this first lock.
     let lifecycle_epoch = persistence::room_lifecycle::lock_active(&mut tx, body.room_id)
         .await
@@ -150,7 +152,9 @@ pub async fn begin_authenticated(
                     .await?;
                 sqlx::query("UPDATE playback_requests SET expires_at=GREATEST(expires_at,now()+interval '48 hours') WHERE user_id=$1 AND idempotency_key=$2")
                     .bind(user).bind(key).execute(&mut *tx).await?;
+                let observation = job_health.into_commit_observation();
                 tx.commit().await?;
+                observation.confirmed();
                 return Ok(Start::Replay(plan));
             }
             _ if !row.get::<bool, _>("retained") => {
@@ -180,7 +184,8 @@ pub async fn begin_authenticated(
             .bind(old)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')").bind(old).execute(&mut *tx).await?;
+        let cancelled = sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')").bind(old).execute(&mut *tx).await?.rows_affected();
+        job_health.cancelled(cancelled);
         persistence::upstream_reservations::close(&mut tx, old, "playback_request_interrupted")
             .await?;
         sqlx::query("UPDATE playback_requests SET status='failed',error_status=409,error_code='playback_request_interrupted',response_encrypted=NULL WHERE user_id=$1 AND idempotency_key=$2")
@@ -188,7 +193,9 @@ pub async fn begin_authenticated(
         if row.get::<i32, _>("attempt") >= 3 {
             sqlx::query("UPDATE playback_requests SET error_code='playback_request_retry_exhausted' WHERE user_id=$1 AND idempotency_key=$2")
                 .bind(user).bind(key).execute(&mut *tx).await?;
+            let observation = job_health.into_commit_observation();
             tx.commit().await?;
+            observation.confirmed();
             return Err(err(
                 StatusCode::CONFLICT,
                 "playback_request_retry_exhausted",
@@ -201,8 +208,17 @@ pub async fn begin_authenticated(
         http_file = Some(Box::new(if body.http_file_fallback.is_some() {
             // Accept the preserved sample and freeze the claim before the
             // viewer high-water below can retire its live parent.
-            http_file_fallback::claim(app, &mut tx, user, body, &state, context, lifecycle_epoch)
-                .await?
+            http_file_fallback::claim(
+                app,
+                &mut tx,
+                user,
+                body,
+                &state,
+                context,
+                lifecycle_epoch,
+                &mut job_health,
+            )
+            .await?
         } else if body.candidate_report.is_some() {
             playback_capabilities::capture_http(
                 app,
@@ -265,8 +281,9 @@ pub async fn begin_authenticated(
                 .bind(old)
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')")
-                .bind(old).execute(&mut *tx).await?;
+            let cancelled = sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')")
+                .bind(old).execute(&mut *tx).await?.rows_affected();
+            job_health.cancelled(cancelled);
             sqlx::query("UPDATE playback_requests SET status='failed',response_encrypted=NULL,error_status=409,error_code='stale_playback_plan',lease_until=clock_timestamp() WHERE session_id=$1")
                 .bind(old).execute(&mut *tx).await?;
             persistence::upstream_reservations::close(&mut tx, old, "stale_playback_plan").await?;
@@ -279,7 +296,9 @@ pub async fn begin_authenticated(
         // Do not publish a new high-water without its request identity. A
         // quota rejection must remain safely retryable with the same intent.
         if body.viewer_id.is_none() {
+            let observation = job_health.into_commit_observation();
             tx.commit().await?;
+            observation.confirmed();
         }
         return Err(err(
             StatusCode::TOO_MANY_REQUESTS,
@@ -304,7 +323,9 @@ pub async fn begin_authenticated(
             return Err(err(StatusCode::GONE, "invalid_playback_session"));
         }
     }
+    let observation = job_health.into_commit_observation();
     tx.commit().await?;
+    observation.confirmed();
     Ok(Start::Reserved(Reservation {
         key,
         session,
@@ -546,11 +567,15 @@ pub async fn cancel(
             .bind(session)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')")
-            .bind(session).execute(&mut *tx).await?;
+        let cancelled = sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')")
+            .bind(session).execute(&mut *tx).await?.rows_affected();
         persistence::upstream_reservations::close(&mut tx, session, "playback_request_cancelled")
             .await?;
+        let mut job_health = PendingJobHealth::default();
+        job_health.cancelled(cancelled);
+        let observation = job_health.into_commit_observation();
         tx.commit().await?;
+        observation.confirmed();
         return Ok(Json(json!({"ok":true})));
     }
     Err(err(StatusCode::CONFLICT, "playback_request_interrupted"))

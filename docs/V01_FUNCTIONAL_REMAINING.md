@@ -18,13 +18,16 @@ to that baseline, not to untested later changes.
   Worker and Web. The same logical intent retains its encrypted representation
   binding and device report across bounded decode fallback; stale/changed or
   malformed reports cannot silently rediscover a new source. Local checks passed
-  28 new API groups, 32 continuation groups and 457 frontend tests. Publication
-  and exact-head CI remain pending. See [scope and evidence](HTTP_FILE_CAPABILITY_BINDING.md).
+  28 new API groups, 32 continuation groups and 457 frontend tests. Published
+  checkpoint `d8418a7` is awaiting its retried exact-head CI after an initial
+  package-download timeout before application validation. See [scope and evidence](HTTP_FILE_CAPABILITY_BINDING.md).
 
 - NEXT_PLAN §12.1: current persisted job inventory, registered process-owner
   state and completed cache scan counts/age are exposed through existing admin
   metrics. Unknown samples remain absent; these gauges do not replace task
-  duration or transition event producers. See [the scoped contract](TASK_HEALTH_OBSERVATIONS.md).
+  duration. Fixed process-local retry/cancel/expiry event producers now have
+  bounded local transaction/API checks; see [event definitions](JOB_HEALTH_EVENTS.md)
+  and [the inventory contract](TASK_HEALTH_OBSERVATIONS.md).
 - NEXT_PLAN §9.2: make NAS single-range behavior agree with local file delivery.
   HEAD describes the full file, unsupported/invalid ranges are ignored, and
   valid ranges selecting no bytes return 416. A stat-v1 change detector is not a
@@ -53,8 +56,9 @@ and [validation limits](VALIDATION.md). Initial usable data is not a complete pr
 2. **Task-health measurements, NEXT_PLAN §12.1.** Current metrics now include
    fixed-state persisted job inventory, oldest queued creation age, recorded
    expired/missing leases, process-owner observations and fresh cache inventory
-   ([scope](TASK_HEALTH_OBSERVATIONS.md)). Complete queue/run duration, retry,
-   cancellation and lease-expiry event producers remain. `available_at` is an eligibility
+   ([scope](TASK_HEALTH_OBSERVATIONS.md)). Complete queue/run duration remains;
+   retry/cancellation/lease-expiry event producers are now implemented and locally
+   verified separately. `available_at` is an eligibility
    deadline rather than requeue time. Execution drain receipts are not runtime
    measurements. Successful completion uses `media_outputs::publish`, and
    cancellation occurs in several Server and persistence paths; Worker-only

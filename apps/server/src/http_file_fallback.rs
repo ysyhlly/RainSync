@@ -1,6 +1,7 @@
 //! One HTTP Binary representation, one atomic decoder continuation. The
 //! encrypted request ledger is the authority; observations never grant access.
 use crate::*;
+use media_core::job_health::PendingJobHealth;
 use persistence::http_file_authorization::{self as authorization, Context};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Transaction, postgres::PgRow};
@@ -434,6 +435,10 @@ pub async fn mark_root(
     Ok(true)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep transaction observations separate from serialized grant authority"
+)]
 pub async fn claim(
     app: &App,
     tx: &mut Transaction<'_, Postgres>,
@@ -442,6 +447,7 @@ pub async fn claim(
     state: &Value,
     context: Context,
     lifecycle_epoch: i64,
+    job_health: &mut PendingJobHealth,
 ) -> Result<Authority> {
     let parent = body
         .http_file_fallback
@@ -547,8 +553,9 @@ pub async fn claim(
         .bind(parent)
         .execute(&mut **tx)
         .await?;
-    sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')")
-        .bind(parent).execute(&mut **tx).await?;
+    let cancelled = sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')")
+        .bind(parent).execute(&mut **tx).await?.rows_affected();
+    job_health.cancelled(cancelled);
     Ok(authority)
 }
 

@@ -84,6 +84,7 @@ histogram and actual cache-decision assertions. Only the four new inventory
 names are excluded from that older collector's selector.
 
 Exact final report identities and results are recorded in VALIDATION.md.
-Queue/run duration histograms and complete retry/cancellation/lease-expiry
-event producers are still separate functional work. These finite observations
+The separate [committed event observations](JOB_HEALTH_EVENTS.md) now cover
+retry schedules, cancellations and lease-expiry normalization. Queue/run duration
+histograms remain a separate implementation item. These finite observations
 do not close device, filesystem, sustained-load or long-running acceptance.

@@ -10,6 +10,7 @@ serde.workspace = true
 uuid.workspace = true
 sqlx.workspace = true
 protocol.workspace = true
+media-core.workspace = true
 room-core.workspace = true
 sha2 = "0.10"
 hex = "0.4"

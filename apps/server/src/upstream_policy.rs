@@ -2,6 +2,7 @@
 //! Observation rows fence authorization; retiring a grant is not a drain ACK.
 use super::{App, Result, err};
 use axum::http::StatusCode;
+use media_core::job_health::PendingJobHealth;
 use providers::account_policy::{UpstreamAccountPolicy, upstream_account_policy};
 use sqlx::{Connection, PgPool, Postgres, Row, Transaction, pool::PoolConnection};
 use std::{
@@ -471,11 +472,15 @@ async fn retire(pool: &PgPool) -> anyhow::Result<()> {
         let mut tx = db.transaction().await?;
         sqlx::query("UPDATE playback_sessions p SET stopped=true FROM media_items m JOIN sources s ON s.id=m.source_id WHERE p.media_id=m.id AND NOT p.stopped AND s.kind IN('jellyfin','emby') AND NOT playback_source_allowed(p.media_id,p.resource)")
             .execute(&mut *tx).await?;
-        sqlx::query("UPDATE media_jobs j SET status='cancelled' FROM playback_sessions p WHERE j.session_id=p.id AND p.stopped AND j.status IN('queued','running')")
-            .execute(&mut *tx).await?;
+        let cancelled = sqlx::query("UPDATE media_jobs j SET status='cancelled' FROM playback_sessions p WHERE j.session_id=p.id AND p.stopped AND j.status IN('queued','running')")
+            .execute(&mut *tx).await?.rows_affected();
         sqlx::query("UPDATE upstream_reservations u SET state='closing',close_reason=COALESCE(close_reason,CASE WHEN EXISTS(SELECT 1 FROM sources s WHERE s.id=u.source_id AND s.access_policy_revision=u.source_policy_revision) THEN 'upstream_policy_changed' ELSE 'source_changed' END),cleanup_after=COALESCE(cleanup_after,clock_timestamp()),cleanup_deadline=COALESCE(cleanup_deadline,clock_timestamp()+interval '60 seconds'),updated_at=clock_timestamp() WHERE u.state IN('preparing','active') AND NOT source_account_policy_allowed(u.source_id,u.source_policy_revision,u.account_policy_generation)")
             .execute(&mut *tx).await?;
+        let mut job_health = PendingJobHealth::default();
+        job_health.cancelled(cancelled);
+        let observation = job_health.into_commit_observation();
         tx.commit().await?;
+        observation.confirmed();
         db.release();
         Ok(())
     }).await

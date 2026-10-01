@@ -1215,6 +1215,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hex",
+ "media-core",
  "protocol",
  "room-core",
  "serde",

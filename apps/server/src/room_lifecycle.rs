@@ -1,4 +1,5 @@
 use super::*;
+use media_core::job_health::PendingJobHealth;
 use protocol::{PlaybackStatus, RoomState};
 
 #[derive(Deserialize)]
@@ -178,12 +179,16 @@ async fn change(
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE status IN('queued','running') AND session_id IN(SELECT id FROM playback_sessions WHERE room_id=$1)")
-        .bind(id).execute(&mut *tx).await?;
+    let cancelled = sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE status IN('queued','running') AND session_id IN(SELECT id FROM playback_sessions WHERE room_id=$1)")
+        .bind(id).execute(&mut *tx).await?.rows_affected();
     if target == "closing" {
         persistence::room_cleanup::enqueue(&mut tx, id, epoch).await?;
     }
+    let mut job_health = PendingJobHealth::default();
+    job_health.cancelled(cancelled);
+    let observation = job_health.into_commit_observation();
     tx.commit().await?;
+    observation.confirmed();
     rooms::lifecycle_changed(app, &state, target, epoch, event_id).await;
     Ok(media_titles::private_json(
         json!({"lifecycle":target,"lifecycle_epoch":epoch,"owner_id":owner,"state":state,"event_id":event_id}),

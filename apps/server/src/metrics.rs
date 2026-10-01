@@ -282,6 +282,7 @@ pub async fn endpoint(State(app): State<App>, h: HeaderMap) -> Result<Response> 
     }
     let queued = jobs.counts[0];
     let mut text = app.metrics.render();
+    text.push_str(&media_core::job_health::render(runtime::Process::Server));
     text.push_str(&jobs.render());
     text.push_str(&process_owner_metrics(
         media_core::child_process::owner_snapshot(),

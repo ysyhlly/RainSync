@@ -194,6 +194,7 @@ pub async fn endpoint(State(app): State<App>, headers: HeaderMap) -> Response {
         return denied(status);
     }
     let mut output = app.metrics.render_for(Process::Worker);
+    output.push_str(&media_core::job_health::render(Process::Worker));
     append_observations(
         &mut output,
         media_core::child_process::owner_snapshot(),

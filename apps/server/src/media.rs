@@ -1159,7 +1159,7 @@ pub async fn stop(
         .bind(u.id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id IN(SELECT id FROM playback_sessions WHERE id=$1 AND user_id=$2) AND status IN('queued','running')").bind(id).bind(u.id).execute(&mut *tx).await?;
+    let cancelled = sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id IN(SELECT id FROM playback_sessions WHERE id=$1 AND user_id=$2) AND status IN('queued','running')").bind(id).bind(u.id).execute(&mut *tx).await?.rows_affected();
     if sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM playback_sessions WHERE id=$1 AND user_id=$2)",
     )
@@ -1170,7 +1170,11 @@ pub async fn stop(
     {
         persistence::upstream_reservations::close(&mut tx, id, "playback_stopped").await?;
     }
+    let mut job_health = media_core::job_health::PendingJobHealth::default();
+    job_health.cancelled(cancelled);
+    let observation = job_health.into_commit_observation();
     tx.commit().await?;
+    observation.confirmed();
     if let Some(error) = final_error {
         // Ownership authorizes stopping independently of accepting a sample.
         // Reject invalid final data without retaining the caller's resources.

@@ -226,8 +226,14 @@ pub async fn commit(
     sqlx::query("UPDATE playback_sessions SET stopped=true WHERE room_id=$1 AND generation<>$2 AND NOT stopped").bind(state.room_id).bind(i64::from(state.media_generation)).execute(&mut *tx).await?;
     upstream_reservations::close_room(&mut tx, state.room_id, i64::from(state.media_generation))
         .await?;
-    sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE status IN('queued','running') AND session_id IN(SELECT id FROM playback_sessions WHERE room_id=$1 AND stopped)").bind(state.room_id).execute(&mut *tx).await?;
+    let cancelled = sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE status IN('queued','running') AND session_id IN(SELECT id FROM playback_sessions WHERE room_id=$1 AND stopped)").bind(state.room_id).execute(&mut *tx).await?.rows_affected();
+    let mut job_health = media_core::job_health::PendingJobHealth::default();
+    job_health.cancelled(cancelled);
+    // Only the acknowledged logical transition is observed. Child-process
+    // drainage remains owned by the existing execution supervisors/receipts.
+    let job_health = job_health.into_commit_observation();
     tx.commit().await?;
+    job_health.confirmed();
     Ok(())
 }
 pub mod media_previews;
