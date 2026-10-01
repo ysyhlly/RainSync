@@ -385,6 +385,28 @@ async fn prepare(
     out.body(Body::from_stream(combined)).map_err(failure)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BinaryOnly {
+    version: u8,
+    target_sha256: String,
+}
+
+fn binary_only(resource: &Value, q: &Params, target: &url::Url) -> Result<bool> {
+    let Some(value) = resource.get("http_file_binary_only") else {
+        return Ok(false);
+    };
+    let restriction: BinaryOnly =
+        serde_json::from_value(value.clone()).map_err(|_| crate::http_identity::required())?;
+    if restriction.version != 1
+        || restriction.target_sha256 != crate::hash(target.as_str())
+        || q.url.is_some()
+    {
+        return Err(crate::http_identity::required());
+    }
+    Ok(true)
+}
+
 /// Generic HTTP resources have durable per-grant pins. Jellyfin/Emby retain
 /// their provider-owned session contracts in the path above.
 async fn prepare_pinned(
@@ -397,9 +419,18 @@ async fn prepare_pinned(
     observation: input_failure::Observation,
 ) -> Result<Response> {
     use crate::http_identity::{self as identity, Class, Metadata, Range};
+    if resource.get("http_file_binary_only").is_some() && q.url.is_some() {
+        observation.source_version_required();
+        return Err(identity::required());
+    }
     let (mut target, kind, depth) = target(app, id, resource, q)
         .map_err(|_| (StatusCode::FORBIDDEN, "invalid_resource_signature".into()))?;
     target.set_fragment(None);
+    let binary_only = binary_only(resource, q, &target)?;
+    if binary_only && (kind.is_some() || target.path().to_ascii_lowercase().ends_with(".m3u8")) {
+        observation.source_version_required();
+        return Err(identity::required());
+    }
     let config = providers::resource_config(resource).map_err(failure)?;
     let mut previous = identity::load(&app.db, id, target.as_str()).await?;
     let mut declared = kind == Some(Kind::Playlist)
@@ -407,6 +438,10 @@ async fn prepare_pinned(
         || previous
             .as_ref()
             .is_some_and(|state| state.class == Some(Class::Playlist));
+    if binary_only && declared {
+        observation.source_version_required();
+        return Err(identity::required());
+    }
     let mut range = (!head && !declared && kind != Some(Kind::Key))
         .then(|| Range::read(h))
         .flatten();
@@ -499,6 +534,10 @@ async fn prepare_pinned(
             &observation,
         )?);
         if declared {
+            if binary_only {
+                observation.source_version_required();
+                return Err(identity::required());
+            }
             range = None;
         }
     }
@@ -582,6 +621,25 @@ async fn prepare_pinned(
         ));
     }
     declared |= playlist_headers(&headers);
+    if binary_only && declared {
+        // Observe the class before refusing it. A seeded Binary mismatch is
+        // durable even if the origin later reverts to its original response.
+        identity_result(
+            identity::commit(
+                &app.db,
+                id,
+                target.as_str(),
+                if head { &admitted.metadata } else { &metadata },
+                Some(Class::Playlist),
+                false,
+                false,
+            )
+            .await,
+            &observation,
+        )?;
+        observation.source_version_required();
+        return Err(identity::required());
+    }
     if kind == Some(Kind::Key) && (declared || metadata.size.is_some_and(|size| size != 16)) {
         return Err(failure("invalid_hls_key"));
     }
@@ -640,6 +698,23 @@ async fn prepare_pinned(
             observation.permanent();
             failure(error)
         })?;
+    }
+    if binary_only && declared {
+        identity_result(
+            identity::commit(
+                &app.db,
+                id,
+                target.as_str(),
+                &metadata,
+                Some(Class::Playlist),
+                false,
+                false,
+            )
+            .await,
+            &observation,
+        )?;
+        observation.source_version_required();
+        return Err(identity::required());
     }
     if declared && status == StatusCode::PARTIAL_CONTENT {
         // The preflight should already have classified playlists. Never parse
@@ -883,4 +958,233 @@ where
         )
         .fuse(),
     )
+}
+
+#[cfg(test)]
+mod binary_tests {
+    use super::*;
+
+    #[test]
+    fn binary_restriction_is_closed_and_excludes_all_child_targets() {
+        let target = url::Url::parse("https://source.invalid/file").unwrap();
+        let mut q = Params {
+            token: "fixture".into(),
+            url: None,
+            attempt: None,
+            execution: None,
+        };
+        assert!(!binary_only(&json!({}), &q, &target).unwrap());
+        let restriction = json!({"version":1,"target_sha256":crate::hash(target.as_str())});
+        assert!(binary_only(&json!({"http_file_binary_only":restriction}), &q, &target).unwrap());
+        q.url = Some("any_child_ticket".into());
+        assert!(binary_only(&json!({"http_file_binary_only":restriction}), &q, &target).is_err());
+        q.url = None;
+        for value in [
+            Value::Null,
+            json!(true),
+            json!({"version":2,"target_sha256":crate::hash(target.as_str())}),
+            json!({"version":1,"target_sha256":"different"}),
+            json!({"version":1,"target_sha256":crate::hash(target.as_str()),"url":target.as_str()}),
+        ] {
+            assert!(binary_only(&json!({"http_file_binary_only":value}), &q, &target).is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires fresh owned RAINSYNC_HTTP_IDENTITY_TEST_DATABASE"]
+    async fn isolated_binary_only_contract() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicU8, Ordering},
+        };
+        let connection =
+            std::env::var("RAINSYNC_HTTP_IDENTITY_TEST_DATABASE").expect("owned database");
+        let db = persistence::connect(&connection).await.unwrap();
+        persistence::migrate(&db).await.unwrap();
+        let app = App {
+            readiness: Default::default(),
+            metrics: Default::default(),
+            db,
+            key: Arc::new(Aes256Gcm::new_from_slice(&[31; 32]).unwrap()),
+            cache: std::env::temp_dir(),
+            client: reqwest::Client::new(),
+            relay: Default::default(),
+            public_url: "http://127.0.0.1".into(),
+            probes: Arc::new(tokio::sync::Semaphore::new(2)),
+            output_checks: Default::default(),
+            input_failures: Default::default(),
+            preview_inputs: Default::default(),
+            deliveries: Default::default(),
+        };
+        let mode = Arc::new(AtomicU8::new(0));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let origin_mode = mode.clone();
+        let origin_seen = seen.clone();
+        let origin =
+            Router::new().fallback(move |uri: axum::http::Uri, method: axum::http::Method| {
+                let mode = origin_mode.clone();
+                let seen = origin_seen.clone();
+                async move {
+                    seen.lock().unwrap().push(uri.path().into());
+                    let mode = mode.load(Ordering::SeqCst);
+                    let mut bytes = vec![b'x'; 4096];
+                    if mode != 0 {
+                        let playlist = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nchild.m3u8\n";
+                        bytes[..playlist.len()].copy_from_slice(playlist);
+                    }
+                    Response::builder()
+                        .header(header::ETAG, "\"stable\"")
+                        .header(header::CONTENT_LENGTH, 4096)
+                        .header(
+                            header::CONTENT_TYPE,
+                            if mode == 1 {
+                                "application/vnd.apple.mpegurl"
+                            } else {
+                                "video/mp4"
+                            },
+                        )
+                        .body(if method == axum::http::Method::HEAD {
+                            Body::empty()
+                        } else {
+                            Body::from(bytes)
+                        })
+                        .unwrap()
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+        let url = format!("{base}/file");
+        let mut resource = json!({"kind":"http","url":url,"source_url":url,"headers":{},
+            "access_policy":{"schema_version":1,"origins":[{"origin":base,"cidrs":["127.0.0.1/32"]}]}});
+        resource["http_file_binary_only"] = json!({"version":1,"target_sha256":crate::hash(&url)});
+        let q = Params {
+            token: "fixture".into(),
+            url: None,
+            attempt: None,
+            execution: None,
+        };
+        for (detected, range, head) in [
+            (1, None, false),
+            (2, None, false),
+            (1, Some("bytes=10-20"), false),
+            (2, Some("bytes=10-20"), false),
+            (1, None, true),
+        ] {
+            mode.store(detected, Ordering::SeqCst);
+            let id = Uuid::new_v4();
+            sqlx::query("INSERT INTO playback_sessions(id,generation,delivery_token_hash,resource,expires_at) VALUES($1,1,$2,'{}',now()+interval '1 minute')")
+                .bind(id).bind(id.to_string()).execute(&app.db).await.unwrap();
+            let mut headers = HeaderMap::new();
+            if let Some(range) = range {
+                headers.insert(header::RANGE, range.parse().unwrap());
+            }
+            let before = seen.lock().unwrap().len();
+            let failure =
+                prepare_pinned(&app, id, &resource, &q, &headers, head, Default::default())
+                    .await
+                    .err()
+                    .unwrap();
+            assert_eq!(failure.1, "source_version_required");
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                before + 1,
+                "no follow-on fetch after classification"
+            );
+            let identity = crate::http_identity::load(&app.db, id, &url)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(identity.class, Some(crate::http_identity::Class::Playlist));
+        }
+        for detected in [1, 2] {
+            mode.store(0, Ordering::SeqCst);
+            let id = Uuid::new_v4();
+            sqlx::query("INSERT INTO playback_sessions(id,generation,delivery_token_hash,resource,expires_at) VALUES($1,1,$2,'{}',now()+interval '1 minute')")
+                .bind(id).bind(id.to_string()).execute(&app.db).await.unwrap();
+            let response = prepare_pinned(
+                &app,
+                id,
+                &resource,
+                &q,
+                &HeaderMap::new(),
+                false,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+            axum::body::to_bytes(response.into_body(), 10000)
+                .await
+                .unwrap();
+            mode.store(detected, Ordering::SeqCst);
+            let failure = prepare_pinned(
+                &app,
+                id,
+                &resource,
+                &q,
+                &HeaderMap::new(),
+                false,
+                Default::default(),
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(failure.1, "source_changed");
+            assert!(
+                sqlx::query_scalar::<_, bool>("SELECT stopped FROM playback_sessions WHERE id=$1")
+                    .bind(id)
+                    .fetch_one(&app.db)
+                    .await
+                    .unwrap()
+            );
+            mode.store(0, Ordering::SeqCst);
+            let before = seen.lock().unwrap().len();
+            assert_eq!(
+                prepare_pinned(
+                    &app,
+                    id,
+                    &resource,
+                    &q,
+                    &HeaderMap::new(),
+                    false,
+                    Default::default()
+                )
+                .await
+                .err()
+                .unwrap()
+                .1,
+                "source_changed"
+            );
+            assert_eq!(seen.lock().unwrap().len(), before);
+        }
+        let child = Params {
+            url: Some("untrusted_child".into()),
+            ..q
+        };
+        let before = seen.lock().unwrap().len();
+        assert_eq!(
+            prepare_pinned(
+                &app,
+                Uuid::new_v4(),
+                &resource,
+                &child,
+                &HeaderMap::new(),
+                false,
+                Default::default()
+            )
+            .await
+            .err()
+            .unwrap()
+            .1,
+            "source_version_required"
+        );
+        assert_eq!(seen.lock().unwrap().len(), before);
+        assert!(seen.lock().unwrap().iter().all(|path| path == "/file"));
+        task.abort();
+        let _ = task.await;
+        app.db.close().await;
+        println!(
+            "PASS: Binary-only header/prefix/range/HEAD exclusion, no child reads, durable Binary-to-Playlist mismatch and refused revert"
+        );
+    }
 }

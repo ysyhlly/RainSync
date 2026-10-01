@@ -18,6 +18,16 @@
     "decision_reason": {
       "type": "string"
     },
+    "http_file_capabilities_version": {
+      "description": "Present only for a verified HTTP Binary binding. The client retains the\noriginal binding across automatic route changes within the same intent.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
     "schema_version": {
       "type": "integer",
       "format": "uint32",

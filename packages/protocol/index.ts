@@ -78,9 +78,19 @@ content_type: string, video: VideoCapabilityConfiguration, audio: AudioCapabilit
  */
 mse_supported?: boolean, file_decoding?: MediaDecodingSupport, mse_decoding?: MediaDecodingSupport, };
 export type CapabilityReport = { schema_version: number, candidates: Array<MediaCapabilityCandidate>, };
-export type PlaybackCandidateRequest = { room_id: string, media_generation: number, audio_index: number | null, position_ms: number, };
+export type PlaybackCandidateRequest = {
+/**
+ * Opt in to version-bound, reliable single-file HTTP candidates.
+ * Omitted by explicit-direct requests, which must not force source probing.
+ */
+http_file_capabilities_version?: number, room_id: string, media_generation: number, audio_index: number | null, position_ms: number, };
 export type PlaybackCandidate = { id: string, delivery_mode: string, transport: string, content_type: string, video: VideoCapabilityConfiguration, audio: AudioCapabilityConfiguration | null, };
-export type PlaybackCandidateSet = { schema_version: number, binding: string | null, candidates: Array<PlaybackCandidate>, decision_reason: string, };
+export type PlaybackCandidateSet = { schema_version: number,
+/**
+ * Present only for a verified HTTP Binary binding. The client retains the
+ * original binding across automatic route changes within the same intent.
+ */
+http_file_capabilities_version?: number, binding: string | null, candidates: Array<PlaybackCandidate>, decision_reason: string, };
 export type PlaybackCandidateResult = { candidate_id: string, progressive: MediaTypeSupport, mse_supported?: boolean, file_decoding?: MediaDecodingSupport, mse_decoding?: MediaDecodingSupport, };
 export type PlaybackCandidateReport = { binding: string, results: Array<PlaybackCandidateResult>,
 /**

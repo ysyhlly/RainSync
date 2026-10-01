@@ -21,6 +21,7 @@ import type {
   PlaybackRequest,
   PlaybackReadiness,
   PlaybackCandidateSet,
+  PlaybackCandidateReport,
   PlaybackCapabilities,
   PlaybackMetricsReceipt,
 } from "../../../../../packages/protocol";
@@ -47,6 +48,18 @@ import {
   type PlaybackSummary,
 } from "./playback-summary";
 import { createPlaybackMetricsSender } from "./metrics-sender";
+
+const HTTP_CANDIDATE_LIFETIME_MS = 5 * 60 * 1000;
+const httpCandidateError = "播放候选无法安全使用，请重新加载播放";
+const httpCandidateExpiredError = "播放候选已失效，请重新加载播放";
+
+function freezeCandidateSnapshot<T>(value: T): T {
+  if (value && typeof value === "object") {
+    for (const child of Object.values(value)) freezeCandidateSnapshot(child);
+    Object.freeze(value);
+  }
+  return value;
+}
 
 export type PlaybackRecoveryState =
   | "idle"
@@ -214,11 +227,27 @@ export function createPlaybackRuntime(ctx: {
     epoch: number;
     room: string;
     media: number;
+    mediaId: string;
+    mode: string;
+    audio: number | undefined;
+    inputsInvalidated?: boolean;
+    candidateDiscovery?: {
+      probe: AbortController;
+      result: Promise<CandidateDiscovery>;
+    };
+    httpCandidates?: CandidateDiscovery;
+    failedCandidates: string[];
     element?: HTMLVideoElement;
     meter?: PlaybackMetrics;
     last?: PlaybackMetricsSnapshot;
     disabled: boolean;
     enabledPlan?: PlaybackPlan;
+  };
+  type CandidateDiscovery = {
+    capabilities: PlaybackCapabilities;
+    report?: PlaybackCandidateReport;
+    // Only a marked response creates this immutable, same-intent snapshot.
+    http?: { candidates: PlaybackCandidateSet; startedAt: number };
   };
   let metricIntent: MetricIntent | undefined;
   let metricSource: ReturnType<typeof bindPlaybackMetricEvents> | undefined;
@@ -227,6 +256,7 @@ export function createPlaybackRuntime(ctx: {
         metrics: MetricIntent;
         intent: ReturnType<PlaybackPlanGenerations["next"]>;
         failed: string[];
+        preparing: boolean;
         continuation?: {
           parent: PlaybackPlan;
           capabilities: PlaybackCapabilities;
@@ -327,7 +357,31 @@ export function createPlaybackRuntime(ctx: {
     session.epoch === m.epoch &&
     state.value?.room_id === m.room &&
     state.value?.media_generation === m.media &&
+    state.value?.media_id === m.mediaId &&
     (!m.element || video.value === m.element);
+  const candidateIntentCurrent = (m: MetricIntent) =>
+    metricCurrent(m) &&
+    !m.inputsInvalidated &&
+    mode.value === m.mode &&
+    audioIndex.value === m.audio;
+  function invalidateCandidates(m: MetricIntent) {
+    m.inputsInvalidated = true;
+    m.candidateDiscovery?.probe.abort();
+    m.candidateDiscovery = undefined;
+    m.httpCandidates = undefined;
+  }
+  function checkHttpCandidateLifetime(snapshot: CandidateDiscovery) {
+    if (!snapshot.http) return;
+    const elapsed = performance.now() - snapshot.http.startedAt;
+    // This conservative local limit never authorizes a binding. The server's
+    // original authority-clock expiry and current fences still decide prepare.
+    if (
+      !Number.isFinite(elapsed) ||
+      elapsed < 0 ||
+      elapsed >= HTTP_CANDIDATE_LIFETIME_MS
+    )
+      throw new Error(httpCandidateExpiredError);
+  }
   const metricState = () => ({
     foreground: foreground(),
     expectedPlaying: state.value?.playback_status === "playing",
@@ -356,6 +410,7 @@ export function createPlaybackRuntime(ctx: {
       const final = bestEffort(() => m.meter?.dispose(m.fence, metricRead()));
       if (final && !m.disabled) bestEffort(() => metricSender.offer(final));
     }
+    if (m) invalidateCandidates(m);
     metricIntent = undefined;
     pendingLoad = undefined;
     bestEffort(() => metricSource?.stop());
@@ -455,12 +510,20 @@ export function createPlaybackRuntime(ctx: {
       session.user?.id,
       roomIsActive(),
       state.value?.room_id,
+      state.value?.media_id,
       state.value?.media_generation,
       state.value?.playback_status,
     ],
     () => {
       if (metricIntent && !metricCurrent(metricIntent)) finishMetrics();
       else observeMetrics();
+    },
+    { flush: "sync" },
+  );
+  watch(
+    () => [mode.value, audioIndex.value],
+    () => {
+      if (metricIntent) invalidateCandidates(metricIntent);
     },
     { flush: "sync" },
   );
@@ -590,7 +653,7 @@ export function createPlaybackRuntime(ctx: {
     }
     return readiness;
   }
-  function detachPlayback() {
+  function detachPlayback(preserveCandidates?: MetricIntent) {
     recoveryPending = false;
     recoveryState.value = "idle";
     terminalEnd = false;
@@ -605,8 +668,10 @@ export function createPlaybackRuntime(ctx: {
     observations = undefined;
     mediaDataLoad?.stop();
     mediaDataLoad = undefined;
-    capabilityProbe?.abort();
-    capabilityProbe = undefined;
+    if (capabilityProbe !== preserveCandidates?.candidateDiscovery?.probe) {
+      capabilityProbe?.abort();
+      capabilityProbe = undefined;
+    }
     generationWait?.abort();
     generationWait = undefined;
     generationWaitFailed = false;
@@ -645,8 +710,9 @@ export function createPlaybackRuntime(ctx: {
     };
     return { old, finalObservation, previous, deletePrevious };
   }
-  async function stopPlayback() {
-    const { finalObservation, previous, deletePrevious } = detachPlayback();
+  async function stopPlayback(preserveCandidates?: MetricIntent) {
+    const { finalObservation, previous, deletePrevious } =
+      detachPlayback(preserveCandidates);
     // The final sample and Stop commit together before key cancellation can
     // close the grant. Preparing work is still aborted synchronously in stop().
     const beforeCleanup = finalObservation ? deletePrevious : undefined;
@@ -683,6 +749,10 @@ export function createPlaybackRuntime(ctx: {
       epoch: session.epoch,
       room: s.room_id,
       media: s.media_generation,
+      mediaId: s.media_id,
+      mode: mode.value,
+      audio: audioIndex.value,
+      failedCandidates: [],
       element: video.value,
       disabled: false,
     };
@@ -712,10 +782,120 @@ export function createPlaybackRuntime(ctx: {
     },
   ) {
     const m = metricIntent;
-    if (!m || !metricCurrent(m)) return;
+    if (!m || !candidateIntentCurrent(m)) return;
+    if (m.httpCandidates) {
+      m.failedCandidates = [...new Set([...m.failedCandidates, ...failed])];
+      failed = [...m.failedCandidates];
+    }
     const intent = planGenerations.next();
     advanceMetricAttempt(m);
     await loadAttempt(failed, intent, m, continuation);
+  }
+  function discoverCandidates(
+    metrics: MetricIntent,
+    element: HTMLVideoElement,
+  ): Promise<CandidateDiscovery> {
+    if (metrics.httpCandidates) return Promise.resolve(metrics.httpCandidates);
+    if (metrics.candidateDiscovery) return metrics.candidateDiscovery.result;
+    const probe = new AbortController();
+    capabilityProbe = probe;
+    const discovery = {
+      probe,
+      result: undefined as unknown as Promise<CandidateDiscovery>,
+    };
+    metrics.candidateDiscovery = discovery;
+    discovery.result = (async () => {
+      let marked = false;
+      try {
+        const startedAt = performance.now();
+        let candidateSet: PlaybackCandidateSet | undefined;
+        try {
+          candidateSet = await session.api<PlaybackCandidateSet>(
+            "/playback-candidates",
+            "POST",
+            {
+              room_id: metrics.room,
+              media_generation: metrics.media,
+              audio_index: metrics.audio ?? null,
+              position_ms: target(state.value!, clock.now()),
+              ...(metrics.mode === "direct"
+                ? {}
+                : { http_file_capabilities_version: 1 }),
+            },
+            AbortSignal.any([probe.signal, AbortSignal.timeout(40000)]),
+          );
+        } catch (failure) {
+          if (
+            !(failure instanceof RequestFailure) ||
+            !["NOT_FOUND", "METHOD_NOT_ALLOWED"].includes(failure.code)
+          )
+            throw failure;
+        }
+        const current = () =>
+          candidateIntentCurrent(metrics) &&
+          metrics.candidateDiscovery === discovery &&
+          !probe.signal.aborted &&
+          video.value === element;
+        if (!current()) throw new PlaybackCancelled();
+        marked = candidateSet?.http_file_capabilities_version !== undefined;
+        if (marked) {
+          if (
+            metrics.mode === "direct" ||
+            candidateSet!.http_file_capabilities_version !== 1 ||
+            candidateSet!.schema_version !== 1 ||
+            typeof candidateSet!.binding !== "string" ||
+            !candidateSet!.binding.trim() ||
+            !Array.isArray(candidateSet!.candidates) ||
+            !candidateSet!.candidates.length
+          )
+            throw new Error(httpCandidateError);
+          // Freeze before device probing: a later response/source change cannot
+          // replace the set or the original configurations used for this report.
+          candidateSet = freezeCandidateSnapshot(
+            structuredClone(candidateSet!),
+          );
+        }
+        const mseProbe = Hls.isSupported() ? Hls.getMediaSource() : undefined;
+        const decoder =
+          typeof navigator === "undefined"
+            ? undefined
+            : navigator.mediaCapabilities;
+        const report = candidateSet
+          ? await detectCandidateReport(
+              element,
+              candidateSet,
+              mseProbe,
+              decoder,
+            )
+          : undefined;
+        if (!current()) throw new PlaybackCancelled();
+        if (marked && !report) throw new Error(httpCandidateError);
+        const capabilities = report
+          ? detectCapabilities(element, mseProbe)
+          : await detectCapabilitiesAsync(element, mseProbe, decoder);
+        if (!current()) throw new PlaybackCancelled();
+        const result: CandidateDiscovery = {
+          capabilities,
+          ...(report ? { report } : {}),
+          ...(marked ? { http: { candidates: candidateSet!, startedAt } } : {}),
+        };
+        if (marked) {
+          metrics.httpCandidates = freezeCandidateSnapshot(
+            structuredClone(result),
+          );
+          return metrics.httpCandidates;
+        }
+        return result;
+      } finally {
+        // Legacy/local/Agent paths retain their per-attempt discovery behavior.
+        // Marked failures remain rejected for this intent; never downgrade or
+        // discover a new source after a malformed negotiated response.
+        if (metrics.candidateDiscovery === discovery && !marked)
+          metrics.candidateDiscovery = undefined;
+        if (capabilityProbe === probe) capabilityProbe = undefined;
+      }
+    })();
+    return discovery.result;
   }
   async function loadAttempt(
     failedCandidates: string[],
@@ -726,9 +906,16 @@ export function createPlaybackRuntime(ctx: {
       capabilities: PlaybackCapabilities;
     },
   ) {
-    if (!metricCurrent(metrics)) return;
+    if (!candidateIntentCurrent(metrics)) return;
     const s = state.value!;
-    pendingLoad = { metrics, intent, failed: failedCandidates, continuation };
+    const pending = {
+      metrics,
+      intent,
+      failed: failedCandidates,
+      continuation,
+      preparing: false,
+    };
+    pendingLoad = pending;
     recoveryPending = true;
     updateRecovery();
     if (!clockUsable()) {
@@ -738,11 +925,11 @@ export function createPlaybackRuntime(ctx: {
     const revision = clockRevision();
     const serial = ++loadSerial;
     try {
-      if (!continuation) await stopPlayback();
+      if (!continuation) await stopPlayback(metrics);
       await nextTick();
       if (
         serial !== loadSerial ||
-        !metricCurrent(metrics) ||
+        !candidateIntentCurrent(metrics) ||
         !roomIsActive() ||
         !video.value ||
         (continuation && plan !== continuation.parent)
@@ -758,52 +945,27 @@ export function createPlaybackRuntime(ctx: {
       metrics.element = element;
       const identity = session.epoch;
       waiting.value = true;
-      const probe = new AbortController();
-      capabilityProbe = probe;
-      let candidateSet: PlaybackCandidateSet | undefined;
-      try {
-        if (!continuation)
-          candidateSet = await session.api<PlaybackCandidateSet>(
-            "/playback-candidates",
-            "POST",
-            {
-              room_id: s.room_id,
-              media_generation: s.media_generation,
-              audio_index: audioIndex.value ?? null,
-              position_ms: target(s, clock.now()),
-            },
-            AbortSignal.any([probe.signal, AbortSignal.timeout(40000)]),
-          );
-      } catch (failure) {
-        if (
-          !(failure instanceof RequestFailure) ||
-          !["NOT_FOUND", "METHOD_NOT_ALLOWED"].includes(failure.code)
-        )
-          throw failure;
-      }
-      const mseProbe = Hls.isSupported() ? Hls.getMediaSource() : undefined;
-      const decoder =
-        typeof navigator === "undefined"
-          ? undefined
-          : navigator.mediaCapabilities;
-      const candidateReport = candidateSet
-        ? await detectCandidateReport(element, candidateSet, mseProbe, decoder)
+      const discovered: CandidateDiscovery = continuation
+        ? { capabilities: continuation.capabilities }
+        : await discoverCandidates(metrics, element);
+      const candidateReport = discovered.report
+        ? {
+            ...structuredClone(discovered.report),
+            excluded_candidates: [
+              ...(discovered.http
+                ? metrics.failedCandidates
+                : failedCandidates),
+            ],
+          }
         : undefined;
-      if (candidateReport)
-        candidateReport.excluded_candidates = [...failedCandidates];
-      const capabilities =
-        continuation?.capabilities ??
-        (candidateReport
-          ? detectCapabilities(element, mseProbe)
-          : await detectCapabilitiesAsync(element, mseProbe, decoder));
+      const capabilities = structuredClone(discovered.capabilities);
       // Capability probing is optional asynchronous work. Never start a session
       // for an old identity, element or media after a newer load/reset wins.
       if (
         serial !== loadSerial ||
-        !metricCurrent(metrics) ||
+        !candidateIntentCurrent(metrics) ||
         session.epoch !== identity ||
         !roomIsActive() ||
-        probe.signal.aborted ||
         video.value !== element ||
         state.value?.room_id !== s.room_id ||
         state.value?.media_generation !== s.media_generation
@@ -814,14 +976,15 @@ export function createPlaybackRuntime(ctx: {
         clockAction = "load";
         return;
       }
+      checkHttpCandidateLifetime(discovered);
       const request: PlaybackRequest = {
         ...intent,
         room_id: s.room_id,
         media_generation: s.media_generation,
-        mode: continuation ? "transcode" : mode.value,
+        mode: continuation ? "transcode" : metrics.mode,
         audio_index: continuation
           ? (continuation.parent.selected_audio_track ?? null)
-          : (audioIndex.value ?? null),
+          : (metrics.audio ?? null),
         position_ms: target(state.value ?? s, clock.now()),
         capabilities,
         ...(candidateReport ? { candidate_report: candidateReport } : {}),
@@ -838,14 +1001,17 @@ export function createPlaybackRuntime(ctx: {
       const currentPosition = () => {
         if (!clockUsable() || revision !== clockRevision()) {
           // Keep the already claimed file/version and request key through a
-          // clock recalibration. Attachment waits for fresh clock correction;
+          // clock recalibration. Reconciliation waits for fresh clock correction;
           // readiness can safely inspect the originally requested position.
-          if (continuation) return request.position_ms;
+          if (continuation || discovered.http) return request.position_ms;
           clockAction = "load";
           throw new PlaybackCancelled();
         }
         return target(state.value ?? s, clock.now());
       };
+      // Once claimed, a marked HTTP request keeps its key/generation through
+      // clock recovery. A new key at that generation would violate high-water.
+      pending.preparing = !!discovered.http;
       let p: PlaybackPlan;
       if (continuation) {
         // No await between detaching the old element and handing its cleanup
@@ -870,7 +1036,7 @@ export function createPlaybackRuntime(ctx: {
       } else p = await requests().prepare(request, currentPosition);
       if (
         serial !== loadSerial ||
-        !metricCurrent(metrics) ||
+        !candidateIntentCurrent(metrics) ||
         !roomIsActive() ||
         session.epoch !== identity ||
         video.value !== element ||
@@ -1063,16 +1229,19 @@ export function createPlaybackRuntime(ctx: {
           (target(state.value!, clock.now()) - p.timeline_origin_ms) / 1000,
         );
       };
-      const retryDecode = () => {
+      const retryDecode = (confirmedDecode = true) => {
         const candidate = p.selected_candidate_id;
         if (
           serial !== loadSerial ||
           !currentPlan(p) ||
           !roomIsActive() ||
+          !candidateIntentCurrent(metrics) ||
+          (discovered.http && !confirmedDecode) ||
           mode.value !== "auto"
         )
           return false;
         if (
+          !discovered.http &&
           p.http_file_fallback_version === 1 &&
           p.delivery_mode === "direct" &&
           p.transport === "progressive" &&
@@ -1086,6 +1255,9 @@ export function createPlaybackRuntime(ctx: {
         if (
           !candidate ||
           !candidateReport ||
+          !candidateReport.results.some(
+            (result) => result.candidate_id === candidate,
+          ) ||
           failedCandidates.includes(candidate) ||
           failedCandidates.length >= 2
         )
@@ -1172,13 +1344,18 @@ export function createPlaybackRuntime(ctx: {
           }
           if (recover()) return;
         }
-        if ((el.error.code === 3 || el.error.code === 4) && retryDecode())
+        if (
+          (el.error.code === 3 || el.error.code === 4) &&
+          retryDecode(el.error.code === 3)
+        )
           return;
         recoveringHls = false;
         error.value =
           el.error.code === 2
             ? "媒体加载中断，请检查连接后重新加载"
-            : "无法播放此格式，可切换兼容转码后重载";
+            : discovered.http && el.error.code === 4
+              ? "媒体加载或格式支持状态未知，请检查连接后重新加载"
+              : "无法播放此格式，可切换兼容转码后重载";
         waiting.value = false;
       };
       const attachHls = () => {
@@ -1216,8 +1393,14 @@ export function createPlaybackRuntime(ctx: {
         void runAutomaticApply(true);
       };
     } catch (e) {
-      if (serial !== loadSerial || e instanceof PlaybackCancelled) return;
+      if (
+        serial !== loadSerial ||
+        !candidateIntentCurrent(metrics) ||
+        e instanceof PlaybackCancelled
+      )
+        return;
       waiting.value = false;
+      pendingLoad = undefined;
       if (
         continuation &&
         e instanceof RequestFailure &&
@@ -1600,6 +1783,7 @@ export function createPlaybackRuntime(ctx: {
     generationWaitFailed = false;
     mediaDataLoad?.sync();
     queueApply();
+    if (pendingLoad && !pendingLoad.preparing) clockAction = "load";
     recoveryPending = !!plan || !!pendingLoad;
     updateRecovery();
   }

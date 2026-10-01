@@ -2,6 +2,11 @@ use super::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PlaybackCandidateRequest {
+    /// Opt in to version-bound, reliable single-file HTTP candidates.
+    /// Omitted by explicit-direct requests, which must not force source probing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub http_file_capabilities_version: Option<u8>,
     pub room_id: Uuid,
     pub media_generation: u32,
     #[serde(default)]
@@ -24,6 +29,11 @@ pub struct PlaybackCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PlaybackCandidateSet {
     pub schema_version: u32,
+    /// Present only for a verified HTTP Binary binding. The client retains the
+    /// original binding across automatic route changes within the same intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub http_file_capabilities_version: Option<u8>,
     pub binding: Option<String>,
     pub candidates: Vec<PlaybackCandidate>,
     pub decision_reason: String,
@@ -51,4 +61,50 @@ pub struct PlaybackCandidateReport {
     /// Bounded client decode-failure history; never changes authorization.
     #[serde(default)]
     pub excluded_candidates: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_candidates_are_explicitly_negotiated_without_changing_legacy_shapes() {
+        let legacy = serde_json::json!({
+            "room_id": Uuid::nil(), "media_generation": 0,
+            "audio_index": null, "position_ms": 0.0
+        });
+        let mut request: PlaybackCandidateRequest = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(request.http_file_capabilities_version, None);
+        assert_eq!(serde_json::to_value(&request).unwrap(), legacy);
+        request.http_file_capabilities_version = Some(1);
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["http_file_capabilities_version"],
+            1
+        );
+
+        let mut response = PlaybackCandidateSet {
+            schema_version: 1,
+            http_file_capabilities_version: None,
+            binding: None,
+            candidates: Vec::new(),
+            decision_reason: "provider_requires_legacy_negotiation".into(),
+        };
+        let legacy_response = serde_json::to_value(&response).unwrap();
+        assert!(
+            legacy_response
+                .get("http_file_capabilities_version")
+                .is_none()
+        );
+        assert!(
+            serde_json::from_value::<PlaybackCandidateSet>(legacy_response)
+                .unwrap()
+                .http_file_capabilities_version
+                .is_none()
+        );
+        response.http_file_capabilities_version = Some(1);
+        assert_eq!(
+            serde_json::to_value(response).unwrap()["http_file_capabilities_version"],
+            1
+        );
+    }
 }

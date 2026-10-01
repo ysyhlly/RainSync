@@ -57,21 +57,22 @@ pub async fn begin_authenticated(
             .await?;
     // The client advertises this before it knows the provider. Only HTTP
     // grants acquire the new restriction; other providers retain their paths.
-    let http_source = if body.http_file_fallback_version == Some(1) {
-        let media = state["media_id"]
-            .as_str()
-            .and_then(|v| Uuid::parse_str(v).ok());
-        sqlx::query_scalar::<_, String>(
-            "SELECT s.kind FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1",
-        )
-        .bind(media)
-        .fetch_optional(&mut *tx)
-        .await?
-        .as_deref()
-            == Some("http")
-    } else {
-        false
-    };
+    let http_source =
+        if body.http_file_fallback_version == Some(1) || body.candidate_report.is_some() {
+            let media = state["media_id"]
+                .as_str()
+                .and_then(|v| Uuid::parse_str(v).ok());
+            sqlx::query_scalar::<_, String>(
+                "SELECT s.kind FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1",
+            )
+            .bind(media)
+            .fetch_optional(&mut *tx)
+            .await?
+            .as_deref()
+                == Some("http")
+        } else {
+            false
+        };
     let context = if http_source || body.http_file_fallback.is_some() {
         Some(
             persistence::http_file_authorization::capture(
@@ -202,6 +203,16 @@ pub async fn begin_authenticated(
             // viewer high-water below can retire its live parent.
             http_file_fallback::claim(app, &mut tx, user, body, &state, context, lifecycle_epoch)
                 .await?
+        } else if body.candidate_report.is_some() {
+            playback_capabilities::capture_http(
+                app,
+                &mut tx,
+                body,
+                &state,
+                context,
+                lifecycle_epoch,
+            )
+            .await?
         } else {
             http_file_fallback::capture_root(&mut tx, body, &state, context).await?
         }));
@@ -284,7 +295,7 @@ pub async fn begin_authenticated(
         .as_ref()
         .and_then(|authority| authority.claim.as_ref().map(|claim| claim.parent));
     sqlx::query("INSERT INTO playback_requests(user_id,idempotency_key,request_hash,session_id,owner_epoch,status,lease_until,expires_at,room_id,lifecycle_epoch,preparation_drained_at,viewer_id,plan_generation,http_file_context_encrypted,http_file_parent) VALUES($1,$2,$3,$4,$5,'pending',LEAST(clock_timestamp()+interval '60 seconds',to_timestamp($12::double precision/1000.0)),now()+interval '48 hours',$6,$7,NULL,$8,$9,$10,$11) ON CONFLICT(user_id,idempotency_key) DO UPDATE SET session_id=EXCLUDED.session_id,owner_epoch=EXCLUDED.owner_epoch,status='pending',response_encrypted=NULL,error_status=NULL,error_code=NULL,lease_until=EXCLUDED.lease_until,expires_at=EXCLUDED.expires_at,attempt=playback_requests.attempt+1,room_id=EXCLUDED.room_id,lifecycle_epoch=EXCLUDED.lifecycle_epoch,preparation_drained_at=NULL,viewer_id=EXCLUDED.viewer_id,plan_generation=EXCLUDED.plan_generation")
-        .bind(user).bind(key).bind(digest).bind(session).bind(app.epoch).bind(body.room_id).bind(lifecycle_epoch).bind(body.viewer_id).bind(body.plan_generation.map(i64::from)).bind(encrypted_context).bind(parent).bind(http_file.as_ref().and_then(|a| a.claim.as_ref().map(|c| c.deadline_ms))).execute(&mut *tx).await?;
+        .bind(user).bind(key).bind(digest).bind(session).bind(app.epoch).bind(body.room_id).bind(lifecycle_epoch).bind(body.viewer_id).bind(body.plan_generation.map(i64::from)).bind(encrypted_context).bind(parent).bind(http_file_fallback::preparation_deadline_ms(http_file.as_deref())).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO playback_preparations(session_id,room_id,lifecycle_epoch,owner_epoch) VALUES($1,$2,$3,$4)")
         .bind(session).bind(body.room_id).bind(lifecycle_epoch).bind(app.epoch).execute(&mut *tx).await?;
     if let Some(authority) = &http_file {

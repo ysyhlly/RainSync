@@ -32,7 +32,7 @@
 
 新客户端在准备播放前 POST `/api/v1/playback-candidates`，携带房间、媒体代次、音轨和当前位置。服务端返回最多四条有限候选及五分钟有效的加密绑定。绑定限定用户、房间、媒体代次、生命周期 epoch、媒体、源文件版本、音轨和原始候选，不接受客户端自行声明任意 codec 配置。
 
-本地文件在 ffprobe 前后通过持有句柄及重新打开的文件身份验证；NAS 首次使用则建立受生命周期约束的临时 Worker 探测授权，探测后停止授权，并只在 `source_version` 仍匹配时保存 `capability_source_version` 标记。所有预探测先登记不可变准备所有者，取消/超时后正向等待进程树回收，再登记完成回执。HTTP、Jellyfin/Emby 保留独立的保守协商路径。HTTP已有可靠表示身份固定与单次解码续接，但尚未把该身份接入本节的实际候选绑定；上游也不伪造本地文件版本证明。
+本地文件在 ffprobe 前后通过持有句柄及重新打开的文件身份验证；NAS 首次使用则建立受生命周期约束的临时 Worker 探测授权，探测后停止授权，并只在 `source_version` 仍匹配时保存 `capability_source_version` 标记。所有预探测先登记不可变准备所有者，取消/超时后正向等待进程树回收，再登记完成回执。可靠单Binary HTTP文件通过版本1显式协商接入本节实际候选：绑定当前身份/来源和可靠ETag或Last-Modified及长度，每次准备先提交独立表示pin再读取。HLS及不可靠身份不冒充支持；显式direct省略HTTP标记，但仍访问通用候选入口以保留本地/Agent兼容。范围及证据见 [HTTP候选绑定](HTTP_FILE_CAPABILITY_BINDING.md)。Jellyfin/Emby保留独立保守协商，不伪造本地文件版本证明。
 
 直放/复制候选只为已经支持的 8-bit AVC 路径生成。RFC6381 AVC profile/compatibility/level 来自实际 avcC/SPS 字节，AAC-LC 来自 AudioSpecificConfig 和 ffprobe 字段；缺失 extradata、尺寸、帧率或码率时不猜。可用的配置按下列顺序协商：
 
@@ -45,7 +45,7 @@
 
 客户端仅探测服务端提供的有限配置，500ms 内收集结果并冻结快照，通过 `candidate_report` 回传同一绑定。实际 passthrough 需要对应 `decodingInfo.supported`；API 不可用时只有固定保守转码输出可以使用 MIME 提示。`supported=false` 绝不当成未知。播放准备及最终发布再次验证来源、房间和生命周期；源变化返回 `SOURCE_CHANGED`，失效绑定返回 `STALE_CAPABILITY_REPORT`。计划包含 `decision_reason`、`selected_candidate_id` 和选中音轨。
 
-自动模式仅在真实解码错误时排除当前候选并重新协商，每条路线一次、最多三条路线；原生 HLS 优先保留单次 native→MSE。网络、鉴权错误和初始媒体数据装载超时不会触发额外转码。每个已挂接方案都有20秒可实际装载的累计预算，包括没有具体候选ID的HTTP/Jellyfin/Emby方案；排队准备在挂接前处理，已知生成等待、明确隐藏的页面和被自动播放政策阻挡的手势等待单独处理，不消耗此预算。普通网络停滞及尚未完成的play()仍计时。native→MSE或同计划重新挂接保留剩余预算，Stop、离房、身份/媒体换代和销毁使旧回调失效。
+自动模式排除失败候选，每条路线一次、最多三条路线；带HTTP版本标记的具体候选仅在code 3解码错误时准备新方案，code 4本身也可能是早期HTTP/DNS失败，不作为该路径的解码证明。同一HTTP意图保留不可变绑定和设备报告，不重新预检以接受变化来源；原生 HLS 优先保留单次 native→MSE。网络、鉴权错误和初始媒体数据装载超时不会触发额外转码。每个已挂接方案都有20秒可实际装载的累计预算，包括没有具体候选ID的HTTP/Jellyfin/Emby方案；排队准备在挂接前处理，已知生成等待、明确隐藏的页面和被自动播放政策阻挡的手势等待单独处理，不消耗此预算。普通网络停滞及尚未完成的play()仍计时。native→MSE或同计划重新挂接保留剩余预算，Stop、离房、身份/媒体换代和销毁使旧回调失效。
 
 `loadeddata`或`readyState >= 2`只表示有可用媒体数据，不是已呈现首帧证明，也不会写入首帧遥测。截止后显示明确装载错误，保留已有媒体/鉴权错误和加入播放按钮；稍后收到本方案有效数据可清除该超时提示。呈现测量仍使用独立的视频帧回调/时间前进契约。
 

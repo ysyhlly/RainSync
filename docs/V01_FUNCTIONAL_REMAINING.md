@@ -1,7 +1,7 @@
 # v0.1 functional work, separate from acceptance
 
 This is the 2026-10-01 code audit against the collaboration branch, including
-the NAS/loading and bounded task-health implementations described below. It does not replace the
+the NAS/loading, bounded task-health and reliable HTTP candidate implementations described below. It does not replace the
 historical evidence in PROGRESS or the release gates in NEXT_PLAN. A historical
 “pending” row is not evidence that the same function is still missing today.
 
@@ -13,6 +13,13 @@ result; RainSync's account-policy enforcement passed 30/30. These results belong
 to that baseline, not to untested later changes.
 
 ## Current bounded implementation
+
+- Reliable single-Binary HTTP concrete candidates are now integrated in Server,
+  Worker and Web. The same logical intent retains its encrypted representation
+  binding and device report across bounded decode fallback; stale/changed or
+  malformed reports cannot silently rediscover a new source. Local checks passed
+  28 new API groups, 32 continuation groups and 457 frontend tests. Publication
+  and exact-head CI remain pending. See [scope and evidence](HTTP_FILE_CAPABILITY_BINDING.md).
 
 - NEXT_PLAN §12.1: current persisted job inventory, registered process-owner
   state and completed cache scan counts/age are exposed through existing admin
@@ -31,27 +38,19 @@ to that baseline, not to untested later changes.
 The NAS/loading implementation passed focused Rust and actual NAS checks plus
 the integrated frontend suite. Its published compatibility checkpoint is
 `e7ef0d1`; [its exact-head CI](https://github.com/ysyhlly/RainSync/actions/runs/36888979539)
-is tracked separately. The next task-health candidate passed finite Rust/API
-checks but has not inherited that remote result. See [NAS evidence](NAS_RANGE_SEMANTICS.md)
+passed separately. The task-health checkpoint `3b93c66` also passed its own
+[complete CI](https://github.com/ysyhlly/RainSync/actions/runs/36893338856). See [NAS evidence](NAS_RANGE_SEMANTICS.md)
 and [validation limits](VALIDATION.md). Initial usable data is not a complete presented-frame guarantee.
 
 ## Remaining implementation work identified in current code
 
-1. **Specific HTTP capability candidates.** Local and Agent sources already
-   offer source-bound codec/profile/dimension candidates. Generic HTTP still
-   falls back to the older negotiation path. Reliable single-file HTTP is the
-   bounded next extension: an authenticated candidate must carry its exact
-   target and representation identity from preflight into the eventual grant,
-   before any new source I/O. Merely opening the existing source-kind gate is
-   unsafe. The one-hop HTTP decoder continuation already implemented is a
-   separate, constrained feature and does not solve this preflight binding.
-2. **Specific upstream capability negotiation.** Jellyfin and Emby have working
+1. **Specific upstream capability negotiation.** Jellyfin and Emby have working
    independent adapters, real seek/audio paths and bounded account-policy
    observation. They still do not consume the concrete candidate report used
    for local/Agent media. This needs a truthful fixed-profile/output contract,
    with every negotiation SID owned and cleaned up. Broad HLS content-identity
    claims, ambiguous versions and unproven automatic fallback stay disabled.
-3. **Task-health measurements, NEXT_PLAN §12.1.** Current metrics now include
+2. **Task-health measurements, NEXT_PLAN §12.1.** Current metrics now include
    fixed-state persisted job inventory, oldest queued creation age, recorded
    expired/missing leases, process-owner observations and fresh cache inventory
    ([scope](TASK_HEALTH_OBSERVATIONS.md)). Complete queue/run duration, retry,

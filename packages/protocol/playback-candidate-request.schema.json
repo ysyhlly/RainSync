@@ -12,6 +12,16 @@
       "default": null,
       "minimum": 0
     },
+    "http_file_capabilities_version": {
+      "description": "Opt in to version-bound, reliable single-file HTTP candidates.\nOmitted by explicit-direct requests, which must not force source probing.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
     "media_generation": {
       "type": "integer",
       "format": "uint32",

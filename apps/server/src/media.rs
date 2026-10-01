@@ -320,7 +320,7 @@ async fn prepare_playback(
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no_media"))?;
     let row=sqlx::query("SELECT m.source_id,m.resource,m.duration_ms,m.metadata,m.source_version,s.kind,s.config_encrypted,s.access_policy_revision FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND m.available").bind(media).fetch_optional(&app.db).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "media_not_found"))?;
     let kind: String = row.get("kind");
-    if body.candidate_report.is_some() && !matches!(kind.as_str(), "local" | "agent") {
+    if body.candidate_report.is_some() && !matches!(kind.as_str(), "local" | "agent" | "http") {
         return Err(err(StatusCode::CONFLICT, "stale_capability_report"));
     }
     let config: SourceConfig =
@@ -372,7 +372,14 @@ async fn prepare_playback(
     };
     let mut probed = false;
     let mut negotiated_info = None;
-    let mut duration: Option<f64> = row.get("duration_ms");
+    // A concrete HTTP intent learns timing only from this attempt's pinned
+    // probe. Cached media-item duration must not clamp a new representation.
+    let mut duration: Option<f64> =
+        if kind == "http" && http_file.is_some_and(|authority| authority.candidate.is_some()) {
+            None
+        } else {
+            row.get("duration_ms")
+        };
     let mut position_ms = protocol::bounded_position(body.position_ms, duration);
     let mut transport = "progressive";
     let requested_mode = body.mode.as_deref().unwrap_or("auto");
@@ -380,7 +387,14 @@ async fn prepare_playback(
     if !["auto", "direct", "remux", "transcode"].contains(&mode) {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_mode"));
     }
-    let selected = if body.candidate_report.is_some() {
+    let selected = if body.candidate_report.is_some() && kind == "http" {
+        playback_capabilities::select_http(
+            app,
+            body,
+            http_file.ok_or_else(|| err(StatusCode::CONFLICT, "stale_capability_report"))?,
+            reservation.lifecycle_epoch,
+        )?
+    } else if body.candidate_report.is_some() {
         let version = if kind == "local" {
             playback_capabilities::current_local_version(&config.root, &item)?
         } else if kind == "agent" {
@@ -421,6 +435,10 @@ async fn prepare_playback(
                 .ends_with(".m3u8")
             {
                 transport = "hls";
+            }
+            if http_file.is_some_and(|authority| authority.candidate.is_some()) {
+                playback_requests::http_file_fallback::verify_target(&resource, http_file)?;
+                playback_requests::http_file_fallback::restrict_binary(&mut resource)?;
             }
             if continuation {
                 resource =
@@ -589,7 +607,7 @@ async fn prepare_playback(
             .execute(&mut *preparation)
             .await?;
         sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch,viewer_id,plan_generation) VALUES($1,$2,$3,$4,$5,$6,$7,LEAST(clock_timestamp()+interval '1 minute',to_timestamp($11::double precision/1000.0)),$8,$9,$10)")
-            .bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(playback_requests::http_file_fallback::wrap_resource(app, &resource, http_file, source_policy_revision, account_policy_generation)?).bind(reservation.lifecycle_epoch).bind(reservation.viewer_id).bind(reservation.plan_generation.map(i64::from)).bind(http_file.and_then(|a| a.claim.as_ref().map(|c| c.deadline_ms))).execute(&mut *preparation).await?;
+            .bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(playback_requests::http_file_fallback::wrap_resource(app, &resource, http_file, source_policy_revision, account_policy_generation)?).bind(reservation.lifecycle_epoch).bind(reservation.viewer_id).bind(reservation.plan_generation.map(i64::from)).bind(playback_requests::http_file_fallback::preparation_deadline_ms(http_file)).execute(&mut *preparation).await?;
         playback_requests::http_file_fallback::seed(&mut preparation, id, http_file).await?;
         preparation.commit().await?;
         let probe: Result<Value> = async {
@@ -653,6 +671,21 @@ async fn prepare_playback(
             .await?;
         meta = probe?;
         playback_requests::http_file_fallback::verify_audio(&meta, http_file)?;
+        if kind == "http"
+            && let Some(selection) = &selected
+        {
+            let actual =
+                media_core::capabilities::candidates(&meta, body.audio_index, body.position_ms)
+                    .map_err(|_| err(StatusCode::CONFLICT, "source_changed"))?;
+            let expected =
+                serde_json::to_value(&selection.candidate).map_err(anyhow::Error::from)?;
+            if !actual
+                .iter()
+                .any(|candidate| serde_json::to_value(candidate).ok().as_ref() == Some(&expected))
+            {
+                return Err(err(StatusCode::CONFLICT, "source_changed"));
+            }
+        }
         current_metadata = true;
         probed = true;
         if kind == "agent" {
@@ -753,7 +786,9 @@ async fn prepare_playback(
     if let Some(selection) = &selected {
         mode = &selection.candidate.delivery_mode;
         transport = &selection.candidate.transport;
-        resource["source_version"] = json!(selection.source_version);
+        if let Some(version) = &selection.source_version {
+            resource["source_version"] = json!(version);
+        }
     } else if let Some(caps) = &body.capabilities {
         let (selected_mode, selected_transport) =
             caps.negotiate(mode, transport).ok_or_else(|| {
@@ -866,6 +901,7 @@ async fn prepare_playback(
         playback_requests::http_file_fallback::verify_pin(&mut tx, id, http_file).await?;
         if http_file.is_some()
             && !continuation
+            && !http_file.is_some_and(|authority| authority.candidate.is_some())
             && reservation.viewer_id.is_some()
             && playback_requests::http_file_fallback::mark_root(
                 &mut tx,

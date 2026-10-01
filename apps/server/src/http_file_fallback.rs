@@ -15,6 +15,17 @@ pub struct Authority {
     pub source_policy_revision: i64,
     pub audio_intent: Option<u32>,
     pub claim: Option<Claim>,
+    // Older continuation contexts omit this independently scoped expectation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<CandidateExpectation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateExpectation {
+    pub target_sha256: String,
+    pub identity: Identity,
+    pub expires: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -173,7 +184,7 @@ fn canonical_date(value: &str) -> bool {
 }
 
 impl Identity {
-    fn eligible(&self) -> bool {
+    pub(crate) fn eligible(&self) -> bool {
         self.version == 1
             && self.class.as_deref() == Some("binary")
             && !self.changed
@@ -260,6 +271,7 @@ pub async fn capture_root(
         source_policy_revision: row.get("access_policy_revision"),
         audio_intent: body.audio_index,
         claim: None,
+        candidate: None,
     };
     guard_scope(tx, &authority, state).await?;
     Ok(authority)
@@ -276,7 +288,7 @@ pub async fn guard_scope(
         return Err(err(StatusCode::CONFLICT, "stale_media"));
     }
     source_access::guard(tx, authority.source_id, authority.source_policy_revision).await?;
-    if authority.claim.is_some() {
+    if authority.claim.is_some() || authority.candidate.is_some() {
         require_http_source(tx, authority.source_id).await?;
     }
     let current: bool = sqlx::query_scalar(
@@ -307,6 +319,19 @@ pub async fn guard_deadline(
     tx: &mut Transaction<'_, Postgres>,
     authority: &Authority,
 ) -> Result<()> {
+    if let Some(candidate) = &authority.candidate {
+        if authority.claim.is_some() || !candidate.identity.eligible() {
+            return Err(required());
+        }
+        let live: bool =
+            sqlx::query_scalar("SELECT clock_timestamp()<to_timestamp($1::double precision)")
+                .bind(candidate.expires as f64)
+                .fetch_one(&mut **tx)
+                .await?;
+        if !live {
+            return Err(err(StatusCode::CONFLICT, "stale_capability_report"));
+        }
+    }
     if let Some(claim) = &authority.claim {
         if !claim.identity.eligible() || !claim.deadline_ms.is_finite() {
             return Err(required());
@@ -324,7 +349,22 @@ pub async fn guard_deadline(
     Ok(())
 }
 
-async fn single_identity(
+/// Only pending preparation leases use this deadline. A successfully published
+/// grant keeps its normal lifetime and current-authority delivery gates.
+pub fn preparation_deadline_ms(authority: Option<&Authority>) -> Option<f64> {
+    let authority = authority?;
+    let claim = authority.claim.as_ref().map(|claim| claim.deadline_ms);
+    let candidate = authority
+        .candidate
+        .as_ref()
+        .map(|candidate| candidate.expires as f64 * 1000.0);
+    match (claim, candidate) {
+        (Some(claim), Some(candidate)) => Some(claim.min(candidate)),
+        (claim, candidate) => claim.or(candidate),
+    }
+}
+
+pub(crate) async fn single_identity(
     tx: &mut Transaction<'_, Postgres>,
     session: Uuid,
 ) -> Result<(String, Identity)> {
@@ -345,7 +385,7 @@ async fn single_identity(
     Ok((rows[0].get("target_sha256"), identity))
 }
 
-fn target(resource: &Value) -> Result<String> {
+pub(crate) fn target(resource: &Value) -> Result<String> {
     let mut url = providers::validate_url(resource["url"].as_str().ok_or_else(required)?)
         .map_err(|_| required())?;
     // Match the Worker's representation key. Fragments are never sent in an
@@ -413,6 +453,7 @@ pub async fn claim(
     let mut authority = restore(app, &request, Some(&context))?.ok_or_else(required)?;
     if request.get::<String, _>("status") != "completed"
         || authority.claim.is_some()
+        || authority.candidate.is_some()
         || request.get::<Option<Uuid>, _>("http_file_parent").is_some()
     {
         return Err(required());
@@ -542,10 +583,10 @@ pub async fn seed(
     session: Uuid,
     authority: Option<&Authority>,
 ) -> Result<()> {
-    let Some(claim) = authority.and_then(|a| a.claim.as_ref()) else {
+    let Some((target, identity)) = frozen_pin(authority) else {
         return Ok(());
     };
-    if !claim.identity.eligible() {
+    if !identity.eligible() {
         return Err(required());
     }
     sqlx::query("SELECT lock_playback_http_representation($1)")
@@ -553,7 +594,7 @@ pub async fn seed(
         .execute(&mut **tx)
         .await?;
     sqlx::query("INSERT INTO playback_http_representations(session_id,target_sha256,identity) VALUES($1,$2,$3)")
-        .bind(session).bind(&claim.target_sha256).bind(serde_json::to_value(&claim.identity).map_err(anyhow::Error::from)?)
+        .bind(session).bind(target).bind(serde_json::to_value(identity).map_err(anyhow::Error::from)?)
         .execute(&mut **tx).await?;
     Ok(())
 }
@@ -563,13 +604,41 @@ pub async fn verify_pin(
     session: Uuid,
     authority: Option<&Authority>,
 ) -> Result<()> {
-    let Some(claim) = authority.and_then(|a| a.claim.as_ref()) else {
+    let Some((expected_target, expected_identity)) = frozen_pin(authority) else {
         return Ok(());
     };
     let (target, identity) = single_identity(tx, session).await?;
-    if target != claim.target_sha256
-        || identity.metadata != claim.identity.metadata
-        || identity.class != claim.identity.class
+    if target != expected_target
+        || identity.metadata != expected_identity.metadata
+        || identity.class != expected_identity.class
+    {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+fn frozen_pin(authority: Option<&Authority>) -> Option<(&str, &Identity)> {
+    let authority = authority?;
+    if let Some(candidate) = &authority.candidate {
+        Some((&candidate.target_sha256, &candidate.identity))
+    } else {
+        authority
+            .claim
+            .as_ref()
+            .map(|claim| (claim.target_sha256.as_str(), &claim.identity))
+    }
+}
+
+/// The restriction remains inside the encrypted resource. It creates no new
+/// authorization and prevents the Worker from expanding a Binary into HLS.
+pub fn restrict_binary(resource: &mut Value) -> Result<()> {
+    resource["http_file_binary_only"] = json!({"version":1,"target_sha256":target(resource)?});
+    Ok(())
+}
+
+pub fn verify_target(resource: &Value, authority: Option<&Authority>) -> Result<()> {
+    if let Some((expected, _)) = frozen_pin(authority)
+        && target(resource)? != expected
     {
         return Err(changed());
     }
@@ -618,6 +687,47 @@ mod tests {
     fn identity() -> Identity {
         serde_json::from_value(json!({"version":1,"metadata":{"etag":"\"a\"","modified":null,"reliable_modified":false,"size":100},"class":"binary","consumed":true,"changed":false})).unwrap()
     }
+    #[test]
+    fn old_contexts_remain_readable_and_candidate_pins_grant_no_parent_authority() {
+        let old = json!({"context":{"version":1,"user_id":Uuid::nil(),"room_id":Uuid::nil(),
+            "membership_epoch":Uuid::nil(),"login_hash":"ab".repeat(32)},"media_id":Uuid::nil(),
+            "media_generation":1,"source_id":Uuid::nil(),"source_policy_revision":0,"audio_intent":null,"claim":null});
+        let mut authority: Authority = serde_json::from_value(old.clone()).unwrap();
+        assert!(authority.candidate.is_none());
+        assert_eq!(preparation_deadline_ms(Some(&authority)), None);
+        assert_eq!(serde_json::to_value(&authority).unwrap(), old);
+        authority.candidate = Some(CandidateExpectation {
+            target_sha256: hash("https://source.invalid/file?b=2&a=1"),
+            identity: identity(),
+            expires: 123,
+        });
+        assert!(authority.claim.is_none());
+        assert_eq!(preparation_deadline_ms(Some(&authority)), Some(123_000.0));
+        assert!(
+            verify_target(
+                &json!({"url":"https://source.invalid/file?b=2&a=1#position"}),
+                Some(&authority)
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            verify_target(
+                &json!({"url":"https://source.invalid/file?a=1&b=2"}),
+                Some(&authority)
+            )
+            .unwrap_err()
+            .1,
+            "source_changed"
+        );
+        assert_eq!(frozen_pin(Some(&authority)).unwrap().1, &identity());
+        let mut restricted = json!({"url":"https://source.invalid/file?b=2&a=1#position"});
+        restrict_binary(&mut restricted).unwrap();
+        assert_eq!(
+            restricted["http_file_binary_only"]["target_sha256"],
+            authority.candidate.unwrap().target_sha256
+        );
+    }
+
     #[test]
     fn target_matches_worker_fragment_normalization_without_rewriting_queries() {
         let plain = target(&json!({"url":"https://source.invalid/file?b=2&a=1"})).unwrap();
@@ -1136,5 +1246,210 @@ mod tests {
             "PASS: atomic observation/claim, live-login binding, immutable retry, seeded pin, replay, parent cleanup, cancel tombstones, concurrent keys, rejoin and source/deadline fences"
         );
         app.db.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires fresh owned RAINSYNC_HTTP_FILE_TEST_DATABASE"]
+    async fn isolated_candidate_expectation_contract() {
+        let app = test_app().await;
+        let f = fixture(&app).await;
+        let row = sqlx::query("SELECT * FROM playback_requests WHERE session_id=$1")
+            .bind(f.parent)
+            .fetch_one(&app.db)
+            .await
+            .unwrap();
+        let lifecycle_epoch: i64 = row.get("lifecycle_epoch");
+        let mut authority = decrypt(&app, &row).unwrap().unwrap();
+        let mut clock_tx = app.db.begin().await.unwrap();
+        let before: i64 =
+            sqlx::query_scalar("SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::bigint")
+                .fetch_one(&mut *clock_tx)
+                .await
+                .unwrap();
+        let expires = playback_capabilities::http_expiry(&mut clock_tx)
+            .await
+            .unwrap();
+        let after: i64 =
+            sqlx::query_scalar("SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::bigint")
+                .fetch_one(&mut *clock_tx)
+                .await
+                .unwrap();
+        assert!(
+            (before + 300..=after + 300).contains(&(expires as i64)),
+            "expiry comes from the DB clock"
+        );
+        clock_tx.commit().await.unwrap();
+        authority.candidate = Some(CandidateExpectation {
+            target_sha256: hash("http://127.0.0.1/file"),
+            identity: identity(),
+            expires,
+        });
+        let candidates = media_core::capabilities::candidates(
+            &json!({"streams":[{"codec_type":"video","codec_name":"h264"}]}),
+            None,
+            0.0,
+        )
+        .unwrap();
+        let binding = app
+            .encrypt(
+                &json!({"purpose":"actual_http_file_capabilities_v1","lifecycle_epoch":lifecycle_epoch,
+            "authority":authority,"candidates":candidates}),
+            )
+            .unwrap();
+        let mut request = f.body.clone();
+        request.idempotency_key = Some(Uuid::new_v4());
+        request.plan_generation = Some(2);
+        request.mode = Some("auto".into());
+        request.http_file_fallback_version = None;
+        request.capabilities = Some(
+            serde_json::from_value(
+                json!({"progressive_h264_aac":true,"native_hls":true,"mse_h264_aac":true}),
+            )
+            .unwrap(),
+        );
+        request.candidate_report=Some(serde_json::from_value(json!({"binding":binding,"results":[{"candidate_id":"transcode_720p","progressive":"probably","mse_supported":true}]})).unwrap());
+        let mut explicit_direct = request.clone();
+        explicit_direct.mode = Some("direct".into());
+        assert_eq!(
+            super::super::begin_authenticated(&app, f.user, &explicit_direct, Some(&f.login))
+                .await
+                .err()
+                .unwrap()
+                .1,
+            "stale_capability_report"
+        );
+        let super::super::Start::Reserved(first) =
+            super::super::begin_authenticated(&app, f.user, &request, Some(&f.login))
+                .await
+                .unwrap()
+        else {
+            panic!("candidate reservation")
+        };
+        assert!(first.http_file.as_deref().unwrap().claim.is_none());
+        assert_eq!(
+            serde_json::to_value(first.http_file.as_deref().unwrap()).unwrap(),
+            serde_json::to_value(&authority).unwrap()
+        );
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT http_file_parent IS NULL FROM playback_requests WHERE session_id=$1"
+            )
+            .bind(first.session)
+            .fetch_one(&app.db)
+            .await
+            .unwrap()
+        );
+        // A waited HTTP fence cannot publish a binding after its probe or
+        // request lease expires. Keep the fixture wait below one second.
+        let resource = json!({"kind":"http","url":"http://127.0.0.1/file"});
+        sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch) VALUES($1,$2,$3,$4,1,$6,$5,clock_timestamp()+interval '1 minute',$7)")
+            .bind(first.session).bind(f.user).bind(f.body.room_id).bind(authority.media_id)
+            .bind(wrap_resource(&app,&resource,first.http_file.as_deref(),0,None).unwrap()).bind(hash(&token())).bind(lifecycle_epoch).execute(&app.db).await.unwrap();
+        for expiry in ["probe", "request"] {
+            if expiry == "probe" {
+                sqlx::query("UPDATE playback_sessions SET expires_at=clock_timestamp()+interval '250 milliseconds' WHERE id=$1")
+                    .bind(first.session).execute(&app.db).await.unwrap();
+            } else {
+                sqlx::query("UPDATE playback_sessions SET expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1")
+                    .bind(first.session).execute(&app.db).await.unwrap();
+                sqlx::query("UPDATE playback_requests SET lease_until=clock_timestamp()+interval '250 milliseconds' WHERE session_id=$1")
+                    .bind(first.session).execute(&app.db).await.unwrap();
+            }
+            let mut blocker = app.db.begin().await.unwrap();
+            sqlx::query("SELECT lock_playback_http_representation($1)")
+                .bind(first.session)
+                .execute(&mut *blocker)
+                .await
+                .unwrap();
+            let waited = async {
+                let mut tx = app.db.begin().await.unwrap();
+                super::super::guard(&app, &mut tx, &first).await.unwrap();
+                http_representation::guard(&mut tx, first.session)
+                    .await
+                    .unwrap();
+                super::super::guard(&app, &mut tx, &first).await?;
+                playback_capabilities::require_live_probe(&mut tx, first.session).await
+            };
+            let release = async {
+                tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                blocker.commit().await.unwrap();
+            };
+            let (result, ()) = tokio::join!(waited, release);
+            assert_eq!(
+                result.unwrap_err().1,
+                if expiry == "probe" {
+                    "invalid_playback_session"
+                } else {
+                    "playback_request_interrupted"
+                }
+            );
+        }
+        super::super::fail(
+            &app,
+            &first,
+            &err(StatusCode::GATEWAY_TIMEOUT, "playback_request_interrupted"),
+        )
+        .await
+        .unwrap();
+        // A retry uses its ledger expectation, even if unrelated old evidence changes.
+        sqlx::query("UPDATE playback_http_representations SET identity=jsonb_set(identity,'{metadata,etag}',$2) WHERE session_id=$1")
+            .bind(f.parent).bind(json!("\"new-parent\"")).execute(&app.db).await.unwrap();
+        let super::super::Start::Reserved(retry) =
+            super::super::begin_authenticated(&app, f.user, &request, Some(&f.login))
+                .await
+                .unwrap()
+        else {
+            panic!("candidate retry")
+        };
+        assert_ne!(retry.session, first.session);
+        assert_eq!(
+            serde_json::to_value(retry.http_file.as_deref().unwrap()).unwrap(),
+            serde_json::to_value(&authority).unwrap()
+        );
+        let resource = json!({"kind":"http","url":"http://127.0.0.1/file"});
+        let mut tx = app.db.begin().await.unwrap();
+        super::super::guard(&app, &mut tx, &retry).await.unwrap();
+        sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch,viewer_id,plan_generation) VALUES($1,$2,$3,$4,1,$7,$5,clock_timestamp()+interval '1 minute',$8,$6,2)")
+            .bind(retry.session).bind(f.user).bind(f.body.room_id).bind(authority.media_id).bind(wrap_resource(&app,&resource,retry.http_file.as_deref(),0,None).unwrap()).bind(request.viewer_id).bind(hash(&token())).bind(lifecycle_epoch).execute(&mut *tx).await.unwrap();
+        seed(&mut tx, retry.session, retry.http_file.as_deref())
+            .await
+            .unwrap();
+        verify_pin(&mut tx, retry.session, retry.http_file.as_deref())
+            .await
+            .unwrap();
+        super::super::complete(&app, &mut tx, &retry, &json!({"session_id":retry.session}))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        // Binding expiry limits new preparation, not a completed session replay.
+        let mut expired = authority.clone();
+        expired.candidate.as_mut().unwrap().expires = 1;
+        sqlx::query(
+            "UPDATE playback_requests SET http_file_context_encrypted=$2 WHERE session_id=$1",
+        )
+        .bind(retry.session)
+        .bind(encrypt(&app, &expired).unwrap())
+        .execute(&app.db)
+        .await
+        .unwrap();
+        assert!(matches!(
+            super::super::begin_authenticated(&app, f.user, &request, Some(&f.login))
+                .await
+                .unwrap(),
+            super::super::Start::Replay(_)
+        ));
+        sqlx::query("UPDATE playback_requests SET status='failed',response_encrypted=NULL,error_status=504,error_code='playback_request_interrupted' WHERE session_id=$1").bind(retry.session).execute(&app.db).await.unwrap();
+        assert_eq!(
+            super::super::begin_authenticated(&app, f.user, &request, Some(&f.login))
+                .await
+                .err()
+                .unwrap()
+                .1,
+            "stale_capability_report"
+        );
+        app.db.close().await;
+        println!(
+            "PASS: DB-clock candidate deadline, immutable candidate ledger, NULL parent authority, independent retry pin, explicit-direct rejection, completed replay and new-attempt expiry"
+        );
     }
 }
