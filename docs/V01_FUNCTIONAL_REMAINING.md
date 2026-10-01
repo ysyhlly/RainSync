@@ -1,7 +1,7 @@
 # v0.1 functional work, separate from acceptance
 
-This is the 2026-10-01 code audit against collaboration commit `5c94745`, plus
-the next bounded implementation described below. It does not replace the
+This is the 2026-10-01 code audit against the collaboration branch, including
+the NAS/loading and bounded task-health implementations described below. It does not replace the
 historical evidence in PROGRESS or the release gates in NEXT_PLAN. A historical
 “pending” row is not evidence that the same function is still missing today.
 
@@ -14,6 +14,10 @@ to that baseline, not to untested later changes.
 
 ## Current bounded implementation
 
+- NEXT_PLAN §12.1: current persisted job inventory, registered process-owner
+  state and completed cache scan counts/age are exposed through existing admin
+  metrics. Unknown samples remain absent; these gauges do not replace task
+  duration or transition event producers. See [the scoped contract](TASK_HEALTH_OBSERVATIONS.md).
 - NEXT_PLAN §9.2: make NAS single-range behavior agree with local file delivery.
   HEAD describes the full file, unsupported/invalid ranges are ignored, and
   valid ranges selecting no bytes return 416. A stat-v1 change detector is not a
@@ -24,10 +28,12 @@ to that baseline, not to untested later changes.
   into decoder failure or grant a new fallback route. Preparation/queue waiting
   and autoplay gestures retain their separate behavior.
 
-The implementation passed focused Rust and actual NAS checks plus the integrated
-frontend suite; see [NAS evidence](NAS_RANGE_SEMANTICS.md) and
-[validation limits](VALIDATION.md). Publication and exact-head remote CI remain
-separate steps. Initial usable data is not a complete presented-frame guarantee.
+The NAS/loading implementation passed focused Rust and actual NAS checks plus
+the integrated frontend suite. Its published compatibility checkpoint is
+`e7ef0d1`; [its exact-head CI](https://github.com/ysyhlly/RainSync/actions/runs/36888979539)
+is tracked separately. The next task-health candidate passed finite Rust/API
+checks but has not inherited that remote result. See [NAS evidence](NAS_RANGE_SEMANTICS.md)
+and [validation limits](VALIDATION.md). Initial usable data is not a complete presented-frame guarantee.
 
 ## Remaining implementation work identified in current code
 
@@ -45,9 +51,11 @@ separate steps. Initial usable data is not a complete presented-frame guarantee.
    for local/Agent media. This needs a truthful fixed-profile/output contract,
    with every negotiation SID owned and cleaned up. Broad HLS content-identity
    claims, ambiguous versions and unproven automatic fallback stay disabled.
-3. **Task-health measurements, NEXT_PLAN §12.1.** Current metrics include queued
-   job count, but not complete queue/run duration, retry, cancellation and
-   lease-expiry production observations. `available_at` is an eligibility
+3. **Task-health measurements, NEXT_PLAN §12.1.** Current metrics now include
+   fixed-state persisted job inventory, oldest queued creation age, recorded
+   expired/missing leases, process-owner observations and fresh cache inventory
+   ([scope](TASK_HEALTH_OBSERVATIONS.md)). Complete queue/run duration, retry,
+   cancellation and lease-expiry event producers remain. `available_at` is an eligibility
    deadline rather than requeue time. Execution drain receipts are not runtime
    measurements. Successful completion uses `media_outputs::publish`, and
    cancellation occurs in several Server and persistence paths; Worker-only

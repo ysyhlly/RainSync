@@ -6,6 +6,15 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+/// A completed traversal observation of regular-file entries and logical
+/// lengths. This is neither an atomic inventory nor allocated disk usage.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct Inventory {
+    pub regular_files: u64,
+    pub logical_bytes: u64,
+}
+
 struct ProbeFile(Option<PathBuf>);
 impl Drop for ProbeFile {
     fn drop(&mut self) {
@@ -20,7 +29,7 @@ pub(super) fn check(
     max_bytes: u64,
     budget: Duration,
     max_entries: usize,
-) -> io::Result<()> {
+) -> io::Result<Inventory> {
     let began = Instant::now();
     let metadata = fs::symlink_metadata(root)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -57,6 +66,7 @@ pub(super) fn check(
 
     let mut pending = vec![(root, 0usize)];
     let mut bytes = 0u64;
+    let mut inventory = Inventory::default();
     let mut seen = 0usize;
     while let Some((path, depth)) = pending.pop() {
         if depth > 64 {
@@ -80,6 +90,17 @@ pub(super) fn check(
                 pending.push((entry.path(), depth + 1));
             } else {
                 bytes = bytes.saturating_add(metadata.len());
+                if metadata.is_file() {
+                    inventory.regular_files = inventory
+                        .regular_files
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("cache file count overflow"))?;
+                    inventory.logical_bytes =
+                        inventory
+                            .logical_bytes
+                            .checked_add(metadata.len())
+                            .ok_or_else(|| io::Error::other("cache logical byte count overflow"))?;
+                }
             }
             if bytes >= max_bytes {
                 return Err(io::Error::other("cache quota exceeded"));
@@ -89,5 +110,5 @@ pub(super) fn check(
     if began.elapsed() > budget {
         return Err(io::Error::other("cache probe budget exceeded"));
     }
-    Ok(())
+    Ok(inventory)
 }

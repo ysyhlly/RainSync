@@ -4,6 +4,8 @@
 mod metric_stream;
 #[path = "../src/metrics.rs"]
 mod metrics;
+#[path = "../src/readiness.rs"]
+mod readiness;
 use axum::{
     body::{Bytes, to_bytes},
     extract::State,
@@ -21,6 +23,7 @@ use std::{io, time::Duration};
 pub struct App {
     db: PgPool,
     metrics: RuntimeMetrics,
+    readiness: readiness::Runtime,
 }
 
 fn count(output: &str, name: &str) -> u64 {
@@ -159,6 +162,7 @@ async fn worker_no_session_or_bearer_returns_private_401_without_database_access
     let app = App {
         db,
         metrics: RuntimeMetrics::default(),
+        readiness: readiness::Runtime::default(),
     };
     for headers in [
         HeaderMap::new(),
@@ -260,6 +264,7 @@ async fn blackholed_auth_preserves_pool_capacity(options: &PgConnectOptions, obs
     let app = App {
         db: db.clone(),
         metrics: RuntimeMetrics::default(),
+        readiness: readiness::Runtime::default(),
     };
     let began = std::time::Instant::now();
     let request = tokio::spawn(metrics::endpoint(State(app), headers('a')));
@@ -335,6 +340,7 @@ async fn worker_real_session_authorization_deadlines_and_cancellation() {
     let app = App {
         db: db.clone(),
         metrics: RuntimeMetrics::default(),
+        readiness: readiness::Runtime::default(),
     };
     app.metrics.cache_lookup(CacheDecision::Hit);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -397,6 +403,27 @@ async fn worker_real_session_authorization_deadlines_and_cancellation() {
             .contains("version=0.0.4")
     );
     let body = to_bytes(response.into_body(), 32_768).await.unwrap();
+    let exposition = std::str::from_utf8(&body).unwrap();
+    assert!(
+        exposition.lines().any(
+            |line| line == "rainsync_process_owner_observation_available{process=\"worker\"} 1"
+        )
+    );
+    assert!(
+        exposition
+            .lines()
+            .any(|line| line == "rainsync_cache_inventory_available{process=\"worker\"} 0")
+    );
+    assert!(
+        !exposition
+            .lines()
+            .any(|line| line.starts_with("rainsync_cache_regular_files{"))
+    );
+    assert!(
+        !exposition
+            .lines()
+            .any(|line| line.starts_with("rainsync_cache_logical_bytes{"))
+    );
     assert!(
         std::str::from_utf8(&body)
             .unwrap()

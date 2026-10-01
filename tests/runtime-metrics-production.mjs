@@ -100,7 +100,19 @@ const workerPids = [],
   timers = new Set(),
   offers = [];
 let fixture, upstream, upstreamPort, failure, cacheLock;
+// Readiness inventory is independent of the body/cache-decision collector and
+// changes with scan time, including before media is requested. Keep the exact
+// byte/outcome/HEAD comparisons scoped to the collector they validate. The
+// inventory's fixed labels, absence semantics and actual scans have their own
+// task-health API fixture.
+const cacheInventoryNames = new Set([
+  "rainsync_cache_inventory_available",
+  "rainsync_cache_regular_files",
+  "rainsync_cache_logical_bytes",
+  "rainsync_cache_inventory_age_seconds",
+]);
 const runtimeName = (name) =>
+  !cacheInventoryNames.has(name) &&
   /^rainsync_(metric_|transfer_|cache_|playback_preparation_)/.test(name);
 const allowedLabels = {
   process: ["server", "worker"],
@@ -1069,7 +1081,20 @@ try {
         await cacheLock.done;
         cacheLock = undefined;
         const first = await waiting;
-        assert.equal(first.status, 200);
+        let failureCode;
+        if (first.status !== 200) {
+          const body = await first.json().catch(() => null);
+          const code = body?.error?.code;
+          failureCode =
+            typeof code === "string" && /^[A-Z_]{1,64}$/.test(code)
+              ? code
+              : "UNSTRUCTURED_RESPONSE";
+        }
+        assert.equal(
+          first.status,
+          200,
+          `Actual remux delivery: ${failureCode ?? "OK"}`,
+        );
         const firstBody = Buffer.from(await first.arrayBuffer());
         await f.waitForSql(
           `SELECT status FROM media_jobs WHERE id=${quote(remux.session_id)}`,

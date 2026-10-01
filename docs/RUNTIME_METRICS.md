@@ -108,3 +108,12 @@ DTO checks. The integrated frontend suite passed 349 tests with strict Vue types
 and production build. Independent scoped production and fixture reviews found no
 remaining blocker. These local checks do not imply this batch's remote full CI
 has run, nor close physical-device or sustained-load acceptance.
+
+
+## Current task-health observations
+
+The existing administrator endpoints additionally expose fixed-state persisted
+job inventory, nonblocking process-owner observations and fresh completed cache
+inventory. Unknown values remain absent, and cache age starts at actual scan
+completion. These are current gauges, not per-attempt durations or cumulative
+transition counters; see [the exact scope and bounds](TASK_HEALTH_OBSERVATIONS.md).

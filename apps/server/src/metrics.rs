@@ -45,12 +45,80 @@ fn session_hash(headers: &HeaderMap) -> Option<String> {
     Some(hash(token?))
 }
 
+const JOB_STATES: [&str; 6] = [
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "other",
+];
+
+#[derive(Default)]
+struct JobInventory {
+    counts: [i64; 6],
+    expired_running: i64,
+    missing_running_lease: i64,
+    oldest_queued_age_seconds: Option<f64>,
+}
+
+// This is one bounded database observation, not a cumulative event counter or
+// per-attempt queue/run duration. available_at is retry eligibility, not entry time.
+const JOB_INVENTORY_SQL: &str = r#"
+WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS at),
+inventory AS (
+    SELECT count(*) FILTER (WHERE status='queued') AS queued,
+           count(*) FILTER (WHERE status='running') AS running,
+           count(*) FILTER (WHERE status='succeeded') AS succeeded,
+           count(*) FILTER (WHERE status='failed') AS failed,
+           count(*) FILTER (WHERE status='cancelled') AS cancelled,
+           count(*) FILTER (WHERE status IS NULL OR status NOT IN ('queued','running','succeeded','failed','cancelled')) AS other,
+           count(*) FILTER (WHERE status='running' AND lease_until <= (SELECT at FROM observed)) AS expired_running,
+           count(*) FILTER (WHERE status='running' AND lease_until IS NULL) AS missing_running_lease,
+           min(created_at) FILTER (WHERE status='queued') AS oldest
+    FROM media_jobs
+)
+SELECT inventory.*,
+       CASE WHEN isfinite(oldest) AND oldest <= observed.at
+            THEN extract(epoch FROM observed.at-oldest)::float8 ELSE NULL END AS oldest_age
+FROM inventory CROSS JOIN observed
+"#;
+
+impl JobInventory {
+    fn render(&self) -> String {
+        let mut text = String::from(
+            "# HELP rainsync_media_jobs Current persisted job inventory, not live processes or cumulative transitions.\n# TYPE rainsync_media_jobs gauge\n",
+        );
+        for (state, count) in JOB_STATES.iter().zip(self.counts) {
+            text += &format!("rainsync_media_jobs{{state=\"{state}\"}} {count}\n");
+        }
+        text += &format!(
+            "# HELP rainsync_media_jobs_expired_running Current running rows whose lease timestamp has passed at the database sample.\n# TYPE rainsync_media_jobs_expired_running gauge\nrainsync_media_jobs_expired_running {}\n# HELP rainsync_media_jobs_missing_running_lease Current running rows with no recorded lease timestamp.\n# TYPE rainsync_media_jobs_missing_running_lease gauge\nrainsync_media_jobs_missing_running_lease {}\n",
+            self.expired_running, self.missing_running_lease
+        );
+        let age = self
+            .oldest_queued_age_seconds
+            .filter(|v| v.is_finite() && *v >= 0.0);
+        text += &format!(
+            "# HELP rainsync_media_jobs_oldest_queued_age_available Whether the oldest queued creation age is finite and not in the database clock's future; empty queues have no age.\n# TYPE rainsync_media_jobs_oldest_queued_age_available gauge\nrainsync_media_jobs_oldest_queued_age_available {}\n",
+            u8::from(age.is_some())
+        );
+        if let Some(age) = age {
+            text += &format!(
+                "# HELP rainsync_media_jobs_oldest_queued_age_seconds Database-clock age of the oldest queued row's creation, not per-attempt queue wait.\n# TYPE rainsync_media_jobs_oldest_queued_age_seconds gauge\nrainsync_media_jobs_oldest_queued_age_seconds {age}\n"
+            );
+        }
+        text
+    }
+}
+
 async fn database_snapshot(
     db: &PgPool,
-    hash: String,
+    hash: &str,
     deadline: tokio::time::Instant,
-) -> Result<(i64, i64)> {
-    let (admin, rooms, queued) = tokio::time::timeout_at(deadline, async {
+    include_inventory: bool,
+) -> Result<(i64, JobInventory)> {
+    let (admin, rooms, jobs) = tokio::time::timeout_at(deadline, async {
         let mut owned = MetricsConnection {
             connection: db.acquire().await?,
             reusable: false,
@@ -61,26 +129,29 @@ async fn database_snapshot(
         sqlx::query("SELECT set_config('statement_timeout','1000ms',true), set_config('lock_timeout','500ms',true)").execute(&mut *tx).await?;
         let admin: Option<bool> = sqlx::query_scalar("SELECT u.admin FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>clock_timestamp()")
             .bind(hash).fetch_optional(&mut *tx).await?;
-        let (rooms, queued) = if admin == Some(true) {
+        let (rooms, jobs) = if admin == Some(true) && include_inventory {
             let rooms: i64 = sqlx::query_scalar("SELECT count(*) FROM rooms")
-                .fetch_one(&mut *tx)
-                .await?;
-            let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM media_jobs WHERE status='queued'")
-                .fetch_one(&mut *tx)
-                .await?;
-            (rooms, queued)
+                .fetch_one(&mut *tx).await?;
+            let row = sqlx::query(JOB_INVENTORY_SQL).fetch_one(&mut *tx).await?;
+            let jobs = JobInventory {
+                counts: JOB_STATES.map(|state| row.get(state)),
+                expired_running: row.get("expired_running"),
+                missing_running_lease: row.get("missing_running_lease"),
+                oldest_queued_age_seconds: row.get("oldest_age"),
+            };
+            (rooms, jobs)
         } else {
-            (0, 0)
+            (0, JobInventory::default())
         };
         tx.rollback().await?;
         owned.reusable = true;
-        Ok::<_, sqlx::Error>((admin, rooms, queued))
+        Ok::<_, sqlx::Error>((admin, rooms, jobs))
     })
     .await
     .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "metrics_unavailable"))?
     .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "metrics_unavailable"))?;
     match admin {
-        Some(true) => Ok((rooms, queued)),
+        Some(true) => Ok((rooms, jobs)),
         Some(false) => Err(err(StatusCode::FORBIDDEN, "admin_required")),
         None => Err(err(StatusCode::UNAUTHORIZED, "session_expired")),
     }
@@ -92,6 +163,25 @@ fn denied(error: Error) -> Response {
         .headers_mut()
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     response
+}
+
+fn process_owner_metrics(owners: Option<media_core::child_process::OwnerSnapshot>) -> String {
+    let mut text = String::from(
+        "# HELP rainsync_process_owner_observation_available Whether the process-tree registry was available without waiting.\n# TYPE rainsync_process_owner_observation_available gauge\n# HELP rainsync_owned_process_tree_owners Registered process-tree owners, not all OS descendants or proof of physical drainage.\n# TYPE rainsync_owned_process_tree_owners gauge\n# HELP rainsync_process_admission_closed Whether the existing process registry has closed new process admission.\n# TYPE rainsync_process_admission_closed gauge\n# HELP rainsync_process_cleanup_failed Whether the existing registry retains a process-owner cleanup failure.\n# TYPE rainsync_process_cleanup_failed gauge\n",
+    );
+    text += &format!(
+        "rainsync_process_owner_observation_available{{process=\"server\"}} {}\n",
+        u8::from(owners.is_some())
+    );
+    if let Some(owners) = owners {
+        text += &format!(
+            "rainsync_owned_process_tree_owners{{process=\"server\"}} {}\nrainsync_process_admission_closed{{process=\"server\"}} {}\nrainsync_process_cleanup_failed{{process=\"server\"}} {}\n",
+            owners.active_owners,
+            u8::from(owners.admission_closed),
+            u8::from(owners.cleanup_failed)
+        );
+    }
+    text
 }
 
 #[derive(Default)]
@@ -161,7 +251,7 @@ pub async fn endpoint(State(app): State<App>, h: HeaderMap) -> Result<Response> 
         )));
     };
     let deadline = tokio::time::Instant::now() + SCRAPE_DEADLINE;
-    let (rooms, queued) = match database_snapshot(&app.db, hash, deadline).await {
+    let (rooms, jobs) = match database_snapshot(&app.db, &hash, deadline, true).await {
         Ok(snapshot) => snapshot,
         Err(error) => return Ok(denied(error)),
     };
@@ -184,7 +274,18 @@ pub async fn endpoint(State(app): State<App>, h: HeaderMap) -> Result<Response> 
         }
         (rooms.len(), connections, queue_total, queue_max)
     };
+    // Room-map waits and inventory queries cannot extend the initial login
+    // decision. Recheck that exact session/current role after those awaits,
+    // under the original deadline. No database connection waits on the map.
+    if let Err(error) = database_snapshot(&app.db, &hash, deadline, false).await {
+        return Ok(denied(error));
+    }
+    let queued = jobs.counts[0];
     let mut text = app.metrics.render();
+    text.push_str(&jobs.render());
+    text.push_str(&process_owner_metrics(
+        media_core::child_process::owner_snapshot(),
+    ));
     text += &format!(
         "# TYPE rainsync_room_actors gauge\nrainsync_room_actors {actors}\n# TYPE rainsync_control_connections gauge\nrainsync_control_connections {connections}\n# TYPE rainsync_control_queue_depth gauge\nrainsync_control_queue_depth {queue_total}\n# TYPE rainsync_control_queue_max_depth gauge\nrainsync_control_queue_max_depth {queue_max}\n# TYPE rainsync_db_pool_connections gauge\nrainsync_db_pool_connections {}\n# TYPE rainsync_db_pool_idle_connections gauge\nrainsync_db_pool_idle_connections {}\n",
         app.db.size(),
@@ -209,6 +310,55 @@ pub async fn endpoint(State(app): State<App>, h: HeaderMap) -> Result<Response> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unavailable_owner_state_does_not_report_zero_or_successful_cleanup() {
+        let unknown = process_owner_metrics(None);
+        assert!(
+            unknown
+                .contains("rainsync_process_owner_observation_available{process=\"server\"} 0\n")
+        );
+        assert!(
+            !unknown
+                .lines()
+                .any(|line| line.starts_with("rainsync_owned_process_tree_owners{"))
+        );
+        assert!(
+            !unknown
+                .lines()
+                .any(|line| line.starts_with("rainsync_process_cleanup_failed{"))
+        );
+        let failed = process_owner_metrics(Some(media_core::child_process::OwnerSnapshot {
+            active_owners: 0,
+            admission_closed: true,
+            cleanup_failed: true,
+        }));
+        assert!(failed.contains("rainsync_owned_process_tree_owners{process=\"server\"} 0\n"));
+        assert!(failed.contains("rainsync_process_cleanup_failed{process=\"server\"} 1\n"));
+    }
+    #[test]
+    fn unavailable_queue_age_is_not_a_fabricated_zero_sample() {
+        for age in [None, Some(f64::NAN), Some(f64::INFINITY), Some(-1.0)] {
+            let inventory = JobInventory {
+                oldest_queued_age_seconds: age,
+                ..Default::default()
+            };
+            let text = inventory.render();
+            assert!(text.contains("rainsync_media_jobs_oldest_queued_age_available 0\n"));
+            assert!(
+                !text
+                    .lines()
+                    .any(|line| line.starts_with("rainsync_media_jobs_oldest_queued_age_seconds "))
+            );
+            assert!(!text.contains("NaN") && !text.contains(" inf"));
+        }
+        let inventory = JobInventory {
+            oldest_queued_age_seconds: Some(0.0),
+            ..Default::default()
+        };
+        let text = inventory.render();
+        assert!(text.contains("rainsync_media_jobs_oldest_queued_age_available 1\n"));
+        assert!(text.contains("rainsync_media_jobs_oldest_queued_age_seconds 0\n"));
+    }
     #[test]
     fn scrape_cookie_is_bounded_and_duplicate_sessions_fail_closed() {
         let mut headers = HeaderMap::new();

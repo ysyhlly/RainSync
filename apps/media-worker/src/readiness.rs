@@ -44,9 +44,16 @@ impl Observation {
         }
     }
 }
+#[derive(Clone, Copy)]
+struct CompletedCacheInventory {
+    inventory: cache::Inventory,
+    // Recorded by the blocking owner, before delivery to the async observer.
+    completed_at: Instant,
+}
 #[derive(Default)]
 struct Evidence {
     probes: BTreeMap<&'static str, Observation>,
+    cache_inventory: Option<CompletedCacheInventory>,
     claim: Option<Observation>,
     // No Worker singleton lock exists. None is idle; Some is an actual task
     // lease, conservatively translated from the database's remaining lifetime.
@@ -68,6 +75,17 @@ pub struct Snapshot {
     pub ready: bool,
     pub checks: BTreeMap<&'static str, Outcome>,
 }
+
+/// Fresh successful cache traversal evidence. Counts describe regular-file
+/// entries and logical lengths, not an atomic inventory or disk allocation.
+#[derive(Clone, Copy, Debug)]
+pub struct CacheInventorySnapshot {
+    pub regular_files: u64,
+    pub logical_bytes: u64,
+    /// Includes any delay between scan completion and async publication.
+    pub age: Duration,
+}
+
 impl Runtime {
     pub fn accepting(&self, accepting: bool) {
         self.0.accepting.store(accepting, Ordering::Release);
@@ -162,6 +180,9 @@ impl Runtime {
     }
     fn observe(&self, check: &'static str, ready: bool) {
         if let Ok(mut e) = self.0.evidence.lock() {
+            if check == "writable_cache" {
+                e.cache_inventory = None;
+            }
             e.probes.insert(
                 check,
                 Observation {
@@ -174,6 +195,44 @@ impl Runtime {
                 },
             );
         }
+    }
+    fn observe_cache(&self, inventory: Option<CompletedCacheInventory>) {
+        if let Ok(mut e) = self.0.evidence.lock() {
+            e.cache_inventory = inventory;
+            e.probes.insert(
+                "writable_cache",
+                Observation {
+                    outcome: if inventory.is_some() {
+                        Outcome::Ready
+                    } else {
+                        Outcome::Failed
+                    },
+                    checked_at: Instant::now(),
+                },
+            );
+        }
+    }
+    /// Read memory only; unavailable, failed or stale evidence omits counts.
+    /// A metrics request never starts file work or waits for the evidence lock.
+    pub fn cache_inventory(&self) -> Option<CacheInventorySnapshot> {
+        self.cache_inventory_at(Instant::now())
+    }
+    fn cache_inventory_at(&self, now: Instant) -> Option<CacheInventorySnapshot> {
+        let e = self.0.evidence.try_lock().ok()?;
+        let checked = e.probes.get("writable_cache")?;
+        if checked.outcome(now, PROBE_AGE) != Outcome::Ready {
+            return None;
+        }
+        let completed = e.cache_inventory?;
+        let age = now.checked_duration_since(completed.completed_at)?;
+        if age > PROBE_AGE {
+            return None;
+        }
+        Some(CacheInventorySnapshot {
+            regular_files: completed.inventory.regular_files,
+            logical_bytes: completed.inventory.logical_bytes,
+            age,
+        })
     }
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot_at(Instant::now())
@@ -404,14 +463,22 @@ async fn cache_loop(
         let root = root.clone();
         let scope = media_core::child_process::Scope::new();
         let keep_running = scope.run(async {
-            let probe = media_core::child_process::blocking(move || cache::check(&root, max, Duration::from_secs(1), 100_000));
+            let probe = media_core::child_process::blocking(move || {
+                cache::check(&root, max, Duration::from_secs(1), 100_000).map(|inventory| CompletedCacheInventory {
+                    inventory,
+                    completed_at: Instant::now(),
+                })
+            });
             tokio::pin!(probe);
             let result = tokio::select! { biased;
                 _ = stopped(&mut stop) => return false,
                 result = &mut probe => Some(result),
                 _ = tokio::time::sleep(Duration::from_secs(2)) => None,
             };
-            runtime.observe("writable_cache", matches!(&result, Some(Ok(Ok(())))));
+            runtime.observe_cache(match &result {
+                Some(Ok(Ok(inventory))) => Some(*inventory),
+                _ => None,
+            });
             if result.is_none() {
                 // An OS file call may be uninterruptible. Keep exactly one owner,
                 // remain unready, and wait for disposal before another scan starts.
@@ -468,6 +535,127 @@ async fn tools_loop(runtime: Runtime, mut stop: watch::Receiver<bool>) -> std::i
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn completed_inventory(inventory: cache::Inventory) -> CompletedCacheInventory {
+        CompletedCacheInventory {
+            inventory,
+            completed_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn cache_inventory_requires_a_fresh_success_and_never_substitutes_zero() {
+        let r = Runtime::default();
+        assert!(r.cache_inventory().is_none());
+        r.observe("writable_cache", true);
+        assert!(
+            r.cache_inventory().is_none(),
+            "readiness alone is not an inventory"
+        );
+        r.observe_cache(Some(completed_inventory(cache::Inventory {
+            regular_files: 3,
+            logical_bytes: 512,
+        })));
+        let checked =
+            r.0.evidence
+                .lock()
+                .unwrap()
+                .cache_inventory
+                .unwrap()
+                .completed_at;
+        let fresh = r.cache_inventory_at(checked + PROBE_AGE).unwrap();
+        assert_eq!((fresh.regular_files, fresh.logical_bytes), (3, 512));
+        assert_eq!(fresh.age, PROBE_AGE);
+        assert!(
+            r.cache_inventory_at(checked + PROBE_AGE + Duration::from_nanos(1))
+                .is_none()
+        );
+        assert!(
+            r.cache_inventory_at(checked - Duration::from_nanos(1))
+                .is_none()
+        );
+        let held = r.0.evidence.lock().unwrap();
+        assert!(
+            r.cache_inventory().is_none(),
+            "a scrape cannot wait on evidence"
+        );
+        drop(held);
+        r.observe_cache(None); // Failed or deadline-limited traversal.
+        assert!(r.cache_inventory().is_none());
+        assert_eq!(r.snapshot().checks["writable_cache"], Outcome::Failed);
+        r.observe_cache(Some(completed_inventory(cache::Inventory::default())));
+        let empty = r.cache_inventory().unwrap();
+        assert_eq!((empty.regular_files, empty.logical_bytes), (0, 0));
+        r.observe("writable_cache", false); // Monitor stop invalidates inventory too.
+        assert!(r.cache_inventory().is_none());
+    }
+
+    #[test]
+    fn late_cache_delivery_cannot_refresh_old_or_future_completion_evidence() {
+        let r = Runtime::default();
+        let old_completion = Instant::now() - PROBE_AGE - Duration::from_nanos(1);
+        r.observe_cache(Some(CompletedCacheInventory {
+            inventory: cache::Inventory {
+                regular_files: 3,
+                logical_bytes: 512,
+            },
+            completed_at: old_completion,
+        }));
+        let published = r.0.evidence.lock().unwrap().probes["writable_cache"].checked_at;
+        // Existing readiness still describes its fresh async publication.
+        assert_eq!(
+            r.snapshot_at(published).checks["writable_cache"],
+            Outcome::Ready
+        );
+        assert!(
+            r.cache_inventory_at(published).is_none(),
+            "late delivery cannot reset the completion age to zero"
+        );
+
+        let recent_completion = published - Duration::from_secs(3);
+        r.observe_cache(Some(CompletedCacheInventory {
+            inventory: cache::Inventory {
+                regular_files: 3,
+                logical_bytes: 512,
+            },
+            completed_at: recent_completion,
+        }));
+        let published = r.0.evidence.lock().unwrap().probes["writable_cache"].checked_at;
+        assert_eq!(
+            r.cache_inventory_at(published).unwrap().age,
+            published.duration_since(recent_completion)
+        );
+
+        r.observe_cache(Some(CompletedCacheInventory {
+            inventory: cache::Inventory::default(),
+            completed_at: published + Duration::from_secs(60),
+        }));
+        let published = r.0.evidence.lock().unwrap().probes["writable_cache"].checked_at;
+        assert_eq!(
+            r.snapshot_at(published).checks["writable_cache"],
+            Outcome::Ready
+        );
+        assert!(
+            r.cache_inventory_at(published).is_none(),
+            "future completion evidence is unavailable"
+        );
+    }
+
+    #[test]
+    fn poisoned_cache_evidence_is_unavailable() {
+        let r = Runtime::default();
+        r.observe_cache(Some(completed_inventory(cache::Inventory::default())));
+        let poisoned = r.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _held = poisoned.0.evidence.lock().unwrap();
+                panic!("poison cache observation fixture");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(r.cache_inventory().is_none());
+    }
+
     fn positive() -> Runtime {
         let r = Runtime::default();
         r.accepting(true);
@@ -638,13 +826,65 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    #[tokio::test]
+    async fn owned_cache_loop_updates_inventory_only_after_completed_scans() {
+        let root = Temp::new();
+        std::fs::write(root.0.join("output"), [0u8; 13]).unwrap();
+        let runtime = Runtime::default();
+        let (stop, stopping) = watch::channel(false);
+        let monitor = Monitor {
+            stop,
+            runtime: runtime.clone(),
+            owner: Some(tokio::spawn(cache_loop(
+                runtime.clone(),
+                root.0.clone(),
+                stopping,
+            ))),
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while runtime.cache_inventory().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let observed = runtime.cache_inventory().unwrap();
+        assert_eq!((observed.regular_files, observed.logical_bytes), (1, 13));
+        std::fs::remove_file(root.0.join("output")).unwrap();
+        std::fs::remove_dir(&root.0).unwrap();
+        std::fs::write(&root.0, b"no longer a cache directory").unwrap();
+        // Memory reads retain the completed observation; they never rescan.
+        for _ in 0..100 {
+            let observed = runtime.cache_inventory().unwrap();
+            assert_eq!((observed.regular_files, observed.logical_bytes), (1, 13));
+        }
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while runtime.cache_inventory().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runtime.snapshot().checks["writable_cache"], Outcome::Failed);
+        monitor.shutdown().await.unwrap();
+        assert!(runtime.cache_inventory().is_none());
+        std::fs::remove_file(&root.0).unwrap();
+        std::fs::create_dir(&root.0).unwrap();
+    }
     #[test]
     fn cache_probe_checks_actual_access_quota_and_bounded_traversal_without_eviction() {
         let root = Temp::new();
         let check = |max, count| cache::check(&root.0, max, Duration::from_secs(1), count);
-        assert!(check(1024, 100).is_ok());
+        assert_eq!(check(1024, 100).unwrap(), cache::Inventory::default());
         assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 0);
         std::fs::write(root.0.join("owned-output"), [0u8; 256]).unwrap();
+        assert_eq!(
+            check(1024, 100).unwrap(),
+            cache::Inventory {
+                regular_files: 1,
+                logical_bytes: 256
+            }
+        );
         assert!(check(256, 100).is_err());
         assert!(check(1024, 0).is_err());
         assert_eq!(
@@ -667,6 +907,42 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn cache_inventory_counts_nested_regular_files_and_removes_its_probe() {
+        let root = Temp::new();
+        std::fs::create_dir(root.0.join("nested")).unwrap();
+        std::fs::create_dir(root.0.join("empty-directory")).unwrap();
+        std::fs::write(root.0.join("empty-file"), []).unwrap();
+        std::fs::write(root.0.join("nested/first"), [0u8; 17]).unwrap();
+        std::fs::write(root.0.join("nested/second"), [0u8; 23]).unwrap();
+        #[cfg(unix)]
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(root.0.join("fifo"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            cache::check(&root.0, 1024, Duration::from_secs(1), 100).unwrap(),
+            cache::Inventory {
+                regular_files: 3,
+                logical_bytes: 40,
+            }
+        );
+        assert!(std::fs::read_dir(&root.0).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rainsync-ready-")
+        }));
+        assert!(cache::check(&root.0, 1024, Duration::ZERO, 100).is_err());
+        assert_eq!(
+            std::fs::read(root.0.join("nested/first")).unwrap().len(),
+            17
+        );
+    }
     #[cfg(unix)]
     #[test]
     fn cache_scan_never_follows_source_symlinks() {
@@ -674,7 +950,11 @@ mod tests {
         let outside = Temp::new();
         std::fs::write(outside.0.join("outside"), [0u8; 1024]).unwrap();
         std::os::unix::fs::symlink(&outside.0, root.0.join("link")).unwrap();
-        assert!(cache::check(&root.0, 512, Duration::from_secs(1), 100).is_ok());
+        std::os::unix::fs::symlink(outside.0.join("outside"), root.0.join("file-link")).unwrap();
+        assert_eq!(
+            cache::check(&root.0, 512, Duration::from_secs(1), 100).unwrap(),
+            cache::Inventory::default()
+        );
         assert!(cache::check(&root.0.join("link"), 2048, Duration::from_secs(1), 100).is_err());
         assert_eq!(std::fs::read_dir(&outside.0).unwrap().count(), 1);
     }

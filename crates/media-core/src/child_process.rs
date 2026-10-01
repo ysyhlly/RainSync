@@ -8,6 +8,15 @@ use tokio::{
 
 type Outcome = Result<ExitStatus, (io::ErrorKind, String)>;
 
+/// Registered process-tree owners, not a descendant/process count or drain
+/// receipt. Zero owners does not prove cleanup succeeded; inspect the flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnerSnapshot {
+    pub active_owners: usize,
+    pub admission_closed: bool,
+    pub cleanup_failed: bool,
+}
+
 #[derive(Default)]
 struct Owners {
     runtime: Option<tokio::runtime::Handle>,
@@ -32,6 +41,15 @@ impl Default for Registry {
 }
 
 impl Registry {
+    fn owner_snapshot(&self) -> Option<OwnerSnapshot> {
+        let owners = self.owners.try_lock().ok()?;
+        Some(OwnerSnapshot {
+            active_owners: owners.active.len(),
+            admission_closed: owners.closing,
+            cleanup_failed: owners.failure.is_some(),
+        })
+    }
+
     fn set_owner_runtime(&self, runtime: tokio::runtime::Handle) -> io::Result<()> {
         let mut owners = self.owners.lock().expect("process registry lock");
         if owners.runtime.is_some() || owners.next_id != 0 || owners.closing {
@@ -66,6 +84,12 @@ impl Registry {
 fn registry() -> std::sync::Arc<Registry> {
     static REGISTRY: std::sync::OnceLock<std::sync::Arc<Registry>> = std::sync::OnceLock::new();
     REGISTRY.get_or_init(Default::default).clone()
+}
+
+/// Observe the existing owner registry without waiting for its lock. Contended
+/// or poisoned state is unavailable, never an invented zero or drain receipt.
+pub fn owner_snapshot() -> Option<OwnerSnapshot> {
+    registry().owner_snapshot()
 }
 
 /// Permanently close process admission and wait for all owners, including those
@@ -696,6 +720,56 @@ mod tests {
     use std::{path::PathBuf, process::Stdio, time::Duration};
 
     #[test]
+    fn owner_observation_is_nonblocking_and_poison_is_unavailable() {
+        let registry = std::sync::Arc::new(Registry::default());
+        assert_eq!(
+            registry.owner_snapshot(),
+            Some(OwnerSnapshot {
+                active_owners: 0,
+                admission_closed: false,
+                cleanup_failed: false,
+            })
+        );
+        let held = registry.owners.lock().unwrap();
+        assert_eq!(registry.owner_snapshot(), None);
+        drop(held);
+        let poisoned = registry.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _held = poisoned.owners.lock().unwrap();
+                panic!("poison observation fixture");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(registry.owner_snapshot(), None);
+    }
+
+    #[test]
+    fn zero_registrations_retains_cleanup_failure_and_admission_state() {
+        let registry = std::sync::Arc::new(Registry::default());
+        {
+            let mut owners = registry.owners.lock().unwrap();
+            owners.active.insert(0, watch::channel(false).0);
+            owners.closing = true;
+        }
+        assert_eq!(registry.owner_snapshot().unwrap().active_owners, 1);
+        drop(Registration {
+            registry: registry.clone(),
+            id: 0,
+            failure: Some((io::ErrorKind::Other, "fixture cleanup failure".into())),
+        });
+        assert_eq!(
+            registry.owner_snapshot(),
+            Some(OwnerSnapshot {
+                active_owners: 0,
+                admission_closed: true,
+                cleanup_failed: true,
+            })
+        );
+    }
+
+    #[test]
     #[ignore = "process tree fixture launched by lifecycle tests"]
     #[allow(clippy::zombie_processes)] // Deliberately orphan a leaf to test production reaping.
     fn tree_fixture() {
@@ -949,6 +1023,14 @@ mod tests {
             ));
             roots.push(root);
         }
+        assert_eq!(
+            registry.owner_snapshot(),
+            Some(OwnerSnapshot {
+                active_owners: 2, // Two registered trees, each with a separate leaf.
+                admission_closed: false,
+                cleanup_failed: false,
+            })
+        );
         drop(children.pop());
         // Interrupting a shutdown waiter cannot reopen admission or discard owners.
         let mut shutdown = Box::pin(registry.shutdown());
@@ -958,6 +1040,7 @@ mod tests {
         })
         .await;
         drop(shutdown);
+        assert!(registry.owner_snapshot().unwrap().admission_closed);
         let error = spawn_registered(Command::new("must-never-be-launched"), registry.clone())
             .err()
             .unwrap();
@@ -969,6 +1052,14 @@ mod tests {
         assert!(witnesses.iter().all(Witness::exited));
         assert!(children[0].try_wait().unwrap().is_some());
         assert!(registry.owners.lock().unwrap().active.is_empty());
+        assert_eq!(
+            registry.owner_snapshot(),
+            Some(OwnerSnapshot {
+                active_owners: 0,
+                admission_closed: true,
+                cleanup_failed: false,
+            })
+        );
         registry.shutdown().await.unwrap();
         for root in roots {
             std::fs::remove_dir_all(root).unwrap();

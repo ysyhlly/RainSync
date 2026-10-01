@@ -8,6 +8,7 @@ use axum::{
 use media_core::runtime_metrics::Process;
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgPool, Postgres, pool::PoolConnection};
+use std::fmt::Write;
 use std::time::Duration;
 
 const AUTH_DEADLINE: Duration = Duration::from_secs(3);
@@ -85,6 +86,102 @@ fn denied(status: StatusCode) -> Response {
     };
     (status, [(header::CACHE_CONTROL, "no-store")], reason).into_response()
 }
+
+fn append_observations(
+    output: &mut String,
+    owners: Option<media_core::child_process::OwnerSnapshot>,
+    inventory: Option<crate::readiness::CacheInventorySnapshot>,
+) {
+    for (name, help) in [
+        (
+            "rainsync_process_owner_observation_available",
+            "Whether the process owner registry was available without waiting.",
+        ),
+        (
+            "rainsync_owned_process_tree_owners",
+            "Registered process-tree owners, not a physical process count or drain receipt.",
+        ),
+        (
+            "rainsync_process_admission_closed",
+            "Whether process admission is closed.",
+        ),
+        (
+            "rainsync_process_cleanup_failed",
+            "Whether the owner registry retained a cleanup failure; zero owners is not a successful drain receipt.",
+        ),
+        (
+            "rainsync_cache_inventory_available",
+            "Whether a fresh successful cache traversal observation is available.",
+        ),
+        (
+            "rainsync_cache_regular_files",
+            "Regular-file entries observed by the bounded readiness scan, excluding symlinks and its probe file; not an atomic inventory.",
+        ),
+        (
+            "rainsync_cache_logical_bytes",
+            "Logical regular-file lengths observed by the bounded readiness scan; not allocated disk bytes or an atomic inventory.",
+        ),
+        (
+            "rainsync_cache_inventory_age_seconds",
+            "Monotonic age of the fresh successful cache traversal observation.",
+        ),
+    ] {
+        writeln!(output, "# HELP {name} {help}\n# TYPE {name} gauge").unwrap();
+    }
+    writeln!(
+        output,
+        "rainsync_process_owner_observation_available{{process=\"worker\"}} {}",
+        u8::from(owners.is_some())
+    )
+    .unwrap();
+    if let Some(owners) = owners {
+        writeln!(
+            output,
+            "rainsync_owned_process_tree_owners{{process=\"worker\"}} {}",
+            owners.active_owners
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "rainsync_process_admission_closed{{process=\"worker\"}} {}",
+            u8::from(owners.admission_closed)
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "rainsync_process_cleanup_failed{{process=\"worker\"}} {}",
+            u8::from(owners.cleanup_failed)
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "rainsync_cache_inventory_available{{process=\"worker\"}} {}",
+        u8::from(inventory.is_some())
+    )
+    .unwrap();
+    if let Some(inventory) = inventory {
+        writeln!(
+            output,
+            "rainsync_cache_regular_files{{process=\"worker\"}} {}",
+            inventory.regular_files
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "rainsync_cache_logical_bytes{{process=\"worker\"}} {}",
+            inventory.logical_bytes
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "rainsync_cache_inventory_age_seconds{{process=\"worker\"}} {}",
+            inventory.age.as_secs_f64()
+        )
+        .unwrap();
+    }
+}
+
 pub async fn endpoint(State(app): State<App>, headers: HeaderMap) -> Response {
     let Some(hash) = session_hash(&headers) else {
         return denied(StatusCode::UNAUTHORIZED);
@@ -96,6 +193,12 @@ pub async fn endpoint(State(app): State<App>, headers: HeaderMap) -> Response {
     if let Err(status) = authorize(&app.db, hash).await {
         return denied(status);
     }
+    let mut output = app.metrics.render_for(Process::Worker);
+    append_observations(
+        &mut output,
+        media_core::child_process::owner_snapshot(),
+        app.readiness.cache_inventory(),
+    );
     (
         [
             (
@@ -104,7 +207,7 @@ pub async fn endpoint(State(app): State<App>, headers: HeaderMap) -> Response {
             ),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        app.metrics.render_for(Process::Worker),
+        output,
     )
         .into_response()
 }
@@ -112,6 +215,99 @@ pub async fn endpoint(State(app): State<App>, headers: HeaderMap) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unavailable_observations_omit_counts_instead_of_exporting_zero() {
+        let mut output = String::new();
+        append_observations(&mut output, None, None);
+        let samples: Vec<_> = output
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect();
+        assert_eq!(
+            samples,
+            [
+                "rainsync_process_owner_observation_available{process=\"worker\"} 0",
+                "rainsync_cache_inventory_available{process=\"worker\"} 0",
+            ]
+        );
+    }
+    #[test]
+    fn successful_empty_inventory_and_owner_failure_are_independent_fixed_gauges() {
+        let mut output = String::new();
+        append_observations(
+            &mut output,
+            Some(media_core::child_process::OwnerSnapshot {
+                active_owners: 0,
+                admission_closed: true,
+                cleanup_failed: true,
+            }),
+            Some(crate::readiness::CacheInventorySnapshot {
+                regular_files: 0,
+                logical_bytes: 0,
+                age: Duration::from_millis(1250),
+            }),
+        );
+        for sample in [
+            "rainsync_process_owner_observation_available{process=\"worker\"} 1",
+            "rainsync_owned_process_tree_owners{process=\"worker\"} 0",
+            "rainsync_process_admission_closed{process=\"worker\"} 1",
+            "rainsync_process_cleanup_failed{process=\"worker\"} 1",
+            "rainsync_cache_inventory_available{process=\"worker\"} 1",
+            "rainsync_cache_regular_files{process=\"worker\"} 0",
+            "rainsync_cache_logical_bytes{process=\"worker\"} 0",
+            "rainsync_cache_inventory_age_seconds{process=\"worker\"} 1.25",
+        ] {
+            assert!(
+                output.lines().any(|line| line == sample),
+                "missing {sample}"
+            );
+        }
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.starts_with("# TYPE ") && line.ends_with(" gauge"))
+                .count(),
+            8
+        );
+        assert!(output.len() < 4096);
+    }
+    #[test]
+    fn nonzero_inventory_exports_observed_values_without_identity_labels() {
+        let mut output = String::new();
+        append_observations(
+            &mut output,
+            Some(media_core::child_process::OwnerSnapshot {
+                active_owners: 7,
+                admission_closed: false,
+                cleanup_failed: false,
+            }),
+            Some(crate::readiness::CacheInventorySnapshot {
+                regular_files: 11,
+                logical_bytes: 2048,
+                age: Duration::ZERO,
+            }),
+        );
+        for sample in [
+            "rainsync_owned_process_tree_owners{process=\"worker\"} 7",
+            "rainsync_cache_regular_files{process=\"worker\"} 11",
+            "rainsync_cache_logical_bytes{process=\"worker\"} 2048",
+        ] {
+            assert!(
+                output.lines().any(|line| line == sample),
+                "missing {sample}"
+            );
+        }
+        assert!(
+            output
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .all(|line| line
+                    .split_once('{')
+                    .unwrap()
+                    .1
+                    .starts_with("process=\"worker\"} "))
+        );
+    }
     #[test]
     fn worker_cookie_boundaries_and_ambiguous_tokens_fail_closed() {
         let mut headers = HeaderMap::new();
