@@ -21,7 +21,7 @@ pub async fn enqueue(
     if active >= limit {
         return Ok(false);
     }
-    sqlx::query("INSERT INTO media_jobs(id,session_id,status,spec) VALUES($1,$1,'queued',$2)")
+    sqlx::query("INSERT INTO media_jobs(id,session_id,status,spec,timing_version,timing_attempt,queue_entered_at,run_started_at) VALUES($1,$1,'queued',$2,1,0,clock_timestamp(),NULL)")
         .bind(session)
         .bind(spec)
         .execute(&mut **tx)

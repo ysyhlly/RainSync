@@ -1,5 +1,5 @@
 use super::*;
-use media_core::job_health::PendingJobHealth;
+use persistence::media_job_timing::{CancellationScope, cancel_jobs};
 use protocol::{PlaybackStatus, RoomState};
 
 #[derive(Deserialize)]
@@ -179,13 +179,10 @@ async fn change(
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    let cancelled = sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE status IN('queued','running') AND session_id IN(SELECT id FROM playback_sessions WHERE room_id=$1)")
-        .bind(id).execute(&mut *tx).await?.rows_affected();
+    let job_health = cancel_jobs(&mut *tx, CancellationScope::Room(id)).await?;
     if target == "closing" {
         persistence::room_cleanup::enqueue(&mut tx, id, epoch).await?;
     }
-    let mut job_health = PendingJobHealth::default();
-    job_health.cancelled(cancelled);
     let observation = job_health.into_commit_observation();
     tx.commit().await?;
     observation.confirmed();

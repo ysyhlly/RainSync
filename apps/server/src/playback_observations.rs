@@ -43,8 +43,11 @@ pub async fn lock_grant(
     let Some(state) = state else {
         return Ok(None);
     };
+    // Grant mutations never change a referenced key. Keep them serialized,
+    // while allowing a job claim's media_executions FK to take KEY SHARE:
+    // claim already owns the job that Stop must cancel after this grant lock.
     Ok(
-        sqlx::query("SELECT * FROM playback_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE")
+        sqlx::query("SELECT * FROM playback_sessions WHERE id=$1 AND user_id=$2 FOR NO KEY UPDATE")
             .bind(id)
             .bind(user)
             .fetch_optional(&mut **tx)

@@ -74,8 +74,8 @@ delivery acknowledgement is claimed.
 
 Current task inventory, oldest queued creation age and cache observations keep
 their separate definitions in [task health](TASK_HEALTH_OBSERVATIONS.md).
-Per-attempt queue/run durations remain a separate implementation item: neither
-creation age nor drain-receipt timestamps are substituted for those durations.
+Per-attempt queue/run durations now have a separate [versioned phase contract](JOB_TIMING_CONTRACT.md):
+neither creation age nor drain-receipt timestamps are substituted for those durations.
 
 
 ## Bounded evidence (2026-10-01 UTC)

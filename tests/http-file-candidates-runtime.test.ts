@@ -549,14 +549,14 @@ for (const field of ["mode", "audio"]) {
   });
 }
 
-it("unmarked local/Agent responses retain their existing per-route discovery", async () => {
+it("unmarked local/Agent responses retain the original concrete discovery", async () => {
   const legacy = candidateSet("local-stat-binding");
   delete legacy.http_file_capabilities_version;
   const s = setup({ candidates: legacy });
   try {
     await s.runtime.loadMedia();
     await s.decode();
-    expect(s.preflights()).toHaveLength(2);
+    expect(s.preflights()).toHaveLength(1);
     expect(s.prepares()[1][2].candidate_report.binding).toBe(
       "local-stat-binding",
     );
@@ -975,3 +975,586 @@ it("HTTP fallback preserves final observation→Stop→key cancel ordering and o
     s.cleanup();
   }
 });
+
+for (const source of ["local", "Agent"]) {
+  const concreteSet = (binding = `${source}-binding`, useHls = false) => {
+    const result = candidateSet(binding, useHls);
+    delete result.http_file_capabilities_version;
+    result.decision_reason = `observed_${source}`;
+    return result;
+  };
+
+  it(`${source} retains immutable binding, reports, capabilities and cumulative finite exclusions`, async () => {
+    const s = setup({ candidates: concreteSet(), directFallback: true });
+    try {
+      await s.runtime.loadMedia();
+      const report = structuredClone(s.prepares()[0][2].candidate_report);
+      const capabilities = structuredClone(s.prepares()[0][2].capabilities);
+      const probes = s.decodingInfo.mock.calls.length;
+      s.candidates.binding = "replacement-source";
+      s.candidates.candidates[0].id = "replacement-route";
+      s.candidates.candidates[0].video.width = 3840;
+      s.prepares()[0][2].candidate_report.results[0].progressive =
+        "unsupported";
+      s.prepares()[0][2].capabilities.native_hls = false;
+      s.prepares()[0][2].capabilities.report.candidates[0].video.width = 3840;
+      s.el.canPlayType.mockReturnValue("");
+      await s.decode();
+      await s.decode();
+      await s.decode();
+      expect(s.preflights()).toHaveLength(1);
+      expect(detectCandidateReport).toHaveBeenCalledTimes(1);
+      expect(s.decodingInfo).toHaveBeenCalledTimes(probes);
+      expect(s.prepares()).toHaveLength(3);
+      expect(
+        s
+          .prepares()
+          .slice(1)
+          .map((call) => call[2].candidate_report),
+      ).toEqual([
+        { ...report, excluded_candidates: ["direct"] },
+        { ...report, excluded_candidates: ["direct", "remux"] },
+      ]);
+      expect(
+        s
+          .prepares()
+          .slice(1)
+          .map((call) => call[2].capabilities),
+      ).toEqual([capabilities, capabilities]);
+      expect(
+        s.api.mock.calls.some(([path]) =>
+          path.endsWith("http-file-continuation"),
+        ),
+      ).toBe(false);
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  for (const code of [
+    "SOURCE_CHANGED",
+    "STALE_CAPABILITY_REPORT",
+    "PLAYBACK_REQUEST_EXPIRED",
+  ]) {
+    it(`${source} ${code} cannot rediscover or submit an unbound recovery, but explicit reload can`, async () => {
+      const s = setup({ candidates: concreteSet() });
+      try {
+        await s.runtime.loadMedia();
+        const original = s.api.getMockImplementation()!;
+        let rejectBound = true;
+        s.api.mockImplementation(async (path, method, body) => {
+          if (path === "/playback-candidates")
+            return concreteSet("fresh-source");
+          if (path === "/playback-sessions" && method === "POST" && rejectBound)
+            throw new RequestFailure({
+              error: { code, message: "reload required" },
+            });
+          return original(path, method, body);
+        });
+        await s.decode();
+        expect(s.preflights()).toHaveLength(1);
+        expect(s.prepares()).toHaveLength(2);
+        expect(s.prepares()[1][2].candidate_report).toMatchObject({
+          binding: `${source}-binding`,
+          excluded_candidates: ["direct"],
+        });
+        expect(s.error.value).toBe("reload required");
+        s.runtime.onClockReady();
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(s.prepares()).toHaveLength(2);
+        rejectBound = false;
+        await s.runtime.loadMedia();
+        expect(s.preflights()).toHaveLength(2);
+        expect(s.prepares()[2][2].candidate_report).toMatchObject({
+          binding: "fresh-source",
+          excluded_candidates: [],
+        });
+      } finally {
+        s.cleanup();
+      }
+    });
+  }
+
+  for (const failure of ["missing", "throw"]) {
+    it(`${source} report ${failure} fails closed without generic capability admission`, async () => {
+      const s = setup({ candidates: concreteSet() });
+      reportFault.value = failure;
+      try {
+        await expect(s.runtime.loadMedia()).rejects.toThrow();
+        expect(s.prepares()).toHaveLength(0);
+        expect(detectCapabilitiesAsync).not.toHaveBeenCalled();
+        s.runtime.onClockReady();
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(s.preflights()).toHaveLength(1);
+        reportFault.value = "";
+        await s.runtime.loadMedia();
+        expect(s.preflights()).toHaveLength(2);
+        expect(s.prepares()[0][2].candidate_report.binding).toBe(
+          `${source}-binding`,
+        );
+      } finally {
+        s.cleanup();
+      }
+    });
+  }
+
+  it(`${source} measures five minutes from the original discovery, including clock deferral`, async () => {
+    const s = setup({ candidates: concreteSet() });
+    try {
+      await s.runtime.loadMedia();
+      await vi.advanceTimersByTimeAsync(299999);
+      s.clock.ready = false;
+      s.clock.revision++;
+      s.runtime.onClockInvalidated();
+      await s.decode();
+      expect(s.prepares()).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      s.clock.ready = true;
+      s.runtime.onClockReady();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(s.preflights()).toHaveLength(1);
+      expect(s.prepares()).toHaveLength(1);
+      expect(s.error.value).toContain("候选已失效");
+      await s.runtime.loadMedia();
+      expect(s.preflights()).toHaveLength(2);
+      expect(s.prepares()).toHaveLength(2);
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  it(`${source} discovery latency cannot restart the five-minute concrete bound`, async () => {
+    const s = setup({ candidates: concreteSet() });
+    const pending = gate<any>();
+    try {
+      const original = s.api.getMockImplementation()!;
+      s.api.mockImplementation(async (path, method, body) =>
+        path === "/playback-candidates"
+          ? pending.promise
+          : original(path, method, body),
+      );
+      const loading = s.runtime.loadMedia();
+      await vi.advanceTimersByTimeAsync(300000);
+      pending.resolve(concreteSet());
+      await expect(loading).rejects.toThrow("候选已失效");
+      expect(s.preflights()).toHaveLength(1);
+      expect(s.prepares()).toHaveLength(0);
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  for (const elapsed of [-1, NaN, Infinity]) {
+    it(`${source} rejects invalid monotonic elapsed time ${elapsed} before a new prepare`, async () => {
+      const s = setup({ candidates: concreteSet() });
+      let now: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        await s.runtime.loadMedia();
+        now = vi.spyOn(performance, "now").mockReturnValue(elapsed);
+        await s.decode();
+        expect(s.preflights()).toHaveLength(1);
+        expect(s.prepares()).toHaveLength(1);
+        expect(s.error.value).toContain("候选已失效");
+      } finally {
+        now?.mockRestore();
+        s.cleanup();
+      }
+    });
+  }
+
+  for (const phase of ["preflight", "device"]) {
+    it(`${source} clock deferral during ${phase} retains one in-flight concrete discovery`, async () => {
+      const pending = gate<any>();
+      const decoder = vi.fn(() =>
+        phase === "device" ? pending.promise : Promise.resolve(supported),
+      );
+      const s = setup({ candidates: concreteSet(), decodingInfo: decoder });
+      try {
+        const original = s.api.getMockImplementation()!;
+        if (phase === "preflight")
+          s.api.mockImplementation(async (path, method, body) =>
+            path === "/playback-candidates"
+              ? pending.promise
+              : original(path, method, body),
+          );
+        const loading = s.runtime.loadMedia();
+        await vi.advanceTimersByTimeAsync(0);
+        s.clock.ready = false;
+        s.clock.revision++;
+        s.runtime.onClockInvalidated();
+        s.clock.ready = true;
+        s.runtime.onClockReady();
+        await vi.advanceTimersByTimeAsync(0);
+        pending.resolve(phase === "preflight" ? concreteSet() : supported);
+        await loading;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(s.preflights()).toHaveLength(1);
+        expect(detectCandidateReport).toHaveBeenCalledTimes(1);
+        expect(s.prepares()).toHaveLength(1);
+        expect(s.prepares()[0][2].candidate_report.binding).toBe(
+          `${source}-binding`,
+        );
+        expect(s.prepares()[0][2].playback_metrics.meter_start_generation).toBe(
+          1,
+        );
+      } finally {
+        s.cleanup();
+      }
+    });
+  }
+
+  for (const readyBeforeReply of [false, true]) {
+    it(`${source} clock readiness ${readyBeforeReply ? "before" : "after"} a claimed reply retains the same key and high-water generation`, async () => {
+      const s = setup({ candidates: concreteSet() });
+      const pending = gate();
+      try {
+        const original = s.api.getMockImplementation()!;
+        const highWater = new Map<number, string>();
+        s.api.mockImplementation(async (path, method, body) => {
+          if (path === "/playback-sessions" && method === "POST") {
+            const key = highWater.get(body.plan_generation);
+            if (key && key !== body.idempotency_key)
+              throw new RequestFailure({
+                error: { code: "STALE_PLAYBACK_PLAN" },
+              });
+            highWater.set(body.plan_generation, body.idempotency_key);
+            const plan = await original(path, method, body);
+            await pending.promise;
+            return { ...plan, rebuild_on_seek: true };
+          }
+          if (
+            path.startsWith("/playback-sessions/session-1?") &&
+            method === "GET"
+          )
+            return {
+              session_id: "session-1",
+              plan_generation: 1,
+              status: "ready",
+              complete: true,
+            };
+          return original(path, method, body);
+        });
+        const loading = s.runtime.loadMedia();
+        await vi.advanceTimersByTimeAsync(0);
+        s.clock.ready = false;
+        s.clock.revision++;
+        s.runtime.onClockInvalidated();
+        if (readyBeforeReply) {
+          s.clock.ready = true;
+          s.runtime.onClockReady();
+          await vi.advanceTimersByTimeAsync(0);
+        }
+        pending.resolve();
+        await loading;
+        if (!readyBeforeReply) {
+          s.clock.ready = true;
+          s.runtime.onClockReady();
+          await vi.advanceTimersByTimeAsync(0);
+        }
+        expect(s.preflights()).toHaveLength(1);
+        expect(s.prepares()).toHaveLength(1);
+        expect(s.runtime.sessionId.value).toBe("session-1");
+        expect(s.error.value).toBe("");
+        expect(s.prepares()[0][2].playback_metrics.meter_start_generation).toBe(
+          1,
+        );
+        expect(
+          s.api.mock.calls.some(([path]) =>
+            path.startsWith("/playback-requests/"),
+          ),
+        ).toBe(false);
+      } finally {
+        s.cleanup();
+      }
+    });
+  }
+
+  for (const fence of [
+    "mode",
+    "audio",
+    "media",
+    "generation",
+    "room",
+    "lifecycle",
+    "login",
+    "epoch",
+    "stop",
+    "dispose",
+  ]) {
+    it(`${source} ${fence} reset fences a held discovery and old callbacks`, async () => {
+      const s = setup({ candidates: concreteSet() });
+      const pending = gate<any>();
+      try {
+        const original = s.api.getMockImplementation()!;
+        s.api.mockImplementation(async (path, method, body) =>
+          path === "/playback-candidates"
+            ? pending.promise
+            : original(path, method, body),
+        );
+        const loading = s.runtime.loadMedia();
+        await vi.advanceTimersByTimeAsync(0);
+        switch (fence) {
+          case "mode":
+            s.runtime.mode.value = "direct";
+            s.runtime.mode.value = "auto";
+            break;
+          case "audio":
+            s.runtime.audioIndex.value = 1;
+            s.runtime.audioIndex.value = undefined;
+            break;
+          case "media":
+            s.state.value.media_id = "other";
+            break;
+          case "generation":
+            s.state.value.media_generation++;
+            break;
+          case "room":
+            s.state.value.room_id = "other";
+            break;
+          case "lifecycle":
+            s.active.value = false;
+            s.active.value = true;
+            break;
+          case "login":
+            s.session.user.id = "other";
+            break;
+          case "epoch":
+            s.session.epoch++;
+            break;
+          case "stop":
+            await s.runtime.reset();
+            break;
+          case "dispose":
+            s.cleanup();
+            break;
+        }
+        pending.resolve(concreteSet());
+        await loading;
+        s.runtime.onClockReady();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(s.prepares()).toHaveLength(0);
+        expect(detectCandidateReport).not.toHaveBeenCalled();
+      } finally {
+        s.cleanup();
+      }
+    });
+  }
+
+  it(`${source} HTML code 4 stays neutral while confirmed decode still selects the next bound route`, async () => {
+    const s = setup({ candidates: concreteSet(), directFallback: true });
+    try {
+      await s.runtime.loadMedia();
+      s.el.error = { code: 4 };
+      s.el.onerror();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(s.preflights()).toHaveLength(1);
+      expect(s.prepares()).toHaveLength(1);
+      expect(s.error.value).toContain("媒体加载或格式支持状态未知");
+      expect(
+        s.api.mock.calls.some(([path]) =>
+          path.endsWith("http-file-continuation"),
+        ),
+      ).toBe(false);
+      await s.decode();
+      expect(s.prepares()[1][2].candidate_report).toMatchObject({
+        binding: `${source}-binding`,
+        excluded_candidates: ["direct"],
+      });
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  it(`${source} decoder fallback retains metric t0 and final-observation→Stop→cancel order while giving the new plan 20 seconds`, async () => {
+    const s = setup({ candidates: concreteSet(), readyState: 0 });
+    try {
+      await s.runtime.loadMedia();
+      const oldLoaded = s.el.onloadeddata;
+      const oldError = s.el.onerror;
+      s.el.currentTime = 12.25;
+      s.el.paused = false;
+      s.el.dispatchEvent(new Event("playing"));
+      await vi.advanceTimersByTimeAsync(12000);
+      const stop = gate();
+      const original = s.api.getMockImplementation()!;
+      s.api.mockImplementation(async (path, method, body) => {
+        if (path === "/playback-sessions/session-1" && method === "DELETE")
+          await stop.promise;
+        return original(path, method, body);
+      });
+      await s.decode();
+      const final = s.api.mock.calls.find(
+        ([path, method]) =>
+          path === "/playback-sessions/session-1" && method === "DELETE",
+      )!;
+      expect(final[2]).toMatchObject({
+        media_time_ms: 12250,
+        has_played: false,
+        buffering: true,
+      });
+      expect(s.prepares()).toHaveLength(1);
+      expect(
+        s.api.mock.calls.some(([path]) =>
+          path.startsWith("/playback-requests/"),
+        ),
+      ).toBe(false);
+      oldError();
+      stop.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      const cancel = s.api.mock.calls.find(([path]) =>
+        path.startsWith("/playback-requests/"),
+      )!;
+      expect(s.api.mock.calls.indexOf(cancel)).toBeGreaterThan(
+        s.api.mock.calls.indexOf(final),
+      );
+      expect(s.api.mock.calls.indexOf(s.prepares()[1])).toBeGreaterThan(
+        s.api.mock.calls.indexOf(cancel),
+      );
+      expect(s.prepares().map((call) => call[2].playback_metrics)).toEqual([
+        { meter_start_generation: 1, startup_origin: "user_intent" },
+        { meter_start_generation: 1, startup_origin: "user_intent" },
+      ]);
+      s.el.readyState = 2;
+      oldLoaded();
+      s.el.readyState = 0;
+      await vi.advanceTimersByTimeAsync(19999);
+      expect(s.error.value).toBe("");
+      expect(s.metrics().at(-1)![2].elapsed_ms).toBe(30000);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(s.error.value).toContain("媒体数据加载超时");
+      expect(s.preflights()).toHaveLength(1);
+      expect(s.prepares()).toHaveLength(2);
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  it(`${source} native→MSE and range retries keep one plan's original 20-second loading budget`, async () => {
+    const candidates = concreteSet(`${source}-binding`, true);
+    candidates.candidates.shift();
+    const s = setup({ candidates, readyState: 0 });
+    try {
+      await s.runtime.loadMedia();
+      const oldLoaded = s.el.onloadeddata;
+      await vi.advanceTimersByTimeAsync(12000);
+      await s.decode();
+      await vi.advanceTimersByTimeAsync(4000);
+      hls.handlers.at(-1)!(undefined, {
+        fatal: true,
+        type: "networkError",
+        response: { code: 409 },
+      });
+      s.el.readyState = 2;
+      oldLoaded();
+      s.el.readyState = 0;
+      await vi.advanceTimersByTimeAsync(3999);
+      expect(s.error.value).toBe("");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(s.error.value).toContain("媒体数据加载超时");
+      expect(s.preflights()).toHaveLength(1);
+      expect(s.prepares()).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  it(`${source} same-grant native→MSE and range recovery preserve the snapshot and Hls.js decoder branch`, async () => {
+    const s = setup({ candidates: concreteSet(`${source}-binding`, true) });
+    try {
+      await s.runtime.loadMedia();
+      await s.decode();
+      s.el.error = { code: 4 };
+      s.el.onerror();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(s.prepares()).toHaveLength(2);
+      const oldError = hls.handlers.at(-1)!;
+      oldError(undefined, {
+        fatal: true,
+        type: "networkError",
+        response: { code: 409 },
+      });
+      expect(hls.started).toHaveBeenCalled();
+      oldError(undefined, {
+        fatal: true,
+        type: "networkError",
+        response: { code: 401 },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(s.prepares()).toHaveLength(2);
+      // Hls.js identifies decoder failure independently of HTML MediaError 4.
+      oldError(undefined, { fatal: true, type: "mediaError" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(s.prepares()).toHaveLength(3);
+      oldError(undefined, { fatal: true, type: "mediaError" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(s.prepares()).toHaveLength(3);
+      expect(s.preflights()).toHaveLength(1);
+      expect(s.prepares()[2][2].candidate_report).toMatchObject({
+        binding: `${source}-binding`,
+        excluded_candidates: ["direct", "remux"],
+      });
+    } finally {
+      s.cleanup();
+    }
+  });
+}
+
+for (const legacy of ["empty", "404"]) {
+  it(`legacy ${legacy} initial admission and code-3 one-hop remain compatible, but code 4 cannot create a grant`, async () => {
+    const s = setup({ directFallback: true });
+    try {
+      const original = s.api.getMockImplementation()!;
+      s.api.mockImplementation(async (path, method, body) => {
+        if (path === "/playback-candidates") {
+          if (legacy === "404")
+            throw new RequestFailure({ error: { code: "NOT_FOUND" } });
+          return {
+            schema_version: 1,
+            binding: null,
+            candidates: [],
+            decision_reason: "provider_requires_legacy_negotiation",
+          };
+        }
+        if (path === "/playback-sessions/http-file-continuation") {
+          const plan = await original("/playback-sessions", "POST", body);
+          return {
+            ...plan,
+            delivery_mode: "transcode",
+            selected_candidate_id: undefined,
+            http_file_fallback_version: undefined,
+          };
+        }
+        return original(path, method, body);
+      });
+      await s.runtime.loadMedia();
+      expect(s.prepares()).toHaveLength(1);
+      expect(s.prepares()[0][2]).not.toHaveProperty("candidate_report");
+      expect(s.prepares()[0][2]).not.toHaveProperty(
+        "upstream_playback_profile",
+      );
+      expect(detectCapabilitiesAsync).toHaveBeenCalledTimes(1);
+      s.el.error = { code: 4 };
+      s.el.onerror();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(s.error.value).toContain("媒体加载或格式支持状态未知");
+      expect(
+        s.api.mock.calls.filter(([path]) =>
+          path.endsWith("http-file-continuation"),
+        ),
+      ).toHaveLength(0);
+      await s.decode();
+      const continuation = s.api.mock.calls.filter(([path]) =>
+        path.endsWith("http-file-continuation"),
+      );
+      expect(continuation).toHaveLength(1);
+      expect(continuation[0][2].http_file_fallback.parent_session_id).toBe(
+        "session-1",
+      );
+      expect(continuation[0][2].mode).toBe("transcode");
+      expect(s.preflights()).toHaveLength(1);
+      expect(s.runtime.sessionId.value).toBe("session-2");
+    } finally {
+      s.cleanup();
+    }
+  });
+}

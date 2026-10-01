@@ -3,6 +3,7 @@
 use crate::*;
 use media_core::job_health::PendingJobHealth;
 use persistence::http_file_authorization::{self as authorization, Context};
+use persistence::media_job_timing::{CancellationScope, cancel_jobs};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Transaction, postgres::PgRow};
 
@@ -553,9 +554,7 @@ pub async fn claim(
         .bind(parent)
         .execute(&mut **tx)
         .await?;
-    let cancelled = sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')")
-        .bind(parent).execute(&mut **tx).await?.rows_affected();
-    job_health.cancelled(cancelled);
+    job_health.merge(cancel_jobs(&mut **tx, CancellationScope::Session(parent)).await?);
     Ok(authority)
 }
 

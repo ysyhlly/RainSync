@@ -49,9 +49,9 @@ import {
 } from "./playback-summary";
 import { createPlaybackMetricsSender } from "./metrics-sender";
 
-const HTTP_CANDIDATE_LIFETIME_MS = 5 * 60 * 1000;
-const httpCandidateError = "播放候选无法安全使用，请重新加载播放";
-const httpCandidateExpiredError = "播放候选已失效，请重新加载播放";
+const CANDIDATE_LIFETIME_MS = 5 * 60 * 1000;
+const candidateError = "播放候选无法安全使用，请重新加载播放";
+const candidateExpiredError = "播放候选已失效，请重新加载播放";
 
 function freezeCandidateSnapshot<T>(value: T): T {
   if (value && typeof value === "object") {
@@ -235,7 +235,7 @@ export function createPlaybackRuntime(ctx: {
       probe: AbortController;
       result: Promise<CandidateDiscovery>;
     };
-    httpCandidates?: CandidateDiscovery;
+    concreteCandidates?: CandidateDiscovery;
     failedCandidates: string[];
     element?: HTMLVideoElement;
     meter?: PlaybackMetrics;
@@ -246,8 +246,8 @@ export function createPlaybackRuntime(ctx: {
   type CandidateDiscovery = {
     capabilities: PlaybackCapabilities;
     report?: PlaybackCandidateReport;
-    // Only a marked response creates this immutable, same-intent snapshot.
-    http?: { candidates: PlaybackCandidateSet; startedAt: number };
+    // A finite schema-1 set keeps its original binding and device evidence.
+    concrete?: { candidates: PlaybackCandidateSet; startedAt: number };
   };
   let metricIntent: MetricIntent | undefined;
   let metricSource: ReturnType<typeof bindPlaybackMetricEvents> | undefined;
@@ -368,19 +368,19 @@ export function createPlaybackRuntime(ctx: {
     m.inputsInvalidated = true;
     m.candidateDiscovery?.probe.abort();
     m.candidateDiscovery = undefined;
-    m.httpCandidates = undefined;
+    m.concreteCandidates = undefined;
   }
-  function checkHttpCandidateLifetime(snapshot: CandidateDiscovery) {
-    if (!snapshot.http) return;
-    const elapsed = performance.now() - snapshot.http.startedAt;
+  function checkCandidateLifetime(snapshot: CandidateDiscovery) {
+    if (!snapshot.concrete) return;
+    const elapsed = performance.now() - snapshot.concrete.startedAt;
     // This conservative local limit never authorizes a binding. The server's
     // original authority-clock expiry and current fences still decide prepare.
     if (
       !Number.isFinite(elapsed) ||
       elapsed < 0 ||
-      elapsed >= HTTP_CANDIDATE_LIFETIME_MS
+      elapsed >= CANDIDATE_LIFETIME_MS
     )
-      throw new Error(httpCandidateExpiredError);
+      throw new Error(candidateExpiredError);
   }
   const metricState = () => ({
     foreground: foreground(),
@@ -783,7 +783,7 @@ export function createPlaybackRuntime(ctx: {
   ) {
     const m = metricIntent;
     if (!m || !candidateIntentCurrent(m)) return;
-    if (m.httpCandidates) {
+    if (m.concreteCandidates) {
       m.failedCandidates = [...new Set([...m.failedCandidates, ...failed])];
       failed = [...m.failedCandidates];
     }
@@ -795,7 +795,8 @@ export function createPlaybackRuntime(ctx: {
     metrics: MetricIntent,
     element: HTMLVideoElement,
   ): Promise<CandidateDiscovery> {
-    if (metrics.httpCandidates) return Promise.resolve(metrics.httpCandidates);
+    if (metrics.concreteCandidates)
+      return Promise.resolve(metrics.concreteCandidates);
     if (metrics.candidateDiscovery) return metrics.candidateDiscovery.result;
     const probe = new AbortController();
     capabilityProbe = probe;
@@ -805,7 +806,8 @@ export function createPlaybackRuntime(ctx: {
     };
     metrics.candidateDiscovery = discovery;
     discovery.result = (async () => {
-      let marked = false;
+      let marked = false,
+        concrete = false;
       try {
         const startedAt = performance.now();
         let candidateSet: PlaybackCandidateSet | undefined;
@@ -848,9 +850,17 @@ export function createPlaybackRuntime(ctx: {
             !Array.isArray(candidateSet!.candidates) ||
             !candidateSet!.candidates.length
           )
-            throw new Error(httpCandidateError);
-          // Freeze before device probing: a later response/source change cannot
-          // replace the set or the original configurations used for this report.
+            throw new Error(candidateError);
+        }
+        concrete =
+          candidateSet?.schema_version === 1 &&
+          typeof candidateSet.binding === "string" &&
+          !!candidateSet.binding.trim() &&
+          Array.isArray(candidateSet.candidates) &&
+          candidateSet.candidates.length > 0;
+        if (concrete) {
+          // Freeze before device probing: local/Agent and marked HTTP routes
+          // retain the source configurations that produced this device report.
           candidateSet = freezeCandidateSnapshot(
             structuredClone(candidateSet!),
           );
@@ -869,7 +879,7 @@ export function createPlaybackRuntime(ctx: {
             )
           : undefined;
         if (!current()) throw new PlaybackCancelled();
-        if (marked && !report) throw new Error(httpCandidateError);
+        if (concrete && !report) throw new Error(candidateError);
         const capabilities = report
           ? detectCapabilities(element, mseProbe)
           : await detectCapabilitiesAsync(element, mseProbe, decoder);
@@ -877,20 +887,22 @@ export function createPlaybackRuntime(ctx: {
         const result: CandidateDiscovery = {
           capabilities,
           ...(report ? { report } : {}),
-          ...(marked ? { http: { candidates: candidateSet!, startedAt } } : {}),
+          ...(concrete
+            ? { concrete: { candidates: candidateSet!, startedAt } }
+            : {}),
         };
-        if (marked) {
-          metrics.httpCandidates = freezeCandidateSnapshot(
+        if (concrete) {
+          metrics.concreteCandidates = freezeCandidateSnapshot(
             structuredClone(result),
           );
-          return metrics.httpCandidates;
+          return metrics.concreteCandidates;
         }
         return result;
       } finally {
-        // Legacy/local/Agent paths retain their per-attempt discovery behavior.
-        // Marked failures remain rejected for this intent; never downgrade or
-        // discover a new source after a malformed negotiated response.
-        if (metrics.candidateDiscovery === discovery && !marked)
+        // Empty/old-server negotiation keeps its legacy discovery behavior.
+        // Concrete report and marked validation failures stay rejected for this
+        // intent; recovery cannot downgrade or discover a replacement source.
+        if (metrics.candidateDiscovery === discovery && !marked && !concrete)
           metrics.candidateDiscovery = undefined;
         if (capabilityProbe === probe) capabilityProbe = undefined;
       }
@@ -952,7 +964,7 @@ export function createPlaybackRuntime(ctx: {
         ? {
             ...structuredClone(discovered.report),
             excluded_candidates: [
-              ...(discovered.http
+              ...(discovered.concrete
                 ? metrics.failedCandidates
                 : failedCandidates),
             ],
@@ -976,7 +988,7 @@ export function createPlaybackRuntime(ctx: {
         clockAction = "load";
         return;
       }
-      checkHttpCandidateLifetime(discovered);
+      checkCandidateLifetime(discovered);
       const request: PlaybackRequest = {
         ...intent,
         room_id: s.room_id,
@@ -1003,15 +1015,15 @@ export function createPlaybackRuntime(ctx: {
           // Keep the already claimed file/version and request key through a
           // clock recalibration. Reconciliation waits for fresh clock correction;
           // readiness can safely inspect the originally requested position.
-          if (continuation || discovered.http) return request.position_ms;
+          if (continuation || discovered.concrete) return request.position_ms;
           clockAction = "load";
           throw new PlaybackCancelled();
         }
         return target(state.value ?? s, clock.now());
       };
-      // Once claimed, a marked HTTP request keeps its key/generation through
-      // clock recovery. A new key at that generation would violate high-water.
-      pending.preparing = !!discovered.http;
+      // Once claimed, a concrete request keeps its key/generation through clock
+      // recovery. A new key at that generation would violate high-water.
+      pending.preparing = !!discovered.concrete;
       let p: PlaybackPlan;
       if (continuation) {
         // No await between detaching the old element and handing its cleanup
@@ -1229,19 +1241,18 @@ export function createPlaybackRuntime(ctx: {
           (target(state.value!, clock.now()) - p.timeline_origin_ms) / 1000,
         );
       };
-      const retryDecode = (confirmedDecode = true) => {
+      const retryDecode = () => {
         const candidate = p.selected_candidate_id;
         if (
           serial !== loadSerial ||
           !currentPlan(p) ||
           !roomIsActive() ||
           !candidateIntentCurrent(metrics) ||
-          (discovered.http && !confirmedDecode) ||
           mode.value !== "auto"
         )
           return false;
         if (
-          !discovered.http &&
+          !discovered.concrete &&
           p.http_file_fallback_version === 1 &&
           p.delivery_mode === "direct" &&
           p.transport === "progressive" &&
@@ -1344,16 +1355,14 @@ export function createPlaybackRuntime(ctx: {
           }
           if (recover()) return;
         }
-        if (
-          (el.error.code === 3 || el.error.code === 4) &&
-          retryDecode(el.error.code === 3)
-        )
-          return;
+        // HTML code 4 mixes format, delivery and support failures. It cannot
+        // justify a fresh grant, including the legacy one-hop HTTP continuation.
+        if (el.error.code === 3 && retryDecode()) return;
         recoveringHls = false;
         error.value =
           el.error.code === 2
             ? "媒体加载中断，请检查连接后重新加载"
-            : discovered.http && el.error.code === 4
+            : el.error.code === 4
               ? "媒体加载或格式支持状态未知，请检查连接后重新加载"
               : "无法播放此格式，可切换兼容转码后重载";
         waiting.value = false;

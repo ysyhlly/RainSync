@@ -1,5 +1,6 @@
 use super::*;
 use media_core::job_health::PendingJobHealth;
+use persistence::media_job_timing::{CancellationScope, cancel_jobs};
 
 #[path = "http_file_fallback.rs"]
 pub mod http_file_fallback;
@@ -184,8 +185,7 @@ pub async fn begin_authenticated(
             .bind(old)
             .execute(&mut *tx)
             .await?;
-        let cancelled = sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')").bind(old).execute(&mut *tx).await?.rows_affected();
-        job_health.cancelled(cancelled);
+        job_health.merge(cancel_jobs(&mut *tx, CancellationScope::Session(old)).await?);
         persistence::upstream_reservations::close(&mut tx, old, "playback_request_interrupted")
             .await?;
         sqlx::query("UPDATE playback_requests SET status='failed',error_status=409,error_code='playback_request_interrupted',response_encrypted=NULL WHERE user_id=$1 AND idempotency_key=$2")
@@ -281,9 +281,7 @@ pub async fn begin_authenticated(
                 .bind(old)
                 .execute(&mut *tx)
                 .await?;
-            let cancelled = sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')")
-                .bind(old).execute(&mut *tx).await?.rows_affected();
-            job_health.cancelled(cancelled);
+            job_health.merge(cancel_jobs(&mut *tx, CancellationScope::Session(old)).await?);
             sqlx::query("UPDATE playback_requests SET status='failed',response_encrypted=NULL,error_status=409,error_code='stale_playback_plan',lease_until=clock_timestamp() WHERE session_id=$1")
                 .bind(old).execute(&mut *tx).await?;
             persistence::upstream_reservations::close(&mut tx, old, "stale_playback_plan").await?;
@@ -567,12 +565,9 @@ pub async fn cancel(
             .bind(session)
             .execute(&mut *tx)
             .await?;
-        let cancelled = sqlx::query("UPDATE media_jobs SET status='cancelled' WHERE session_id=$1 AND status IN('queued','running')")
-            .bind(session).execute(&mut *tx).await?.rows_affected();
+        let job_health = cancel_jobs(&mut *tx, CancellationScope::Session(session)).await?;
         persistence::upstream_reservations::close(&mut tx, session, "playback_request_cancelled")
             .await?;
-        let mut job_health = PendingJobHealth::default();
-        job_health.cancelled(cancelled);
         let observation = job_health.into_commit_observation();
         tx.commit().await?;
         observation.confirmed();

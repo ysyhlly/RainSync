@@ -85,6 +85,7 @@ names are excluded from that older collector's selector.
 
 Exact final report identities and results are recorded in VALIDATION.md.
 The separate [committed event observations](JOB_HEALTH_EVENTS.md) now cover
-retry schedules, cancellations and lease-expiry normalization. Queue/run duration
-histograms remain a separate implementation item. These finite observations
+retry schedules, cancellations and lease-expiry normalization. Per-attempt queue/run duration
+histograms are now implemented with [versioned logical phase evidence](JOB_TIMING_CONTRACT.md);
+they do not reinterpret this inventory or its oldest creation-age gauge. These finite observations
 do not close device, filesystem, sustained-load or long-running acceptance.

@@ -33,7 +33,9 @@ async function snapshot(){
   return Promise.all(files.map(async path=>({path:relative(root,path).replaceAll("\\","/"),sha256:sha(await readFile(path))})));
 }
 const before=await snapshot(), started_at=new Date().toISOString(), logPath=resolve(output,"build.log");
-const args=["build","--workspace","--bins","--examples","--locked","-j","2"];
+const buildJobs=process.env.RAINSYNC_BUILD_JOBS??"2";
+assert.ok(["1","2"].includes(buildJobs),"Native binding builds allow one or two Cargo jobs");
+const args=["build","--workspace","--bins","--examples","--locked","-j",buildJobs];
 const log=createWriteStream(logPath,{flags:"wx"});
 const child=spawn("cargo",args,{cwd:root,env:process.env,stdio:["ignore","pipe","pipe"]});
 child.stdout.pipe(log,{end:false});child.stderr.pipe(log,{end:false});
@@ -49,7 +51,7 @@ for(const name of ["rainsync-server","rainsync-media-worker","rainsync-nas-agent
 // Test drivers are bound separately; the production binary set remains exactly
 // Server/Worker/Agent for existing compatibility fixtures.
 const test_helpers=[];
-for(const name of ["verify_job_health_events"]) {
+for(const name of ["verify_job_health_events","stop_claim_fixture","verify_job_phase_timings"]) {
   const path=resolve(process.env.CARGO_TARGET_DIR,"debug","examples",name+(process.platform==="win32"?".exe":""));
   test_helpers.push({name,path,sha256:sha(await readFile(path))});
 }

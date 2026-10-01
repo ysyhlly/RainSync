@@ -1,6 +1,10 @@
+use crate::media_job_timing::{
+    AGGREGATE_SQL, CancellationScope, OLD_PHASE_SQL, OWNED_TICK_SQL, SINGLE_PHASE_SQL, cancel_jobs,
+    count, record_aggregate, record_single,
+};
 use anyhow::Result;
 use media_core::job_health::{
-    LeaseExpiryResult, PendingJobHealth, RetryReason, begin_mutation_observation,
+    LeaseExpiryResult, PendingJobHealth, RetryReason, TimingKind, begin_mutation_observation,
 };
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -82,27 +86,73 @@ pub async fn claim(pool: &PgPool, owner: Uuid) -> Result<Option<Claim>> {
     // Normalize abandoned work before claiming. Cancellation wins over retry
     // exhaustion; changing running to queued schedules backoff exactly once.
     let observation = begin_mutation_observation();
-    let cancelled = sqlx::query("UPDATE media_jobs j SET status='cancelled',error=CASE WHEN p.stopped THEN 'playback_session_stopped' ELSE 'playback_session_expired' END,owner_id=NULL,lease_until=NULL FROM playback_sessions p WHERE p.id=j.session_id AND j.status IN ('queued','running') AND (p.stopped OR p.expires_at<=clock_timestamp())")
-        .execute(pool).await?.rows_affected();
-    let mut delta = PendingJobHealth::default();
-    delta.cancelled(cancelled);
+    let delta = cancel_jobs(pool, CancellationScope::StoppedOrExpiredSessions).await?;
     observation.confirmed(delta);
 
-    // Lock each eligible row before remembering its old status. Aggregate in
-    // SQL so normalization retains only one bounded result, even for a backlog.
+    // Drain locked before sampling a single authority clock. Each independent
+    // normalization keeps its own standalone acknowledgement and bounded delta.
     let observation = begin_mutation_observation();
-    let exhausted_expiries: i64 = sqlx::query_scalar("WITH exhausted AS MATERIALIZED (SELECT id,status FROM media_jobs WHERE attempt>=max_attempts AND (status='queued' OR (status='running' AND lease_until<=clock_timestamp())) FOR UPDATE), normalized AS (UPDATE media_jobs j SET status='failed',error='media_job_retry_exhausted',owner_id=NULL,lease_until=NULL FROM exhausted WHERE j.id=exhausted.id RETURNING exhausted.status) SELECT count(*) FILTER (WHERE status='running') FROM normalized")
-        .fetch_one(pool).await?;
+    let query = format!(
+        r#"/* media_job_exhausted */
+WITH locked AS MATERIALIZED (
+    SELECT j.id,j.status AS old_status,j.attempt AS old_attempt,
+        j.timing_version,j.timing_attempt,j.queue_entered_at,j.run_started_at
+    FROM media_jobs j WHERE j.attempt>=j.max_attempts
+        AND (j.status='queued' OR (j.status='running' AND j.lease_until<=clock_timestamp()))
+    ORDER BY j.id FOR UPDATE OF j
+), tick AS MATERIALIZED (
+    SELECT CASE WHEN count(*)>=0 THEN clock_timestamp() END AS ended_at FROM locked
+), changed AS (
+    UPDATE media_jobs j SET status='failed',error='media_job_retry_exhausted',
+        owner_id=NULL,lease_until=NULL,timing_version=NULL,timing_attempt=NULL,
+        queue_entered_at=NULL,run_started_at=NULL
+    FROM locked l CROSS JOIN tick t WHERE j.id=l.id AND j.attempt>=j.max_attempts
+        AND (j.status='queued' OR (j.status='running' AND j.lease_until<=clock_timestamp()))
+    RETURNING l.old_status,l.old_attempt,l.timing_version,l.timing_attempt,
+        l.queue_entered_at,l.run_started_at,t.ended_at
+){AGGREGATE_SQL}"#
+    );
+    let row = sqlx::query(&query).fetch_one(pool).await?;
     let mut delta = PendingJobHealth::default();
-    delta.lease_expiry_normalized(LeaseExpiryResult::Exhausted, exhausted_expiries as u64);
+    match count(&row, "run_total") {
+        Some(rows) => delta.lease_expiry_normalized(LeaseExpiryResult::Exhausted, rows),
+        None => delta.mark_incomplete(),
+    }
+    record_aggregate(&mut delta, &row, "queue", TimingKind::QueueFailed);
+    record_aggregate(&mut delta, &row, "run", TimingKind::RunFailed);
     observation.confirmed(delta);
 
     let observation = begin_mutation_observation();
-    let requeued = sqlx::query("UPDATE media_jobs SET status='queued',error='worker_lease_expired',owner_id=NULL,lease_until=NULL,available_at=clock_timestamp()+((CASE WHEN attempt=1 THEN 2 ELSE 5 END)+random())*interval '1 second' WHERE status='running' AND lease_until<=clock_timestamp() AND attempt<max_attempts")
-        .execute(pool).await?.rows_affected();
+    let query = format!(
+        r#"/* media_job_lease_retry */
+WITH locked AS MATERIALIZED (
+    SELECT j.id,j.status AS old_status,j.attempt AS old_attempt,
+        j.timing_version,j.timing_attempt,j.queue_entered_at,j.run_started_at
+    FROM media_jobs j WHERE j.status='running' AND j.lease_until<=clock_timestamp()
+        AND j.attempt<j.max_attempts ORDER BY j.id FOR UPDATE OF j
+), tick AS MATERIALIZED (
+    SELECT CASE WHEN count(*)>=0 THEN clock_timestamp() END AS ended_at FROM locked
+), changed AS (
+    UPDATE media_jobs j SET status='queued',error='worker_lease_expired',
+        owner_id=NULL,lease_until=NULL,
+        available_at=clock_timestamp()+((CASE WHEN j.attempt=1 THEN 2 ELSE 5 END)+random())*interval '1 second',
+        timing_version=1,timing_attempt=j.attempt,queue_entered_at=t.ended_at,run_started_at=NULL
+    FROM locked l CROSS JOIN tick t WHERE j.id=l.id AND j.status='running'
+        AND j.lease_until<=clock_timestamp() AND j.attempt<j.max_attempts
+    RETURNING l.old_status,l.old_attempt,l.timing_version,l.timing_attempt,
+        l.queue_entered_at,l.run_started_at,t.ended_at
+){AGGREGATE_SQL}"#
+    );
+    let row = sqlx::query(&query).fetch_one(pool).await?;
     let mut delta = PendingJobHealth::default();
-    delta.retry_scheduled(RetryReason::LeaseExpired, requeued);
-    delta.lease_expiry_normalized(LeaseExpiryResult::Requeued, requeued);
+    match count(&row, "updated_count") {
+        Some(rows) => {
+            delta.retry_scheduled(RetryReason::LeaseExpired, rows);
+            delta.lease_expiry_normalized(LeaseExpiryResult::Requeued, rows);
+        }
+        None => delta.mark_incomplete(),
+    }
+    record_aggregate(&mut delta, &row, "run", TimingKind::RunRetry);
     observation.confirmed(delta);
     sqlx::query("UPDATE media_outputs o SET status='abandoned' FROM media_jobs j WHERE o.job_id=j.id AND o.status='writing' AND (o.attempt<>j.attempt OR j.status<>'running')").execute(pool).await?;
     let mut tx = pool.begin().await?;
@@ -111,8 +161,35 @@ pub async fn claim(pool: &PgPool, owner: Uuid) -> Result<Option<Claim>> {
     sqlx::query("SELECT pg_advisory_xact_lock(72614933)")
         .execute(&mut *tx)
         .await?;
-    let row = sqlx::query("UPDATE media_jobs claimed SET status='running',owner_id=$1,attempt=attempt+1,lease_until=clock_timestamp()+interval '30 seconds' FROM playback_sessions session WHERE claimed.id=(SELECT j.id FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id LEFT JOIN media_queue_turns turn ON turn.user_id IS NOT DISTINCT FROM p.user_id WHERE j.status='queued' AND j.attempt<j.max_attempts AND j.available_at<=clock_timestamp() AND NOT p.stopped AND p.expires_at>clock_timestamp() ORDER BY turn.last_turn NULLS FIRST,j.created_at,j.id FOR UPDATE OF j SKIP LOCKED LIMIT 1) AND session.id=claimed.session_id RETURNING claimed.id,claimed.spec,claimed.attempt,session.user_id")
-        .bind(owner).fetch_optional(&mut *tx).await?;
+    let query = format!(
+        r#"WITH locked AS MATERIALIZED (
+    SELECT {OLD_PHASE_SQL}
+    FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id
+    LEFT JOIN media_queue_turns turn ON turn.user_id IS NOT DISTINCT FROM p.user_id
+    WHERE j.status='queued' AND j.attempt<j.max_attempts
+        AND j.available_at<=clock_timestamp() AND NOT p.stopped AND p.expires_at>clock_timestamp()
+    ORDER BY turn.last_turn NULLS FIRST,j.created_at,j.id FOR UPDATE OF j SKIP LOCKED LIMIT 1
+), tick AS MATERIALIZED (
+    SELECT CASE WHEN count(*)>=0 THEN clock_timestamp() END AS ended_at FROM locked
+)
+UPDATE media_jobs claimed SET status='running',owner_id=$1,attempt=claimed.attempt+1,
+    lease_until=clock_timestamp()+interval '30 seconds',timing_version=1,
+    timing_attempt=claimed.attempt+1,queue_entered_at=NULL,run_started_at=t.ended_at
+FROM locked l CROSS JOIN tick t,playback_sessions session
+WHERE claimed.id=l.id AND session.id=claimed.session_id AND claimed.status='queued'
+    AND claimed.attempt<claimed.max_attempts AND claimed.available_at<=clock_timestamp()
+    AND NOT session.stopped AND session.expires_at>clock_timestamp()
+RETURNING claimed.id,claimed.spec,claimed.attempt,session.user_id,
+    {SINGLE_PHASE_SQL}"#
+    );
+    let row = sqlx::query(&query)
+        .bind(owner)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let mut delta = PendingJobHealth::default();
+    if let Some(row) = &row {
+        record_single(&mut delta, row, "queue_seconds", TimingKind::QueueStarted);
+    }
     if let Some(row) = &row {
         sqlx::query("INSERT INTO media_queue_turns(user_id,last_turn) VALUES($1,nextval('media_queue_turn_seq')) ON CONFLICT(user_id) DO UPDATE SET last_turn=EXCLUDED.last_turn")
             .bind(row.get::<Option<Uuid>, _>("user_id")).execute(&mut *tx).await?;
@@ -131,7 +208,9 @@ pub async fn claim(pool: &PgPool, owner: Uuid) -> Result<Option<Claim>> {
         sqlx::query("INSERT INTO media_executions(id,session_id,kind,job_id,attempt,owner_id) SELECT gen_random_uuid(),session_id,'job',id,attempt,owner_id FROM media_jobs WHERE id=$1")
             .bind(claim.id).execute(&mut *tx).await?;
     }
+    let observation = delta.into_commit_observation();
     tx.commit().await?;
+    observation.confirmed();
     Ok(claim)
 }
 
@@ -181,15 +260,63 @@ pub async fn finish(
     }
     let mut tx = pool.begin().await?;
     let retryable = matches!(failure, Some(JobFailure::UpstreamTransient));
-    let status: Option<String> = sqlx::query_scalar("UPDATE media_jobs j SET status=CASE WHEN $6 AND j.attempt<j.max_attempts THEN 'queued' ELSE $4 END,error=CASE WHEN $6 AND j.attempt>=j.max_attempts THEN 'upstream_transport_retry_exhausted' ELSE $5 END,available_at=CASE WHEN $6 THEN clock_timestamp()+((CASE WHEN j.attempt=1 THEN 2 ELSE 5 END)+random())*interval '1 second' ELSE j.available_at END,owner_id=CASE WHEN $6 THEN NULL ELSE j.owner_id END,lease_until=NULL FROM playback_sessions p WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND p.id=j.session_id AND NOT p.stopped AND p.expires_at>clock_timestamp() RETURNING j.status")
-        .bind(claim.id).bind(claim.owner).bind(claim.attempt)
-        .bind(if failure.is_none() { "succeeded" } else { "failed" })
-        .bind(failure.map(JobFailure::reason)).bind(retryable)
+    let query = format!(
+        "SELECT {OLD_PHASE_SQL} FROM media_jobs j WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' FOR UPDATE OF j"
+    );
+    let old = sqlx::query(&query)
+        .bind(claim.id)
+        .bind(claim.owner)
+        .bind(claim.attempt)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(_old) = old else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    // The output participates in the same legacy publication transaction.
+    // Acquire its lock before the authority tick and final live fence.
+    let output = sqlx::query("SELECT job_id FROM media_outputs WHERE job_id=$1 AND attempt=$2 AND owner_id=$3 AND status='writing' AND (validation_version<2 OR $4) FOR UPDATE")
+        .bind(claim.id).bind(claim.attempt).bind(claim.owner).bind(failure.is_some())
         .fetch_optional(&mut *tx).await?;
-    if status.is_none() {
+    if output.is_none() {
         tx.rollback().await?;
         return Ok(false);
     }
+    let query = format!(
+        r#"{OWNED_TICK_SQL}
+UPDATE media_jobs j SET
+    status=CASE WHEN $6 AND j.attempt<j.max_attempts THEN 'queued' ELSE $4 END,
+    error=CASE WHEN $6 AND j.attempt>=j.max_attempts THEN 'upstream_transport_retry_exhausted' ELSE $5 END,
+    available_at=CASE WHEN $6 THEN clock_timestamp()+((CASE WHEN j.attempt=1 THEN 2 ELSE 5 END)+random())*interval '1 second' ELSE j.available_at END,
+    owner_id=CASE WHEN $6 THEN NULL ELSE j.owner_id END,lease_until=NULL,
+    timing_version=CASE WHEN $6 AND j.attempt<j.max_attempts THEN 1 ELSE NULL END,
+    timing_attempt=CASE WHEN $6 AND j.attempt<j.max_attempts THEN j.attempt ELSE NULL END,
+    queue_entered_at=CASE WHEN $6 AND j.attempt<j.max_attempts THEN t.ended_at ELSE NULL END,
+    run_started_at=NULL
+FROM locked l CROSS JOIN tick t,playback_sessions p
+WHERE j.id=l.id AND j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running'
+    AND j.lease_until>clock_timestamp() AND p.id=j.session_id
+    AND NOT p.stopped AND p.expires_at>clock_timestamp()
+RETURNING j.status,{SINGLE_PHASE_SQL}"#
+    );
+    let ended = sqlx::query(&query)
+        .bind(claim.id)
+        .bind(claim.owner)
+        .bind(claim.attempt)
+        .bind(if failure.is_none() {
+            "succeeded"
+        } else {
+            "failed"
+        })
+        .bind(failure.map(JobFailure::reason))
+        .bind(retryable)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(ended) = ended else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    let status: String = ended.get("status");
     let updated = sqlx::query("UPDATE media_outputs SET status=$4,manifest_sha256=$5,segment_count=$6,published_at=CASE WHEN $4='published' THEN clock_timestamp() ELSE NULL END WHERE job_id=$1 AND attempt=$2 AND owner_id=$3 AND status='writing' AND (validation_version<2 OR $4<>'published')")
         .bind(claim.id).bind(claim.attempt).bind(claim.owner)
         .bind(if failure.is_none() { "published" } else if retryable { "abandoned" } else { "failed" })
@@ -200,9 +327,15 @@ pub async fn finish(
         return Ok(false);
     }
     let mut delta = PendingJobHealth::default();
-    if status.as_deref() == Some("queued") {
-        delta.retry_scheduled(RetryReason::UpstreamTransport, 1);
-    }
+    let kind = match status.as_str() {
+        "queued" => {
+            delta.retry_scheduled(RetryReason::UpstreamTransport, 1);
+            TimingKind::RunRetry
+        }
+        "succeeded" => TimingKind::RunSucceeded,
+        _ => TimingKind::RunFailed,
+    };
+    record_single(&mut delta, &ended, "run_seconds", kind);
     let observation = delta.into_commit_observation();
     tx.commit().await?;
     observation.confirmed();
@@ -212,18 +345,56 @@ pub async fn finish(
 /// Called only after the execution's child has stopped and been reaped.
 pub async fn release(pool: &PgPool, claim: &Claim) -> Result<bool> {
     let mut tx = pool.begin().await?;
-    let status: Option<String> = sqlx::query_scalar("UPDATE media_jobs j SET status=CASE WHEN j.attempt>=j.max_attempts THEN 'failed' ELSE 'queued' END,error=CASE WHEN j.attempt>=j.max_attempts THEN 'media_job_retry_exhausted' ELSE 'worker_shutdown' END,available_at=clock_timestamp(),owner_id=NULL,lease_until=NULL FROM playback_sessions p WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND p.id=j.session_id AND NOT p.stopped AND p.expires_at>clock_timestamp() RETURNING j.status")
-        .bind(claim.id).bind(claim.owner).bind(claim.attempt).fetch_optional(&mut *tx).await?;
-    if status.is_none() {
+    let query = format!(
+        "SELECT {OLD_PHASE_SQL} FROM media_jobs j WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' FOR UPDATE OF j"
+    );
+    let old = sqlx::query(&query)
+        .bind(claim.id)
+        .bind(claim.owner)
+        .bind(claim.attempt)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(_old) = old else {
         tx.rollback().await?;
         return Ok(false);
-    }
+    };
+    sqlx::query("SELECT job_id FROM media_outputs WHERE job_id=$1 AND attempt=$2 AND owner_id=$3 AND status='writing' FOR UPDATE")
+        .bind(claim.id).bind(claim.attempt).bind(claim.owner).fetch_optional(&mut *tx).await?;
+    let query = format!(
+        r#"{OWNED_TICK_SQL}
+UPDATE media_jobs j SET status=CASE WHEN j.attempt>=j.max_attempts THEN 'failed' ELSE 'queued' END,
+    error=CASE WHEN j.attempt>=j.max_attempts THEN 'media_job_retry_exhausted' ELSE 'worker_shutdown' END,
+    available_at=clock_timestamp(),owner_id=NULL,lease_until=NULL,
+    timing_version=CASE WHEN j.attempt<j.max_attempts THEN 1 ELSE NULL END,
+    timing_attempt=CASE WHEN j.attempt<j.max_attempts THEN j.attempt ELSE NULL END,
+    queue_entered_at=CASE WHEN j.attempt<j.max_attempts THEN t.ended_at ELSE NULL END,run_started_at=NULL
+FROM locked l CROSS JOIN tick t,playback_sessions p
+WHERE j.id=l.id AND j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running'
+    AND j.lease_until>clock_timestamp() AND p.id=j.session_id
+    AND NOT p.stopped AND p.expires_at>clock_timestamp()
+RETURNING j.status,{SINGLE_PHASE_SQL}"#
+    );
+    let ended = sqlx::query(&query)
+        .bind(claim.id)
+        .bind(claim.owner)
+        .bind(claim.attempt)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(ended) = ended else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    let status: String = ended.get("status");
     sqlx::query("UPDATE media_outputs SET status='abandoned' WHERE job_id=$1 AND attempt=$2 AND owner_id=$3 AND status='writing'")
         .bind(claim.id).bind(claim.attempt).bind(claim.owner).execute(&mut *tx).await?;
     let mut delta = PendingJobHealth::default();
-    if status.as_deref() == Some("queued") {
+    let kind = if status == "queued" {
         delta.retry_scheduled(RetryReason::WorkerShutdown, 1);
-    }
+        TimingKind::RunRetry
+    } else {
+        TimingKind::RunFailed
+    };
+    record_single(&mut delta, &ended, "run_seconds", kind);
     let observation = delta.into_commit_observation();
     tx.commit().await?;
     observation.confirmed();

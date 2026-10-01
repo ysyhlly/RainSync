@@ -1,6 +1,6 @@
 //! Source policy changes fence grants without claiming physical resource drain.
 use super::*;
-use media_core::job_health::PendingJobHealth;
+use persistence::media_job_timing::{CancellationScope, cancel_jobs};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Change {
@@ -75,10 +75,8 @@ pub async fn change(
 pub async fn retire(db: &PgPool) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
     sqlx::query("UPDATE playback_sessions p SET stopped=true FROM media_items m JOIN sources s ON s.id=m.source_id WHERE p.media_id=m.id AND NOT p.stopped AND COALESCE((p.resource->>'source_policy_revision')::bigint,0)<>s.access_policy_revision").execute(&mut *tx).await?;
-    let cancelled = sqlx::query("UPDATE media_jobs j SET status='cancelled' FROM playback_sessions p WHERE j.session_id=p.id AND p.stopped AND j.status IN('queued','running')").execute(&mut *tx).await?.rows_affected();
+    let job_health = cancel_jobs(&mut *tx, CancellationScope::StoppedSessions).await?;
     sqlx::query("UPDATE upstream_reservations u SET state='closing',close_reason=COALESCE(close_reason,'source_changed'),cleanup_after=COALESCE(cleanup_after,clock_timestamp()),cleanup_deadline=COALESCE(cleanup_deadline,clock_timestamp()+interval '60 seconds'),updated_at=clock_timestamp() FROM sources s WHERE u.source_id=s.id AND u.source_policy_revision<>s.access_policy_revision AND u.state IN('preparing','active')").execute(&mut *tx).await?;
-    let mut job_health = PendingJobHealth::default();
-    job_health.cancelled(cancelled);
     let observation = job_health.into_commit_observation();
     tx.commit().await?;
     observation.confirmed();

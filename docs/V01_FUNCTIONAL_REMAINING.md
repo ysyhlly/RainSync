@@ -1,7 +1,7 @@
 # v0.1 functional work, separate from acceptance
 
 This is the 2026-10-01 code audit against the collaboration branch, including
-the NAS/loading, bounded task-health and reliable HTTP candidate implementations described below. It does not replace the
+the NAS/loading, bounded task-health, attempt timing and concrete-candidate recovery implementations described below. It does not replace the
 historical evidence in PROGRESS or the release gates in NEXT_PLAN. A historical
 “pending” row is not evidence that the same function is still missing today.
 
@@ -19,13 +19,17 @@ to that baseline, not to untested later changes.
   binding and device report across bounded decode fallback; stale/changed or
   malformed reports cannot silently rediscover a new source. Local checks passed
   28 new API groups, 32 continuation groups and 457 frontend tests. Published
-  checkpoint `d8418a7` is awaiting its retried exact-head CI after an initial
-  package-download timeout before application validation. See [scope and evidence](HTTP_FILE_CAPABILITY_BINDING.md).
+  checkpoint `d8418a7` passed compilation and frontend checks on its CI retry,
+  but failed actual integration with Stop returning 500. A separately reproduced
+  claim/Stop lock cycle has a locally verified repair awaiting publication; see
+  [the bounded regression](stop-claim-lock-regression.md). See [scope and evidence](HTTP_FILE_CAPABILITY_BINDING.md).
 
 - NEXT_PLAN §12.1: current persisted job inventory, registered process-owner
   state and completed cache scan counts/age are exposed through existing admin
   metrics. Unknown samples remain absent; these gauges do not replace task
-  duration. Fixed process-local retry/cancel/expiry event producers now have
+  duration. Versioned per-attempt queue/run timing is now implemented and locally
+  verified with missing samples preserved as unknown ([contract](JOB_TIMING_CONTRACT.md)).
+  Fixed process-local retry/cancel/expiry event producers now have
   bounded local transaction/API checks; see [event definitions](JOB_HEALTH_EVENTS.md)
   and [the inventory contract](TASK_HEALTH_OBSERVATIONS.md).
 - NEXT_PLAN §9.2: make NAS single-range behavior agree with local file delivery.
@@ -53,23 +57,21 @@ and [validation limits](VALIDATION.md). Initial usable data is not a complete pr
    for local/Agent media. This needs a truthful fixed-profile/output contract,
    with every negotiation SID owned and cleaned up. Broad HLS content-identity
    claims, ambiguous versions and unproven automatic fallback stay disabled.
-2. **Task-health measurements, NEXT_PLAN §12.1.** Current metrics now include
-   fixed-state persisted job inventory, oldest queued creation age, recorded
-   expired/missing leases, process-owner observations and fresh cache inventory
-   ([scope](TASK_HEALTH_OBSERVATIONS.md)). Complete queue/run duration remains;
-   retry/cancellation/lease-expiry event producers are now implemented and locally
-   verified separately. `available_at` is an eligibility
-   deadline rather than requeue time. Execution drain receipts are not runtime
-   measurements. Successful completion uses `media_outputs::publish`, and
-   cancellation occurs in several Server and persistence paths; Worker-only
-   counters would miss real events. A bounded implementation must state its
-   exact observation boundary and distinguish current inventory from events.
 
-These are verified implementation gaps, not an assertion that every other
+
+This is a verified implementation gap, not an assertion that every other
 v0.1 interface has undergone a fresh exhaustive audit. Keep each next slice
 small enough to review and verify before enlarging its contract.
 
 ## Already implemented; do not reopen from old ledger rows
+
+Concrete local/Agent automatic recovery now retains the original schema-1
+binding, candidate configurations and device report just like marked HTTP.
+HTML code 4 cannot create a new grant; same-grant native-to-MSE and hls.js fatal
+mediaError remain supported. The local candidate passed all 517 frontend tests,
+types and build; no new physical-browser result is claimed. See [the recovery
+contract](CONCRETE_CANDIDATE_RECOVERY.md). This change does not turn stat-v1 into
+a content hash or provide an upstream-product candidate contract.
 
 NAS periodic source-version refresh and individual unreadable-file isolation
 are implemented. So are Worker error classification/readiness, valid-identity

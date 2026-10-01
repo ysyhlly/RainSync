@@ -395,7 +395,7 @@ async fn run(
     let awaiting = tokio::spawn(async move { media_jobs::claim(&other, Uuid::new_v4()).await });
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'UPDATE media_jobs j SET status=''cancelled''%'").fetch_one(db).await.unwrap();
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '/* media_job_cancel_jobs */%'").fetch_one(db).await.unwrap();
             if count > 0 { break; }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
