@@ -320,7 +320,7 @@ async fn prepare_playback(
     let mut resource = json!({"kind":kind,"resource":item,"root":config.root,"headers":{},"source_url":config.url,"access_policy":config.access_policy,"source_policy_revision":source_policy_revision,"source_id":source_id});
     let http_file = reservation.http_file.as_deref();
     let continuation = http_file.is_some_and(|authority| authority.claim.is_some());
-    if continuation && kind != "http" {
+    if http_file.is_some() && kind != "http" {
         return Err(err(StatusCode::CONFLICT, "source_changed"));
     }
     if let Some(authority) = http_file {

@@ -842,6 +842,27 @@ mod tests {
     #[ignore = "requires fresh owned RAINSYNC_HTTP_FILE_TEST_DATABASE"]
     async fn isolated_atomic_claim_contract() {
         let app = test_app().await;
+        // Initial opt-in is global on the client. Non-HTTP reservations keep
+        // legacy admission without requiring a login hash or HTTP context.
+        for kind in ["local", "agent", "jellyfin", "emby"] {
+            let f = fixture(&app).await;
+            sqlx::query("UPDATE sources SET kind=$2 WHERE id=(SELECT source_id FROM media_items WHERE id=(SELECT media_id FROM playback_sessions WHERE id=$1))")
+                .bind(f.parent).bind(kind).execute(&app.db).await.unwrap();
+            let mut request = f.body.clone();
+            request.idempotency_key = Some(Uuid::new_v4());
+            request.viewer_id = Some(Uuid::new_v4());
+            let super::super::Start::Reserved(reservation) =
+                super::super::begin(&app, f.user, &request).await.unwrap()
+            else {
+                panic!("non-HTTP reservation");
+            };
+            assert!(
+                reservation.http_file.is_none(),
+                "{kind} keeps provider admission"
+            );
+            assert!(sqlx::query_scalar::<_,bool>("SELECT http_file_context_encrypted IS NULL AND http_file_parent IS NULL FROM playback_requests WHERE session_id=$1")
+                .bind(reservation.session).fetch_one(&app.db).await.unwrap());
+        }
         let f = fixture(&app).await;
         // Two simultaneously live logins for the same user are distinct authority.
         let second_login = hash(&token());

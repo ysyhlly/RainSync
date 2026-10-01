@@ -55,7 +55,24 @@ pub async fn begin_authenticated(
             .bind(body.room_id)
             .fetch_one(&mut *tx)
             .await?;
-    let context = if body.http_file_fallback_version == Some(1) {
+    // The client advertises this before it knows the provider. Only HTTP
+    // grants acquire the new restriction; other providers retain their paths.
+    let http_source = if body.http_file_fallback_version == Some(1) {
+        let media = state["media_id"]
+            .as_str()
+            .and_then(|v| Uuid::parse_str(v).ok());
+        sqlx::query_scalar::<_, String>(
+            "SELECT s.kind FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1",
+        )
+        .bind(media)
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_deref()
+            == Some("http")
+    } else {
+        false
+    };
+    let context = if http_source || body.http_file_fallback.is_some() {
         Some(
             persistence::http_file_authorization::capture(
                 &mut tx,
