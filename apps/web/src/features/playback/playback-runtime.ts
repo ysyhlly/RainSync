@@ -113,11 +113,14 @@ export function createPlaybackRuntime(ctx: {
     clockAction: "load" | "apply" | undefined;
   let recoveringHls = false,
     terminalEnd = false,
-    firstFrameTimer: ReturnType<typeof setTimeout> | undefined,
     capabilityProbe: AbortController | undefined,
     generationWait: AbortController | undefined,
     generationWaitFailed = false,
     generatedEnd: number | undefined;
+  let mediaDataLoad:
+    | { sourceChanged: () => void; sync: () => void; stop: () => void }
+    | undefined;
+  const mediaDataTimeoutError = "媒体数据加载超时，请检查连接或重新加载播放";
   const corrector = new Corrector();
   let rates: PlaybackRateSupport | undefined,
     applySerial = 0,
@@ -125,6 +128,17 @@ export function createPlaybackRuntime(ctx: {
     pendingForce = false,
     seekSerial = 0;
   let pendingPlay: object | undefined;
+  let playFailed = false;
+  function invalidatePlayActions() {
+    ++applySerial;
+    pendingPlay = undefined;
+    playFailed = false;
+  }
+  const playFailureIs = (failure: unknown, name: string) =>
+    !!failure &&
+    typeof failure === "object" &&
+    "name" in failure &&
+    failure.name === name;
   const clockRevision = () => clock.revision ?? 0;
   const clockUsable = () => {
     ctx.checkClock?.();
@@ -140,6 +154,10 @@ export function createPlaybackRuntime(ctx: {
   }
   const unsupportedRateError =
     "本地播放器不支持此速率，请调整房间倍速或重新加载";
+  const playInterruptedError = "媒体播放被中断，请重试或重新加载播放";
+  function reportPlayInterruption() {
+    if (!error.value) error.value = playInterruptedError;
+  }
   function reportUnsupportedRate() {
     rejectedBaseRate = state.value?.playback_rate;
     if (!error.value || error.value === unsupportedRateError)
@@ -327,6 +345,11 @@ export function createPlaybackRuntime(ctx: {
     if (m && metricCurrent(m))
       bestEffort(() => m.meter?.observe(m.fence, metricRead()));
   }
+  function visibilityChanged() {
+    mediaDataLoad?.sync();
+    observeMetrics();
+    updateRecovery();
+  }
   function finishMetrics() {
     const m = metricIntent;
     if (m && metricCurrent(m)) {
@@ -442,7 +465,7 @@ export function createPlaybackRuntime(ctx: {
     { flush: "sync" },
   );
   if (typeof document !== "undefined")
-    document.addEventListener("visibilitychange", observeMetrics);
+    document.addEventListener("visibilitychange", visibilityChanged);
   let checkingEnd = false,
     endAttempt = -Infinity;
   async function completed() {
@@ -571,8 +594,7 @@ export function createPlaybackRuntime(ctx: {
     recoveryPending = false;
     recoveryState.value = "idle";
     terminalEnd = false;
-    ++applySerial;
-    pendingPlay = undefined;
+    invalidatePlayActions();
     // Grant teardown alone (including automatic fallback) never ends its meter.
     bestEffort(() => metricSource?.stop());
     metricSource = undefined;
@@ -581,8 +603,8 @@ export function createPlaybackRuntime(ctx: {
     // Capture the old element before teardown changes its time or identity.
     const finalObservation = bestEffort(() => observations?.stop());
     observations = undefined;
-    clearTimeout(firstFrameTimer);
-    firstFrameTimer = undefined;
+    mediaDataLoad?.stop();
+    mediaDataLoad = undefined;
     capabilityProbe?.abort();
     capabilityProbe = undefined;
     generationWait?.abort();
@@ -919,6 +941,114 @@ export function createPlaybackRuntime(ctx: {
       };
       waiting.value = true;
       let recoveries = 0;
+      // This bounds usable media data for the attached plan, not a
+      // presented first frame. Server queue/generated waits keep their own
+      // deadlines. Known gesture/background suspension excludes time when
+      // the browser may prevent loading; an unresolved play() still counts.
+      let dataTimer: ReturnType<typeof setTimeout> | undefined;
+      let dataSource: object | undefined;
+      let dataReady = false;
+      let dataTimedOut = false;
+      let dataStopped = false;
+      let dataRemainingMs = 20000;
+      let dataStartedAt = 0;
+      const dataMediaId = s.media_id;
+      const dataCurrent = (source: object) =>
+        dataSource === source &&
+        serial === loadSerial &&
+        currentPlan(p) &&
+        roomIsActive() &&
+        session.user?.id === metrics.user &&
+        session.epoch === metrics.epoch &&
+        state.value?.room_id === metrics.room &&
+        state.value?.media_generation === metrics.media &&
+        state.value?.media_id === dataMediaId &&
+        video.value === el;
+      const clearDataTimer = () => {
+        if (dataTimer !== undefined) {
+          const elapsed = performance.now() - dataStartedAt;
+          // A broken local clock cannot extend or disable a media deadline.
+          dataRemainingMs =
+            Number.isFinite(elapsed) && elapsed >= 0
+              ? Math.max(0, dataRemainingMs - elapsed)
+              : 0;
+        }
+        clearTimeout(dataTimer);
+        dataTimer = undefined;
+      };
+      const syncDataLoad = () => {
+        const source = dataSource;
+        if (!source) return;
+        if (!dataCurrent(source)) {
+          dataStopped = true;
+          dataSource = undefined;
+          clearDataTimer();
+          return;
+        }
+        if (el.readyState >= 2) {
+          dataReady = true;
+          clearDataTimer();
+          if (error.value === mediaDataTimeoutError) error.value = "";
+          return;
+        }
+        if (
+          generationWait ||
+          generationWaitFailed ||
+          blocked.value ||
+          !foreground()
+        ) {
+          clearDataTimer();
+          if (blocked.value && error.value === mediaDataTimeoutError) {
+            dataTimedOut = false;
+            error.value = "";
+          }
+          return;
+        }
+        if (dataReady || dataTimedOut || dataTimer !== undefined) return;
+        dataStartedAt = performance.now();
+        dataTimer = setTimeout(() => {
+          dataRemainingMs = 0;
+          dataTimer = undefined;
+          if (!dataCurrent(source)) {
+            syncDataLoad();
+            return;
+          }
+          if (
+            el.readyState >= 2 ||
+            generationWait ||
+            generationWaitFailed ||
+            blocked.value ||
+            !foreground()
+          ) {
+            syncDataLoad();
+            return;
+          }
+          dataTimedOut = true;
+          recoveringHls = false;
+          waiting.value = false;
+          if (!error.value) error.value = mediaDataTimeoutError;
+        }, dataRemainingMs);
+      };
+      mediaDataLoad = {
+        sourceChanged() {
+          if (dataStopped) return;
+          clearDataTimer();
+          const source = (dataSource = {});
+          // Native → MSE and native reloads retain the plan's original budget.
+          // Once data was usable, later recovery is governed by its own path.
+          el.onloadeddata = () => {
+            if (!dataCurrent(source) || el.readyState < 2) return;
+            syncDataLoad();
+          };
+          syncDataLoad();
+        },
+        sync: syncDataLoad,
+        stop() {
+          dataStopped = true;
+          dataSource = undefined;
+          clearDataTimer();
+        },
+      };
       let mse =
         p.transport === "hls" &&
         !el.canPlayType("application/vnd.apple.mpegurl") &&
@@ -982,6 +1112,8 @@ export function createPlaybackRuntime(ctx: {
         generatedEnd = undefined;
         recoveringHls = true;
         waiting.value = true;
+        invalidatePlayActions();
+        mediaDataLoad?.sourceChanged();
         const position = playbackPosition();
         if (mse && hls) {
           hls.stopLoad();
@@ -1028,6 +1160,8 @@ export function createPlaybackRuntime(ctx: {
             generatedEnd = undefined;
             recoveringHls = true;
             waiting.value = true;
+            invalidatePlayActions();
+            mediaDataLoad?.sourceChanged();
             el.pause();
             bestEffort(() => metricSource?.stop());
             el.removeAttribute("src");
@@ -1074,20 +1208,7 @@ export function createPlaybackRuntime(ctx: {
       bindMetricSource(p, el);
       if (mse) attachHls();
       else el.src = p.playback_url;
-      if (p.selected_candidate_id) {
-        firstFrameTimer = setTimeout(() => {
-          if (serial !== loadSerial || !currentPlan(p) || el.readyState >= 2)
-            return;
-          waiting.value = false;
-          error.value = "首帧等待超时，请检查连接或重新加载播放";
-        }, 20000);
-        el.onloadeddata = () => {
-          if (serial !== loadSerial || !currentPlan(p) || el.readyState < 2)
-            return;
-          clearTimeout(firstFrameTimer);
-          firstFrameTimer = undefined;
-        };
-      }
+      mediaDataLoad.sourceChanged();
       el.onloadedmetadata = () => {
         if (serial !== loadSerial || !currentPlan(p)) return;
         applySubtitles();
@@ -1125,6 +1246,8 @@ export function createPlaybackRuntime(ctx: {
     const revision = clockRevision();
     const controller = new AbortController();
     generationWait = controller;
+    invalidatePlayActions();
+    mediaDataLoad?.sync();
     observeMetrics();
     waiting.value = true;
     video.value?.pause();
@@ -1172,6 +1295,8 @@ export function createPlaybackRuntime(ctx: {
         bindMetricSource(p, video.value, true);
         const url = new URL(p.playback_url, location.href);
         url.hash = `t=${position}`;
+        invalidatePlayActions();
+        mediaDataLoad?.sourceChanged();
         video.value.src = url.href;
         video.value.load();
       }
@@ -1187,6 +1312,7 @@ export function createPlaybackRuntime(ctx: {
       throw e;
     } finally {
       if (generationWait === controller) generationWait = undefined;
+      mediaDataLoad?.sync();
       observeMetrics();
     }
   }
@@ -1268,6 +1394,7 @@ export function createPlaybackRuntime(ctx: {
       recoveringHls = false;
       generationWait?.abort();
       generationWait = undefined;
+      mediaDataLoad?.sync();
     }
     if (generationWait || generationWaitFailed) return;
     const relative = (target(s, clock.now()) - p.timeline_origin_ms) / 1000;
@@ -1323,18 +1450,30 @@ export function createPlaybackRuntime(ctx: {
         el.currentTime = expected;
     }
     if (s.playback_status === "playing") {
-      if (el.paused && !blocked.value && !pendingPlay) {
+      if (el.paused && !blocked.value && !pendingPlay && !playFailed) {
         const playing = {};
         pendingPlay = playing;
         try {
           await el.play();
           if (!afterPlay(p, el, revision, serial)) return;
           blocked.value = false;
+          if (error.value === playInterruptedError) error.value = "";
           observeMetrics();
-        } catch {
+        } catch (failure) {
           if (!afterPlay(p, el, revision, serial)) return;
-          blocked.value = true;
-          observeMetrics();
+          if (playFailureIs(failure, "NotAllowedError")) {
+            blocked.value = true;
+            observeMetrics();
+          } else {
+            // Stop periodic play retries without claiming a gesture denial or
+            // suspending the independent media-data deadline.
+            playFailed = true;
+            if (playFailureIs(failure, "AbortError")) {
+              reportPlayInterruption();
+              return;
+            }
+            throw failure;
+          }
         } finally {
           if (pendingPlay === playing) pendingPlay = undefined;
         }
@@ -1354,16 +1493,32 @@ export function createPlaybackRuntime(ctx: {
         revision = clockRevision();
       const playing = {};
       pendingPlay = playing;
+      playFailed = false;
+      // An explicit gesture resumes loading even while play() waits for data.
+      // Only a new permission denial may restore the gesture gate.
+      blocked.value = false;
+      observeMetrics();
       try {
         await el.play();
       } catch (failure) {
         if (!afterPlay(p, el, revision, serial)) return;
+        if (playFailureIs(failure, "NotAllowedError")) {
+          blocked.value = true;
+          observeMetrics();
+        } else {
+          playFailed = true;
+          if (playFailureIs(failure, "AbortError")) {
+            reportPlayInterruption();
+            return;
+          }
+        }
         throw failure;
       } finally {
         if (pendingPlay === playing) pendingPlay = undefined;
       }
       if (!afterPlay(p, el, revision, serial)) return;
       blocked.value = false;
+      if (error.value === playInterruptedError) error.value = "";
       observeMetrics();
       await applyState(true);
     }
@@ -1412,6 +1567,7 @@ export function createPlaybackRuntime(ctx: {
     if (
       !blocked.value &&
       !pendingPlay &&
+      !playFailed &&
       (el.paused || pendingForce || pendingUserSeek)
     ) {
       void runAutomaticApply(pendingForce, pendingUserSeek);
@@ -1442,6 +1598,7 @@ export function createPlaybackRuntime(ctx: {
     generationWait?.abort();
     generationWait = undefined;
     generationWaitFailed = false;
+    mediaDataLoad?.sync();
     queueApply();
     recoveryPending = !!plan || !!pendingLoad;
     updateRecovery();
@@ -1507,13 +1664,17 @@ export function createPlaybackRuntime(ctx: {
       state.value?.room_id,
       state.value?.media_id,
       state.value?.media_generation,
+      session.user?.id,
       session.epoch,
       connected.value,
       waiting.value,
       blocked.value,
       error.value,
     ],
-    updateRecovery,
+    () => {
+      mediaDataLoad?.sync();
+      updateRecovery();
+    },
     { flush: "sync" },
   );
   const timer = setInterval(tick, 500);
@@ -1546,7 +1707,7 @@ export function createPlaybackRuntime(ctx: {
     void reset().catch(() => {});
     bestEffort(() => metricSender.stop());
     if (typeof document !== "undefined")
-      document.removeEventListener("visibilitychange", observeMetrics);
+      document.removeEventListener("visibilitychange", visibilityChanged);
   });
   return {
     video,

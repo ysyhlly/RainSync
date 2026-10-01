@@ -2,17 +2,23 @@ import { afterEach, expect, it, vi } from "vitest";
 import { effectScope, ref } from "vue";
 import { createPlaybackRuntime } from "../apps/web/src/features/playback/playback-runtime";
 import { RequestFailure } from "../apps/web/src/errors";
+import { PLAYBACK_METRICS_MAX_ELAPSED_MS } from "../apps/web/src/features/playback/playback-metrics";
 
 const isPlaybackPost = (path: string) =>
   path === "/playback-sessions" ||
   path === "/playback-sessions/http-file-continuation";
 
-const faults = vi.hoisted(() => ({ observe: false, dispose: false }));
+const faults = vi.hoisted(() => ({
+  construct: false,
+  observe: false,
+  dispose: false,
+}));
 const meterStarts = vi.hoisted(() => [] as number[]);
 const hls = vi.hoisted(() => ({
   supported: false,
   start: vi.fn(),
   load: vi.fn(),
+  errorHandler: undefined as ((event: unknown, data: any) => void) | undefined,
 }));
 vi.mock("hls.js", () => ({
   default: class {
@@ -29,7 +35,9 @@ vi.mock("hls.js", () => ({
     }
     stopLoad() {}
     attachMedia() {}
-    on() {}
+    on(_event: unknown, handler: (event: unknown, data: any) => void) {
+      hls.errorHandler = handler;
+    }
     destroy() {}
   },
 }));
@@ -40,6 +48,7 @@ vi.mock(
     return {
       ...actual,
       createPlaybackMetrics: (...args: any[]) => {
+        if (faults.construct) throw new Error("telemetry construction");
         meterStarts.push(args[0].t0);
         const meter = actual.createPlaybackMetrics(...args);
         const observe = meter.observe,
@@ -58,11 +67,12 @@ vi.mock(
   },
 );
 afterEach(() => {
-  faults.observe = faults.dispose = false;
+  faults.construct = faults.observe = faults.dispose = false;
   meterStarts.length = 0;
   hls.supported = false;
   hls.start.mockClear();
-  hls.load.mockClear();
+  hls.load.mockReset();
+  hls.errorHandler = undefined;
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
@@ -85,6 +95,7 @@ function setup(
     hls?: boolean;
     fileFallback?: boolean;
     captureErrors?: boolean;
+    candidateId?: string;
   } = {},
 ) {
   vi.useFakeTimers({
@@ -126,6 +137,7 @@ function setup(
           transport:
             options.hls || body.http_file_fallback ? "hls" : "progressive",
           delivery_mode: body.http_file_fallback ? "transcode" : "direct",
+          selected_candidate_id: options.candidateId,
           ...(options.fileFallback && !body.http_file_fallback
             ? {
                 http_file_fallback_version: 1,
@@ -162,7 +174,8 @@ function setup(
   );
   const session = { user: { id: "user" }, epoch: 1, api };
   const connected = ref(true),
-    error = ref("");
+    error = ref(""),
+    active = ref(true);
   const clock = { ready: true, revision: 0, time: 0, now: () => clock.time };
   const checkClock = vi.fn();
   const scope = effectScope();
@@ -171,6 +184,7 @@ function setup(
       session: session as any,
       state: state as any,
       connected,
+      active,
       clock: clock as any,
       checkClock,
       error,
@@ -232,6 +246,7 @@ function setup(
     clock,
     state,
     connected,
+    active,
     error,
     document,
     api,
@@ -254,6 +269,697 @@ function setup(
     cleanup: () => scope.stop(),
   };
 }
+
+const mediaDataTimeout = "媒体数据加载超时，请检查连接或重新加载播放";
+const playInterrupted = "媒体播放被中断，请重试或重新加载播放";
+const playbackPosts = (s: ReturnType<typeof setup>) =>
+  s.api.mock.calls.filter(
+    ([path, method]) => isPlaybackPost(path) && method === "POST",
+  );
+
+it.each([
+  { name: "HTTP progressive", hls: false, mse: false },
+  { name: "legacy/upstream native HLS", hls: true, mse: false },
+  { name: "legacy/upstream MSE HLS", hls: true, mse: true },
+  {
+    name: "candidate-bound progressive",
+    hls: false,
+    mse: false,
+    candidateId: "direct",
+  },
+])(
+  "bounds initial usable data for $name without decoding fallback",
+  async (options) => {
+    const s = setup({ ...options, fileFallback: true });
+    try {
+      hls.supported = options.mse;
+      if (options.mse) s.el.canPlayType = () => "";
+      s.el.readyState = 1;
+      await s.runtime.loadMedia();
+      expect(s.runtime.waiting.value).toBe(true);
+      s.el.onloadedmetadata();
+      await vi.advanceTimersByTimeAsync(19999);
+      expect(s.error.value).toBe("");
+      // Ordinary waiting/buffering and a stalled network do not pause this bound.
+      expect(s.runtime.waiting.value).toBe(true);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(s.error.value).toBe(mediaDataTimeout);
+      expect(s.runtime.waiting.value).toBe(false);
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(s.runtime.sessionId.value).toBe("session-1");
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it.each(["loadeddata", "readyState"] as const)(
+  "usable %s completes the data bound without claiming a presented frame",
+  async (completion) => {
+    const s = setup();
+    try {
+      s.el.readyState = 1;
+      await s.runtime.loadMedia();
+      s.el.onloadeddata();
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(s.error.value).toBe("");
+      s.el.readyState = 2;
+      if (completion === "loadeddata") s.el.onloadeddata();
+      else await vi.advanceTimersByTimeAsync(10000);
+      s.el.readyState = 1;
+      await vi.advanceTimersByTimeAsync(25000);
+      expect(s.error.value).toBe("");
+      expect(playbackPosts(s)).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it.each(["explicit authorization failure", "media network failure"])(
+  "a media-data timeout preserves an existing %s",
+  async (failure) => {
+    const s = setup({ fileFallback: true });
+    try {
+      s.el.readyState = 1;
+      await s.runtime.loadMedia();
+      if (failure === "media network failure") {
+        s.el.error = { code: 2 };
+        s.el.onerror();
+      } else s.error.value = "播放会话已失效，请重新加载";
+      const explicitError = s.error.value;
+      await vi.advanceTimersByTimeAsync(25000);
+      expect(s.error.value).toBe(explicitError);
+      expect(s.runtime.waiting.value).toBe(false);
+      s.el.readyState = 2;
+      s.el.onloadeddata();
+      expect(s.error.value).toBe(explicitError);
+      expect(playbackPosts(s)).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it("reload owns a fresh budget and an older loadeddata callback cannot finish it", async () => {
+  const s = setup();
+  try {
+    s.el.readyState = 1;
+    await s.runtime.loadMedia();
+    const oldData = s.el.onloadeddata;
+    await vi.advanceTimersByTimeAsync(10000);
+    await s.runtime.loadMedia();
+    s.el.readyState = 2;
+    oldData();
+    s.el.readyState = 1;
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(s.error.value).toBe("");
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(s.error.value).toBe(mediaDataTimeout);
+    expect(playbackPosts(s)).toHaveLength(2);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it.each([
+  "reset",
+  "inactive",
+  "identity",
+  "user",
+  "media",
+  "media id",
+  "room",
+  "dispose",
+] as const)(
+  "%s invalidates the old data deadline and callback",
+  async (interruption) => {
+    const s = setup();
+    try {
+      s.el.readyState = 1;
+      await s.runtime.loadMedia();
+      const oldData = s.el.onloadeddata;
+      await vi.advanceTimersByTimeAsync(10000);
+      switch (interruption) {
+        case "reset":
+          await s.runtime.reset();
+          break;
+        case "inactive":
+          s.active.value = false;
+          break;
+        case "identity":
+          s.session.epoch++;
+          break;
+        case "user":
+          s.session.user.id = "other-user";
+          break;
+        case "media":
+          s.state.value.media_generation++;
+          break;
+        case "media id":
+          s.state.value.media_id = "other-media";
+          break;
+        case "room":
+          s.state.value.room_id = "other-room";
+          break;
+        case "dispose":
+          s.cleanup();
+          break;
+      }
+      await vi.advanceTimersByTimeAsync(25000);
+      expect(s.error.value).toBe("");
+      // Reusing a room or identity does not make its old source callback valid.
+      s.active.value = true;
+      s.session.epoch = 1;
+      s.session.user.id = "user";
+      s.state.value.media_generation = 1;
+      s.state.value.media_id = "media";
+      s.state.value.room_id = "room";
+      s.error.value = mediaDataTimeout;
+      s.el.readyState = 2;
+      oldData();
+      expect(s.error.value).toBe(mediaDataTimeout);
+      expect(playbackPosts(s)).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it.each([false, true])(
+  "same-plan native recovery keeps the original data budget (MSE=%s)",
+  async (mse) => {
+    const s = setup({ hls: true });
+    try {
+      hls.supported = mse;
+      s.el.readyState = 1;
+      await s.runtime.loadMedia();
+      const oldData = s.el.onloadeddata;
+      await vi.advanceTimersByTimeAsync(15000);
+      s.el.load.mockImplementation(() => {
+        // Reentrant delivery during source replacement still owns the old load.
+        s.el.readyState = 2;
+        oldData();
+        s.el.readyState = 1;
+      });
+      s.el.error = { code: mse ? 3 : 2 };
+      s.el.onerror();
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(s.el.onloadeddata).not.toBe(oldData);
+      s.el.readyState = 2;
+      oldData();
+      s.el.readyState = 1;
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(s.error.value).toBe("");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(s.error.value).toBe(mediaDataTimeout);
+      expect(playbackPosts(s)).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it("same-plan recovery after usable data does not restart the initial data deadline", async () => {
+  const s = setup({ hls: true });
+  try {
+    hls.supported = true;
+    s.el.readyState = 1;
+    await s.runtime.loadMedia();
+    s.el.readyState = 2;
+    s.el.onloadeddata();
+    s.el.readyState = 1;
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    await vi.advanceTimersByTimeAsync(25000);
+    expect(s.error.value).toBe("");
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+for (const path of ["native reload", "native to MSE", "MSE reload"] as const) {
+  it.each(["AbortError", "NotAllowedError", "success"] as const)(
+    `${path} fences a causal old play() %s and keeps the remaining data budget`,
+    async (outcome) => {
+      const s = setup({ hls: true });
+      try {
+        hls.supported = path !== "native reload";
+        if (path === "MSE reload") s.el.canPlayType = () => "";
+        s.el.readyState = 1;
+        await s.runtime.loadMedia();
+        await vi.advanceTimersByTimeAsync(15000);
+        let settle!: () => void;
+        s.el.play.mockImplementationOnce(() => {
+          s.el.paused = false;
+          return new Promise<void>((resolve, reject) => {
+            settle = () => {
+              if (outcome === "success") resolve();
+              else reject(new DOMException("old source interrupted", outcome));
+            };
+          });
+        });
+        s.el.play.mockImplementation(() => new Promise<void>(() => {}));
+        s.state.value.playback_status = "playing";
+        const oldPlay = s.runtime.applyState();
+        let interruptions = 0;
+        const interrupt = () => {
+          s.el.paused = true;
+          s.el.readyState = 1;
+          interruptions++;
+          settle();
+        };
+        s.el.load.mockImplementation(interrupt);
+        if (path === "native to MSE") s.el.pause.mockImplementation(interrupt);
+        if (path === "MSE reload") {
+          hls.load.mockImplementation(interrupt);
+          hls.errorHandler?.(undefined, {
+            fatal: true,
+            response: { code: 409 },
+          });
+        } else {
+          s.el.error = { code: path === "native to MSE" ? 3 : 2 };
+          s.el.onerror();
+        }
+        await oldPlay;
+        expect(interruptions).toBeGreaterThan(0);
+        expect(s.runtime.blocked.value).toBe(false);
+        expect(s.error.value).toBe("");
+        expect(playbackPosts(s)).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(4999);
+        expect(s.error.value).toBe("");
+        await vi.advanceTimersByTimeAsync(1);
+        expect(s.error.value).toBe(mediaDataTimeout);
+        expect(s.runtime.waiting.value).toBe(false);
+        expect(playbackPosts(s)).toHaveLength(1);
+      } finally {
+        s.cleanup();
+      }
+    },
+  );
+}
+
+it.each(["success", "NotAllowedError", "NotSupportedError"] as const)(
+  "old same-plan play %s preserves a newer room PAUSE, gesture gate, and explicit error",
+  async (outcome) => {
+    const s = setup({ hls: true });
+    try {
+      s.el.readyState = 1;
+      await s.runtime.loadMedia();
+      let settle!: () => void;
+      s.el.play.mockImplementation(
+        () =>
+          new Promise<void>((resolve, reject) => {
+            settle = () =>
+              outcome === "success"
+                ? resolve()
+                : reject(new DOMException("old source result", outcome));
+          }),
+      );
+      s.state.value.playback_status = "playing";
+      const oldPlay = s.runtime.applyState();
+      s.el.load.mockImplementation(() => {
+        s.el.paused = false;
+        settle();
+      });
+      s.el.error = { code: 2 };
+      s.el.onerror();
+      s.state.value.playback_status = "paused";
+      s.runtime.blocked.value = true;
+      s.error.value = "replacement authorization failure";
+      await oldPlay;
+      expect(s.el.paused).toBe(true);
+      expect(s.runtime.blocked.value).toBe(true);
+      expect(s.error.value).toBe("replacement authorization failure");
+      expect(playbackPosts(s)).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it.each(["source recovery", "explicit gesture", "reload"] as const)(
+  "%s clears a current-source play failure without automatic preparation",
+  async (retry) => {
+    const s = setup({ hls: true });
+    try {
+      s.el.readyState = 1;
+      await s.runtime.loadMedia();
+      s.state.value.playback_status = "playing";
+      s.el.play.mockRejectedValueOnce(
+        new DOMException("source unsupported", "NotSupportedError"),
+      );
+      await expect(s.runtime.applyState()).rejects.toMatchObject({
+        name: "NotSupportedError",
+      });
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(s.el.play).toHaveBeenCalledTimes(1);
+      expect(s.runtime.blocked.value).toBe(false);
+      s.el.play.mockImplementation(async () => {
+        s.el.paused = false;
+      });
+      if (retry === "source recovery") {
+        s.el.error = { code: 2 };
+        s.el.onerror();
+      } else if (retry === "explicit gesture") await s.runtime.enablePlayback();
+      else await s.runtime.loadMedia();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(s.el.play).toHaveBeenCalledTimes(2);
+      expect(playbackPosts(s)).toHaveLength(retry === "reload" ? 2 : 1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it.each([false, true])(
+  "generated recovery pause fences the old play promise and retains the data budget (MSE=%s)",
+  async (mse) => {
+    const s = setup({ hls: true, rebuild: true });
+    try {
+      hls.supported = mse;
+      if (mse) s.el.canPlayType = () => "";
+      s.el.readyState = 1;
+      await s.runtime.loadMedia();
+      await vi.advanceTimersByTimeAsync(15000);
+      let reject!: (failure: Error) => void;
+      s.el.play.mockImplementationOnce(() => {
+        s.el.paused = false;
+        return new Promise<void>((_resolve, fail) => {
+          reject = fail;
+        });
+      });
+      s.el.play.mockImplementation(() => new Promise<void>(() => {}));
+      s.state.value.playback_status = "playing";
+      const oldPlay = s.runtime.applyState();
+      s.el.pause.mockImplementation(() => {
+        s.el.paused = true;
+        reject(
+          new DOMException("generated wait interrupted play", "AbortError"),
+        );
+      });
+      s.el.seekable = s.el.buffered = intervals([]);
+      await s.runtime.applyState(true);
+      await oldPlay;
+      expect(s.runtime.blocked.value).toBe(false);
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(s.error.value).toBe("");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(s.error.value).toBe(mediaDataTimeout);
+      expect(playbackPosts(s)).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+for (const action of ["applyState", "enablePlayback"] as const) {
+  it.each([
+    "AbortError",
+    "NotAllowedError",
+    "NotSupportedError",
+    "Error",
+  ] as const)(
+    `${action} suspends the data budget only for an actual %s autoplay denial`,
+    async (name) => {
+      const s = setup();
+      try {
+        s.el.readyState = 1;
+        await s.runtime.loadMedia();
+        await vi.advanceTimersByTimeAsync(5000);
+        s.state.value.playback_status = "playing";
+        const failure = new DOMException("current play failure", name);
+        s.el.play.mockRejectedValueOnce(failure);
+        s.el.play.mockImplementation(() => new Promise<void>(() => {}));
+        const playing = s.runtime[action]();
+        if (
+          name === "AbortError" ||
+          (action === "applyState" && name === "NotAllowedError")
+        )
+          await expect(playing).resolves.toBeUndefined();
+        else await expect(playing).rejects.toBe(failure);
+        expect(s.runtime.blocked.value).toBe(name === "NotAllowedError");
+        await vi.advanceTimersByTimeAsync(15000);
+        expect(s.error.value).toBe(
+          name === "NotAllowedError"
+            ? ""
+            : name === "AbortError"
+              ? playInterrupted
+              : mediaDataTimeout,
+        );
+        expect(s.el.play).toHaveBeenCalledTimes(1);
+        expect(playbackPosts(s)).toHaveLength(1);
+      } finally {
+        s.cleanup();
+      }
+    },
+  );
+}
+
+it.each(["", "authorization failure"])(
+  "a current AbortError after usable data has a visible recoverable outcome and preserves %s",
+  async (priorError) => {
+    const s = setup();
+    try {
+      s.el.readyState = 2;
+      await s.runtime.loadMedia();
+      s.state.value.playback_status = "playing";
+      s.error.value = priorError;
+      s.el.play.mockRejectedValueOnce(
+        new DOMException("current playback interrupted", "AbortError"),
+      );
+      await s.runtime.applyState();
+      await vi.advanceTimersByTimeAsync(25000);
+      expect(s.runtime.blocked.value).toBe(false);
+      expect(s.error.value).toBe(priorError || playInterrupted);
+      expect(s.el.play).toHaveBeenCalledTimes(1);
+      await s.runtime.enablePlayback();
+      expect(s.el.play).toHaveBeenCalledTimes(2);
+      expect(s.error.value).toBe(priorError);
+      expect(playbackPosts(s)).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it("an explicit gesture resumes the remaining budget while its play() is still waiting for data", async () => {
+  const s = setup();
+  try {
+    s.el.readyState = 1;
+    await s.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(5000);
+    s.state.value.playback_status = "playing";
+    s.el.play.mockRejectedValueOnce(
+      new DOMException("gesture required", "NotAllowedError"),
+    );
+    await s.runtime.applyState();
+    await vi.advanceTimersByTimeAsync(30000);
+    let interrupt!: () => void;
+    s.el.play.mockImplementation(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          interrupt = () =>
+            reject(new DOMException("gesture play interrupted", "AbortError"));
+        }),
+    );
+    const gesture = s.runtime.enablePlayback();
+    expect(s.runtime.blocked.value).toBe(false);
+    await vi.advanceTimersByTimeAsync(14999);
+    expect(s.error.value).toBe("");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(s.error.value).toBe(mediaDataTimeout);
+    interrupt();
+    await gesture;
+    expect(s.runtime.blocked.value).toBe(false);
+    expect(s.error.value).toBe(mediaDataTimeout);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it.each([NaN, Infinity, -1])(
+  "a broken monotonic clock (%s) cannot extend a source transition's budget",
+  async (now) => {
+    const s = setup({ hls: true });
+    try {
+      s.el.readyState = 1;
+      await s.runtime.loadMedia();
+      await vi.advanceTimersByTimeAsync(15000);
+      const clock = vi.spyOn(performance, "now").mockReturnValue(now);
+      s.el.error = { code: 2 };
+      s.el.onerror();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(s.error.value).toBe(mediaDataTimeout);
+      expect(playbackPosts(s)).toHaveLength(1);
+      clock.mockRestore();
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it.each(["construction", "observation"] as const)(
+  "telemetry %s failure does not disable the media-data deadline",
+  async (failure) => {
+    const s = setup();
+    try {
+      if (failure === "construction") faults.construct = true;
+      else faults.observe = true;
+      s.el.readyState = 1;
+      await s.runtime.loadMedia();
+      await vi.advanceTimersByTimeAsync(20000);
+      expect(s.error.value).toBe(mediaDataTimeout);
+      expect(playbackPosts(s)).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it("the telemetry elapsed limit does not disable the core data deadline", async () => {
+  const s = setup();
+  let clock: ReturnType<typeof vi.spyOn> | undefined;
+  try {
+    s.el.readyState = 1;
+    await s.runtime.loadMedia();
+    // Advance only telemetry's sampled timestamp; avoid millions of fake ticks.
+    clock = vi
+      .spyOn(performance, "now")
+      .mockReturnValue(PLAYBACK_METRICS_MAX_ELAPSED_MS + 1);
+    await vi.advanceTimersByTimeAsync(20000);
+    expect(s.error.value).toBe(mediaDataTimeout);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    clock?.mockRestore();
+    s.cleanup();
+  }
+});
+
+it("confirmed autoplay blocking pauses the data budget and a gesture resumes it", async () => {
+  const s = setup();
+  try {
+    s.el.readyState = 1;
+    s.el.play.mockRejectedValueOnce(
+      new DOMException("gesture required", "NotAllowedError"),
+    );
+    await s.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(5000);
+    s.state.value.playback_status = "playing";
+    await s.runtime.applyState();
+    expect(s.runtime.blocked.value).toBe(true);
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(s.error.value).toBe("");
+    expect(s.runtime.recoveryState.value).toBe("blocked");
+    await s.runtime.enablePlayback();
+    expect(s.runtime.blocked.value).toBe(false);
+    await vi.advanceTimersByTimeAsync(14999);
+    expect(s.error.value).toBe("");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(s.error.value).toBe(mediaDataTimeout);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("an unresolved play promise cannot hide a data stall and a late gesture rejection takes priority", async () => {
+  const s = setup();
+  let reject!: (failure: Error) => void;
+  try {
+    s.el.readyState = 1;
+    s.state.value.playback_status = "playing";
+    s.el.play.mockImplementation(
+      () =>
+        new Promise<void>((_resolve, fail) => {
+          reject = fail;
+        }),
+    );
+    await s.runtime.loadMedia();
+    const playing = s.runtime.applyState();
+    await vi.advanceTimersByTimeAsync(20000);
+    expect(s.error.value).toBe(mediaDataTimeout);
+    reject(new DOMException("gesture required", "NotAllowedError"));
+    await playing;
+    expect(s.runtime.blocked.value).toBe(true);
+    expect(s.error.value).toBe("");
+    expect(s.runtime.recoveryState.value).toBe("blocked");
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("hidden visibility pauses the data budget and foreground calibration keeps the remaining budget", async () => {
+  const s = setup();
+  try {
+    s.el.readyState = 1;
+    await s.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(5000);
+    s.document.visibilityState = "hidden";
+    s.document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(s.error.value).toBe("");
+    expect(s.runtime.recoveryState.value).toBe("background");
+    s.clock.ready = false;
+    s.document.visibilityState = "visible";
+    s.document.dispatchEvent(new Event("visibilitychange"));
+    expect(s.runtime.recoveryState.value).toBe("calibrating");
+    await vi.advanceTimersByTimeAsync(14999);
+    expect(s.error.value).toBe("");
+    expect(s.runtime.recoveryState.value).toBe("calibrating");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(s.error.value).toBe(mediaDataTimeout);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("queue preparation and generated readiness have separate waits from usable-data loading", async () => {
+  const s = setup({ rebuild: true, hls: true, ranges: [] });
+  let ready = false;
+  const original = s.api.getMockImplementation()!;
+  s.api.mockImplementation(async (path, method, body) => {
+    if (method === "GET" && path.startsWith("/playback-sessions/"))
+      return {
+        session_id: "session-1",
+        plan_generation: 1,
+        status: ready ? "ready" : "queued",
+        complete: false,
+        available_until_ms: 30000,
+      };
+    return original(path, method, body);
+  });
+  try {
+    s.el.readyState = 1;
+    const loading = s.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(s.el.src).toBe("");
+    expect(s.error.value).toBe("");
+    ready = true;
+    await vi.advanceTimersByTimeAsync(1000);
+    await loading;
+    await vi.advanceTimersByTimeAsync(5000);
+    ready = false;
+    const generating = s.runtime.applyState(true);
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(s.error.value).toBe("");
+    expect(s.runtime.waiting.value).toBe(true);
+    ready = true;
+    await vi.advanceTimersByTimeAsync(1000);
+    await generating;
+    await vi.advanceTimersByTimeAsync(14999);
+    expect(s.error.value).toBe("");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(s.error.value).toBe(mediaDataTimeout);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});
 
 it("continues an opted-in HTTP decoder failure once with the old final sample before DELETE", async () => {
   const s = setup({ fileFallback: true, observationSeq: 0 });
@@ -939,7 +1645,9 @@ it("an autoplay rejection waits for the explicit gesture instead of periodic pla
   try {
     await s.prepare();
     s.state.value.playback_status = "playing";
-    s.el.play.mockRejectedValue(new Error("gesture required"));
+    s.el.play.mockRejectedValue(
+      new DOMException("gesture required", "NotAllowedError"),
+    );
     await s.runtime.applyState();
     await vi.advanceTimersByTimeAsync(5000);
     expect(s.el.play).toHaveBeenCalledTimes(1);
@@ -1122,7 +1830,9 @@ it("autoplay recovery keeps the gesture button and completes only after successf
     await s.runtime.applyState();
     s.state.value.playback_status = "playing";
     s.invalidate();
-    s.el.play.mockRejectedValue(new Error("gesture required"));
+    s.el.play.mockRejectedValue(
+      new DOMException("gesture required", "NotAllowedError"),
+    );
     s.clock.ready = true;
     s.runtime.onClockReady();
     await vi.advanceTimersByTimeAsync(0);

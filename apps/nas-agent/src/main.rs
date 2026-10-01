@@ -137,9 +137,18 @@ async fn transfer(
             })
             .await?;
         let size = snapshot.len;
-        let range = match media_core::byte_range(request["range"].as_str(), size) {
-            Ok(value) => value,
-            Err(_) => {
+        // Also normalize at the file owner for older Workers. HEAD always
+        // describes the complete representation; malformed/multi-range input
+        // is ignored, while a valid range selecting no bytes remains 416.
+        let range_request = if request["head"].as_bool().unwrap_or(false) {
+            media_core::http_range::Request::default()
+        } else {
+            media_core::http_range::Request::parse(request["range"].as_str())
+        };
+        let range = match range_request.resolve(size) {
+            media_core::http_range::Selection::Full => None,
+            media_core::http_range::Selection::Partial(start, end) => Some((start, end)),
+            media_core::http_range::Selection::Unsatisfiable => {
                 headers_started = true;
                 tokio::time::timeout(std::time::Duration::from_secs(30), writer.send(Message::Text(json!({"status":416,"content-range":format!("bytes */{size}"),"content-length":"0"}).to_string().into()))).await??;
                 return Ok(());

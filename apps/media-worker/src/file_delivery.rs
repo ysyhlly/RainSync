@@ -7,7 +7,10 @@ use axum::{
     response::Response,
 };
 use futures_util::Stream;
-use media_core::{child_process, file_version};
+use media_core::{
+    child_process, file_version,
+    http_range::{Request as RangeRequest, Selection as Range},
+};
 use std::{
     fs::File,
     io::{self, Read, Seek},
@@ -28,69 +31,22 @@ fn verify(file: &File, version: Option<&str>) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, PartialEq)]
-enum Range {
-    Full,
-    Partial(u64, u64),
-    Unsatisfiable,
-}
-
-/// Range applies only to GET. Malformed/unsupported ranges are ignored; a
-/// syntactically valid range that selects no bytes receives 416 (RFC 9110).
-fn select_range(headers: &HeaderMap, head: bool, size: u64) -> Range {
-    // stat-v1 detects local changes but is not a strong representation validator.
-    // Until the caller supplies a trustworthy ETag/date, If-Range cannot match.
+/// Local files and NAS use the same request policy. stat-v1 is a change
+/// detector, not a strong HTTP validator, so no If-Range value can match it.
+pub(crate) fn range_request(headers: &HeaderMap, head: bool) -> RangeRequest {
     if head || headers.contains_key(header::IF_RANGE) {
-        return Range::Full;
+        return RangeRequest::default();
     }
     let mut values = headers.get_all(header::RANGE).iter();
-    let Some(value) = values.next().and_then(|v| v.to_str().ok()) else {
-        return Range::Full;
-    };
+    let value = values.next().and_then(|value| value.to_str().ok());
     if values.next().is_some() {
-        return Range::Full;
+        return RangeRequest::default();
     }
-    let Some(raw) = value.strip_prefix("bytes=") else {
-        return Range::Full;
-    };
-    let Some((start, end)) = raw.split_once('-') else {
-        return Range::Full;
-    };
-    let number = |value: &str| {
-        (!value.is_empty() && value.bytes().all(|v| v.is_ascii_digit()))
-            .then(|| value.parse::<u64>().ok())
-            .flatten()
-    };
-    if start.is_empty() {
-        let Some(suffix) = number(end) else {
-            return Range::Full;
-        };
-        if suffix == 0 || size == 0 {
-            Range::Unsatisfiable
-        } else {
-            Range::Partial(size.saturating_sub(suffix), size - 1)
-        }
-    } else {
-        let Some(start) = number(start) else {
-            return Range::Full;
-        };
-        let end = if end.is_empty() {
-            None
-        } else if let Some(end) = number(end) {
-            Some(end)
-        } else {
-            return Range::Full;
-        };
-        // Reversed bounds are invalid syntax, rather than an unsatisfied range.
-        if end.is_some_and(|end| end < start) {
-            return Range::Full;
-        }
-        if start >= size {
-            Range::Unsatisfiable
-        } else {
-            Range::Partial(start, end.unwrap_or(size - 1).min(size - 1))
-        }
-    }
+    RangeRequest::parse(value)
+}
+
+fn select_range(headers: &HeaderMap, head: bool, size: u64) -> Range {
+    range_request(headers, head).resolve(size)
 }
 fn stream(
     file: Arc<File>,

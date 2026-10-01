@@ -386,8 +386,10 @@ try {
   const head = await complete({ head: true });
   assert.equal(head.bytes, 0);
   assert.equal(head.headers[0]["content-length"], "1073741824");
-  const headRange = await complete({ head: true, range: "bytes=10-99" }, 206);
+  const headRange = await complete({ head: true, range: "bytes=10-99" }, 200);
   assert.equal(headRange.bytes, 0);
+  assert.equal(headRange.headers[0]["content-length"], "1073741824");
+  assert.equal(headRange.headers[0]["content-range"], undefined);
   await complete({ resource: "missing.mp4" }, 404);
   await complete({ range: "bytes=1073741824-" }, 416);
   await probeLocked([], "Range/HEAD/error source files released");

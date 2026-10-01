@@ -46,7 +46,7 @@ HLS 清单中的子清单、分片、初始化片段和 KEY URI 被重写为 Rai
 
 本地和有有效 source_version 的 NAS 文件可通过 `/api/v1/playback-candidates` 获得至多四条实际候选：原 MP4 直放、符合条件的复制转封装、复制视频/转 AAC，以及固定 SDR 720p/30fps/AVC High Level 3.1 转码。实际 AVC/AAC 配置来自源元数据与编码字节，缺失信息不猜测，HDR 不自动转换。五分钟加密绑定限制用户、房间、生命周期 epoch、代次、媒体/源版本、音轨和原始候选；发布时再次校验。
 
-浏览器保留旧布尔与有限样本报告以兼容，实际候选仅探测服务端给出的配置，等待最多 500ms 并冻结回报。实际 passthrough 要求对应 decodingInfo 明确支持，API 不可用时仅固定保守转码可使用 MIME 提示；明确不支持不当作未知。自动模式仅解码错误可排除候选、每路线一次且最多三条路线；网络/鉴权/首帧超时不自动升级转码，20 秒首帧等待给出明确错误。原生 HLS 保留一次 native→MSE 回退，关闭/换媒体/离房取消后续链路。
+浏览器保留旧布尔与有限样本报告以兼容，实际候选仅探测服务端给出的配置，等待最多 500ms 并冻结回报。实际 passthrough 要求对应 decodingInfo 明确支持，API 不可用时仅固定保守转码可使用 MIME 提示；明确不支持不当作未知。自动模式仅解码错误可排除候选、每路线一次且最多三条路线；网络/鉴权/初始媒体数据装载超时不自动升级转码。所有已挂接方案使用20秒有效装载预算，准备/已知生成、明确后台与手势等待单列；可用媒体数据不等于首帧呈现证据，具体边界见 [能力与装载契约](PLAYBACK_CAPABILITIES.md)。原生 HLS 保留一次 native→MSE 回退，关闭/换媒体/离房取消后续链路。
 
 HTTP/Jellyfin/Emby 等无稳定文件版本的外部来源返回 `provider_requires_legacy_negotiation` 并走既有保守路径；无版本 NAS 返回 `source_version_required`，不伪造文件证明。该区分与 `decision_reason`、候选契约/边界见 [能力协商](PLAYBACK_CAPABILITIES.md)，不代表所有媒体或设备已验收。
 

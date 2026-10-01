@@ -74,7 +74,7 @@ pub async fn fetch(
             .replace("https://", "wss://")
             .replace("http://", "ws://")
     );
-    let request = json!({"data_url":data_url,"resource":resource["resource"],"source_version":source_version,"range":h.get(header::RANGE).and_then(|v|v.to_str().ok()),"head":head,"drain_receipt_required":session_id.is_some()});
+    let request = json!({"data_url":data_url,"resource":resource["resource"],"source_version":source_version,"range":file_delivery::range_request(h, head).header_value(),"head":head,"drain_receipt_required":session_id.is_some()});
     let (cancel, cancelled) = oneshot::channel();
     let registration = Registration {
         id,

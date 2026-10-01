@@ -1,3 +1,4 @@
+pub mod http_range;
 pub mod input_policy;
 pub mod runtime_metrics;
 use anyhow::{Result, bail};
