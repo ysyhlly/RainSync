@@ -15,6 +15,16 @@
         "null"
       ]
     },
+    "decoder_fallback_modes": {
+      "description": "Evidence-backed next request modes, never access or decode guarantees.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/DecoderFallbackMode"
+      }
+    },
     "delivery_mode": {
       "type": "string"
     },
@@ -56,6 +66,14 @@
       "format": "uint32",
       "minimum": 0
     },
+    "pending_job_id": {
+      "description": "A real authorized local job only while queued or running.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
     "plan_generation": {
       "description": "Per-viewer intent generation; absent for legacy grants. Never room revision.",
       "type": [
@@ -91,6 +109,16 @@
     "rebuild_on_seek": {
       "type": "boolean"
     },
+    "seekable_media_ranges_ms": {
+      "description": "Original-media intervals; absent is unknown, while [] is known empty.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/PlaybackMediaRange"
+      }
+    },
     "selected_audio_track": {
       "type": [
         "integer",
@@ -108,6 +136,17 @@
     "session_id": {
       "type": "string",
       "format": "uuid"
+    },
+    "subtitle_mode": {
+      "description": "Available delivery pipeline, not the user's currently selected subtitle.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SubtitleDeliveryMode"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "subtitle_tracks": {
       "type": "array",
@@ -137,6 +176,14 @@
     "subtitle_tracks"
   ],
   "$defs": {
+    "DecoderFallbackMode": {
+      "description": "A next request mode justified by existing source/output evidence. It is\nneither authorization nor a guarantee that the device will decode it.",
+      "type": "string",
+      "enum": [
+        "remux",
+        "transcode"
+      ]
+    },
     "MediaTrack": {
       "type": "object",
       "properties": {
@@ -162,6 +209,27 @@
         "index",
         "label",
         "language"
+      ]
+    },
+    "PlaybackMediaRange": {
+      "description": "A measured or otherwise established interval in original-media time.\nThe start is inclusive and the end is exclusive; an empty interval is omitted.",
+      "type": "object",
+      "properties": {
+        "end_ms": {
+          "type": "number",
+          "format": "double",
+          "minimum": 0
+        },
+        "start_ms": {
+          "type": "number",
+          "format": "double",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "start_ms",
+        "end_ms"
       ]
     },
     "PlaybackMetricsFirstFrame": {
@@ -374,6 +442,14 @@
         "rebuffer_ms",
         "playing_ms",
         "unobserved_ms"
+      ]
+    },
+    "SubtitleDeliveryMode": {
+      "description": "Subtitle delivery available in the plan, independent of local selection.",
+      "type": "string",
+      "enum": [
+        "none",
+        "external_vtt"
       ]
     }
   }

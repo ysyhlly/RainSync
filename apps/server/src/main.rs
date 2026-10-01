@@ -14,6 +14,7 @@ mod metrics;
 mod playback_capabilities;
 mod playback_metrics;
 mod playback_observations;
+mod playback_plan;
 mod playback_requests;
 mod preparation_owner;
 pub mod presence;

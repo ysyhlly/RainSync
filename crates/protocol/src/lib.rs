@@ -12,6 +12,8 @@ mod playback_metrics;
 pub use playback_metrics::*;
 mod playback_candidates;
 pub use playback_candidates::*;
+mod playback_facts;
+pub use playback_facts::*;
 
 pub const VERSION: u8 = 1;
 /// Unknown-duration media is bounded to one week. Known durations are authoritative.
@@ -108,6 +110,22 @@ pub struct PlaybackPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub selected_candidate_id: Option<String>,
+    /// Available delivery pipeline, not the user's currently selected subtitle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub subtitle_mode: Option<SubtitleDeliveryMode>,
+    /// Original-media intervals; absent is unknown, while [] is known empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub seekable_media_ranges_ms: Option<Vec<PlaybackMediaRange>>,
+    /// A real authorized local job only while queued or running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pending_job_id: Option<Uuid>,
+    /// Evidence-backed next request modes, never access or decode guarantees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub decoder_fallback_modes: Option<Vec<DecoderFallbackMode>>,
     /// Present only when this grant negotiated actual viewer observations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -184,6 +202,13 @@ pub struct PlaybackReadiness {
     /// Exclusive end of the published prefix, relative to the plan's timeline origin.
     /// None means this source/legacy output has no measured generated interval.
     pub available_until_ms: Option<f64>,
+    /// Original-media intervals; absent is unknown, while [] is known empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub seekable_media_ranges_ms: Option<Vec<PlaybackMediaRange>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pending_job_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub observation_version: Option<u32>,

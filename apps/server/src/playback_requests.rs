@@ -86,6 +86,8 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
                 plan["expires_in_seconds"] = json!(remaining);
                 playback_observations::refresh_plan(&mut tx, &mut plan).await?;
                 playback_metrics::refresh(&mut tx, &mut plan).await?;
+                playback_plan::refresh(app, &mut tx, user, row.get("session_id"), &mut plan)
+                    .await?;
                 sqlx::query("UPDATE playback_requests SET expires_at=GREATEST(expires_at,now()+interval '48 hours') WHERE user_id=$1 AND idempotency_key=$2")
                     .bind(user).bind(key).execute(&mut *tx).await?;
                 tx.commit().await?;
@@ -312,6 +314,14 @@ pub async fn fail(app: &App, reservation: &Reservation, error: &Error) -> Result
         let mut plan = app.decrypt(&row.get::<String, _>("response_encrypted"))?;
         playback_observations::refresh_plan(&mut tx, &mut plan).await?;
         playback_metrics::refresh(&mut tx, &mut plan).await?;
+        playback_plan::refresh(
+            app,
+            &mut tx,
+            reservation.user,
+            reservation.session,
+            &mut plan,
+        )
+        .await?;
         return Ok(Some(plan));
     }
     let exhausted = row.get::<String, _>("status") == "pending"

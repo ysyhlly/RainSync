@@ -6,11 +6,30 @@ export type Action = { "type": "PLAY" } | { "type": "PAUSE" } | { "type": "SEEK"
 export type Command = { protocol_version: number, room_id: string, command_id: string, control_epoch?: string, expected_revision: number, media_generation: number, } & ({ "type": "PLAY" } | { "type": "PAUSE" } | { "type": "SEEK", "payload": { position_ms: number, } } | { "type": "SET_RATE", "payload": { rate: number, } } | { "type": "CHANGE_MEDIA", "payload": { media_id: string, } } | { "type": "END_MEDIA", "payload": { position_ms: number, } });
 export type ControlEpoch = { id: string, expires_at_ms: number, };
 export type MediaTrack = { index: number, label: string, language: string, url: string | null, };
+export type SubtitleDeliveryMode = "none" | "external_vtt";
+export type DecoderFallbackMode = "remux" | "transcode";
+export type PlaybackMediaRange = { start_ms: number, end_ms: number, };
 export type PlaybackPlan = { session_id: string,
 /**
  * Per-viewer intent generation; absent for legacy grants. Never room revision.
  */
 plan_generation?: number, media_id: string, media_generation: number, delivery_mode: string, transport: string, playback_url: string, timeline_origin_ms: number, duration_ms: number | null, expires_in_seconds: number, rebuild_on_seek: boolean, audio_tracks: Array<MediaTrack>, subtitle_tracks: Array<MediaTrack>, decision_reason?: string, selected_audio_track?: number, selected_candidate_id?: string,
+/**
+ * Available delivery pipeline, not the user's currently selected subtitle.
+ */
+subtitle_mode?: SubtitleDeliveryMode,
+/**
+ * Original-media intervals; absent is unknown, while [] is known empty.
+ */
+seekable_media_ranges_ms?: Array<PlaybackMediaRange>,
+/**
+ * A real authorized local job only while queued or running.
+ */
+pending_job_id?: string,
+/**
+ * Evidence-backed next request modes, never access or decode guarantees.
+ */
+decoder_fallback_modes?: Array<DecoderFallbackMode>,
 /**
  * Present only when this grant negotiated actual viewer observations.
  */
@@ -29,7 +48,11 @@ plan_generation?: number, status: PreparationStatus, complete: boolean,
  * Exclusive end of the published prefix, relative to the plan's timeline origin.
  * None means this source/legacy output has no measured generated interval.
  */
-available_until_ms: number | null, observation_version?: number, observation_seq?: number, };
+available_until_ms: number | null,
+/**
+ * Original-media intervals; absent is unknown, while [] is known empty.
+ */
+seekable_media_ranges_ms?: Array<PlaybackMediaRange>, pending_job_id?: string, observation_version?: number, observation_seq?: number, };
 export type MediaTypeSupport = "unknown" | "unsupported" | "maybe" | "probably";
 export type VideoCapabilityConfiguration = { content_type: string, width: number, height: number, bitrate: number, framerate: number, };
 export type AudioCapabilityConfiguration = { content_type: string, channels: string, bitrate: number, samplerate: number, };

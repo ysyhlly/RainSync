@@ -285,6 +285,26 @@ async fn prepare_playback(
     };
     let mut resource = json!({"kind":kind,"resource":item,"root":config.root,"headers":{},"source_url":config.url,"access_policy":config.access_policy,"source_policy_revision":source_policy_revision,"source_id":source_id});
     let mut meta: Value = row.get("metadata");
+    let local_fact_version = if kind == "local" {
+        Some(playback_capabilities::current_local_version(
+            &config.root,
+            &item,
+        )?)
+    } else {
+        None
+    };
+    let mut current_metadata = match kind.as_str() {
+        "local" => local_fact_version.as_deref().is_some_and(|version| {
+            meta["capability_source_version"].as_str() == Some(version)
+                || meta["preview_file_version"].as_str() == Some(version)
+        }),
+        "agent" => source_version
+            .as_deref()
+            .is_some_and(|version| meta["capability_source_version"].as_str() == Some(version)),
+        _ => false,
+    };
+    let mut probed = false;
+    let mut negotiated_info = None;
     let mut duration: Option<f64> = row.get("duration_ms");
     let mut position_ms = protocol::bounded_position(body.position_ms, duration);
     let mut transport = "progressive";
@@ -468,6 +488,7 @@ async fn prepare_playback(
             resource["upstream_media_source"] = source["Id"].clone();
             resource["upstream_live_stream"] = source["LiveStreamId"].clone();
             resource["headers"] = json!(providers::upstream_headers(&kind, &config, &device_id)?);
+            negotiated_info = Some(info);
         }
         _ => {}
     }
@@ -542,6 +563,8 @@ async fn prepare_playback(
             .execute(&app.db)
             .await?;
         meta = probe?;
+        current_metadata = true;
+        probed = true;
         if kind == "agent" {
             meta["capability_source_version"] = json!(source_version);
         }
@@ -571,17 +594,19 @@ async fn prepare_playback(
         .map(|rows| {
             rows.iter()
                 .filter(|s| s["codec_type"] == "audio")
-                .map(|s| protocol::MediaTrack {
-                    index: s["index"].as_u64().unwrap_or(0) as u32,
-                    label: s["tags"]["title"].as_str().unwrap_or("Audio").into(),
-                    language: s["tags"]["language"].as_str().unwrap_or("und").into(),
-                    url: None,
+                .filter_map(|s| {
+                    Some(protocol::MediaTrack {
+                        index: playback_plan::stream_index(s)?,
+                        label: s["tags"]["title"].as_str().unwrap_or("Audio").into(),
+                        language: s["tags"]["language"].as_str().unwrap_or("und").into(),
+                        url: None,
+                    })
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     if let Some(index) = body.audio_index
-        && !audio_tracks.iter().any(|t| t.index == index)
+        && audio_tracks.iter().filter(|t| t.index == index).count() != 1
     {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_audio_track"));
     }
@@ -595,16 +620,16 @@ async fn prepare_playback(
                             Some("subrip" | "webvtt" | "mov_text")
                         )
                 })
-                .map(|s| {
-                    let index = s["index"].as_u64().unwrap_or(0) as u32;
-                    protocol::MediaTrack {
+                .filter_map(|s| {
+                    let index = playback_plan::stream_index(s)?;
+                    Some(protocol::MediaTrack {
                         index,
                         label: s["tags"]["title"].as_str().unwrap_or("Subtitle").into(),
                         language: s["tags"]["language"].as_str().unwrap_or("und").into(),
                         url: Some(format!(
                             "/media-delivery/{id}/subtitle-{index}.vtt?token={t}"
                         )),
-                    }
+                    })
                 })
                 .collect::<Vec<_>>()
         })
@@ -671,6 +696,27 @@ async fn prepare_playback(
     }
     resource["transport"] = json!(transport);
     resource["timeline_origin_ms"] = json!(timeline);
+    resource["plan_facts_version"] = json!(1);
+    let hls_supported = body.capabilities.as_ref().is_none_or(|c| c.supports_hls());
+    let decoder_fallback_modes = if selected.is_some() {
+        vec![]
+    } else if let Some(info) = &negotiated_info {
+        playback_plan::upstream_fallbacks(info, mode, hls_supported, &config.url)
+    } else {
+        playback_plan::local_fallbacks(&meta, mode, position_ms, current_metadata, hls_supported)
+    };
+    let selected_audio_track = if matches!(kind.as_str(), "jellyfin" | "emby") {
+        negotiated_info
+            .as_ref()
+            .and_then(|info| playback_plan::upstream_audio(info, body.audio_index, mode))
+    } else {
+        playback_plan::mapped_audio(&meta, body.audio_index, mode, current_metadata)
+    };
+    let subtitle_mode = if subtitle_tracks.iter().any(|track| track.url.is_some()) {
+        protocol::SubtitleDeliveryMode::ExternalVtt
+    } else {
+        protocol::SubtitleDeliveryMode::None
+    };
     let encrypted = app.encrypt(&resource)?;
     let plan = protocol::PlaybackPlan {
         session_id: id,
@@ -697,19 +743,20 @@ async fn prepare_playback(
         playback_metrics_version: None,
         playback_metrics: None,
         observation_seq: body.observation_version.map(|_| 0),
-        decision_reason: Some(selected.as_ref().map_or_else(
-            || "legacy_conservative_transport_negotiation".to_string(),
-            |s| format!("actual_media_{}", s.candidate.id),
+        decision_reason: Some(playback_plan::decision_reason(
+            &kind,
+            requested_mode,
+            mode,
+            current_metadata,
+            probed,
+            selected.as_ref().map(|s| s.candidate.id.as_str()),
         )),
         selected_candidate_id: selected.as_ref().map(|s| s.candidate.id.clone()),
-        selected_audio_track: body.audio_index.or_else(|| {
-            meta["streams"]
-                .as_array()?
-                .iter()
-                .find(|s| s["codec_type"] == "audio")?["index"]
-                .as_u64()
-                .and_then(|v| u32::try_from(v).ok())
-        }),
+        subtitle_mode: Some(subtitle_mode),
+        seekable_media_ranges_ms: None,
+        pending_job_id: None,
+        decoder_fallback_modes: Some(decoder_fallback_modes),
+        selected_audio_track,
     };
     let protocol_plan = plan;
     let mut plan = serde_json::to_value(&protocol_plan).map_err(anyhow::Error::from)?;
@@ -759,9 +806,8 @@ async fn prepare_playback(
         return Err(err(StatusCode::CONFLICT, "source_changed"));
     }
     if kind == "local"
-        && let Some(selection) = &selected
-        && playback_capabilities::current_local_version(&config.root, &item)?
-            != selection.source_version
+        && let Some(version) = &local_fact_version
+        && playback_capabilities::current_local_version(&config.root, &item)? != *version
     {
         return Err(err(StatusCode::CONFLICT, "source_changed"));
     }
@@ -787,6 +833,7 @@ async fn prepare_playback(
         plan["playback_metrics_version"] = json!(protocol::PLAYBACK_METRICS_VERSION);
         plan["playback_metrics"] = serde_json::to_value(grant).map_err(anyhow::Error::from)?;
     }
+    playback_plan::refresh(app, &mut tx, u.id, id, &mut plan).await?;
     playback_requests::complete(app, &mut tx, reservation, &plan).await?;
     if matches!(kind.as_str(), "jellyfin" | "emby")
         && !persistence::upstream_reservations::activate(
@@ -822,25 +869,6 @@ pub struct ReadinessQuery {
     relative_position_ms: Option<f64>,
 }
 
-// Only the committed manifest is authoritative; never inspect FFmpeg's private file.
-fn published_duration_ms(manifest: &str, segments: i32) -> Option<f64> {
-    let mut count = 0;
-    let mut seconds = 0.0;
-    for duration in manifest
-        .lines()
-        .filter_map(|line| line.strip_prefix("#EXTINF:"))
-    {
-        let value: f64 = duration.split_once(',')?.0.parse().ok()?;
-        if !value.is_finite() || value <= 0.0 {
-            return None;
-        }
-        seconds += value;
-        count += 1;
-    }
-    let ms = seconds * 1000.0;
-    (count == segments && count > 0 && ms.is_finite()).then_some(ms)
-}
-
 pub async fn readiness(
     State(app): State<App>,
     h: HeaderMap,
@@ -855,9 +883,13 @@ pub async fn readiness(
         return Err(err(StatusCode::BAD_REQUEST, "invalid_position"));
     }
     // One statement gives permission and the current attempt a consistent snapshot.
-    let row = sqlx::query("SELECT p.plan_generation, j.status AS job_status, j.error AS job_error, o.validation_version, o.ready_segments, o.visible_manifest, v.seq AS observation_seq FROM playback_sessions p JOIN rooms r ON r.id=p.room_id JOIN room_snapshots s ON s.room_id=p.room_id LEFT JOIN media_jobs j ON j.session_id=p.id LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt LEFT JOIN playback_observations v ON v.session_id=p.id WHERE p.id=$1 AND p.user_id=$2 AND r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource) AND p.expires_at>now() AND (s.state->>'media_generation')::bigint=p.generation AND (p.viewer_id IS NULL OR EXISTS(SELECT 1 FROM playback_viewer_plans g WHERE g.user_id=p.user_id AND g.room_id=p.room_id AND g.viewer_id=p.viewer_id AND g.plan_generation=p.plan_generation)) AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
-        .bind(id).bind(u.id).fetch_optional(&app.db).await?
+    let row = sqlx::query(playback_plan::AUTHORIZED_SNAPSHOT_SQL)
+        .bind(id)
+        .bind(u.id)
+        .fetch_optional(&app.db)
+        .await?
         .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
+    let facts = playback_plan::job_facts(&app, &row)?;
     let plan_generation = row
         .get::<Option<i64>, _>("plan_generation")
         .map(|v| v as u32);
@@ -869,14 +901,22 @@ pub async fn readiness(
     let legacy = row
         .get::<Option<i32>, _>("validation_version")
         .is_some_and(|v| v < 2);
-    let available_until_ms = if job.is_none() || legacy {
+    let available_until_ms = if job.is_none() {
+        None
+    } else if facts.recorded {
+        facts.seekable_media_ranges_ms.as_ref().map(|ranges| {
+            ranges
+                .first()
+                .map_or(0.0, |range| range.end_ms - range.start_ms)
+        })
+    } else if legacy {
         None
     } else {
         Some(
             row.get::<Option<String>, _>("visible_manifest")
                 .as_deref()
                 .and_then(|m| {
-                    published_duration_ms(
+                    playback_plan::published_duration_ms(
                         m,
                         row.get::<Option<i32>, _>("ready_segments").unwrap_or(0),
                     )
@@ -904,7 +944,11 @@ pub async fn readiness(
                         || query.relative_position_ms.unwrap_or(0.0) < end)
             });
             (
-                if legacy || visible { Ready } else { Preparing },
+                if (legacy && !facts.recorded) || visible {
+                    Ready
+                } else {
+                    Preparing
+                },
                 job.as_deref() == Some("succeeded"),
             )
         }
@@ -916,6 +960,8 @@ pub async fn readiness(
         status,
         complete,
         available_until_ms,
+        seekable_media_ranges_ms: facts.seekable_media_ranges_ms,
+        pending_job_id: facts.pending_job_id,
         observation_version: row.get::<Option<i64>, _>("observation_seq").map(|_| 1),
         observation_seq: row
             .get::<Option<i64>, _>("observation_seq")
@@ -1027,7 +1073,7 @@ pub async fn renew(
 
 #[cfg(test)]
 mod readiness_tests {
-    use super::published_duration_ms;
+    use super::playback_plan::published_duration_ms;
     #[test]
     fn published_interval_requires_finite_positive_durations_and_exact_count() {
         assert_eq!(

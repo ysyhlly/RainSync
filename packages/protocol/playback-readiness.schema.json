@@ -31,6 +31,13 @@
       "format": "uint32",
       "minimum": 0
     },
+    "pending_job_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
     "plan_generation": {
       "description": "Echoes the immutable grant generation, independent of job attempts.",
       "type": [
@@ -39,6 +46,16 @@
       ],
       "format": "uint32",
       "minimum": 1
+    },
+    "seekable_media_ranges_ms": {
+      "description": "Original-media intervals; absent is unknown, while [] is known empty.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/PlaybackMediaRange"
+      }
     },
     "session_id": {
       "type": "string",
@@ -54,6 +71,27 @@
     "complete"
   ],
   "$defs": {
+    "PlaybackMediaRange": {
+      "description": "A measured or otherwise established interval in original-media time.\nThe start is inclusive and the end is exclusive; an empty interval is omitted.",
+      "type": "object",
+      "properties": {
+        "end_ms": {
+          "type": "number",
+          "format": "double",
+          "minimum": 0
+        },
+        "start_ms": {
+          "type": "number",
+          "format": "double",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "start_ms",
+        "end_ms"
+      ]
+    },
     "PreparationStatus": {
       "type": "string",
       "enum": [
