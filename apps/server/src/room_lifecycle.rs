@@ -101,13 +101,15 @@ async fn change(
         }
     }
     let mut state: RoomState = serde_json::from_value(value).map_err(anyhow::Error::from)?;
+    let before = state.clone();
     if state.revision != body.expected_revision {
         return Err(err(StatusCode::CONFLICT, "revision_conflict"));
     }
     if room.get::<String, _>("lifecycle") != expected {
         return Err(err(StatusCode::CONFLICT, "room_lifecycle_conflict"));
     }
-    let epoch: i64 = room.get("lifecycle_epoch");
+    let previous_epoch: i64 = room.get("lifecycle_epoch");
+    let epoch = previous_epoch;
     let epoch = if target == "archived" {
         epoch
     } else {
@@ -138,13 +140,26 @@ async fn change(
         .bind(&value)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO room_events(room_id,revision,state) VALUES($1,$2,$3)")
-        .bind(id)
-        .bind(i64::from(state.revision))
-        .bind(&value)
-        .execute(&mut *tx)
-        .await?;
     let event_id = Uuid::new_v4();
+    use room_core::diagnostics::{CheckpointReason, Operation};
+    let reason = match target {
+        "closing" => CheckpointReason::Closing,
+        "active" => CheckpointReason::Reopened,
+        "archived" => CheckpointReason::Archived,
+        _ => return Err(err(StatusCode::CONFLICT, "room_lifecycle_conflict")),
+    };
+    let diagnostic = persistence::room_diagnostics::envelope(
+        event_id,
+        before,
+        Some((user.id, user.admin)),
+        persistence::room_diagnostics::lifecycle(expected, previous_epoch)?,
+        persistence::room_diagnostics::lifecycle(target, epoch)?,
+        Operation::Checkpoint {
+            reason,
+            command: None,
+        },
+    );
+    persistence::room_diagnostics::append(&mut tx, &state, diagnostic).await?;
     sqlx::query("INSERT INTO room_lifecycle_events(id,room_id,actor_id,previous_lifecycle,lifecycle,lifecycle_epoch,revision) VALUES($1,$2,$3,$4,$5,$6,$7)")
         .bind(event_id).bind(id).bind(user.id).bind(expected).bind(target).bind(epoch).bind(i64::from(state.revision)).execute(&mut *tx).await?;
     // These revocations are part of the same commit as the state transition.

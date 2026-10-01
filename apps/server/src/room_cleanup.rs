@@ -28,6 +28,7 @@ async fn finish(app: &App, task: &Task) -> anyhow::Result<Option<(protocol::Room
             .fetch_one(&mut *tx)
             .await?,
     )?;
+    let before = state.clone();
     state.revision = state
         .revision
         .checked_add(1)
@@ -43,12 +44,18 @@ async fn finish(app: &App, task: &Task) -> anyhow::Result<Option<(protocol::Room
         .bind(&value)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO room_events(room_id,revision,state) VALUES($1,$2,$3)")
-        .bind(task.room)
-        .bind(i64::from(state.revision))
-        .bind(&value)
-        .execute(&mut *tx)
-        .await?;
+    let diagnostic = persistence::room_diagnostics::envelope(
+        event,
+        before,
+        None,
+        persistence::room_diagnostics::lifecycle("closing", task.epoch)?,
+        persistence::room_diagnostics::lifecycle("closed", task.epoch)?,
+        room_core::diagnostics::Operation::Checkpoint {
+            reason: room_core::diagnostics::CheckpointReason::Closed,
+            command: None,
+        },
+    );
+    persistence::room_diagnostics::append(&mut tx, &state, diagnostic).await?;
     sqlx::query("INSERT INTO room_lifecycle_events(id,room_id,previous_lifecycle,lifecycle,lifecycle_epoch,revision) VALUES($1,$2,'closing','closed',$3,$4)")
         .bind(event).bind(task.room).bind(task.epoch).bind(i64::from(state.revision)).execute(&mut *tx).await?;
     sqlx::query("UPDATE room_cleanup_tasks SET completed_at=clock_timestamp(),last_error=NULL,lease_owner=NULL,lease_until=NULL WHERE room_id=$1 AND lifecycle_epoch=$2 AND lease_owner=$3")

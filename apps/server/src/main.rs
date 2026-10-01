@@ -22,6 +22,7 @@ mod profile;
 mod registration;
 mod registration_auth;
 mod room_cleanup;
+mod room_diagnostics;
 mod room_lifecycle;
 mod room_ownership;
 mod rooms;
@@ -482,21 +483,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .execute(&mut *recovery).await?;
     persistence::upstream_reservations::recover(&mut recovery, app.epoch).await?;
     recovery.commit().await?;
-    for row in sqlx::query("SELECT state FROM room_snapshots")
-        .fetch_all(&db)
-        .await?
-    {
-        let mut s: protocol::RoomState = serde_json::from_value(row.get("state"))?;
-        s.playback_status = protocol::PlaybackStatus::Paused;
-        s.clock_epoch = app.epoch;
-        s.anchor_server_time_ms = 0.0;
-        s.revision += 1;
-        sqlx::query("UPDATE room_snapshots SET state=$2 WHERE room_id=$1")
-            .bind(s.room_id)
-            .bind(serde_json::to_value(&s)?)
-            .execute(&db)
-            .await?;
-    }
+    persistence::room_diagnostics::reset_clock(&db, app.epoch).await?;
     let cleanup = db.clone();
     tokio::spawn(async move {
         loop {
@@ -560,6 +547,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         )
         .route("/api/v1/rooms", get(rooms::list).post(rooms::create))
         .route("/api/v1/rooms/{id}/members", get(room_ownership::members))
+        .route(
+            "/api/v1/admin/rooms/{id}/diagnostics",
+            get(room_diagnostics::export),
+        )
         .route("/api/v1/rooms/{id}/owner", post(room_ownership::transfer))
         .route("/api/v1/rooms/{id}/lifecycle", get(room_lifecycle::status))
         .route("/api/v1/rooms/{id}/close", post(room_lifecycle::close))

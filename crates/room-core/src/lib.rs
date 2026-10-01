@@ -1,3 +1,4 @@
+pub mod diagnostics;
 pub mod replay;
 
 use protocol::{Action, Command, PlaybackStatus, RoomState, VERSION};

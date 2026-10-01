@@ -1216,6 +1216,7 @@ dependencies = [
  "anyhow",
  "hex",
  "protocol",
+ "room-core",
  "serde",
  "serde_json",
  "sha2",
@@ -1678,7 +1679,11 @@ dependencies = [
 name = "room-core"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "protocol",
+ "serde",
+ "serde_json",
+ "sha2",
  "uuid",
 ]
 

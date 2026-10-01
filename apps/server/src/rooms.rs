@@ -261,8 +261,9 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                         false,
                     ));
                 }
+                let reducer_time_ms = app.now();
                 let mut next =
-                    room_core::reduce(&state, &req.command, req.user.id, req.user.admin, app.now())
+                    room_core::reduce(&state, &req.command, req.user.id, req.user.admin, reducer_time_ms)
                         .map_err(String::from)?;
                 if matches!(req.command.action, protocol::Action::EndMedia { .. }) {
                     let mut ids: Vec<Uuid> = sqlx::query_scalar(&format!("SELECT q.media_id FROM playlist_items q JOIN media_items m ON m.id=q.media_id JOIN sources s ON s.id=m.source_id WHERE q.room_id=$1 AND {} ORDER BY q.sort_order,q.id", media_titles::VISIBLE))
@@ -288,7 +289,7 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                     .ok_or("media_not_found")?;
                     next.duration_ms = duration.get("duration_ms");
                 }
-                persistence::commit(&app.db, &next, &req.command, req.user.id, state.revision)
+                persistence::commit(&app.db, &next, &req.command, req.user.id, state.revision, req.user.admin, reducer_time_ms)
                     .await
                     .map_err(|error| control_error(error, "commit_failed"))?;
                 state = next.clone();

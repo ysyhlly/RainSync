@@ -48,7 +48,7 @@ pub async fn transfer(
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
-    persistence::room_lifecycle::lock_active(&mut tx, id)
+    let lifecycle_epoch = persistence::room_lifecycle::lock_active(&mut tx, id)
         .await
         .map_err(room_lifecycle::gate_error)?;
     let value: Value =
@@ -100,13 +100,20 @@ pub async fn transfer(
         .bind(&value)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO room_events(room_id,revision,state) VALUES($1,$2,$3)")
-        .bind(id)
-        .bind(i64::from(next.revision))
-        .bind(&value)
-        .execute(&mut *tx)
-        .await?;
     let event_id = Uuid::new_v4();
+    let lifecycle = persistence::room_diagnostics::lifecycle("active", lifecycle_epoch)?;
+    let diagnostic = persistence::room_diagnostics::envelope(
+        event_id,
+        state,
+        Some((user.id, user.admin)),
+        lifecycle,
+        lifecycle,
+        room_core::diagnostics::Operation::Ownership {
+            expected_revision: body.expected_revision,
+            controller_user_id: body.owner_id,
+        },
+    );
+    persistence::room_diagnostics::append(&mut tx, &next, diagnostic).await?;
     sqlx::query("INSERT INTO room_ownership_events(id,room_id,actor_id,previous_owner_id,owner_id,revision) VALUES($1,$2,$3,$4,$5,$6)")
         .bind(event_id).bind(id).bind(user.id).bind(owner).bind(body.owner_id).bind(i64::from(next.revision)).execute(&mut *tx).await?;
     // All devices must use a fresh command identity and credential after transfer.

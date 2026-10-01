@@ -12,6 +12,7 @@ pub mod media_outputs;
 pub mod media_queue;
 pub mod playback_observations;
 pub mod room_cleanup;
+pub mod room_diagnostics;
 pub mod room_lifecycle;
 pub mod source_account_policy;
 pub mod upstream_reservations;
@@ -144,11 +145,13 @@ pub async fn commit(
     command: &Command,
     user: Uuid,
     previous_revision: u32,
+    actor_is_admin: bool,
+    server_time_ms: f64,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
     // Match room management's room -> snapshot lock order before inserting
     // rows whose foreign keys also need a key-share lock on rooms.
-    room_lifecycle::lock_active(&mut tx, state.room_id).await?;
+    let lifecycle_epoch = room_lifecycle::lock_active(&mut tx, state.room_id).await?;
     // Validate wall-clock expiry after acquiring the state lock, so a command
     // that expired while waiting cannot execute when that lock is released.
     let current: serde_json::Value =
@@ -184,12 +187,32 @@ pub async fn commit(
         sqlx::query("INSERT INTO playlist_items SELECT $1,$2,$3,COALESCE(max(sort_order),0)+1 FROM playlist_items WHERE room_id=$2 HAVING NOT EXISTS(SELECT 1 FROM playlist_items WHERE room_id=$2 AND media_id=$3)")
             .bind(Uuid::new_v4()).bind(state.room_id).bind(media_id).execute(&mut *tx).await?;
     }
-    sqlx::query("INSERT INTO room_events(room_id,revision,state) VALUES($1,$2,$3)")
-        .bind(state.room_id)
-        .bind(i64::from(state.revision))
-        .bind(&value)
-        .execute(&mut *tx)
-        .await?;
+    use room_core::diagnostics::{CheckpointReason, Operation, SafeCommand};
+    let safe_command = SafeCommand::from_command(command);
+    let operation = match command.action {
+        protocol::Action::ChangeMedia { .. } => Operation::Checkpoint {
+            reason: CheckpointReason::MediaChanged,
+            command: Some(safe_command),
+        },
+        protocol::Action::EndMedia { .. } => Operation::Checkpoint {
+            reason: CheckpointReason::MediaAdvanced,
+            command: Some(safe_command),
+        },
+        _ => Operation::Control {
+            command: safe_command,
+            server_time_ms,
+        },
+    };
+    let lifecycle = room_diagnostics::lifecycle("active", lifecycle_epoch)?;
+    let diagnostic = room_diagnostics::envelope(
+        Uuid::new_v4(),
+        current,
+        Some((user, actor_is_admin)),
+        lifecycle,
+        lifecycle,
+        operation,
+    );
+    room_diagnostics::append(&mut tx, state, diagnostic).await?;
     sqlx::query(
         "INSERT INTO command_results(room_id,command_id,user_id,state,request_payload) VALUES($1,$2,$3,$4,$5)",
     )

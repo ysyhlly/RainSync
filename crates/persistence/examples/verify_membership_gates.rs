@@ -22,9 +22,10 @@ impl Gate {
     async fn run(self, db: PgPool, state: RoomState, command: Command, user: Uuid) -> Result<()> {
         match self {
             Self::Commit => {
-                let mut next = state.clone();
-                next.revision += 1;
-                persistence::commit(&db, &next, &command, user, state.revision).await?;
+                let now = state.anchor_server_time_ms;
+                let next = room_core::reduce(&state, &command, user, false, now)
+                    .map_err(anyhow::Error::msg)?;
+                persistence::commit(&db, &next, &command, user, state.revision, false, now).await?;
             }
             Self::Replay => {
                 ensure!(
@@ -71,7 +72,8 @@ async fn fixture(db: &PgPool) -> Result<(RoomState, Command, Uuid)> {
     let state = RoomState {
         room_id: room,
         revision: 1,
-        media_id: None,
+        // An explicit owned timeline fixture makes Pause a legal reducer input.
+        media_id: Some(Uuid::new_v4()),
         media_generation: 0,
         playback_status: PlaybackStatus::Paused,
         anchor_position_ms: 0.0,
