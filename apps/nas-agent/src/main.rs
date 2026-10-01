@@ -1,4 +1,5 @@
 mod drain;
+mod receipt_mode;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -383,48 +384,94 @@ async fn retry_or_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) ->
 
 async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
     let server = std::env::var("SERVER_URL")?;
-    let root = PathBuf::from(std::env::var("MEDIA_ROOT")?).canonicalize()?;
+    let configured_root = PathBuf::from(std::env::var("MEDIA_ROOT")?);
     let credential = PathBuf::from(
         std::env::var("AGENT_CREDENTIAL_FILE").unwrap_or("agent-credentials.json".into()),
     );
-    let token = tokio::select! {
+    // Durable receipts and unchanged existing credentials do not depend on the
+    // media mount. Pairing is allowed only after a valid root has been observed.
+    let (mut token, mut receipts) = tokio::select! {
         biased;
         _ = drain::cancelled(&mut shutdown) => return Ok(()),
-        token = async {
-    let token = if let Ok(token) = std::env::var("AGENT_TOKEN") {
-        token
-    } else if credential.is_file() {
-        serde_json::from_slice::<Value>(&tokio::fs::read(&credential).await?)?["token"]
-            .as_str()
-            .context("token")?
-            .to_string()
-    } else {
-        let code = std::env::var("PAIR_CODE")?;
-        let v: Value = reqwest::Client::new()
-            .post(format!("{server}/api/v1/agents/pair"))
-            .json(&json!({"code":code}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        tokio::fs::write(&credential, serde_json::to_vec(&v)?).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).await?;
-        }
-        v["token"].as_str().context("pair token")?.to_string()
+        loaded = async {
+            let receipts = drain::Receipts::load(&credential).await?;
+            let token = receipt_mode::existing_token(&credential).await?;
+            Ok::<_, anyhow::Error>((token, receipts))
+        } => loaded?,
     };
-            Ok::<_, anyhow::Error>(token)
-        } => token?,
-    };
-    let mut receipts = drain::Receipts::load(&credential).await?;
+    let mut root_check = receipt_mode::RootCheck::default();
     let slots = Arc::new(Semaphore::new(16));
     let rejections = Arc::new(Semaphore::new(4));
     let scans = Arc::new(Semaphore::new(1));
     let index_interval = std::time::Duration::from_secs(index_interval_seconds()?);
     loop {
+        let Some(root) = root_check
+            .validated(&configured_root, &mut shutdown)
+            .await?
+        else {
+            if *shutdown.borrow() {
+                break;
+            }
+            if let Some(token) = token.as_deref()
+                && receipt_mode::replay(
+                    &server,
+                    token,
+                    &mut receipts,
+                    &mut root_check,
+                    &configured_root,
+                    &mut shutdown,
+                )
+                .await
+                .is_err()
+            {
+                tracing::warn!("receipt-only control ended; durable receipts retained for retry");
+            }
+            // No existing token means no receipt connection, pairing, or write
+            // of credentials while the media root is unavailable.
+            if retry_or_shutdown(&mut shutdown).await {
+                break;
+            }
+            continue;
+        };
+        if token.is_none() {
+            // A restored mount may also make an existing credential/journal
+            // visible. Re-read them before considering the original pairing
+            // flow, so recovery never overwrites newly available credentials.
+            let restored = tokio::select! {
+                biased;
+                _ = drain::cancelled(&mut shutdown) => break,
+                restored = receipt_mode::existing_token(&credential) => restored?,
+            };
+            if let Some(restored) = restored {
+                receipts = drain::Receipts::load(&credential).await?;
+                token = Some(restored);
+            }
+        }
+        if token.is_none() {
+            token = Some(tokio::select! {
+                    biased;
+                    _ = drain::cancelled(&mut shutdown) => break,
+                    token = async {
+            let code = std::env::var("PAIR_CODE")?;
+            let v: Value = reqwest::Client::new()
+                .post(format!("{server}/api/v1/agents/pair"))
+                .json(&json!({"code":code}))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            tokio::fs::write(&credential, serde_json::to_vec(&v)?).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).await?;
+            }
+                        Ok::<_, anyhow::Error>(v["token"].as_str().context("pair token")?.to_string())
+                    } => token?,
+                });
+        }
+        let token = token.as_deref().unwrap();
         let url = format!(
             "{}/api/v1/agents/ws",
             server

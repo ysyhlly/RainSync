@@ -9,6 +9,10 @@ pub enum JobFailure {
     CacheReadOnly,
     CachePermissionDenied,
     ExecutionFailed,
+    InputInvalid,
+    InputDenied,
+    DecoderUnavailable,
+    EncoderUnavailable,
     UpstreamTransient,
     SourceChanged,
     SourceVersionRequired,
@@ -21,6 +25,10 @@ impl JobFailure {
             Self::CacheReadOnly => "cache_read_only",
             Self::CachePermissionDenied => "cache_permission_denied",
             Self::ExecutionFailed => "media_job_failed",
+            Self::InputInvalid => "media_input_invalid",
+            Self::InputDenied => "media_input_denied",
+            Self::DecoderUnavailable => "media_decoder_unavailable",
+            Self::EncoderUnavailable => "media_encoder_unavailable",
             Self::UpstreamTransient => "upstream_transport_failed",
             Self::SourceChanged => "source_changed",
             Self::SourceVersionRequired => "source_version_required",
@@ -44,6 +52,10 @@ pub fn terminal_error(reason: Option<&str>) -> (u16, &'static str) {
         Some("cache_permission_denied") => (503, "cache_permission_denied"),
         Some("source_version_required") => (409, "source_version_required"),
         Some("source_seek_unsupported") => (422, "source_seek_unsupported"),
+        Some("media_input_invalid") => (422, "media_input_invalid"),
+        Some("media_input_denied") => (502, "media_input_denied"),
+        Some("media_decoder_unavailable") => (422, "media_decoder_unavailable"),
+        Some("media_encoder_unavailable") => (503, "media_encoder_unavailable"),
         Some("upstream_transport_retry_exhausted" | "media_job_retry_exhausted") => {
             (502, "media_job_retry_exhausted")
         }

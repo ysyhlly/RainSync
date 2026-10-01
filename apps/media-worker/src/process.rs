@@ -12,6 +12,17 @@ impl std::fmt::Display for LeaseInterrupted {
 }
 impl std::error::Error for LeaseInterrupted {}
 
+/// A nonzero encoder exit, distinct from cancellation, loss of ownership,
+/// process cleanup failure, and an independently observed resource failure.
+#[derive(Debug)]
+pub struct EncodingFailed;
+impl std::fmt::Display for EncodingFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ffmpeg_failed")
+    }
+}
+impl std::error::Error for EncodingFailed {}
+
 /// Missing finalization evidence is recoverable; never turn a deadline into
 /// a permanent encoder failure or publish an unverified output.
 pub async fn finalization_deadline<T>(
@@ -66,7 +77,7 @@ where
                 error = &mut capacity => return Err(error),
                 _ = tokio::time::sleep_until(confirmed_until) => return Err(LeaseInterrupted.into()),
                 status = child.wait() => {
-                    anyhow::ensure!(status?.success(), "ffmpeg_failed");
+                    anyhow::ensure!(status?.success(), EncodingFailed);
                     return Ok(());
                 }
                 _ = tokio::time::sleep_until(next_check) => {
@@ -76,7 +87,7 @@ where
                         error = &mut capacity => return Err(error),
                         _ = tokio::time::sleep_until(confirmed_until) => return Err(LeaseInterrupted.into()),
                         status = child.wait() => {
-                            anyhow::ensure!(status?.success(), "ffmpeg_failed");
+                            anyhow::ensure!(status?.success(), EncodingFailed);
                             return Ok(());
                         }
                         result = tokio::time::timeout(Duration::from_secs(3), healthy()) => {

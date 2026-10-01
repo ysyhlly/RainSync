@@ -128,6 +128,10 @@ pub enum ErrorCode {
     CrossOriginSubtitle,
     InvalidResource,
     MediaJobFailed,
+    MediaInputInvalid,
+    MediaInputDenied,
+    MediaDecoderUnavailable,
+    MediaEncoderUnavailable,
     CacheCapacityExceeded,
     CacheReadOnly,
     CachePermissionDenied,
@@ -313,6 +317,10 @@ impl ErrorCode {
             | Self::UpstreamPlaybackFailed
             | Self::MediaUnavailable => "媒体源暂时不可用，请稍后重试",
             Self::MediaJobFailed => "媒体处理失败，请重新加载或联系管理员",
+            Self::MediaInputInvalid => "媒体输入无法解析，请检查文件格式或重新扫描片源",
+            Self::MediaInputDenied => "媒体源拒绝访问，请检查片源账户或设备权限",
+            Self::MediaDecoderUnavailable => "当前媒体处理程序缺少所需解码器，请联系管理员",
+            Self::MediaEncoderUnavailable => "当前媒体处理程序缺少所需编码器，请联系管理员",
             Self::InternalError | Self::DatabaseError | Self::CommitFailed => {
                 "操作未能完成，请保留诊断编号并联系管理员"
             }
@@ -439,6 +447,32 @@ mod tests {
         assert!(!wire.contains("retry_after_ms"));
         assert!(!response.error.retryable);
         assert_eq!(response.error.code, ErrorCode::InternalError);
+    }
+    #[test]
+    fn terminal_media_categories_are_actionable_without_retry_or_credentials() {
+        for (reason, status, expected) in [
+            ("media_input_invalid", 422, ErrorCode::MediaInputInvalid),
+            ("media_input_denied", 502, ErrorCode::MediaInputDenied),
+            (
+                "media_decoder_unavailable",
+                422,
+                ErrorCode::MediaDecoderUnavailable,
+            ),
+            (
+                "media_encoder_unavailable",
+                503,
+                ErrorCode::MediaEncoderUnavailable,
+            ),
+        ] {
+            let error = ApiError::new(ErrorCode::from_reason(reason, status), Uuid::nil());
+            assert_eq!(error.code, expected);
+            assert!(!error.retryable);
+            assert!(error.retry_after_ms.is_none());
+            assert!(!error.message.is_empty());
+            assert!(!error.message.contains(reason));
+            assert_ne!(error.code, ErrorCode::LoginRequired);
+            assert_ne!(error.code, ErrorCode::Forbidden);
+        }
     }
     #[test]
     fn authorization_and_conflict_require_action_not_blind_retry() {

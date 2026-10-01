@@ -1,5 +1,6 @@
 mod account_rules;
 mod account_security;
+mod agent_drain;
 mod agents;
 mod avatar_image;
 mod avatars;
@@ -625,6 +626,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route("/api/v1/agents/{id}", delete(agents::revoke))
         .route("/api/v1/agents/{id}/scan", post(agents::scan))
         .route("/api/v1/agents/ws", get(agents::connect))
+        .route("/api/v1/agents/drain-ws", get(agent_drain::connect))
         .route("/api/v1/ws", get(ws))
         .route("/api/v1/metrics", get(metrics::endpoint))
         .layer(axum::extract::DefaultBodyLimit::max(65536))

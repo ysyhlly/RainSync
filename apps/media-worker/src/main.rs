@@ -1,6 +1,7 @@
 mod cache;
 mod cache_outputs;
 mod cache_read;
+mod execution_failure;
 mod file_delivery;
 use media_core::child_process;
 use media_core::runtime_metrics::{Cache, CacheDecision, Layer};
@@ -163,6 +164,9 @@ async fn delivery_response(
             }
             Some(persistence::media_jobs::JobFailure::SourceSeekUnsupported) => {
                 Some((StatusCode::UNPROCESSABLE_ENTITY, "source_seek_unsupported"))
+            }
+            Some(persistence::media_jobs::JobFailure::InputDenied) => {
+                Some((StatusCode::BAD_GATEWAY, "media_input_denied"))
             }
             _ => None,
         } {
@@ -609,7 +613,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 let confirmed_until = confirmation?
                     .filter(|until| *until > tokio::time::Instant::now())
                     .ok_or_else(|| anyhow::anyhow!("lease_lost_before_spawn"))?;
-                Ok::<_, anyhow::Error>((args, confirmed_until))
+                Ok::<_, anyhow::Error>((args, confirmed_until, input))
             };
             let prepared = tokio::select! {
                 biased;
@@ -617,19 +621,21 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 result = prepare => result,
             };
             let mut execution_stopped = true;
+            let mut diagnostic_failure = None;
             let mut result = async {
-                let (args, confirmed_until) = prepared?;
+                let (args, confirmed_until, input) = prepared?;
                 anyhow::ensure!(!*stop.borrow(), "worker_shutdown");
                 let mut command = tokio::process::Command::new("ffmpeg");
         media_core::input_policy::clean_environment(&mut command);
-                command.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+                command.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
                 #[cfg(windows)]
                 command.creation_flags(0x08000000);
                 anyhow::ensure!(confirmed_until > tokio::time::Instant::now(), "lease_lost_before_spawn");
                 let mut child = child_process::spawn(command)?;
+                let diagnostics = child.stderr.take().expect("piped encoder diagnostics");
                 writer_stopped = false;
                 execution_stopped = false;
-                let result = process::supervise(&mut child, &mut stop, confirmed_until, || async {
+                let supervised = process::supervise(&mut child, &mut stop, confirmed_until, || async {
                     app.readiness.check_lease(process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim))).await
                 }, async {
                     tokio::select! {
@@ -637,7 +643,9 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                         error = cache::monitor(&app) => error,
                         error = output_publish::monitor(&app.db, &claim, persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt), output_builder.clone(), &output_decoder) => error,
                     }
-                }).await;
+                });
+                let (result, evidence) = execution_failure::observe_with_input(supervised, diagnostics, &input).await;
+                diagnostic_failure = evidence;
                 execution_stopped = child.try_wait()?.is_some();
                 writer_stopped = execution_stopped;
                 result
@@ -662,6 +670,19 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 // A truncated input may make FFmpeg exit successfully. A known
                 // source transport failure must not publish that partial movie.
                 result = Err(failure.into());
+            }
+            if execution_stopped && !*stop.borrow()
+                && result.as_ref().is_err_and(|error| error.is::<process::EncodingFailed>())
+                && let Some(evidence) = diagnostic_failure {
+                // Stderr can refine a known encoder exit only. Independent
+                // input, source, capacity, cancellation and ownership evidence
+                // always keeps precedence; no retry is inferred from text.
+                use persistence::media_jobs::JobFailure;
+                result = Err(match evidence {
+                    execution_failure::Kind::InputInvalid => JobFailure::InputInvalid,
+                    execution_failure::Kind::DecoderUnavailable => JobFailure::DecoderUnavailable,
+                    execution_failure::Kind::EncoderUnavailable => JobFailure::EncoderUnavailable,
+                }.into());
             }
             let mut publication = None;
             if result.is_ok() && !*stop.borrow() {

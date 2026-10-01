@@ -584,15 +584,20 @@ async fn prepare_playback(
                 .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_probe_failed"))?;
             if matches!(
                 response.status(),
-                StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY
+                StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY | StatusCode::BAD_GATEWAY
             ) {
                 let status = response.status();
                 let reason = match response.json::<protocol::ErrorResponse>().await {
-                    Ok(response) if response.error.code == protocol::ErrorCode::SourceChanged => {
+                    Ok(response)
+                        if status == StatusCode::CONFLICT
+                            && response.error.code == protocol::ErrorCode::SourceChanged =>
+                    {
                         "source_changed"
                     }
                     Ok(response)
-                        if response.error.code == protocol::ErrorCode::SourceVersionRequired =>
+                        if status == StatusCode::CONFLICT
+                            && response.error.code
+                                == protocol::ErrorCode::SourceVersionRequired =>
                     {
                         "source_version_required"
                     }
@@ -602,6 +607,12 @@ async fn prepare_playback(
                                 == protocol::ErrorCode::SourceSeekUnsupported =>
                     {
                         "source_seek_unsupported"
+                    }
+                    Ok(response)
+                        if status == StatusCode::BAD_GATEWAY
+                            && response.error.code == protocol::ErrorCode::MediaInputDenied =>
+                    {
+                        "media_input_denied"
                     }
                     _ => return Err(err(StatusCode::BAD_GATEWAY, "source_probe_failed")),
                 };

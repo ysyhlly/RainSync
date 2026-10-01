@@ -2,7 +2,7 @@
 //! cancels OS reaping or releases ownership of descendants.
 use std::{io, process::ExitStatus};
 use tokio::{
-    process::{ChildStdin, ChildStdout, Command},
+    process::{ChildStderr, ChildStdin, ChildStdout, Command},
     sync::watch,
 };
 
@@ -156,6 +156,9 @@ pub struct Child {
     status: watch::Receiver<Option<Outcome>>,
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
+    /// Optional caller-owned diagnostics pipe. Callers that request it must
+    /// drain concurrently, bound retained data, and never expose raw secrets.
+    pub stderr: Option<ChildStderr>,
 }
 
 impl Child {
@@ -338,6 +341,7 @@ fn spawn_registered(mut command: Command, registry: std::sync::Arc<Registry>) ->
     let mut child = platform::spawn(command)?;
     let stdin = platform::stdin(&mut child);
     let stdout = platform::stdout(&mut child);
+    let stderr = platform::stderr(&mut child);
     let (stop, receiver) = watch::channel(false);
     let (status, result) = watch::channel(None);
     let id = owners.next_id;
@@ -366,6 +370,7 @@ fn spawn_registered(mut command: Command, registry: std::sync::Arc<Registry>) ->
         status: result,
         stdin,
         stdout,
+        stderr,
     })
 }
 
@@ -452,6 +457,9 @@ mod platform {
     }
     pub fn stdout(tree: &mut Tree) -> Option<ChildStdout> {
         tree.child.stdout.take()
+    }
+    pub fn stderr(tree: &mut Tree) -> Option<ChildStderr> {
+        tree.child.stderr.take()
     }
 
     pub async fn reap(mut tree: Tree, mut stop: watch::Receiver<bool>) -> io::Result<ExitStatus> {
@@ -581,6 +589,9 @@ mod platform {
     }
     pub fn stdout(tree: &mut Tree) -> Option<ChildStdout> {
         tree.child.stdout.take()
+    }
+    pub fn stderr(tree: &mut Tree) -> Option<ChildStderr> {
+        tree.child.stderr.take()
     }
 
     fn process_handles(job: HANDLE) -> io::Result<Vec<OwnedHandle>> {

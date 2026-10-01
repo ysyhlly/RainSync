@@ -194,6 +194,10 @@ it("does not retry authorization, conflicts or exhausted preparation", async () 
     "PLAYBACK_REQUEST_RETRY_EXHAUSTED",
     "CACHE_READ_ONLY",
     "CACHE_PERMISSION_DENIED",
+    "MEDIA_INPUT_INVALID",
+    "MEDIA_INPUT_DENIED",
+    "MEDIA_DECODER_UNAVAILABLE",
+    "MEDIA_ENCODER_UNAVAILABLE",
   ]) {
     const error = new RequestFailure({ error: { code, retryable: true } });
     const send = vi.fn().mockRejectedValue(error);

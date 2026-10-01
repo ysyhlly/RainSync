@@ -70,20 +70,25 @@ impl Observation {
     pub fn permanent(&self) {
         self.0.fetch_max(2, Ordering::Relaxed);
     }
+    pub fn denied(&self) {
+        self.0.fetch_max(3, Ordering::Relaxed);
+    }
     // Preserve a confirmed source conflict across concurrent generic failures.
     // A transport retry cannot repair a grant pinned to the previous version.
     pub fn source_version_required(&self) {
-        self.0.fetch_max(3, Ordering::Relaxed);
-    }
-    pub fn source_seek_unsupported(&self) {
         self.0.fetch_max(4, Ordering::Relaxed);
     }
-    pub fn source_changed(&self) {
+    pub fn source_seek_unsupported(&self) {
         self.0.fetch_max(5, Ordering::Relaxed);
+    }
+    pub fn source_changed(&self) {
+        self.0.fetch_max(6, Ordering::Relaxed);
     }
     pub fn status(&self, status: reqwest::StatusCode) {
         if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
             self.transient();
+        } else if matches!(status.as_u16(), 401 | 403) {
+            self.denied();
         } else if status.is_client_error() {
             // An authorization/not-found response is not made transient by an
             // unrelated simultaneous transport failure within this execution.
@@ -112,9 +117,10 @@ impl Guard {
         match self.observation.0.load(Ordering::Relaxed) {
             1 => Some(JobFailure::UpstreamTransient),
             2 => Some(JobFailure::ExecutionFailed),
-            3 => Some(JobFailure::SourceVersionRequired),
-            4 => Some(JobFailure::SourceSeekUnsupported),
-            5 => Some(JobFailure::SourceChanged),
+            3 => Some(JobFailure::InputDenied),
+            4 => Some(JobFailure::SourceVersionRequired),
+            5 => Some(JobFailure::SourceSeekUnsupported),
+            6 => Some(JobFailure::SourceChanged),
             _ => None,
         }
     }
@@ -266,5 +272,28 @@ mod tests {
             terminal_error(Some("private upstream diagnostic")),
             (502, "media_job_failed")
         );
+    }
+    #[test]
+    fn confirmed_upstream_denial_is_specific_and_never_a_login_or_retry_signal() {
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            let registry = Registry::default();
+            let id = Uuid::new_v4();
+            let guard = registry.register(id);
+            let observer = registry.observe(id, Some(guard.token()));
+            observer.status(status);
+            observer.transient();
+            observer.permanent();
+            assert_eq!(guard.failure().unwrap().reason(), "media_input_denied");
+            assert_eq!(
+                persistence::media_jobs::terminal_error(Some("media_input_denied")),
+                (502, "media_input_denied")
+            );
+            assert!(!guard.retryable());
+            observer.source_changed();
+            assert_eq!(guard.failure().unwrap().reason(), "source_changed");
+        }
     }
 }

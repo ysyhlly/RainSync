@@ -64,3 +64,19 @@ it("explains locally detected stale playback plans without automatic retry", () 
       .message,
   ).toContain("现有播放器");
 });
+
+it("shows media failure guidance without treating upstream denial as logout", () => {
+  for (const code of [
+    "MEDIA_INPUT_INVALID",
+    "MEDIA_INPUT_DENIED",
+    "MEDIA_DECODER_UNAVAILABLE",
+    "MEDIA_ENCODER_UNAVAILABLE",
+  ]) {
+    const error = new RequestFailure({
+      error: { code, message: "请检查媒体或处理程序", retryable: false },
+    });
+    expect(error.message).toBe("请检查媒体或处理程序");
+    expect(error.retryable).toBe(false);
+    expect(stopsReconnect(error)).toBe(false);
+  }
+});
