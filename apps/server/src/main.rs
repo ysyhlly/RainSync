@@ -610,6 +610,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         )
         .route("/api/v1/playback-sessions", post(media::playback))
         .route(
+            "/api/v1/playback-sessions/http-file-continuation",
+            post(media::http_file_continuation),
+        )
+        .route(
             "/api/v1/playback-requests/{key}",
             delete(playback_requests::cancel),
         )

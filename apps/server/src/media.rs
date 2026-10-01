@@ -188,12 +188,36 @@ pub async fn playback(
     h: HeaderMap,
     Json(body): Json<protocol::PlaybackRequest>,
 ) -> Result<Json<Value>> {
+    start_playback(app, h, body, false).await
+}
+
+/// Central registers this at /api/v1/playback-sessions/http-file-continuation.
+/// A distinct path fails closed against Servers predating continuation support.
+pub async fn http_file_continuation(
+    State(app): State<App>,
+    h: HeaderMap,
+    Json(body): Json<protocol::PlaybackRequest>,
+) -> Result<Json<Value>> {
+    start_playback(app, h, body, true).await
+}
+
+async fn start_playback(
+    app: App,
+    h: HeaderMap,
+    body: protocol::PlaybackRequest,
+    continuation: bool,
+) -> Result<Json<Value>> {
     let u = auth(&app, &h, true).await?;
-    // Contract checkpoint: until the atomic continuation owner is wired, never
-    // interpret a continuation request as an unrelated fresh playback intent.
     if body.http_file_fallback.is_some() {
+        if !continuation {
+            return Err(err(StatusCode::CONFLICT, "source_version_required"));
+        }
+    } else if continuation {
         return Err(err(StatusCode::CONFLICT, "source_version_required"));
     }
+    playback_requests::http_file_fallback::validate(&body)?;
+    // This is exactly the cookie used by auth above, retained only as a hash.
+    let login_hash = cookie(&h).map(|value| hash(&value));
     if body.observation_version.is_some_and(|version| version != 1) {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -210,7 +234,7 @@ pub async fn playback(
             "playback_request_interrupted",
         )
     })?;
-    tokio::spawn(owned_playback(app, u, body, owner))
+    tokio::spawn(owned_playback(app, u, body, login_hash, owner))
         .await
         .map_err(anyhow::Error::from)?
 }
@@ -219,12 +243,16 @@ async fn owned_playback(
     app: App,
     u: User,
     body: protocol::PlaybackRequest,
+    login_hash: Option<String>,
     owner: preparation_owner::Owner,
 ) -> Result<Json<Value>> {
-    let reservation = match playback_requests::begin(&app, u.id, &body).await? {
-        playback_requests::Start::Replay(plan) => return Ok(Json(plan)),
-        playback_requests::Start::Reserved(reservation) => reservation,
-    };
+    let reservation =
+        match playback_requests::begin_authenticated(&app, u.id, &body, login_hash.as_deref())
+            .await?
+        {
+            playback_requests::Start::Replay(plan) => return Ok(Json(plan)),
+            playback_requests::Start::Reserved(reservation) => reservation,
+        };
     let scope = media_core::child_process::Scope::new();
     let result = scope.run(async {
         tokio::select! {
@@ -289,6 +317,21 @@ async fn prepare_playback(
         None
     };
     let mut resource = json!({"kind":kind,"resource":item,"root":config.root,"headers":{},"source_url":config.url,"access_policy":config.access_policy,"source_policy_revision":source_policy_revision,"source_id":source_id});
+    let http_file = reservation.http_file.as_deref();
+    let continuation = http_file.is_some_and(|authority| authority.claim.is_some());
+    if http_file.is_some() && kind != "http" {
+        return Err(err(StatusCode::CONFLICT, "source_changed"));
+    }
+    if let Some(authority) = http_file {
+        if authority.media_id != media
+            || authority.source_id != source_id
+            || authority.source_policy_revision != source_policy_revision
+        {
+            return Err(err(StatusCode::CONFLICT, "source_changed"));
+        }
+        resource["http_file_context"] =
+            serde_json::to_value(&authority.context).map_err(anyhow::Error::from)?;
+    }
     let mut meta: Value = row.get("metadata");
     let local_fact_version = if kind == "local" {
         Some(playback_capabilities::current_local_version(
@@ -359,6 +402,12 @@ async fn prepare_playback(
                 .ends_with(".m3u8")
             {
                 transport = "hls";
+            }
+            if continuation {
+                resource =
+                    playback_requests::http_file_fallback::parent_resource(app, http_file.unwrap())
+                        .await?;
+                transport = "progressive";
             }
         }
         "agent" => {
@@ -516,8 +565,13 @@ async fn prepare_playback(
             account_policy_generation,
         )
         .await?;
-        sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch,viewer_id,plan_generation) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '1 minute',$8,$9,$10)")
-            .bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":app.encrypt(&resource)?,"source_policy_revision":source_policy_revision,"account_policy_generation":account_policy_generation})).bind(reservation.lifecycle_epoch).bind(reservation.viewer_id).bind(reservation.plan_generation.map(i64::from)).execute(&mut *preparation).await?;
+        sqlx::query("SELECT lock_playback_http_representation($1)")
+            .bind(id)
+            .execute(&mut *preparation)
+            .await?;
+        sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch,viewer_id,plan_generation) VALUES($1,$2,$3,$4,$5,$6,$7,LEAST(clock_timestamp()+interval '1 minute',to_timestamp($11::double precision/1000.0)),$8,$9,$10)")
+            .bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(playback_requests::http_file_fallback::wrap_resource(app, &resource, http_file, source_policy_revision, account_policy_generation)?).bind(reservation.lifecycle_epoch).bind(reservation.viewer_id).bind(reservation.plan_generation.map(i64::from)).bind(http_file.and_then(|a| a.claim.as_ref().map(|c| c.deadline_ms))).execute(&mut *preparation).await?;
+        playback_requests::http_file_fallback::seed(&mut preparation, id, http_file).await?;
         preparation.commit().await?;
         let probe: Result<Value> = async {
             let base = std::env::var("WORKER_URL").unwrap_or("http://127.0.0.1:8081".into());
@@ -568,6 +622,7 @@ async fn prepare_playback(
             .execute(&app.db)
             .await?;
         meta = probe?;
+        playback_requests::http_file_fallback::verify_audio(&meta, http_file)?;
         current_metadata = true;
         probed = true;
         if kind == "agent" {
@@ -700,6 +755,7 @@ async fn prepare_playback(
         resource["job_id"] = json!(id);
     }
     resource["transport"] = json!(transport);
+    resource["delivery_mode"] = json!(mode);
     resource["timeline_origin_ms"] = json!(timeline);
     resource["plan_facts_version"] = json!(1);
     let hls_supported = body.capabilities.as_ref().is_none_or(|c| c.supports_hls());
@@ -722,7 +778,6 @@ async fn prepare_playback(
     } else {
         protocol::SubtitleDeliveryMode::None
     };
-    let encrypted = app.encrypt(&resource)?;
     let plan = protocol::PlaybackPlan {
         http_file_fallback_version: None,
         session_id: id,
@@ -778,6 +833,23 @@ async fn prepare_playback(
     .await?;
     if kind == "http" {
         http_representation::guard(&mut tx, id).await?;
+        playback_requests::http_file_fallback::verify_pin(&mut tx, id, http_file).await?;
+        if http_file.is_some()
+            && !continuation
+            && reservation.viewer_id.is_some()
+            && playback_requests::http_file_fallback::mark_root(
+                &mut tx,
+                id,
+                &mut resource,
+                &meta,
+                current_metadata,
+                mode,
+                hls_supported,
+            )
+            .await?
+        {
+            plan["http_file_fallback_version"] = json!(protocol::HTTP_FILE_FALLBACK_VERSION);
+        }
     }
     let current: Value =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
@@ -817,7 +889,7 @@ async fn prepare_playback(
     {
         return Err(err(StatusCode::CONFLICT, "source_changed"));
     }
-    sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch,viewer_id,plan_generation) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '30 minutes',$8,$9,$10) ON CONFLICT(id) DO UPDATE SET resource=EXCLUDED.resource,expires_at=EXCLUDED.expires_at,stopped=false,lifecycle_epoch=EXCLUDED.lifecycle_epoch,viewer_id=EXCLUDED.viewer_id,plan_generation=EXCLUDED.plan_generation").bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(json!({"encrypted":encrypted,"source_policy_revision":source_policy_revision,"account_policy_generation":account_policy_generation})).bind(reservation.lifecycle_epoch).bind(reservation.viewer_id).bind(reservation.plan_generation.map(i64::from)).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch,viewer_id,plan_generation) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '30 minutes',$8,$9,$10) ON CONFLICT(id) DO UPDATE SET resource=EXCLUDED.resource,expires_at=EXCLUDED.expires_at,stopped=false,lifecycle_epoch=EXCLUDED.lifecycle_epoch,viewer_id=EXCLUDED.viewer_id,plan_generation=EXCLUDED.plan_generation").bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(playback_requests::http_file_fallback::wrap_resource(app, &resource, http_file, source_policy_revision, account_policy_generation)?).bind(reservation.lifecycle_epoch).bind(reservation.viewer_id).bind(reservation.plan_generation.map(i64::from)).execute(&mut *tx).await?;
     if body.observation_version == Some(1) {
         persistence::playback_observations::create(&mut tx, u.id, body.room_id, &protocol_plan)
             .await?;
@@ -862,6 +934,12 @@ async fn prepare_playback(
         account_policy_generation,
     )
     .await?;
+    if let Some(authority) = http_file {
+        playback_requests::http_file_fallback::guard_deadline(&mut tx, authority).await?;
+        if !persistence::http_file_authorization::lock(&mut tx, &authority.context).await? {
+            return Err(err(StatusCode::GONE, "invalid_playback_session"));
+        }
+    }
     tx.commit().await?;
     if matches!(kind.as_str(), "jellyfin" | "emby") {
         let _ = upstream::report(app, id, "start").await;

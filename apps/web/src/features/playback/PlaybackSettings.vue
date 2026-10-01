@@ -44,7 +44,8 @@ function place() {
   const right = Math.min(innerWidth - 12, (frame?.right ?? innerWidth) - 12);
   const width = Math.min(480, right - left);
   p.style.width = width + "px";
-  p.style.left = Math.max(left, Math.min(r.right - width, right - width)) + "px";
+  p.style.left =
+    Math.max(left, Math.min(r.right - width, right - width)) + "px";
   p.style.top =
     Math.max(
       top,
@@ -81,6 +82,12 @@ onBeforeUnmount(() => {
     </summary>
     <div ref="panel" popover="manual" class="settings-panel">
       <p class="helper">更改播放方式后点击重新加载。</p>
+      <p v-if="r.playbackSummary" class="helper">
+        当前方式：{{ r.playbackSummary.mode
+        }}<span v-if="r.playbackSummary.reason">
+          · {{ r.playbackSummary.reason }}</span
+        >
+      </p>
       <div class="option-fields">
         <label
           >播放方式<AppSelect

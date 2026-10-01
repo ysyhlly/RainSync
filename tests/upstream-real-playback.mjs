@@ -1481,7 +1481,7 @@ async function actualMatrix(upstream, product, fixture) {
     await viewer.page.goto(`${fixture.webOrigin}/rooms/${room.id}`);
     await viewer.page
       .locator(".room-information")
-      .filter({ hasText: "已连接" })
+      .filter({ hasText: "房间连接正常" })
       .waitFor();
     await viewer.page.locator("video").waitFor();
     await viewer.page.locator("video").evaluate((video) => {

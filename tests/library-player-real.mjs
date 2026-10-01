@@ -89,7 +89,7 @@ await isolatedMediaStack(
         await page
           .getByRole("button", { name: "进入房间", exact: true })
           .click();
-        await expect(page.locator(".room-information")).toContainText("已连接");
+        await expect(page.locator(".room-information")).toContainText("房间连接正常");
       }
       await login(ownerPage, "admin", f.password);
       await login(viewerPage, "viewer", "Fixture-pass-123");

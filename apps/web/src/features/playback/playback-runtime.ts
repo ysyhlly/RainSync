@@ -21,6 +21,7 @@ import type {
   PlaybackRequest,
   PlaybackReadiness,
   PlaybackCandidateSet,
+  PlaybackCapabilities,
   PlaybackMetricsReceipt,
 } from "../../../../../packages/protocol";
 import { RequestFailure } from "../../errors";
@@ -41,6 +42,10 @@ import {
   type PlaybackMetricsSnapshot,
 } from "./playback-metrics";
 import { bindPlaybackMetricEvents } from "./metrics-binding";
+import {
+  summarizePlaybackPlan,
+  type PlaybackSummary,
+} from "./playback-summary";
 import { createPlaybackMetricsSender } from "./metrics-sender";
 
 export type PlaybackRecoveryState =
@@ -80,6 +85,7 @@ export function createPlaybackRuntime(ctx: {
     position = ref(0),
     sessionId = ref<string | null>(null);
   const recoveryState = ref<PlaybackRecoveryState>("idle");
+  const playbackSummary = ref<PlaybackSummary>();
   const recoveryLabel = computed(() => {
     switch (recoveryState.value) {
       case "calibrating":
@@ -203,6 +209,10 @@ export function createPlaybackRuntime(ctx: {
         metrics: MetricIntent;
         intent: ReturnType<PlaybackPlanGenerations["next"]>;
         failed: string[];
+        continuation?: {
+          parent: PlaybackPlan;
+          capabilities: PlaybackCapabilities;
+        };
       }
     | undefined;
   const metricSender = createPlaybackMetricsSender((binding, body, signal) =>
@@ -502,7 +512,9 @@ export function createPlaybackRuntime(ctx: {
         (body, signal) => {
           if (session.epoch !== epoch) throw new StaleIdentity();
           return session.api<PlaybackPlan>(
-            "/playback-sessions",
+            body.http_file_fallback
+              ? "/playback-sessions/http-file-continuation"
+              : "/playback-sessions",
             "POST",
             body,
             signal,
@@ -555,7 +567,7 @@ export function createPlaybackRuntime(ctx: {
     }
     return readiness;
   }
-  async function stopPlayback() {
+  function detachPlayback() {
     recoveryPending = false;
     recoveryState.value = "idle";
     terminalEnd = false;
@@ -580,6 +592,7 @@ export function createPlaybackRuntime(ctx: {
     recoveringHls = false;
     const old = plan;
     plan = undefined;
+    playbackSummary.value = undefined;
     sessionId.value = null;
     if (video.value) {
       video.value.onerror = null;
@@ -608,6 +621,10 @@ export function createPlaybackRuntime(ctx: {
           )
           .catch(() => {});
     };
+    return { old, finalObservation, previous, deletePrevious };
+  }
+  async function stopPlayback() {
+    const { finalObservation, previous, deletePrevious } = detachPlayback();
     // The final sample and Stop commit together before key cancellation can
     // close the grant. Preparing work is still aborted synchronously in stop().
     const beforeCleanup = finalObservation ? deletePrevious : undefined;
@@ -665,21 +682,31 @@ export function createPlaybackRuntime(ctx: {
   async function loadMedia() {
     await beginLoad("user_intent");
   }
-  async function fallbackLoad(failed: string[] = []) {
+  async function fallbackLoad(
+    failed: string[] = [],
+    continuation?: {
+      parent: PlaybackPlan;
+      capabilities: PlaybackCapabilities;
+    },
+  ) {
     const m = metricIntent;
     if (!m || !metricCurrent(m)) return;
     const intent = planGenerations.next();
     advanceMetricAttempt(m);
-    await loadAttempt(failed, intent, m);
+    await loadAttempt(failed, intent, m, continuation);
   }
   async function loadAttempt(
     failedCandidates: string[],
     intent: ReturnType<PlaybackPlanGenerations["next"]>,
     metrics: MetricIntent,
+    continuation?: {
+      parent: PlaybackPlan;
+      capabilities: PlaybackCapabilities;
+    },
   ) {
     if (!metricCurrent(metrics)) return;
     const s = state.value!;
-    pendingLoad = { metrics, intent, failed: failedCandidates };
+    pendingLoad = { metrics, intent, failed: failedCandidates, continuation };
     recoveryPending = true;
     updateRecovery();
     if (!clockUsable()) {
@@ -689,13 +716,14 @@ export function createPlaybackRuntime(ctx: {
     const revision = clockRevision();
     const serial = ++loadSerial;
     try {
-      await stopPlayback();
+      if (!continuation) await stopPlayback();
       await nextTick();
       if (
         serial !== loadSerial ||
         !metricCurrent(metrics) ||
         !roomIsActive() ||
-        !video.value
+        !video.value ||
+        (continuation && plan !== continuation.parent)
       )
         return;
       recoveryPending = true;
@@ -712,17 +740,18 @@ export function createPlaybackRuntime(ctx: {
       capabilityProbe = probe;
       let candidateSet: PlaybackCandidateSet | undefined;
       try {
-        candidateSet = await session.api<PlaybackCandidateSet>(
-          "/playback-candidates",
-          "POST",
-          {
-            room_id: s.room_id,
-            media_generation: s.media_generation,
-            audio_index: audioIndex.value ?? null,
-            position_ms: target(s, clock.now()),
-          },
-          AbortSignal.any([probe.signal, AbortSignal.timeout(40000)]),
-        );
+        if (!continuation)
+          candidateSet = await session.api<PlaybackCandidateSet>(
+            "/playback-candidates",
+            "POST",
+            {
+              room_id: s.room_id,
+              media_generation: s.media_generation,
+              audio_index: audioIndex.value ?? null,
+              position_ms: target(s, clock.now()),
+            },
+            AbortSignal.any([probe.signal, AbortSignal.timeout(40000)]),
+          );
       } catch (failure) {
         if (
           !(failure instanceof RequestFailure) ||
@@ -740,9 +769,11 @@ export function createPlaybackRuntime(ctx: {
         : undefined;
       if (candidateReport)
         candidateReport.excluded_candidates = [...failedCandidates];
-      const capabilities = candidateReport
-        ? detectCapabilities(element, mseProbe)
-        : await detectCapabilitiesAsync(element, mseProbe, decoder);
+      const capabilities =
+        continuation?.capabilities ??
+        (candidateReport
+          ? detectCapabilities(element, mseProbe)
+          : await detectCapabilitiesAsync(element, mseProbe, decoder));
       // Capability probing is optional asynchronous work. Never start a session
       // for an old identity, element or media after a newer load/reset wins.
       if (
@@ -765,12 +796,15 @@ export function createPlaybackRuntime(ctx: {
         ...intent,
         room_id: s.room_id,
         media_generation: s.media_generation,
-        mode: mode.value,
-        audio_index: audioIndex.value ?? null,
+        mode: continuation ? "transcode" : mode.value,
+        audio_index: continuation
+          ? (continuation.parent.selected_audio_track ?? null)
+          : (audioIndex.value ?? null),
         position_ms: target(state.value ?? s, clock.now()),
         capabilities,
         ...(candidateReport ? { candidate_report: candidateReport } : {}),
         observation_version: 1,
+        http_file_fallback_version: 1,
         playback_metrics_version: 1,
         playback_metrics: {
           meter_start_generation: metrics.startGeneration,
@@ -779,13 +813,39 @@ export function createPlaybackRuntime(ctx: {
       };
       waiting.value = true;
       const requestedSeek = seekSerial;
-      const p = await requests().prepare(request, () => {
+      const currentPosition = () => {
         if (!clockUsable() || revision !== clockRevision()) {
+          // Keep the already claimed file/version and request key through a
+          // clock recalibration. Attachment waits for fresh clock correction;
+          // readiness can safely inspect the originally requested position.
+          if (continuation) return request.position_ms;
           clockAction = "load";
           throw new PlaybackCancelled();
         }
         return target(state.value ?? s, clock.now());
-      });
+      };
+      let p: PlaybackPlan;
+      if (continuation) {
+        // No await between detaching the old element and handing its cleanup
+        // ownership to the request manager. Stop can then cancel the child key
+        // immediately while the parent final DELETE is still pending.
+        if (plan !== continuation.parent) throw new PlaybackCancelled();
+        const detached = detachPlayback();
+        request.http_file_fallback = {
+          parent_session_id: continuation.parent.session_id,
+          ...(detached.finalObservation
+            ? { final_observation: detached.finalObservation }
+            : {}),
+        };
+        const preparing = requests().prepareContinuation(
+          request,
+          detached.deletePrevious,
+          currentPosition,
+        );
+        recoveryPending = true;
+        updateRecovery();
+        p = await preparing;
+      } else p = await requests().prepare(request, currentPosition);
       if (
         serial !== loadSerial ||
         !metricCurrent(metrics) ||
@@ -800,6 +860,7 @@ export function createPlaybackRuntime(ctx: {
         return;
       }
       plan = p;
+      playbackSummary.value = summarizePlaybackPlan(p);
       pendingLoad = undefined;
       // A new plan request has consumed the latest explicit target. Its own
       // metadata reconcile must not replay a pre-load seek as another rebuild.
@@ -878,7 +939,21 @@ export function createPlaybackRuntime(ctx: {
           serial !== loadSerial ||
           !currentPlan(p) ||
           !roomIsActive() ||
-          mode.value !== "auto" ||
+          mode.value !== "auto"
+        )
+          return false;
+        if (
+          p.http_file_fallback_version === 1 &&
+          p.delivery_mode === "direct" &&
+          p.transport === "progressive" &&
+          p.decoder_fallback_modes?.includes("transcode") &&
+          (audioIndex.value === undefined ||
+            audioIndex.value === p.selected_audio_track)
+        ) {
+          void run(() => fallbackLoad([], { parent: p, capabilities }));
+          return true;
+        }
+        if (
           !candidate ||
           !candidateReport ||
           failedCandidates.includes(candidate) ||
@@ -1022,6 +1097,12 @@ export function createPlaybackRuntime(ctx: {
     } catch (e) {
       if (serial !== loadSerial || e instanceof PlaybackCancelled) return;
       waiting.value = false;
+      if (
+        continuation &&
+        e instanceof RequestFailure &&
+        ["NOT_FOUND", "METHOD_NOT_ALLOWED"].includes(e.code)
+      )
+        throw new Error("此服务器不支持安全续接，请重新加载播放");
       throw e;
     }
   }
@@ -1374,7 +1455,12 @@ export function createPlaybackRuntime(ctx: {
       const pending = pendingLoad;
       if (action === "load" && pending)
         void run(() =>
-          loadAttempt(pending.failed, pending.intent, pending.metrics),
+          loadAttempt(
+            pending.failed,
+            pending.intent,
+            pending.metrics,
+            pending.continuation,
+          ),
         );
       else void runAutomaticApply(pendingForce, pendingUserSeek);
     }
@@ -1476,6 +1562,7 @@ export function createPlaybackRuntime(ctx: {
     position,
     sessionId,
     recoveryState,
+    playbackSummary,
     recoveryLabel,
     loadMedia,
     applyState,

@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "http_file_fallback.rs"]
+pub mod http_file_fallback;
+
 pub struct Reservation {
     pub key: Uuid,
     pub session: Uuid,
@@ -8,6 +11,7 @@ pub struct Reservation {
     pub lifecycle_epoch: i64,
     pub viewer_id: Option<Uuid>,
     pub plan_generation: Option<u32>,
+    pub http_file: Option<Box<http_file_fallback::Authority>>,
 }
 
 pub enum Start {
@@ -19,7 +23,17 @@ pub enum Start {
 /// serializes quota decisions across different keys without holding a database
 /// connection while the media source is contacted.
 pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> Result<Start> {
+    begin_authenticated(app, user, body, None).await
+}
+
+pub async fn begin_authenticated(
+    app: &App,
+    user: Uuid,
+    body: &protocol::PlaybackRequest,
+    login_hash: Option<&str>,
+) -> Result<Start> {
     playback_metrics::validate(body)?;
+    http_file_fallback::validate(body)?;
     if !matches!(
         (body.viewer_id, body.plan_generation),
         (None, None) | (Some(_), Some(1..))
@@ -36,6 +50,42 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
     let lifecycle_epoch = persistence::room_lifecycle::lock_active(&mut tx, body.room_id)
         .await
         .map_err(lifecycle_error)?;
+    let state: Value =
+        sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
+            .bind(body.room_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    // The client advertises this before it knows the provider. Only HTTP
+    // grants acquire the new restriction; other providers retain their paths.
+    let http_source = if body.http_file_fallback_version == Some(1) {
+        let media = state["media_id"]
+            .as_str()
+            .and_then(|v| Uuid::parse_str(v).ok());
+        sqlx::query_scalar::<_, String>(
+            "SELECT s.kind FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1",
+        )
+        .bind(media)
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_deref()
+            == Some("http")
+    } else {
+        false
+    };
+    let context = if http_source || body.http_file_fallback.is_some() {
+        Some(
+            persistence::http_file_authorization::capture(
+                &mut tx,
+                user,
+                body.room_id,
+                login_hash.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "login_required"))?,
+            )
+            .await?
+            .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?,
+        )
+    } else {
+        None
+    };
     let member: Option<Uuid> = sqlx::query_scalar(
         "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
     )
@@ -54,6 +104,11 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
         .await?;
     let previous = sqlx::query("SELECT *,expires_at>clock_timestamp() AS retained,lease_until>clock_timestamp() AS live FROM playback_requests WHERE user_id=$1 AND idempotency_key=$2 FOR UPDATE")
         .bind(user).bind(key).fetch_optional(&mut *tx).await?;
+    if let Some(viewer) = body.viewer_id {
+        sqlx::query("SELECT viewer_id FROM playback_viewer_plans WHERE user_id=$1 AND room_id=$2 AND viewer_id=$3 FOR UPDATE")
+            .bind(user).bind(body.room_id).bind(viewer).fetch_optional(&mut *tx).await?;
+    }
+    let mut http_file = None;
     if let Some(row) = previous {
         if row.get::<Option<String>, _>("error_code").as_deref()
             == Some("playback_request_cancelled")
@@ -63,6 +118,7 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
         if row.get::<String, _>("request_hash") != digest {
             return Err(err(StatusCode::CONFLICT, "playback_request_conflict"));
         }
+        http_file = http_file_fallback::restore(app, &row, context.as_ref())?.map(Box::new);
         guard_generation(
             &mut tx,
             user,
@@ -71,6 +127,9 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
             body.plan_generation,
         )
         .await?;
+        if let Some(authority) = &http_file {
+            http_file_fallback::guard_scope(&mut tx, authority, &state).await?;
+        }
         match row.get::<String, _>("status").as_str() {
             "completed" => {
                 if !persistence::source_account_policy::lock_session(&mut tx, row.get("session_id"))
@@ -110,6 +169,10 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
             _ => {}
         }
         let old: Uuid = row.get("session_id");
+        if let Some(authority) = &http_file {
+            http_file_fallback::guard_deadline(&mut tx, authority).await?;
+            http_representation::guard(&mut tx, old).await?;
+        }
         // Retire the previous grant before reclaiming its quota. A different
         // session UUID fences both late completion and late failure callbacks.
         sqlx::query("UPDATE playback_sessions SET stopped=true WHERE id=$1")
@@ -130,6 +193,18 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
                 "playback_request_retry_exhausted",
             ));
         }
+    }
+    if http_file.is_none()
+        && let Some(context) = context
+    {
+        http_file = Some(Box::new(if body.http_file_fallback.is_some() {
+            // Accept the preserved sample and freeze the claim before the
+            // viewer high-water below can retire its live parent.
+            http_file_fallback::claim(app, &mut tx, user, body, &state, context, lifecycle_epoch)
+                .await?
+        } else {
+            http_file_fallback::capture_root(&mut tx, body, &state, context).await?
+        }));
     }
     // A viewer identity is only a correlation key within this authenticated
     // user and room. Admission, retirement and publication share the room lock.
@@ -201,10 +276,23 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
         ));
     }
     let session = Uuid::new_v4();
-    sqlx::query("INSERT INTO playback_requests(user_id,idempotency_key,request_hash,session_id,owner_epoch,status,lease_until,expires_at,room_id,lifecycle_epoch,preparation_drained_at,viewer_id,plan_generation) VALUES($1,$2,$3,$4,$5,'pending',clock_timestamp()+interval '60 seconds',now()+interval '48 hours',$6,$7,NULL,$8,$9) ON CONFLICT(user_id,idempotency_key) DO UPDATE SET session_id=EXCLUDED.session_id,owner_epoch=EXCLUDED.owner_epoch,status='pending',response_encrypted=NULL,error_status=NULL,error_code=NULL,lease_until=EXCLUDED.lease_until,expires_at=EXCLUDED.expires_at,attempt=playback_requests.attempt+1,room_id=EXCLUDED.room_id,lifecycle_epoch=EXCLUDED.lifecycle_epoch,preparation_drained_at=NULL,viewer_id=EXCLUDED.viewer_id,plan_generation=EXCLUDED.plan_generation")
-        .bind(user).bind(key).bind(digest).bind(session).bind(app.epoch).bind(body.room_id).bind(lifecycle_epoch).bind(body.viewer_id).bind(body.plan_generation.map(i64::from)).execute(&mut *tx).await?;
+    let encrypted_context = http_file
+        .as_ref()
+        .map(|authority| http_file_fallback::encrypt(app, authority))
+        .transpose()?;
+    let parent = http_file
+        .as_ref()
+        .and_then(|authority| authority.claim.as_ref().map(|claim| claim.parent));
+    sqlx::query("INSERT INTO playback_requests(user_id,idempotency_key,request_hash,session_id,owner_epoch,status,lease_until,expires_at,room_id,lifecycle_epoch,preparation_drained_at,viewer_id,plan_generation,http_file_context_encrypted,http_file_parent) VALUES($1,$2,$3,$4,$5,'pending',LEAST(clock_timestamp()+interval '60 seconds',to_timestamp($12::double precision/1000.0)),now()+interval '48 hours',$6,$7,NULL,$8,$9,$10,$11) ON CONFLICT(user_id,idempotency_key) DO UPDATE SET session_id=EXCLUDED.session_id,owner_epoch=EXCLUDED.owner_epoch,status='pending',response_encrypted=NULL,error_status=NULL,error_code=NULL,lease_until=EXCLUDED.lease_until,expires_at=EXCLUDED.expires_at,attempt=playback_requests.attempt+1,room_id=EXCLUDED.room_id,lifecycle_epoch=EXCLUDED.lifecycle_epoch,preparation_drained_at=NULL,viewer_id=EXCLUDED.viewer_id,plan_generation=EXCLUDED.plan_generation")
+        .bind(user).bind(key).bind(digest).bind(session).bind(app.epoch).bind(body.room_id).bind(lifecycle_epoch).bind(body.viewer_id).bind(body.plan_generation.map(i64::from)).bind(encrypted_context).bind(parent).bind(http_file.as_ref().and_then(|a| a.claim.as_ref().map(|c| c.deadline_ms))).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO playback_preparations(session_id,room_id,lifecycle_epoch,owner_epoch) VALUES($1,$2,$3,$4)")
         .bind(session).bind(body.room_id).bind(lifecycle_epoch).bind(app.epoch).execute(&mut *tx).await?;
+    if let Some(authority) = &http_file {
+        http_file_fallback::guard_deadline(&mut tx, authority).await?;
+        if !persistence::http_file_authorization::lock(&mut tx, &authority.context).await? {
+            return Err(err(StatusCode::GONE, "invalid_playback_session"));
+        }
+    }
     tx.commit().await?;
     Ok(Start::Reserved(Reservation {
         key,
@@ -214,6 +302,7 @@ pub async fn begin(app: &App, user: Uuid, body: &protocol::PlaybackRequest) -> R
         lifecycle_epoch,
         viewer_id: body.viewer_id,
         plan_generation: body.plan_generation,
+        http_file,
     }))
 }
 
@@ -253,6 +342,16 @@ pub async fn guard(
     if epoch != reservation.lifecycle_epoch {
         return Err(err(StatusCode::CONFLICT, "room_not_active"));
     }
+    let state: Value =
+        sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
+            .bind(reservation.room_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if let Some(authority) = &reservation.http_file
+        && !persistence::http_file_authorization::lock(tx, &authority.context).await?
+    {
+        return Err(err(StatusCode::GONE, "invalid_playback_session"));
+    }
     let member: Option<Uuid> = sqlx::query_scalar(
         "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
     )
@@ -275,6 +374,10 @@ pub async fn guard(
         .bind(reservation.user).bind(reservation.key).bind(reservation.session).bind(app.epoch).fetch_optional(&mut **tx).await?;
     if valid.is_none() {
         return Err(err(StatusCode::CONFLICT, "playback_request_interrupted"));
+    }
+    if let Some(authority) = &reservation.http_file {
+        http_file_fallback::guard_scope(tx, authority, &state).await?;
+        http_file_fallback::guard_deadline(tx, authority).await?;
     }
     Ok(())
 }

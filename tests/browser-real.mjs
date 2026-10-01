@@ -400,7 +400,7 @@ await isolatedServer(
           exact: true,
         }),
       ).toBeVisible();
-      await expect(admin.locator(".connection-status")).toHaveText("已连接");
+      await expect(admin.locator(".connection-status")).toHaveText("房间连接正常");
       await admin
         .getByRole("button", { name: "房间邀请", exact: true })
         .click();

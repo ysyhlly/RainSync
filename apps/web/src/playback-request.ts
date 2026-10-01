@@ -197,6 +197,11 @@ export class PlaybackRequests {
   private controller?: AbortController;
   private serial = 0;
   private finalization: Promise<void> = Promise.resolve();
+  private completed?: { key: string; plan: PlaybackPlan };
+  private continuation?: {
+    parentKey: string;
+    finish: () => Promise<void>;
+  };
   constructor(
     private send: (
       body: PlaybackRequest,
@@ -229,23 +234,38 @@ export class PlaybackRequests {
       clearTimeout(timer);
     }
   }
-  private async cleanup() {
+  private async cleanup(except?: string) {
+    if (this.continuation && except !== this.continuation.parentKey)
+      await this.continuation.finish();
     await this.finalization;
-    for (const key of [...this.keys]) await this.revoke(key);
+    for (const key of [...this.keys])
+      if (key !== except) await this.revoke(key);
   }
   async stop(beforeCleanup?: () => Promise<void>) {
     this.serial++;
     this.controller?.abort();
+    this.completed = undefined;
     // Snapshot before the barrier: a late DELETE must not revoke a successor.
     const keys = [...this.keys];
+    const continuation = this.continuation;
+    // A continuation's new key must be cancelled immediately, even while its
+    // old final DELETE is blocked. That tombstone fences a late claim POST.
+    const immediate = continuation
+      ? Promise.all(
+          keys
+            .filter((key) => key !== continuation.parentKey)
+            .map((key) => this.revoke(key)),
+        )
+      : Promise.resolve();
+    const finishParent = continuation?.finish() ?? Promise.resolve();
     const finalization = beforeCleanup
       ? this.finalization.then(beforeCleanup)
       : this.finalization;
     // Successor preparations and repeated stops must also wait for the final
     // grant sample, before any key cancellation can close the same grant.
     this.finalization = finalization.catch(() => {});
-    await finalization;
-    for (const key of keys) await this.revoke(key);
+    await Promise.all([immediate, finishParent, finalization]);
+    if (!continuation) for (const key of keys) await this.revoke(key);
   }
   async prepare(
     input: PlaybackRequest,
@@ -253,6 +273,7 @@ export class PlaybackRequests {
   ): Promise<PlaybackPlan> {
     const serial = ++this.serial;
     this.controller?.abort();
+    this.completed = undefined;
     // Never consume another quota slot while an older result is uncertain.
     try {
       await this.cleanup();
@@ -290,6 +311,7 @@ export class PlaybackRequests {
           plan.plan_generation,
         );
       if (serial !== this.serial) throw new PlaybackCancelled();
+      this.completed = { key, plan };
       return plan;
     } catch (error) {
       // Failed revocation remains in storage and blocks the next preparation.
@@ -304,6 +326,105 @@ export class PlaybackRequests {
       }
       if (serial !== this.serial || error instanceof PlaybackCancelled)
         throw new PlaybackCancelled();
+      throw error;
+    }
+  }
+
+  /** Atomically replace an opted-in live HTTP file through the server's claim.
+   * The parent stays in cleanup storage until final DELETE then key revocation.
+   * Its final sample is also in the immutable POST, before server retirement. */
+  async prepareContinuation(
+    input: PlaybackRequest,
+    finalizeParent: () => Promise<void>,
+    position?: () => number,
+  ): Promise<PlaybackPlan> {
+    const parent = this.completed;
+    if (
+      !parent ||
+      parent.plan.http_file_fallback_version !== 1 ||
+      parent.plan.delivery_mode !== "direct" ||
+      parent.plan.transport !== "progressive" ||
+      !parent.plan.decoder_fallback_modes?.includes("transcode") ||
+      input.http_file_fallback_version !== 1 ||
+      input.mode !== "transcode" ||
+      input.http_file_fallback?.parent_session_id !== parent.plan.session_id ||
+      input.idempotency_key === parent.key ||
+      !this.keys.has(parent.key) ||
+      this.continuation
+    ) {
+      await this.stop(finalizeParent);
+      throw new RequestFailure({ error: { code: "SOURCE_VERSION_REQUIRED" } });
+    }
+    const serial = ++this.serial;
+    this.controller?.abort();
+    this.completed = undefined;
+    let finishing: Promise<void> | undefined;
+    const continuation = {
+      parentKey: parent.key,
+      finish: () => {
+        if (!finishing) {
+          finishing = this.finalization
+            .then(finalizeParent)
+            .then(() => this.revoke(parent.key))
+            .finally(() => {
+              if (this.continuation === continuation)
+                this.continuation = undefined;
+            });
+          this.finalization = finishing.catch(() => {});
+        }
+        return finishing;
+      },
+    };
+    this.continuation = continuation;
+    const key = input.idempotency_key ?? crypto.randomUUID();
+    let recorded = false;
+    try {
+      await this.cleanup(parent.key);
+      if (serial !== this.serial) throw new PlaybackCancelled();
+      // Persist before the first POST; Stop can cancel even an unclaimed key.
+      this.keys.add(key);
+      recorded = true;
+      this.save();
+      const controller = new AbortController();
+      this.controller = controller;
+      const plan = await requestPlayback(
+        this.send,
+        { ...input, idempotency_key: key },
+        controller.signal,
+      );
+      if (serial !== this.serial) throw new PlaybackCancelled();
+      await continuation.finish();
+      if (serial !== this.serial) throw new PlaybackCancelled();
+      if (plan.rebuild_on_seek && this.readiness)
+        await waitPlaybackReady(
+          (id, signal) =>
+            this.readiness!(
+              id,
+              signal,
+              Math.max(
+                0,
+                (position?.() ?? input.position_ms) - plan.timeline_origin_ms,
+              ),
+              plan.plan_generation,
+            ),
+          plan.session_id,
+          controller.signal,
+          plan.plan_generation,
+        );
+      if (serial !== this.serial) throw new PlaybackCancelled();
+      // A successor is never a root, even if a malformed response says it is.
+      this.completed = undefined;
+      return plan;
+    } catch (error) {
+      // Start child cancellation before potentially slow parent finalization.
+      const cleanup = await Promise.allSettled([
+        recorded ? this.revoke(key) : Promise.resolve(),
+        continuation.finish(),
+      ]);
+      if (serial !== this.serial || error instanceof PlaybackCancelled)
+        throw new PlaybackCancelled();
+      if (cleanup.some((result) => result.status === "rejected"))
+        throw new Error("播放续接已停止；旧播放请求尚待清理，恢复连接后重试");
       throw error;
     }
   }

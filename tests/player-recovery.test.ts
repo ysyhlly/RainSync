@@ -1,8 +1,14 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { effectScope, ref } from "vue";
 import { createPlaybackRuntime } from "../apps/web/src/features/playback/playback-runtime";
+import { RequestFailure } from "../apps/web/src/errors";
+
+const isPlaybackPost = (path: string) =>
+  path === "/playback-sessions" ||
+  path === "/playback-sessions/http-file-continuation";
 
 const faults = vi.hoisted(() => ({ observe: false, dispose: false }));
+const meterStarts = vi.hoisted(() => [] as number[]);
 const hls = vi.hoisted(() => ({
   supported: false,
   start: vi.fn(),
@@ -34,6 +40,7 @@ vi.mock(
     return {
       ...actual,
       createPlaybackMetrics: (...args: any[]) => {
+        meterStarts.push(args[0].t0);
         const meter = actual.createPlaybackMetrics(...args);
         const observe = meter.observe,
           dispose = meter.dispose;
@@ -52,6 +59,7 @@ vi.mock(
 );
 afterEach(() => {
   faults.observe = faults.dispose = false;
+  meterStarts.length = 0;
   hls.supported = false;
   hls.start.mockClear();
   hls.load.mockClear();
@@ -75,6 +83,8 @@ function setup(
     observationSeq?: number;
     clearsError?: boolean;
     hls?: boolean;
+    fileFallback?: boolean;
+    captureErrors?: boolean;
   } = {},
 ) {
   vi.useFakeTimers({
@@ -107,14 +117,21 @@ function setup(
   const api = vi.fn(
     async (path: string, method?: string, body?: any): Promise<any> => {
       if (path === "/playback-candidates") return {};
-      if (path === "/playback-sessions" && method === "POST")
+      if (isPlaybackPost(path) && method === "POST")
         return {
           session_id: `session-${body.plan_generation}`,
           plan_generation: body.plan_generation,
-          media_id: "media",
-          media_generation: 1,
-          transport: options.hls ? "hls" : "progressive",
-          delivery_mode: "direct",
+          media_id: state.value.media_id,
+          media_generation: body.media_generation,
+          transport:
+            options.hls || body.http_file_fallback ? "hls" : "progressive",
+          delivery_mode: body.http_file_fallback ? "transcode" : "direct",
+          ...(options.fileFallback && !body.http_file_fallback
+            ? {
+                http_file_fallback_version: 1,
+                decoder_fallback_modes: ["transcode"],
+              }
+            : {}),
           playback_url: "/authorized.mp4",
           timeline_origin_ms: 0,
           duration_ms: 120000,
@@ -159,7 +176,13 @@ function setup(
       error,
       run: async (action) => {
         if (options.clearsError) error.value = "";
-        await action();
+        try {
+          await action();
+        } catch (failure) {
+          if (!options.captureErrors) throw failure;
+          error.value =
+            failure instanceof Error ? failure.message : String(failure);
+        }
       },
     }),
   )!;
@@ -204,6 +227,7 @@ function setup(
   runtime.attach(el);
   return {
     runtime,
+    session,
     el,
     clock,
     state,
@@ -230,6 +254,351 @@ function setup(
     cleanup: () => scope.stop(),
   };
 }
+
+it("continues an opted-in HTTP decoder failure once with the old final sample before DELETE", async () => {
+  const s = setup({ fileFallback: true, observationSeq: 0 });
+  try {
+    await s.prepare();
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    await vi.advanceTimersByTimeAsync(0);
+    const posts = s.api.mock.calls.filter(
+      ([path, method]) => isPlaybackPost(path) && method === "POST",
+    );
+    expect(posts).toHaveLength(2);
+    const body = posts[1][2];
+    expect(body.mode).toBe("transcode");
+    expect(body.http_file_fallback_version).toBe(1);
+    expect(body.http_file_fallback.parent_session_id).toBe("session-1");
+    expect(body.http_file_fallback.final_observation.seq).toBe(1);
+    expect(body.playback_metrics).toEqual(posts[0][2].playback_metrics);
+    const finalDelete = s.api.mock.calls.findIndex(
+      ([path, method]) =>
+        path === "/playback-sessions/session-1" && method === "DELETE",
+    );
+    expect(finalDelete).toBeGreaterThan(s.api.mock.calls.indexOf(posts[1]));
+    expect(s.api.mock.calls[finalDelete][2]).toEqual(
+      body.http_file_fallback.final_observation,
+    );
+    expect(s.runtime.sessionId.value).toBe("session-2");
+    // The successor's fatal media error may use same-plan native recovery, but
+    // it must never allocate a third continuation or a fresh unbound plan.
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(
+      s.api.mock.calls.filter(
+        ([path, method]) => isPlaybackPost(path) && method === "POST",
+      ),
+    ).toHaveLength(2);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it.each([false, true])(
+  "never uses file continuation for a network error (marker=%s)",
+  async (fileFallback) => {
+    const s = setup({ fileFallback });
+    try {
+      await s.prepare();
+      s.el.error = { code: 2 };
+      s.el.onerror();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(
+        s.api.mock.calls.filter(
+          ([path, method]) => isPlaybackPost(path) && method === "POST",
+        ),
+      ).toHaveLength(1);
+      expect(s.error.value).toContain("检查连接");
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it("keeps old-server playback usable without inventing file continuation eligibility", async () => {
+  const s = setup();
+  try {
+    await s.prepare();
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(
+      s.api.mock.calls.filter(
+        ([path, method]) => isPlaybackPost(path) && method === "POST",
+      ),
+    ).toHaveLength(1);
+    await s.runtime.loadMedia();
+    const posts = s.api.mock.calls.filter(
+      ([path, method]) => isPlaybackPost(path) && method === "POST",
+    );
+    expect(posts).toHaveLength(2);
+    expect(posts[1][2].http_file_fallback).toBeUndefined();
+  } finally {
+    s.cleanup();
+  }
+});
+
+it.each(["NOT_FOUND", "METHOD_NOT_ALLOWED"] as const)(
+  "a cached marker after rollback fails closed on %s without ordinary prepare fallback",
+  async (code) => {
+    const s = setup({
+      fileFallback: true,
+      observationSeq: 0,
+      captureErrors: true,
+    });
+    const original = s.api.getMockImplementation()!;
+    s.api.mockImplementation(async (path, method, body) => {
+      if (path === "/playback-sessions/http-file-continuation")
+        throw new RequestFailure({ error: { code } });
+      return original(path, method, body);
+    });
+    try {
+      await s.prepare();
+      s.el.error = { code: 3 };
+      s.el.onerror();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(
+        s.api.mock.calls.filter(
+          ([path]) => path === "/playback-sessions/http-file-continuation",
+        ),
+      ).toHaveLength(1);
+      expect(
+        s.api.mock.calls.filter(
+          ([path, method]) =>
+            path === "/playback-sessions" && method === "POST",
+        ),
+      ).toHaveLength(1);
+      expect(s.runtime.sessionId.value).toBeNull();
+      expect(s.error.value).toContain("不支持安全续接");
+      expect(
+        s.api.mock.calls.some(
+          ([path, method, body]) =>
+            path === "/playback-sessions/session-1" &&
+            method === "DELETE" &&
+            body.seq === 1,
+        ),
+      ).toBe(true);
+      s.invalidate();
+      s.clock.ready = true;
+      s.runtime.onClockReady();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(
+        s.api.mock.calls.filter(
+          ([path, method]) => isPlaybackPost(path) && method === "POST",
+        ),
+      ).toHaveLength(2);
+      // Explicit reload is a fresh user intent and uses the ordinary route.
+      await s.runtime.loadMedia();
+      const ordinary = s.api.mock.calls.filter(
+        ([path, method]) => path === "/playback-sessions" && method === "POST",
+      );
+      expect(ordinary).toHaveLength(2);
+      expect(ordinary[1][2].http_file_fallback).toBeUndefined();
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it("clock invalidation during a claimed file continuation preserves its key and waits for calibration", async () => {
+  const s = setup({ fileFallback: true, observationSeq: 0 });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const original = s.api.getMockImplementation()!;
+  s.api.mockImplementation(async (path, method, body) => {
+    if (isPlaybackPost(path) && body?.http_file_fallback) await held;
+    return original(path, method, body);
+  });
+  try {
+    await s.prepare();
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    await vi.advanceTimersByTimeAsync(0);
+    s.invalidate();
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.runtime.sessionId.value).toBe("session-2");
+    expect(s.runtime.recoveryState.value).toBe("calibrating");
+    s.clock.ready = true;
+    s.runtime.onClockReady();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(
+      s.api.mock.calls.filter(
+        ([path, method]) => isPlaybackPost(path) && method === "POST",
+      ),
+    ).toHaveLength(2);
+  } finally {
+    release();
+    s.cleanup();
+  }
+});
+
+it("defers file continuation before claim until a fresh clock while preserving the logical t0", async () => {
+  const s = setup({ fileFallback: true, observationSeq: 0 });
+  try {
+    await s.prepare();
+    const t0 = meterStarts[0];
+    await vi.advanceTimersByTimeAsync(2500);
+    s.invalidate();
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(
+      s.api.mock.calls.filter(
+        ([path, method]) => isPlaybackPost(path) && method === "POST",
+      ),
+    ).toHaveLength(1);
+    expect(
+      s.api.mock.calls.some(
+        ([path, method]) =>
+          path === "/playback-sessions/session-1" && method === "DELETE",
+      ),
+    ).toBe(false);
+    expect(meterStarts).toEqual([t0]);
+    s.clock.ready = true;
+    s.runtime.onClockReady();
+    await vi.advanceTimersByTimeAsync(0);
+    const posts = s.api.mock.calls.filter(
+      ([path, method]) => isPlaybackPost(path) && method === "POST",
+    );
+    expect(posts).toHaveLength(2);
+    expect(posts[1][0]).toBe("/playback-sessions/http-file-continuation");
+    expect(posts[1][2].playback_metrics).toEqual(posts[0][2].playback_metrics);
+    expect(meterStarts).toEqual([t0]);
+    expect(performance.now() - t0).toBeGreaterThanOrEqual(7500);
+    expect(s.runtime.sessionId.value).toBe("session-2");
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("an identity replacement cannot resume a deferred old file continuation", async () => {
+  const s = setup({
+    fileFallback: true,
+    observationSeq: 0,
+    captureErrors: true,
+  });
+  try {
+    await s.prepare();
+    s.invalidate();
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    await vi.advanceTimersByTimeAsync(0);
+    s.session.user = { id: "different-user" };
+    s.session.epoch++;
+    await s.runtime.reset();
+    s.clock.ready = true;
+    s.runtime.onClockReady();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(
+      s.api.mock.calls.filter(
+        ([path, method]) => isPlaybackPost(path) && method === "POST",
+      ),
+    ).toHaveLength(1);
+    expect(s.runtime.sessionId.value).toBeNull();
+    expect(s.el.src).toBe("");
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("a newer media intent cancels a claimed file continuation and ignores its late response", async () => {
+  const s = setup({
+    fileFallback: true,
+    observationSeq: 0,
+    captureErrors: true,
+  });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const original = s.api.getMockImplementation()!;
+  s.api.mockImplementation(async (path, method, body) => {
+    if (path === "/playback-sessions/http-file-continuation") await held;
+    return original(path, method, body);
+  });
+  try {
+    await s.prepare();
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    await vi.advanceTimersByTimeAsync(0);
+    const old = s.api.mock.calls.find(
+      ([path]) => path === "/playback-sessions/http-file-continuation",
+    )![2];
+    s.state.value.media_id = "other-media";
+    s.state.value.media_generation = 2;
+    s.runtime.mediaChanged();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.runtime.sessionId.value).toBe("session-3");
+    expect(
+      s.api.mock.calls.some(
+        ([path, method]) =>
+          path === `/playback-requests/${old.idempotency_key}` &&
+          method === "DELETE",
+      ),
+    ).toBe(true);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.runtime.sessionId.value).toBe("session-3");
+    const posts = s.api.mock.calls.filter(
+      ([path, method]) => isPlaybackPost(path) && method === "POST",
+    );
+    expect(posts).toHaveLength(3);
+    expect(posts[2][2].http_file_fallback).toBeUndefined();
+    expect(posts[2][2].media_generation).toBe(2);
+    expect(meterStarts).toHaveLength(2);
+  } finally {
+    release();
+    s.cleanup();
+  }
+});
+
+it("Stop during the file continuation cancels both identities and ignores a late plan", async () => {
+  const s = setup({ fileFallback: true, observationSeq: 0 });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const original = s.api.getMockImplementation()!;
+  s.api.mockImplementation(async (path, method, body) => {
+    if (isPlaybackPost(path) && body?.http_file_fallback) await held;
+    return original(path, method, body);
+  });
+  try {
+    await s.prepare();
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    await vi.advanceTimersByTimeAsync(0);
+    const body = s.api.mock.calls.find(
+      ([path, method, body]) =>
+        isPlaybackPost(path) && method === "POST" && body.http_file_fallback,
+    )![2];
+    await s.runtime.reset();
+    expect(
+      s.api.mock.calls.some(
+        ([path, method]) =>
+          path === `/playback-requests/${body.idempotency_key}` &&
+          method === "DELETE",
+      ),
+    ).toBe(true);
+    const oldDelete = s.api.mock.calls.findIndex(
+      ([path, method]) =>
+        path === "/playback-sessions/session-1" && method === "DELETE",
+    );
+    expect(oldDelete).toBeGreaterThan(0);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.runtime.sessionId.value).toBeNull();
+    expect(s.el.src).toBe("");
+  } finally {
+    release();
+    s.cleanup();
+  }
+});
 
 it("keeps a supported non-unit room rate and verifies fine behavior over later ticks", async () => {
   const s = setup({ rate: 1.5 });
@@ -372,7 +741,7 @@ it("generated holes use a new generation for explicit seeks", async () => {
     s.state.value.anchor_position_ms = 15000;
     await s.runtime.applyState(true, true);
     const posts = s.api.mock.calls.filter(
-      ([path, method]) => path === "/playback-sessions" && method === "POST",
+      ([path, method]) => isPlaybackPost(path) && method === "POST",
     );
     expect(posts.map((call) => call[2].plan_generation)).toEqual([1, 2]);
     expect(s.seeks).not.toHaveBeenCalled();
