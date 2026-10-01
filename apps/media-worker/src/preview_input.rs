@@ -160,7 +160,7 @@ impl Grant {
     }
     fn charge(&self, n: usize) -> std::io::Result<()> {
         self.remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(n as u64)
             })
             .map(|_| ())
