@@ -19,6 +19,7 @@ import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import WS from "ws";
+import { encoderLogSnapshot, collectEncoderLogs } from "./fixtures/upstream-encoder-evidence.mjs";
 import { chainEvidence, manifestReferences } from "./fixtures/upstream-profile-chain.mjs";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
 import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
@@ -61,6 +62,7 @@ const coordinator = await Promise.all([
   "tests/upstream-profile-products.mjs", "tests/fixtures/upstream-real.mjs",
   "tests/fixtures/upstream-storage.mjs",
   "tests/fixtures/upstream-profile-route-contract.mjs", "tests/fixtures/upstream-profile-chain.mjs",
+  "tests/fixtures/upstream-encoder-evidence.mjs",
   "tests/fixtures/media-stack.mjs", "tests/fixtures/server.mjs", "tests/fixtures/postgres.mjs",
 ].map(async (path) => ({ path, sha256: await digest(resolve(repo, path)) })));
 const nodeRuntime = { version: process.version, path: process.execPath, sha256: await digest(process.execPath) };
@@ -816,7 +818,11 @@ async function runProduct(upstream, product, directory) {
           const row = { ...input, result: "running", started_at: new Date().toISOString(), browser_estimate_controlled: true };
           product.cases.push(row); await save();
           const caseDirectory = resolve(directory, row.name); await mkdir(caseDirectory, { recursive: true });
-          const key = randomUUID(); let plan;
+          const key = randomUUID(); let plan, encoderBefore;
+          if (upstream.kind === "emby") {
+            try { encoderBefore = await encoderLogSnapshot(upstream.admin); }
+            catch { row.encoder_log_evidence = { status: "pre_case_snapshot_unavailable" }; }
+          }
           try {
             const listed = upstream.items.find((entry) => entry.Name === input.title); assert.ok(listed);
             const item = await upstreamClient.api(`/Users/${upstreamClient.userId}/Items/${listed.Id}`);
@@ -975,6 +981,14 @@ async function runProduct(upstream, product, directory) {
             } catch (error) {
               row.result = "failed"; row.cleanup_error = redact(error.message);
               report.failures.push({ kind: upstream.kind, case: input.name, stage: "cleanup", error: row.cleanup_error });
+            }
+            if (upstream.kind === "emby" && encoderBefore) {
+              // Cleanup above remains independent; log inspection cannot replace the primary case failure.
+              try {
+                const owned = ledger(key);
+                row.encoder_log_evidence = await collectEncoderLogs(upstream.admin, encoderBefore,
+                  { sid: owned?.play_session_id, device: owned?.device_id });
+              } catch { row.encoder_log_evidence = { status: "incomplete_or_unavailable" }; }
             }
             row.finished_at = new Date().toISOString(); await save();
             console.log(`${row.result === "passed" ? "PASS" : "FAIL"} ${upstream.kind} ${input.name}`);

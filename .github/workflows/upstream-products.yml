@@ -172,7 +172,7 @@ jobs:
           export RAINSYNC_NATIVE_POSTGRES_BIN="$(pg_config --bindir)"
           node scripts/bind-native-backend.mjs > "$RAINSYNC_ARTIFACT_DIR/binding-path.txt"
           export W03_BACKEND_BINDING="$(tail -n 1 "$RAINSYNC_ARTIFACT_DIR/binding-path.txt")"
-          node --test tests/upstream-storage.test.mjs tests/upstream-profile-route-contract.test.mjs tests/upstream-profile-emby-diagnostic.test.mjs tests/upstream-profile-diagnostic-trigger.test.mjs tests/upstream-profile-stress.test.mjs tests/upstream-profile-chain.test.mjs
+          node --test tests/upstream-storage.test.mjs tests/upstream-profile-route-contract.test.mjs tests/upstream-profile-emby-diagnostic.test.mjs tests/upstream-profile-diagnostic-trigger.test.mjs tests/upstream-profile-stress.test.mjs tests/upstream-profile-chain.test.mjs tests/upstream-encoder-evidence.test.mjs
           node tests/upstream-profile-products.mjs all
       - name: Observe raw Emby profile behavior (explicit opt-in only)
         if: ${{ always() && ((github.event_name == 'workflow_dispatch' && inputs.run_emby_profile_diagnostic) || (github.event_name == 'push' && github.ref == 'refs/heads/integration/v0.1-next' && contains(github.event.head_commit.message, '[run-emby-profile-diagnostic]'))) }}
