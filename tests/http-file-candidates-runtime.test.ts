@@ -32,6 +32,7 @@ vi.mock("hls.js", () => ({
   default: class {
     static Events = { ERROR: "error" };
     static isSupported = () => hls.supported;
+    static isMSESupported = () => hls.supported;
     static getMediaSource = () => ({ isTypeSupported: () => true });
     config = {};
     loadSource(url: string) {
@@ -508,7 +509,11 @@ for (const mode of ["auto", "remux", "transcode"]) {
       s.runtime.mode.value = mode;
       const original = s.api.getMockImplementation()!;
       s.api.mockImplementation(async (path, method, body) => {
-        if (path === "/playback-candidates")
+        if (
+          ["/playback-candidates", "/upstream-profile-candidates"].includes(
+            path,
+          )
+        )
           throw new RequestFailure({ error: { code: "NOT_FOUND" } });
         return original(path, method, body);
       });
@@ -517,6 +522,11 @@ for (const mode of ["auto", "remux", "transcode"]) {
       expect(s.prepares()[0][2].mode).toBe(mode);
       expect(s.prepares()[0][2]).not.toHaveProperty("candidate_report");
       expect(detectCapabilitiesAsync).toHaveBeenCalledTimes(1);
+      expect(
+        s.api.mock.calls.filter(
+          ([path]) => path === "/upstream-profile-candidates",
+        ),
+      ).toHaveLength(mode === "transcode" ? 1 : 0);
     } finally {
       s.cleanup();
     }

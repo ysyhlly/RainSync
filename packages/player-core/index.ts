@@ -4,6 +4,11 @@ export {
   detectCandidateReport,
 } from "./capabilities";
 export {
+  detectUpstreamProfileReport,
+  isUpstreamProfileEnvelope,
+  matchesUpstreamProfilePlan,
+} from "./upstream-profile";
+export {
   PlaybackPlanGenerations,
   matchesPlanGeneration,
 } from "./plan-generation";

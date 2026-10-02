@@ -15,7 +15,11 @@ export type SubtitleDeliveryMode = "none" | "external_vtt";
 export type DecoderFallbackMode = "remux" | "transcode";
 export type PlaybackMediaRange = { start_ms: number, end_ms: number, };
 export type HttpFileFallback = { parent_session_id: string, final_observation?: PlaybackObservation, };
-export type PlaybackPlan = { session_id: string,
+export type PlaybackPlan = {
+/**
+ * Negotiated upstream recipe envelope; not measured media configuration.
+ */
+upstream_profile?: UpstreamTranscodeProfileEnvelope, session_id: string,
 /**
  * Per-viewer intent generation; absent for legacy grants. Never room revision.
  */
@@ -97,12 +101,32 @@ export type PlaybackCandidateReport = { binding: string, results: Array<Playback
  * Bounded client decode-failure history; never changes authorization.
  */
 excluded_candidates: Array<string>, };
+export type UpstreamProfileSemantics = "upstream_transcode_profile_envelope";
+export type UpstreamVideoProfileBounds = { codec: string, profile: string, max_level: string, max_width: number, max_height: number, max_framerate: number, max_bitrate: number, requested_bit_depth: number, requested_range: string, };
+export type UpstreamAudioProfileBounds = {
+/**
+ * AAC is requested. A particular AAC profile is not promised by this field.
+ */
+codec: string, max_channels: number, requested_sample_rate: number, max_bitrate: number, };
+export type UpstreamProfileProbeSample = { video: VideoCapabilityConfiguration, audio: AudioCapabilityConfiguration | null, };
+export type UpstreamTranscodeProfileEnvelope = { profile_version: number, profile_id: string, configuration_semantics: UpstreamProfileSemantics, transport: string, container: string, requested_video: UpstreamVideoProfileBounds, requested_audio: UpstreamAudioProfileBounds | null, mse_sample: UpstreamProfileProbeSample, };
+export type UpstreamProfileCandidateRequest = { profile_version: number, room_id: string, media_generation: number, position_ms: number, audio_index: number | null, };
+export type UpstreamProfileCandidateSet = { profile_version: number,
+/**
+ * Binding and profile are either both present or both absent.
+ */
+binding: string | null, profile: UpstreamTranscodeProfileEnvelope | null, decision_reason: string, };
+export type UpstreamProfileReport = { profile_version: number, binding: string, profile_id: string, mse_supported: boolean, mse_decoding?: MediaDecodingSupport, };
 export type PlaybackCapabilities = { progressive_h264_aac: boolean, native_hls: boolean, mse_h264_aac: boolean,
 /**
  * Optional additive hints. Old clients retain the original transport gates.
  */
 report?: CapabilityReport, };
 export type PlaybackRequest = {
+/**
+ * Dedicated upstream-profile route only; absence preserves legacy hashes.
+ */
+upstream_profile_report?: UpstreamProfileReport,
 /**
  * Negotiate single-hop verified HTTP-file continuation; absence is legacy.
  */

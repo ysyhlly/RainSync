@@ -4,6 +4,8 @@ import {
   detectCapabilities,
   detectCapabilitiesAsync,
   detectCandidateReport,
+  detectUpstreamProfileReport,
+  isUpstreamProfileEnvelope,
   PlaybackPlanGenerations,
   matchesPlanGeneration,
   PlaybackRateSupport,
@@ -24,6 +26,8 @@ import type {
   PlaybackCandidateReport,
   PlaybackCapabilities,
   PlaybackMetricsReceipt,
+  UpstreamProfileCandidateSet,
+  UpstreamProfileReport,
 } from "../../../../../packages/protocol";
 import { RequestFailure } from "../../errors";
 import { StaleIdentity } from "../../shared/api/client";
@@ -248,6 +252,11 @@ export function createPlaybackRuntime(ctx: {
     report?: PlaybackCandidateReport;
     // A finite schema-1 set keeps its original binding and device evidence.
     concrete?: { candidates: PlaybackCandidateSet; startedAt: number };
+    upstream?: {
+      candidates: UpstreamProfileCandidateSet;
+      report: UpstreamProfileReport;
+      startedAt: number;
+    };
   };
   let metricIntent: MetricIntent | undefined;
   let metricSource: ReturnType<typeof bindPlaybackMetricEvents> | undefined;
@@ -371,8 +380,10 @@ export function createPlaybackRuntime(ctx: {
     m.concreteCandidates = undefined;
   }
   function checkCandidateLifetime(snapshot: CandidateDiscovery) {
-    if (!snapshot.concrete) return;
-    const elapsed = performance.now() - snapshot.concrete.startedAt;
+    const startedAt =
+      snapshot.upstream?.startedAt ?? snapshot.concrete?.startedAt;
+    if (startedAt === undefined) return;
+    const elapsed = performance.now() - startedAt;
     // This conservative local limit never authorizes a binding. The server's
     // original authority-clock expiry and current fences still decide prepare.
     if (
@@ -597,12 +608,25 @@ export function createPlaybackRuntime(ctx: {
       playbackRequests = new PlaybackRequests(
         (body, signal) => {
           if (session.epoch !== epoch) throw new StaleIdentity();
+          if (body.upstream_profile_report) {
+            const snapshot = metricIntent?.concreteCandidates;
+            if (
+              !snapshot?.upstream ||
+              !candidateIntentCurrent(metricIntent!) ||
+              snapshot.upstream.report.binding !==
+                body.upstream_profile_report.binding
+            )
+              throw new PlaybackCancelled();
+            checkCandidateLifetime(snapshot);
+          }
           return session.api<PlaybackPlan>(
-            body.http_file_fallback
-              ? "/playback-sessions/http-file-continuation"
-              : "/playback-sessions",
+            body.upstream_profile_report
+              ? "/playback-sessions/upstream-profile"
+              : body.http_file_fallback
+                ? "/playback-sessions/http-file-continuation"
+                : "/playback-sessions",
             "POST",
-            body,
+            body.upstream_profile_report ? structuredClone(body) : body,
             signal,
           );
         },
@@ -783,6 +807,7 @@ export function createPlaybackRuntime(ctx: {
   ) {
     const m = metricIntent;
     if (!m || !candidateIntentCurrent(m)) return;
+    if (m.concreteCandidates?.upstream) throw new Error(candidateError);
     if (m.concreteCandidates) {
       m.failedCandidates = [...new Set([...m.failedCandidates, ...failed])];
       failed = [...m.failedCandidates];
@@ -807,7 +832,8 @@ export function createPlaybackRuntime(ctx: {
     metrics.candidateDiscovery = discovery;
     discovery.result = (async () => {
       let marked = false,
-        concrete = false;
+        concrete = false,
+        upstreamAttempted = false;
       try {
         const startedAt = performance.now();
         let candidateSet: PlaybackCandidateSet | undefined;
@@ -865,11 +891,123 @@ export function createPlaybackRuntime(ctx: {
             structuredClone(candidateSet!),
           );
         }
-        const mseProbe = Hls.isSupported() ? Hls.getMediaSource() : undefined;
-        const decoder =
-          typeof navigator === "undefined"
-            ? undefined
-            : navigator.mediaCapabilities;
+        const profileDiscovery = metrics.mode === "transcode" && !concrete;
+        let mseProbe: ReturnType<typeof Hls.getMediaSource>;
+        let decoder: MediaCapabilities | undefined;
+        if (profileDiscovery) {
+          // API availability opts into the new envelope; it is not sample
+          // evidence. An unavailable/unreadable API keeps legacy negotiation.
+          try {
+            mseProbe = Hls.isMSESupported() ? Hls.getMediaSource() : undefined;
+            if (typeof mseProbe?.isTypeSupported !== "function")
+              mseProbe = undefined;
+          } catch {
+            mseProbe = undefined;
+          }
+          try {
+            decoder =
+              typeof navigator === "undefined"
+                ? undefined
+                : navigator.mediaCapabilities;
+            if (typeof decoder?.decodingInfo !== "function")
+              decoder = undefined;
+          } catch {
+            decoder = undefined;
+          }
+        } else {
+          mseProbe = Hls.isSupported() ? Hls.getMediaSource() : undefined;
+          decoder =
+            typeof navigator === "undefined"
+              ? undefined
+              : navigator.mediaCapabilities;
+        }
+        if (profileDiscovery && mseProbe && decoder) {
+          if (
+            candidateSet &&
+            (candidateSet.schema_version !== 1 ||
+              candidateSet.binding !== null ||
+              !Array.isArray(candidateSet.candidates) ||
+              candidateSet.candidates.length !== 0)
+          )
+            throw new Error(candidateError);
+          // Provider legacy/empty candidates negotiate a separate recipe. Keep
+          // this attempt (including rejection) for the whole original intent.
+          upstreamAttempted = true;
+          let upstreamSet: UpstreamProfileCandidateSet | undefined;
+          let endpointAbsent = false;
+          try {
+            upstreamSet = await session.api<UpstreamProfileCandidateSet>(
+              "/upstream-profile-candidates",
+              "POST",
+              {
+                profile_version: 1,
+                room_id: metrics.room,
+                media_generation: metrics.media,
+                audio_index: metrics.audio ?? null,
+                position_ms: target(state.value!, clock.now()),
+              },
+              AbortSignal.any([probe.signal, AbortSignal.timeout(40000)]),
+            );
+          } catch (failure) {
+            if (
+              !(failure instanceof RequestFailure) ||
+              failure.code !== "NOT_FOUND"
+            )
+              throw failure;
+            endpointAbsent = true;
+          }
+          if (!current()) throw new PlaybackCancelled();
+          if (!endpointAbsent && upstreamSet === undefined)
+            throw new Error(candidateError);
+          if (upstreamSet !== undefined) {
+            if (
+              !upstreamSet ||
+              typeof upstreamSet !== "object" ||
+              upstreamSet.profile_version !== 1 ||
+              typeof upstreamSet.decision_reason !== "string" ||
+              Object.keys(upstreamSet).some(
+                (key) =>
+                  ![
+                    "profile_version",
+                    "binding",
+                    "profile",
+                    "decision_reason",
+                  ].includes(key),
+              )
+            )
+              throw new Error(candidateError);
+            const absent =
+              upstreamSet.binding === null && upstreamSet.profile === null;
+            if (!absent) {
+              marked = true;
+              if (
+                typeof upstreamSet.binding !== "string" ||
+                !upstreamSet.binding.trim() ||
+                !isUpstreamProfileEnvelope(upstreamSet.profile)
+              )
+                throw new Error(candidateError);
+              const candidates = freezeCandidateSnapshot(
+                structuredClone(upstreamSet),
+              );
+              const report = await detectUpstreamProfileReport(
+                candidates,
+                mseProbe,
+                decoder,
+                probe.signal,
+              );
+              if (!current()) throw new PlaybackCancelled();
+              if (!report) throw new Error(candidateError);
+              const result: CandidateDiscovery = {
+                capabilities: detectCapabilities(element, mseProbe),
+                upstream: { candidates, report, startedAt },
+              };
+              metrics.concreteCandidates = freezeCandidateSnapshot(
+                structuredClone(result),
+              );
+              return metrics.concreteCandidates;
+            }
+          }
+        }
         const report = candidateSet
           ? await detectCandidateReport(
               element,
@@ -902,7 +1040,12 @@ export function createPlaybackRuntime(ctx: {
         // Empty/old-server negotiation keeps its legacy discovery behavior.
         // Concrete report and marked validation failures stay rejected for this
         // intent; recovery cannot downgrade or discover a replacement source.
-        if (metrics.candidateDiscovery === discovery && !marked && !concrete)
+        if (
+          metrics.candidateDiscovery === discovery &&
+          !marked &&
+          !concrete &&
+          !upstreamAttempted
+        )
           metrics.candidateDiscovery = undefined;
         if (capabilityProbe === probe) capabilityProbe = undefined;
       }
@@ -1000,6 +1143,13 @@ export function createPlaybackRuntime(ctx: {
         position_ms: target(state.value ?? s, clock.now()),
         capabilities,
         ...(candidateReport ? { candidate_report: candidateReport } : {}),
+        ...(discovered.upstream
+          ? {
+              upstream_profile_report: structuredClone(
+                discovered.upstream.report,
+              ),
+            }
+          : {}),
         observation_version: 1,
         http_file_fallback_version: 1,
         playback_metrics_version: 1,
@@ -1015,7 +1165,8 @@ export function createPlaybackRuntime(ctx: {
           // Keep the already claimed file/version and request key through a
           // clock recalibration. Reconciliation waits for fresh clock correction;
           // readiness can safely inspect the originally requested position.
-          if (continuation || discovered.concrete) return request.position_ms;
+          if (continuation || discovered.concrete || discovered.upstream)
+            return request.position_ms;
           clockAction = "load";
           throw new PlaybackCancelled();
         }
@@ -1023,7 +1174,7 @@ export function createPlaybackRuntime(ctx: {
       };
       // Once claimed, a concrete request keeps its key/generation through clock
       // recovery. A new key at that generation would violate high-water.
-      pending.preparing = !!discovered.concrete;
+      pending.preparing = !!(discovered.concrete || discovered.upstream);
       let p: PlaybackPlan;
       if (continuation) {
         // No await between detaching the old element and handing its cleanup
@@ -1058,6 +1209,20 @@ export function createPlaybackRuntime(ctx: {
       ) {
         await session.api(`/playback-sessions/${p.session_id}`, "DELETE");
         return;
+      }
+      // The helper validates the entire fixed recipe before readiness. Also
+      // retain the originally selected presence/absence of advisory audio.
+      if (
+        discovered.upstream &&
+        (p.upstream_profile?.requested_audio === null) !==
+          (discovered.upstream.candidates.profile!.requested_audio === null)
+      ) {
+        await requests().stop();
+        throw new Error(candidateError);
+      }
+      if (discovered.upstream && !Hls.isSupported()) {
+        await requests().stop();
+        throw new Error(candidateError);
       }
       plan = p;
       playbackSummary.value = summarizePlaybackPlan(p);
@@ -1115,6 +1280,8 @@ export function createPlaybackRuntime(ctx: {
       }
       endAttempt = -Infinity;
       el.onended = () => {
+        if (serial !== loadSerial || !currentPlan(p) || !metricCurrent(metrics))
+          return;
         void completed();
       };
       waiting.value = true;
@@ -1229,7 +1396,8 @@ export function createPlaybackRuntime(ctx: {
       };
       let mse =
         p.transport === "hls" &&
-        !el.canPlayType("application/vnd.apple.mpegurl") &&
+        (!!p.upstream_profile ||
+          !el.canPlayType("application/vnd.apple.mpegurl")) &&
         Hls.isSupported();
       const playbackPosition = () => {
         if (!clockUsable()) {
@@ -1248,6 +1416,7 @@ export function createPlaybackRuntime(ctx: {
           !currentPlan(p) ||
           !roomIsActive() ||
           !candidateIntentCurrent(metrics) ||
+          !!p.upstream_profile ||
           mode.value !== "auto"
         )
           return false;
@@ -1283,6 +1452,7 @@ export function createPlaybackRuntime(ctx: {
           serial !== loadSerial ||
           !roomIsActive() ||
           !currentPlan(p) ||
+          !metricCurrent(metrics) ||
           !state.value ||
           recoveries >= 3 ||
           !clockUsable()
@@ -1324,6 +1494,7 @@ export function createPlaybackRuntime(ctx: {
           !roomIsActive() ||
           !currentPlan(p) ||
           video.value !== el ||
+          !metricCurrent(metrics) ||
           !el.getAttribute("src") ||
           !el.error ||
           el.error.code === 1
@@ -1380,6 +1551,7 @@ export function createPlaybackRuntime(ctx: {
           if (
             serial === loadSerial &&
             currentPlan(p) &&
+            metricCurrent(metrics) &&
             roomIsActive() &&
             data.fatal
           ) {
@@ -1396,7 +1568,8 @@ export function createPlaybackRuntime(ctx: {
       else el.src = p.playback_url;
       mediaDataLoad.sourceChanged();
       el.onloadedmetadata = () => {
-        if (serial !== loadSerial || !currentPlan(p)) return;
+        if (serial !== loadSerial || !currentPlan(p) || !metricCurrent(metrics))
+          return;
         applySubtitles();
         duration.value = p.duration_ms ? p.duration_ms / 1000 : el.duration;
         void runAutomaticApply(true);
@@ -1601,7 +1774,10 @@ export function createPlaybackRuntime(ctx: {
       p.rebuild_on_seek &&
       (relative < -0.5 || (userSeek && !seekable))
     ) {
-      if (userSeek) await beginLoad("automatic_load");
+      // A fresh authoritative target before this upstream timeline is a new
+      // seek intent, not a decoder retry of the previous profile or SID.
+      const profileTimelineSeek = relative < -0.5 && !!p.upstream_profile;
+      if (userSeek || profileTimelineSeek) await beginLoad("automatic_load");
       else await fallbackLoad();
       return;
     }

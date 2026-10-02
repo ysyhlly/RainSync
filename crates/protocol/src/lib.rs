@@ -12,6 +12,8 @@ mod playback_metrics;
 pub use playback_metrics::*;
 mod playback_candidates;
 pub use playback_candidates::*;
+mod upstream_profiles;
+pub use upstream_profiles::*;
 mod playback_facts;
 pub use playback_facts::*;
 mod http_file_fallback;
@@ -88,6 +90,10 @@ pub struct ControlEpoch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PlaybackPlan {
+    /// Negotiated upstream recipe envelope; not measured media configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub upstream_profile: Option<UpstreamTranscodeProfileEnvelope>,
     pub session_id: Uuid,
     /// Per-viewer intent generation; absent for legacy grants. Never room revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,6 +317,10 @@ pub struct PlaybackCapabilities {
 /// Missing optional fields preserve the original v1 playback request defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PlaybackRequest {
+    /// Dedicated upstream-profile route only; absence preserves legacy hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub upstream_profile_report: Option<UpstreamProfileReport>,
     /// Negotiate single-hop verified HTTP-file continuation; absence is legacy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

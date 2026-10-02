@@ -32,6 +32,7 @@ mod rooms;
 mod source_access;
 mod upstream;
 mod upstream_policy;
+mod upstream_profiles;
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
@@ -603,6 +604,15 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
             post(playback_capabilities::candidates),
         )
         .route("/api/v1/playback-sessions", post(media::playback))
+        .route(
+            "/api/v1/upstream-profile-candidates",
+            post(upstream_profiles::candidates).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v1/playback-sessions/upstream-profile",
+            post(media::upstream_profile_playback)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
         .route(
             "/api/v1/playback-sessions/http-file-continuation",
             post(media::http_file_continuation),

@@ -4,7 +4,10 @@ import type {
   PlaybackReadiness,
 } from "../../../packages/protocol";
 import { RequestFailure } from "./errors";
-import { matchesPlanGeneration } from "../../../packages/player-core";
+import {
+  matchesPlanGeneration,
+  matchesUpstreamProfilePlan,
+} from "../../../packages/player-core";
 
 export class PlaybackCancelled extends Error {
   constructor() {
@@ -81,6 +84,17 @@ export async function requestPlayback(
           )
             throw new RequestFailure({
               error: { code: "STALE_PLAYBACK_PLAN" },
+            });
+          if (
+            !matchesUpstreamProfilePlan(
+              request.upstream_profile_report,
+              plan.upstream_profile,
+              plan.delivery_mode,
+              plan.transport,
+            )
+          )
+            throw new RequestFailure({
+              error: { code: "STALE_CAPABILITY_REPORT" },
             });
           return plan;
         } catch (error) {

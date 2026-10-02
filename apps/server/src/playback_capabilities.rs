@@ -91,6 +91,7 @@ pub async fn candidates(
             audio_index: body.audio_index,
             capabilities: None,
             candidate_report: None,
+            upstream_profile_report: None,
         };
         let start = if body.http_file_capabilities_version == Some(1) {
             playback_requests::begin_authenticated(&app, user.id, &request, login_hash.as_deref()).await?

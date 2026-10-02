@@ -1,5 +1,6 @@
 pub mod access_policy;
 pub mod account_policy;
+pub mod upstream_profiles;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -172,6 +173,25 @@ pub async fn upstream_audio_source(
         upstream_headers(kind, config, device_id)?,
     )
     .await
+}
+
+/// Explicit profile recipe only. The caller owns the reservation and must
+/// checkpoint its complete response before validating the returned route.
+pub async fn upstream_profile_plan(
+    kind: &str,
+    config: &SourceConfig,
+    item: &str,
+    options: &PlaybackOptions,
+    metadata: &upstream_profiles::UpstreamProfileMetadata,
+    device_id: &str,
+) -> Result<Value> {
+    match kind {
+        "jellyfin" => {
+            jellyfin::upstream_profile_plan(config, item, options, metadata, device_id).await
+        }
+        "emby" => emby::upstream_profile_plan(config, item, options, metadata, device_id).await,
+        _ => bail!("invalid_upstream_kind"),
+    }
 }
 
 /// The same device identity must accompany negotiation, media/subtitle delivery

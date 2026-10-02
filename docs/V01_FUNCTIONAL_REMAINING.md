@@ -1,7 +1,8 @@
 # v0.1 functional work, separate from acceptance
 
-This is the 2026-10-01 code audit against the collaboration branch, including
-the NAS/loading, bounded task-health, attempt timing and concrete-candidate recovery implementations described below. It does not replace the
+This is the 2026-10-02 code audit against the collaboration branch and the local
+explicit upstream profile candidate, including the NAS/loading, bounded task-health,
+attempt timing and concrete-candidate recovery implementations described below. It does not replace the
 historical evidence in PROGRESS or the release gates in NEXT_PLAN. A historical
 “pending” row is not evidence that the same function is still missing today.
 
@@ -21,7 +22,9 @@ to that baseline, not to untested later changes.
   28 new API groups, 32 continuation groups and 457 frontend tests. Published
   checkpoint `d8418a7` passed compilation and frontend checks on its CI retry,
   but failed actual integration with Stop returning 500. A separately reproduced
-  claim/Stop lock cycle has a locally verified repair awaiting publication; see
+  claim/Stop lock cycle has a verified repair published in `c108c52`; the current
+  `fc088e6` also corrects two migration-test history assumptions. Its complete
+  checks are still running at this audit checkpoint; see
   [the bounded regression](stop-claim-lock-regression.md). See [scope and evidence](HTTP_FILE_CAPABILITY_BINDING.md).
 
 - NEXT_PLAN §12.1: current persisted job inventory, registered process-owner
@@ -49,19 +52,27 @@ passed separately. The task-health checkpoint `3b93c66` also passed its own
 [complete CI](https://github.com/ysyhlly/RainSync/actions/runs/36893338856). See [NAS evidence](NAS_RANGE_SEMANTICS.md)
 and [validation limits](VALIDATION.md). Initial usable data is not a complete presented-frame guarantee.
 
-## Remaining implementation work identified in current code
+## Selected upstream capability slice
 
-1. **Specific upstream capability negotiation.** Jellyfin and Emby have working
-   independent adapters, real seek/audio paths and bounded account-policy
-   observation. They still do not consume the concrete candidate report used
-   for local/Agent media. This needs a truthful fixed-profile/output contract,
-   with every negotiation SID owned and cleaned up. Broad HLS content-identity
-   claims, ambiguous versions and unproven automatic fallback stay disabled.
+The selected smaller Jellyfin/Emby implementation now provides an opt-in,
+explicit-transcode profile envelope. It advertises requested configuration bounds
+and a separate MSE compatibility estimate, not measured output or the exact
+candidate contract used by local/Agent media. Server and provider preparation,
+owned SID cleanup, replay fences, Web negotiation and the explanation UI are
+implemented in the local candidate. Its final controlled API matrix passed 49
+cases and its frontend suite passed 576 tests. See [the contract and evidence
+limits](UPSTREAM_PROFILE_ENVELOPE.md).
 
+Actual recipe propagation and finite decoded output against both pinned products
+remain unverified until the new finite CI job runs. Auto/direct/remux behavior
+stays unchanged. Prepared same-SID exact-output negotiation, broad HLS identity,
+ambiguous media versions and automatic decoder fallback to another upstream SID
+are not enabled by this smaller slice.
 
-This is a verified implementation gap, not an assertion that every other
-v0.1 interface has undergone a fresh exhaustive audit. Keep each next slice
-small enough to review and verify before enlarging its contract.
+This closes the selected code implementation gap, subject to publication and
+real-product compatibility. It is not a fresh exhaustive audit or a claim that
+the broader original exact-output design is implemented. Further work should
+follow a concrete compatibility failure or an explicit scope decision.
 
 ## Already implemented; do not reopen from old ledger rows
 

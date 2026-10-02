@@ -1,4 +1,5 @@
 import type { PlaybackPlan } from "../../../../../packages/protocol";
+import { isUpstreamProfileEnvelope } from "../../../../../packages/player-core";
 
 export type PlaybackSummary = { mode: string; reason?: string };
 
@@ -6,7 +7,10 @@ export type PlaybackSummary = { mode: string; reason?: string };
 export function summarizePlaybackPlan(
   plan: Pick<
     PlaybackPlan,
-    "delivery_mode" | "decision_reason" | "selected_candidate_id"
+    | "delivery_mode"
+    | "decision_reason"
+    | "selected_candidate_id"
+    | "upstream_profile"
   >,
 ): PlaybackSummary | undefined {
   const modes: Record<string, string> = {
@@ -19,6 +23,16 @@ export function summarizePlaybackPlan(
     : undefined;
   if (!mode) return;
   const summary: PlaybackSummary = { mode };
+  if (
+    plan.delivery_mode === "transcode" &&
+    isUpstreamProfileEnvelope(plan.upstream_profile)
+  ) {
+    summary.reason =
+      "请求上游转码：最高720p SDR，H.264" +
+      (plan.upstream_profile.requested_audio ? " / AAC" : "") +
+      "；设备兼容性为估计";
+    return summary;
+  }
   if (
     plan.selected_candidate_id &&
     plan.decision_reason === `actual_media_${plan.selected_candidate_id}`

@@ -141,6 +141,29 @@ pub struct Prepare<'a> {
     pub item: &'a str,
     pub options: providers::PlaybackOptions,
     pub observation_version: Option<u32>,
+    pub profile: Option<upstream_profiles::Selection>,
+}
+
+/// Metadata-only preflight shares the bounded global and per-origin lane. Its
+/// preparation owner supplies cancellation and an overall elapsed-time bound.
+pub async fn profile_metadata(
+    app: &App,
+    kind: &str,
+    config: &providers::SourceConfig,
+    item: &str,
+    audio_index: Option<u32>,
+    device_id: &str,
+) -> Result<providers::upstream_profiles::UpstreamProfileMetadata> {
+    let origin = hash(
+        providers::validate_url(&config.url)?
+            .origin()
+            .ascii_serialization()
+            .as_str(),
+    );
+    let _permits = app.upstream.negotiate_permit(&origin).await?;
+    providers::upstream_profiles::metadata(kind, config, item, audio_index, device_id)
+        .await
+        .map_err(|_| err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"))
 }
 
 fn identifier(value: &Value) -> Option<&str> {
@@ -164,6 +187,9 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
     let scope = app.encrypt(&json!({"config":p.config,"item":p.item}))?;
     let mut tx = app.db.begin().await?;
     playback_requests::guard(app, &mut tx, p.reservation).await?;
+    if let Some(selection) = &p.profile {
+        upstream_profiles::guard(app, &mut tx, p.reservation, selection).await?;
+    }
     let state: Value =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
             .bind(p.room)
@@ -208,13 +234,47 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
     let config = p.config.clone();
     let item = p.item.to_owned();
     let mut options = p.options;
+    let profile_reservation = p.profile.as_ref().map(|_| playback_requests::Reservation {
+        key: p.reservation.key,
+        session: p.reservation.session,
+        user: p.reservation.user,
+        room_id: p.reservation.room_id,
+        lifecycle_epoch: p.reservation.lifecycle_epoch,
+        viewer_id: p.reservation.viewer_id,
+        plan_generation: p.reservation.plan_generation,
+        http_file: None,
+    });
+    let profile = p.profile;
     let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let _permits = permits;
         let result: Result<Value> = async {
             // Read-only discovery cannot allocate a play session. Keep the
             // ledger reserved so timeout/cancel has a positive no-POST proof.
-            if let Some(audio) = options.audio_index {
+            if let Some(selection) = &profile {
+                let observed = providers::upstream_profiles::metadata(
+                    &kind, &config, &item,
+                    selection.requested_audio(), &device_id,
+                ).await;
+                if !observed.is_ok_and(|metadata| metadata == selection.metadata) {
+                    let mut tx = app.db.begin().await?;
+                    ledger::close(&mut tx, id, "upstream_profile_metadata_changed").await?;
+                    tx.commit().await?;
+                    return Err(err(StatusCode::CONFLICT, "source_changed"));
+                }
+                // Discovery is read-only while negotiation remains reserved.
+                // Recheck identity, authority and DB expiry after its I/O.
+                let reservation = profile_reservation.as_ref().expect("profile reservation");
+                let mut tx = app.db.begin().await?;
+                playback_requests::guard(&app, &mut tx, reservation).await?;
+                upstream_profiles::guard(&app, &mut tx, reservation, selection).await?;
+                tx.commit().await?;
+                options.media_source_id = Some(selection.metadata.media_source_id.clone());
+                options.audio_index = selection.metadata.audio.as_ref().map(|audio| audio.index);
+                options.progressive = false;
+                options.hls = true;
+                options.force_transcode = true;
+            } else if let Some(audio) = options.audio_index {
                 match providers::upstream_audio_source(&kind, &config, &item, audio, &device_id).await {
                     Ok(source) => options.media_source_id = Some(source),
                     Err(_) => {
@@ -234,7 +294,13 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
             }
             let result = tokio::time::timeout(
                 Duration::from_secs(ledger::NEGOTIATION_SECONDS),
-                providers::upstream_plan(&kind, &config, &item, &options, &device_id)
+                async {
+                    if let Some(selection) = &profile {
+                        providers::upstream_profile_plan(&kind, &config, &item, &options, &selection.metadata, &device_id).await
+                    } else {
+                        providers::upstream_plan(&kind, &config, &item, &options, &device_id).await
+                    }
+                }
             ).await;
             let info = match result {
                 Ok(Ok(info)) => info,
@@ -249,6 +315,14 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
             let live_stream = source.and_then(|s| identifier(&s["LiveStreamId"]));
             let encrypted = app.encrypt(&info)?;
             if !ledger::checkpoint(&app.db, id, token, &encrypted, sid, media_source, live_stream).await? || sid.is_none() {
+                return Err(err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"));
+            }
+            if let Some(selection) = &profile
+                && providers::upstream_profiles::validate_route(&kind, &config, &selection.metadata, &info).is_err()
+            {
+                let mut tx = app.db.begin().await?;
+                ledger::close(&mut tx, id, "upstream_profile_route_mismatch").await?;
+                tx.commit().await?;
                 return Err(err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"));
             }
             // Preserve the complete response/SID before rejecting a product

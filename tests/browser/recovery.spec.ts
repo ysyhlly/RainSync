@@ -1073,7 +1073,7 @@ for (const action of [
   });
 }
 
-test("teardown media errors are silent while an active unsupported resource is reported", async ({
+test("teardown media errors are silent while active ambiguous media support is reported", async ({
   page,
 }) => {
   await page.addInitScript(() => {
@@ -1103,5 +1103,9 @@ test("teardown media errors are silent while an active unsupported resource is r
     Object.defineProperty(el, "error", { get: () => ({ code: 4 }) });
     el.dispatchEvent(new Event("error"));
   });
-  await expect(page.getByRole("alert")).toContainText("无法播放此格式");
+  await expect(page.getByRole("alert")).toContainText(
+    "媒体加载或格式支持状态未知，请检查连接后重新加载",
+  );
+  await page.clock.fastForward(500);
+  expect(h.preparations).toHaveLength(3);
 });

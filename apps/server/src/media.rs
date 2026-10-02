@@ -208,7 +208,16 @@ pub async fn playback(
     h: HeaderMap,
     Json(body): Json<protocol::PlaybackRequest>,
 ) -> Result<Json<Value>> {
-    start_playback(app, h, body, false).await
+    start_playback(app, h, body, false, false).await
+}
+
+/// Dedicated admission fails closed against Servers predating this profile.
+pub async fn upstream_profile_playback(
+    State(app): State<App>,
+    h: HeaderMap,
+    Json(body): Json<protocol::PlaybackRequest>,
+) -> Result<Json<Value>> {
+    start_playback(app, h, body, false, true).await
 }
 
 /// Central registers this at /api/v1/playback-sessions/http-file-continuation.
@@ -218,7 +227,7 @@ pub async fn http_file_continuation(
     h: HeaderMap,
     Json(body): Json<protocol::PlaybackRequest>,
 ) -> Result<Json<Value>> {
-    start_playback(app, h, body, true).await
+    start_playback(app, h, body, true, false).await
 }
 
 async fn start_playback(
@@ -226,8 +235,10 @@ async fn start_playback(
     h: HeaderMap,
     body: protocol::PlaybackRequest,
     continuation: bool,
+    profile_endpoint: bool,
 ) -> Result<Json<Value>> {
     let u = auth(&app, &h, true).await?;
+    upstream_profiles::validate_request(&body, profile_endpoint)?;
     if body.http_file_fallback.is_some() {
         if !continuation {
             return Err(err(StatusCode::CONFLICT, "source_version_required"));
@@ -270,7 +281,11 @@ async fn owned_playback(
         match playback_requests::begin_authenticated(&app, u.id, &body, login_hash.as_deref())
             .await?
         {
-            playback_requests::Start::Replay(plan) => return Ok(Json(plan)),
+            playback_requests::Start::Replay(plan) => {
+                upstream_profiles::guard_replay(&app, u.id, &body, login_hash.as_deref(), &plan)
+                    .await?;
+                return Ok(Json(plan));
+            }
             playback_requests::Start::Reserved(reservation) => reservation,
         };
     let scope = media_core::child_process::Scope::new();
@@ -280,7 +295,7 @@ async fn owned_playback(
             _ = owner.cancelled() => Err(err(StatusCode::SERVICE_UNAVAILABLE, "playback_request_interrupted")),
             result = tokio::time::timeout(
                 std::time::Duration::from_secs(45),
-                prepare_playback(&app, &u, &body, &reservation),
+                prepare_playback(&app, &u, &body, &reservation, login_hash.as_deref()),
             ) => result.unwrap_or_else(|_| Err(err(StatusCode::GATEWAY_TIMEOUT, "playback_request_interrupted"))),
         }
     }).await;
@@ -308,6 +323,7 @@ async fn prepare_playback(
     u: &User,
     body: &protocol::PlaybackRequest,
     reservation: &playback_requests::Reservation,
+    login_hash: Option<&str>,
 ) -> Result<Value> {
     let state = persistence::snapshot(&app.db, body.room_id).await?;
     if state.media_generation != body.media_generation {
@@ -336,7 +352,25 @@ async fn prepare_playback(
     } else {
         None
     };
+    let upstream_profile = upstream_profiles::select(
+        app,
+        body,
+        reservation,
+        upstream_profiles::Scope {
+            media,
+            source: source_id,
+            source_revision: source_policy_revision,
+            account_generation: account_policy_generation,
+            kind: &kind,
+            item: &item,
+            login_hash,
+        },
+    )
+    .await?;
     let mut resource = json!({"kind":kind,"resource":item,"root":config.root,"headers":{},"source_url":config.url,"access_policy":config.access_policy,"source_policy_revision":source_policy_revision,"source_id":source_id});
+    if let Some(report) = &body.upstream_profile_report {
+        resource["upstream_profile_binding_hash"] = json!(hash(&report.binding));
+    }
     let http_file = reservation.http_file.as_deref();
     let continuation = http_file.is_some_and(|authority| authority.claim.is_some());
     if http_file.is_some() && kind != "http" {
@@ -375,12 +409,13 @@ async fn prepare_playback(
     let mut negotiated_info = None;
     // A concrete HTTP intent learns timing only from this attempt's pinned
     // probe. Cached media-item duration must not clamp a new representation.
-    let mut duration: Option<f64> =
-        if kind == "http" && http_file.is_some_and(|authority| authority.candidate.is_some()) {
-            None
-        } else {
-            row.get("duration_ms")
-        };
+    let mut duration: Option<f64> = if let Some(selection) = &upstream_profile {
+        Some(selection.metadata.runtime_ticks as f64 / 10_000.0)
+    } else if kind == "http" && http_file.is_some_and(|authority| authority.candidate.is_some()) {
+        None
+    } else {
+        row.get("duration_ms")
+    };
     let mut position_ms = protocol::bounded_position(body.position_ms, duration);
     let mut transport = "progressive";
     let requested_mode = body.mode.as_deref().unwrap_or("auto");
@@ -482,6 +517,7 @@ async fn prepare_playback(
                         force_transcode: body.mode.as_deref() == Some("transcode"),
                     },
                     observation_version: body.observation_version,
+                    profile: upstream_profile.clone(),
                 },
             )
             .await?;
@@ -525,7 +561,9 @@ async fn prepare_playback(
                 meta["streams"] = json!(tracks);
                 resource["subtitle_urls"] = Value::Object(subtitle_urls);
             }
-            if let Some(ticks) = source["RunTimeTicks"].as_f64() {
+            if upstream_profile.is_none()
+                && let Some(ticks) = source["RunTimeTicks"].as_f64()
+            {
                 duration = Some(ticks / 10000.0);
             }
             let base = providers::validate_url(&format!("{}/", config.url.trim_end_matches('/')))?;
@@ -539,7 +577,19 @@ async fn prepare_playback(
                     .capabilities
                     .as_ref()
                     .is_none_or(|c| c.supports_progressive());
-            let url = if !use_direct && let Some(path) = source["TranscodingUrl"].as_str() {
+            let url = if let Some(selection) = &upstream_profile {
+                transport = "hls";
+                mode = "transcode";
+                providers::upstream_profiles::validate_route(
+                    &kind,
+                    &config,
+                    &selection.metadata,
+                    &info,
+                )
+                .map_err(|_| err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"))?
+                .url
+                .to_string()
+            } else if !use_direct && let Some(path) = source["TranscodingUrl"].as_str() {
                 transport = "hls";
                 mode = "transcode";
                 providers::upstream_url(&base, path)
@@ -790,6 +840,9 @@ async fn prepare_playback(
         if let Some(version) = &selection.source_version {
             resource["source_version"] = json!(version);
         }
+    } else if upstream_profile.is_some() {
+        mode = "transcode";
+        transport = "hls";
     } else if let Some(caps) = &body.capabilities {
         let (selected_mode, selected_transport) =
             caps.negotiate(mode, transport).ok_or_else(|| {
@@ -825,7 +878,7 @@ async fn prepare_playback(
     resource["timeline_origin_ms"] = json!(timeline);
     resource["plan_facts_version"] = json!(1);
     let hls_supported = body.capabilities.as_ref().is_none_or(|c| c.supports_hls());
-    let decoder_fallback_modes = if selected.is_some() {
+    let decoder_fallback_modes = if selected.is_some() || upstream_profile.is_some() {
         vec![]
     } else if let Some(info) = &negotiated_info {
         playback_plan::upstream_fallbacks(info, mode, hls_supported, &config.url)
@@ -846,6 +899,10 @@ async fn prepare_playback(
     };
     let plan = protocol::PlaybackPlan {
         http_file_fallback_version: None,
+        upstream_profile: upstream_profile
+            .as_ref()
+            .map(|selection| upstream_profiles::envelope(&selection.metadata))
+            .transpose()?,
         session_id: id,
         media_id: media,
         media_generation: body.media_generation,
@@ -889,6 +946,9 @@ async fn prepare_playback(
     let mut plan = serde_json::to_value(&protocol_plan).map_err(anyhow::Error::from)?;
     let mut tx = app.db.begin().await?;
     playback_requests::guard(app, &mut tx, reservation).await?;
+    if let Some(selection) = &upstream_profile {
+        upstream_profiles::guard(app, &mut tx, reservation, selection).await?;
+    }
     source_access::guard(&mut tx, source_id, source_policy_revision).await?;
     upstream_policy::guard(
         &mut tx,
@@ -1006,6 +1066,9 @@ async fn prepare_playback(
         if !persistence::http_file_authorization::lock(&mut tx, &authority.context).await? {
             return Err(err(StatusCode::GONE, "invalid_playback_session"));
         }
+    }
+    if let Some(selection) = &upstream_profile {
+        upstream_profiles::guard(app, &mut tx, reservation, selection).await?;
     }
     tx.commit().await?;
     if matches!(kind.as_str(), "jellyfin" | "emby") {

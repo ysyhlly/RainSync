@@ -37,8 +37,154 @@ pub fn playback_body(config: &SourceConfig, options: &PlaybackOptions) -> Result
     Ok(playback_request(config, options))
 }
 
-fn valid_source_id(value: &str) -> bool {
+pub(super) fn valid_source_id(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
+}
+
+/// Read-only item discovery. It neither calls PlaybackInfo nor opens a stream.
+/// Transport/parser errors are reduced to bounded names before crossing the
+/// adapter boundary, since reqwest errors can otherwise contain signed URLs.
+pub(super) async fn item_metadata(
+    config: &SourceConfig,
+    item: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<Value> {
+    ensure!(
+        valid_source_id(item) && valid_source_id(&config.user_id) && !config.token.is_empty(),
+        "upstream_metadata_identity_invalid"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let url = endpoint(config, &["Users", &config.user_id, "Items", item])
+            .map_err(|_| anyhow::anyhow!("upstream_metadata_endpoint_invalid"))?;
+        let request = super::source_request(config, url.as_str(), reqwest::Method::GET, headers)
+            .await
+            .map_err(|error| {
+                if let Some(error) = error.downcast_ref::<super::access_policy::AccessError>() {
+                    anyhow::anyhow!(*error)
+                } else {
+                    anyhow::anyhow!("upstream_metadata_request_failed")
+                }
+            })?;
+        let mut response = request
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("upstream_metadata_request_failed"))?;
+        ensure!(
+            response.status() == reqwest::StatusCode::OK,
+            "upstream_metadata_status"
+        );
+        const MAX_BYTES: usize = 2 * 1024 * 1024;
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|n| n <= MAX_BYTES as u64),
+            "upstream_metadata_too_large"
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| anyhow::anyhow!("upstream_metadata_body_failed"))?
+        {
+            ensure!(
+                chunk.len() <= MAX_BYTES.saturating_sub(bytes.len()),
+                "upstream_metadata_too_large"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        let mut parser = serde_json::Deserializer::from_slice(&bytes);
+        let value = <UniqueValue as serde::Deserialize>::deserialize(&mut parser)
+            .map_err(|_| anyhow::anyhow!("upstream_metadata_invalid_json"))?;
+        parser
+            .end()
+            .map_err(|_| anyhow::anyhow!("upstream_metadata_invalid_json"))?;
+        Ok(value.0)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("upstream_metadata_timeout"))?
+}
+
+/// A duplicate identity/constraint is ambiguous even when both values agree.
+/// Value's ordinary map parser uses last-wins semantics, which is unsuitable
+/// for metadata used as a proof. Apply the same rule at every nested object.
+struct UniqueValue(Value);
+
+impl<'de> serde::Deserialize<'de> for UniqueValue {
+    fn deserialize<D: serde::Deserializer<'de>>(parser: D) -> std::result::Result<Self, D::Error> {
+        struct UniqueVisitor;
+        impl<'de> serde::de::Visitor<'de> for UniqueVisitor {
+            type Value = UniqueValue;
+            fn expecting(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                output.write_str("JSON with unique object fields")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(Value::Null))
+            }
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                value: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(Value::Bool(value)))
+            }
+            fn visit_i64<E: serde::de::Error>(
+                self,
+                value: i64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(value.into()))
+            }
+            fn visit_u64<E: serde::de::Error>(
+                self,
+                value: u64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(value.into()))
+            }
+            fn visit_f64<E: serde::de::Error>(
+                self,
+                value: f64,
+            ) -> std::result::Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|value| UniqueValue(Value::Number(value)))
+                    .ok_or_else(|| E::custom("invalid JSON number"))
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(value.into()))
+            }
+            fn visit_string<E: serde::de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(value.into()))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<UniqueValue>()? {
+                    values.push(value.0);
+                }
+                Ok(UniqueValue(Value::Array(values)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut object: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = object.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom("duplicate JSON field"));
+                    }
+                    let value = object.next_value::<UniqueValue>()?;
+                    values.insert(key, value.0);
+                }
+                Ok(UniqueValue(Value::Object(values)))
+            }
+        }
+        parser.deserialize_any(UniqueVisitor)
+    }
 }
 
 pub async fn audio_source(
@@ -125,6 +271,11 @@ fn endpoint(config: &SourceConfig, parts: &[&str]) -> Result<reqwest::Url> {
     Ok(url)
 }
 
+pub(super) fn profile_item_route(config: &SourceConfig, item: &str) -> Result<reqwest::Url> {
+    endpoint(config, &["Videos", item, "master.m3u8"])
+        .map_err(|_| anyhow::anyhow!("upstream_profile_route_invalid"))
+}
+
 pub async fn plan(
     config: &SourceConfig,
     item: &str,
@@ -209,5 +360,28 @@ pub async fn list(config: &SourceConfig, headers: BTreeMap<String, String>) -> R
             return Ok(items);
         }
         ensure!(!rows.is_empty(), "incomplete_library_response");
+    }
+}
+
+#[cfg(test)]
+mod metadata_json_tests {
+    use super::UniqueValue;
+
+    #[test]
+    fn comparable_metadata_does_not_use_last_wins_json_fields() {
+        for text in [
+            r#"{"Id":"item","Id":"other"}"#,
+            r#"{"Id":"item","Id":"item"}"#,
+            r#"{"MediaSources":[{"Id":"source","Id":"source"}]}"#,
+            r#"{"MediaStreams":[{"Index":1,"Index":2}]}"#,
+            r#"{"Id":"item","\u0049d":"other"}"#,
+        ] {
+            assert!(serde_json::from_str::<UniqueValue>(text).is_err());
+        }
+        let value: UniqueValue = serde_json::from_str(
+            r#"{"Id":"item","MediaSources":[{"Id":"source","RunTimeTicks":900000000}],"Rate":29.97003,"Optional":null,"Flag":false}"#,
+        ).unwrap();
+        assert_eq!(value.0["Id"], "item");
+        assert_eq!(value.0["Rate"], 29.97003);
     }
 }

@@ -120,6 +120,17 @@
       "type": "string",
       "format": "uuid"
     },
+    "upstream_profile_report": {
+      "description": "Dedicated upstream-profile route only; absence preserves legacy hashes.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UpstreamProfileReport"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "viewer_id": {
       "description": "Opaque per-player identity for ordering only, never authorization.",
       "type": [
@@ -471,6 +482,44 @@
         "seeked",
         "buffering",
         "ended"
+      ]
+    },
+    "UpstreamProfileReport": {
+      "description": "Only the dedicated preparation endpoint accepts this report. It grants no\nauthority and cannot describe a replacement recipe or automatic fallback.",
+      "type": "object",
+      "properties": {
+        "binding": {
+          "type": "string"
+        },
+        "mse_decoding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MediaDecodingSupport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mse_supported": {
+          "type": "boolean"
+        },
+        "profile_id": {
+          "type": "string"
+        },
+        "profile_version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile_version",
+        "binding",
+        "profile_id",
+        "mse_supported"
       ]
     },
     "VideoCapabilityConfiguration": {
