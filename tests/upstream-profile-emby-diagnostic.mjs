@@ -57,6 +57,20 @@ export function diagnosticPath(reference, parent, base, item, sid, master = fals
   return { url, path, query };
 }
 
+export function diagnosticRouteShape(reference, base) {
+  const shape = { present: typeof reference === "string" && reference.length > 0 };
+  if (!shape.present) return shape;
+  shape.form = reference.startsWith("/") ? "root-relative" : /^[a-z][a-z0-9+.-]*:/i.test(reference) ? "absolute" : "relative";
+  try {
+    const configured = new URL(base), route = new URL(reference, base + "/");
+    shape.valid_url = true;
+    shape.same_owned_origin = route.origin === configured.origin;
+    shape.under_configured_base = route.pathname.toLowerCase().startsWith(configured.pathname.replace(/\/$/, "").toLowerCase() + "/");
+    shape.master_path = route.pathname.toLowerCase().endsWith("/master.m3u8");
+  } catch { shape.valid_url = false; }
+  return shape;
+}
+
 export function finiteObservation(streams) {
   const video = streams.find((stream) => stream.codec_type === "video");
   const audio = streams.find((stream) => stream.codec_type === "audio");
@@ -69,6 +83,66 @@ export function finiteObservation(streams) {
     audio_sample_rate: Number(audio?.sample_rate) || null,
     observed_fps_at_most_30: nominal !== null && average !== null && nominal <= 30.001 && average <= 30.001,
     observed_audio_48000: Number(audio?.sample_rate) === 48000 };
+}
+
+// Sanitize values, never serialized JSON or object keys. Public synthetic item
+// numbers are not secrets. Short secrets require token boundaries in free text;
+// typed integrity hashes and immutable image digests retain their meaning.
+export function redactDiagnostic(value, secrets = new Set()) {
+  const known = [...secrets].filter((secret) => typeof secret === "string" && secret.length)
+    .sort((a, b) => b.length - a.length);
+  const sensitive = (key) => /^(?:[a-z]*password|passwd|pw|[a-z]*token|apikey|[a-z]*authorization|cookie|setcookie|[a-z]*secret|credentials?|sourceencryptionkey|privatekey|csrf)$/i.test(key.replace(/[-_]/g, ""));
+  const text = (value, key) => {
+    if (known.includes(value)) return "[redacted]";
+    if ((/(?:^|_)sha256$|^source_digest$/.test(key) && /^[0-9a-f]{64}$/.test(value)) ||
+        (key === "image" && /^[a-z0-9/.-]+@sha256:[0-9a-f]{64}$/.test(value))) return value;
+    let result = value;
+    for (const secret of known) {
+      if (secret.length >= 8) result = result.replaceAll(secret, "[redacted]");
+      else {
+        let offset = 0, next = "", found;
+        while ((found = result.indexOf(secret, offset)) !== -1) {
+          const end = found + secret.length;
+          const boundary = (character) => !character || !/[A-Za-z0-9_]/.test(character);
+          next += result.slice(offset, found) + (boundary(result[found - 1]) && boundary(result[end]) ? "[redacted]" : secret);
+          offset = end;
+        }
+        result = next + result.slice(offset);
+      }
+    }
+    return result.replace(/(?:https?|wss?):\/\/[^\s"'<>]+/gi, "[redacted-url]")
+      // Error strings are not a trusted parser format. Drop the rest of a
+      // credential-bearing line, including quoted/escaped/whitespace values.
+      .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|authorization|cookie|csrf)\s*["']?\s*[=:]\s*)[^\r\n]*/gi, "$1[redacted]")
+      .replace(/\bBearer\s+[^\s"'<>]+/gi, "Bearer [redacted]");
+  };
+  const visit = (entry, key = "") => {
+    if (sensitive(key)) return "[redacted]";
+    if (typeof entry === "string") return text(entry, key);
+    if (Array.isArray(entry)) return entry.map((child) => visit(child));
+    if (entry && typeof entry === "object")
+      return Object.fromEntries(Object.entries(entry).map(([name, child]) => [name, visit(child, name)]));
+    return entry;
+  };
+  return visit(value);
+}
+
+export function diagnosticError(error, phase, seen = new Set(), depth = 0) {
+  if (depth >= 5 || seen.has(error)) return { phase, message: "[cause chain bounded]" };
+  if (!error || typeof error !== "object") return { phase, message: String(error).slice(0, 4096) };
+  seen.add(error);
+  const result = { phase, name: String(error.name ?? "Error").slice(0, 128), message: String(error.message ?? error).slice(0, 4096) };
+  if (typeof error.code === "string" || typeof error.code === "number") result.code = error.code;
+  if (error.cause !== undefined) result.cause = diagnosticError(error.cause, phase, seen, depth + 1);
+  if (Array.isArray(error.errors)) result.errors = error.errors.slice(0, 4).map((child) => diagnosticError(child, phase, seen, depth + 1));
+  return result;
+}
+
+// Keep only useful fixture evidence, not credentials, command arguments or logs.
+export function diagnosticFixtureEvidence(fixture) {
+  const fields = ["id", "kind", "image", "actual_version", "result", "failures", "cleanup",
+    "source_sha256", "storage_helper_sha256", "source_unchanged", "toolchain_unchanged", "started_at", "finished_at"];
+  return Object.fromEntries(fields.filter((key) => Object.hasOwn(fixture, key)).map((key) => [key, fixture[key]]));
 }
 
 async function main() {
@@ -109,13 +183,8 @@ async function main() {
     limits: { request_ms: 15000, process_ms: 15000, window_bytes: 25 * 1024 * 1024, segments: 3, manifest_depth: 2 },
     backend_binding_sha256: sha(bindingBytes), coordinator, processes: [], failures: [], cleanup: {}, resources: [] };
   const secrets = new Set();
-  const redact = (value) => {
-    let text = String(value);
-    for (const secret of [...secrets].sort((a, b) => b.length - a.length)) if (secret) text = text.replaceAll(secret, "[redacted]");
-    return text.replace(/(?:https?|wss?):\/\/[^\s"'<>]+/gi, "[redacted-url]")
-      .replace(/((?:api[_-]?key|token|password|csrf)=)[^&\s"']+/gi, "$1[redacted]");
-  };
-  const save = () => writeFile(resolve(root, "report.json"), redact(JSON.stringify(report, null, 2)) + "\n");
+  let phase = "fixture_startup";
+  const save = () => writeFile(resolve(root, "report.json"), JSON.stringify(redactDiagnostic(report, secrets), null, 2) + "\n");
   const tool = async (binary, args, label, input) => {
     const child = spawn(binary, args, { stdio: ["pipe", "pipe", "pipe"] });
     const record = { label, pid: child.pid ?? null, closed: false, pid_absent: false }; report.processes.push(record);
@@ -135,10 +204,11 @@ async function main() {
   try {
     await isolatedUpstreamReal("emby", async (upstream) => {
       assert.equal(upstream.metadata.image, image); assert.equal(upstream.metadata.actual_version, "4.10.0.40");
+      phase = "fixture_client";
       const client = await upstream.client({ restricted: true });
       secrets.add(client.userId); secrets.add(client.deviceId);
       const item = upstream.items.find((entry) => entry.MediaSources?.[0]?.MediaStreams?.some((stream) => stream.Type === "Video" && stream.Codec === "h264"));
-      assert.ok(item); const itemId = item.Id; secrets.add(itemId);
+      assert.ok(item); const itemId = item.Id;
       let sid, sourceId;
       const json = async (path, method = "GET", body) => {
         const response = await client.raw(path, { method, body, timeout: 15000 });
@@ -146,9 +216,10 @@ async function main() {
         assert.equal(response.status, 200); return JSON.parse(bytes);
       };
       try {
+        phase = "source_metadata";
         const metadata = await json(`/Users/${encodeURIComponent(client.userId)}/Items/${encodeURIComponent(itemId)}`);
         assert.equal(metadata.MediaSources.length, 1); const source = metadata.MediaSources[0];
-        sourceId = source.Id; secrets.add(sourceId);
+        sourceId = source.Id;
         const inputVideo = source.MediaStreams.find((stream) => stream.Type === "Video");
         const inputAudio = source.MediaStreams.find((stream) => stream.Type === "Audio");
         assert.ok(inputVideo && inputAudio);
@@ -156,6 +227,7 @@ async function main() {
         assert.equal(inputAudio.SampleRate, 44100);
         report.input = { frame_rate: 60, sample_rate: 44100,
           samples: upstream.metadata.samples.map(({ sha256, codec, duration_seconds }) => ({ sha256, codec, duration_seconds })) };
+        phase = "request_builder";
         const body = JSON.parse(await tool(helper.path, [], "production request builder", JSON.stringify({
           user_id: client.userId, item_id: itemId, item_metadata: metadata, audio_index: inputAudio.Index, position_ms: 0,
         })));
@@ -164,6 +236,7 @@ async function main() {
         assert.equal(body.AllowVideoStreamCopy, false); assert.equal(body.AllowAudioStreamCopy, false);
         report.request = { body_sha256: sha(JSON.stringify(body)), device_profile: body.DeviceProfile,
           max_streaming_bitrate: body.MaxStreamingBitrate, position_ticks: body.StartTimeTicks ?? null };
+        phase = "upstream_negotiation";
         const negotiation = await client.raw(`/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, { method: "POST", body, timeout: 15000 });
         const info = JSON.parse(await diagnosticBody(negotiation, 1024 * 1024));
         // Keep cleanup ownership before validating status, returned route or source.
@@ -171,6 +244,14 @@ async function main() {
         assert.ok(sid && sid.length <= 512 && !/[\x00-\x1f]/.test(sid));
         report.sid_sha256 = sha(sid); report.device_sha256 = sha(client.deviceId);
         assert.equal(negotiation.status, 200);
+        phase = "returned_route_validation";
+        report.returned_route_facts = {
+          source_count: Array.isArray(info.MediaSources) ? info.MediaSources.length : null,
+          source_matches: info.MediaSources?.[0]?.Id === sourceId,
+          audio_matches: info.MediaSources?.[0]?.DefaultAudioStreamIndex === inputAudio.Index,
+          route: diagnosticRouteShape(info.MediaSources?.[0]?.TranscodingUrl, upstream.base),
+        };
+        await save();
         assert.equal(info.MediaSources.length, 1); const returned = info.MediaSources[0];
         assert.equal(returned.Id, sourceId); assert.equal(returned.DefaultAudioStreamIndex, inputAudio.Index);
         const master = diagnosticPath(returned.TranscodingUrl, upstream.base + "/", upstream.base, itemId, sid, true);
@@ -180,6 +261,7 @@ async function main() {
         await save();
         const statusBody = { ItemId: itemId, MediaSourceId: sourceId, PlaySessionId: sid, PositionTicks: 0,
           CanSeek: true, IsPaused: false, PlayMethod: "Transcode" };
+        phase = "upstream_playing_start";
         const start = await client.raw("/Sessions/Playing", { method: "POST", body: statusBody, timeout: 15000 });
         await diagnosticBody(start, 64 * 1024); assert.ok([200, 204].includes(start.status));
         const budget = { remaining: report.limits.window_bytes };
@@ -189,6 +271,7 @@ async function main() {
           report.resources.push({ type, url_sha256: sha(route.url.href), status: response.status, bytes: bytes.length, sha256: sha(bytes) });
           assert.equal(response.status, 200); return bytes;
         };
+        phase = "original_hls_read";
         let current = master, lines;
         for (let depth = 0; depth <= 2; depth++) {
           const text = (await fetchOriginal(current, 256 * 1024, "manifest")).toString("utf8");
@@ -214,16 +297,22 @@ async function main() {
         const ffprobe = upstream.metadata.ffmpeg.find((entry) => entry.tool === "ffprobe").path;
         const ffmpeg = upstream.metadata.ffmpeg.find((entry) => entry.tool === "ffmpeg").path;
         const limits = ["-probesize", "8388608", "-analyzeduration", "60000000", "-max_probe_packets", "32768"];
+        phase = "finite_probe";
         const probe = JSON.parse(await tool(ffprobe, ["-v", "error", ...limits, "-show_streams", "-of", "json", window], "finite probe"));
         report.observed_streams = (probe.streams ?? []).map((stream) => Object.fromEntries([
           "codec_type", "codec_name", "profile", "width", "height", "r_frame_rate", "avg_frame_rate", "sample_rate", "channels",
         ].map((key) => [key, stream[key] ?? null])));
         report.finite_observation = finiteObservation(report.observed_streams); await save();
+        phase = "finite_decode";
         await tool(ffmpeg, ["-v", "error", "-nostdin", "-threads", "1", ...limits, "-i", window,
           "-t", "1", "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"], "finite video/audio decode");
         report.finite_decode_completed = true;
         report.interpretation = "These observations describe only downloaded finite output. Missing route constraints stay missing; neither output observations nor this test change RainSync admission or promise whole-title behavior.";
+      } catch (error) {
+        report.callback_error = diagnosticError(error, phase);
+        throw error;
       } finally {
+        phase = "session_cleanup";
         if (sid) {
           const stops = await Promise.allSettled([
             (async () => {
@@ -243,13 +332,19 @@ async function main() {
         report.source_samples_and_tools_unchanged = true;
       }
     }, { durationSeconds: 20, h264ConstraintStress: true, artifactRoot: owned, ffmpegBin: process.env.RAINSYNC_FFMPEG_BIN });
-  } catch (error) { report.failures.push(redact(error.message)); }
+  } catch (error) { report.failures.push(diagnosticError(error, phase)); }
   finally {
     try {
+      phase = "fixture_evidence_and_cleanup";
       const entries = await readdir(owned, { withFileTypes: true }); assert.equal(entries.length, 1);
       const entry = entries[0]; assert.ok(entry.isDirectory() && /^[0-9a-f-]{36}$/.test(entry.name));
       const fixture = JSON.parse(await readFile(resolve(owned, entry.name, "report.json"), "utf8"));
       assert.equal(fixture.id, entry.name); assert.equal(fixture.kind, "emby"); assert.equal(fixture.image, image);
+      // Retain safe inner failure evidence before cleanup assertions/removal.
+      const evidence = redactDiagnostic(diagnosticFixtureEvidence(fixture), secrets);
+      await writeFile(resolve(root, "fixture.sanitized.json"), JSON.stringify(evidence, null, 2) + "\n");
+      report.fixture_evidence = { filename: "fixture.sanitized.json", result: evidence.result, failures: evidence.failures };
+      await save();
       report.fixture_cleanup = fixture.cleanup;
       assert.equal(fixture.cleanup.container, true); assert.equal(fixture.cleanup.network, true);
       assert.ok(fixture.cleanup.volumes.every((volume) => volume.absent));
@@ -258,7 +353,7 @@ async function main() {
       await rm(owned, { recursive: true }); report.owned_fixture_data_removed = true;
       await verify(); report.bound_source_and_binaries_unchanged = true;
       assert.ok(report.processes.every((process) => process.closed && process.pid_absent));
-    } catch (error) { report.failures.push(redact(`final integrity/cleanup: ${error.message}`)); }
+    } catch (error) { report.failures.push(diagnosticError(error, phase)); }
     report.finished_at = new Date().toISOString();
     report.result = report.failures.length ? "diagnostic_failed" : "diagnostic_completed";
     await save(); console.log(`Sanitized Emby diagnostic: ${resolve(root, "report.json")}`);
