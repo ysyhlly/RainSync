@@ -1,7 +1,8 @@
 # Explicit upstream transcode profile envelope
 
-Implemented locally with the bounded checks below; not yet published or
-validated on the fixed products.
+Published on `integration/v0.1-next`; the fixed-product run at
+`464dc39fba02431807aef0bb924fd0b0e46ba11a` failed. The controlled checks below
+remain separate from real-product compatibility.
 This is the smaller profile-envelope option chosen on 2026-10-01. It does not
 introduce a prepared/consumed upstream SID lifecycle or measured-output claim.
 
@@ -63,7 +64,7 @@ automatic new-SID fallback is introduced. Product-specific recipe propagation
 and actual generated output must be verified against the fixed Jellyfin and
 Emby images before their profile support is declared implemented.
 
-## Local evidence and remaining product check
+## Controlled evidence and failed product check
 
 Protocol tests and generated exports passed. Provider and Server tests and strict
 Clippy passed; the Server run included 81 unit tests and 17 presence tests, with
@@ -96,8 +97,26 @@ failure remains recorded separately. The final frontend suite also covers
 incomplete MSE buffer APIs and a fresh-clock seek before the current origin,
 with decoder failure still unable to create a replacement grant.
 
-Real pinned-product recipe propagation and finite decoded output still need the
-new product test. In particular, mocked URL fields do not establish Emby's
-actual range/level/frame-rate behavior. The existing raw upstream policy failures
-remain separate from RainSync enforcement and from this profile feature. No
-new device, sustained-load or production acceptance is claimed.
+The [fixed-product profile job](https://github.com/ysyhlly/RainSync/actions/runs/36949379906/job/110658667275)
+ran against the published `464dc39` candidate. All three cases for each product
+(H.264 at zero, HEVC seek with default audio, HEVC seek with alternate audio)
+failed final preparation with HTTP 502 rather than 200. No case reached finite
+output decoding, so product recipe propagation and actual output remain unverified.
+The [sanitized report](https://github.com/ysyhlly/RainSync/actions/runs/36949379906/artifacts/11203432113)
+records all six case cleanup checks as verified and the owned reservations as
+closed. Jellyfin's `encoding_stop_confirmed` remains false; these receipts do
+not prove that an actual Jellyfin encoder was stopped. Both product containers
+and networks were confirmed removed, but final host fixture-data removal failed
+with EACCES on Emby's bind-mounted configuration directory.
+
+The fixture now uses per-run owner-labeled Docker volumes for disposable config
+and cache, retaining credentials outside the host evidence tree. Existing volumes
+are not adopted, and named-volume deletion requires the exact run owner label.
+Seven dependency-free ownership/refusal tests and syntax checks passed locally;
+Docker was unavailable, so the new real-product cleanup path still needs CI.
+No permission widening or privileged host cleanup is used.
+
+The next implementation work is the concrete compatibility failure, not broader
+exact-output negotiation. Existing raw upstream policy failures remain separate
+from RainSync enforcement and this profile feature. No new device, sustained-load
+or production acceptance is claimed.

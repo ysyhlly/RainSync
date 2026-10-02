@@ -51,7 +51,7 @@ for(const name of ["rainsync-server","rainsync-media-worker","rainsync-nas-agent
 // Test drivers are bound separately; the production binary set remains exactly
 // Server/Worker/Agent for existing compatibility fixtures.
 const test_helpers=[];
-for(const name of ["verify_job_health_events","stop_claim_fixture","verify_job_phase_timings"]) {
+for(const name of ["verify_job_health_events","stop_claim_fixture","verify_job_phase_timings","emby_profile_request"]) {
   const path=resolve(process.env.CARGO_TARGET_DIR,"debug","examples",name+(process.platform==="win32"?".exe":""));
   test_helpers.push({name,path,sha256:sha(await readFile(path))});
 }

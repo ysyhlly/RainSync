@@ -265,6 +265,18 @@ function playbackInfo(subject, sid, body, fault) {
       TranscodingMaxAudioChannels: "2",
     }))
       query.set(name, value);
+  // Real Jellyfin returns this inert default even with no subtitle index.
+  if (subject.kind === "jellyfin") query.set("SubtitleMethod", "Encode");
+  if (fault.mismatch === "subtitle-selected") query.set("SubtitleStreamIndex", "0");
+  if (fault.mismatch === "subtitle-empty") query.set("SubtitleStreamIndex", "");
+  if (fault.mismatch === "subtitle-duplicate") {
+    query.set("SubtitleStreamIndex", "-1");
+    query.set("subtitlestreamindex", "0");
+  }
+  if (fault.mismatch === "missing-frame-rate" || fault.mismatch === "frame-rate-alias")
+    query.delete("MaxFramerate");
+  if (fault.mismatch === "frame-rate-alias") query.set("h264-maxframerate", "30");
+  if (fault.mismatch === "missing-sample-rate") query.delete("AudioSampleRate");
   if (fault.mismatch === "recipe") query.set("MaxWidth", "1920");
   if (fault.mismatch === "audio") query.set("AudioStreamIndex", "17");
   if (fault.mismatch === "namespace") {
@@ -1155,6 +1167,12 @@ try {
           "namespace",
           "silent-default",
           "silent-stream",
+          "subtitle-selected",
+          "subtitle-empty",
+          "subtitle-duplicate",
+          "missing-frame-rate",
+          "frame-rate-alias",
+          "missing-sample-rate",
         ])
           await scenario(
             `${kind}: checkpoint ${mismatch} mismatch SID before owned Stop`,

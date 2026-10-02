@@ -11,6 +11,12 @@ import {
 import { dirname, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import {
+  ownedUpstreamStorage,
+  createOwnedUpstreamVolume,
+  verifyOwnedUpstreamVolume,
+  removeOwnedUpstreamVolume,
+} from "./upstream-storage.mjs";
 
 const execute = promisify(execFile);
 const definitions = {
@@ -54,6 +60,14 @@ const delay = (ms, signal) =>
     signal?.addEventListener("abort", stop, { once: true });
   });
 
+export function upstreamFixtureSampleSettings(h264ConstraintStress = false) {
+  assert.equal(typeof h264ConstraintStress, "boolean");
+  return {
+    h264_frame_rate: h264ConstraintStress ? 60 : 10,
+    h264_sample_rate: h264ConstraintStress ? 44100 : 48000,
+  };
+}
+
 /**
  * An owned, disposable upstream. Credentials stay in this closure; metadata,
  * HTTP clients and addRainSyncSource are available only until the callback ends.
@@ -67,6 +81,7 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
   assert.ok(definition, "Supported fixture kind: jellyfin or emby");
   assert.equal(typeof run, "function");
   const durationSeconds = options.durationSeconds ?? 20;
+  const sampleSettings = upstreamFixtureSampleSettings(options.h264ConstraintStress);
   assert.ok(
     Number.isInteger(durationSeconds) &&
       durationSeconds >= 20 &&
@@ -92,11 +107,13 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
     scope: "Real upstream setup only; no actual playback compatibility claim",
     id,
     kind,
+    sample_settings: sampleSettings,
     root,
     image: definition.image,
     limits: { cpus: 1, memory_bytes: 1610612736, pids: 256 },
     started_at: new Date().toISOString(),
     source_sha256: await digest(new URL(import.meta.url)),
+    storage_helper_sha256: await digest(new URL("./upstream-storage.mjs", import.meta.url)),
     checks: [],
     failures: [],
     cleanup: { container: false, network: false, volumes: [] },
@@ -170,6 +187,7 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
   };
   let containerId;
   let networkId;
+  const storage = ownedUpstreamStorage(kind, id);
   let volumeNames = [];
   let callbackResult;
   let originalError;
@@ -228,10 +246,7 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
       ? "verified fixed Windows archive"
       : "explicit existing local executables; version and SHA-256 recorded; no archive claim";
     const media = resolve(root, "media");
-    const config = resolve(root, "config");
-    const cache = resolve(root, "cache");
-    for (const path of [media, config, cache])
-      await mkdir(path, { recursive: true });
+    await mkdir(media, { recursive: true });
     const clock = (seconds) =>
       `${String(Math.floor(seconds / 3600)).padStart(2, "0")}:${String(Math.floor(seconds / 60) % 60).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")},000`;
     const cues = [];
@@ -283,11 +298,11 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
         "-f",
         "lavfi",
         "-i",
-        "testsrc2=size=320x180:rate=10",
+        `testsrc2=size=320x180:rate=${sampleSettings.h264_frame_rate}`,
         "-f",
         "lavfi",
         "-i",
-        "sine=frequency=440:sample_rate=48000",
+        `sine=frequency=440:sample_rate=${sampleSettings.h264_sample_rate}`,
         "-t",
         String(durationSeconds),
         "-vf",
@@ -411,6 +426,12 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
         Number(info.format.duration) >= durationSeconds - 0.1 &&
           Number(info.format.duration) <= durationSeconds + 1,
       );
+      if (path === h264) {
+        const video = info.streams.find((stream) => stream.codec_type === "video");
+        const [numerator, denominator] = video.avg_frame_rate.split("/").map(Number);
+        assert.equal(numerator / denominator, sampleSettings.h264_frame_rate);
+        assert.equal(Number(info.streams.find((stream) => stream.codec_type === "audio").sample_rate), sampleSettings.h264_sample_rate);
+      }
       report.samples.push({
         path,
         sha256: await digest(path),
@@ -435,6 +456,12 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
       `rainsync.fixture=${id}`,
       network,
     );
+    for (const volume of storage) {
+      await createOwnedUpstreamVolume(docker, volume, () => {
+        volumeNames.push(volume.name);
+      });
+      await verifyOwnedUpstreamVolume(docker, volume);
+    }
     containerId = await docker(
       "run",
       "--detach",
@@ -455,9 +482,9 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
       "--publish",
       "127.0.0.1::8096",
       "--mount",
-      `type=bind,source=${config},target=/config`,
+      `type=volume,source=${storage[0].name},target=/config`,
       "--mount",
-      `type=bind,source=${cache},target=/cache`,
+      `type=volume,source=${storage[1].name},target=/cache`,
       "--mount",
       `type=bind,source=${media},target=/media,readonly`,
       definition.image,
@@ -869,8 +896,16 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
       report.cleanup.container = true;
       for (const volume of volumeNames) {
         assert.match(volume, /^[A-Za-z0-9_.-]+$/);
-        if (await inspect("volume", volume, "{{.Name}}"))
-          await docker("volume", "rm", volume);
+        if (await inspect("volume", volume, "{{.Name}}")) {
+          const owned = storage.find((entry) => entry.name === volume);
+          if (owned) await removeOwnedUpstreamVolume(docker, owned);
+          else {
+            // Only anonymous Docker-generated volumes discovered on this exact
+            // owner-verified container may use the legacy cleanup path.
+            assert.match(volume, /^[0-9a-f]{64}$/);
+            await docker("volume", "rm", volume);
+          }
+        }
         assert.equal(await inspect("volume", volume, "{{.Name}}"), null);
         report.cleanup.volumes.push({ name: volume, absent: true });
       }
@@ -896,6 +931,11 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
       assert.equal(
         await digest(new URL(import.meta.url)),
         report.source_sha256,
+      );
+      assert.equal(
+        await digest(new URL("./upstream-storage.mjs", import.meta.url)),
+        report.storage_helper_sha256,
+        "The owned storage helper did not change during the fixture",
       );
       report.source_unchanged = true;
       for (const tool of report.ffmpeg ?? [])

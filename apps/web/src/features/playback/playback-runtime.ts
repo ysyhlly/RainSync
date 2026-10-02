@@ -651,6 +651,7 @@ export function createPlaybackRuntime(ctx: {
     signal: AbortSignal,
     relativePosition = 0,
     planGeneration?: number,
+    currentRelativePosition?: () => number,
   ): Promise<PlaybackReadiness> {
     const readiness = await session.api<PlaybackReadiness>(
       `/playback-sessions/${id}?relative_position_ms=${encodeURIComponent(relativePosition)}${planGeneration === undefined ? "" : `&plan_generation=${planGeneration}`}`,
@@ -664,14 +665,18 @@ export function createPlaybackRuntime(ctx: {
     )
       throw new RequestFailure({ error: { code: "STALE_PLAYBACK_PLAN" } });
     // A running EVENT prefix needs one whole segment ahead of the room clock.
-    // Keep polling the real position; a complete or legacy response needs no lead.
+    // Network time can consume that lead. Recheck the current target after the
+    // response, not only the position sent in the request. Complete/legacy
+    // responses and a paused room still need no forward lead.
     if (
       state.value?.playback_status === "playing" &&
       readiness.status === "ready" &&
       readiness.complete === false &&
       readiness.available_until_ms != null &&
       Number.isFinite(readiness.available_until_ms) &&
-      readiness.available_until_ms - relativePosition < 4_000
+      readiness.available_until_ms -
+        (currentRelativePosition?.() ?? relativePosition) <
+        4_000
     ) {
       return { ...readiness, status: "preparing" };
     }
@@ -1631,6 +1636,11 @@ export function createPlaybackRuntime(ctx: {
               target(state.value!, clock.now()) - p.timeline_origin_ms,
             ),
             p.plan_generation,
+            () =>
+              Math.max(
+                0,
+                target(state.value!, clock.now()) - p.timeline_origin_ms,
+              ),
           );
         },
         p.session_id,

@@ -1,6 +1,6 @@
 # v0.1 functional work, separate from acceptance
 
-This is the 2026-10-02 code audit against the collaboration branch and the local
+This is the 2026-10-02 code audit against the collaboration branch and the published
 explicit upstream profile candidate, including the NAS/loading, bounded task-health,
 attempt timing and concrete-candidate recovery implementations described below. It does not replace the
 historical evidence in PROGRESS or the release gates in NEXT_PLAN. A historical
@@ -59,18 +59,23 @@ explicit-transcode profile envelope. It advertises requested configuration bound
 and a separate MSE compatibility estimate, not measured output or the exact
 candidate contract used by local/Agent media. Server and provider preparation,
 owned SID cleanup, replay fences, Web negotiation and the explanation UI are
-implemented in the local candidate. Its final controlled API matrix passed 49
+implemented in the published candidate. Its final controlled API matrix passed 49
 cases and its frontend suite passed 576 tests. See [the contract and evidence
 limits](UPSTREAM_PROFILE_ENVELOPE.md).
 
-Actual recipe propagation and finite decoded output against both pinned products
-remain unverified until the new finite CI job runs. Auto/direct/remux behavior
+The [finite product job at `464dc39`](https://github.com/ysyhlly/RainSync/actions/runs/36949379906/job/110658667275)
+has run and failed: all six explicit-profile preparations returned 502, before
+finite output decoding. Actual recipe propagation and decoded output against
+both pinned products therefore remain unverified. All six case cleanup checks
+passed, but Jellyfin encoder-stop confirmation remained false and final host
+fixture-data removal hit Emby config-directory EACCES. The scoped fixture storage
+repair has local ownership/refusal tests only; real Docker cleanup needs CI. Auto/direct/remux behavior
 stays unchanged. Prepared same-SID exact-output negotiation, broad HLS identity,
 ambiguous media versions and automatic decoder fallback to another upstream SID
 are not enabled by this smaller slice.
 
-This closes the selected code implementation gap, subject to publication and
-real-product compatibility. It is not a fresh exhaustive audit or a claim that
+The selected implementation is published, but the concrete product compatibility
+failure is still open. It is not a fresh exhaustive audit or a claim that
 the broader original exact-output design is implemented. Further work should
 follow a concrete compatibility failure or an explicit scope decision.
 

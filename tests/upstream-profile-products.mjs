@@ -23,6 +23,7 @@ import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
 import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
 import { delay } from "./fixtures/server.mjs";
 import { isolatedUpstreamReal } from "./fixtures/upstream-real.mjs";
+import { sameProfileItemMasterPath, profileSubtitleSelectionSupported } from "./fixtures/upstream-profile-route-contract.mjs";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
@@ -57,6 +58,8 @@ for (const name of ["rainsync-server", "rainsync-media-worker", "rainsync-nas-ag
     resolve(target, name + (process.platform === "win32" ? ".exe" : "")), "frozen binary location");
 const coordinator = await Promise.all([
   "tests/upstream-profile-products.mjs", "tests/fixtures/upstream-real.mjs",
+  "tests/fixtures/upstream-storage.mjs",
+  "tests/fixtures/upstream-profile-route-contract.mjs",
   "tests/fixtures/media-stack.mjs", "tests/fixtures/server.mjs", "tests/fixtures/postgres.mjs",
 ].map(async (path) => ({ path, sha256: await digest(resolve(repo, path)) })));
 const nodeRuntime = { version: process.version, path: process.execPath, sha256: await digest(process.execPath) };
@@ -234,7 +237,7 @@ async function limitedBody(response, cap, budget = { remaining: cap }) {
 
 const queryFields = ["videocodec", "audiocodec", "allowvideostreamcopy", "allowaudiostreamcopy",
   "allowinterlacedvideostreamcopy", "enableautostreamcopy", "static", "maxwidth", "maxheight", "width", "height",
-  "maxframerate", "framerate", "videobitrate", "h264-level", "h264-profile", "h264-rangetype", "h264-videorange",
+  "maxframerate", "h264-maxframerate", "framerate", "videobitrate", "h264-level", "h264-profile", "h264-rangetype", "h264-videorange",
   "level", "profile", "videorange", "videostreamindex", "audiostreamindex", "audiobitrate", "audiosamplerate",
   "transcodingmaxaudiochannels", "maxaudiochannels", "audiochannels", "aac-audiochannels", "subtitlestreamindex", "subtitlemethod"];
 function routeEvidence(value, expected, upstream) {
@@ -254,6 +257,7 @@ function routeEvidence(value, expected, upstream) {
     present: true, valid_url: true, same_owned_origin: url.origin === base.origin,
     owned_base_path: url.pathname.startsWith(base.pathname),
     exact_item_master_path: url.pathname.toLowerCase() === `${base.pathname}videos/${expected.item}/master.m3u8`.toLowerCase(),
+    same_item_master_path: sameProfileItemMasterPath(upstream.kind, base.pathname, expected.item, url.pathname),
     query_keys: [...query.keys()].sort(), duplicate_keys: [...query].filter(([, values]) => values.length > 1).map(([key]) => key),
     fields: Object.fromEntries(queryFields.map((key) => [key, query.get(key)?.map((value) =>
       /^[A-Za-z0-9.,_-]{1,80}$/.test(value) ? value : "[unrecognized-value]") ?? null])),
@@ -314,7 +318,7 @@ function routeChecks(route, kind, audioIndex) {
     observed: fields[key] ?? null, expected: `positive and <= ${limit}`, passed: one(key) !== null && Number.isFinite(value) && value > 0 && value <= limit }); };
   const flag = (field, observed, expected = true) => checks.push({ field, observed: observed ?? null, expected, passed: observed === expected });
   flag("route.present", route?.present); flag("route.valid_url", route?.valid_url);
-  flag("route.same_owned_origin", route?.same_owned_origin); flag("route.exact_item_master_path", route?.exact_item_master_path);
+  flag("route.same_owned_origin", route?.same_owned_origin); flag("route.same_item_master_path", route?.same_item_master_path);
   flag("route.media_source_matches", route?.media_source_matches); flag("route.play_session_matches", route?.play_session_matches);
   flag("route.fragment_present", route?.fragment_present, false);
   checks.push({ field: "route.duplicate_keys", observed: route?.duplicate_keys ?? null, expected: [], passed: route?.duplicate_keys?.length === 0 });
@@ -344,8 +348,8 @@ function routeChecks(route, kind, audioIndex) {
   for (const key of ["audiochannels", "aac-audiochannels", "maxaudiochannels", "transcodingmaxaudiochannels"])
     if (fields[key]) max(key, 2);
   if (fields.subtitlestreamindex) exact("subtitlestreamindex", "-1");
-  if (fields.subtitlemethod) checks.push({ field: "subtitlemethod", observed: fields.subtitlemethod,
-    expected: "not encode", passed: one("subtitlemethod")?.toLowerCase() !== "encode" });
+  checks.push({ field: "subtitle_selection", observed: { index: fields.subtitlestreamindex ?? null, method: fields.subtitlemethod ?? null },
+    expected: "no selected subtitle; Jellyfin Encode without an index is inert", passed: profileSubtitleSelectionSupported(kind, fields) });
   return checks;
 }
 function assertChecks(checks, label) {
@@ -825,7 +829,7 @@ async function runProduct(upstream, product, directory) {
             const remote = row.negotiations[0].response.sources[0];
             assert.equal(remote.source_hash, row.selection.source_hash); assert.equal(remote.default_audio_index, audio.Index);
             assert.equal(remote.route.media_source_matches, true); assert.equal(remote.route.play_session_matches, true);
-            assert.equal(remote.route.same_owned_origin, true); assert.equal(remote.route.exact_item_master_path, true);
+            assert.equal(remote.route.same_owned_origin, true); assert.equal(remote.route.same_item_master_path, true);
             assert.equal(remote.supports_transcoding, true); assert.equal(remote.transcoding_subprotocol?.toLowerCase(), "hls");
             assert.equal(remote.transcoding_container?.toLowerCase(), "ts");
             assertChecks(remote.route.constraint_checks, "actual product-returned route");

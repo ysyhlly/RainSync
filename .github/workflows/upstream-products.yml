@@ -3,6 +3,11 @@ on:
   push:
     branches: [integration/v0.1-next]
   workflow_dispatch:
+    inputs:
+      run_emby_profile_diagnostic:
+        description: Observe original Emby route on synthetic stress input (not acceptance)
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -167,7 +172,18 @@ jobs:
           export RAINSYNC_NATIVE_POSTGRES_BIN="$(pg_config --bindir)"
           node scripts/bind-native-backend.mjs > "$RAINSYNC_ARTIFACT_DIR/binding-path.txt"
           export W03_BACKEND_BINDING="$(tail -n 1 "$RAINSYNC_ARTIFACT_DIR/binding-path.txt")"
+          node --test tests/upstream-storage.test.mjs tests/upstream-profile-route-contract.test.mjs tests/upstream-profile-emby-diagnostic.test.mjs
           node tests/upstream-profile-products.mjs all
+      - name: Observe raw Emby profile behavior (explicit opt-in only)
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.run_emby_profile_diagnostic }}
+        timeout-minutes: 8
+        env:
+          RAINSYNC_RUN_EMBY_PROFILE_DIAGNOSTIC: 1
+          RAINSYNC_FFMPEG_BIN: /usr/bin
+          RAINSYNC_ARTIFACT_DIR: ${{ runner.temp }}/rainsync-profile-evidence
+        run: |
+          export W03_BACKEND_BINDING="$(tail -n 1 "$RAINSYNC_ARTIFACT_DIR/binding-path.txt")"
+          node tests/upstream-profile-emby-diagnostic.mjs
       - name: Preserve sanitized profile evidence only
         if: always()
         uses: actions/upload-artifact@v4
@@ -175,6 +191,7 @@ jobs:
           name: rainsync-upstream-profile-${{ github.sha }}
           path: |
             ${{ runner.temp }}/rainsync-profile-evidence/upstream-profile-products/**
+            ${{ runner.temp }}/rainsync-profile-evidence/emby-profile-diagnostic/**
             ${{ runner.temp }}/rainsync-profile-runtime/**/backend-binding.json
           if-no-files-found: warn
           retention-days: 7

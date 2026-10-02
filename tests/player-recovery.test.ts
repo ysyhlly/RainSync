@@ -1524,6 +1524,191 @@ it("generated prefix recovery cannot use finite duration to cross unavailable me
   }
 });
 
+it("generated prefix readiness must still have forward headroom when its delayed response arrives", async () => {
+  hls.supported = true;
+  const s = setup({ hls: true, rebuild: true, ranges: [[0, 10]] });
+  let recovery: Promise<void> | undefined;
+  try {
+    s.el.canPlayType = () => "";
+    await s.prepare();
+    s.playing();
+    s.state.value.anchor_position_ms = 15000;
+    let release!: (value: unknown) => void;
+    let reads = 0;
+    const original = s.api.getMockImplementation()!;
+    s.api.mockImplementation((path, method, body) => {
+      if (method !== "GET") return original(path, method, body);
+      reads++;
+      if (reads === 1)
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      return Promise.resolve({
+        session_id: "session-1",
+        plan_generation: 1,
+        status: "ready",
+        complete: false,
+        available_until_ms: 24000,
+      });
+    });
+    recovery = s.runtime.applyState(true);
+    expect(reads).toBe(1);
+    // The prefix had 5s lead when requested, but only 2s when returned.
+    s.clock.time = 3000;
+    release({
+      session_id: "session-1",
+      plan_generation: 1,
+      status: "ready",
+      complete: false,
+      available_until_ms: 20000,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hls.start).not.toHaveBeenCalled();
+    expect(s.runtime.waiting.value).toBe(true);
+    expect(s.el.paused).toBe(true);
+    s.clock.time = 4000;
+    await vi.advanceTimersByTimeAsync(1000);
+    await recovery;
+    expect(reads).toBe(2);
+    expect(hls.start).toHaveBeenCalledExactlyOnceWith(19);
+    expect(hls.load).toHaveBeenCalledTimes(1);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    await s.runtime.reset();
+    await recovery?.catch(() => {});
+    s.cleanup();
+  }
+});
+
+it.each([
+  {
+    name: "complete prefix ahead",
+    complete: true,
+    until: 20000,
+    time: 3000,
+    position: 18,
+  },
+  {
+    name: "complete prefix behind",
+    complete: true,
+    until: 20000,
+    time: 8000,
+    position: 20,
+  },
+  {
+    name: "legacy unknown prefix",
+    complete: undefined,
+    until: undefined,
+    time: 8000,
+    position: 23,
+  },
+  {
+    name: "paused room",
+    complete: false,
+    until: 16000,
+    time: 3000,
+    position: 15,
+    paused: true,
+  },
+  {
+    name: "target moved behind request",
+    complete: false,
+    until: 17000,
+    time: 0,
+    position: 12,
+    anchor: 12000,
+  },
+])("delayed readiness preserves $name semantics", async (input) => {
+  hls.supported = true;
+  const s = setup({ hls: true, rebuild: true, ranges: [[0, 10]] });
+  let recovery: Promise<void> | undefined;
+  try {
+    s.el.canPlayType = () => "";
+    await s.prepare();
+    s.playing();
+    s.state.value.anchor_position_ms = 15000;
+    let release!: (value: unknown) => void;
+    const original = s.api.getMockImplementation()!;
+    s.api.mockImplementation((path, method, body) =>
+      method === "GET"
+        ? new Promise((resolve) => {
+            release = resolve;
+          })
+        : original(path, method, body),
+    );
+    recovery = s.runtime.applyState(true);
+    s.clock.time = input.time;
+    if (input.paused) s.state.value.playback_status = "paused";
+    if (input.anchor) s.state.value.anchor_position_ms = input.anchor;
+    release({
+      session_id: "session-1",
+      plan_generation: 1,
+      status: "ready",
+      complete: input.complete,
+      available_until_ms: input.until,
+    });
+    await recovery;
+    expect(hls.start).toHaveBeenCalledExactlyOnceWith(input.position);
+    expect(hls.load).toHaveBeenCalledTimes(1);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    await s.runtime.reset();
+    await recovery?.catch(() => {});
+    s.cleanup();
+  }
+});
+
+it("initial preparation also rechecks headroom after a delayed readiness response", async () => {
+  hls.supported = true;
+  const s = setup({ hls: true, rebuild: true, ranges: [[0, 20]] });
+  let preparation: Promise<void> | undefined;
+  try {
+    s.el.canPlayType = () => "";
+    s.playing();
+    let release!: (value: unknown) => void;
+    let reads = 0;
+    const original = s.api.getMockImplementation()!;
+    s.api.mockImplementation((path, method, body) => {
+      if (method !== "GET") return original(path, method, body);
+      reads++;
+      if (reads === 1)
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      return Promise.resolve({
+        session_id: "session-1",
+        plan_generation: 1,
+        status: "ready",
+        complete: false,
+        available_until_ms: 20000,
+      });
+    });
+    preparation = s.prepare();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reads).toBe(1);
+    s.clock.time = 3000;
+    release({
+      session_id: "session-1",
+      plan_generation: 1,
+      status: "ready",
+      complete: false,
+      available_until_ms: 15000,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hls.load).not.toHaveBeenCalled();
+    s.clock.time = 4000;
+    await vi.advanceTimersByTimeAsync(1000);
+    await preparation;
+    expect(reads).toBe(2);
+    expect(hls.load).toHaveBeenCalledTimes(1);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    await s.runtime.reset();
+    await preparation?.catch(() => {});
+    s.cleanup();
+  }
+});
+
 it("generation readiness from an invalidated clock cannot replace or restart the source", async () => {
   const s = setup({ rebuild: true, ranges: [[0, 10]] });
   try {

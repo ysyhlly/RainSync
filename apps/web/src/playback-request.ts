@@ -229,6 +229,7 @@ export class PlaybackRequests {
       signal: AbortSignal,
       relativePosition?: number,
       planGeneration?: number,
+      currentRelativePosition?: () => number,
     ) => Promise<PlaybackReadiness>,
   ) {
     const saved = JSON.parse(storage.getItem(storageKey) ?? "[]") as string[];
@@ -319,6 +320,11 @@ export class PlaybackRequests {
                 (position?.() ?? input.position_ms) - plan.timeline_origin_ms,
               ),
               plan.plan_generation,
+              () =>
+                Math.max(
+                  0,
+                  (position?.() ?? input.position_ms) - plan.timeline_origin_ms,
+                ),
             ),
           plan.session_id,
           controller.signal,
@@ -420,6 +426,11 @@ export class PlaybackRequests {
                 (position?.() ?? input.position_ms) - plan.timeline_origin_ms,
               ),
               plan.plan_generation,
+              () =>
+                Math.max(
+                  0,
+                  (position?.() ?? input.position_ms) - plan.timeline_origin_ms,
+                ),
             ),
           plan.session_id,
           controller.signal,

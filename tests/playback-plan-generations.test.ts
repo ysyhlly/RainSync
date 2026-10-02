@@ -124,7 +124,9 @@ it("revokes a plan whose readiness generation is stale before exposing its URL",
     expect.any(AbortSignal),
     2000,
     7,
+    expect.any(Function),
   );
+  expect(read.mock.calls[0][4]()).toBe(2000);
   expect(cancel).toHaveBeenCalledTimes(1);
   expect(storage.getItem("key")).toBe("[]");
 });

@@ -462,6 +462,49 @@ fn query_exact(query: &BTreeMap<String, String>, key: &str, expected: &str) -> R
     Ok(())
 }
 
+fn item_master_path_matches(
+    kind: &str,
+    config: &SourceConfig,
+    item: &str,
+    url: &reqwest::Url,
+) -> Result<bool> {
+    let expected = upstream_common::profile_item_route(config, item)?;
+    if url.path().eq_ignore_ascii_case(expected.path()) {
+        return Ok(true);
+    }
+    // Jellyfin serializes metadata IDs as compact GUIDs but its HLS route uses
+    // Guid's hyphenated format. Admit only these two exact GUID spellings, not
+    // arbitrary hyphen removal, percent decoding or another item/base path.
+    if kind != "jellyfin"
+        || !((item.len() == 32 && item.bytes().all(|b| b.is_ascii_hexdigit()))
+            || (item.len() == 36
+                && item.bytes().enumerate().all(|(i, b)| {
+                    if [8, 13, 18, 23].contains(&i) {
+                        b == b'-'
+                    } else {
+                        b.is_ascii_hexdigit()
+                    }
+                })))
+    {
+        return Ok(false);
+    }
+    let compact = item.replace('-', "");
+    let alternate = if item.len() == 36 {
+        compact
+    } else {
+        format!(
+            "{}-{}-{}-{}-{}",
+            &compact[..8],
+            &compact[8..12],
+            &compact[12..16],
+            &compact[16..20],
+            &compact[20..]
+        )
+    };
+    let expected = upstream_common::profile_item_route(config, &alternate)?;
+    Ok(url.path().eq_ignore_ascii_case(expected.path()))
+}
+
 /// Encrypted bindings can outlive this parser invocation. Check their bounded
 /// typed representation again before using it to build or admit a recipe.
 pub fn validate_metadata_proof(metadata: &UpstreamProfileMetadata) -> Result<()> {
@@ -592,9 +635,8 @@ pub fn validate_route(
             && segments[segments.len() - 1].eq_ignore_ascii_case("master.m3u8"),
         "upstream_profile_route_not_hls"
     );
-    let expected = upstream_common::profile_item_route(config, &metadata.item_id)?;
     ensure!(
-        url.path().eq_ignore_ascii_case(expected.path()),
+        item_master_path_matches(kind, config, &metadata.item_id, &url)?,
         "upstream_profile_selection_mismatch"
     );
     let query = route_query(&url)?;
@@ -719,10 +761,16 @@ pub fn validate_route(
     if query.contains_key("subtitlestreamindex") {
         query_exact(&query, "subtitlestreamindex", "-1")?;
     }
+    // Jellyfin 10.11 EncodingHelper.AttachMediaSourceInfo calls GetMediaStream
+    // for subtitles with returnFirstIfNoIndex=false. Encode alone is therefore
+    // an inert default when the route omits the index (or explicitly uses -1).
+    // A selected, malformed or duplicate index still fails above/in route_query.
+    // Do not assume the same omission semantics for other providers.
     ensure!(
-        !query
-            .get("subtitlemethod")
-            .is_some_and(|value| value.eq_ignore_ascii_case("encode")),
+        kind == "jellyfin"
+            || !query
+                .get("subtitlemethod")
+                .is_some_and(|value| value.eq_ignore_ascii_case("encode")),
         "upstream_profile_route_mismatch"
     );
     Ok(UpstreamProfileRoute {
@@ -1019,7 +1067,7 @@ mod tests {
                 "&VideoCodec=copy",
                 "&static=true",
                 "&Width=1920",
-                "&SubtitleMethod=Encode",
+                "&SubtitleMethod=Encode&SubtitleStreamIndex=0",
             ] {
                 let mut bad = good.clone();
                 bad["MediaSources"][0]["TranscodingUrl"] = json!(format!(
@@ -1039,6 +1087,132 @@ mod tests {
                 .unwrap()
                 .to_string();
             assert!(!error.contains("evil") && !error.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn jellyfin_guid_route_spelling_preserves_exact_item_base_and_returned_url() {
+        let compact = "1234567890abcdef1234567890abcdef";
+        let hyphenated = "12345678-90ab-cdef-1234-567890abcdef";
+        for (item, route_item) in [(compact, hyphenated), (hyphenated, compact)] {
+            let mut metadata = proof();
+            metadata.item_id = item.into();
+            for base in [
+                "https://example.test/proxy/jellyfin",
+                "https://example.test/proxy/jellyfin/",
+            ] {
+                let config = SourceConfig {
+                    url: base.into(),
+                    ..config()
+                };
+                let mut info = reply("jellyfin");
+                let path = info["MediaSources"][0]["TranscodingUrl"]
+                    .as_str()
+                    .unwrap()
+                    .replace("Videos/item/", &format!("Videos/{route_item}/"));
+                info["MediaSources"][0]["TranscodingUrl"] = json!(path);
+                let route = validate_route("jellyfin", &config, &metadata, &info).unwrap();
+                assert_eq!(
+                    route.url.path(),
+                    format!("/proxy/jellyfin/Videos/{route_item}/master.m3u8")
+                );
+                assert_eq!(
+                    route.url.query(),
+                    path.split_once('?').map(|(_, query)| query)
+                );
+                assert!(validate_route("emby", &config, &metadata, &info).is_err());
+                for bad in [
+                    "12345678-90ab-cdef-1234-567890abcdee", // different GUID
+                    "1234-567890ab-cdef-1234-567890abcdef", // misplaced hyphens
+                    "{12345678-90ab-cdef-1234-567890abcdef}",
+                    "urn:uuid:12345678-90ab-cdef-1234-567890abcdef",
+                    "%31%32%33%34%35%36%37%38-90ab-cdef-1234-567890abcdef",
+                    "12345678-90ab-cdef-1234-567890abcdef/extra",
+                ] {
+                    info["MediaSources"][0]["TranscodingUrl"] =
+                        json!(path.replace(route_item, bad));
+                    assert!(
+                        validate_route("jellyfin", &config, &metadata, &info).is_err(),
+                        "{bad}"
+                    );
+                }
+                for bad_base in [
+                    "https://other.test/proxy/jellyfin",
+                    "https://example.test/other",
+                ] {
+                    info["MediaSources"][0]["TranscodingUrl"] = json!(format!("{bad_base}/{path}"));
+                    assert!(validate_route("jellyfin", &config, &metadata, &info).is_err());
+                }
+            }
+        }
+        let mut metadata = proof();
+        metadata.item_id = "not-a-guid".into();
+        let mut info = reply("jellyfin");
+        info["MediaSources"][0]["TranscodingUrl"] = json!(
+            info["MediaSources"][0]["TranscodingUrl"]
+                .as_str()
+                .unwrap()
+                .replace("Videos/item/", "Videos/notaguid/")
+        );
+        assert!(validate_route("jellyfin", &config(), &metadata, &info).is_err());
+    }
+
+    #[test]
+    fn jellyfin_encode_default_requires_no_selected_or_ambiguous_subtitle() {
+        for kind in ["jellyfin", "emby"] {
+            let good = reply(kind);
+            let path = good["MediaSources"][0]["TranscodingUrl"].as_str().unwrap();
+            for index in ["", "&SubtitleStreamIndex=-1"] {
+                let mut info = good.clone();
+                let returned = format!("{path}&SubtitleMethod=Encode{index}");
+                info["MediaSources"][0]["TranscodingUrl"] = json!(returned);
+                let result = validate_route(kind, &config(), &proof(), &info);
+                assert_eq!(result.is_ok(), kind == "jellyfin");
+                if let Ok(route) = result {
+                    assert_eq!(
+                        route.url.query(),
+                        returned.split_once('?').map(|(_, query)| query)
+                    );
+                }
+            }
+            for index in ["0", "2", "", "null", "-2", "-1&SUBTITLESTREAMINDEX=0"] {
+                for method in ["", "&SubtitleMethod=Encode", "&SubtitleMethod=External"] {
+                    let mut info = good.clone();
+                    info["MediaSources"][0]["TranscodingUrl"] =
+                        json!(format!("{path}&SubtitleStreamIndex={index}{method}"));
+                    assert!(
+                        validate_route(kind, &config(), &proof(), &info).is_err(),
+                        "{kind}: {index}{method}"
+                    );
+                }
+            }
+            let mut info = good.clone();
+            info["MediaSources"][0]["TranscodingUrl"] = json!(format!(
+                "{path}&SubtitleMethod=Encode&subtitlemethod=External"
+            ));
+            assert!(validate_route(kind, &config(), &proof(), &info).is_err());
+        }
+    }
+
+    #[test]
+    fn source_metadata_does_not_replace_missing_returned_frame_or_sample_bounds() {
+        let mut metadata = proof();
+        metadata.video.frame_rate = Some(10.0);
+        metadata.audio.as_mut().unwrap().sample_rate = 48_000;
+        for kind in ["jellyfin", "emby"] {
+            let good = reply(kind);
+            let path = good["MediaSources"][0]["TranscodingUrl"].as_str().unwrap();
+            for returned in [
+                path.replace("&MaxFramerate=30", ""),
+                path.replace("&AudioSampleRate=48000", ""),
+                path.replace("&MaxFramerate=30", "&h264-maxframerate=30"),
+                path.replace("&AudioSampleRate=48000", "&aac-audiosamplerate=48000"),
+            ] {
+                let mut info = good.clone();
+                info["MediaSources"][0]["TranscodingUrl"] = json!(returned);
+                assert!(validate_route(kind, &config(), &metadata, &info).is_err());
+                assert_eq!(info["MediaSources"][0]["TranscodingUrl"], returned);
+            }
         }
     }
 
