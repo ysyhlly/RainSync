@@ -22,7 +22,8 @@ const root = resolve(
   id,
 );
 await mkdir(root, { recursive: true });
-const historicalReference = "d7cb0ed6309bbb555773c9b61f27ac83a4a8a570";
+// Published pre-0039 tree; local integration commit IDs are not portable to CI.
+const historicalReference = "c86d1508da22920cb8d21e3f2c11f8bbc9270b45";
 const migrationName = "0039_media_job_timing.sql";
 const fields = [
   "timing_version",
