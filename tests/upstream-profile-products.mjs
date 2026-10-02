@@ -112,7 +112,7 @@ const report = {
   schema_version: 1, run_id: runId, started_at: new Date().toISOString(), result: "running", selection,
   scope: "Actual RainSync preflight and dedicated explicit-transcode prepare against fixed disposable products, actual Worker-delivered HLS, finite native decode. Browser estimate is controlled, not browser execution or whole-title output proof. Raw upstream policy semantics remain in upstream-real-contracts.mjs.",
   browser_estimate: { controlled: true, mse_supported: true,
-    mse_decoding: { supported: true, smooth: false, powerEfficient: false } },
+    mse_decoding: { supported: true, smooth: false, power_efficient: false } },
   limits: { request_ms: 20000, probe_decode_ms: 15000, stop_ms: 15000, cleanup_grace_ms: 10000,
     stack_startup_ms: 180000, stack_matrix_ms: 900000,
     max_segments_per_window: 3, total_read_budget_per_window_bytes: 25 * 1024 * 1024,
@@ -793,7 +793,7 @@ async function runProduct(upstream, product, directory) {
               idempotency_key: key, mode: "transcode", position_ms: input.position_ms, audio_index: audio.Index,
               capabilities: { progressive_h264_aac: false, native_hls: false, mse_h264_aac: true },
               upstream_profile_report: { profile_version: 1, binding: candidates.binding, profile_id: candidates.profile.profile_id,
-                mse_supported: true, mse_decoding: { supported: true, smooth: false, powerEfficient: false } } } });
+                mse_supported: true, mse_decoding: { supported: true, smooth: false, power_efficient: false } } } });
             const value = JSON.parse((await limitedBody(response, 1024 * 1024)).toString("utf8"));
             // Own the plan immediately, before any route/marker/output assertion.
             if (value.session_id) plan = value;
