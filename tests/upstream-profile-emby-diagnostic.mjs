@@ -7,6 +7,7 @@ import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isolatedUpstreamReal } from "./fixtures/upstream-real.mjs";
+import { ownedEmbyMediaPath } from "./fixtures/upstream-media-route.mjs";
 import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
 
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -37,25 +38,7 @@ export async function diagnosticBody(response, cap, budget = { remaining: cap })
 }
 
 // Resolve only original returned references. Never add/replace query parameters.
-export function diagnosticPath(reference, parent, base, item, sid, master = false) {
-  assert.equal(typeof reference, "string"); assert.ok(reference.length > 0 && reference.length <= 16384);
-  const url = new URL(reference, parent), configured = new URL(base);
-  assert.equal(url.origin, configured.origin);
-  assert.ok(!url.username && !url.password && !url.hash);
-  const prefix = configured.pathname.replace(/\/$/, "");
-  const itemPrefix = `${prefix}/videos/${encodeURIComponent(item)}/`;
-  assert.ok(url.pathname.toLowerCase().startsWith(itemPrefix.toLowerCase()), "same owned item only");
-  if (master) assert.equal(url.pathname.toLowerCase(), `${itemPrefix}master.m3u8`.toLowerCase());
-  const query = new Map();
-  for (const [key, value] of url.searchParams) {
-    const normalized = key.toLowerCase(); assert.ok(!query.has(normalized), "no duplicate query keys");
-    query.set(normalized, value);
-  }
-  if (master || query.has("playsessionid")) assert.equal(query.get("playsessionid"), sid);
-  const path = url.pathname.slice(prefix.length) + url.search;
-  assert.equal(base.replace(/\/$/, "") + path, url.href, "original route round-trips without synthesis");
-  return { url, path, query };
-}
+export const diagnosticPath = ownedEmbyMediaPath;
 
 export function diagnosticRouteShape(reference, base) {
   const shape = { present: typeof reference === "string" && reference.length > 0 };
@@ -141,7 +124,7 @@ export function diagnosticError(error, phase, seen = new Set(), depth = 0) {
 // Keep only useful fixture evidence, not credentials, command arguments or logs.
 export function diagnosticFixtureEvidence(fixture) {
   const fields = ["id", "kind", "image", "actual_version", "result", "failures", "cleanup",
-    "source_sha256", "storage_helper_sha256", "source_unchanged", "toolchain_unchanged", "started_at", "finished_at"];
+    "source_sha256", "storage_helper_sha256", "media_route_helper_sha256", "source_unchanged", "toolchain_unchanged", "started_at", "finished_at"];
   return Object.fromEntries(fields.filter((key) => Object.hasOwn(fixture, key)).map((key) => [key, fixture[key]]));
 }
 
@@ -163,7 +146,7 @@ async function main() {
   for (const path of ["crates/providers/examples/emby_profile_request.rs", "crates/providers/src/upstream_profiles.rs"])
     assert.ok(binding.source.some((entry) => entry.path === path));
   const coordinator = await Promise.all(["tests/upstream-profile-emby-diagnostic.mjs", "tests/fixtures/upstream-real.mjs",
-    "tests/fixtures/upstream-storage.mjs", "tests/fixtures/postgres.mjs"].map(async (path) => ({ path, sha256: await digest(resolve(repo, path)) })));
+    "tests/fixtures/upstream-storage.mjs", "tests/fixtures/upstream-media-route.mjs", "tests/fixtures/postgres.mjs"].map(async (path) => ({ path, sha256: await digest(resolve(repo, path)) })));
   const verify = async () => {
     assert.equal(await digest(bindingPath), sha(bindingBytes));
     for (const entry of [...binding.source, ...coordinator]) {
@@ -266,7 +249,10 @@ async function main() {
         await diagnosticBody(start, 64 * 1024); assert.ok([200, 204].includes(start.status));
         const budget = { remaining: report.limits.window_bytes };
         const fetchOriginal = async (route, cap, type) => {
-          const response = await client.raw(route.path, { timeout: 15000 });
+          const response = await client.rawMedia(route.url.href, {
+            parent: master.url.href, item: itemId, source: sourceId, sid,
+            master: type === "manifest" && route.url.href === master.url.href, timeout: 15000,
+          });
           const bytes = await diagnosticBody(response, cap, budget);
           report.resources.push({ type, url_sha256: sha(route.url.href), status: response.status, bytes: bytes.length, sha256: sha(bytes) });
           assert.equal(response.status, 200); return bytes;

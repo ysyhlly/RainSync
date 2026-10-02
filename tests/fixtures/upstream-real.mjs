@@ -11,6 +11,7 @@ import {
 import { dirname, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { fetchOwnedEmbyMedia } from "./upstream-media-route.mjs";
 import {
   ownedUpstreamStorage,
   createOwnedUpstreamVolume,
@@ -114,6 +115,7 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
     started_at: new Date().toISOString(),
     source_sha256: await digest(new URL(import.meta.url)),
     storage_helper_sha256: await digest(new URL("./upstream-storage.mjs", import.meta.url)),
+    media_route_helper_sha256: await digest(new URL("./upstream-media-route.mjs", import.meta.url)),
     checks: [],
     failures: [],
     cleanup: { container: false, network: false, volumes: [] },
@@ -530,6 +532,7 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
     const password = randomBytes(24).toString("hex");
     secrets.add(username);
     secrets.add(password);
+    const ownedItems = new Map();
     function makeClient(
       deviceId = `fixture-${randomUUID()}`,
       token = "",
@@ -577,7 +580,13 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
           );
         }
       };
-      return { deviceId, userId, raw, api };
+      const rawMedia = async (reference, { parent, item, source, sid, master = false, timeout = 15000 }) => {
+        checkOpen();
+        assert.equal(kind, "emby", "raw controller diagnostic is pinned to Emby");
+        return fetchOwnedEmbyMedia({ reference, parent, base, item, source, sid, master,
+          ownedItems, headers: headers(), signal: control.signal, timeout });
+      };
+      return { deviceId, userId, raw, api, rawMedia };
     }
     const anonymous = makeClient();
     let info;
@@ -767,6 +776,7 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
     await denied.arrayBuffer();
     report.anonymous_status = denied.status;
     report.checks.push("authenticated metadata and unauthenticated denial");
+    for (const item of listing.Items) ownedItems.set(item.Id, new Set((item.MediaSources ?? []).map((source) => source.Id)));
     report.items = listing.Items.map((item) => ({
       id: item.Id,
       name: item.Name,
@@ -936,6 +946,11 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
         await digest(new URL("./upstream-storage.mjs", import.meta.url)),
         report.storage_helper_sha256,
         "The owned storage helper did not change during the fixture",
+      );
+      assert.equal(
+        await digest(new URL("./upstream-media-route.mjs", import.meta.url)),
+        report.media_route_helper_sha256,
+        "The owned media route helper did not change during the fixture",
       );
       report.source_unchanged = true;
       for (const tool of report.ffmpeg ?? [])

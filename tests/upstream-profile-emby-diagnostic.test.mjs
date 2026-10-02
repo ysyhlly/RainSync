@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFile } from "node:fs/promises";
 import { diagnosticBody, diagnosticPath, finiteObservation, redactDiagnostic, diagnosticError, diagnosticFixtureEvidence, diagnosticRouteShape } from "./upstream-profile-emby-diagnostic.mjs";
 import { upstreamFixtureSampleSettings } from "./fixtures/upstream-real.mjs";
+import { fetchOwnedEmbyMedia } from "./fixtures/upstream-media-route.mjs";
 const base = "http://127.0.0.1:8096/emby";
 const route = "/emby/Videos/123/master.m3u8?PlaySessionId=owned&MediaSourceId=source&h264-maxframerate=30";
 
@@ -30,7 +32,7 @@ test("raw route restricts origin, item, SID, credential authority, duplicates an
 test("child references stay in original item namespace without adding SID", () => {
   const master = diagnosticPath(route, base + "/", base, "123", "owned", true);
   const child = diagnosticPath("hls1/main/0.ts", master.url, base, "123", "owned");
-  assert.equal(child.path, "/Videos/123/hls1/main/0.ts");
+  assert.equal(child.path, "/emby/Videos/123/hls1/main/0.ts");
   assert.equal(child.query.size, 0);
   assert.throws(() => diagnosticPath("/emby/Users/private", master.url, base, "123", "owned"));
 });
@@ -144,4 +146,62 @@ test("prevalidation route shape explains base resolution without retaining URL o
   assert.equal(diagnosticRouteShape("Videos/6/master.m3u8?api_key=private", base).under_configured_base, true);
   assert.equal(JSON.stringify(shape).includes("private"), false);
   assert.equal(JSON.stringify(shape).includes("/Videos/6"), false);
+});
+
+
+test("raw media fetch preserves both exact root and API-prefixed URLs and query spelling", async () => {
+  for (const prefix of ["", "/emby"]) {
+    const original = `http://127.0.0.1:8096${prefix}/Videos/123/master.m3u8?PlaySessionId=owned&MediaSourceId=source&h264-maxframerate=30&VideoCodec=h264%2Ch264`;
+    const calls = [];
+    const controller = new AbortController();
+    const response = await fetchOwnedEmbyMedia({ reference: original, parent: original, base,
+      item: "123", source: "source", sid: "owned", master: true, ownedItems: new Map([["123", new Set(["source"])]]),
+      headers: { Authorization: "fixture-auth" }, signal: controller.signal }, async (...args) => {
+      calls.push(args); return new Response("media");
+    });
+    assert.equal(await response.text(), "media");
+    assert.equal(calls.length, 1); assert.equal(calls[0][0], original);
+    assert.equal(calls[0][1].headers.Authorization, "fixture-auth");
+    assert.equal(calls[0][1].redirect, "error"); assert.equal(calls[0][1].method, "GET");
+    controller.abort(); assert.equal(calls[0][1].signal.aborted, true);
+  }
+});
+
+test("media helper rejects unowned catalog items and wrong target before authenticated fetch", async () => {
+  const root = "http://127.0.0.1:8096/Videos/123/master.m3u8?PlaySessionId=owned&MediaSourceId=source";
+  for (const overrides of [
+    { reference: root, ownedItems: new Map([["other", new Set(["source"])]]) },
+    { reference: root.replace("/Videos/", "/private/Videos/") },
+    { reference: root.replace("/123/", "/456/") },
+    { reference: root.replace("127.0.0.1", "foreign.test") },
+    { reference: root.replace("http://", "http://user:password@") },
+    { reference: root.replace("owned", "other") },
+    { reference: root + "&playsessionid=owned" },
+    { reference: root + "#fragment" },
+    { source: "wrong-source" },
+    { reference: root.replace("MediaSourceId=source", "MediaSourceId=other") },
+    { reference: root.replace("/Videos/", "/emby/Videos/") },
+    { timeout: 0 },
+  ]) {
+    let called = false;
+    await assert.rejects(fetchOwnedEmbyMedia({ reference: root, parent: root, base,
+      item: "123", source: "source", sid: "owned", master: true, ownedItems: new Map([["123", new Set(["source"])]]), ...overrides }, async () => { called = true; }));
+    assert.equal(called, false);
+  }
+});
+
+test("root controller children stay in root namespace; aliases cannot change mid-grant", () => {
+  const parent = "http://127.0.0.1:8096/Videos/123/master.m3u8?PlaySessionId=owned";
+  assert.equal(diagnosticPath("hls1/main/0.ts", parent, base, "123", "owned").path, "/Videos/123/hls1/main/0.ts");
+  assert.throws(() => diagnosticPath("/emby/Videos/123/hls1/main/0.ts", parent, base, "123", "owned"));
+  assert.throws(() => diagnosticPath("/Videos/123/hls1/main/0.ts", base + "/Videos/123/master.m3u8", base, "123", "owned"));
+});
+
+
+test("ordinary fixture API raw still appends configured base; media helper is a separate path", async () => {
+  const source = await readFile(new URL("./fixtures/upstream-real.mjs", import.meta.url), "utf8");
+  const ordinary = source.slice(source.indexOf("const raw = async"), source.indexOf("const api = async"));
+  assert.match(ordinary, /fetch\(base \+ path,/);
+  assert.match(ordinary, /redirect: "error"/);
+  assert.equal(ordinary.includes("fetchOwnedEmbyMedia"), false);
 });
