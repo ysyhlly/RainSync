@@ -120,3 +120,18 @@ The next implementation work is the concrete compatibility failure, not broader
 exact-output negotiation. Existing raw upstream policy failures remain separate
 from RainSync enforcement and this profile feature. No new device, sustained-load
 or production acceptance is claimed.
+
+## Explicit diagnostic execution
+
+The raw-product diagnostic remains separate from RainSync acceptance and never
+relaxes production route validation. Prefer `workflow_dispatch` with
+`run_emby_profile_diagnostic: true` when that action is available.
+
+When the workflow is not on the default branch, the same bounded diagnostic can
+be requested once by including `[run-emby-profile-diagnostic]` in the pushed head
+commit message on `integration/v0.1-next`. The push must target exactly that
+branch; ordinary unmarked pushes and pull-request events do not opt in. Only the
+head commit message is checked, so a marker in an earlier commit does not enable
+later pushes. Re-running that explicitly opted-in workflow run can repeat the
+diagnostic; this is an event opt-in, not a persistent setting. The existing
+fixed-product acceptance still runs and retains its own failure result.
