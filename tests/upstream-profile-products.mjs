@@ -19,6 +19,7 @@ import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import WS from "ws";
+import { chainEvidence, manifestReferences } from "./fixtures/upstream-profile-chain.mjs";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
 import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
 import { delay } from "./fixtures/server.mjs";
@@ -59,7 +60,7 @@ for (const name of ["rainsync-server", "rainsync-media-worker", "rainsync-nas-ag
 const coordinator = await Promise.all([
   "tests/upstream-profile-products.mjs", "tests/fixtures/upstream-real.mjs",
   "tests/fixtures/upstream-storage.mjs",
-  "tests/fixtures/upstream-profile-route-contract.mjs",
+  "tests/fixtures/upstream-profile-route-contract.mjs", "tests/fixtures/upstream-profile-chain.mjs",
   "tests/fixtures/media-stack.mjs", "tests/fixtures/server.mjs", "tests/fixtures/postgres.mjs",
 ].map(async (path) => ({ path, sha256: await digest(resolve(repo, path)) })));
 const nodeRuntime = { version: process.version, path: process.execPath, sha256: await digest(process.execPath) };
@@ -372,6 +373,10 @@ function assertChecks(checks, label) {
 async function recorder(upstream, product) {
   const prefix = new URL(upstream.base).pathname.replace(/\/$/, "");
   const negotiations = [], reads = [], stops = [], failures = [], mediaRequests = [], originalResponses = new Map();
+  const chain = [], referenced = new Map();
+  const recordChain = (entry) => {
+    assert.ok(chain.length < 512, "bounded product chain observations"); chain.push(entry);
+  };
   const controllers = new Set(), pending = new Set(), sockets = new Set();
   const server = createServer((incoming, outgoing) => {
     const work = (async () => {
@@ -402,6 +407,14 @@ async function recorder(upstream, product) {
             path_and_query_sha256: sha256(url.pathname + url.search),
             route: routeEvidence(url.href, { item: original.item, source: original.source, sid }, upstream) });
         }
+        const query = new Map([...url.searchParams].map(([key, value]) => [key.toLowerCase(), value]));
+        const sid = query.get("playsessionid"), negotiated = originalResponses.get(sid);
+        const inherited = referenced.get(sha256(url.href));
+        const expected = inherited?.expected ?? (negotiated ? { sid, source: negotiated.source, device: negotiated.device } : undefined);
+        const isMedia = incoming.method === "GET" && (mediaMaster || Boolean(inherited));
+        const chainRequest = isMedia ? { boundary: "outbound_request", parent_url_sha256: inherited?.parent ?? null,
+          ...chainEvidence(url.href, upstream.base, expected), requested_at_ms: Date.now(), status: null } : null;
+        if (chainRequest) recordChain(chainRequest);
         const stopping = (incoming.method === "POST" && path === "/Sessions/Playing/Stopped") ||
           (incoming.method === "DELETE" && path === "/Videos/ActiveEncodings");
         const body = bytes.length && (negotiation || stopping) ? JSON.parse(bytes) : {};
@@ -415,6 +428,7 @@ async function recorder(upstream, product) {
         const response = await fetch(url, { method: incoming.method, headers, body: bytes.length ? bytes : undefined,
           redirect: "manual", signal: control.signal });
         if (event) event.status = response.status;
+        if (chainRequest) chainRequest.status = response.status;
         assert.ok(response.status < 300 || response.status >= 400, "owned product redirect is not followed");
         const forwarded = Object.fromEntries(response.headers);
         for (const key of ["transfer-encoding", "connection", "content-encoding"]) delete forwarded[key];
@@ -425,7 +439,7 @@ async function recorder(upstream, product) {
           if (negotiation) {
             const sources = value?.MediaSources;
             if (value?.PlaySessionId) originalResponses.set(value.PlaySessionId, {
-              item: path.split("/")[2], source: body.MediaSourceId, info: structuredClone(value),
+              item: path.split("/")[2], source: body.MediaSourceId, device: deviceId, info: structuredClone(value),
             });
             event.response = { error_code: value?.ErrorCode ?? null, sid_present: Boolean(value?.PlaySessionId),
               sid_hash: sidHash(value?.PlaySessionId), source_count: Array.isArray(sources) ? sources.length : null,
@@ -442,6 +456,19 @@ async function recorder(upstream, product) {
             sources: (value?.MediaSources ?? []).slice(0, 4).map((source) => ({ source_hash: sidHash(source.Id),
               default_audio_index: source.DefaultAudioStreamIndex ?? null, streams: (source.MediaStreams ?? []).slice(0, 64).map(streamFields) })) });
           delete forwarded["content-length"];
+          outgoing.writeHead(response.status, forwarded).end(data);
+        } else if (isMedia && /\.m3u8$/i.test(url.pathname)) {
+          const data = await limitedBody(response, 256 * 1024);
+          const parent = sha256(url.href);
+          if (response.ok) for (const reference of manifestReferences(data.toString("utf8"))) {
+            const evidence = chainEvidence(reference, url.href, expected);
+            recordChain({ boundary: "returned_reference", parent_url_sha256: parent, ...evidence });
+            if (evidence.valid_url) {
+              assert.ok(referenced.size < 256 || referenced.has(evidence.url_sha256), "bounded referenced product URLs");
+              referenced.set(evidence.url_sha256, { expected, parent });
+            }
+          }
+          // Preserve the upstream bytes, including every child URI and query.
           outgoing.writeHead(response.status, forwarded).end(data);
         } else {
           outgoing.writeHead(response.status, forwarded);
@@ -474,7 +501,7 @@ async function recorder(upstream, product) {
   await new Promise((done, reject) => server.once("error", reject).listen(0, "127.0.0.1", done));
   const port = server.address().port;
   const origin = `http://127.0.0.1:${port}`;
-  product.recorder = { negotiations, metadata_reads: reads, stops, media_requests: mediaRequests, failures, port };
+  product.recorder = { negotiations, metadata_reads: reads, stops, media_requests: mediaRequests, media_chain: chain, failures, port };
   return { negotiations, reads, stops, mediaRequests,
     originalResponse(sid) { return originalResponses.get(sid)?.info; },
     async source(client, upstreamClient) {
