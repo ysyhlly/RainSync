@@ -52,6 +52,20 @@ passed separately. The task-health checkpoint `3b93c66` also passed its own
 [complete CI](https://github.com/ysyhlly/RainSync/actions/runs/36893338856). See [NAS evidence](NAS_RANGE_SEMANTICS.md)
 and [validation limits](VALIDATION.md). Initial usable data is not a complete presented-frame guarantee.
 
+## Latest Emby compatibility decision
+
+Published `e27051d` retains a failing exact-48 kHz Emby product result: all three
+cases deliver finite 44.1 kHz audio, despite unchanged 48000 requests at the
+master and variant boundaries. Owned encoder logs explicitly select
+`-ar:a:0 44100`; source/track/SID/device and cleanup checks pass. Jellyfin passes
+three cases. See [exact evidence and the approved contract](UPSTREAM_PROFILE_ENVELOPE.md#exact-request-chain-and-encoder-evidence-2026-10-02).
+
+The user-approved next scope is a versioned Emby-only discrete 44.1/48 kHz contract,
+with browser checks for both rates and rejection of other/unknown source rates.
+Existing codec/channel guards and Jellyfin's 48 kHz contract remain. The local implementation passed 116 actual Server/PostgreSQL scenarios and 664
+frontend tests; expanded pinned-product output validation remains pending CI; no generic ceiling semantics or whole-title
+compatibility is established. Full CI is tracked independently.
+
 ## Selected upstream capability slice
 
 The selected smaller Jellyfin/Emby implementation now provides an opt-in,

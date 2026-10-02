@@ -11,6 +11,29 @@ use std::collections::{BTreeMap, HashSet};
 
 pub const PROFILE_ID: &str = "avc_sdr_720p_v1";
 pub const PROFILE_VERSION: u8 = 1;
+pub const EMBY_PROFILE_ID: &str = "emby_avc_sdr_720p_rates_v2";
+pub const EMBY_PROFILE_VERSION: u8 = 2;
+pub const EMBY_AUDIO_RATES: [u32; 2] = [44_100, 48_000];
+pub fn profile_identity(kind: &str) -> (u8, &'static str) {
+    if kind == "emby" {
+        (EMBY_PROFILE_VERSION, EMBY_PROFILE_ID)
+    } else {
+        (PROFILE_VERSION, PROFILE_ID)
+    }
+}
+pub fn validate_profile_metadata(kind: &str, metadata: &UpstreamProfileMetadata) -> Result<()> {
+    validate_metadata_proof(metadata)?;
+    ensure!(matches!(kind, "emby" | "jellyfin"), "invalid_upstream_kind");
+    ensure!(
+        kind != "emby"
+            || metadata
+                .audio
+                .as_ref()
+                .is_none_or(|audio| EMBY_AUDIO_RATES.contains(&audio.sample_rate)),
+        "upstream_profile_audio_rate_unsupported"
+    );
+    Ok(())
+}
 const MAX_STREAMS: usize = 64;
 const MAX_RUNTIME_TICKS: u64 = 7 * 24 * 60 * 60 * 10_000_000;
 
@@ -88,6 +111,10 @@ pub struct UpstreamProfileRouteProvenance {
     pub frame_rate_field: String,
     pub provider_audio_sample_rate: Option<u32>,
     pub server_requested_audio_sample_rate: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_audio_sample_rates: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_audio_sample_rate: Option<u32>,
 }
 
 pub struct UpstreamProfileRoute {
@@ -98,10 +125,10 @@ pub struct UpstreamProfileRoute {
     pub provenance: UpstreamProfileRouteProvenance,
 }
 
-pub fn evidence(metadata: &UpstreamProfileMetadata) -> UpstreamProfileEvidence {
+pub fn evidence(kind: &str, metadata: &UpstreamProfileMetadata) -> UpstreamProfileEvidence {
     UpstreamProfileEvidence {
-        profile_id: PROFILE_ID.into(),
-        profile_version: PROFILE_VERSION,
+        profile_id: profile_identity(kind).1.into(),
+        profile_version: profile_identity(kind).0,
         video_codec: "h264".into(),
         video_profile: "main".into(),
         video_range: "SDR".into(),
@@ -130,7 +157,9 @@ pub async fn metadata(
     let headers = upstream_headers(kind, config, device_id)
         .map_err(|_| anyhow::anyhow!("upstream_metadata_identity_invalid"))?;
     let value = upstream_common::item_metadata(config, item, &headers).await?;
-    normalize_metadata(&value, item, audio_index)
+    let metadata = normalize_metadata(&value, item, audio_index)?;
+    validate_profile_metadata(kind, &metadata)?;
+    Ok(metadata)
 }
 
 fn text(value: &Value, key: &str, required: bool) -> Result<Option<String>> {
@@ -355,7 +384,7 @@ pub(super) fn request(
     metadata: &UpstreamProfileMetadata,
 ) -> Result<Value> {
     ensure!(matches!(kind, "jellyfin" | "emby"), "invalid_upstream_kind");
-    validate_metadata_proof(metadata)?;
+    validate_profile_metadata(kind, metadata)?;
     ensure!(
         options.hls && options.force_transcode,
         "upstream_profile_explicit_transcode_required"
@@ -594,7 +623,7 @@ pub fn validate_route(
     info: &Value,
 ) -> Result<UpstreamProfileRoute> {
     ensure!(matches!(kind, "jellyfin" | "emby"), "invalid_upstream_kind");
-    validate_metadata_proof(metadata)?;
+    validate_profile_metadata(kind, metadata)?;
     ensure!(
         info.get("ErrorCode").is_none_or(Value::is_null),
         "upstream_profile_route_unavailable"
@@ -792,8 +821,19 @@ pub fn validate_route(
         if kind == "emby" && !query.contains_key("audiosamplerate") {
             server_requested_audio_sample_rate = Some(48_000);
         } else {
-            query_exact(&query, "audiosamplerate", "48000")?;
-            provider_audio_sample_rate = Some(48_000);
+            let rate = query
+                .get("audiosamplerate")
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|rate| {
+                    if kind == "emby" {
+                        EMBY_AUDIO_RATES.contains(rate)
+                    } else {
+                        *rate == 48_000
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("upstream_profile_route_mismatch"))?;
+            query_exact(&query, "audiosamplerate", &rate.to_string())?;
+            provider_audio_sample_rate = Some(rate);
         }
         let channels = if query.contains_key("transcodingmaxaudiochannels") {
             "transcodingmaxaudiochannels"
@@ -839,13 +879,20 @@ pub fn validate_route(
         url,
         media_source_id: metadata.media_source_id.clone(),
         audio_index,
-        evidence: evidence(metadata),
+        evidence: evidence(kind, metadata),
         provenance: UpstreamProfileRouteProvenance {
-            schema_version: 1,
+            schema_version: if kind == "emby" { 2 } else { 1 },
             semantics: "requested_configuration_not_measured_output".into(),
             frame_rate_field: frame_rate_field.into(),
             provider_audio_sample_rate,
             server_requested_audio_sample_rate,
+            allowed_audio_sample_rates: (kind == "emby" && metadata.audio.is_some())
+                .then(|| EMBY_AUDIO_RATES.to_vec()),
+            source_audio_sample_rate: if kind == "emby" {
+                metadata.audio.as_ref().map(|audio| audio.sample_rate)
+            } else {
+                None
+            },
         },
     })
 }
@@ -879,7 +926,12 @@ pub fn complete_route(
     // Final length/count bounds still apply after owned identity/completion.
     let final_query = route_query(&route.url)?;
     if metadata.audio.is_some() {
-        query_exact(&final_query, "audiosamplerate", "48000")?;
+        let rate = route
+            .provenance
+            .provider_audio_sample_rate
+            .or(route.provenance.server_requested_audio_sample_rate)
+            .ok_or_else(|| anyhow::anyhow!("upstream_profile_route_mismatch"))?;
+        query_exact(&final_query, "audiosamplerate", &rate.to_string())?;
     }
     Ok(route)
 }
@@ -1102,7 +1154,7 @@ mod tests {
             ..options()
         };
         assert!(request("emby", &config(), &changed, &proof()).is_err());
-        let bounds = evidence(&proof());
+        let bounds = evidence("jellyfin", &proof());
         assert_eq!(bounds.max_width, 1280);
         assert_eq!(bounds.max_video_bit_rate, 4_000_000);
         assert_eq!(bounds.audio.unwrap().requested_sample_rate, 48_000);
@@ -1136,14 +1188,14 @@ mod tests {
             let route = validate_route(kind, &config(), &proof(), &good).unwrap();
             assert_eq!(route.audio_index, Some(1));
             assert_eq!(route.media_source_id, "source");
-            assert_eq!(route.evidence.profile_id, PROFILE_ID);
+            assert_eq!(route.evidence.profile_id, profile_identity(kind).1);
             for (before, after) in [
                 ("MaxWidth=1280", "MaxWidth=1920"),
                 ("MaxHeight=720", "MaxHeight=1080"),
                 ("MaxFramerate=30", "MaxFramerate=60"),
                 ("VideoBitrate=4000000", "VideoBitrate=5000000"),
                 ("AudioBitrate=128000", "AudioBitrate=256000"),
-                ("AudioSampleRate=48000", "AudioSampleRate=44100"),
+                ("AudioSampleRate=48000", "AudioSampleRate=32000"),
                 ("AudioStreamIndex=1", "AudioStreamIndex=2"),
                 ("allowVideoStreamCopy=false", "allowVideoStreamCopy=true"),
                 ("allowAudioStreamCopy=false", "allowAudioStreamCopy=true"),
@@ -1395,7 +1447,7 @@ mod tests {
         let good = emby_missing_rate();
         let path = good["MediaSources"][0]["TranscodingUrl"].as_str().unwrap();
         for route in [
-            format!("{path}&AudioSampleRate=44100"),
+            format!("{path}&AudioSampleRate=32000"),
             format!("{path}&AudioSampleRate=48000&AUDIOSAMPLERATE=48000"),
             format!("{path}&aac-audiosamplerate=48000"),
             format!("{path}&MaxFramerate=30"),
@@ -1524,6 +1576,46 @@ mod tests {
                 assert!(!request.contains("api_key=secret") && !request.contains("PlaybackInfo"));
                 assert!(request.contains("DeviceId=\"rainsync-profile-preflight\""));
             }
+        }
+    }
+    #[test]
+    fn emby_discrete_rates_preserve_codec_channel_guards_and_source_provenance() {
+        for rate in EMBY_AUDIO_RATES {
+            let mut metadata = proof();
+            metadata.audio.as_mut().unwrap().sample_rate = rate;
+            for codec in ["aac", "ac3"] {
+                metadata.audio.as_mut().unwrap().codec = codec.into();
+                metadata.audio.as_mut().unwrap().channels = 2;
+                assert!(validate_profile_metadata("emby", &metadata).is_ok());
+                let mut info = reply("emby");
+                info["MediaSources"][0]["TranscodingUrl"] = json!(
+                    info["MediaSources"][0]["TranscodingUrl"]
+                        .as_str()
+                        .unwrap()
+                        .replace("AudioSampleRate=48000", &format!("AudioSampleRate={rate}"))
+                );
+                let route = validate_route("emby", &config(), &metadata, &info).unwrap();
+                assert_eq!(
+                    route.provenance.allowed_audio_sample_rates,
+                    Some(EMBY_AUDIO_RATES.to_vec())
+                );
+                assert_eq!(route.provenance.source_audio_sample_rate, Some(rate));
+                assert_eq!(route.provenance.provider_audio_sample_rate, Some(rate));
+                assert_eq!(route.evidence.profile_version, 2);
+                let completed =
+                    complete_route("emby", &config(), &metadata, &info, "owned-device").unwrap();
+                assert_eq!(completed.provenance.provider_audio_sample_rate, Some(rate));
+                assert_eq!(
+                    completed.provenance.server_requested_audio_sample_rate,
+                    None
+                );
+            }
+        }
+        for rate in [0, 32_000, 96_000] {
+            let mut metadata = proof();
+            metadata.audio.as_mut().unwrap().sample_rate = rate;
+            assert!(validate_profile_metadata("emby", &metadata).is_err());
+            assert!(validate_route("emby", &config(), &metadata, &reply("emby")).is_err());
         }
     }
 }

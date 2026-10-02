@@ -25,6 +25,7 @@ import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
 import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
 import { delay } from "./fixtures/server.mjs";
 import { isolatedUpstreamReal } from "./fixtures/upstream-real.mjs";
+import { assertAudioRateContract, assertObservedAudioRate, positiveRateReports, profileVersion } from "./fixtures/upstream-profile-rate-contract.mjs";
 import { sameProfileItemMasterPath, profileSubtitleSelectionSupported } from "./fixtures/upstream-profile-route-contract.mjs";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -60,6 +61,7 @@ for (const name of ["rainsync-server", "rainsync-media-worker", "rainsync-nas-ag
     resolve(target, name + (process.platform === "win32" ? ".exe" : "")), "frozen binary location");
 const coordinator = await Promise.all([
   "tests/upstream-profile-products.mjs", "tests/fixtures/upstream-real.mjs",
+  "tests/fixtures/upstream-profile-rate-contract.mjs",
   "tests/fixtures/upstream-storage.mjs",
   "tests/fixtures/upstream-profile-route-contract.mjs", "tests/fixtures/upstream-profile-chain.mjs",
   "tests/fixtures/upstream-encoder-evidence.mjs",
@@ -99,6 +101,12 @@ const pinned = {
 const expectedVideo = { codec: "h264", profile: "main", max_level: "3.1", max_width: 1280,
   max_height: 720, max_framerate: 30, max_bitrate: 4000000, requested_bit_depth: 8, requested_range: "SDR" };
 const expectedAudio = { codec: "aac", max_channels: 2, requested_sample_rate: 48000, max_bitrate: 128000 };
+const productCases = [{ name: "h264-default-zero", title: "rainsync-h264", position_ms: 0, track: 0, audio_hz: 440, source_rate: 44100, source_codec: "aac", source_channels: 1 },
+        { name: "hevc-default-seek", title: "rainsync-hevc", position_ms: 10000, track: 0, audio_hz: 440, source_rate: 44100, source_codec: "aac", source_channels: 1 },
+        { name: "hevc-alternate-seek", title: "rainsync-hevc", position_ms: 27000, track: 1, audio_hz: 880, source_rate: 44100, source_codec: "aac", source_channels: 1 },
+        { name: "h264-48k-stereo-aac-zero", title: "rainsync-h264-48k-stereo-aac", position_ms: 0, track: 0, audio_hz: 440, source_rate: 48000, source_codec: "aac", source_channels: 2 },
+        { name: "h264-44k-stereo-ac3-seek", title: "rainsync-h264-44k-stereo-ac3", position_ms: 10000, track: 0, audio_hz: 440, source_rate: 44100, source_codec: "ac3", source_channels: 2 },
+        { name: "h264-48k-stereo-ac3-seek", title: "rainsync-h264-48k-stereo-ac3", position_ms: 27000, track: 0, audio_hz: 440, source_rate: 48000, source_codec: "ac3", source_channels: 2 }];
 const runId = randomUUID();
 const root = resolve(artifactRoot, "upstream-profile-products", runId);
 // Fixtures containing credentials are separate from the uploadable evidence.
@@ -126,6 +134,7 @@ const report = {
   interpretation: {
     bitrate: "Recipe/request bounds verified. Finite-window rate may be recorded as an observation; instantaneous packet rate is not guaranteed by requested bitrate bounds.",
     aac: "AAC family is requested. Observed AAC profile is recorded; the advisory AAC-LC MSE sample is not an enforced AAC profile.",
+    audio_rate: "Jellyfin v1 output must equal 48000. Emby v2 output must be a member of the exact discrete set [44100,48000]; requested 48000 and original route/encoder evidence remain independently recorded. No lower-rate ceiling or prior-failure rewrite.",
   },
   backend_binding: { sha256: sha256(bindingBytes), source_digest: binding.source_digest,
     binaries: binding.binaries.map(({ name, path, sha256 }) => ({ name, path, sha256 })) },
@@ -356,6 +365,8 @@ function routeChecks(route, kind, audioIndex, originalResponse = false) {
   if (kind === "emby" && originalResponse && fields.audiosamplerate == null)
     checks.push({ field: "audiosamplerate", observed: null,
       expected: "absent in provider response; requires separately proven same-SID server request", passed: true });
+  else if (kind === "emby") checks.push({ field: "audiosamplerate", observed: fields.audiosamplerate ?? null,
+    expected: "exactly 44100 or 48000", passed: ["44100", "48000"].includes(one("audiosamplerate")) });
   else exact("audiosamplerate", "48000");
   max(fields.transcodingmaxaudiochannels ? "transcodingmaxaudiochannels" : "maxaudiochannels", 2);
   for (const key of ["audiochannels", "aac-audiochannels", "maxaudiochannels", "transcodingmaxaudiochannels"])
@@ -721,7 +732,10 @@ async function decode(upstream, input, row, directory) {
   assert.equal(audio.codec_name, expectedAudio.codec, "observed AAC family");
   assert.ok(Number.isInteger(audio.channels) && audio.channels > 0 && audio.channels <= expectedAudio.max_channels,
     "observed audio channel bound");
-  assert.equal(Number(audio.sample_rate), expectedAudio.requested_sample_rate, "observed audio sample rate");
+  row.observed.audio_rate_contract = { profile_version: profileVersion(upstream.kind),
+    allowed_sample_rates: upstream.kind === "emby" ? [44100, 48000] : [48000],
+    requested_sample_rate: expectedAudio.requested_sample_rate, measured_sample_rate: Number(audio.sample_rate) };
+  assertObservedAudioRate(upstream.kind, Number(audio.sample_rate));
   // Same loss-tolerant frame-clock and zero-crossing algorithms as the existing
   // real-product contract suite, applied to actual Worker bytes for this grant.
   const frame = await tool(ffmpeg, ["-v", "error", "-nostdin", "-threads", "1", ...probeOptions,
@@ -751,8 +765,8 @@ async function decode(upstream, input, row, directory) {
     "actual decoded audio matches the exact selected source track");
 }
 
-function assertEnvelope(profile) {
-  assert.ok(profile); assert.equal(profile.profile_version, 1); assert.equal(profile.profile_id, "avc_sdr_720p_v1");
+function assertEnvelope(profile, kind, sourceRate) {
+  assert.ok(profile); assertAudioRateContract(profile, kind, sourceRate);
   assert.equal(profile.configuration_semantics, "upstream_transcode_profile_envelope");
   assert.equal(profile.transport, "hls"); assert.equal(profile.container, "ts");
   assert.deepEqual(profile.requested_video, expectedVideo); assert.deepEqual(profile.requested_audio, expectedAudio);
@@ -765,11 +779,15 @@ async function runProduct(upstream, product, directory) {
   assert.equal(upstream.metadata.actual_version, pinned[upstream.kind].version);
   product.image = upstream.metadata.image; product.image_id = upstream.metadata.image_id;
   product.version = upstream.metadata.actual_version; product.toolchain = upstream.metadata.ffmpeg;
-  product.samples = upstream.metadata.samples.map(({ sha256, codec, audio_streams, duration_seconds, frame_rate, audio_sample_rate }) =>
-    ({ sha256, codec, audio_streams, duration_seconds, frame_rate, audio_sample_rate }));
+  product.samples = upstream.metadata.samples.map(({ title, sha256, codec, audio_streams, audio_codec, audio_channels, duration_seconds, frame_rate, audio_sample_rate }) =>
+    ({ title, sha256, codec, audio_streams, audio_codec, audio_channels, duration_seconds, frame_rate, audio_sample_rate }));
   product.sample_settings = upstream.metadata.sample_settings;
-  assert.ok(product.samples.every((sample) => sample.frame_rate === 60 && sample.audio_sample_rate === 44100),
-    "both codecs and every selected audio track stress the requested 30fps/48k conversion");
+  assert.equal(product.samples.length, 5);
+  assert.ok(product.samples.every((sample) => sample.frame_rate === 60 && [44100, 48000].includes(sample.audio_sample_rate)),
+    "both known source rates retain stressed 60fps video");
+  assert.deepEqual([...new Set(product.samples.map((sample) => sample.audio_sample_rate))].sort(), [44100, 48000]);
+  assert.ok(product.samples.some((sample) => sample.audio_codec === "ac3" && sample.audio_channels === 2),
+    "stereo and non-AAC source coverage is real generated media, not metadata rewrites");
   for (const entry of [...upstream.metadata.ffmpeg, ...upstream.metadata.samples])
     assert.equal(await digest(entry.path), entry.sha256, "recorded tool/sample hash before product checks");
   const proxy = await recorder(upstream, product);
@@ -810,11 +828,9 @@ async function runProduct(upstream, product, directory) {
         sid_hash: sidHash(value.play_session_id), source_hash: sidHash(value.media_source_id), device_hash: sidHash(value.device_id),
         stop_confirmed: value.stop_confirmed, encoding_stop_confirmed: value.encoding_stop_confirmed,
         io_uncertain: value.io_uncertain, close_reason: value.close_reason, last_error: value.last_error, closed_at: value.closed_at };
-      const cases = [{ name: "h264-default-zero", title: "rainsync-h264", position_ms: 0, track: 0, audio_hz: 440 },
-        { name: "hevc-default-seek", title: "rainsync-hevc", position_ms: 10000, track: 0, audio_hz: 440 },
-        { name: "hevc-alternate-seek", title: "rainsync-hevc", position_ms: 27000, track: 1, audio_hz: 880 }];
+
       try {
-        for (const input of cases) {
+        for (const input of productCases) {
           const row = { ...input, result: "running", started_at: new Date().toISOString(), browser_estimate_controlled: true };
           product.cases.push(row); await save();
           const caseDirectory = resolve(directory, row.name); await mkdir(caseDirectory, { recursive: true });
@@ -832,7 +848,9 @@ async function runProduct(upstream, product, directory) {
             assert.ok(audio && Number.isInteger(audio.Index));
             row.selection = { item_hash: sidHash(item.Id), source_hash: sidHash(observedSource.Id), audio_index: audio.Index,
               source_video: streamFields(observedSource.MediaStreams.find((stream) => stream.Type === "Video")), source_audio: streamFields(audio) };
-            assert.equal(row.selection.source_audio.SampleRate, 44100, "actual product metadata observes stressed source audio");
+            assert.equal(row.selection.source_audio.SampleRate, input.source_rate, "actual product metadata observes the exact generated source rate");
+            assert.equal(row.selection.source_audio.Codec, input.source_codec);
+            assert.equal(row.selection.source_audio.Channels, input.source_channels);
             assert.equal(row.selection.source_video.AverageFrameRate ?? row.selection.source_video.RealFrameRate, 60,
               "actual product metadata observes stressed source video");
             const media = f.sql(`SELECT id FROM media_items WHERE source_id=${quote(source.id)} AND title=${quote(input.title)}`);
@@ -840,7 +858,7 @@ async function runProduct(upstream, product, directory) {
             const beforePosts = proxy.negotiations.length, beforeReads = proxy.reads.length;
             const beforeSids = Number(f.sql("SELECT count(*) FROM upstream_reservations WHERE play_session_id IS NOT NULL"));
             const preflightResponse = await admin.raw("/upstream-profile-candidates", { method: "POST", body: {
-              profile_version: 1, room_id: room.id, media_generation: controller.state.media_generation,
+              profile_version: 2, room_id: room.id, media_generation: controller.state.media_generation,
               position_ms: input.position_ms, audio_index: audio.Index } });
             const candidates = JSON.parse((await limitedBody(preflightResponse, 1024 * 1024)).toString("utf8"));
             if (candidates.binding) secrets.add(candidates.binding);
@@ -852,14 +870,18 @@ async function runProduct(upstream, product, directory) {
             assert.equal(row.preflight.allocated_sids, 0, "metadata-only discovery allocates no ledger SID");
             assert.equal(preflightResponse.status, 200, "actual RainSync preflight succeeds");
             assert.equal(row.preflight.metadata_gets, 1, "one actual bounded metadata GET");
-            assert.ok(candidates.binding); assertEnvelope(candidates.profile);
+            assert.ok(candidates.binding);
+            assert.equal(candidates.profile_version, profileVersion(upstream.kind));
+            assertEnvelope(candidates.profile, upstream.kind, input.source_rate);
+            row.browser_audio_rate_reports = positiveRateReports(candidates.profile).audio_rate_reports ?? null;
             const beforePrepare = proxy.negotiations.length;
             const response = await admin.raw("/playback-sessions/upstream-profile", { method: "POST", body: {
               room_id: room.id, media_generation: controller.state.media_generation, viewer_id: randomUUID(), plan_generation: 1,
               idempotency_key: key, mode: "transcode", position_ms: input.position_ms, audio_index: audio.Index,
               capabilities: { progressive_h264_aac: false, native_hls: false, mse_h264_aac: true },
-              upstream_profile_report: { profile_version: 1, binding: candidates.binding, profile_id: candidates.profile.profile_id,
-                mse_supported: true, mse_decoding: { supported: true, smooth: false, power_efficient: false } } } });
+              upstream_profile_report: { profile_version: candidates.profile_version, binding: candidates.binding, profile_id: candidates.profile.profile_id,
+                mse_supported: true, mse_decoding: { supported: true, smooth: false, power_efficient: false },
+                ...positiveRateReports(candidates.profile) } } });
             const value = JSON.parse((await limitedBody(response, 1024 * 1024)).toString("utf8"));
             // Own the plan immediately, before any route/marker/output assertion.
             if (value.session_id) plan = value;
@@ -881,7 +903,7 @@ async function runProduct(upstream, product, directory) {
             assert.equal(row.negotiations[0].request.AudioStreamIndex, audio.Index, "requested exact selected audio");
             assertChecks(row.negotiations[0].request_constraint_checks, "actual PlaybackInfo recipe");
             assert.equal(response.status, 200, "product profile constraints must propagate or use the narrowly recorded same-SID completion");
-            assert.equal(plan.delivery_mode, "transcode"); assert.equal(plan.transport, "hls"); assertEnvelope(plan.upstream_profile);
+            assert.equal(plan.delivery_mode, "transcode"); assert.equal(plan.transport, "hls"); assertEnvelope(plan.upstream_profile, upstream.kind, input.source_rate);
             assert.deepEqual(plan.upstream_profile, candidates.profile, "published requested recipe marker is unchanged");
             assert.equal(plan.selected_audio_track, audio.Index, "RainSync selected exact audio track");
             const reservation = ledger(key);
@@ -914,10 +936,11 @@ async function runProduct(upstream, product, directory) {
             if (!query.has("deviceid")) final.search += "&DeviceId=" + encodeURIComponent(reservation.device_id);
             if (completed) final.search += "&AudioSampleRate=48000";
             assert.equal(resource.url, final.href, "completed URL adds only owned missing device identity and missing AudioSampleRate");
-            const expectedProvenance = { schema_version: 1, semantics: "requested_configuration_not_measured_output",
+            const expectedProvenance = { schema_version: upstream.kind === "emby" ? 2 : 1, semantics: "requested_configuration_not_measured_output",
               frame_rate_field: query.has("h264-maxframerate") ? "h264-maxframerate" : "maxframerate",
-              provider_audio_sample_rate: query.has("audiosamplerate") ? 48000 : null,
-              server_requested_audio_sample_rate: completed ? 48000 : null };
+              provider_audio_sample_rate: query.has("audiosamplerate") ? Number(query.get("audiosamplerate")) : null,
+              server_requested_audio_sample_rate: completed ? 48000 : null,
+              ...(upstream.kind === "emby" ? { allowed_audio_sample_rates: [44100, 48000], source_audio_sample_rate: input.source_rate } : {}) };
             assert.deepEqual(resource.upstream_profile_route_provenance, expectedProvenance);
             assert.equal(plan.decision_reason === "emby_server_requested_audio_sample_rate_48000", completed);
             if (upstream.kind === "emby") {
@@ -1090,8 +1113,8 @@ try {
     try {
       await verifyBinding();
       await isolatedUpstreamReal(kind, (upstream) => runProduct(upstream, product, directory),
-        { durationSeconds: 60, profileConstraintStress: true, artifactRoot: resolve(ownedRoot, kind, "upstream"), ffmpegBin: process.env.RAINSYNC_FFMPEG_BIN });
-      product.result = product.cases.every((row) => row.result === "passed" && row.cleanup_verified) && product.cases.length === 3
+        { durationSeconds: 60, profileConstraintStress: true, profileAudioRateMatrix: true, artifactRoot: resolve(ownedRoot, kind, "upstream"), ffmpegBin: process.env.RAINSYNC_FFMPEG_BIN });
+      product.result = product.cases.every((row) => row.result === "passed" && row.cleanup_verified) && product.cases.length === productCases.length
         ? "passed" : "failed";
     } catch (error) {
       product.result = "failed"; product.error = redact(error.message);

@@ -902,7 +902,7 @@ async fn prepare_playback(
         http_file_fallback_version: None,
         upstream_profile: upstream_profile
             .as_ref()
-            .map(|selection| upstream_profiles::envelope(&selection.metadata))
+            .map(|selection| upstream_profiles::envelope(&kind, &selection.metadata))
             .transpose()?,
         session_id: id,
         media_id: media,

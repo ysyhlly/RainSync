@@ -6,6 +6,7 @@ import { RequestFailure } from "../apps/web/src/errors";
 import {
   detectUpstreamProfileReport,
   isUpstreamProfileEnvelope,
+  matchesUpstreamProfilePlan,
 } from "../packages/player-core";
 
 const hls = vi.hoisted(() => ({
@@ -104,6 +105,30 @@ const candidateSet = () => ({
   binding: "original-profile-binding",
   profile: profile(),
   decision_reason: "observed_metadata_and_requested_upstream_profile_envelope",
+});
+function embyProfile(audio = true, sourceRate = 44100): any {
+  return {
+    ...profile(audio),
+    profile_version: 2,
+    profile_id: "emby_avc_sdr_720p_rates_v2",
+    ...(audio
+      ? {
+          audio_rate_contract: {
+            allowed_sample_rates: [44100, 48000],
+            source_sample_rate: sourceRate,
+            mse_samples: [44100, 48000].map((samplerate) => ({
+              ...profile().mse_sample.audio,
+              samplerate,
+            })),
+          },
+        }
+      : {}),
+  };
+}
+const embyCandidates = (audio = true, sourceRate = 44100): any => ({
+  ...candidateSet(),
+  profile_version: 2,
+  profile: embyProfile(audio, sourceRate),
 });
 const legacy = () => ({
   schema_version: 1,
@@ -293,7 +318,7 @@ it("probes the exact factory advisory sample only through MSE, including known n
   try {
     await s.runtime.loadMedia();
     expect(s.preflights()[0][2]).toEqual({
-      profile_version: 1,
+      profile_version: 2,
       room_id: "room",
       media_generation: 1,
       audio_index: null,
@@ -1032,6 +1057,704 @@ it("cleans the legacy intent before a fresh user intent can opt into available A
     expect(s.prepares()).toHaveLength(1);
     expect(s.prepares()[0][2].idempotency_key).not.toBe(previousKey);
     expect(s.runtime.sessionId.value).toBe("session-2");
+  } finally {
+    s.cleanup();
+  }
+});
+
+for (const sourceRate of [44100, 48000]) {
+  it(`requires both full AV rate estimates for an Emby ${sourceRate} Hz source`, async () => {
+    const s = setup({ profileCandidates: embyCandidates(true, sourceRate) });
+    try {
+      await s.runtime.loadMedia();
+      expect(s.preflights()[0][2].profile_version).toBe(2);
+      expect(s.decodingInfo).toHaveBeenCalledTimes(2);
+      for (const [index, samplerate] of [44100, 48000].entries()) {
+        expect(s.decodingInfo.mock.calls[index][0]).toEqual({
+          type: "media-source",
+          video: {
+            contentType: 'video/mp4; codecs="avc1.4d001f"',
+            width: 1280,
+            height: 720,
+            bitrate: 4_000_000,
+            framerate: 30,
+          },
+          audio: {
+            contentType: 'audio/mp4; codecs="mp4a.40.2"',
+            channels: "2",
+            bitrate: 128000,
+            samplerate,
+          },
+        });
+      }
+      const decoding = {
+        supported: true,
+        smooth: false,
+        power_efficient: false,
+      };
+      expect(s.prepares()[0][2].upstream_profile_report).toEqual({
+        profile_version: 2,
+        binding: "original-profile-binding",
+        profile_id: "emby_avc_sdr_720p_rates_v2",
+        mse_supported: true,
+        mse_decoding: decoding,
+        audio_rate_reports: [44100, 48000].map((sample_rate) => ({
+          sample_rate,
+          mse_supported: true,
+          mse_decoding: decoding,
+        })),
+      });
+      expect(s.ordinary()).toHaveLength(0);
+      expect(hls.loaded).toHaveBeenCalledWith("/authorized");
+      expect(s.runtime.playbackSummary.value?.reason).toContain(
+        "AAC（44.1或48 kHz）",
+      );
+      expect(s.runtime.playbackSummary.value?.reason).toContain("估计");
+    } finally {
+      s.cleanup();
+    }
+  });
+}
+
+it("probes silent v2 as video-only and requires an explicit empty rate report", async () => {
+  const candidates = embyCandidates(false);
+  const decodingInfo = vi.fn().mockResolvedValue(positive);
+  const report = await detectUpstreamProfileReport(
+    candidates,
+    { isTypeSupported: () => true },
+    { decodingInfo },
+  );
+  expect(isUpstreamProfileEnvelope(candidates.profile)).toBe(true);
+  expect(decodingInfo).toHaveBeenCalledTimes(1);
+  expect(decodingInfo.mock.calls[0][0].audio).toBeUndefined();
+  expect(report?.audio_rate_reports).toEqual([]);
+  expect(
+    matchesUpstreamProfilePlan(report, candidates.profile, "transcode", "hls"),
+  ).toBe(true);
+  expect(
+    matchesUpstreamProfilePlan(
+      { ...report, audio_rate_reports: undefined } as any,
+      candidates.profile,
+      "transcode",
+      "hls",
+    ),
+  ).toBe(false);
+  expect(
+    summarizePlaybackPlan({
+      delivery_mode: "transcode",
+      upstream_profile: candidates.profile,
+    })?.reason,
+  ).not.toMatch(/AAC|kHz/);
+});
+
+const malformedEmbyProfiles: [string, (profile: any) => void][] = [
+  [
+    "v1 discriminator",
+    (p) => {
+      p.profile_version = 1;
+    },
+  ],
+  [
+    "v1 identifier",
+    (p) => {
+      p.profile_id = "avc_sdr_720p_v1";
+    },
+  ],
+  [
+    "unknown version",
+    (p) => {
+      p.profile_version = 3;
+    },
+  ],
+  [
+    "unknown identifier",
+    (p) => {
+      p.profile_id += "_unknown";
+    },
+  ],
+  [
+    "missing contract",
+    (p) => {
+      delete p.audio_rate_contract;
+    },
+  ],
+  [
+    "null contract",
+    (p) => {
+      p.audio_rate_contract = null;
+    },
+  ],
+  [
+    "extra contract key",
+    (p) => {
+      p.audio_rate_contract.observed = true;
+    },
+  ],
+  [
+    "missing allowed rates",
+    (p) => {
+      delete p.audio_rate_contract.allowed_sample_rates;
+    },
+  ],
+  [
+    "single allowed rate",
+    (p) => {
+      p.audio_rate_contract.allowed_sample_rates = [48000];
+    },
+  ],
+  [
+    "extra allowed rate",
+    (p) => {
+      p.audio_rate_contract.allowed_sample_rates.push(96000);
+    },
+  ],
+  [
+    "duplicate allowed rate",
+    (p) => {
+      p.audio_rate_contract.allowed_sample_rates = [48000, 48000];
+    },
+  ],
+  [
+    "unsorted allowed rates",
+    (p) => {
+      p.audio_rate_contract.allowed_sample_rates.reverse();
+    },
+  ],
+  [
+    "negative allowed rate",
+    (p) => {
+      p.audio_rate_contract.allowed_sample_rates[0] = -44100;
+    },
+  ],
+  [
+    "string allowed rate",
+    (p) => {
+      p.audio_rate_contract.allowed_sample_rates[0] = "44100";
+    },
+  ],
+  [
+    "missing source rate",
+    (p) => {
+      delete p.audio_rate_contract.source_sample_rate;
+    },
+  ],
+  [
+    "unknown source rate",
+    (p) => {
+      p.audio_rate_contract.source_sample_rate = null;
+    },
+  ],
+  [
+    "out-of-contract source rate",
+    (p) => {
+      p.audio_rate_contract.source_sample_rate = 32000;
+    },
+  ],
+  [
+    "negative source rate",
+    (p) => {
+      p.audio_rate_contract.source_sample_rate = -48000;
+    },
+  ],
+  [
+    "fractional source rate",
+    (p) => {
+      p.audio_rate_contract.source_sample_rate = 44100.5;
+    },
+  ],
+  [
+    "missing samples",
+    (p) => {
+      delete p.audio_rate_contract.mse_samples;
+    },
+  ],
+  [
+    "single sample",
+    (p) => {
+      p.audio_rate_contract.mse_samples.pop();
+    },
+  ],
+  [
+    "extra sample",
+    (p) => {
+      p.audio_rate_contract.mse_samples.push({
+        ...p.mse_sample.audio,
+        samplerate: 96000,
+      });
+    },
+  ],
+  [
+    "duplicate sample",
+    (p) => {
+      p.audio_rate_contract.mse_samples[0] =
+        p.audio_rate_contract.mse_samples[1];
+    },
+  ],
+  [
+    "unsorted samples",
+    (p) => {
+      p.audio_rate_contract.mse_samples.reverse();
+    },
+  ],
+  [
+    "negative sample rate",
+    (p) => {
+      p.audio_rate_contract.mse_samples[0].samplerate = -44100;
+    },
+  ],
+  [
+    "wrong sample channels",
+    (p) => {
+      p.audio_rate_contract.mse_samples[0].channels = "6";
+    },
+  ],
+  [
+    "wrong sample codec",
+    (p) => {
+      p.audio_rate_contract.mse_samples[0].content_type =
+        'audio/mp4; codecs="ac-3"';
+    },
+  ],
+  [
+    "wrong sample bitrate",
+    (p) => {
+      p.audio_rate_contract.mse_samples[0].bitrate = 192000;
+    },
+  ],
+  [
+    "extra sample key",
+    (p) => {
+      p.audio_rate_contract.mse_samples[0].measured = true;
+    },
+  ],
+  [
+    "missing sample key",
+    (p) => {
+      delete p.audio_rate_contract.mse_samples[0].channels;
+    },
+  ],
+  [
+    "conflicting advisory rate",
+    (p) => {
+      p.mse_sample.audio.samplerate = 44100;
+    },
+  ],
+  [
+    "conflicting requested rate",
+    (p) => {
+      p.requested_audio.requested_sample_rate = 44100;
+    },
+  ],
+  [
+    "contract on silent profile",
+    (p) => {
+      p.requested_audio = p.mse_sample.audio = null;
+    },
+  ],
+];
+for (const [fault, mutate] of malformedEmbyProfiles) {
+  it(`rejects Emby ${fault} before probing or granting a session`, async () => {
+    const candidates = embyCandidates();
+    mutate(candidates.profile);
+    expect(isUpstreamProfileEnvelope(candidates.profile)).toBe(false);
+    const s = setup({ profileCandidates: candidates });
+    try {
+      await expect(s.runtime.loadMedia()).rejects.toThrow("候选无法安全使用");
+      s.runtime.onClockReady();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(s.decodingInfo).not.toHaveBeenCalled();
+      expect(s.preflights()).toHaveLength(1);
+      expect(s.prepares()).toHaveLength(0);
+      expect(s.ordinary()).toHaveLength(0);
+    } finally {
+      s.cleanup();
+    }
+  });
+}
+
+it("rejects a valid v2 envelope inside a v1 candidate-set discriminator", async () => {
+  const candidates = { ...embyCandidates(), profile_version: 1 };
+  const s = setup({ profileCandidates: candidates });
+  try {
+    await expect(s.runtime.loadMedia()).rejects.toThrow("候选无法安全使用");
+    expect(s.decodingInfo).not.toHaveBeenCalled();
+    expect(s.prepares()).toHaveLength(0);
+    expect(s.ordinary()).toHaveLength(0);
+  } finally {
+    s.cleanup();
+  }
+});
+
+for (const unsupportedRate of [44100, 48000]) {
+  for (const fault of [
+    "negative",
+    "rejects",
+    "throws",
+    "malformed",
+    "timeout",
+  ]) {
+    it(`fails closed when only the ${unsupportedRate} Hz AV estimate ${fault}`, async () => {
+      const pending = gate();
+      const decodingInfo = vi.fn((config: MediaDecodingConfiguration) => {
+        if (config.audio?.samplerate !== unsupportedRate)
+          return Promise.resolve(positive);
+        if (fault === "throws") throw new Error("failed configuration");
+        if (fault === "rejects")
+          return Promise.reject(new Error("failed configuration"));
+        if (fault === "timeout") return pending.promise;
+        return Promise.resolve(
+          fault === "negative"
+            ? { ...positive, supported: false }
+            : { supported: true },
+        );
+      });
+      const s = setup({ profileCandidates: embyCandidates(), decodingInfo });
+      try {
+        const rejected = expect(s.runtime.loadMedia()).rejects.toThrow(
+          "候选无法安全使用",
+        );
+        if (fault === "timeout") await vi.advanceTimersByTimeAsync(500);
+        await rejected;
+        pending.resolve(positive);
+        s.runtime.onClockReady();
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(decodingInfo).toHaveBeenCalledTimes(2);
+        expect(s.preflights()).toHaveLength(1);
+        expect(s.prepares()).toHaveLength(0);
+        expect(s.ordinary()).toHaveLength(0);
+        expect(hls.loaded).not.toHaveBeenCalled();
+      } finally {
+        s.cleanup();
+      }
+    });
+  }
+}
+
+for (const failedCall of [1, 2, 3, 4]) {
+  it(`requires positive MSE for each rate's AV sample (probe ${failedCall})`, async () => {
+    const decodingInfo = vi.fn().mockResolvedValue(positive);
+    let count = 0;
+    const report = await detectUpstreamProfileReport(
+      embyCandidates(),
+      {
+        isTypeSupported: () => ++count !== failedCall,
+      },
+      { decodingInfo },
+    );
+    expect(report).toBeUndefined();
+    expect(decodingInfo).not.toHaveBeenCalled();
+  });
+}
+
+it("keeps canonical rate order when 48 kHz resolves before 44.1 kHz", async () => {
+  const pending = gate();
+  const decodingInfo = vi.fn((config: MediaDecodingConfiguration) =>
+    config.audio?.samplerate === 44100
+      ? pending.promise
+      : Promise.resolve({ ...positive, smooth: true }),
+  );
+  const result = detectUpstreamProfileReport(
+    embyCandidates(),
+    { isTypeSupported: () => true },
+    { decodingInfo },
+  );
+  await Promise.resolve();
+  pending.resolve(positive);
+  const report = await result;
+  expect(report?.audio_rate_reports?.map((rate) => rate.sample_rate)).toEqual([
+    44100, 48000,
+  ]);
+  expect(
+    report?.audio_rate_reports?.map((rate) => rate.mse_decoding?.smooth),
+  ).toEqual([false, true]);
+  expect(report?.mse_decoding?.smooth).toBe(true);
+});
+
+const malformedRateReports: [string, (report: any) => void][] = [
+  [
+    "absent",
+    (r) => {
+      delete r.audio_rate_reports;
+    },
+  ],
+  [
+    "null",
+    (r) => {
+      r.audio_rate_reports = null;
+    },
+  ],
+  [
+    "empty",
+    (r) => {
+      r.audio_rate_reports = [];
+    },
+  ],
+  [
+    "single",
+    (r) => {
+      r.audio_rate_reports.pop();
+    },
+  ],
+  [
+    "extra",
+    (r) => {
+      r.audio_rate_reports.push({
+        ...r.audio_rate_reports[1],
+        sample_rate: 96000,
+      });
+    },
+  ],
+  [
+    "duplicate",
+    (r) => {
+      r.audio_rate_reports[0] = r.audio_rate_reports[1];
+    },
+  ],
+  [
+    "unsorted",
+    (r) => {
+      r.audio_rate_reports.reverse();
+    },
+  ],
+  [
+    "unknown rate",
+    (r) => {
+      r.audio_rate_reports[0].sample_rate = 32000;
+    },
+  ],
+  [
+    "negative rate",
+    (r) => {
+      r.audio_rate_reports[0].sample_rate = -44100;
+    },
+  ],
+  [
+    "missing rate",
+    (r) => {
+      delete r.audio_rate_reports[0].sample_rate;
+    },
+  ],
+  [
+    "extra entry field",
+    (r) => {
+      r.audio_rate_reports[0].file_decoding = r.mse_decoding;
+    },
+  ],
+  [
+    "negative MSE",
+    (r) => {
+      r.audio_rate_reports[0].mse_supported = false;
+    },
+  ],
+  [
+    "missing MSE",
+    (r) => {
+      delete r.audio_rate_reports[0].mse_supported;
+    },
+  ],
+  [
+    "missing estimate",
+    (r) => {
+      delete r.audio_rate_reports[0].mse_decoding;
+    },
+  ],
+  [
+    "negative estimate",
+    (r) => {
+      r.audio_rate_reports[0].mse_decoding.supported = false;
+    },
+  ],
+  [
+    "malformed estimate",
+    (r) => {
+      delete r.audio_rate_reports[0].mse_decoding.smooth;
+    },
+  ],
+  [
+    "extra estimate field",
+    (r) => {
+      r.audio_rate_reports[0].mse_decoding.observed = true;
+    },
+  ],
+  [
+    "unknown top field",
+    (r) => {
+      r.measured_output = true;
+    },
+  ],
+  [
+    "v1 version",
+    (r) => {
+      r.profile_version = 1;
+    },
+  ],
+  [
+    "v1 identifier",
+    (r) => {
+      r.profile_id = "avc_sdr_720p_v1";
+    },
+  ],
+];
+for (const [fault, mutate] of malformedRateReports) {
+  it(`rejects ${fault} rate evidence even when the top-level 48 kHz estimate is positive`, async () => {
+    const candidates = embyCandidates();
+    const report = await detectUpstreamProfileReport(
+      candidates,
+      { isTypeSupported: () => true },
+      { decodingInfo: async () => positive },
+    );
+    expect(
+      matchesUpstreamProfilePlan(
+        report,
+        candidates.profile,
+        "transcode",
+        "hls",
+      ),
+    ).toBe(true);
+    mutate(report);
+    expect(
+      matchesUpstreamProfilePlan(
+        report,
+        candidates.profile,
+        "transcode",
+        "hls",
+      ),
+    ).toBe(false);
+  });
+}
+
+it("keeps v2 contract and report fields absent from v1", async () => {
+  const candidates = candidateSet();
+  const report = await detectUpstreamProfileReport(
+    candidates,
+    { isTypeSupported: () => true },
+    { decodingInfo: async () => positive },
+  );
+  expect(report).not.toHaveProperty("audio_rate_reports");
+  expect(
+    matchesUpstreamProfilePlan(report, candidates.profile, "transcode", "hls"),
+  ).toBe(true);
+  expect(
+    matchesUpstreamProfilePlan(
+      { ...report, audio_rate_reports: [] } as any,
+      candidates.profile,
+      "transcode",
+      "hls",
+    ),
+  ).toBe(false);
+  candidates.profile.audio_rate_contract = embyProfile().audio_rate_contract;
+  expect(isUpstreamProfileEnvelope(candidates.profile)).toBe(false);
+});
+
+for (const fault of [
+  "source rate",
+  "downgrade",
+  "missing contract",
+  "extra field",
+  "no audio",
+]) {
+  it(`rejects v2 ${fault} plan changes without attaching, rediscovery or ordinary fallback`, async () => {
+    const s = setup({ profileCandidates: embyCandidates() });
+    try {
+      const original = s.api.getMockImplementation()!;
+      s.api.mockImplementation(async (path, method, body) => {
+        const plan = await original(path, method, body);
+        if (path === "/playback-sessions/upstream-profile") {
+          if (fault === "source rate")
+            plan.upstream_profile.audio_rate_contract.source_sample_rate = 48000;
+          if (fault === "downgrade") plan.upstream_profile = profile();
+          if (fault === "missing contract")
+            delete plan.upstream_profile.audio_rate_contract;
+          if (fault === "extra field")
+            plan.upstream_profile.audio_rate_contract.output_confirmed = true;
+          if (fault === "no audio") plan.upstream_profile = embyProfile(false);
+        }
+        return plan;
+      });
+      await expect(s.runtime.loadMedia()).rejects.toThrow();
+      s.runtime.onClockReady();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(s.preflights()).toHaveLength(1);
+      expect(s.prepares()).toHaveLength(1);
+      expect(s.ordinary()).toHaveLength(0);
+      expect(hls.loaded).not.toHaveBeenCalled();
+      expect(s.runtime.sessionId.value).toBeNull();
+    } finally {
+      s.cleanup();
+    }
+  });
+}
+
+it("keeps v2 rate evidence and request identity across an uncertain dedicated POST", async () => {
+  const s = setup({ profileCandidates: embyCandidates() });
+  try {
+    const original = s.api.getMockImplementation()!;
+    const sent: any[] = [];
+    s.api.mockImplementation(async (path, method, body) => {
+      if (path === "/playback-sessions/upstream-profile") {
+        sent.push(structuredClone(body));
+        if (sent.length === 1) {
+          body.upstream_profile_report.audio_rate_reports.reverse();
+          s.candidates.profile.audio_rate_contract.source_sample_rate = 48000;
+          throw new TypeError("uncertain result");
+        }
+      }
+      return original(path, method, body);
+    });
+    const loading = s.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(1000);
+    await loading;
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toEqual(sent[0]);
+    expect(s.decodingInfo).toHaveBeenCalledTimes(2);
+    expect(s.preflights()).toHaveLength(1);
+    expect(s.ordinary()).toHaveLength(0);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("never turns a v2 decoder failure into a new grant or HTTP continuation", async () => {
+  const s = setup({ profileCandidates: embyCandidates() });
+  try {
+    await s.runtime.loadMedia();
+    hls.handlers[0](null, {
+      fatal: true,
+      type: "mediaError",
+      details: "v2 decode failure",
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(s.error.value).toContain("v2 decode failure");
+    expect(s.preflights()).toHaveLength(1);
+    expect(s.prepares()).toHaveLength(1);
+    expect(s.ordinary()).toHaveLength(0);
+    expect(
+      s.api.mock.calls.some(([path]) =>
+        path.endsWith("http-file-continuation"),
+      ),
+    ).toBe(false);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("cancels both v2 estimates when identity changes without accepting a late second rate", async () => {
+  const pending = gate();
+  const decodingInfo = vi.fn((configuration: MediaDecodingConfiguration) =>
+    configuration.audio?.samplerate === 44100
+      ? Promise.resolve(positive)
+      : pending.promise,
+  );
+  const s = setup({ profileCandidates: embyCandidates(), decodingInfo });
+  try {
+    const loading = s.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(0);
+    s.session.epoch++;
+    pending.resolve(positive);
+    await loading;
+    expect(s.prepares()).toHaveLength(0);
+    expect(s.ordinary()).toHaveLength(0);
+    expect(hls.loaded).not.toHaveBeenCalled();
   } finally {
     s.cleanup();
   }

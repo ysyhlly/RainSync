@@ -1,7 +1,9 @@
 //! Explicit upstream transcode envelopes are metadata observations and sample
 //! probes. They never claim to describe exact encoded bytes or a stable input.
 use super::*;
-use providers::upstream_profiles::{PROFILE_ID, UpstreamProfileMetadata};
+use providers::upstream_profiles::{
+    EMBY_AUDIO_RATES, EMBY_PROFILE_ID, PROFILE_ID, UpstreamProfileMetadata, profile_identity,
+};
 use serde::Serialize;
 use sqlx::{Connection, Postgres, pool::PoolConnection};
 
@@ -64,6 +66,8 @@ struct Binding {
     item: String,
     requested_audio: Option<u32>,
     metadata: UpstreamProfileMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_envelope: Option<Value>,
     issued_at_ms: i64,
     expires_at_ms: i64,
 }
@@ -91,13 +95,14 @@ pub struct Scope<'a> {
 }
 
 pub fn envelope(
+    kind: &str,
     metadata: &UpstreamProfileMetadata,
 ) -> Result<protocol::UpstreamTranscodeProfileEnvelope> {
-    providers::upstream_profiles::validate_metadata_proof(metadata)
+    providers::upstream_profiles::validate_profile_metadata(kind, metadata)
         .map_err(|_| invalid_report())?;
-    let evidence = providers::upstream_profiles::evidence(metadata);
+    let evidence = providers::upstream_profiles::evidence(kind, metadata);
     Ok(protocol::UpstreamTranscodeProfileEnvelope {
-        profile_version: 1,
+        profile_version: evidence.profile_version,
         profile_id: evidence.profile_id,
         configuration_semantics:
             protocol::UpstreamProfileSemantics::UpstreamTranscodeProfileEnvelope,
@@ -123,6 +128,26 @@ pub fn envelope(
                 requested_sample_rate: 48_000,
                 max_bitrate: 128_000,
             }),
+        audio_rate_contract: if kind == "emby" {
+            metadata
+                .audio
+                .as_ref()
+                .map(|audio| protocol::UpstreamAudioRateContract {
+                    allowed_sample_rates: EMBY_AUDIO_RATES.to_vec(),
+                    source_sample_rate: audio.sample_rate,
+                    mse_samples: EMBY_AUDIO_RATES
+                        .iter()
+                        .map(|rate| protocol::AudioCapabilityConfiguration {
+                            content_type: "audio/mp4; codecs=\"mp4a.40.2\"".into(),
+                            channels: "2".into(),
+                            bitrate: 128_000,
+                            samplerate: *rate,
+                        })
+                        .collect(),
+                })
+        } else {
+            None
+        },
         mse_sample: protocol::UpstreamProfileProbeSample {
             video: protocol::VideoCapabilityConfiguration {
                 content_type: "video/mp4; codecs=\"avc1.4d001f\"".into(),
@@ -153,7 +178,7 @@ pub async fn candidates(
 ) -> Result<Json<protocol::UpstreamProfileCandidateSet>> {
     let user = auth(&app, &headers, true).await?;
     member(&app, &user, body.room_id).await?;
-    if body.profile_version != 1 {
+    if !matches!(body.profile_version, 1 | 2) {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_request"));
     }
     if !body.position_ms.is_finite() || body.position_ms < 0.0 {
@@ -238,6 +263,9 @@ async fn preflight(
             decision_reason: "provider_requires_legacy_negotiation".into(),
         }));
     }
+    if kind == "emby" && body.profile_version < 2 {
+        return Err(invalid_report());
+    }
     let source: Uuid = row.get("source_id");
     let source_revision: i64 = row.get("access_policy_revision");
     let item: String = row.get("resource");
@@ -272,10 +300,16 @@ async fn preflight(
     let mut tx = database.transaction().await?;
     playback_requests::guard(app, &mut tx, reservation).await?;
     let issued_at_ms = clock_ms(&mut tx).await?;
+    let profile = envelope(&kind, &metadata)?;
     let binding = Binding {
         purpose: PURPOSE.into(),
-        profile_version: 1,
-        profile_id: PROFILE_ID.into(),
+        profile_version: u32::from(profile.profile_version),
+        profile_id: profile.profile_id.clone(),
+        profile_envelope: if kind == "emby" {
+            Some(serde_json::to_value(&profile).map_err(anyhow::Error::from)?)
+        } else {
+            None
+        },
         identity,
         lifecycle_epoch: reservation.lifecycle_epoch,
         media,
@@ -302,11 +336,11 @@ async fn preflight(
             "upstream_device_profile_required",
         ));
     }
-    let profile = envelope(&selection.metadata)?;
+    let profile = envelope(&selection.binding.kind, &selection.metadata)?;
     tx.commit().await?;
     database.release();
     Ok(Json(protocol::UpstreamProfileCandidateSet {
-        profile_version: 1,
+        profile_version: profile.profile_version,
         binding: Some(encrypted),
         profile: Some(profile),
         decision_reason: "observed_metadata_and_requested_upstream_profile_envelope".into(),
@@ -322,10 +356,11 @@ pub fn validate_request(body: &protocol::PlaybackRequest, profile_endpoint: bool
     match (&body.upstream_profile_report, profile_endpoint) {
         (None, false) => Ok(()),
         (Some(report), true) => {
-            if report.profile_version != 1
-                || report.binding.is_empty()
+            if !matches!(
+                (report.profile_version, report.profile_id.as_str()),
+                (1, PROFILE_ID) | (2, EMBY_PROFILE_ID)
+            ) || report.binding.is_empty()
                 || report.binding.len() > MAX_BINDING_BYTES
-                || report.profile_id != PROFILE_ID
                 || body.mode.as_deref() != Some("transcode")
                 || body.candidate_report.is_some()
                 || body.http_file_fallback.is_some()
@@ -342,6 +377,28 @@ pub fn validate_request(body: &protocol::PlaybackRequest, profile_endpoint: bool
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "device_has_no_compatible_playback_transport",
                 ));
+            }
+            if report.profile_version == 1 && report.audio_rate_reports.is_some() {
+                return Err(err(StatusCode::BAD_REQUEST, "invalid_request"));
+            }
+            if report.profile_version == 2 {
+                let reports = report
+                    .audio_rate_reports
+                    .as_ref()
+                    .ok_or_else(invalid_report)?;
+                if !reports.is_empty()
+                    && (reports.len() != 2
+                        || reports.iter().zip(EMBY_AUDIO_RATES).any(|(sample, rate)| {
+                            sample.sample_rate != rate
+                                || !sample.mse_supported
+                                || !sample
+                                    .mse_decoding
+                                    .as_ref()
+                                    .is_some_and(|value| value.supported)
+                        }))
+                {
+                    return Err(invalid_report());
+                }
             }
             Ok(())
         }
@@ -409,12 +466,43 @@ async fn clock_ms(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<i64>
 
 fn bounded_contract(binding: &Binding) -> bool {
     binding.purpose == PURPOSE
-        && binding.profile_version == 1
-        && binding.profile_id == PROFILE_ID
+        && binding.profile_version == u32::from(profile_identity(&binding.kind).0)
+        && binding.profile_id == profile_identity(&binding.kind).1
+        && match envelope(&binding.kind, &binding.metadata) {
+            Ok(profile) if binding.kind == "emby" => {
+                serde_json::to_value(profile).ok().as_ref() == binding.profile_envelope.as_ref()
+            }
+            Ok(_) => binding.profile_envelope.is_none(),
+            Err(_) => false,
+        }
         && binding
             .expires_at_ms
             .checked_sub(binding.issued_at_ms)
             .is_some_and(|ttl| (1..=TTL_MS).contains(&ttl))
+}
+
+fn report_matches_binding(report: &protocol::UpstreamProfileReport, binding: &Binding) -> bool {
+    report.profile_version as u32 == binding.profile_version
+        && if binding.kind == "emby" {
+            report.audio_rate_reports.as_ref().is_some_and(|reports| {
+                let rates: &[u32] = if binding.metadata.audio.is_some() {
+                    &EMBY_AUDIO_RATES
+                } else {
+                    &[]
+                };
+                reports.len() == rates.len()
+                    && reports.iter().zip(rates).all(|(sample, rate)| {
+                        sample.sample_rate == *rate
+                            && sample.mse_supported
+                            && sample
+                                .mse_decoding
+                                .as_ref()
+                                .is_some_and(|value| value.supported)
+                    })
+            })
+        } else {
+            report.audio_rate_reports.is_none()
+        }
 }
 
 fn current(binding: &Binding, now: i64) -> bool {
@@ -449,13 +537,15 @@ pub async fn guard_replay(
         || login_hash != Some(binding.identity.login_hash.as_str())
         || binding.media_generation != body.media_generation
         || binding.requested_audio != body.audio_index
+        || !report_matches_binding(report, &binding)
         || report.profile_id != binding.profile_id
         || plan["media_id"].as_str() != Some(binding.media.to_string().as_str())
         || plan["media_generation"].as_u64() != Some(u64::from(binding.media_generation))
         || plan["delivery_mode"] != "transcode"
         || plan["transport"] != "hls"
         || plan["upstream_profile"]
-            != serde_json::to_value(envelope(&binding.metadata)?).map_err(anyhow::Error::from)?
+            != serde_json::to_value(envelope(&binding.kind, &binding.metadata)?)
+                .map_err(anyhow::Error::from)?
     {
         return Err(invalid_report());
     }
@@ -563,7 +653,8 @@ pub async fn guard_replay(
     if inner["url"].as_str() != Some(expected.url.as_str())
         || inner["upstream_device"] != device
         || inner["upstream_session"] != original["PlaySessionId"]
-        || ((!persisted.is_null() || completion) && *persisted != json!(expected.provenance))
+        || ((!persisted.is_null() || completion || binding.kind == "emby")
+            && *persisted != json!(expected.provenance))
         || (plan["decision_reason"] == "emby_server_requested_audio_sample_rate_48000")
             != completion
     {
@@ -609,6 +700,7 @@ pub async fn select(
         || binding.kind != scope.kind
         || binding.item != scope.item
         || binding.requested_audio != body.audio_index
+        || !report_matches_binding(report, &binding)
         || report.profile_id != binding.profile_id
         || !matches!(scope.kind, "jellyfin" | "emby")
     {
@@ -732,6 +824,7 @@ mod tests {
             item: "item".into(),
             requested_audio: None,
             metadata: metadata(),
+            profile_envelope: None,
             issued_at_ms: 1000,
             expires_at_ms: 1000 + TTL_MS,
         }
@@ -818,7 +911,7 @@ mod tests {
     #[test]
     fn envelope_preserves_requested_bounds_and_advisory_sample_as_separate_fields() {
         let mut observed = metadata();
-        let profile = envelope(&observed).unwrap();
+        let profile = envelope("jellyfin", &observed).unwrap();
         assert_eq!(profile.requested_video.profile, "main");
         assert_eq!(profile.requested_video.max_width, 1280);
         assert_eq!(profile.requested_video.max_height, 720);
@@ -837,10 +930,47 @@ mod tests {
                 .contains("mp4a.40.2")
         );
         observed.audio = None;
-        let silent = envelope(&observed).unwrap();
+        let silent = envelope("jellyfin", &observed).unwrap();
         assert!(silent.requested_audio.is_none());
         assert!(silent.mse_sample.audio.is_none());
         assert!(valid_login_hash(&"ab".repeat(32)));
         assert!(!valid_login_hash(&"AB".repeat(32)));
+    }
+    #[test]
+    fn emby_v2_binds_full_discrete_contract_and_requires_every_rate() {
+        let mut proof = binding();
+        proof.kind = "emby".into();
+        proof.profile_version = 2;
+        proof.profile_id = EMBY_PROFILE_ID.into();
+        proof.profile_envelope = Some(json!(envelope("emby", &proof.metadata).unwrap()));
+        assert!(bounded_contract(&proof));
+        let mut body = request();
+        let report = body.upstream_profile_report.as_mut().unwrap();
+        report.profile_version = 2;
+        report.profile_id = EMBY_PROFILE_ID.into();
+        report.audio_rate_reports = Some(
+            EMBY_AUDIO_RATES
+                .iter()
+                .map(|rate| protocol::UpstreamAudioRateReport {
+                    sample_rate: *rate,
+                    mse_supported: true,
+                    mse_decoding: report.mse_decoding.clone(),
+                })
+                .collect(),
+        );
+        assert!(report_matches_binding(report, &proof));
+        report.audio_rate_reports.as_mut().unwrap().reverse();
+        assert!(!report_matches_binding(report, &proof));
+        report.audio_rate_reports = Some(vec![]);
+        assert!(!report_matches_binding(report, &proof));
+        proof.profile_envelope.as_mut().unwrap()["audio_rate_contract"]["allowed_sample_rates"] =
+            json!([48_000]);
+        assert!(!bounded_contract(&proof));
+        proof.metadata.audio = None;
+        proof.profile_envelope = Some(json!(envelope("emby", &proof.metadata).unwrap()));
+        assert!(bounded_contract(&proof));
+        assert!(report_matches_binding(report, &proof));
+        proof.profile_version = 1;
+        assert!(!bounded_contract(&proof));
     }
 }

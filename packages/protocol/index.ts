@@ -109,14 +109,20 @@ export type UpstreamAudioProfileBounds = {
  */
 codec: string, max_channels: number, requested_sample_rate: number, max_bitrate: number, };
 export type UpstreamProfileProbeSample = { video: VideoCapabilityConfiguration, audio: AudioCapabilityConfiguration | null, };
-export type UpstreamTranscodeProfileEnvelope = { profile_version: number, profile_id: string, configuration_semantics: UpstreamProfileSemantics, transport: string, container: string, requested_video: UpstreamVideoProfileBounds, requested_audio: UpstreamAudioProfileBounds | null, mse_sample: UpstreamProfileProbeSample, };
-export type UpstreamProfileCandidateRequest = { profile_version: number, room_id: string, media_generation: number, position_ms: number, audio_index: number | null, };
+export type UpstreamAudioRateContract = { allowed_sample_rates: Array<number>, source_sample_rate: number, mse_samples: Array<AudioCapabilityConfiguration>, };
+export type UpstreamAudioRateReport = { sample_rate: number, mse_supported: boolean, mse_decoding?: MediaDecodingSupport, };
+export type UpstreamTranscodeProfileEnvelope = { profile_version: number, profile_id: string, configuration_semantics: UpstreamProfileSemantics, transport: string, container: string, requested_video: UpstreamVideoProfileBounds, requested_audio: UpstreamAudioProfileBounds | null, mse_sample: UpstreamProfileProbeSample, audio_rate_contract?: UpstreamAudioRateContract, };
+export type UpstreamProfileCandidateRequest = {
+/**
+ * Maximum supported dedicated contract version; response keeps its actual version.
+ */
+profile_version: number, room_id: string, media_generation: number, position_ms: number, audio_index: number | null, };
 export type UpstreamProfileCandidateSet = { profile_version: number,
 /**
  * Binding and profile are either both present or both absent.
  */
 binding: string | null, profile: UpstreamTranscodeProfileEnvelope | null, decision_reason: string, };
-export type UpstreamProfileReport = { profile_version: number, binding: string, profile_id: string, mse_supported: boolean, mse_decoding?: MediaDecodingSupport, };
+export type UpstreamProfileReport = { profile_version: number, binding: string, profile_id: string, mse_supported: boolean, mse_decoding?: MediaDecodingSupport, audio_rate_reports?: Array<UpstreamAudioRateReport>, };
 export type PlaybackCapabilities = { progressive_h264_aac: boolean, native_hls: boolean, mse_h264_aac: boolean,
 /**
  * Optional additive hints. Old clients retain the original transport gates.

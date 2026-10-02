@@ -80,6 +80,17 @@ export function upstreamProfileFixtureSampleSettings(
   };
 }
 
+// Additional source facts are opt-in; existing real-policy fixtures retain their
+// original two-item setup and pagination contract.
+export function upstreamProfileAudioRateFixtures(enabled = false) {
+  assert.equal(typeof enabled, "boolean");
+  return enabled ? [
+    { title: "rainsync-h264-48k-stereo-aac", sample_rate: 48000, channels: 2, audio_codec: "aac" },
+    { title: "rainsync-h264-44k-stereo-ac3", sample_rate: 44100, channels: 2, audio_codec: "ac3" },
+    { title: "rainsync-h264-48k-stereo-ac3", sample_rate: 48000, channels: 2, audio_codec: "ac3" },
+  ] : [];
+}
+
 /**
  * An owned, disposable upstream. Credentials stay in this closure; metadata,
  * HTTP clients and addRainSyncSource are available only until the callback ends.
@@ -93,6 +104,7 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
   assert.ok(definition, "Supported fixture kind: jellyfin or emby");
   assert.equal(typeof run, "function");
   const durationSeconds = options.durationSeconds ?? 20;
+  const extraAudioFixtures = upstreamProfileAudioRateFixtures(options.profileAudioRateMatrix);
   const sampleSettings = {
     ...upstreamProfileFixtureSampleSettings(options.profileConstraintStress),
     ...upstreamFixtureSampleSettings(
@@ -415,11 +427,26 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
       ],
       { timeout: 60000, signal: control.signal },
     );
+    const sampleDefinitions = [
+      { path: h264, title: "rainsync-h264", codec: "h264", audios: 1, subtitles: 0,
+        sample_rate: sampleSettings.h264_sample_rate, frame_rate: sampleSettings.h264_frame_rate, audio_codec: "aac", channels: 1 },
+      { path: hevc, title: "rainsync-hevc", codec: "hevc", audios: 2, subtitles: 1,
+        sample_rate: sampleSettings.hevc_sample_rate, frame_rate: sampleSettings.hevc_frame_rate, audio_codec: "aac", channels: 1 },
+    ];
+    for (const input of extraAudioFixtures) {
+      const path = resolve(media, input.title + ".mkv");
+      await command(ffmpeg, [
+        ...common, "-i", h264, "-f", "lavfi", "-i", `sine=frequency=440:sample_rate=${input.sample_rate}`,
+        "-t", String(durationSeconds), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+        "-c:a", input.audio_codec, "-threads:a", "2", "-ac", String(input.channels),
+        "-ar", String(input.sample_rate), "-b:a", input.audio_codec === "ac3" ? "192k" : "128k", path,
+      ], { timeout: 60000, signal: control.signal });
+      sampleDefinitions.push({ ...input, path, codec: "h264", audios: 1, subtitles: 0,
+        frame_rate: sampleSettings.h264_frame_rate });
+    }
     report.samples = [];
-    for (const [path, codec, audios, subtitles] of [
-      [h264, "h264", 1, 0],
-      [hevc, "hevc", 2, 1],
-    ]) {
+    for (const { path, title, codec, audios, subtitles, sample_rate: sampleRate, frame_rate: frameRate,
+      audio_codec: audioCodec, channels } of sampleDefinitions) {
       const info = JSON.parse(
         await command(ffprobe, [
           "-v",
@@ -454,15 +481,19 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
       const [numerator, denominator] = video.avg_frame_rate
         .split("/")
         .map(Number);
-      const frameRate = sampleSettings[`${codec}_frame_rate`];
-      const sampleRate = sampleSettings[`${codec}_sample_rate`];
       assert.equal(numerator / denominator, frameRate);
       for (const audio of info.streams.filter(
         (stream) => stream.codec_type === "audio",
-      ))
+      )) {
         assert.equal(Number(audio.sample_rate), sampleRate);
+        assert.equal(audio.codec_name, audioCodec);
+        assert.equal(audio.channels, channels);
+      }
       report.samples.push({
         path,
+        title,
+        audio_codec: audioCodec,
+        audio_channels: channels,
         sha256: await digest(path),
         codec,
         audio_streams: audios,
@@ -478,7 +509,7 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
     // A restrictive host umask must not hide these owned synthetic samples from
     // Emby's non-root container user. Never widen the credential/config paths.
     await chmod(media, 0o755);
-    for (const path of [h264, hevc, resolve(media, "rainsync-h264.en.srt")])
+    for (const path of [...sampleDefinitions.map((sample) => sample.path), resolve(media, "rainsync-h264.en.srt")])
       await chmod(path, 0o644);
     networkId = await docker(
       "network",
@@ -775,46 +806,42 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
     await admin.api("/Library/Refresh", "POST");
     const itemPath = (start = 0, limit = 10) =>
       `/Users/${admin.userId}/Items?Recursive=true&IncludeItemTypes=Video,Movie&Fields=MediaSources&SortBy=SortName&SortOrder=Ascending&StartIndex=${start}&Limit=${limit}&EnableTotalRecordCount=true`;
+    const itemCount = sampleDefinitions.length;
     let listing;
     for (let i = 0; i < 120; i++) {
       listing = await admin.api(itemPath());
       if (
-        listing.TotalRecordCount === 2 &&
-        listing.Items?.length === 2 &&
+        listing.TotalRecordCount === itemCount &&
+        listing.Items?.length === itemCount &&
         listing.Items.every((item) => item.MediaSources?.length)
       )
         break;
       await delay(500, control.signal);
     }
-    assert.equal(listing.TotalRecordCount, 2);
-    assert.equal(listing.Items.length, 2);
+    assert.equal(listing.TotalRecordCount, itemCount);
+    assert.equal(listing.Items.length, itemCount);
     assert.ok(
       listing.Items.every((item) => item.MediaSources?.length),
       "Real metadata/probe completed",
     );
-    const first = await admin.api(itemPath(0, 1));
-    const second = await admin.api(itemPath(1, 1));
-    const tail = await admin.api(itemPath(2, 1));
-    report.pagination = [first, second, tail].map((page, start) => ({
-      start_index: start,
-      limit: 1,
-      total_record_count: page.TotalRecordCount,
+    const pages = [];
+    for (let start = 0; start <= itemCount; start++) pages.push(await admin.api(itemPath(start, 1)));
+    report.pagination = pages.map((page, start) => ({
+      start_index: start, limit: 1, total_record_count: page.TotalRecordCount,
       item_ids: page.Items.map((item) => item.Id),
     }));
     await save();
-    for (const page of [first, second]) assert.equal(page.TotalRecordCount, 2);
-    // Fixed Emby 4.10 returns zero total for an empty beyond-end page;
-    // its two nonempty pages must still report the complete library count.
-    assert.equal(tail.TotalRecordCount, kind === "emby" ? 0 : 2);
-    assert.equal(first.Items.length, 1);
-    assert.equal(second.Items.length, 1);
+    const tail = pages.at(-1), nonempty = pages.slice(0, -1);
+    for (const page of nonempty) {
+      assert.equal(page.TotalRecordCount, itemCount);
+      assert.equal(page.Items.length, 1);
+    }
+    // Fixed Emby 4.10 returns zero total for an empty beyond-end page.
+    assert.equal(tail.TotalRecordCount, kind === "emby" ? 0 : itemCount);
     assert.equal(tail.Items.length, 0);
-    assert.notEqual(first.Items[0].Id, second.Items[0].Id);
-    assert.deepEqual(
-      [first.Items[0].Id, second.Items[0].Id].sort(),
-      listing.Items.map((item) => item.Id).sort(),
-    );
-    report.checks.push("two real items and complete Limit=1 pagination");
+    assert.deepEqual(nonempty.flatMap((page) => page.Items.map((item) => item.Id)).sort(),
+      listing.Items.map((item) => item.Id).sort());
+    report.checks.push(`${itemCount} real items and complete Limit=1 pagination`);
     const denied = await anonymous.raw(itemPath());
     assert.ok(
       [401, 403].includes(denied.status),

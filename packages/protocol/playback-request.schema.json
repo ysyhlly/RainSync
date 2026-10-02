@@ -484,10 +484,44 @@
         "ended"
       ]
     },
+    "UpstreamAudioRateReport": {
+      "type": "object",
+      "properties": {
+        "mse_decoding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MediaDecodingSupport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mse_supported": {
+          "type": "boolean"
+        },
+        "sample_rate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sample_rate",
+        "mse_supported"
+      ]
+    },
     "UpstreamProfileReport": {
       "description": "Only the dedicated preparation endpoint accepts this report. It grants no\nauthority and cannot describe a replacement recipe or automatic fallback.",
       "type": "object",
       "properties": {
+        "audio_rate_reports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UpstreamAudioRateReport"
+          }
+        },
         "binding": {
           "type": "string"
         },

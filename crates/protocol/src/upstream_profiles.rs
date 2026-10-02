@@ -53,12 +53,35 @@ pub struct UpstreamTranscodeProfileEnvelope {
     pub requested_video: UpstreamVideoProfileBounds,
     pub requested_audio: Option<UpstreamAudioProfileBounds>,
     pub mse_sample: UpstreamProfileProbeSample,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub audio_rate_contract: Option<UpstreamAudioRateContract>,
+}
+
+/// A discrete allowed set, separate from the requested rate and measured output.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamAudioRateContract {
+    pub allowed_sample_rates: Vec<u32>,
+    pub source_sample_rate: u32,
+    pub mse_samples: Vec<AudioCapabilityConfiguration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamAudioRateReport {
+    pub sample_rate: u32,
+    pub mse_supported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mse_decoding: Option<MediaDecodingSupport>,
 }
 
 /// The dedicated endpoint only describes explicit-transcode eligibility.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamProfileCandidateRequest {
+    /// Maximum supported dedicated contract version; response keeps its actual version.
     pub profile_version: u8,
     pub room_id: Uuid,
     pub media_generation: u32,
@@ -90,6 +113,17 @@ pub struct UpstreamProfileReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub mse_decoding: Option<MediaDecodingSupport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[serde(deserialize_with = "non_null_audio_rate_reports")]
+    #[schemars(with = "Vec<UpstreamAudioRateReport>")]
+    pub audio_rate_reports: Option<Vec<UpstreamAudioRateReport>>,
+}
+
+fn non_null_audio_rate_reports<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<UpstreamAudioRateReport>>, D::Error> {
+    Vec::<UpstreamAudioRateReport>::deserialize(deserializer).map(Some)
 }
 
 #[cfg(test)]
@@ -126,5 +160,21 @@ mod tests {
         assert!(serde_json::from_value::<UpstreamProfileReport>(value.clone()).is_ok());
         value["excluded_candidates"] = serde_json::json!([]);
         assert!(serde_json::from_value::<UpstreamProfileReport>(value).is_err());
+    }
+    #[test]
+    fn optional_rate_report_field_must_be_omitted_or_a_non_null_array() {
+        let mut value = serde_json::json!({"profile_version":1,"binding":"opaque","profile_id":UPSTREAM_PROFILE_ID,"mse_supported":true});
+        assert!(serde_json::from_value::<UpstreamProfileReport>(value.clone()).is_ok());
+        value["audio_rate_reports"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<UpstreamProfileReport>(value.clone()).is_err());
+        value["profile_version"] = serde_json::json!(2);
+        value["profile_id"] = serde_json::json!("emby_avc_sdr_720p_rates_v2");
+        value["audio_rate_reports"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<UpstreamProfileReport>(value.clone()).is_ok());
+        value["audio_rate_reports"] = serde_json::json!([
+            {"sample_rate":44100,"mse_supported":true,"mse_decoding":{"supported":true,"smooth":true,"power_efficient":false}},
+            {"sample_rate":48000,"mse_supported":true,"mse_decoding":{"supported":true,"smooth":true,"power_efficient":false}}
+        ]);
+        assert!(serde_json::from_value::<UpstreamProfileReport>(value).is_ok());
     }
 }

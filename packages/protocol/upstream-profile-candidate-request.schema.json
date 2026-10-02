@@ -24,6 +24,7 @@
       "default": 0.0
     },
     "profile_version": {
+      "description": "Maximum supported dedicated contract version; response keeps its actual version.",
       "type": "integer",
       "format": "uint8",
       "maximum": 255,

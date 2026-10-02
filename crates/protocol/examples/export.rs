@@ -53,6 +53,8 @@ fn main() {
         UpstreamVideoProfileBounds::decl(),
         UpstreamAudioProfileBounds::decl(),
         UpstreamProfileProbeSample::decl(),
+        UpstreamAudioRateContract::decl(),
+        UpstreamAudioRateReport::decl(),
         UpstreamTranscodeProfileEnvelope::decl(),
         UpstreamProfileCandidateRequest::decl(),
         UpstreamProfileCandidateSet::decl(),

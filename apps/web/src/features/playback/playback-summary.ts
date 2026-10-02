@@ -29,7 +29,11 @@ export function summarizePlaybackPlan(
   ) {
     summary.reason =
       "请求上游转码：最高720p SDR，H.264" +
-      (plan.upstream_profile.requested_audio ? " / AAC" : "") +
+      (plan.upstream_profile.requested_audio
+        ? plan.upstream_profile.profile_version === 2
+          ? " / AAC（44.1或48 kHz）"
+          : " / AAC"
+        : "") +
       "；设备兼容性为估计";
     return summary;
   }

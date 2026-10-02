@@ -945,7 +945,8 @@ export function createPlaybackRuntime(ctx: {
               "/upstream-profile-candidates",
               "POST",
               {
-                profile_version: 1,
+                // Discovery advertises our maximum supported profile version.
+                profile_version: 2,
                 room_id: metrics.room,
                 media_generation: metrics.media,
                 audio_index: metrics.audio ?? null,
@@ -968,7 +969,7 @@ export function createPlaybackRuntime(ctx: {
             if (
               !upstreamSet ||
               typeof upstreamSet !== "object" ||
-              upstreamSet.profile_version !== 1 ||
+              ![1, 2].includes(upstreamSet.profile_version) ||
               typeof upstreamSet.decision_reason !== "string" ||
               Object.keys(upstreamSet).some(
                 (key) =>
@@ -988,7 +989,9 @@ export function createPlaybackRuntime(ctx: {
               if (
                 typeof upstreamSet.binding !== "string" ||
                 !upstreamSet.binding.trim() ||
-                !isUpstreamProfileEnvelope(upstreamSet.profile)
+                !isUpstreamProfileEnvelope(upstreamSet.profile) ||
+                upstreamSet.profile_version !==
+                  upstreamSet.profile.profile_version
               )
                 throw new Error(candidateError);
               const candidates = freezeCandidateSnapshot(
@@ -1215,12 +1218,16 @@ export function createPlaybackRuntime(ctx: {
         await session.api(`/playback-sessions/${p.session_id}`, "DELETE");
         return;
       }
-      // The helper validates the entire fixed recipe before readiness. Also
-      // retain the originally selected presence/absence of advisory audio.
+      // The helper validates the fixed recipe before readiness. Retain the
+      // original audio selection and source rate; both rates can be supported
+      // without allowing a different source-bound contract into this intent.
       if (
         discovered.upstream &&
-        (p.upstream_profile?.requested_audio === null) !==
-          (discovered.upstream.candidates.profile!.requested_audio === null)
+        ((p.upstream_profile?.requested_audio === null) !==
+          (discovered.upstream.candidates.profile!.requested_audio === null) ||
+          p.upstream_profile?.audio_rate_contract?.source_sample_rate !==
+            discovered.upstream.candidates.profile!.audio_rate_contract
+              ?.source_sample_rate)
       ) {
         await requests().stop();
         throw new Error(candidateError);

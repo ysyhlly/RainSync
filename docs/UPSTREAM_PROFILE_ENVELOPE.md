@@ -1,9 +1,11 @@
 # Explicit upstream transcode profile envelope
 
-Published on `integration/v0.1-next`. At `8897d20273512a194929d84c62ba8fb47f19e021`,
-Jellyfin passed the three fixed-product profile cases; Emby still failed closed.
-A separate finite Emby diagnostic completed and observed 44.1 kHz audio rather
-than the requested 48 kHz. This is not a blanket upstream compatibility pass.
+Published on `integration/v0.1-next`. The latest bounded product evidence at
+`e27051d5b47eba827ed885efb79469665ab7d0fd` passes Jellyfin's three cases but fails
+all three Emby cases at actual audio output: 44.1 kHz instead of requested 48 kHz.
+The request reaches Emby unchanged; its owned encoder command explicitly selects
+44.1 kHz. The current exact-48 kHz Emby recipe is not product-validated. The discrete-rate contract below was approved for implementation; pinned-product
+acceptance of the new contract is still required.
 This is the smaller profile-envelope option chosen on 2026-10-01. It does not
 introduce a prepared/consumed upstream SID lifecycle or measured-output claim.
 
@@ -186,12 +188,12 @@ be checked against that fixed product's own API schema or an explicit bounded
 product test.
 
 The successful raw diagnostic above did not alter the route. The authorized local
-request-completion candidate below has no pinned-product output result yet. Requested parameters, provider-returned
+request-completion candidate below subsequently failed pinned-product output checks, as recorded below. Requested parameters, provider-returned
 fields and actual finite output must remain distinguishable in evidence.
 
-### Authorized narrow request repair, local candidate
+### Authorized narrow request repair, historical implementation
 
-The local candidate preserves the provider-returned `h264-maxframerate=30` and
+The published request-completion implementation preserves the provider-returned `h264-maxframerate=30` and
 adds only the documented `AudioSampleRate=48000` when absent, to the already
 owned master request for the same SID. This path was approved on 2026-10-02. Do not introduce an undocumented generic
 frame-rate field, a second PlaybackInfo call, an automatic new-SID fallback or a
@@ -254,5 +256,119 @@ kHz input for both H.264 and HEVC and all audio tracks. It checks the untouched
 PlaybackInfo checkpoint, the separately completed encrypted resource and actual
 Worker request, one SID, seek/alternate audio and finite decoded 30 fps / 48 kHz
 output. Docker is unavailable in this workspace, so that new product-output
-matrix is prepared but not run here. The earlier unchanged-route 44.1 kHz
-observation remains the latest real Emby output evidence until CI replaces it.
+matrix cannot run locally. CI subsequently produced the failed Emby output and encoder evidence below.
+
+
+## Exact request-chain and encoder evidence, 2026-10-02
+
+The request-completion implementation at `6cf8202` reached actual Worker media
+in all three Emby cases, but finite output remained 30 fps / 44.1 kHz. Jellyfin
+passed all three cases. Later diagnostics preserved the same production behavior:
+
+- At `c14a0cd`, [request-chain artifacts](https://github.com/ysyhlly/RainSync/actions/runs/36963703096/artifacts/11208634441)
+  show `AudioSampleRate=48000` in the master request, original returned variant
+  reference and exact Worker variant GET. SID/source/device checks match. The
+  generated media references omit rate/codec fields; actual Worker media GETs
+  match those references unchanged. Omission alone does not establish causation.
+- At `e27051d`, [owned encoder artifacts](https://github.com/ysyhlly/RainSync/actions/runs/36964767899/artifacts/11208109807)
+  contain one new sanitized ffmpeg log per Emby case, with exact owned SID and
+  device text matches. Each single-input invocation has output
+  `-c:a:0 aac -ar:a:0 44100` and `-f segment`. Default audio maps `0:1`; alternate
+  audio maps `0:2`. No resampling filter was observed in these command lines.
+  Other partial command-like lines remain unknown; audio summary lines without
+  parsed input/output context are not promoted to output evidence.
+- Finite Worker probes independently report 44.1 kHz in all three Emby cases.
+  Every owned reservation closes, Emby Stop and encoding Stop succeed, fixture
+  data is removed and source/binary integrity checks pass. These are finite
+  synthetic windows, not whole-title or physical-device proof.
+
+This establishes that the explicit 48 kHz request reached the pinned Emby
+4.10.0.40 variant handler while its encoder selected 44.1 kHz. It does not
+establish general ceiling semantics, an undocumented override, or a reason to
+rewrite opaque segment URLs. The exact-48 kHz product assertion remains failing.
+The full checks workflow is tracked independently; product diagnostics do not
+constitute a full-CI success.
+
+## Approved implementation: discrete Emby audio rates
+
+The user approved this bounded contract change on 2026-10-02. Publication remains
+subject to final review and the coordinated batch decision. It uses a distinct Emby profile ID and
+contract version advertising the canonical allowed output rates `[44100,48000]`,
+while keeping any requested 48000 parameter explicitly separate from those
+allowed rates and from measured output. Jellyfin retains its current 48 kHz
+contract and existing v1 client compatibility.
+
+Source admission requires a known selected-audio sample rate in that set;
+other or missing rates fail closed. Existing codec/channel guards remain intact.
+Any extra input-codec/channel restriction would require an explicit tradeoff,
+not be silently inferred from the mono AAC fixture. Silent media keeps no audio
+rate set. No generic ceiling rule or automatic fallback is introduced.
+
+The browser must probe both advertised audio configurations at 44.1 and 48 kHz,
+with positive path-specific MSE and decoding support for each. A canonical,
+versioned per-rate report rejects missing, duplicate, extra, unknown or negative
+results. A single favorable sample cannot admit the broader set. The encrypted
+binding captures that complete envelope, source/selected-audio metadata, rate
+set and profile version; final preparation and completed-key replay compare all
+of them under existing authority/lifecycle fences. Old Emby v1 evidence must
+never silently become a v2 report or revive an incompatible grant.
+
+The implementation touches the dedicated protocol DTO/generated
+schemas, provider profile construction/validation, Server binding/replay and
+`packages/player-core/upstream-profile.ts`, plus controlled and pinned tests.
+It does not alter auto mode, allocate an extra SID or use a local transcoder.
+UI/evidence wording must say supported discrete rates and requested configuration,
+not promise exact 48 kHz or imply an upstream echo that never occurred.
+
+Before a support claim, pinned Emby tests must add known 48 kHz sources and keep
+44.1 kHz stress, zero/seek/alternate-track cases; include stereo and non-AAC
+inputs to validate the retained codec/channel envelope. Every measured output
+must be inside the declared set and meet unchanged video/channel/bitrate bounds.
+Negative controlled cases include unknown/unsupported source rates, partial or
+forged per-rate browser reports, stale version/binding, changed audio selection,
+route/provenance tampering, cancellation and one-SID cleanup. Current 44.1 kHz
+observations alone do not prove the 48 kHz branch of that future contract.
+
+
+The wire discriminator is `profile_version:2` with
+`profile_id:"emby_avc_sdr_720p_rates_v2"`. For selected audio,
+`audio_rate_contract` contains the canonical allowed rates, the selected source
+sample rate and two advisory MSE audio configurations. The existing requested
+48000 field is not a fixed-output promise. `audio_rate_reports` contains exactly
+two positive reports in canonical order; silent v2 uses an explicit empty list
+and has no audio contract. Jellyfin v1 omits these new fields entirely.
+
+Discovery request version 2 declares the client's maximum supported contract;
+the returned envelope/outer version is 1 for Jellyfin or 2 for Emby. An old
+version-1 request cannot obtain an Emby v2 profile by silent reinterpretation.
+The sealed Emby binding stores the complete envelope as well as selected source
+metadata. V2 route provenance also records the allowed rate set and source rate,
+separately from returned and server-requested rate parameters. Every replay
+reconstructs and compares the exact contract and provenance without networking.
+
+
+### V2 local validation before publication
+
+The final frozen native Server/PostgreSQL matrix passed 116/116 scenarios with
+102 controlled SIDs. Every SID received exactly one Stop; all Emby encoding
+Stops were confirmed, no active/undrained work remained, all owned processes and
+ports closed, and backend source/binary hashes stayed unchanged. Report SHA-256:
+`c38b2bc07147fdf43e86b2d066119918f0257d3e8fe8056e1201a702b2ae9eb5`.
+
+Coverage includes both known source rates, audio index zero distinct from the
+video index, silent v2's exact empty report, all advertised browser-rate proofs,
+unknown/other source rates, and unchanged-reseal positive controls before
+independent binding and persisted resource/plan/checkpoint mutations. Fresh-key
+admission failures, same-key idempotency conflicts and deeper persisted replay
+failures are recorded separately; a changed same-key payload is not proof of a
+replay-contract check. Earlier failed fixture runs are retained: they exposed
+reused viewer generations and synthetic JSON float normalization, not a product
+pass. Those fixture corrections did not change the frozen backend.
+
+All 664 frontend tests, type checking and the production frontend build passed;
+45 dependency-free Node tests and syntax checks passed. The new source-generation
+smoke created/probed 48 kHz stereo AAC and 44.1/48 kHz stereo AC3 inputs. The pinned
+product matrix has six cases per provider: the original zero/seek/alternate
+cases plus those three additional sources. Emby finite output must belong to
+exactly `{44100,48000}`; Jellyfin still requires 48000. This expanded real
+Server/Worker/pinned-product matrix awaits Docker CI and is not claimed passed.

@@ -531,6 +531,37 @@
         "max_bitrate"
       ]
     },
+    "UpstreamAudioRateContract": {
+      "description": "A discrete allowed set, separate from the requested rate and measured output.",
+      "type": "object",
+      "properties": {
+        "allowed_sample_rates": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "mse_samples": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AudioCapabilityConfiguration"
+          }
+        },
+        "source_sample_rate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "allowed_sample_rates",
+        "source_sample_rate",
+        "mse_samples"
+      ]
+    },
     "UpstreamProfileProbeSample": {
       "description": "A finite browser estimate for MSE after HLS transmuxing, not measured output.",
       "type": "object",
@@ -564,6 +595,16 @@
     "UpstreamTranscodeProfileEnvelope": {
       "type": "object",
       "properties": {
+        "audio_rate_contract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpstreamAudioRateContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "configuration_semantics": {
           "$ref": "#/$defs/UpstreamProfileSemantics"
         },

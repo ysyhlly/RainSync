@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import WS from "ws";
 import { delay, isolatedServer } from "./fixtures/server.mjs";
 import { verifyClosedPort } from "./fixtures/postgres.mjs";
+import { assertAudioRateContract, positiveRateReports, profileVersion } from "./fixtures/upstream-profile-rate-contract.mjs";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const boundRepo = resolve(
@@ -66,6 +67,7 @@ assert.equal(
 const coordinator = await Promise.all(
   [
     "tests/upstream-profile-admission.mjs",
+    "tests/fixtures/upstream-profile-rate-contract.mjs",
     "tests/fixtures/server.mjs",
     "tests/fixtures/postgres.mjs",
   ].map(async (path) => ({
@@ -217,7 +219,7 @@ function metadata(kind, variant = "normal") {
       Type: "Audio",
       Codec: "ac3",
       Channels: 6,
-      SampleRate: 48000,
+      SampleRate: variant === "source-44100" ? 44100 : variant === "source-32000" ? 32000 : variant === "source-96000" ? 96000 : variant === "source-unknown" ? undefined : 48000,
       BitRate: 640000,
       Profile: "Dolby Digital",
     });
@@ -292,13 +294,13 @@ function playbackInfo(subject, sid, body, fault) {
     query.set("h264-maxframerate", "60");
   }
   if (fault.mismatch === "missing-sample-rate") query.delete("AudioSampleRate");
-  if (fault.explicitSampleRate) query.set("AudioSampleRate", "48000");
+  if (fault.explicitSampleRate) query.set("AudioSampleRate", String(fault.explicitSampleRate));
   if (fault.genericFrameRate) {
     query.delete("h264-maxframerate");
     query.set("MaxFramerate", "30");
   }
   if (fault.mismatch === "conflicting-sample-rate")
-    query.set("AudioSampleRate", "44100");
+    query.set("AudioSampleRate", subject.kind === "emby" ? "32000" : "44100");
   if (fault.mismatch === "empty-sample-rate") query.set("AudioSampleRate", "");
   if (fault.mismatch === "duplicate-sample-rate") {
     query.set("AudioSampleRate", "48000");
@@ -742,7 +744,7 @@ try {
             mse_h264_aac: true,
           },
           upstream_profile_report: {
-            profile_version: 1,
+            profile_version: profile.profile_version,
             binding: profile.binding,
             profile_id: profile.profile.profile_id,
             mse_supported: true,
@@ -751,6 +753,7 @@ try {
               smooth: true,
               power_efficient: false,
             },
+            ...positiveRateReports(profile.profile),
           },
           ...overrides,
         });
@@ -781,7 +784,11 @@ try {
           );
         return Buffer.concat([
           nonce,
-          cipher.update(JSON.stringify(value)),
+          // serde_json retains float versus integer number representations in
+          // the bound Value envelope. Preserve the canonical f64 MSE framerate
+          // token when JS reserializes it, so unrelated tamper tests are not
+          // accidentally rejected only because 30.0 became 30.
+          cipher.update(JSON.stringify(value).replace(/("framerate":)(\d+)(?=[,}])/g, "$1$2.0")),
           cipher.final(),
           cipher.getAuthTag(),
         ]).toString("base64");
@@ -841,15 +848,19 @@ try {
           "only owned missing device identity and explicit missing sample rate are added",
         );
         const provenance = {
-          schema_version: 1,
+          schema_version: subject.kind === "emby" ? 2 : 1,
           semantics: "requested_configuration_not_measured_output",
           frame_rate_field: returned.has("h264-maxframerate")
             ? "h264-maxframerate"
             : "maxframerate",
           provider_audio_sample_rate: returned.has("audiosamplerate")
-            ? 48000
+            ? Number(returned.get("audiosamplerate"))
             : null,
           server_requested_audio_sample_rate: completion ? 48000 : null,
+          ...(subject.kind === "emby" && audio ? {
+            allowed_audio_sample_rates: [44100, 48000],
+            source_audio_sample_rate: subject.variant === "source-44100" ? 44100 : 48000,
+          } : {}),
         };
         assert.deepEqual(
           resource.upstream_profile_route_provenance,
@@ -884,22 +895,11 @@ try {
           );
         proof.issued_at_ms = now - 1000;
         proof.expires_at_ms = now + expiresInMs;
-        const nonce = randomBytes(12),
-          cipher = createCipheriv(
-            "aes-256-gcm",
-            Buffer.from(f.env.SOURCE_ENCRYPTION_KEY, "base64"),
-            nonce,
-          );
-        return Buffer.concat([
-          nonce,
-          cipher.update(JSON.stringify(proof)),
-          cipher.final(),
-          cipher.getAuthTag(),
-        ]).toString("base64");
+        return sealFixture(proof);
       }
       async function candidates(subject, audio = null, overrides = {}) {
         return api(subject.client, "/upstream-profile-candidates", {
-          profile_version: 1,
+          profile_version: 2,
           room_id: subject.room.id,
           media_generation: subject.controller.state.media_generation,
           position_ms: 1200,
@@ -912,7 +912,8 @@ try {
           rows = Number(f.sql("SELECT count(*) FROM playback_requests"));
         const response = await candidates(subject, audio);
         assert.equal(response.status, 200);
-        assert.equal(response.body.profile_version, 1);
+        assert.equal(response.body.profile_version, profileVersion(subject.kind));
+        assertAudioRateContract(response.body.profile, subject.kind, subject.variant === "source-44100" ? 44100 : 48000);
         assert.ok(response.body.binding);
         assert.ok(response.body.profile);
         assert.equal(
@@ -960,6 +961,9 @@ try {
         assert.equal(proof.requested_audio, audio);
         assert.ok(proof.account_generation > 0);
         assert.equal(proof.purpose, "upstream_transcode_profile_envelope_v1");
+        assert.equal(proof.profile_version, profileVersion(subject.kind));
+        assert.equal(proof.profile_id, response.body.profile.profile_id);
+        assert.deepEqual(proof.profile_envelope, subject.kind === "emby" ? response.body.profile : undefined);
         assert.equal(
           response.body.profile.configuration_semantics,
           "upstream_transcode_profile_envelope",
@@ -1155,7 +1159,7 @@ try {
               [
                 "unsupported version",
                 (value) => {
-                  value.upstream_profile_report.profile_version = 2;
+                  value.upstream_profile_report.profile_version = 3;
                 },
                 400,
                 "INVALID_REQUEST",
@@ -1216,6 +1220,20 @@ try {
               error(result, status, code);
               cases.push({ label, ...safeResponse(result) });
             }
+            if (kind === "jellyfin") {
+              assert.equal(base.upstream_profile_report.audio_rate_reports, undefined);
+              const unexpected = structuredClone(base); unexpected.idempotency_key = randomUUID();
+              unexpected.upstream_profile_report.audio_rate_reports = [];
+              error(await prepare(subject, unexpected), 400, "INVALID_REQUEST");
+              unexpected.idempotency_key = randomUUID();
+              unexpected.upstream_profile_report.audio_rate_reports = null;
+              const invalidNull = await prepare(subject, unexpected);
+              noPlan(invalidNull); assert.equal(invalidNull.status, 422);
+              const legacyDiscovery = await candidates(subject, null, { profile_version: 1 });
+              assert.equal(legacyDiscovery.status, 200);
+              assert.equal(legacyDiscovery.body.profile_version, 1);
+              assert.deepEqual(legacyDiscovery.body.profile, profile.profile);
+            }
             const generic = await api(
               subject.client,
               "/playback-sessions",
@@ -1233,7 +1251,7 @@ try {
             const stale = await prepare(subject, invalidCipher);
             error(stale, 409, "STALE_CAPABILITY_REPORT");
             const unsupportedPreflight = await candidates(subject, null, {
-              profile_version: 2,
+              profile_version: 3,
             });
             error(unsupportedPreflight, 400, "INVALID_REQUEST");
             assert.equal(count(subject), 0);
@@ -1257,8 +1275,31 @@ try {
               if (variant === "silent") {
                 assert.equal(profile.profile.requested_audio, null);
                 assert.equal(profile.profile.mse_sample.audio, null);
+                if (kind === "emby") {
+                  assert.deepEqual(body.upstream_profile_report.audio_rate_reports, []);
+                  for (const nullValue of [false, true]) {
+                    const invalid = structuredClone(body); invalid.idempotency_key = randomUUID(); invalid.viewer_id = randomUUID();
+                    if (nullValue) invalid.upstream_profile_report.audio_rate_reports = null;
+                    else delete invalid.upstream_profile_report.audio_rate_reports;
+                    const rejected = await prepare(subject, invalid);
+                    if (nullValue) { noPlan(rejected); assert.equal(rejected.status, 422); }
+                    else error(rejected, 409, "STALE_CAPABILITY_REPORT");
+                    assert.equal(count(subject), 0);
+                  }
+                  const nonempty = structuredClone(body);
+                  nonempty.idempotency_key = randomUUID();
+                  nonempty.viewer_id = randomUUID();
+                  nonempty.upstream_profile_report.audio_rate_reports = [44100, 48000].map((sample_rate) => ({
+                    sample_rate, mse_supported: true, mse_decoding: { supported: true, smooth: false, power_efficient: false },
+                  }));
+                  error(await prepare(subject, nonempty), 409, "STALE_CAPABILITY_REPORT");
+                  assert.equal(count(subject), 0);
+                }
               } else {
                 assert.equal(profile.profile.requested_audio.codec, "aac");
+                assert.equal(decodeProfile(profile.binding).metadata.audio.index, 0);
+                assert.equal(decodeProfile(profile.binding).metadata.video.index, 1);
+                if (kind === "emby") assert.deepEqual(body.upstream_profile_report.audio_rate_reports.map((entry) => entry.sample_rate), [44100, 48000]);
                 assert.ok(
                   profile.profile.mse_sample.audio.content_type.includes(
                     "mp4a.40.2",
@@ -1266,6 +1307,8 @@ try {
                 );
               }
               const response = await prepare(subject, body);
+              record.positive_response = safeResponse(response);
+              record.positive_request = requestRow(body.idempotency_key);
               assert.equal(response.status, 200);
               assert.equal(count(subject), 1);
               const event = contract.events.find(
@@ -1772,13 +1815,169 @@ try {
           },
         );
       }
+      await scenario(
+        "emby: complete canonical discrete-rate probes reject missing extra duplicate unsorted and negative reports before PlaybackInfo",
+        async (record) => {
+          const subject = await setup("emby", "canonical dual-rate probes", "source-44100"),
+            profile = await minted(subject), base = subject.body(profile);
+          record.rejections = [];
+          for (const [name, mutate] of [
+            ["missing complete rate report", (report) => { delete report.audio_rate_reports; }],
+            ["empty rate report", (report) => { report.audio_rate_reports = []; }],
+            ["missing 44100 probe", (report) => { report.audio_rate_reports.shift(); }],
+            ["missing 48000 probe", (report) => { report.audio_rate_reports.pop(); }],
+            ["extra 32000 probe", (report) => { report.audio_rate_reports.unshift({ ...report.audio_rate_reports[0], sample_rate: 32000 }); }],
+            ["duplicate 44100 probe", (report) => { report.audio_rate_reports[1] = structuredClone(report.audio_rate_reports[0]); }],
+            ["unsorted exact set", (report) => { report.audio_rate_reports.reverse(); }],
+            ...[0, 1].flatMap((index) => [
+              [`negative ${index === 0 ? 44100 : 48000} MSE`, (report) => { report.audio_rate_reports[index].mse_supported = false; }],
+              [`negative ${index === 0 ? 44100 : 48000} decoding`, (report) => { report.audio_rate_reports[index].mse_decoding.supported = false; }],
+              [`missing ${index === 0 ? 44100 : 48000} decoding`, (report) => { delete report.audio_rate_reports[index].mse_decoding; }],
+            ]),
+          ]) {
+            const body = structuredClone(base); body.idempotency_key = randomUUID(); body.viewer_id = randomUUID();
+            mutate(body.upstream_profile_report);
+            const rejected = await prepare(subject, body);
+            noPlan(rejected);
+            error(rejected, 409, "STALE_CAPABILITY_REPORT");
+            assert.equal(count(subject), 0, "incomplete rate evidence allocates no PlaybackInfo/SID");
+            record.rejections.push({ name, ...safeResponse(rejected) });
+          }
+          const nullReports = structuredClone(base); nullReports.idempotency_key = randomUUID(); nullReports.viewer_id = randomUUID();
+          nullReports.upstream_profile_report.audio_rate_reports = null;
+          const invalidNull = await prepare(subject, nullReports);
+          noPlan(invalidNull); assert.equal(invalidNull.status, 422, "present null is not an absent or complete rate report");
+          assert.equal(count(subject), 0);
+          record.rejections.push({ name: "null complete rate report", ...safeResponse(invalidNull) });
+          const first = await prepare(subject, base);
+          record.positive_response = safeResponse(first);
+          record.positive_request = requestRow(base.idempotency_key);
+          assert.equal(first.status, 200, "canonical complete reports admit the same source after all negatives");
+          assertAudioRateContract(first.body.upstream_profile, "emby", 44100);
+          const replay = await prepare(subject, base);
+          assert.equal(replay.status, 200); assertExactReplay(replay.body, first.body);
+          assert.equal(count(subject), 1);
+          await drained(base.idempotency_key); await closePlan(subject, first.body); await unaffected();
+          record.canonical_reports = base.upstream_profile_report.audio_rate_reports;
+          record.playback_posts = 1;
+        },
+      );
+      await scenario(
+        "emby: unknown and other source rates fail before PlaybackInfo without narrowing codec or channel support",
+        async (record) => {
+          record.rejections = [];
+          for (const variant of ["source-unknown", "source-32000", "source-96000"]) {
+            const subject = await setup("emby", variant, variant), rejected = await candidates(subject);
+            error(rejected, 502, "UPSTREAM_PLAYBACK_FAILED");
+            assert.equal(count(subject), 0);
+            assert.equal([...contract.sessions.values()].filter((session) => session.tag === subject.tag).length, 0);
+            record.rejections.push({ variant, ...safeResponse(rejected) });
+          }
+          // Both known rates retain the existing AC3/six-channel source support;
+          // stereo AAC is an output request, never a new source admission gate.
+          for (const variant of ["source-44100", "normal"]) {
+            const subject = await setup("emby", variant, variant), profile = await minted(subject),
+              body = subject.body(profile), response = await prepare(subject, body);
+            assert.equal(response.status, 200);
+            assert.equal(decodeProfile(profile.binding).metadata.audio.codec, "ac3");
+            assert.equal(decodeProfile(profile.binding).metadata.audio.channels, 6);
+            await drained(body.idempotency_key); await closePlan(subject, response.body);
+          }
+          await unaffected();
+        },
+      );
+      await scenario(
+        "emby: independently resealed binding contract metadata selection and version tampering fail before PlaybackInfo",
+        async (record) => {
+          const subject = await setup("emby", "encrypted complete envelope tamper"),
+            profile = await minted(subject), original = decodeProfile(profile.binding), body = subject.body(profile);
+          body.upstream_profile_report.binding = sealFixture(original);
+          const first = await prepare(subject, body);
+          assert.equal(first.status, 200, "unchanged resealed v2 envelope remains admissible before field mutations");
+          assert.deepEqual(first.body.upstream_profile, profile.profile);
+          await drained(body.idempotency_key);
+          const baselinePosts = count(subject); assert.equal(baselinePosts, 1);
+          record.unchanged_resealed_binding_admitted = true;
+          record.fault_injection = "Each case reseals one changed field with this isolated fixture key; no product credential or source response is rewritten";
+          record.rejections = [];
+          for (const [name, mutate] of [
+            ["missing bound envelope", (proof) => { delete proof.profile_envelope; }],
+            ["null bound rate contract", (proof) => { proof.profile_envelope.audio_rate_contract = null; }],
+            ["missing bound rate contract", (proof) => { delete proof.profile_envelope.audio_rate_contract; }],
+            ["changed allowed set", (proof) => { proof.profile_envelope.audio_rate_contract.allowed_sample_rates = [32000, 48000]; }],
+            ["missing allowed rate", (proof) => { proof.profile_envelope.audio_rate_contract.allowed_sample_rates.pop(); }],
+            ["unsorted allowed set", (proof) => { proof.profile_envelope.audio_rate_contract.allowed_sample_rates.reverse(); }],
+            ["changed bound source rate", (proof) => { proof.profile_envelope.audio_rate_contract.source_sample_rate = 44100; }],
+            ["changed bound MSE sample", (proof) => { proof.profile_envelope.audio_rate_contract.mse_samples[0].samplerate = 32000; }],
+            ["missing bound MSE sample", (proof) => { proof.profile_envelope.audio_rate_contract.mse_samples.pop(); }],
+            ["changed requested rate", (proof) => { proof.profile_envelope.requested_audio.requested_sample_rate = 44100; }],
+            ["changed selected metadata rate", (proof) => { proof.metadata.audio.sample_rate = 44100; }],
+            ["changed selected audio index", (proof) => { proof.requested_audio = 1; }],
+            ["changed binding version", (proof) => { proof.profile_version = 1; }],
+            ["changed binding id", (proof) => { proof.profile_id = "avc_sdr_720p_v1"; }],
+          ]) {
+            const proof = structuredClone(original); mutate(proof);
+            const body = subject.body(profile); body.upstream_profile_report.binding = sealFixture(proof);
+            const rejected = await prepare(subject, body);
+            error(rejected, 409, "STALE_CAPABILITY_REPORT");
+            assert.equal(count(subject), baselinePosts, "binding mutation allocates zero new PlaybackInfo/SID");
+            record.rejections.push({ name, new_playback_posts: count(subject) - baselinePosts, ...safeResponse(rejected) });
+          }
+          record.replay_report_rejections = [];
+          for (const [name, mutate] of [
+            ["missing replay report", (report) => { delete report.audio_rate_reports; }],
+            ["negative replay rate", (report) => { report.audio_rate_reports[0].mse_supported = false; }],
+            ["changed replay set", (report) => { report.audio_rate_reports[0].sample_rate = 32000; }],
+          ]) {
+            const replayBody = structuredClone(body); mutate(replayBody.upstream_profile_report);
+            const rejected = await prepare(subject, replayBody);
+            error(rejected, 409, "STALE_CAPABILITY_REPORT");
+            assert.equal(count(subject), 1);
+            record.replay_report_rejections.push({ name, ...safeResponse(rejected) });
+          }
+          const replay = await prepare(subject, body); assert.equal(replay.status, 200);
+          assertExactReplay(replay.body, first.body);
+          await closePlan(subject, first.body); await unaffected();
+        },
+      );
+      await scenario(
+        "emby: stale v1 report cannot admit or replay a v2 discrete-rate profile",
+        async (record) => {
+          const subject = await setup("emby", "stale Emby v1"), profile = await minted(subject),
+            base = subject.body(profile), stale = structuredClone(base);
+          stale.viewer_id = randomUUID();
+          Object.assign(stale.upstream_profile_report, { profile_version: 1, profile_id: "avc_sdr_720p_v1" });
+          delete stale.upstream_profile_report.audio_rate_reports;
+          const rejected = await prepare(subject, stale);
+          error(rejected, 409, "STALE_CAPABILITY_REPORT");
+          assert.equal(count(subject), 0);
+          record.admission = safeResponse(rejected);
+          const oldDiscovery = await candidates(subject, null, { profile_version: 1 });
+          error(oldDiscovery, 409, "STALE_CAPABILITY_REPORT");
+          record.discovery = safeResponse(oldDiscovery);
+          base.idempotency_key = randomUUID();
+          const first = await prepare(subject, base); assert.equal(first.status, 200);
+          await drained(base.idempotency_key);
+          stale.idempotency_key = base.idempotency_key;
+          stale.viewer_id = base.viewer_id;
+          const replay = await prepare(subject, stale);
+          error(replay, 409, "PLAYBACK_REQUEST_CONFLICT");
+          assert.equal(count(subject), 1);
+          record.replay = safeResponse(replay);
+          const unchanged = await prepare(subject, base);
+          assert.equal(unchanged.status, 200); assertExactReplay(unchanged.body, first.body);
+          assert.equal(count(subject), 1);
+          await closePlan(subject, first.body); await unaffected();
+        },
+      );
       for (const [explicitSampleRate, genericFrameRate] of [
-        [true, false],
-        [true, true],
+        [48000, false],
+        [48000, true],
+        [44100, false],
         [false, true],
       ])
         await scenario(
-          `emby: original sample ${explicitSampleRate ? "48000" : "missing"} with ${genericFrameRate ? "generic" : "codec-specific"} frame rate retains provenance`,
+          `emby: original sample ${explicitSampleRate || "missing"} with ${genericFrameRate ? "generic" : "codec-specific"} frame rate retains provenance`,
           async (record) => {
             const subject = await setup("emby", "same SID provenance variants"),
               profile = await minted(subject),
@@ -1834,13 +2033,26 @@ try {
             "Only this isolated fixture's encrypted resource/plan/checkpoint is resealed for rejection tests; every original value is restored before cleanup";
           record.rejections = [];
           try {
+            f.sql(`UPDATE playback_sessions SET resource=jsonb_set(resource,'{encrypted}',to_jsonb(${quote(sealFixture(decodeProfile(originalEncrypted)))}::text)) WHERE id=${quote(id)}`);
+            f.sql(`UPDATE playback_requests SET response_encrypted=${quote(sealFixture(decodeProfile(originalPlan)))} WHERE session_id=${quote(id)}`);
+            f.sql(`UPDATE upstream_reservations SET response_encrypted=${quote(sealFixture(decodeProfile(originalCheckpoint)))} WHERE id=${quote(id)}`);
+            const unchangedReplay = await prepare(subject, body);
+            assert.equal(unchangedReplay.status, 200, "unchanged resealed resource plan and checkpoint replay before independent mutations");
+            assertExactReplay(unchangedReplay.body, first.body);
+            record.unchanged_resealed_replay_admitted = true;
             for (const name of [
               "missing provenance",
               "wrong provenance",
+              "changed provenance rate set",
+              "changed provenance source rate",
+              "changed persisted binding hash",
               "missing sample request",
               "changed frame rate",
               "wrong SID",
               "wrong decision reason",
+              "changed plan rate set",
+              "changed plan source rate",
+              "changed plan MSE rate",
               "changed original checkpoint",
             ]) {
               restore();
@@ -1851,9 +2063,12 @@ try {
                 f.sql(
                   `UPDATE upstream_reservations SET response_encrypted=${quote(sealFixture(checkpoint))} WHERE id=${quote(id)}`,
                 );
-              } else if (name === "wrong decision reason") {
+              } else if (name === "wrong decision reason" || name.startsWith("changed plan")) {
                 const plan = decodeProfile(originalPlan);
-                plan.decision_reason = "upstream_transcode";
+                if (name === "wrong decision reason") plan.decision_reason = "upstream_transcode";
+                if (name === "changed plan rate set") plan.upstream_profile.audio_rate_contract.allowed_sample_rates = [32000, 48000];
+                if (name === "changed plan source rate") plan.upstream_profile.audio_rate_contract.source_sample_rate = 44100;
+                if (name === "changed plan MSE rate") plan.upstream_profile.audio_rate_contract.mse_samples[0].samplerate = 32000;
                 f.sql(
                   `UPDATE playback_requests SET response_encrypted=${quote(sealFixture(plan))} WHERE session_id=${quote(id)}`,
                 );
@@ -1863,6 +2078,12 @@ try {
                   delete inner.upstream_profile_route_provenance;
                 if (name === "wrong provenance")
                   inner.upstream_profile_route_provenance.provider_audio_sample_rate = 48000;
+                if (name === "changed provenance rate set")
+                  inner.upstream_profile_route_provenance.allowed_audio_sample_rates = [32000, 48000];
+                if (name === "changed provenance source rate")
+                  inner.upstream_profile_route_provenance.source_audio_sample_rate = 44100;
+                if (name === "changed persisted binding hash")
+                  inner.upstream_profile_binding_hash = "0".repeat(64);
                 if (name === "missing sample request") {
                   const url = new URL(inner.url);
                   url.searchParams.delete("AudioSampleRate");
