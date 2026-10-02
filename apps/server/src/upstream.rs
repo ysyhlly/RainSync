@@ -318,7 +318,7 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
                 return Err(err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"));
             }
             if let Some(selection) = &profile
-                && providers::upstream_profiles::validate_route(&kind, &config, &selection.metadata, &info).is_err()
+                && providers::upstream_profiles::complete_route(&kind, &config, &selection.metadata, &info, &device_id).is_err()
             {
                 let mut tx = app.db.begin().await?;
                 ledger::close(&mut tx, id, "upstream_profile_route_mismatch").await?;

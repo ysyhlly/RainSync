@@ -69,6 +69,17 @@ export function upstreamFixtureSampleSettings(h264ConstraintStress = false) {
   };
 }
 
+export function upstreamProfileFixtureSampleSettings(
+  profileConstraintStress = false,
+) {
+  assert.equal(typeof profileConstraintStress, "boolean");
+  return {
+    ...upstreamFixtureSampleSettings(profileConstraintStress),
+    hevc_frame_rate: profileConstraintStress ? 60 : 10,
+    hevc_sample_rate: profileConstraintStress ? 44100 : 48000,
+  };
+}
+
 /**
  * An owned, disposable upstream. Credentials stay in this closure; metadata,
  * HTTP clients and addRainSyncSource are available only until the callback ends.
@@ -82,7 +93,12 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
   assert.ok(definition, "Supported fixture kind: jellyfin or emby");
   assert.equal(typeof run, "function");
   const durationSeconds = options.durationSeconds ?? 20;
-  const sampleSettings = upstreamFixtureSampleSettings(options.h264ConstraintStress);
+  const sampleSettings = {
+    ...upstreamProfileFixtureSampleSettings(options.profileConstraintStress),
+    ...upstreamFixtureSampleSettings(
+      options.profileConstraintStress || options.h264ConstraintStress,
+    ),
+  };
   assert.ok(
     Number.isInteger(durationSeconds) &&
       durationSeconds >= 20 &&
@@ -114,8 +130,12 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
     limits: { cpus: 1, memory_bytes: 1610612736, pids: 256 },
     started_at: new Date().toISOString(),
     source_sha256: await digest(new URL(import.meta.url)),
-    storage_helper_sha256: await digest(new URL("./upstream-storage.mjs", import.meta.url)),
-    media_route_helper_sha256: await digest(new URL("./upstream-media-route.mjs", import.meta.url)),
+    storage_helper_sha256: await digest(
+      new URL("./upstream-storage.mjs", import.meta.url),
+    ),
+    media_route_helper_sha256: await digest(
+      new URL("./upstream-media-route.mjs", import.meta.url),
+    ),
     checks: [],
     failures: [],
     cleanup: { container: false, network: false, volumes: [] },
@@ -340,15 +360,15 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
         "-f",
         "lavfi",
         "-i",
-        "testsrc2=size=320x180:rate=10",
+        `testsrc2=size=320x180:rate=${sampleSettings.hevc_frame_rate}`,
         "-f",
         "lavfi",
         "-i",
-        "sine=frequency=440:sample_rate=48000",
+        `sine=frequency=440:sample_rate=${sampleSettings.hevc_sample_rate}`,
         "-f",
         "lavfi",
         "-i",
-        "sine=frequency=880:sample_rate=48000",
+        `sine=frequency=880:sample_rate=${sampleSettings.hevc_sample_rate}`,
         "-i",
         embeddedSubtitle,
         "-t",
@@ -428,12 +448,19 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
         Number(info.format.duration) >= durationSeconds - 0.1 &&
           Number(info.format.duration) <= durationSeconds + 1,
       );
-      if (path === h264) {
-        const video = info.streams.find((stream) => stream.codec_type === "video");
-        const [numerator, denominator] = video.avg_frame_rate.split("/").map(Number);
-        assert.equal(numerator / denominator, sampleSettings.h264_frame_rate);
-        assert.equal(Number(info.streams.find((stream) => stream.codec_type === "audio").sample_rate), sampleSettings.h264_sample_rate);
-      }
+      const video = info.streams.find(
+        (stream) => stream.codec_type === "video",
+      );
+      const [numerator, denominator] = video.avg_frame_rate
+        .split("/")
+        .map(Number);
+      const frameRate = sampleSettings[`${codec}_frame_rate`];
+      const sampleRate = sampleSettings[`${codec}_sample_rate`];
+      assert.equal(numerator / denominator, frameRate);
+      for (const audio of info.streams.filter(
+        (stream) => stream.codec_type === "audio",
+      ))
+        assert.equal(Number(audio.sample_rate), sampleRate);
       report.samples.push({
         path,
         sha256: await digest(path),
@@ -441,6 +468,8 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
         audio_streams: audios,
         embedded_subtitles: subtitles,
         duration_seconds: Number(info.format.duration),
+        frame_rate: frameRate,
+        audio_sample_rate: sampleRate,
       });
     }
     report.subtitle_sha256 = await digest(
@@ -580,11 +609,29 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
           );
         }
       };
-      const rawMedia = async (reference, { parent, item, source, sid, master = false, timeout = 15000 }) => {
+      const rawMedia = async (
+        reference,
+        { parent, item, source, sid, master = false, timeout = 15000 },
+      ) => {
         checkOpen();
-        assert.equal(kind, "emby", "raw controller diagnostic is pinned to Emby");
-        return fetchOwnedEmbyMedia({ reference, parent, base, item, source, sid, master,
-          ownedItems, headers: headers(), signal: control.signal, timeout });
+        assert.equal(
+          kind,
+          "emby",
+          "raw controller diagnostic is pinned to Emby",
+        );
+        return fetchOwnedEmbyMedia({
+          reference,
+          parent,
+          base,
+          item,
+          source,
+          sid,
+          master,
+          ownedItems,
+          headers: headers(),
+          signal: control.signal,
+          timeout,
+        });
       };
       return { deviceId, userId, raw, api, rawMedia };
     }
@@ -776,7 +823,11 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
     await denied.arrayBuffer();
     report.anonymous_status = denied.status;
     report.checks.push("authenticated metadata and unauthenticated denial");
-    for (const item of listing.Items) ownedItems.set(item.Id, new Set((item.MediaSources ?? []).map((source) => source.Id)));
+    for (const item of listing.Items)
+      ownedItems.set(
+        item.Id,
+        new Set((item.MediaSources ?? []).map((source) => source.Id)),
+      );
     report.items = listing.Items.map((item) => ({
       id: item.Id,
       name: item.Name,

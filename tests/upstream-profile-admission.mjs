@@ -113,7 +113,7 @@ const report = {
   started_at: new Date().toISOString(),
   result: "running",
   scope:
-    "Actual isolated Server/PostgreSQL; generated metadata and controlled loopback Jellyfin/Emby HTTP only. No real fixed product, media decode, Worker or browser acceptance. Synthetic binding clock fixtures are explicitly labeled. Membership deletion is isolated concurrency fault injection; other authorization changes use public APIs or actual account observations.",
+    "Actual isolated Server/PostgreSQL; generated metadata and controlled loopback Jellyfin/Emby HTTP only. No real fixed product, media decode, Worker or browser acceptance. Synthetic binding clock fixtures are explicitly labeled. Membership deletion and explicitly resealed replay proofs are isolated fault injection; other authorization changes use public APIs or actual account observations.",
   backend_binding: {
     path: resolve(bindingPath),
     sha256: digest(bindingBytes),
@@ -249,7 +249,7 @@ function playbackInfo(subject, sid, body, fault) {
     VideoBitrate: "4000000",
     MaxWidth: "1280",
     MaxHeight: "720",
-    MaxFramerate: "30",
+    [subject.kind === "emby" ? "h264-maxframerate" : "MaxFramerate"]: "30",
     AllowVideoStreamCopy: "false",
     AllowAudioStreamCopy: "false",
     "h264-level": "31",
@@ -261,22 +261,71 @@ function playbackInfo(subject, sid, body, fault) {
       AudioStreamIndex: String(selected),
       AudioCodec: "aac",
       AudioBitrate: "128000",
-      AudioSampleRate: "48000",
+      ...(subject.kind === "jellyfin" ? { AudioSampleRate: "48000" } : {}),
       TranscodingMaxAudioChannels: "2",
     }))
       query.set(name, value);
   // Real Jellyfin returns this inert default even with no subtitle index.
   if (subject.kind === "jellyfin") query.set("SubtitleMethod", "Encode");
-  if (fault.mismatch === "subtitle-selected") query.set("SubtitleStreamIndex", "0");
+  if (fault.mismatch === "subtitle-selected")
+    query.set("SubtitleStreamIndex", "0");
   if (fault.mismatch === "subtitle-empty") query.set("SubtitleStreamIndex", "");
   if (fault.mismatch === "subtitle-duplicate") {
     query.set("SubtitleStreamIndex", "-1");
     query.set("subtitlestreamindex", "0");
   }
-  if (fault.mismatch === "missing-frame-rate" || fault.mismatch === "frame-rate-alias")
+  if (
+    fault.mismatch === "missing-frame-rate" ||
+    fault.mismatch === "frame-rate-alias"
+  ) {
     query.delete("MaxFramerate");
-  if (fault.mismatch === "frame-rate-alias") query.set("h264-maxframerate", "30");
+    query.delete("h264-maxframerate");
+  }
+  if (fault.mismatch === "frame-rate-alias")
+    query.set("h264-maxframerate", "30");
+  if (fault.mismatch === "frame-rate-conflict") {
+    query.set("MaxFramerate", "30");
+    query.set("h264-maxframerate", "30");
+  }
+  if (fault.mismatch === "frame-rate-over-bound") {
+    query.delete("MaxFramerate");
+    query.set("h264-maxframerate", "60");
+  }
   if (fault.mismatch === "missing-sample-rate") query.delete("AudioSampleRate");
+  if (fault.explicitSampleRate) query.set("AudioSampleRate", "48000");
+  if (fault.genericFrameRate) {
+    query.delete("h264-maxframerate");
+    query.set("MaxFramerate", "30");
+  }
+  if (fault.mismatch === "conflicting-sample-rate")
+    query.set("AudioSampleRate", "44100");
+  if (fault.mismatch === "empty-sample-rate") query.set("AudioSampleRate", "");
+  if (fault.mismatch === "duplicate-sample-rate") {
+    query.set("AudioSampleRate", "48000");
+    query.append("audiosamplerate", "48000");
+  }
+  if (fault.mismatch === "sample-rate-alias")
+    query.set("aac-samplerate", "48000");
+  if (fault.mismatch === "device") query.set("DeviceId", "another-device");
+  if (fault.mismatch === "sid") query.set("PlaySessionId", "another-sid");
+  if (fault.mismatch === "video-copy")
+    query.set("AllowVideoStreamCopy", "true");
+  if (fault.mismatch === "audio-copy")
+    query.set("AllowAudioStreamCopy", "true");
+  if (fault.mismatch === "video-codec") query.set("VideoCodec", "hevc");
+  if (fault.mismatch === "audio-codec") query.set("AudioCodec", "mp3");
+  if (fault.mismatch === "channels")
+    query.set("TranscodingMaxAudioChannels", "6");
+  if (fault.mismatch === "profile") query.set("h264-profile", "high");
+  if (fault.mismatch === "level") query.set("h264-level", "51");
+  if (fault.mismatch === "range")
+    query.set(
+      subject.kind === "jellyfin" ? "h264-rangetype" : "h264-videorange",
+      "HDR",
+    );
+  if (fault.mismatch === "video-index") query.set("VideoStreamIndex", "9");
+  if (fault.mismatch === "audio-bitrate") query.set("AudioBitrate", "256000");
+  if (fault.mismatch === "video-bitrate") query.set("VideoBitrate", "6000000");
   if (fault.mismatch === "recipe") query.set("MaxWidth", "1920");
   if (fault.mismatch === "audio") query.set("AudioStreamIndex", "17");
   if (fault.mismatch === "namespace") {
@@ -299,6 +348,16 @@ function playbackInfo(subject, sid, body, fault) {
     MediaStreams: metadata(subject.kind, subject.variant).MediaSources[0]
       .MediaStreams,
   };
+  if (fault.mismatch === "item")
+    source.TranscodingUrl = source.TranscodingUrl.replace(
+      "Videos/fixture/",
+      "Videos/another/",
+    );
+  if (fault.mismatch === "fragment") source.TranscodingUrl += "#ignored";
+  if (fault.mismatch === "origin")
+    source.TranscodingUrl = "http://unowned.invalid/" + source.TranscodingUrl;
+  if (fault.mismatch === "subprotocol") source.TranscodingSubProtocol = "dash";
+  if (fault.mismatch === "container") source.TranscodingContainer = "mp4";
   if (selected !== undefined && selected !== null)
     source.DefaultAudioStreamIndex = selected;
   if (fault.mismatch === "silent-default") source.DefaultAudioStreamIndex = 0;
@@ -449,7 +508,8 @@ const upstream = createServer(async (request, response) => {
       fault.received = event;
       if (fault.hold) await fault.hold.promise;
       event.released_at = new Date().toISOString();
-      return json(playbackInfo(subject, sid, body, fault));
+      session.originalInfo = playbackInfo(subject, sid, body, fault);
+      return json(session.originalInfo);
     }
     if (
       [
@@ -712,6 +772,109 @@ try {
           ]).toString("utf8"),
         );
       }
+      function sealFixture(value) {
+        const nonce = randomBytes(12),
+          cipher = createCipheriv(
+            "aes-256-gcm",
+            Buffer.from(f.env.SOURCE_ENCRYPTION_KEY, "base64"),
+            nonce,
+          );
+        return Buffer.concat([
+          nonce,
+          cipher.update(JSON.stringify(value)),
+          cipher.final(),
+          cipher.getAuthTag(),
+        ]).toString("base64");
+      }
+      function assertExactReplay(replay, original) {
+        assert.ok(
+          Number.isFinite(replay.expires_in_seconds) &&
+            replay.expires_in_seconds > 0 &&
+            replay.expires_in_seconds <= original.expires_in_seconds,
+          "replay refreshes only its remaining positive lifetime",
+        );
+        assert.deepEqual(
+          { ...replay, expires_in_seconds: original.expires_in_seconds },
+          original,
+        );
+      }
+      function assertOwnedRoute(subject, plan) {
+        const row = ledger(plan.session_id),
+          session = contract.sessions.get(row.play_session_id);
+        const checkpoint = decodeProfile(
+          f.sql(
+            `SELECT response_encrypted FROM upstream_reservations WHERE id=${quote(plan.session_id)}`,
+          ),
+        );
+        assert.deepEqual(
+          checkpoint,
+          session.originalInfo,
+          "checkpoint is the exact original response, never completed in place",
+        );
+        const resource = decodeProfile(
+          f.sql(
+            `SELECT resource->>'encrypted' FROM playback_sessions WHERE id=${quote(plan.session_id)}`,
+          ),
+        );
+        const original = new URL(
+          checkpoint.MediaSources[0].TranscodingUrl,
+          upstreamOrigin + subject.base + "/",
+        );
+        const returned = new Map(
+          [...original.searchParams].map(([key, value]) => [
+            key.toLowerCase(),
+            value,
+          ]),
+        );
+        const audio = checkpoint.MediaSources[0].MediaStreams.some(
+          (stream) => stream.Type === "Audio",
+        );
+        const completion =
+          subject.kind === "emby" && audio && !returned.has("audiosamplerate");
+        const expected = new URL(original);
+        if (!returned.has("deviceid"))
+          expected.search += "&DeviceId=" + encodeURIComponent(row.device_id);
+        if (completion) expected.search += "&AudioSampleRate=48000";
+        assert.equal(
+          resource.url,
+          expected.href,
+          "only owned missing device identity and explicit missing sample rate are added",
+        );
+        const provenance = {
+          schema_version: 1,
+          semantics: "requested_configuration_not_measured_output",
+          frame_rate_field: returned.has("h264-maxframerate")
+            ? "h264-maxframerate"
+            : "maxframerate",
+          provider_audio_sample_rate: returned.has("audiosamplerate")
+            ? 48000
+            : null,
+          server_requested_audio_sample_rate: completion ? 48000 : null,
+        };
+        assert.deepEqual(
+          resource.upstream_profile_route_provenance,
+          provenance,
+        );
+        assert.equal(resource.upstream_session, row.play_session_id);
+        assert.equal(resource.upstream_device, row.device_id);
+        assert.equal(resource.upstream_media_source, row.media_source_id);
+        assert.equal(
+          plan.decision_reason ===
+            "emby_server_requested_audio_sample_rate_48000",
+          completion,
+        );
+        assert.equal(
+          count(subject),
+          1,
+          "completion and replay allocate no second PlaybackInfo or SID",
+        );
+        return {
+          provenance,
+          original_response_unchanged: true,
+          completed_same_sid: completion,
+          playback_posts: 1,
+        };
+      }
       function resealClock(value, expiresInMs) {
         const proof = decodeProfile(value),
           now = Number(
@@ -850,6 +1013,7 @@ try {
         return row;
       }
       async function closePlan(subject, plan) {
+        assertOwnedRoute(subject, plan);
         await subject.client.request(
           `/playback-sessions/${plan.session_id}`,
           "DELETE",
@@ -1171,8 +1335,33 @@ try {
           "subtitle-empty",
           "subtitle-duplicate",
           "missing-frame-rate",
-          "frame-rate-alias",
-          "missing-sample-rate",
+          ...(kind === "jellyfin"
+            ? ["frame-rate-alias", "missing-sample-rate"]
+            : []),
+          "frame-rate-conflict",
+          "frame-rate-over-bound",
+          "conflicting-sample-rate",
+          "empty-sample-rate",
+          "duplicate-sample-rate",
+          "sample-rate-alias",
+          "device",
+          "sid",
+          "video-copy",
+          "audio-copy",
+          "video-codec",
+          "audio-codec",
+          "channels",
+          "profile",
+          "level",
+          "range",
+          "video-index",
+          "audio-bitrate",
+          "video-bitrate",
+          "item",
+          "fragment",
+          "origin",
+          "subprotocol",
+          "container",
         ])
           await scenario(
             `${kind}: checkpoint ${mismatch} mismatch SID before owned Stop`,
@@ -1207,7 +1396,19 @@ try {
                   contract.sessions.get(fault.received.sid).starts,
                   0,
                 );
+                const retainedOriginal = decodeProfile(
+                  f.sql(
+                    `SELECT response_encrypted FROM upstream_reservations WHERE id=${quote(row.session_id)}`,
+                  ),
+                );
+                assert.deepEqual(
+                  retainedOriginal,
+                  contract.sessions.get(fault.received.sid).originalInfo,
+                );
                 record.checkpoint = checkpoint;
+                record.original_response_unchanged = true;
+                record.missing_sample_rate_did_not_bypass_other_guards =
+                  kind === "emby";
                 fault.stopHold.release();
                 record.terminal = await stopped(row.session_id);
                 await drained(body.idempotency_key);
@@ -1571,6 +1772,131 @@ try {
           },
         );
       }
+      for (const [explicitSampleRate, genericFrameRate] of [
+        [true, false],
+        [true, true],
+        [false, true],
+      ])
+        await scenario(
+          `emby: original sample ${explicitSampleRate ? "48000" : "missing"} with ${genericFrameRate ? "generic" : "codec-specific"} frame rate retains provenance`,
+          async (record) => {
+            const subject = await setup("emby", "same SID provenance variants"),
+              profile = await minted(subject),
+              body = subject.body(profile);
+            subject.playbackQueue.push({
+              explicitSampleRate,
+              genericFrameRate,
+            });
+            const first = await prepare(subject, body);
+            assert.equal(first.status, 200);
+            Object.assign(record, assertOwnedRoute(subject, first.body));
+            const replay = await prepare(subject, body);
+            assert.equal(replay.status, 200);
+            assertExactReplay(replay.body, first.body);
+            await drained(body.idempotency_key);
+            await closePlan(subject, first.body);
+            await unaffected();
+          },
+        );
+      await scenario(
+        "emby: isolated completed route and provenance tampering rejects replay without second SID",
+        async (record) => {
+          const subject = await setup("emby", "replay proof tamper"),
+            profile = await minted(subject),
+            body = subject.body(profile);
+          const first = await prepare(subject, body);
+          assert.equal(first.status, 200);
+          const id = first.body.session_id;
+          await drained(body.idempotency_key);
+          Object.assign(record, assertOwnedRoute(subject, first.body));
+          const storedResource = read(
+            `SELECT resource FROM playback_sessions WHERE id=${quote(id)}`,
+          );
+          const originalEncrypted = storedResource.encrypted;
+          const originalPlan = f.sql(
+            `SELECT response_encrypted FROM playback_requests WHERE session_id=${quote(id)}`,
+          );
+          const originalCheckpoint = f.sql(
+            `SELECT response_encrypted FROM upstream_reservations WHERE id=${quote(id)}`,
+          );
+          const restore = () => {
+            f.sql(
+              `UPDATE playback_sessions SET resource=jsonb_set(resource,'{encrypted}',to_jsonb(${quote(originalEncrypted)}::text)) WHERE id=${quote(id)}`,
+            );
+            f.sql(
+              `UPDATE playback_requests SET response_encrypted=${quote(originalPlan)} WHERE session_id=${quote(id)}`,
+            );
+            f.sql(
+              `UPDATE upstream_reservations SET response_encrypted=${quote(originalCheckpoint)} WHERE id=${quote(id)}`,
+            );
+          };
+          record.fault_injection =
+            "Only this isolated fixture's encrypted resource/plan/checkpoint is resealed for rejection tests; every original value is restored before cleanup";
+          record.rejections = [];
+          try {
+            for (const name of [
+              "missing provenance",
+              "wrong provenance",
+              "missing sample request",
+              "changed frame rate",
+              "wrong SID",
+              "wrong decision reason",
+              "changed original checkpoint",
+            ]) {
+              restore();
+              if (name === "changed original checkpoint") {
+                const checkpoint = decodeProfile(originalCheckpoint);
+                checkpoint.MediaSources[0].TranscodingUrl +=
+                  "&AudioSampleRate=48000";
+                f.sql(
+                  `UPDATE upstream_reservations SET response_encrypted=${quote(sealFixture(checkpoint))} WHERE id=${quote(id)}`,
+                );
+              } else if (name === "wrong decision reason") {
+                const plan = decodeProfile(originalPlan);
+                plan.decision_reason = "upstream_transcode";
+                f.sql(
+                  `UPDATE playback_requests SET response_encrypted=${quote(sealFixture(plan))} WHERE session_id=${quote(id)}`,
+                );
+              } else {
+                const inner = decodeProfile(originalEncrypted);
+                if (name === "missing provenance")
+                  delete inner.upstream_profile_route_provenance;
+                if (name === "wrong provenance")
+                  inner.upstream_profile_route_provenance.provider_audio_sample_rate = 48000;
+                if (name === "missing sample request") {
+                  const url = new URL(inner.url);
+                  url.searchParams.delete("AudioSampleRate");
+                  inner.url = url.href;
+                }
+                if (name === "changed frame rate") {
+                  const url = new URL(inner.url);
+                  url.searchParams.set("h264-maxframerate", "60");
+                  inner.url = url.href;
+                }
+                if (name === "wrong SID") {
+                  const url = new URL(inner.url);
+                  url.searchParams.set("PlaySessionId", "another-sid");
+                  inner.url = url.href;
+                }
+                f.sql(
+                  `UPDATE playback_sessions SET resource=jsonb_set(resource,'{encrypted}',to_jsonb(${quote(sealFixture(inner))}::text)) WHERE id=${quote(id)}`,
+                );
+              }
+              const rejected = await prepare(subject, body);
+              error(rejected, 409, "STALE_CAPABILITY_REPORT");
+              assert.equal(count(subject), 1);
+              record.rejections.push({ name, ...safeResponse(rejected) });
+            }
+          } finally {
+            restore();
+          }
+          const replay = await prepare(subject, body);
+          assert.equal(replay.status, 200);
+          assertExactReplay(replay.body, first.body);
+          await closePlan(subject, first.body);
+          await unaffected();
+        },
+      );
       for (const action of ["source-policy", "account-generation"])
         await scenario(
           `held final metadata rechecks current ${action} before any PlaybackInfo POST`,

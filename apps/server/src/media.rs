@@ -580,15 +580,16 @@ async fn prepare_playback(
             let url = if let Some(selection) = &upstream_profile {
                 transport = "hls";
                 mode = "transcode";
-                providers::upstream_profiles::validate_route(
+                let route = providers::upstream_profiles::complete_route(
                     &kind,
                     &config,
                     &selection.metadata,
                     &info,
+                    &format!("rainsync-{}", reservation.session),
                 )
-                .map_err(|_| err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"))?
-                .url
-                .to_string()
+                .map_err(|_| err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"))?;
+                resource["upstream_profile_route_provenance"] = json!(route.provenance);
+                route.url.to_string()
             } else if !use_direct && let Some(path) = source["TranscodingUrl"].as_str() {
                 transport = "hls";
                 mode = "transcode";
@@ -927,14 +928,22 @@ async fn prepare_playback(
         playback_metrics_version: None,
         playback_metrics: None,
         observation_seq: body.observation_version.map(|_| 0),
-        decision_reason: Some(playback_plan::decision_reason(
-            &kind,
-            requested_mode,
-            mode,
-            current_metadata,
-            probed,
-            selected.as_ref().map(|s| s.candidate.id.as_str()),
-        )),
+        decision_reason: Some(
+            if resource["upstream_profile_route_provenance"]["server_requested_audio_sample_rate"]
+                == 48_000
+            {
+                "emby_server_requested_audio_sample_rate_48000".into()
+            } else {
+                playback_plan::decision_reason(
+                    &kind,
+                    requested_mode,
+                    mode,
+                    current_metadata,
+                    probed,
+                    selected.as_ref().map(|s| s.candidate.id.as_str()),
+                )
+            },
+        ),
         selected_candidate_id: selected.as_ref().map(|s| s.candidate.id.clone()),
         subtitle_mode: Some(subtitle_mode),
         seekable_media_ranges_ms: None,

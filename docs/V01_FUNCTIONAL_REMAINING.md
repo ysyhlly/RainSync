@@ -63,19 +63,29 @@ implemented in the published candidate. Its final controlled API matrix passed 4
 cases and its frontend suite passed 576 tests. See [the contract and evidence
 limits](UPSTREAM_PROFILE_ENVELOPE.md).
 
-The [finite product job at `464dc39`](https://github.com/ysyhlly/RainSync/actions/runs/36949379906/job/110658667275)
-has run and failed: all six explicit-profile preparations returned 502, before
-finite output decoding. Actual recipe propagation and decoded output against
-both pinned products therefore remain unverified. All six case cleanup checks
-passed, but Jellyfin encoder-stop confirmation remained false and final host
-fixture-data removal hit Emby config-directory EACCES. The scoped fixture storage
-repair has local ownership/refusal tests only; real Docker cleanup needs CI. Auto/direct/remux behavior
-stays unchanged. Prepared same-SID exact-output negotiation, broad HLS identity,
+The [fixed-product run at `8897d2`](https://github.com/ysyhlly/RainSync/actions/runs/36957757296)
+passed all three Jellyfin profile cases, including finite Worker output and
+cleanup. All three Emby RainSync preparations still returned 502 under strict
+route admission. A separate same-SID raw Emby diagnostic completed without
+altering its returned route: synthetic 60 fps / 44.1 kHz input produced finite
+30 fps H.264 Main video and 44.1 kHz AAC-LC audio across three segments (562,496
+bytes). It did not produce the requested 48 kHz audio. Missing `audiosamplerate`
+therefore remains a genuine compatibility gap. Cleanup and integrity checks
+passed; this diagnostic success does not mark Emby profile acceptance passed.
+See [the exact evidence](UPSTREAM_PROFILE_ENVELOPE.md#verified-product-and-finite-diagnostic-checkpoint-8897d2).
+
+The core `326e744` checkpoint separately passed its complete
+[checks workflow](https://github.com/ysyhlly/RainSync/actions/runs/36954508736).
+That result does not replace per-product, exact-head or release acceptance.
+Auto/direct/remux behavior stays unchanged. Prepared same-SID exact-output negotiation, broad HLS identity,
 ambiguous media versions and automatic decoder fallback to another upstream SID
 are not enabled by this smaller slice.
 
-The selected implementation is published, but the concrete product compatibility
-failure is still open. It is not a fresh exhaustive audit or a claim that
+The selected implementation is published, but the concrete Emby compatibility
+failure is still open pending pinned-product output validation of the authorized
+local same-SID sample-rate completion candidate. That candidate passed 111
+controlled Server/PostgreSQL cases and 583 frontend tests; it has not yet proved
+real Emby 48 kHz output. It is not a fresh exhaustive audit or a claim that
 the broader original exact-output design is implemented. Further work should
 follow a concrete compatibility failure or an explicit scope decision.
 

@@ -78,11 +78,24 @@ pub struct UpstreamAudioEvidence {
     pub max_bit_rate: u32,
 }
 
+/// Distinguish upstream-returned evidence from our explicit request. Neither
+/// proves measured output. Kept in the encrypted playback grant and replayed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamProfileRouteProvenance {
+    pub schema_version: u8,
+    pub semantics: String,
+    pub frame_rate_field: String,
+    pub provider_audio_sample_rate: Option<u32>,
+    pub server_requested_audio_sample_rate: Option<u32>,
+}
+
 pub struct UpstreamProfileRoute {
     pub url: reqwest::Url,
     pub media_source_id: String,
     pub audio_index: Option<u32>,
     pub evidence: UpstreamProfileEvidence,
+    pub provenance: UpstreamProfileRouteProvenance,
 }
 
 pub fn evidence(metadata: &UpstreamProfileMetadata) -> UpstreamProfileEvidence {
@@ -570,8 +583,10 @@ pub fn validate_metadata_proof(metadata: &UpstreamProfileMetadata) -> Result<()>
     Ok(())
 }
 
-/// Validates provider-returned configuration evidence without fetching media or
-/// synthesizing any missing constraint. Call only after the SID is checkpointed.
+/// Validate original provider-returned configuration without fetching media or
+/// changing its URL. Only an absent Emby audio sample rate may be completed by
+/// complete_route after all original guards and owned device identity pass.
+/// Call only after the SID is checkpointed.
 pub fn validate_route(
     kind: &str,
     config: &SourceConfig,
@@ -676,7 +691,39 @@ pub fn validate_route(
     }
     query_number(&query, "maxwidth", 1280.0)?;
     query_number(&query, "maxheight", 720.0)?;
-    query_number(&query, "maxframerate", 30.0)?;
+    let frame_rate_field = if kind == "emby" && query.contains_key("h264-maxframerate") {
+        ensure!(
+            !query.contains_key("maxframerate"),
+            "upstream_profile_route_ambiguous"
+        );
+        query_number(&query, "h264-maxframerate", 30.0)?;
+        "h264-maxframerate"
+    } else {
+        ensure!(
+            !query.contains_key("h264-maxframerate"),
+            "upstream_profile_route_ambiguous"
+        );
+        query_number(&query, "maxframerate", 30.0)?;
+        "maxframerate"
+    };
+    ensure!(
+        !query.contains_key("h264-framerate"),
+        "upstream_profile_route_ambiguous"
+    );
+    if let Some(fixed) = query.get("framerate") {
+        let fixed = fixed.parse::<f64>().ok();
+        let ceiling = query
+            .get(frame_rate_field)
+            .and_then(|value| value.parse::<f64>().ok());
+        ensure!(
+            fixed
+                .zip(ceiling)
+                .is_some_and(|(fixed, ceiling)| fixed.is_finite()
+                    && fixed > 0.0
+                    && fixed <= ceiling),
+            "upstream_profile_route_mismatch"
+        );
+    }
     query_number(&query, "videobitrate", 4_000_000.0)?;
     for (key, max) in [("width", 1280.0), ("height", 720.0), ("framerate", 30.0)] {
         if query.contains_key(key) {
@@ -724,6 +771,8 @@ pub fn validate_route(
         query_exact(&query, range, "SDR")?;
     }
     let audio_index = metadata.audio.as_ref().map(|audio| audio.index);
+    let mut provider_audio_sample_rate = None;
+    let mut server_requested_audio_sample_rate = None;
     if let Some(audio) = &metadata.audio {
         ensure!(
             source["DefaultAudioStreamIndex"].as_u64() == Some(u64::from(audio.index)),
@@ -732,7 +781,20 @@ pub fn validate_route(
         query_exact(&query, "audiostreamindex", &audio.index.to_string())?;
         query_exact(&query, "audiocodec", "aac")?;
         query_number(&query, "audiobitrate", 128_000.0)?;
-        query_exact(&query, "audiosamplerate", "48000")?;
+        // An explicit contradictory value cannot be silently overwritten.
+        // Codec-prefixed or alternative sample-rate knobs are not this contract.
+        ensure!(
+            !query
+                .keys()
+                .any(|key| key != "audiosamplerate" && key.contains("samplerate")),
+            "upstream_profile_route_ambiguous"
+        );
+        if kind == "emby" && !query.contains_key("audiosamplerate") {
+            server_requested_audio_sample_rate = Some(48_000);
+        } else {
+            query_exact(&query, "audiosamplerate", "48000")?;
+            provider_audio_sample_rate = Some(48_000);
+        }
         let channels = if query.contains_key("transcodingmaxaudiochannels") {
             "transcodingmaxaudiochannels"
         } else {
@@ -778,7 +840,48 @@ pub fn validate_route(
         media_source_id: metadata.media_source_id.clone(),
         audio_index,
         evidence: evidence(metadata),
+        provenance: UpstreamProfileRouteProvenance {
+            schema_version: 1,
+            semantics: "requested_configuration_not_measured_output".into(),
+            frame_rate_field: frame_rate_field.into(),
+            provider_audio_sample_rate,
+            server_requested_audio_sample_rate,
+        },
     })
+}
+
+/// Complete only the documented missing AudioSampleRate on the original owned
+/// Emby SID. A new PlaybackInfo request, route identity or recipe is never minted.
+pub fn complete_route(
+    kind: &str,
+    config: &SourceConfig,
+    metadata: &UpstreamProfileMetadata,
+    info: &Value,
+    device_id: &str,
+) -> Result<UpstreamProfileRoute> {
+    let mut route = validate_route(kind, config, metadata, info)?;
+    let sid = info["PlaySessionId"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("upstream_profile_route_unavailable"))?;
+    // Check any returned DeviceId before adding a configuration request. The
+    // existing owned identity binder may supply only missing identity fields.
+    route.url = super::bind_playback_identity(route.url, sid, device_id)?;
+    if route.provenance.server_requested_audio_sample_rate == Some(48_000) {
+        ensure!(
+            kind == "emby" && metadata.audio.is_some(),
+            "upstream_profile_route_mismatch"
+        );
+        let original = route.url.query().unwrap_or_default();
+        route
+            .url
+            .set_query(Some(&format!("{original}&AudioSampleRate=48000")));
+    }
+    // Final length/count bounds still apply after owned identity/completion.
+    let final_query = route_query(&route.url)?;
+    if metadata.audio.is_some() {
+        query_exact(&final_query, "audiosamplerate", "48000")?;
+    }
+    Ok(route)
 }
 
 #[cfg(test)]
@@ -1195,25 +1298,197 @@ mod tests {
     }
 
     #[test]
-    fn source_metadata_does_not_replace_missing_returned_frame_or_sample_bounds() {
+    fn missing_fields_remain_distinct_from_owned_request_completion() {
         let mut metadata = proof();
         metadata.video.frame_rate = Some(10.0);
         metadata.audio.as_mut().unwrap().sample_rate = 48_000;
         for kind in ["jellyfin", "emby"] {
             let good = reply(kind);
             let path = good["MediaSources"][0]["TranscodingUrl"].as_str().unwrap();
-            for returned in [
-                path.replace("&MaxFramerate=30", ""),
-                path.replace("&AudioSampleRate=48000", ""),
-                path.replace("&MaxFramerate=30", "&h264-maxframerate=30"),
-                path.replace("&AudioSampleRate=48000", "&aac-audiosamplerate=48000"),
+            for (returned, emby_allowed) in [
+                (path.replace("&MaxFramerate=30", ""), false),
+                (path.replace("&AudioSampleRate=48000", ""), true),
+                (
+                    path.replace("&MaxFramerate=30", "&h264-maxframerate=30"),
+                    true,
+                ),
+                (
+                    path.replace("&AudioSampleRate=48000", "&aac-audiosamplerate=48000"),
+                    false,
+                ),
             ] {
                 let mut info = good.clone();
                 info["MediaSources"][0]["TranscodingUrl"] = json!(returned);
-                assert!(validate_route(kind, &config(), &metadata, &info).is_err());
+                assert_eq!(
+                    validate_route(kind, &config(), &metadata, &info).is_ok(),
+                    kind == "emby" && emby_allowed
+                );
                 assert_eq!(info["MediaSources"][0]["TranscodingUrl"], returned);
             }
         }
+    }
+
+    fn emby_missing_rate() -> Value {
+        let mut info = reply("emby");
+        let path = info["MediaSources"][0]["TranscodingUrl"]
+            .as_str()
+            .unwrap()
+            .replace("&MaxFramerate=30", "&h264-maxframerate=30")
+            .replace("&AudioSampleRate=48000", "");
+        info["MediaSources"][0]["TranscodingUrl"] =
+            json!(format!("{path}&DeviceId=owned-device&opaque=a%2fb%20c%2Bd"));
+        info
+    }
+
+    #[test]
+    fn emby_completion_changes_only_missing_sample_rate_and_keeps_provenance() {
+        let info = emby_missing_rate();
+        let original = info.clone();
+        let observed = validate_route("emby", &config(), &proof(), &info).unwrap();
+        assert_eq!(observed.provenance.provider_audio_sample_rate, None);
+        assert_eq!(
+            observed.provenance.server_requested_audio_sample_rate,
+            Some(48_000)
+        );
+        assert_eq!(observed.provenance.frame_rate_field, "h264-maxframerate");
+        assert!(!observed.url.query().unwrap().contains("AudioSampleRate"));
+        let completed = complete_route("emby", &config(), &proof(), &info, "owned-device").unwrap();
+        assert_eq!(
+            completed.url.as_str(),
+            format!("{}&AudioSampleRate=48000", observed.url)
+        );
+        assert_eq!(completed.provenance, observed.provenance);
+        assert_eq!(info, original);
+        let mut missing_device = info.clone();
+        missing_device["MediaSources"][0]["TranscodingUrl"] = json!(
+            info["MediaSources"][0]["TranscodingUrl"]
+                .as_str()
+                .unwrap()
+                .replace("&DeviceId=owned-device", "")
+        );
+        let observed = validate_route("emby", &config(), &proof(), &missing_device).unwrap();
+        let completed =
+            complete_route("emby", &config(), &proof(), &missing_device, "owned-device").unwrap();
+        assert_eq!(
+            completed.url.as_str(),
+            format!(
+                "{}&DeviceId=owned-device&AudioSampleRate=48000",
+                observed.url
+            )
+        );
+        let echoed =
+            complete_route("emby", &config(), &proof(), &reply("emby"), "owned-device").unwrap();
+        assert_eq!(echoed.provenance.provider_audio_sample_rate, Some(48_000));
+        assert_eq!(echoed.provenance.server_requested_audio_sample_rate, None);
+        assert_eq!(
+            echoed
+                .url
+                .query_pairs()
+                .filter(|(key, _)| key.eq_ignore_ascii_case("audiosamplerate"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn emby_completion_rejects_conflicting_duplicate_and_original_guard_failures() {
+        let good = emby_missing_rate();
+        let path = good["MediaSources"][0]["TranscodingUrl"].as_str().unwrap();
+        for route in [
+            format!("{path}&AudioSampleRate=44100"),
+            format!("{path}&AudioSampleRate=48000&AUDIOSAMPLERATE=48000"),
+            format!("{path}&aac-audiosamplerate=48000"),
+            format!("{path}&MaxFramerate=30"),
+            format!("{path}&h264-framerate=60"),
+            format!(
+                "{}&Framerate=30",
+                path.replace("h264-maxframerate=30", "h264-maxframerate=24")
+            ),
+            path.replace("h264-maxframerate=30", "h264-maxframerate=60"),
+            path.replace("DeviceId=owned-device", "DeviceId=foreign-device"),
+            path.replace("PlaySessionId=owned-sid", "PlaySessionId=foreign-sid"),
+            path.replace("MediaSourceId=source", "MediaSourceId=other"),
+            path.replace("AudioStreamIndex=1", "AudioStreamIndex=2"),
+            path.replace("allowVideoStreamCopy=false", "allowVideoStreamCopy=true"),
+            format!("{path}&SubtitleStreamIndex=0"),
+            format!("{path}&SubtitleMethod=Encode"),
+            format!("https://foreign.example/{path}"),
+            format!("{path}#fragment"),
+        ] {
+            let mut info = good.clone();
+            info["MediaSources"][0]["TranscodingUrl"] = json!(route);
+            let before = info.clone();
+            assert!(
+                complete_route("emby", &config(), &proof(), &info, "owned-device").is_err(),
+                "{route}"
+            );
+            assert_eq!(info, before);
+        }
+        assert!(complete_route("jellyfin", &config(), &proof(), &good, "owned-device").is_err());
+    }
+
+    #[test]
+    fn completion_does_not_add_audio_to_known_silent_media() {
+        let mut metadata = proof();
+        metadata.audio = None;
+        let mut info = emby_missing_rate();
+        let route = info["MediaSources"][0]["TranscodingUrl"]
+            .as_str()
+            .unwrap()
+            .replace("&AudioStreamIndex=1", "");
+        info["MediaSources"][0]["TranscodingUrl"] = json!(route);
+        info["MediaSources"][0]["DefaultAudioStreamIndex"] = Value::Null;
+        let completed =
+            complete_route("emby", &config(), &metadata, &info, "owned-device").unwrap();
+        assert_eq!(
+            completed.provenance.server_requested_audio_sample_rate,
+            None
+        );
+        assert!(!completed.url.query().unwrap().contains("AudioSampleRate"));
+    }
+
+    #[test]
+    fn completion_preserves_final_url_and_query_count_bounds() {
+        let mut info = emby_missing_rate();
+        let mut route = info["MediaSources"][0]["TranscodingUrl"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let base = super::super::validate_url(&config().url).unwrap();
+        while super::super::upstream_url(&base, &route)
+            .unwrap()
+            .as_str()
+            .len()
+            + 1010
+            < 16380
+        {
+            route.push_str(&format!("&p{}={}", route.len(), "x".repeat(1000)));
+        }
+        let remaining = 16380
+            - super::super::upstream_url(&base, &route)
+                .unwrap()
+                .as_str()
+                .len()
+            - 6;
+        route.push_str(&format!("&last={}", "x".repeat(remaining)));
+        info["MediaSources"][0]["TranscodingUrl"] = json!(route);
+        assert!(validate_route("emby", &config(), &proof(), &info).is_ok());
+        assert!(complete_route("emby", &config(), &proof(), &info, "owned-device").is_err());
+        let mut info = emby_missing_rate();
+        let mut route = info["MediaSources"][0]["TranscodingUrl"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let count = super::super::upstream_url(&base, &route)
+            .unwrap()
+            .query_pairs()
+            .count();
+        for index in count..128 {
+            route.push_str(&format!("&padding{index}=x"));
+        }
+        info["MediaSources"][0]["TranscodingUrl"] = json!(route);
+        assert!(validate_route("emby", &config(), &proof(), &info).is_ok());
+        assert!(complete_route("emby", &config(), &proof(), &info, "owned-device").is_err());
     }
 
     #[tokio::test]

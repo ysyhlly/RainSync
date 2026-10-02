@@ -513,6 +513,62 @@ pub async fn guard_replay(
     {
         return Err(invalid_report());
     }
+    // Replay the deterministic request completion from the original checkpoint,
+    // never from the already-completed URL. No network or second SID is created.
+    let checkpoint = sqlx::query("SELECT response_encrypted,scope_encrypted,device_id,play_session_id,media_source_id FROM upstream_reservations WHERE id=$1 AND user_id=$2 AND request_key=$3 AND source_id=$4 AND state='active' AND negotiation='received'")
+        .bind(session).bind(user).bind(key).bind(binding.source)
+        .fetch_optional(&mut *tx).await?.ok_or_else(invalid_report)?;
+    let original = app
+        .decrypt(
+            checkpoint
+                .get::<Option<String>, _>("response_encrypted")
+                .as_deref()
+                .ok_or_else(invalid_report)?,
+        )
+        .map_err(|_| invalid_report())?;
+    let scope = app
+        .decrypt(&checkpoint.get::<String, _>("scope_encrypted"))
+        .map_err(|_| invalid_report())?;
+    let config: providers::SourceConfig =
+        serde_json::from_value(scope["config"].clone()).map_err(|_| invalid_report())?;
+    let device = checkpoint.get::<String, _>("device_id");
+    if scope["item"] != binding.item
+        || device != format!("rainsync-{session}")
+        || checkpoint
+            .get::<Option<String>, _>("play_session_id")
+            .as_deref()
+            != original["PlaySessionId"].as_str()
+        || checkpoint
+            .get::<Option<String>, _>("media_source_id")
+            .as_deref()
+            != Some(binding.metadata.media_source_id.as_str())
+    {
+        return Err(invalid_report());
+    }
+    let expected = providers::upstream_profiles::complete_route(
+        &binding.kind,
+        &config,
+        &binding.metadata,
+        &original,
+        &device,
+    )
+    .map_err(|_| invalid_report())?;
+    let completion = expected
+        .provenance
+        .server_requested_audio_sample_rate
+        .is_some();
+    let persisted = &inner["upstream_profile_route_provenance"];
+    // Pre-upgrade echoed-rate grants may lack this new diagnostic field; no
+    // pre-upgrade grant could have used the newly authorized absent-only path.
+    if inner["url"].as_str() != Some(expected.url.as_str())
+        || inner["upstream_device"] != device
+        || inner["upstream_session"] != original["PlaySessionId"]
+        || ((!persisted.is_null() || completion) && *persisted != json!(expected.provenance))
+        || (plan["decision_reason"] == "emby_server_requested_audio_sample_rate_48000")
+            != completion
+    {
+        return Err(invalid_report());
+    }
     // Re-evaluate clock expiry, exact membership and actual grant association
     // after the contended session lock. A valid context is not any-grant access.
     let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions p JOIN playback_requests r ON r.session_id=p.id JOIN room_members m ON m.room_id=p.room_id AND m.user_id=p.user_id JOIN sessions login ON login.user_id=p.user_id WHERE p.id=$1 AND p.user_id=$2 AND p.room_id=$3 AND p.media_id=$4 AND p.lifecycle_epoch=$5 AND p.generation=$6 AND NOT p.stopped AND p.expires_at>clock_timestamp() AND playback_source_allowed(p.media_id,p.resource) AND r.user_id=$2 AND r.idempotency_key=$7 AND r.status='completed' AND m.membership_epoch=$8 AND login.token_hash=$9 AND login.expires_at>clock_timestamp() AND $10::bigint<=FLOOR(EXTRACT(EPOCH FROM clock_timestamp())*1000)::bigint)")

@@ -1,8 +1,9 @@
 # Explicit upstream transcode profile envelope
 
-Published on `integration/v0.1-next`; the fixed-product run at
-`464dc39fba02431807aef0bb924fd0b0e46ba11a` failed. The controlled checks below
-remain separate from real-product compatibility.
+Published on `integration/v0.1-next`. At `8897d20273512a194929d84c62ba8fb47f19e021`,
+Jellyfin passed the three fixed-product profile cases; Emby still failed closed.
+A separate finite Emby diagnostic completed and observed 44.1 kHz audio rather
+than the requested 48 kHz. This is not a blanket upstream compatibility pass.
 This is the smaller profile-envelope option chosen on 2026-10-01. It does not
 introduce a prepared/consumed upstream SID lifecycle or measured-output claim.
 
@@ -61,10 +62,11 @@ database outage can return an HTTP response within the preflight deadline.
 
 No new credentials, account mapping, source access, revoked-device authority or
 automatic new-SID fallback is introduced. Product-specific recipe propagation
-and actual generated output must be verified against the fixed Jellyfin and
-Emby images before their profile support is declared implemented.
+and actual generated output must be verified against each fixed product before
+its profile support is declared implemented. The current per-product evidence
+is recorded below.
 
-## Controlled evidence and failed product check
+## Controlled evidence and historical failed product check
 
 Protocol tests and generated exports passed. Provider and Server tests and strict
 Clippy passed; the Server run included 81 unit tests and 17 presence tests, with
@@ -112,14 +114,14 @@ with EACCES on Emby's bind-mounted configuration directory.
 The fixture now uses per-run owner-labeled Docker volumes for disposable config
 and cache, retaining credentials outside the host evidence tree. Existing volumes
 are not adopted, and named-volume deletion requires the exact run owner label.
-Seven dependency-free ownership/refusal tests and syntax checks passed locally;
-Docker was unavailable, so the new real-product cleanup path still needs CI.
-No permission widening or privileged host cleanup is used.
+Seven dependency-free ownership/refusal tests and syntax checks passed locally.
+The later `8897d2` product/diagnostic run verified Docker volume cleanup and host
+fixture-data removal. No permission widening or privileged host cleanup is used.
 
-The next implementation work is the concrete compatibility failure, not broader
-exact-output negotiation. Existing raw upstream policy failures remain separate
-from RainSync enforcement and this profile feature. No new device, sustained-load
-or production acceptance is claimed.
+The next possible implementation work is the concrete Emby sample-rate request
+failure, subject to the selected scope and validation. Existing raw upstream policy
+failures remain separate from RainSync enforcement and this profile feature. No
+new device, sustained-load or production acceptance is claimed.
 
 ## Explicit diagnostic execution
 
@@ -135,3 +137,122 @@ head commit message is checked, so a marker in an earlier commit does not enable
 later pushes. Re-running that explicitly opted-in workflow run can repeat the
 diagnostic; this is an event opt-in, not a persistent setting. The existing
 fixed-product acceptance still runs and retains its own failure result.
+
+## Verified product and finite diagnostic checkpoint: 8897d2
+
+The [exact-head upstream run](https://github.com/ysyhlly/RainSync/actions/runs/36957757296)
+and [sanitized artifact 11206840800](https://github.com/ysyhlly/RainSync/actions/runs/36957757296/artifacts/11206840800)
+establish separate results:
+
+- Jellyfin 10.11.0 passed all three RainSync profile cases: H.264 from zero,
+  HEVC seek with default audio, and HEVC seek with alternate audio. The finite
+  Worker-delivered output checks and each case's cleanup passed.
+- Emby 4.10.0.40 returned HTTP 502 from RainSync preparation in all three profile
+  cases. Strict admission still rejected incomplete profile route evidence;
+  these failures were not converted to acceptance successes.
+- The separate raw Emby diagnostic used the unchanged returned route and its
+  original SID on synthetic 60 fps / 44.1 kHz input. Three segments, totaling
+  562,496 bytes, produced finite H.264 Main video at 30 fps and AAC-LC audio at
+  44.1 kHz. The finite audio/video decode completed. Requested 48 kHz was not
+  observed; changing only the browser capability estimate would hide this fact.
+- The original route contained `h264-maxframerate=30`; generic `maxframerate`,
+  `framerate`, and `audiosamplerate` were absent. The diagnostic did not add them.
+- Exact-SID Playing/Stopped and ActiveEncodings cleanup both returned 204.
+  Container, network, owned volumes and host fixture data were removed; source,
+  binary and tool/sample integrity checks passed.
+
+Earlier diagnostic attempts at `88388d6` and `f01ce8a` failed in the harness
+before media reads. Their JSON redaction/cause retention and origin-root route
+handling were repaired before the successful finite diagnostic above. They
+provide no output-decoding evidence.
+
+Separately, the core implementation checkpoint `326e744` passed its complete
+[checks workflow](https://github.com/ysyhlly/RainSync/actions/runs/36954508736).
+That result belongs to that exact head. It does not change the separate upstream
+workflow's failures or mark all later candidate workflows, platforms or release
+acceptance passed.
+
+## Parameter research for a possible next step
+
+The official [HLS guide](https://dev.emby.media/doc/restapi/Http-Live-Streaming.html)
+and [master playlist API reference](https://dev.emby.media/reference/RestAPI/DynamicHlsService/getVideosByIdMasterM3u8.html)
+document `AudioSampleRate` as an explicit requested output rate. The public
+master/main references inspected on 2026-10-02 did not list generic `MaxFramerate`
+or `Framerate`; their absence is not evidence that those fields are unsupported,
+but neither is it proof of support on the pinned 4.10.0.40 image. The observed
+namespaced `h264-maxframerate=30` and finite 30 fps output are product evidence,
+not a general API guarantee. Any new generic frame-rate parameter should first
+be checked against that fixed product's own API schema or an explicit bounded
+product test.
+
+The successful raw diagnostic above did not alter the route. The authorized local
+request-completion candidate below has no pinned-product output result yet. Requested parameters, provider-returned
+fields and actual finite output must remain distinguishable in evidence.
+
+### Authorized narrow request repair, local candidate
+
+The local candidate preserves the provider-returned `h264-maxframerate=30` and
+adds only the documented `AudioSampleRate=48000` when absent, to the already
+owned master request for the same SID. This path was approved on 2026-10-02. Do not introduce an undocumented generic
+frame-rate field, a second PlaybackInfo call, an automatic new-SID fallback or a
+relaxed browser capability estimate.
+
+The mutation is server-owned and narrowly allowlisted. Original route
+identity/authorization, copy flags, audio selection and all other constraints
+must be checked before it; duplicates, conflicting rate fields, changed source,
+item, device, SID or origin must fail closed with the existing cleanup obligation.
+Evidence must distinguish provider-returned fields from explicitly requested
+parameters instead of treating the inserted field as a provider echo.
+
+Before enabling such a repair, the pinned product must prove finite 30 fps / 48 kHz
+output on synthetic 60 fps / 44.1 kHz input through the actual RainSync Worker
+path, including seek and alternate audio. Negative cases must retain one owned
+SID, no stale/cancelled fetch, bounded reads and exact-SID cleanup. A successful
+finite window would still not establish whole-title or physical-device behavior.
+
+
+The encrypted playback resource now records `upstream_profile_route_provenance`
+with schema version 1, semantics `requested_configuration_not_measured_output`,
+the returned frame-rate field name, and separate `provider_audio_sample_rate`
+and `server_requested_audio_sample_rate` values. Only the absent-rate Emby path
+sets the latter to 48000. Its public plan reason is
+`emby_server_requested_audio_sample_rate_48000`; the profile envelope continues
+to describe requested bounds, not measured output.
+
+Completion runs after the original SID response is durably checkpointed and all
+original route/selection/configuration and device checks pass. It preserves the
+original query bytes while appending the fixed sample-rate field; final URL
+length and query-count bounds are rechecked. Video-only media gains no audio
+parameter. Duplicate, contradictory, unknown sample-rate aliases, conflicting
+frame-rate aliases and selected subtitles remain rejected.
+
+Completed-key replay recomputes the final route and provenance from the original
+encrypted checkpoint, without networking or allocating a new SID, and compares
+these to the stored grant and plan reason after the existing authority fences.
+Older echoed-rate grants may lack the new provenance field; an absent-rate
+completed grant may not.
+
+
+### Local candidate validation, 2026-10-02
+
+The frozen candidate passed 111/111 actual isolated Server/PostgreSQL scenarios
+against controlled Jellyfin/Emby HTTP contracts. Coverage includes missing-rate
+completion, already-echoed 48 kHz, namespaced/generic frame-rate alternatives,
+duplicate/conflicting fields, wrong identity and selection, copy/subtitle guards,
+lost responses, cancellation, late SID cleanup, authorization/expiry fences and
+seven tampered replay proofs. All 96 allocated controlled SIDs received exactly
+one Stop; every Emby SID received exactly one encoding Stop. Server/PostgreSQL
+processes exited, all owned ports closed, and source/binary hashes stayed fixed.
+The report's SHA-256 is
+`ecda19aaddd8f9c5dd330de299d34a153646cccd7e17dd1c29010b03f2b67227`.
+
+Provider unit tests (36), Server unit tests (81 plus 17 presence tests, with two
+pre-existing isolated-database tests explicitly ignored), 583 frontend tests,
+31 dependency-free Node tests, strict Clippy, type checking and the frontend
+build passed locally. The pinned-product suite now uses synthetic 60 fps / 44.1
+kHz input for both H.264 and HEVC and all audio tracks. It checks the untouched
+PlaybackInfo checkpoint, the separately completed encrypted resource and actual
+Worker request, one SID, seek/alternate audio and finite decoded 30 fps / 48 kHz
+output. Docker is unavailable in this workspace, so that new product-output
+matrix is prepared but not run here. The earlier unchanged-route 44.1 kHz
+observation remains the latest real Emby output evidence until CI replaces it.
