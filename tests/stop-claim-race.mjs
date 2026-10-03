@@ -6,6 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isolatedServer, delay } from "./fixtures/server.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 
 assert.ok(process.env.RAINSYNC_ARTIFACT_DIR, "external evidence root required");
 const driver = resolve(
@@ -113,7 +114,7 @@ try {
             "SELECT deadlocks FROM pg_stat_database WHERE datname=current_database()",
           ),
         );
-        f.sql(`INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at)
+        withPlaybackAdmission(f, { client: admin, user: identity.id, room: room.id, session: id }, `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at)
         VALUES('${id}','${identity.id}','${room.id}','${media}',1,'${id}','{"upstream_closed":true}',now()+interval '1 hour');
         INSERT INTO playback_observations(session_id,user_id,room_id,media_id,generation,timeline_origin_ms,duration_ms)
         VALUES('${id}','${identity.id}','${room.id}','${media}',1,1000,10000);

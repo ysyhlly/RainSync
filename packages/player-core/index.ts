@@ -12,6 +12,7 @@ export {
   PlaybackPlanGenerations,
   matchesPlanGeneration,
 } from "./plan-generation";
+export { hasUsablePlaybackTimeline } from "./timeline";
 
 export type PlaybackRange = [number, number];
 const MIN_ROOM_RATE = 0.25;

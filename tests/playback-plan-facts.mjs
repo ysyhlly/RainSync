@@ -424,7 +424,7 @@ try {
     assert.equal(direct.plan.subtitle_mode, "external_vtt");
     assert.match(
       direct.plan.decision_reason,
-      /^local_automatic_direct_source_version_matched_metadata$/,
+      /^local_automatic_direct_authorized_probe$/,
     );
     assert.deepEqual(direct.plan.decoder_fallback_modes, [
       "remux",

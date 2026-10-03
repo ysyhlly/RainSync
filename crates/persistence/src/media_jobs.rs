@@ -83,6 +83,31 @@ pub struct Publication {
 }
 
 pub async fn claim(pool: &PgPool, owner: Uuid) -> Result<Option<Claim>> {
+    claim_queue(pool, owner, false).await
+}
+
+/// Purpose-separated Stage A claim; the production Worker does not dispatch
+/// this queue. Both queues share the existing durable fairness turn/lock.
+pub async fn claim_static_hls(pool: &PgPool, owner: Uuid) -> Result<Option<Claim>> {
+    claim_queue(pool, owner, true).await
+}
+
+async fn claim_queue(pool: &PgPool, owner: Uuid, static_hls: bool) -> Result<Option<Claim>> {
+    let queue = if static_hls {
+        "j.logical_queue='static_hls_v1'"
+    } else {
+        "j.logical_queue IS NULL"
+    };
+    let session_gate = if static_hls {
+        "AND static_hls_session_allowed(p.id)"
+    } else {
+        ""
+    };
+    let claimed_queue = if static_hls {
+        "claimed.logical_queue='static_hls_v1' AND static_hls_session_allowed(session.id)"
+    } else {
+        "claimed.logical_queue IS NULL"
+    };
     // Normalize abandoned work before claiming. Cancellation wins over retry
     // exhaustion; changing running to queued schedules backoff exactly once.
     let observation = begin_mutation_observation();
@@ -97,7 +122,7 @@ pub async fn claim(pool: &PgPool, owner: Uuid) -> Result<Option<Claim>> {
 WITH locked AS MATERIALIZED (
     SELECT j.id,j.status AS old_status,j.attempt AS old_attempt,
         j.timing_version,j.timing_attempt,j.queue_entered_at,j.run_started_at
-    FROM media_jobs j WHERE j.attempt>=j.max_attempts
+    FROM media_jobs j WHERE {queue} AND j.attempt>=j.max_attempts
         AND (j.status='queued' OR (j.status='running' AND j.lease_until<=clock_timestamp()))
     ORDER BY j.id FOR UPDATE OF j
 ), tick AS MATERIALIZED (
@@ -128,7 +153,7 @@ WITH locked AS MATERIALIZED (
 WITH locked AS MATERIALIZED (
     SELECT j.id,j.status AS old_status,j.attempt AS old_attempt,
         j.timing_version,j.timing_attempt,j.queue_entered_at,j.run_started_at
-    FROM media_jobs j WHERE j.status='running' AND j.lease_until<=clock_timestamp()
+    FROM media_jobs j WHERE {queue} AND j.status='running' AND j.lease_until<=clock_timestamp()
         AND j.attempt<j.max_attempts ORDER BY j.id FOR UPDATE OF j
 ), tick AS MATERIALIZED (
     SELECT CASE WHEN count(*)>=0 THEN clock_timestamp() END AS ended_at FROM locked
@@ -166,8 +191,8 @@ WITH locked AS MATERIALIZED (
     SELECT {OLD_PHASE_SQL}
     FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id
     LEFT JOIN media_queue_turns turn ON turn.user_id IS NOT DISTINCT FROM p.user_id
-    WHERE j.status='queued' AND j.attempt<j.max_attempts
-        AND j.available_at<=clock_timestamp() AND NOT p.stopped AND p.expires_at>clock_timestamp()
+    WHERE {queue} {session_gate} AND j.status='queued' AND j.attempt<j.max_attempts
+        AND j.available_at<=clock_timestamp() AND NOT p.stopped AND p.expires_at>clock_timestamp() AND playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch)
     ORDER BY turn.last_turn NULLS FIRST,j.created_at,j.id FOR UPDATE OF j SKIP LOCKED LIMIT 1
 ), tick AS MATERIALIZED (
     SELECT CASE WHEN count(*)>=0 THEN clock_timestamp() END AS ended_at FROM locked
@@ -176,9 +201,9 @@ UPDATE media_jobs claimed SET status='running',owner_id=$1,attempt=claimed.attem
     lease_until=clock_timestamp()+interval '30 seconds',timing_version=1,
     timing_attempt=claimed.attempt+1,queue_entered_at=NULL,run_started_at=t.ended_at
 FROM locked l CROSS JOIN tick t,playback_sessions session
-WHERE claimed.id=l.id AND session.id=claimed.session_id AND claimed.status='queued'
+WHERE {claimed_queue} AND claimed.id=l.id AND session.id=claimed.session_id AND claimed.status='queued'
     AND claimed.attempt<claimed.max_attempts AND claimed.available_at<=clock_timestamp()
-    AND NOT session.stopped AND session.expires_at>clock_timestamp()
+    AND NOT session.stopped AND session.expires_at>clock_timestamp() AND playback_origin_allowed(session.user_id,session.room_id,session.auth_login_hash,session.auth_membership_epoch)
 RETURNING claimed.id,claimed.spec,claimed.attempt,session.user_id,
     {SINGLE_PHASE_SQL}"#
     );
@@ -231,7 +256,7 @@ pub async fn renew_remaining(pool: &PgPool, claim: &Claim) -> Result<Option<std:
     }
     // Recheck the live lease/session after acquiring the row lock. A query
     // delayed by a lock must never revive an execution whose lease expired.
-    let remaining: Option<f64> = sqlx::query_scalar("UPDATE media_jobs j SET lease_until=clock_timestamp()+interval '30 seconds' FROM playback_sessions p WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND p.id=j.session_id AND NOT p.stopped AND p.expires_at>clock_timestamp() RETURNING extract(epoch FROM j.lease_until-clock_timestamp())::float8")
+    let remaining: Option<f64> = sqlx::query_scalar("UPDATE media_jobs j SET lease_until=clock_timestamp()+interval '30 seconds' FROM playback_sessions p WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND p.id=j.session_id AND NOT p.stopped AND p.expires_at>clock_timestamp() AND playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch) RETURNING extract(epoch FROM j.lease_until-clock_timestamp())::float8")
         .bind(claim.id).bind(claim.owner).bind(claim.attempt).fetch_optional(&mut *tx).await?;
     tx.commit().await?;
     remaining
@@ -296,7 +321,7 @@ UPDATE media_jobs j SET
 FROM locked l CROSS JOIN tick t,playback_sessions p
 WHERE j.id=l.id AND j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running'
     AND j.lease_until>clock_timestamp() AND p.id=j.session_id
-    AND NOT p.stopped AND p.expires_at>clock_timestamp()
+    AND NOT p.stopped AND p.expires_at>clock_timestamp() AND playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch)
 RETURNING j.status,{SINGLE_PHASE_SQL}"#
     );
     let ended = sqlx::query(&query)
@@ -371,7 +396,7 @@ UPDATE media_jobs j SET status=CASE WHEN j.attempt>=j.max_attempts THEN 'failed'
 FROM locked l CROSS JOIN tick t,playback_sessions p
 WHERE j.id=l.id AND j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running'
     AND j.lease_until>clock_timestamp() AND p.id=j.session_id
-    AND NOT p.stopped AND p.expires_at>clock_timestamp()
+    AND NOT p.stopped AND p.expires_at>clock_timestamp() AND playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch)
 RETURNING j.status,{SINGLE_PHASE_SQL}"#
     );
     let ended = sqlx::query(&query)

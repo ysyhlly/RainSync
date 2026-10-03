@@ -89,7 +89,7 @@ fn rewrite(
     text: &str,
 ) -> anyhow::Result<String> {
     anyhow::ensure!(depth < hls_manifest::MAX_DEPTH, "manifest_depth_limit");
-    let manifest = Manifest::parse(text)?;
+    let manifest = playback_manifest(text)?;
     // A repeated URI remains identical for implicit BYTERANGE offsets. Mixed
     // key/media aliases fail before returning any partially rewritten body.
     let mut granted: HashMap<String, (Kind, String)> = HashMap::new();
@@ -165,6 +165,71 @@ fn rewrite(
     })
 }
 
+fn playback_manifest(text: &str) -> anyhow::Result<Manifest<'_>> {
+    let manifest = Manifest::parse(text)?;
+    manifest.require_continuous_timeline()?;
+    Ok(manifest)
+}
+
+fn manifest_failure(error: anyhow::Error) -> (StatusCode, String) {
+    if error.is::<hls_manifest::UnsupportedTimeline>() {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_timeline".into(),
+        )
+    } else {
+        failure(error)
+    }
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+
+    #[test]
+    fn complete_numbered_vod_passes_the_delivery_guard_without_rewriting_its_timeline() {
+        let source = "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:7\n#EXTINF:4,\nsegment7.ts\n#EXTINF:4,\nsegment8.ts\n#EXT-X-ENDLIST\n";
+        let manifest = playback_manifest(source).unwrap();
+        let mut grants = Vec::new();
+        let output = manifest
+            .rewrite(|reference| {
+                grants.push(reference.uri.to_owned());
+                Ok(format!("/granted/{}", reference.uri))
+            })
+            .unwrap();
+        assert_eq!(grants, ["segment7.ts", "segment8.ts"]);
+        assert!(output.contains("#EXT-X-MEDIA-SEQUENCE:7\n#EXTINF:4,\n/granted/segment7.ts\n#EXTINF:4,\n/granted/segment8.ts"));
+    }
+
+    #[test]
+    fn unsupported_playback_manifest_never_grants_a_child_and_keeps_its_error() {
+        for text in [
+            "#EXTM3U\n#EXT-X-DISCONTINUITY\n#EXTINF:4,\nsecret.ts\n",
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:4,\nsecret.ts\n",
+        ] {
+            let mut grants = 0;
+            let result = playback_manifest(text).and_then(|manifest| {
+                manifest.rewrite(|_| {
+                    grants += 1;
+                    Ok("/should-not-be-granted".into())
+                })
+            });
+            assert_eq!(grants, 0);
+            assert_eq!(
+                manifest_failure(result.unwrap_err()),
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_timeline".into()
+                )
+            );
+        }
+        assert_eq!(
+            manifest_failure(anyhow::anyhow!("private upstream URL")),
+            (StatusCode::BAD_GATEWAY, "media_unavailable".into())
+        );
+    }
+}
+
 pub async fn response(
     app: &App,
     id: Uuid,
@@ -207,7 +272,7 @@ async fn prepare(
     let config = providers::resource_config(resource).map_err(failure)?;
     let mut request = tokio::select! {biased;
         _=input_failure.stopped()=>return Err(failure("input_cancelled")),
-        result=providers::source_request(&config,target.as_str(),if head {reqwest::Method::HEAD}else{reqwest::Method::GET},&config.headers)=>result.map_err(failure)?,
+        result=providers::source_media_request(&config,target.as_str(),if head {reqwest::Method::HEAD}else{reqwest::Method::GET},&config.headers)=>result.map_err(failure)?,
     };
     // Without a reliable pinned validator, If-Range safely yields the full body.
     if !head
@@ -220,7 +285,8 @@ async fn prepare(
     {
         request = request.header(header::RANGE, range)
     }
-    let response = tokio::select! {biased;_=input_failure.stopped()=>return Err(failure("input_cancelled")),result=request.send()=>result.map_err(|e|{input_failure.network(&e);failure(e)})?};
+    let response = tokio::select! {biased;_=input_failure.stopped()=>return Err(failure("input_cancelled")),result=request.send()=>result.map_err(|e|{if e.is_transient() { input_failure.transient(); } else { input_failure.permanent(); } failure(e)})?};
+    let final_target = response.url().clone();
     let status = response.status();
     input_failure.status(status);
     http_delivery::validate_range_response(status, response.headers()).map_err(failure)?;
@@ -238,7 +304,7 @@ async fn prepare(
     }
     let headers = response.headers().clone();
     let declared = kind == Some(Kind::Playlist)
-        || target.path().ends_with(".m3u8")
+        || final_target.path().ends_with(".m3u8")
         || headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -348,9 +414,9 @@ async fn prepare(
             }
         }
         let text = String::from_utf8(bytes).map_err(failure)?;
-        let text = rewrite(app, id, resource, q, &target, depth, &text).map_err(|e| {
+        let text = rewrite(app, id, resource, q, &final_target, depth, &text).map_err(|e| {
             input_failure.permanent();
-            failure(e)
+            manifest_failure(e)
         })?;
         return Ok((
             [
@@ -477,7 +543,9 @@ async fn prepare_pinned(
         if !status.is_success() && status != StatusCode::RANGE_NOT_SATISFIABLE {
             return Err((status, "upstream_media_error".into()));
         }
-        let metadata = Metadata::read(status, response.headers()).map_err(failure)?;
+        let metadata = Metadata::read(status, response.headers())
+            .map_err(failure)?
+            .with_target(&target, response.url());
         if metadata.size.is_none() {
             observation.source_version_required();
             return Err(identity::required());
@@ -485,7 +553,8 @@ async fn prepare_pinned(
         Range::From(0, Some(1023))
             .validate(status, response.headers())
             .map_err(failure)?;
-        declared |= playlist_headers(response.headers());
+        declared |=
+            playlist_headers(response.headers()) || response.url().path().ends_with(".m3u8");
         let mut stream = metric_stream::wrap(
             response.bytes_stream(),
             &app.metrics,
@@ -553,6 +622,7 @@ async fn prepare_pinned(
         &observation,
     )
     .await?;
+    let final_target = response.url().clone();
     let status = response.status();
     if status == StatusCode::PRECONDITION_FAILED {
         observation.source_changed();
@@ -564,7 +634,9 @@ async fn prepare_pinned(
     if !status.is_success() && status != StatusCode::RANGE_NOT_SATISFIABLE {
         return Err((status, "upstream_media_error".into()));
     }
-    let metadata = Metadata::read(status, &headers).map_err(failure)?;
+    let metadata = Metadata::read(status, &headers)
+        .map_err(failure)?
+        .with_target(&target, &final_target);
     if let Some(range) = range {
         range.validate(status, &headers).map_err(failure)?;
     } else if status == StatusCode::PARTIAL_CONTENT {
@@ -620,7 +692,7 @@ async fn prepare_pinned(
             "source_seek_unsupported".into(),
         ));
     }
-    declared |= playlist_headers(&headers);
+    declared |= playlist_headers(&headers) || final_target.path().ends_with(".m3u8");
     if binary_only && declared {
         // Observe the class before refusing it. A seeded Binary mismatch is
         // durable even if the origin later reverts to its original response.
@@ -753,8 +825,8 @@ async fn prepare_pinned(
         }
         let bytes = if declared {
             let text = String::from_utf8(bytes).map_err(failure)?;
-            rewrite(app, id, resource, q, &target, depth, &text)
-                .map_err(failure)?
+            rewrite(app, id, resource, q, &final_target, depth, &text)
+                .map_err(manifest_failure)?
                 .into_bytes()
         } else {
             if bytes.len() != 16 {
@@ -862,7 +934,7 @@ async fn pinned_request(
         .collect();
     let mut request = tokio::select! {biased;
         _=observation.stopped()=>return Err(failure("input_cancelled")),
-        request=providers::source_request(config,target.as_str(),if head {reqwest::Method::HEAD}else{reqwest::Method::GET},&headers)=>request.map_err(failure)?,
+        request=providers::source_media_request(config,target.as_str(),if head {reqwest::Method::HEAD}else{reqwest::Method::GET},&headers)=>request.map_err(failure)?,
     }.header(header::ACCEPT_ENCODING, "identity");
     if let Some(range) = range {
         request = request.header(header::RANGE, range);
@@ -872,7 +944,7 @@ async fn pinned_request(
     }
     let response = tokio::select! {biased;
         _=observation.stopped()=>return Err(failure("input_cancelled")),
-        response=request.send()=>response.map_err(|error| { observation.network(&error); failure(error) })?,
+        response=request.send()=>response.map_err(|error| { if error.is_transient() { observation.transient(); } else { observation.permanent(); } failure(error) })?,
     };
     observation.status(response.status());
     Ok(response)

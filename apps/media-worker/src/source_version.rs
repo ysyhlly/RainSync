@@ -1,4 +1,4 @@
-//! Final and periodic identity checks for negotiated local encoder input.
+//! Final and periodic identity checks for version-bound local encoder input.
 use anyhow::Result;
 use serde_json::Value;
 use std::{path::PathBuf, time::Duration};
@@ -8,7 +8,7 @@ pub async fn verify(spec: &Value) -> Result<()> {
         return Ok(());
     };
     // Remote providers own their own input version checks. Legacy jobs without
-    // a negotiated identity retain their existing execution path.
+    // a recorded identity retain their existing execution path.
     if spec["source_kind"]
         .as_str()
         .is_some_and(|kind| kind != "local")
@@ -42,6 +42,18 @@ pub async fn monitor(spec: &Value) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn persisted_legacy_jobs_do_not_invent_a_source_version() {
+        for spec in [
+            serde_json::json!({"source_kind":"local","root":"missing-legacy-root","resource":"input.mp4"}),
+            serde_json::json!({"source_kind":"local","root":"missing-legacy-root","resource":"input.mp4","source_version":null}),
+        ] {
+            let before = spec.clone();
+            verify(&spec).await.unwrap();
+            assert_eq!(spec, before);
+        }
+    }
+
     #[tokio::test]
     async fn final_identity_check_detects_changed_or_missing_local_file() {
         let root =

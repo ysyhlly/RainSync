@@ -14,6 +14,16 @@ pub struct JobFacts {
     pub seekable_media_ranges_ms: Option<Vec<PlaybackMediaRange>>,
 }
 
+/// The local recipe decodes/discards preroll at nonzero starts. A selected
+/// stream-copy route cannot claim that exact origin or silently change codec.
+pub fn local_timeline_origin(position_ms: f64, mode: &str) -> Option<f64> {
+    (position_ms.is_finite()
+        && position_ms >= 0.0
+        && (mode == "transcode"
+            || (matches!(mode, "remux" | "audio_transcode") && position_ms == 0.0)))
+        .then_some(position_ms)
+}
+
 /// Only the committed manifest is authoritative, not FFmpeg's private file.
 pub fn published_duration_ms(manifest: &str, segments: i32) -> Option<f64> {
     let mut count = 0;
@@ -265,6 +275,45 @@ pub fn local_fallbacks(
     modes
 }
 
+/// Local and reliable HTTP jobs still use the original first-video/default-
+/// audio recipe. A continuation hint must meet the same mapping proof as new
+/// admission. Agent/NAS keeps its existing behavior pending separate qualification.
+pub fn legacy_mapped_fallbacks(
+    meta: &Value,
+    audio_index: Option<u32>,
+    mode: &str,
+    position_ms: f64,
+    current: bool,
+    hls: bool,
+) -> Vec<DecoderFallbackMode> {
+    if media_core::motion_video::legacy_mapping_equivalent(meta, audio_index).is_err() {
+        return vec![];
+    }
+    local_fallbacks(meta, mode, position_ms, current, hls)
+}
+
+/// Check the actual generated route after every negotiation path converges.
+/// Candidate discovery and continuation hints do not grant job admission.
+pub fn require_legacy_job_mapping(
+    kind: &str,
+    local_job: bool,
+    meta: &Value,
+    audio_index: Option<u32>,
+    current_probe: bool,
+) -> Result<()> {
+    if !local_job || !matches!(kind, "local" | "http") {
+        return Ok(());
+    }
+    if !current_probe {
+        return Err(err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "legacy_stream_mapping_unsupported",
+        ));
+    }
+    media_core::motion_video::legacy_mapping_equivalent(meta, audio_index)
+        .map_err(playback_capabilities::probe_error)
+}
+
 pub fn upstream_fallbacks(
     info: &Value,
     mode: &str,
@@ -326,6 +375,95 @@ pub fn decision_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mapped_source() -> Value {
+        json!({"format":{"format_name":"mp4"},"streams":[
+            {"index":5,"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p",
+                "disposition":{"attached_pic":0},"avg_frame_rate":"25/1","r_frame_rate":"25/1"},
+            {"index":0,"codec_type":"audio","codec_name":"aac"},
+            {"index":12,"codec_type":"audio","codec_name":"aac"}
+        ]})
+    }
+
+    #[test]
+    fn generated_admission_requires_fresh_mapping_after_route_selection() {
+        let mut uncertain = mapped_source();
+        uncertain["streams"].as_array_mut().unwrap().insert(
+            0,
+            json!({"index":1,"codec_type":"video","disposition":{"attached_pic":1}}),
+        );
+        // Candidate selection, legacy auto/remux/transcode, explicit-direct
+        // audio conversion and continuation all converge on this same guard.
+        for context in [
+            "candidate",
+            "legacy_auto",
+            "legacy_remux",
+            "legacy_transcode",
+            "forced_direct_with_audio",
+            "continuation",
+        ] {
+            for kind in ["local", "http"] {
+                let audio = (context == "forced_direct_with_audio").then_some(0);
+                assert!(
+                    require_legacy_job_mapping(kind, true, &mapped_source(), audio, true).is_ok(),
+                    "{kind}/{context}"
+                );
+                let error =
+                    require_legacy_job_mapping(kind, true, &uncertain, audio, true).unwrap_err();
+                assert_eq!(
+                    error.0,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{kind}/{context}"
+                );
+                assert_eq!(error.1, "legacy_stream_mapping_unsupported");
+                assert_eq!(
+                    require_legacy_job_mapping(kind, true, &mapped_source(), audio, false)
+                        .unwrap_err()
+                        .1,
+                    "legacy_stream_mapping_unsupported"
+                );
+            }
+        }
+        assert_eq!(
+            require_legacy_job_mapping("local", true, &mapped_source(), Some(99), true)
+                .unwrap_err()
+                .1,
+            "invalid_audio_track"
+        );
+        // The original-file route creates no job; upstream and pending Agent
+        // routes are outside this local/reliable-HTTP change.
+        assert!(require_legacy_job_mapping("http", false, &json!({}), None, false).is_ok());
+        assert!(require_legacy_job_mapping("local", false, &uncertain, None, true).is_ok());
+        for kind in ["agent", "jellyfin", "emby"] {
+            assert!(require_legacy_job_mapping(kind, true, &json!({}), None, false).is_ok());
+        }
+    }
+
+    #[test]
+    fn generated_continuation_hints_require_the_same_mapping() {
+        let meta = mapped_source();
+        assert_eq!(
+            legacy_mapped_fallbacks(&meta, None, "direct", 0.0, true, true),
+            vec![DecoderFallbackMode::Remux, DecoderFallbackMode::Transcode]
+        );
+        assert_eq!(
+            legacy_mapped_fallbacks(&meta, Some(12), "remux", 0.0, true, true),
+            vec![DecoderFallbackMode::Transcode]
+        );
+        let mut reordered = meta.clone();
+        reordered["streams"].as_array_mut().unwrap().swap(1, 2);
+        assert!(legacy_mapped_fallbacks(&reordered, None, "direct", 0.0, true, true).is_empty());
+        assert_eq!(
+            legacy_mapped_fallbacks(&reordered, Some(0), "remux", 0.0, true, true),
+            vec![DecoderFallbackMode::Transcode]
+        );
+        let mut unknown = meta.clone();
+        unknown["streams"][0]["disposition"] = Value::Null;
+        assert!(legacy_mapped_fallbacks(&unknown, None, "direct", 0.0, true, true).is_empty());
+        assert!(legacy_mapped_fallbacks(&meta, None, "direct", 0.0, false, true).is_empty());
+        assert!(legacy_mapped_fallbacks(&meta, None, "direct", 0.0, true, false).is_empty());
+        assert!(legacy_mapped_fallbacks(&meta, None, "transcode", 0.0, true, true).is_empty());
+    }
 
     #[test]
     fn audio_requires_current_unique_source_and_default() {
@@ -454,5 +592,18 @@ mod tests {
         let mut hdr = meta.clone();
         hdr["streams"][0]["color_transfer"] = json!("smpte2084");
         assert!(local_fallbacks(&hdr, "direct", 0.0, true, true).is_empty());
+    }
+
+    #[test]
+    fn nonzero_local_origin_requires_the_exact_decoded_recipe() {
+        assert_eq!(local_timeline_origin(0.0, "remux"), Some(0.0));
+        assert_eq!(local_timeline_origin(0.0, "audio_transcode"), Some(0.0));
+        assert_eq!(local_timeline_origin(12_345.0, "transcode"), Some(12_345.0));
+        assert_eq!(local_timeline_origin(12_345.0, "remux"), None);
+        assert_eq!(local_timeline_origin(12_345.0, "audio_transcode"), None);
+        assert_eq!(local_timeline_origin(0.0, "direct"), None);
+        for position in [f64::NAN, f64::INFINITY, -1.0] {
+            assert_eq!(local_timeline_origin(position, "transcode"), None);
+        }
     }
 }

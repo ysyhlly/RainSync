@@ -512,6 +512,7 @@ async fn isolated_http_representation_contract() {
     // Conflicting simultaneous first commits cannot both authorize bodies.
     let id = session(&app).await;
     let a = Metadata {
+        final_target_sha256: None,
         etag: Some("\"first\"".into()),
         modified: None,
         reliable_modified: false,
@@ -585,6 +586,7 @@ async fn isolated_http_representation_contract() {
             .unwrap()
             .is_none()
     );
+    redirected_http_representation_contract(&app).await;
     server.abort();
     server.await.unwrap_err();
     other_app.db.close().await;
@@ -621,4 +623,185 @@ async fn short_sniffed_bodies_remain_terminated_when_consumed_after_eof() {
         assert!(stream.next().await.is_none());
         assert!(stream.next().await.is_none());
     }
+}
+
+// Reuses only the freshly-created database owned by the coordinator above.
+async fn redirected_http_representation_contract(app: &App) {
+    let cdn_router=Router::new().fallback(|uri: axum::http::Uri, method: axum::http::Method, headers: HeaderMap| async move {
+        assert!(!headers.contains_key(header::AUTHORIZATION));
+        assert!(!headers.contains_key(header::COOKIE));
+        if uri.path()=="/nested/list.m3u8" {
+            let text="#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:1,\nsegment.ts\n#EXT-X-ENDLIST\n";
+            return Response::builder().header(header::CONTENT_TYPE,"application/vnd.apple.mpegurl").header(header::CONTENT_LENGTH,text.len()).header(header::ETAG,"\"manifest\"").body(Body::from(text)).unwrap();
+        }
+        let range=headers.get(header::RANGE).and_then(|value| value.to_str().ok());
+        let (start,end)=if method==axum::http::Method::HEAD { (0,63) } else { media_core::byte_range(range,64).unwrap().unwrap_or((0,63)) };
+        let mut response=Response::builder().header(header::ETAG,"\"equal-across-destinations\"").header(header::CONTENT_LENGTH,end-start+1);
+        if range.is_some() && method!=axum::http::Method::HEAD { response=response.status(206).header(header::CONTENT_RANGE,format!("bytes {start}-{end}/64")); }
+        response.body(if method==axum::http::Method::HEAD { Body::empty() } else { Body::from(vec![1; (end-start+1) as usize]) }).unwrap()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cdn = format!("http://{}", listener.local_addr().unwrap());
+    let cdn_task = tokio::spawn(async move { axum::serve(listener, cdn_router).await.unwrap() });
+    let destination = Arc::new(Mutex::new(format!("{cdn}/file?signature=one")));
+    let selected = destination.clone();
+    let source_router = Router::new().fallback(move |headers: HeaderMap| {
+        let location = selected.lock().unwrap().clone();
+        async move {
+            assert_eq!(headers[header::AUTHORIZATION], "Bearer fixture");
+            Response::builder()
+                .status(302)
+                .header(header::LOCATION, location)
+                .body(Body::empty())
+                .unwrap()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source = format!("http://{}", listener.local_addr().unwrap());
+    let source_task =
+        tokio::spawn(async move { axum::serve(listener, source_router).await.unwrap() });
+    let root = format!("{source}/root");
+    let resource = json!({"kind":"http","url":root,"source_url":source,"headers":{"Authorization":"Bearer fixture","Cookie":"fixture=secret"},
+        "access_policy":{"schema_version":1,"origins":[{"origin":source,"cidrs":["127.0.0.1/32"]},{"origin":cdn,"cidrs":["127.0.0.1/32"]}],"redirects":{"max_hops":5}}});
+    let q = Params {
+        token: "fixture".into(),
+        url: None,
+        attempt: None,
+        execution: None,
+    };
+    let id = session(app).await;
+    let first = prepare_pinned(
+        app,
+        id,
+        &resource,
+        &q,
+        &HeaderMap::new(),
+        false,
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bytes(first).await, vec![1; 64]);
+    let state = identity::load(&app.db, id, &root).await.unwrap().unwrap();
+    assert_eq!(
+        state.metadata.final_target_sha256,
+        Some(hash(&format!("{cdn}/file?signature=one")))
+    );
+    let head = prepare_pinned(
+        app,
+        id,
+        &resource,
+        &q,
+        &HeaderMap::new(),
+        true,
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    assert!(bytes(head).await.is_empty());
+    let mut ranged = HeaderMap::new();
+    ranged.insert(header::RANGE, "bytes=10-19".parse().unwrap());
+    let partial = prepare_pinned(app, id, &resource, &q, &ranged, false, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(partial.status(), 206);
+    assert_eq!(bytes(partial).await, vec![1; 10]);
+    *destination.lock().unwrap() = format!("{cdn}/file?signature=two");
+    assert_eq!(
+        prepare_pinned(
+            app,
+            id,
+            &resource,
+            &q,
+            &HeaderMap::new(),
+            true,
+            Default::default()
+        )
+        .await
+        .unwrap_err(),
+        identity::changed()
+    );
+    *destination.lock().unwrap() = format!("{cdn}/file?signature=one");
+    assert_eq!(
+        prepare_pinned(app, id, &resource, &q, &ranged, false, Default::default())
+            .await
+            .unwrap_err(),
+        identity::changed()
+    );
+    // Old no-follow evidence must never silently acquire a redirected identity.
+    let legacy = session(app).await;
+    let mut old = state.metadata.clone();
+    old.final_target_sha256 = None;
+    identity::commit(
+        &app.db,
+        legacy,
+        &root,
+        &old,
+        Some(Class::Binary),
+        true,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        prepare_pinned(
+            app,
+            legacy,
+            &resource,
+            &q,
+            &ranged,
+            false,
+            Default::default()
+        )
+        .await
+        .unwrap_err(),
+        identity::changed()
+    );
+    // HLS tickets keep the final manifest directory without inheriting its query.
+    let id = session(app).await;
+    *destination.lock().unwrap() = format!("{cdn}/nested/list.m3u8?signature=manifest");
+    let response = prepare_pinned(
+        app,
+        id,
+        &resource,
+        &q,
+        &HeaderMap::new(),
+        false,
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let text = String::from_utf8(bytes(response).await).unwrap();
+    assert!(!text.contains(&cdn));
+    assert!(!text.contains("signature=manifest"));
+    let manifest = Manifest::parse(&text).unwrap();
+    let mut targets = Vec::new();
+    for reference in manifest.references() {
+        let exposed = url::Url::parse(&format!("http://gateway.invalid{}", reference.uri)).unwrap();
+        let encoded = exposed
+            .query_pairs()
+            .find(|(key, _)| key == "url")
+            .unwrap()
+            .1
+            .into_owned();
+        let child = Params {
+            token: "fixture".into(),
+            url: Some(encoded),
+            attempt: None,
+            execution: None,
+        };
+        targets.push(target(app, id, &resource, &child).unwrap().0.to_string());
+    }
+    assert_eq!(
+        targets,
+        vec![
+            format!("{cdn}/nested/init.mp4"),
+            format!("{cdn}/nested/key.bin"),
+            format!("{cdn}/nested/segment.ts")
+        ]
+    );
+    source_task.abort();
+    cdn_task.abort();
+    source_task.await.unwrap_err();
+    cdn_task.await.unwrap_err();
 }

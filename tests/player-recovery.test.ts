@@ -277,6 +277,199 @@ const playbackPosts = (s: ReturnType<typeof setup>) =>
     ([path, method]) => isPlaybackPost(path) && method === "POST",
   );
 
+it("an explicit unsupported HLS timeline is visible and cannot authorize a decoder fallback", async () => {
+  const s = setup({ hls: true, fileFallback: true });
+  try {
+    hls.supported = true;
+    s.el.canPlayType = () => "";
+    await s.runtime.loadMedia();
+    hls.errorHandler!(undefined, {
+      fatal: true,
+      type: "mediaError",
+      response: { code: 422 },
+      networkDetails: {
+        responseText: JSON.stringify({
+          error: {
+            code: "UNSUPPORTED_TIMELINE",
+            message: "private upstream body",
+          },
+        }),
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.error.value).toContain("时间轴无法安全映射");
+    expect(s.error.value).not.toContain("private upstream body");
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it.each([
+  { timeline_origin_ms: NaN },
+  { timeline_origin_ms: -1 },
+  { timeline_origin_ms: 120001 },
+  { timeline_origin_ms: 1000 }, // A progressive route cannot be a cropped job.
+  {
+    timeline_origin_ms: 1000,
+    delivery_mode: "remux",
+    transport: "hls",
+    rebuild_on_seek: true,
+  },
+])(
+  "rejects unsafe timeline before readiness, attachment and observations: %j",
+  async (fields) => {
+    const s = setup({ observationSeq: 0 });
+    try {
+      const original = s.api.getMockImplementation()!;
+      s.api.mockImplementation(async (...args) => {
+        const result = await original(...args);
+        return isPlaybackPost(args[0]) && args[1] === "POST"
+          ? { ...result, ...fields }
+          : result;
+      });
+      await expect(s.runtime.loadMedia()).rejects.toMatchObject({
+        code: "UNSUPPORTED_TIMELINE",
+      });
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(s.el.src).toBe("");
+      expect(s.runtime.sessionId.value).toBeNull();
+      expect(
+        s.api.mock.calls.some(
+          ([path, method]) =>
+            path.startsWith("/playback-sessions/") && method === "GET",
+        ),
+      ).toBe(false);
+      expect(
+        s.api.mock.calls.some(
+          ([path, method]) =>
+            path.startsWith("/playback-requests/") && method === "DELETE",
+        ),
+      ).toBe(true);
+      expect(
+        s.api.mock.calls.some(([path]) => path.endsWith("/observations")),
+      ).toBe(false);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it.each([false, true])(
+  "bounds unpresented ready media independently of telemetry (telemetry fails=%s)",
+  async (brokenTelemetry) => {
+    const s = setup({ fileFallback: true });
+    try {
+      faults.construct = brokenTelemetry;
+      s.state.value.playback_status = "playing";
+      await s.runtime.loadMedia();
+      s.el.onloadedmetadata();
+      s.el.onloadeddata();
+      s.el.dispatchEvent(new Event("canplay"));
+      s.el.dispatchEvent(new Event("playing"));
+      await vi.advanceTimersByTimeAsync(19_999);
+      expect(s.error.value).toBe("");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(s.error.value).toContain("首帧等待超时");
+      expect(playbackPosts(s)).toHaveLength(1);
+      // Timeout is not a decoder diagnosis or permission for a new route.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(playbackPosts(s)).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it.each(["callback", "approximation"])(
+  "only %s presentation finishes the route deadline",
+  async (evidence) => {
+    const s = setup();
+    try {
+      let frame!: (at: number, metadata: any) => void;
+      if (evidence === "callback") {
+        s.el.requestVideoFrameCallback = (callback: typeof frame) => {
+          frame = callback;
+          return 1;
+        };
+        s.el.cancelVideoFrameCallback = vi.fn();
+      }
+      s.state.value.playback_status = "playing";
+      await s.runtime.loadMedia();
+      await vi.advanceTimersByTimeAsync(1000);
+      if (evidence === "callback") frame(1000, { presentationTime: 950 });
+      else {
+        s.el.paused = false;
+        s.el.dispatchEvent(new Event("playing"));
+        s.el.currentTime += 0.1;
+        s.el.dispatchEvent(new Event("timeupdate"));
+      }
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(s.error.value).toBe("");
+      expect(playbackPosts(s)).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it("preparing and a paused room do not consume the presentation budget", async () => {
+  const s = setup();
+  try {
+    const original = s.api.getMockImplementation()!;
+    s.api.mockImplementation(async (...args) => {
+      if (isPlaybackPost(args[0]) && args[1] === "POST")
+        await new Promise((resolve) => setTimeout(resolve, 30_000));
+      return original(...args);
+    });
+    s.state.value.playback_status = "playing";
+    const preparing = s.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await preparing;
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(s.error.value).toBe("");
+    s.state.value.playback_status = "paused";
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.error.value).toBe("");
+    s.state.value.playback_status = "playing";
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(s.error.value).toContain("首帧等待超时");
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("new route ignores an old presentation callback and same-route recovery retains budget", async () => {
+  const s = setup({ hls: true });
+  try {
+    const callbacks: ((at: number, metadata: any) => void)[] = [];
+    s.el.requestVideoFrameCallback = (callback: (typeof callbacks)[number]) =>
+      callbacks.push(callback);
+    s.el.cancelVideoFrameCallback = vi.fn();
+    s.state.value.playback_status = "playing";
+    await s.runtime.loadMedia();
+    const first = callbacks[0];
+    await vi.advanceTimersByTimeAsync(15_000);
+    hls.supported = true;
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    first(15_000, { presentationTime: 15_000 });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(s.error.value).toContain("首帧等待超时");
+    s.error.value = "";
+    await s.runtime.loadMedia();
+    first(20_000, { presentationTime: 20_000 });
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(s.error.value).toBe("");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(s.error.value).toContain("首帧等待超时");
+    expect(playbackPosts(s)).toHaveLength(2);
+  } finally {
+    s.cleanup();
+  }
+});
+
 it.each([
   { name: "HTTP progressive", hls: false, mse: false },
   { name: "legacy/upstream native HLS", hls: true, mse: false },

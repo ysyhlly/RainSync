@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
@@ -96,7 +96,7 @@ const report = {
     minimum_nonfinal_delta_ms: 1000,
   },
 };
-let fixture, workerPid, workerPort, controlled;
+let fixture, workerPid, workerPort, controlled, primaryError;
 const sockets = new Set();
 async function until(probe, label, timeout = 5000) {
   const deadline = Date.now() + timeout;
@@ -422,7 +422,7 @@ try {
           expected,
         );
         if (expected === 200 && input.playback_metrics_version === 1) {
-          assert.equal(plan.playback_metrics_version, 1);
+          assert.equal(plan.playback_metrics_version, input.playback_metrics_supported_versions?.includes(2) ? 2 : 1);
           assert.equal(
             plan.playback_metrics.meter_start_generation,
             input.playback_metrics.meter_start_generation,
@@ -515,6 +515,79 @@ try {
         assert.deepEqual(slot(grant), beforeSlot);
         assert.deepEqual((await scrape()).accepted, beforeMetrics.accepted);
       };
+
+      const v2input = (extra = {}) => makeInput(scope, { playback_metrics_supported_versions: [1, 2], ...extra });
+      const v2sample = (grant, seq = 1, elapsed = 1000, extra = {}) => sample(grant, seq, elapsed, {
+        version: 2,
+        startup_phases: { preparation_ms: Math.min(500, elapsed), loading_ms: Math.max(0,elapsed-500), unobserved_ms:0 },
+        ...extra,
+      });
+      const negotiatedV2 = await prepare(v2input());
+      assert.equal(f.sql(`SELECT metrics_version FROM playback_viewer_plans WHERE viewer_id=${quote(negotiatedV2.input.viewer_id)}`),"2");
+      assert.equal(f.sql(`SELECT metrics_source_kind||':'||metrics_delivery_mode FROM playback_sessions WHERE id=${quote(negotiatedV2.plan.session_id)}`),"local:direct");
+      await prepare({...negotiatedV2.input,playback_metrics_supported_versions:[1]},admin,409);
+      const initialV2 = v2sample(negotiatedV2);
+      const beforeV2 = await scrape();
+      await post(negotiatedV2,initialV2);
+      await post(negotiatedV2,initialV2);
+      assert.equal(count(await scrape())-count(beforeV2),1);
+      assert.deepEqual((await prepare(negotiatedV2.input)).plan.playback_metrics.last_sample,initialV2);
+      await post(negotiatedV2,v2sample(negotiatedV2,2,2000,{startup_phases:{preparation_ms:499,loading_ms:1501,unobserved_ms:0}}),409,"PLAYBACK_METRICS_CONFLICT");
+      await post(negotiatedV2,sample(negotiatedV2,2,2000),400,"PLAYBACK_METRICS_NOT_NEGOTIATED");
+      await post(negotiatedV2,v2sample(negotiatedV2,2,2000));
+      await stop(negotiatedV2);
+      check("negotiated v2 real receiver persists phases/version/server facts, exact retry gives one credit, v1 packet and phase regression reject");
+
+      // The first frame occurs on the first grant, but is first sent on fallback.
+      const originGrant = await prepare(v2input());
+      const nextInput = { ...originGrant.input, idempotency_key:randomUUID(),plan_generation:2,mode:"remux" };
+      const successor = await prepare(nextInput);
+      const framePacket = v2sample(successor,1,1000,{
+        first_frame:{elapsed_ms:800,confirmed_elapsed_ms:1000,evidence:"video_frame_callback"},
+        first_frame_plan_generation:1,
+      });
+      const frameBefore=await scrape();
+      // A live login for the same account is not authority for A's current
+      // grant or its historical first-frame attribution. Repeated B reports
+      // must not consume A's six-request viewer allowance before admission.
+      const otherLogin = f.client();
+      assert.equal((await otherLogin.login()).id, identity.id);
+      const beforeCrossLogin = slot(successor);
+      for (let attempt = 0; attempt < 7; attempt++)
+        await post({ ...successor, client: otherLogin }, framePacket, 410, "INVALID_PLAYBACK_SESSION");
+      await unchanged(successor, beforeCrossLogin, frameBefore);
+      await otherLogin.request(`/playback-sessions/${successor.plan.session_id}`, "DELETE", observation(successor), 410);
+      await unchanged(successor, beforeCrossLogin, frameBefore);
+      check("same-account B cannot report A's earlier frame on A's current grant, consume A's rate allowance, or Stop A");
+      await post(successor,framePacket);
+      assert.equal(f.sql(`SELECT metrics_first_frame_source||':'||metrics_first_frame_mode FROM playback_viewer_plans WHERE viewer_id=${quote(successor.input.viewer_id)}`),"local:direct");
+      assert.equal(f.sql(`SELECT metrics_delivery_mode FROM playback_sessions WHERE id=${quote(successor.plan.session_id)}`),"remux");
+      const attributed=(await scrape()).rows.filter(line=>line.startsWith("rainsync_client_reported_playback_first_frame_attributed_milliseconds_count"));
+      assert.ok(attributed.some(line=>line.includes('source="local",mode="direct",evidence="video_frame_callback"')&&line.endsWith(" 1")),JSON.stringify(attributed));
+      assert.ok(!attributed.some(line=>line.includes('mode="remux"')));
+      await post(originGrant,v2sample(originGrant),410,"INVALID_PLAYBACK_SESSION");
+      const later={...framePacket,seq:2,elapsed_ms:2000,totals:totals(1000,{playing_ms:1000})};
+      await post(successor,{...later,first_frame_plan_generation:2},409,"PLAYBACK_METRICS_CONFLICT");
+      await post(successor,later);
+      const afterFrame=await scrape();
+      assert.equal(count(afterFrame)-count(frameBefore),2);
+      await f.startServer({WORKER_URL:f.workerOrigin});
+      scope.controller=await roomController(f,admin,scope.room);
+      await post(successor,later);
+      assert.equal(count(await scrape()),0);
+      assert.deepEqual((await prepare(nextInput)).plan.playback_metrics.last_sample,later);
+      const finalV2={...later,seq:3,elapsed_ms:2001,totals:totals(1000,{playing_ms:1001}),final:true};
+      await post(successor,finalV2);
+      await stop(successor,observation(successor));
+      check("earlier v2 frame reported on later remux grant retains direct attribution, no old authority, immutable origin, restart dedup and unchanged Stop");
+
+      const pinnedV1=await prepare();
+      const laterV2Offer={...pinnedV1.input,idempotency_key:randomUUID(),plan_generation:2,playback_metrics_supported_versions:[1,2]};
+      const pinnedV1Plan=await admin.request("/playback-sessions","POST",laterV2Offer);
+      assert.equal(pinnedV1Plan.playback_metrics_version,1);
+      assert.equal(f.sql(`SELECT metrics_version FROM playback_viewer_plans WHERE viewer_id=${quote(pinnedV1.input.viewer_id)}`),"1");
+      await stop({client:admin,plan:pinnedV1Plan});
+      check("first selected version remains frozen across fallback even when a later request offers v2; same-key offer changes conflict");
 
       const legacyInput = {
         room_id: scope.room.id,
@@ -1104,9 +1177,12 @@ try {
       const sourceGrant = await prepare(makeInput(sourceScope)),
         sourceSlot = slot(sourceGrant),
         sourceMetrics = await scrape();
+      // Use another real server-encrypted generated configuration. Appending a
+      // byte would test corrupt ciphertext and correctly prevent later restart.
+      const rotatedSource = await localSource("owned source revision ciphertext");
       const heldSource = await lock(
         f,
-        `UPDATE sources SET config_encrypted=config_encrypted||' ' WHERE id=${quote(sourceLocal.source.id)}`,
+        `UPDATE sources SET config_encrypted=(SELECT config_encrypted FROM sources WHERE id=${quote(rotatedSource.source.id)}) WHERE id=${quote(sourceLocal.source.id)}`,
       );
       try {
         const pending = post(
@@ -1204,7 +1280,9 @@ try {
           loginMetrics = await scrape();
         const heldLogin = await lock(
           f,
-          `SELECT id FROM playback_sessions WHERE id=${quote(loginGrant.plan.session_id)} FOR UPDATE`,
+          invalidation === "logout"
+            ? `SELECT id FROM rooms WHERE id=${quote(loginGrant.input.room_id)} FOR NO KEY UPDATE`
+            : `SELECT id FROM playback_sessions WHERE id=${quote(loginGrant.plan.session_id)} FOR UPDATE`,
         );
         try {
           if (invalidation === "expiry")
@@ -1214,10 +1292,10 @@ try {
           const pending = post(
             loginGrant,
             sample(loginGrant),
-            410,
-            "INVALID_PLAYBACK_SESSION",
+            invalidation === "logout" ? 401 : 410,
+            invalidation === "logout" ? "SESSION_EXPIRED" : "INVALID_PLAYBACK_SESSION",
           );
-          await waiting(f, "SELECT * FROM playback_sessions WHERE id=$1");
+          await waiting(f, invalidation === "logout" ? "FROM rooms WHERE id=$1 FOR NO KEY UPDATE" : "SELECT * FROM playback_sessions WHERE id=$1");
           if (invalidation === "logout") {
             await currentLogin.request("/auth/logout", "POST");
             assert.equal(
@@ -1242,24 +1320,21 @@ try {
           await heldLogin.finish(false);
         }
         await unchanged(loginGrant, loginSlot, loginMetrics);
-        assert.equal(
-          f.sql(
-            `SELECT NOT stopped AND expires_at>clock_timestamp() FROM playback_sessions WHERE id=${quote(loginGrant.plan.session_id)}`,
-          ),
-          "t",
-          "playback grant stays live, isolating authentication invalidation",
-        );
-        await stop({ ...loginGrant, client: admin });
+        await admin.request(`/playback-sessions/${loginGrant.plan.session_id}`, "DELETE", undefined, 410);
+        // Cleanup belongs to server retirement, not another login pretending to
+        // be the origin. The revoked caller must not lose cleanup responsibility.
+        await f.waitForSql(`SELECT stopped FROM playback_sessions WHERE id=${quote(loginGrant.plan.session_id)}`, "t", 8000);
+
         authenticationRaces.push({
           invalidation,
-          actual_grant_lock_wait: true,
-          metrics_status: 410,
-          playback_grant_was_live: true,
+          actual_authority_lock_wait: invalidation === "logout" ? "room" : "grant",
+          metrics_status: invalidation === "logout" ? 401 : 410,
+          server_retirement_observed: true,
           durable_and_aggregate_credit: false,
         });
       }
       check(
-        "current login-session expiry and public logout during real grant-lock waits reject metrics without credit",
+        "current login expiry and public logout during real authority-lock waits reject metrics without credit; server retires the grant",
         { variants: authenticationRaces },
       );
 
@@ -1513,30 +1588,46 @@ try {
     { env: { PLAYBACK_SESSION_LIMIT: "128" } },
   );
 } catch (error) {
+  primaryError = error;
   report.result = "failed";
   report.error = error.stack ?? String(error);
-  throw error;
 } finally {
-  for (const socket of sockets) socket.terminate();
+  const cleanupErrors = [];
+  const cleanup = async action => {
+    try { await action(); }
+    catch (error) { cleanupErrors.push(error.stack ?? String(error)); }
+  };
+  for (const socket of sockets) await cleanup(() => socket.terminate());
   if (controlled) {
     report.controlled_upstream_events = controlled.events;
-    await controlled.close();
+    await cleanup(() => controlled.close());
   }
   if (fixture) {
     report.postgres = fixture.postgresDiagnostics();
-    report.cleanup = await fixture.verifyStopped();
-    report.cleanup.worker = {
-      pid: workerPid,
-      pid_absent: verifyPidAbsent(workerPid),
-      port: workerPort,
-      port_closed: await verifyClosedPort(workerPort),
-    };
-    assert.equal(report.cleanup.worker.pid_absent, true);
-    assert.equal(report.cleanup.worker.port_closed, true);
-    report.completed_at = new Date().toISOString();
-    report.check_count = report.checks.length;
-    const path = resolve(fixture.root, "report.json");
-    await writeFile(path, JSON.stringify(report, null, 2) + "\n");
-    console.log(`Evidence: ${path}`);
+    await cleanup(async () => { report.cleanup = await fixture.verifyStopped(); });
   }
+  report.cleanup ??= {};
+  report.cleanup.worker = { state: workerPid === undefined ? "never_started" : "unknown", pid: workerPid ?? null, port: workerPort ?? null };
+  if (workerPid !== undefined) await cleanup(async () => {
+    report.cleanup.worker.pid_absent = verifyPidAbsent(workerPid);
+    report.cleanup.worker.state = report.cleanup.worker.pid_absent ? "pid_absent" : "still_present";
+    assert.equal(report.cleanup.worker.pid_absent, true);
+  });
+  if (workerPort !== undefined) await cleanup(async () => {
+    report.cleanup.worker.port_closed = await verifyClosedPort(workerPort);
+    assert.equal(report.cleanup.worker.port_closed, true);
+  });
+  if (cleanupErrors.length) {
+    report.cleanup_errors = cleanupErrors;
+    report.result = "failed";
+    primaryError ??= new Error("Owned metrics fixture cleanup failed; inspect separate cleanup_errors");
+  }
+  report.completed_at = new Date().toISOString();
+  report.check_count = report.checks.length;
+  const root = fixture?.root ?? resolve(process.env.RAINSYNC_ARTIFACT_DIR, "playback-metrics-runtime", randomUUID());
+  await mkdir(root, { recursive: true });
+  const path = resolve(root, "report.json");
+  await writeFile(path, JSON.stringify(report, null, 2) + "\n");
+  console.log(`Evidence: ${path}`);
 }
+if (primaryError) throw primaryError;

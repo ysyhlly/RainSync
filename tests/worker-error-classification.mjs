@@ -1,5 +1,5 @@
 // Real Worker queue/FFmpeg and HTTP responses in an owned database. Explicit
-// legacy task fixtures isolate failure handling from earlier preparation gates.
+// login-bound synthetic jobs isolate failure handling from preparation gates.
 import assert from "node:assert/strict";
 import {
   createCipheriv,
@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
 import { sourceMedia } from "./fixtures/source-grant.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 import { delay } from "./fixtures/server.mjs";
 import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
 
@@ -22,8 +23,12 @@ assert.ok(process.env.W03_BACKEND_BINDING, "Use a frozen native backend");
 const binding = JSON.parse(await readFile(process.env.W03_BACKEND_BINDING));
 assert.equal(binding.result, "passed");
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
-const coordinator = fileURLToPath(import.meta.url);
-const coordinatorSha = sha(await readFile(coordinator));
+const coordinator = await Promise.all(
+  ["tests/worker-error-classification.mjs", "tests/fixtures/playback-admission.mjs"].map(
+    async (path) => ({ path, sha256: sha(await readFile(resolve(repo, path))) }),
+  ),
+);
+const coordinatorSha = coordinator[0].sha256;
 async function verifyBinding() {
   for (const item of binding.source)
     assert.equal(
@@ -33,15 +38,17 @@ async function verifyBinding() {
     );
   for (const item of binding.binaries)
     assert.equal(sha(await readFile(item.path)), item.sha256, item.name);
-  assert.equal(sha(await readFile(coordinator)), coordinatorSha);
+  for (const item of coordinator)
+    assert.equal(sha(await readFile(resolve(repo, item.path))), item.sha256, item.path);
 }
 await verifyBinding();
 const report = {
   schema_version: 1,
   source_digest: binding.source_digest,
   coordinator_sha256: coordinatorSha,
+  coordinator,
   scope:
-    "Owned legacy job fixtures, real Worker/FFmpeg and PostgreSQL; no device or long-run acceptance",
+    "Owned login-bound synthetic job fixtures, real Worker/FFmpeg and PostgreSQL; no device or long-run acceptance",
   result: "running",
   checks: [],
 };
@@ -116,7 +123,9 @@ try {
         transcode: true,
         estimated_output_bytes: 1048576,
       };
-      f.sql(
+      withPlaybackAdmission(
+        f,
+        { client: admin, user: identity.id, room: room.id, session: id },
         `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES(${quote(id)},${quote(identity.id)},${quote(room.id)},${quote(media)},0,${quote(sha(token))},${json({ encrypted: encrypt(resource) })},clock_timestamp()+interval '1 hour'); INSERT INTO media_jobs(id,session_id,status,spec) VALUES(${quote(id)},${quote(id)},'queued',${json(spec)})`,
       );
       await f.waitForSql(

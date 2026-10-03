@@ -2,6 +2,8 @@
 
 ## 启动与诊断
 
+新增统一 origin/根目录校验、错误 source key 启动拒绝、分离加密材料恢复包和可执行预览升级/回滚演练，见 [可复现交付与隔离升级/恢复](DEPLOYMENT_DELIVERY.md)。实际发布仍须通过真实环境门槛。
+
 `docker compose up --build -d` 后检查 `docker compose ps` 和 `docker compose logs server worker`。数据库只暴露给 Compose 网络。
 
 管理员登录后可读取 `/api/v1/metrics`，包含稳态同步误差直方图、缓冲样本计数、房间数量和转码排队数量。统计来自客户端采样，不能替代画面级同步测试。
@@ -54,7 +56,7 @@ Compose 中 Server 使用内部 `WORKER_URL=http://worker:8081` 探测 HTTP/NAS 
 
 FFmpeg 通过 Worker 自身地址读取原片：WORKER_BIND 为通配地址时使用同族回环地址，为具体 IP 时使用该 IP 和端口。上游请求头继续由 Worker 注入，不进入播放方案或任务明文。自动模式优先直放 H.264 8-bit/AAC MP4 或兼容 HLS，容器或音频不兼容时转封装/转换音频，其他普通视频编码转 H.264/AAC。HDR 自动模式明确拒绝；这仍不是完整的设备解码能力协商。
 
-开发 Dockerfile 的 FFmpeg 尚未固定包版本。正式发布前必须固定基础镜像 digest、APT 快照和包版本并重跑媒体矩阵；一次基线采集不能替代可复现构建。Caddy 现提供基础 CSP，同源脚本/连接及 blob 媒体/Worker；保留内联样式兼容 Vue。真实 Safari/HLS 与外部来源扩展仍需专项验证。逐项审查结论见 [F-01 至 F-14](REVIEW_FINDINGS.md)。
+开发 Dockerfile 的 FFmpeg 尚未固定包版本。正式候选可使用 `deploy/Dockerfile.release` 和 `deploy/release-lock.mjs`，它们要求实际基础镜像 digest、APT 快照和精确 FFmpeg 包版本并采集真实运行时证据；未取得双架构 digest/运行证明前仍不得宣称可复现发布达标。还须重跑媒体矩阵，一次基线采集不能替代验收。Caddy 现提供基础 CSP，同源脚本/连接及 blob 媒体/Worker；保留内联样式兼容 Vue。真实 Safari/HLS 与外部来源扩展仍需专项验证。逐项审查结论见 [F-01 至 F-14](REVIEW_FINDINGS.md)。
 
 Agent 默认将数据连接指向 `SERVER_URL` 的同一入口，Caddy 必须同时代理 `/api/v1/agents/ws` 和 `/agent-data/*`。如控制与数据部署在不同入口，可在 Agent 设置 `AGENT_DATA_ORIGIN`，其值为可达的 HTTP(S) 基址。Agent 不需要开放入站端口。
 

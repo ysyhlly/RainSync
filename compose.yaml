@@ -19,6 +19,8 @@ services:
       DATABASE_URL: postgres://rainsync:${POSTGRES_PASSWORD}@db/rainsync
       SOURCE_ENCRYPTION_KEY: ${SOURCE_ENCRYPTION_KEY:?Set SOURCE_ENCRYPTION_KEY}
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:8088}
+      MEDIA_ORIGIN: ${MEDIA_ORIGIN:-${PUBLIC_ORIGIN:-http://localhost:8088}}
+      AGENT_DATA_ORIGIN: ${AGENT_DATA_ORIGIN:-${PUBLIC_ORIGIN:-http://localhost:8088}}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD}
       WORKER_URL: http://worker:8081
       MEDIA_ROOT: /media

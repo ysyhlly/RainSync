@@ -234,6 +234,7 @@ mod tests {
         SourceConfig {
             access_policy: Some(SourceAccessPolicy {
                 schema_version: 1,
+                redirects: None,
                 origins: vec![OriginRule {
                     origin: origin.clone(),
                     cidrs: vec!["127.0.0.0/8".into()],

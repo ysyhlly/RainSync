@@ -2,15 +2,22 @@
 //! Only the process owner may acknowledge after all local processes/sources are
 //! released. Lost leases and dead owners deliberately leave evidence unknown.
 use anyhow::Result;
-use sqlx::{PgPool, Row};
+use sqlx::{Acquire, PgPool, Row};
 use uuid::Uuid;
+
+pub struct DeliveryAdmission {
+    pub execution_id: Uuid,
+    /// First eligible index admission only; missing/failed observation is false.
+    pub first_output_entry: bool,
+}
 
 pub async fn begin_delivery(
     pool: &PgPool,
     session: Uuid,
     token_hash: &str,
     owner: Uuid,
-) -> Result<Option<Uuid>> {
+    entry_candidate: bool,
+) -> Result<Option<DeliveryAdmission>> {
     let mut tx = pool.begin().await?;
     let room: Option<Uuid> =
         sqlx::query_scalar("SELECT room_id FROM playback_sessions WHERE id=$1")
@@ -32,11 +39,29 @@ pub async fn begin_delivery(
         return Ok(None);
     }
     let id = Uuid::new_v4();
-    let inserted = sqlx::query("INSERT INTO media_executions(id,session_id,kind,owner_id) SELECT $1,p.id,'delivery',$2 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$3 AND p.delivery_token_hash=$4 AND p.lifecycle_epoch=$5 AND p.expires_at>clock_timestamp() AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource) AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
-        .bind(id).bind(owner).bind(session).bind(token_hash).bind(row.get::<i64,_>("lifecycle_epoch"))
+    let inserted = sqlx::query("INSERT INTO media_executions(id,session_id,kind,owner_id,metrics_entry_candidate) SELECT $1,p.id,'delivery',$2,($6 AND COALESCE(p.playback_metrics_version=2,false)) FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$3 AND p.delivery_token_hash=$4 AND p.lifecycle_epoch=$5 AND p.expires_at>clock_timestamp() AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource) AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
+        .bind(id).bind(owner).bind(session).bind(token_hash).bind(row.get::<i64,_>("lifecycle_epoch")).bind(entry_candidate)
         .execute(&mut *tx).await?.rows_affected() == 1;
+    // The mandatory receipt already exists before this optional lookup. Even
+    // if the lookup fails, it consumes eligibility for all later admissions.
+    // Roll back the read-only savepoint on both paths to restore its timeout.
+    let first_output_entry = if inserted && entry_candidate {
+        let mut observation = tx.begin().await?;
+        let first = async {
+            sqlx::query("SET LOCAL statement_timeout='100ms'").execute(&mut *observation).await?;
+            sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM media_executions own WHERE own.id=$1 AND own.metrics_entry_candidate=true) AND NOT EXISTS(SELECT 1 FROM media_executions prior WHERE prior.session_id=$2 AND prior.kind='delivery' AND prior.id<>$1 AND prior.metrics_entry_candidate IS DISTINCT FROM false)")
+                .bind(id).bind(session).fetch_one(&mut *observation).await
+        }.await.unwrap_or(false);
+        observation.rollback().await?;
+        first
+    } else {
+        false
+    };
     tx.commit().await?;
-    Ok(inserted.then_some(id))
+    Ok(inserted.then_some(DeliveryAdmission {
+        execution_id: id,
+        first_output_entry,
+    }))
 }
 
 /// Caller must have a positive drain result; database retries are idempotent.

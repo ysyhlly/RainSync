@@ -91,6 +91,7 @@ mod tests {
         let mut plan: PlaybackPlan = serde_json::from_value(legacy).unwrap();
         let absent = serde_json::to_value(&plan).unwrap();
         for key in [
+            "selected_output",
             "subtitle_mode",
             "seekable_media_ranges_ms",
             "pending_job_id",

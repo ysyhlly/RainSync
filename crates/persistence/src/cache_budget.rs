@@ -19,8 +19,15 @@ pub async fn snapshot(pool: &PgPool) -> Result<i64> {
         sqlx::query_scalar("SELECT revision FROM cache_budget WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await?;
-    let removed = sqlx::query("DELETE FROM cache_write_reservations r WHERE NOT EXISTS(SELECT 1 FROM media_jobs j WHERE j.id=r.job_id AND j.owner_id=r.owner_id AND j.attempt=r.attempt AND j.lease_until>clock_timestamp())")
-        .execute(&mut *tx).await?.rows_affected();
+    // An expired/missing job is not proof that its writer stopped. This also
+    // retains old-attempt reservations after a different owner claims the job.
+    let reaped = crate::cache_writers::reaped("r.job_id", "r.attempt", "r.owner_id");
+    let removed = sqlx::query(&format!(
+        "DELETE FROM cache_write_reservations r WHERE r.purpose='media_job' AND {reaped}"
+    ))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     let revision = if removed > 0 {
         sqlx::query_scalar(
             "UPDATE cache_budget SET revision=revision+1 WHERE singleton RETURNING revision",
@@ -49,10 +56,17 @@ pub async fn reserve(
     if revision != current {
         return Ok(Admission::Changed);
     }
-    let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND NOT p.stopped AND p.expires_at>clock_timestamp())")
+    let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND NOT p.stopped AND p.expires_at>clock_timestamp() AND EXISTS(SELECT 1 FROM media_executions e WHERE e.kind='job' AND e.job_id=j.id AND e.attempt=j.attempt AND e.owner_id=j.owner_id AND e.reaped_at IS NULL))")
         .bind(claim.id).bind(claim.owner).bind(claim.attempt).fetch_one(&mut *tx).await?;
     if !valid {
         return Ok(Admission::Stale);
+    }
+    // There is one reservation slot per job. Never overwrite an unresolved
+    // older attempt with a new owner's reservation or stop counting its bytes.
+    let other_attempt: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cache_write_reservations WHERE job_id=$1 AND (owner_id<>$2 OR attempt<>$3))")
+        .bind(claim.id).bind(claim.owner).bind(claim.attempt).fetch_one(&mut *tx).await?;
+    if other_attempt {
+        return Ok(Admission::Full);
     }
     let held: String = sqlx::query_scalar(
         "SELECT COALESCE(sum(bytes),0)::text FROM cache_write_reservations WHERE job_id<>$1",
@@ -78,9 +92,10 @@ pub async fn release(pool: &PgPool, job: Uuid, owner: Uuid, attempt: i64) -> Res
     sqlx::query("SELECT revision FROM cache_budget WHERE singleton FOR UPDATE")
         .execute(&mut *tx)
         .await?;
-    let n = sqlx::query(
-        "DELETE FROM cache_write_reservations WHERE job_id=$1 AND owner_id=$2 AND attempt=$3",
-    )
+    let reaped = crate::cache_writers::reaped("r.job_id", "r.attempt", "r.owner_id");
+    let n = sqlx::query(&format!(
+        "DELETE FROM cache_write_reservations r WHERE job_id=$1 AND owner_id=$2 AND attempt=$3 AND r.purpose='media_job' AND {reaped}"
+    ))
     .bind(job)
     .bind(owner)
     .bind(attempt)

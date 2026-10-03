@@ -14,6 +14,7 @@ pub async fn lock_grant(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: Uuid,
     user: Uuid,
+    login_hash: &str,
 ) -> Result<Option<Grant>> {
     let room: Option<Uuid> =
         sqlx::query_scalar("SELECT room_id FROM playback_sessions WHERE id=$1 AND user_id=$2")
@@ -43,6 +44,7 @@ pub async fn lock_grant(
     let Some(state) = state else {
         return Ok(None);
     };
+    media_authorization::lock_caller(tx, id, user, login_hash).await?;
     // Grant mutations never change a referenced key. Keep them serialized,
     // while allowing a job claim's media_executions FK to take KEY SHARE:
     // claim already owns the job that Stop must cancel after this grant lock.
@@ -162,7 +164,7 @@ pub async fn observe(
 ) -> Result<Json<protocol::PlaybackObservationReceipt>> {
     let user = auth(&app, &h, true).await?;
     let mut tx = app.db.begin().await?;
-    let grant = lock_grant(&mut tx, id, user.id)
+    let grant = lock_grant(&mut tx, id, user.id, &media_authorization::login_hash(&h)?)
         .await?
         .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
     let receipt = accept(&mut tx, &grant, &sample, false).await?;

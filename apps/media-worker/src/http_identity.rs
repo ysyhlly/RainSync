@@ -27,6 +27,10 @@ pub enum Class {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Metadata {
+    /// Missing legacy evidence proves only an unchanged original destination.
+    /// Hash the complete canonical final URL, including any signed query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_target_sha256: Option<String>,
     pub etag: Option<String>,
     pub modified: Option<String>,
     pub reliable_modified: bool,
@@ -99,11 +103,17 @@ impl Metadata {
                     .is_ok_and(|age| age >= Duration::from_secs(60))
             });
         Ok(Self {
+            final_target_sha256: None,
             etag,
             modified: modified.map(httpdate::fmt_http_date),
             reliable_modified,
             size,
         })
+    }
+    pub fn with_target(mut self, original: &url::Url, final_target: &url::Url) -> Self {
+        self.final_target_sha256 =
+            (original != final_target).then(|| crate::hash(final_target.as_str()));
+        self
     }
     pub fn reliable(&self) -> bool {
         self.size.is_some()
@@ -116,7 +126,8 @@ impl Metadata {
         self.etag.as_deref().or(self.modified.as_deref())
     }
     fn agrees(&self, next: &Self) -> bool {
-        self.size == next.size
+        self.final_target_sha256 == next.final_target_sha256
+            && self.size == next.size
             && if self.etag.as_deref().is_some_and(strong_etag) {
                 self.etag == next.etag
             } else if self.reliable_modified {
@@ -129,9 +140,11 @@ impl Metadata {
     /// Supplied conflicts still invalidate the grant, but absence never erases
     /// a validator or length established by an earlier representation.
     pub fn conflicts_with_partial(&self, next: &Self) -> bool {
-        self.size
-            .zip(next.size)
-            .is_some_and(|(old, new)| old != new)
+        self.final_target_sha256 != next.final_target_sha256
+            || self
+                .size
+                .zip(next.size)
+                .is_some_and(|(old, new)| old != new)
             || next
                 .etag
                 .as_ref()
@@ -144,9 +157,9 @@ impl Metadata {
     }
     pub fn condition(
         &self,
-        mut request: reqwest::RequestBuilder,
+        mut request: providers::media_request::MediaRequest,
         ranged: bool,
-    ) -> reqwest::RequestBuilder {
+    ) -> providers::media_request::MediaRequest {
         if let Some(value) = self.validator() {
             request = request.header(
                 if self.etag.is_some() {
@@ -188,6 +201,16 @@ pub struct State {
 impl State {
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.version == 1, "unsupported_http_identity");
+        anyhow::ensure!(
+            self.metadata
+                .final_target_sha256
+                .as_ref()
+                .is_none_or(|value| value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))),
+            "invalid_http_identity"
+        );
         anyhow::ensure!(
             self.metadata.etag.as_ref().is_none_or(|v| v.len() <= 1024
                 && (strong_etag(v) || v.strip_prefix("W/").is_some_and(strong_etag))),
@@ -471,6 +494,7 @@ mod tests {
     use super::*;
     fn metadata(etag: Option<&str>, length: u64) -> Metadata {
         Metadata {
+            final_target_sha256: None,
             etag: etag.map(str::to_owned),
             modified: None,
             reliable_modified: false,
@@ -582,6 +606,58 @@ mod tests {
         headers.append(header::IF_RANGE, "\"a\"".parse().unwrap());
         assert!(!identity.if_range_matches(&headers));
     }
+    #[test]
+    fn redirected_identity_binds_complete_final_url_and_legacy_means_no_follow() {
+        let original = url::Url::parse("https://media.invalid/start?original=private").unwrap();
+        let final_url = url::Url::parse("https://cdn.invalid/media?signature=private").unwrap();
+        let legacy = metadata(Some("\"same\""), 10);
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_json.get("final_target_sha256").is_none());
+        let legacy: Metadata = serde_json::from_value(legacy_json).unwrap();
+        let direct = legacy.clone().with_target(&original, &original);
+        assert_eq!(direct, legacy);
+        let redirected = legacy.clone().with_target(&original, &final_url);
+        assert!(
+            !serde_json::to_string(&redirected)
+                .unwrap()
+                .contains("private")
+        );
+        let mut bound = state(redirected.clone());
+        bound.validate().unwrap();
+        bound.observe(&redirected, None, true, true, false).unwrap();
+        let mut sparse = Metadata::read(StatusCode::OK, &HeaderMap::new())
+            .unwrap()
+            .with_target(&original, &final_url);
+        bound.observe(&sparse, None, false, false, true).unwrap();
+        for other in [
+            original.clone(),
+            url::Url::parse("https://other-cdn.invalid/media?signature=private").unwrap(),
+            url::Url::parse("https://cdn.invalid/other?signature=private").unwrap(),
+            url::Url::parse("https://cdn.invalid/media?signature=rotated").unwrap(),
+        ] {
+            let next = legacy.clone().with_target(&original, &other);
+            assert!(redirected.conflicts_with_partial(&next));
+            assert!(!redirected.agrees(&next));
+            let mut previous = state(redirected.clone());
+            assert_eq!(
+                previous.observe(&next, None, false, false, true),
+                Err(changed())
+            );
+        }
+        for (previous, next) in [
+            (legacy.clone(), redirected.clone()),
+            (redirected.clone(), legacy.clone()),
+        ] {
+            let mut previous = state(previous);
+            assert_eq!(
+                previous.observe(&next, None, false, false, false),
+                Err(changed())
+            );
+        }
+        sparse.final_target_sha256 = Some("not-a-digest".into());
+        assert!(state(sparse).validate().is_err());
+    }
+
     #[test]
     fn ranges_cover_empty_suffix_tail_multi_and_overflow() {
         for (value, expected) in [

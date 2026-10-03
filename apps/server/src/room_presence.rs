@@ -254,7 +254,7 @@ impl Runtime {
                 // Resolve the terminal reason only on denial. Successful send
                 // admission validates recipient and all subjects in one final
                 // bounded read, without another awaited query before send.
-                super::socket_access(app, self.room, user, session_hash, true).await?;
+                super::socket_access(app, self.room, user, session_hash).await?;
                 return Err("service_unavailable");
             }
             let authorized = candidates

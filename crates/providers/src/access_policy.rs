@@ -29,6 +29,15 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct SourceAccessPolicy {
     pub schema_version: u8,
     pub origins: Vec<OriginRule>,
+    /// Media GET/HEAD only. Omission preserves conservative no-follow behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirects: Option<RedirectPolicy>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedirectPolicy {
+    pub max_hops: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -200,6 +209,7 @@ fn origin(value: &str) -> Result<String> {
 pub struct SourceAccess {
     primary_origin: String,
     rules: Option<BTreeMap<String, Vec<Cidr>>>,
+    max_redirects: u8,
 }
 
 impl SourceAccess {
@@ -208,6 +218,13 @@ impl SourceAccess {
         let rules = if let Some(policy) = policy {
             if policy.schema_version != 1 {
                 return Err(AccessError::UnsupportedVersion);
+            }
+            if policy
+                .redirects
+                .as_ref()
+                .is_some_and(|redirects| !(1..=5).contains(&redirects.max_hops))
+            {
+                return Err(AccessError::InvalidPolicy);
             }
             if policy.origins.is_empty() || policy.origins.len() > MAX_ORIGINS {
                 return Err(AccessError::InvalidPolicy);
@@ -241,7 +258,14 @@ impl SourceAccess {
         Ok(Self {
             primary_origin,
             rules,
+            max_redirects: policy
+                .and_then(|policy| policy.redirects.as_ref())
+                .map_or(0, |redirects| redirects.max_hops),
         })
+    }
+
+    pub(crate) fn max_redirects(&self) -> u8 {
+        self.max_redirects
     }
 
     pub fn enforcement(&self) -> Enforcement {

@@ -25,7 +25,8 @@ impl Handle {
     }
 }
 struct Request {
-    user: User,
+    user_id: Uuid,
+    session_hash: String,
     command: Command,
     reply: oneshot::Sender<Value>,
 }
@@ -141,22 +142,20 @@ async fn socket_access(
     room: Uuid,
     user: Uuid,
     session_hash: &str,
-    presence: bool,
 ) -> std::result::Result<(), &'static str> {
     socket_membership(app, room, user).await?;
-    if presence {
-        match tokio::time::timeout(std::time::Duration::from_secs(2), database_checks::boolean(
-            &app.db,
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>now())")
-                .bind(session_hash).bind(user),
-            1500,
-        )).await {
-            Ok(Ok(true)) => {},
-            Ok(Ok(false)) => return Err("session_expired"),
-            _ => return Err("service_unavailable"),
-        }
+    // Login authority is independent of optional presence negotiation. Legacy
+    // sockets must not keep sending or receiving for the heartbeat interval.
+    match tokio::time::timeout(std::time::Duration::from_secs(2), database_checks::boolean(
+        &app.db,
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>clock_timestamp())")
+            .bind(session_hash).bind(user),
+        1500,
+    )).await {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false)) => Err("session_expired"),
+        _ => Err("service_unavailable"),
     }
-    Ok(())
 }
 
 async fn reject_socket(
@@ -229,13 +228,13 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                 persistence::check_control_epoch(
                     &app.db,
                     id,
-                    req.user.id,
+                    req.user_id,
                     req.command.control_epoch,
                 )
                 .await
                 .map_err(|error| control_error(error, "database_error"))?;
                 if let Some(previous) =
-                    persistence::previous(&app.db, id, &req.command, req.user.id)
+                    persistence::previous(&app.db, id, &req.command, req.user_id)
                         .await
                         .map_err(|error| match error.to_string().as_str() {
                             "room_not_active" => "room_not_active".to_string(),
@@ -262,9 +261,12 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                     ));
                 }
                 let reducer_time_ms = app.now();
-                let mut next =
-                    room_core::reduce(&state, &req.command, req.user.id, req.user.admin, reducer_time_ms)
-                        .map_err(String::from)?;
+                // The final reduction belongs to the transaction, with the
+                // current role and exact originating login held through commit.
+                let mut media_id = match req.command.action {
+                    protocol::Action::ChangeMedia { media_id } => Some(media_id),
+                    _ => state.media_id,
+                };
                 if matches!(req.command.action, protocol::Action::EndMedia { .. }) {
                     let mut ids: Vec<Uuid> = sqlx::query_scalar(&format!("SELECT q.media_id FROM playlist_items q JOIN media_items m ON m.id=q.media_id JOIN sources s ON s.id=m.source_id WHERE q.room_id=$1 AND {} ORDER BY q.sort_order,q.id", media_titles::VISIBLE))
                         .bind(id).fetch_all(&app.db).await.map_err(|_| "database_error")?;
@@ -274,11 +276,12 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                     ids.retain(|media| seen.insert(*media));
                     if !ids.is_empty() {
                         let index = ids.iter().position(|media| Some(*media) == state.media_id);
-                        next.media_id = Some(ids[index.map_or(0, |i| (i + 1) % ids.len())]);
+                        media_id = Some(ids[index.map_or(0, |i| (i + 1) % ids.len())]);
                     }
                 }
+                let mut resolved_media = None;
                 if matches!(req.command.action, protocol::Action::ChangeMedia { .. } | protocol::Action::EndMedia { .. }) {
-                    let media_id = next.media_id.ok_or("no_media")?;
+                    let media_id = media_id.ok_or("no_media")?;
                     let duration = sqlx::query(
                         &format!("SELECT m.duration_ms FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND {}", media_titles::VISIBLE),
                     )
@@ -287,9 +290,13 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                     .await
                     .map_err(|_| "database_error".to_string())?
                     .ok_or("media_not_found")?;
-                    next.duration_ms = duration.get("duration_ms");
+                    let resolution = room_core::diagnostics::ResolvedMedia {
+                        media_id,
+                        duration_ms: duration.get("duration_ms"),
+                    };
+                    resolved_media = Some(resolution);
                 }
-                persistence::commit(&app.db, &next, &req.command, req.user.id, state.revision, req.user.admin, reducer_time_ms)
+                let next = persistence::commit(&app.db, &req.command, req.user_id, &req.session_hash, reducer_time_ms, resolved_media)
                     .await
                     .map_err(|error| control_error(error, "commit_failed"))?;
                 state = next.clone();
@@ -327,6 +334,16 @@ fn control_error(error: anyhow::Error, fallback: &str) -> String {
         "controller_required" => "controller_required".into(),
         "room_not_active" => "room_not_active".into(),
         "not_a_member" => "not_a_member".into(),
+        "session_expired" => "session_expired".into(),
+        // Reducer validation now runs inside persistence's authority transaction.
+        reason @ ("protocol_version"
+        | "wrong_room"
+        | "stale_media"
+        | "no_media"
+        | "invalid_position"
+        | "invalid_rate"
+        | "generation_overflow"
+        | "revision_overflow") => reason.into(),
         _ => fallback.into(),
     }
 }
@@ -401,11 +418,67 @@ async fn controller<'a>(
             .fetch_one(&mut *tx)
             .await?;
     let s: RoomState = serde_json::from_value(value).map_err(anyhow::Error::from)?;
-    if !u.admin && s.controller_user_id != u.id {
+    // Keep room -> snapshot -> member ordering. The earlier fast check cannot
+    // authorize a mutation after membership is revoked while these locks wait.
+    let membership: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
+    )
+    .bind(id)
+    .bind(u.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if membership.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "not_a_member"));
+    }
+    // Freeze current role and the exact authenticated login through commit.
+    // FOR SHARE, unlike KEY SHARE, also conflicts with non-key admin/expiry
+    // changes. Do not reacquire a pool connection via auth() while holding tx.
+    let current_admin: Option<bool> =
+        sqlx::query_scalar("SELECT admin FROM users WHERE id=$1 FOR SHARE")
+            .bind(u.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let login_hash =
+        hash(&cookie(h).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "login_required"))?);
+    let csrf: Option<String> = sqlx::query_scalar(
+        "SELECT csrf FROM sessions WHERE token_hash=$1 AND user_id=$2 FOR SHARE",
+    )
+    .bind(&login_hash)
+    .bind(u.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>clock_timestamp())",
+    ).bind(&login_hash).bind(u.id).fetch_one(&mut *tx).await?;
+    if !valid || csrf.is_none() || current_admin.is_none() {
+        return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
+    }
+    if h.get("x-csrf-token").and_then(|value| value.to_str().ok()) != csrf.as_deref() {
+        return Err(err(StatusCode::FORBIDDEN, "csrf_rejected"));
+    }
+    if current_admin != Some(true) && s.controller_user_id != u.id {
         return Err(err(StatusCode::FORBIDDEN, "controller_required"));
     };
     Ok(tx)
 }
+async fn commit_controller(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    h: &HeaderMap,
+) -> Result<()> {
+    // Row locks prevent revocation/role changes, not natural expiration while
+    // a later INSERT/DELETE waits. Recheck the exact login at final admission.
+    let login_hash =
+        hash(&cookie(h).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "login_required"))?);
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND expires_at>clock_timestamp())",
+    ).bind(login_hash).fetch_one(&mut *tx).await?;
+    if !valid {
+        return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn invite(
     State(app): State<App>,
     h: HeaderMap,
@@ -418,7 +491,7 @@ pub async fn invite(
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
+    commit_controller(tx, &h).await?;
     Ok(Json(json!({"token":t,"room_id":id})))
 }
 pub async fn revoke_invite(
@@ -432,7 +505,7 @@ pub async fn revoke_invite(
         .bind(hash(&t))
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
+    commit_controller(tx, &h).await?;
     Ok(Json(json!({"ok":true})))
 }
 #[derive(Deserialize)]
@@ -506,7 +579,7 @@ pub async fn add_playlist(
     }
     let item = Uuid::new_v4();
     sqlx::query("INSERT INTO playlist_items SELECT $1,$2,$3,COALESCE(max(sort_order),0)+1 FROM playlist_items WHERE room_id=$2").bind(item).bind(id).bind(body.media_id).execute(&mut *tx).await?;
-    tx.commit().await?;
+    commit_controller(tx, &h).await?;
     Ok(Json(json!({"id":item})))
 }
 pub async fn remove_playlist(
@@ -520,7 +593,7 @@ pub async fn remove_playlist(
         .bind(item)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
+    commit_controller(tx, &h).await?;
     Ok(Json(json!({"ok":true})))
 }
 #[derive(Deserialize)]
@@ -666,15 +739,7 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
             missing = rows.iter().map(|r| r.get("state")).collect();
         }
     }
-    if let Err(reason) = socket_access(
-        &app,
-        id,
-        user.id,
-        &session_hash,
-        negotiated_presence || negotiated_control_metrics,
-    )
-    .await
-    {
+    if let Err(reason) = socket_access(&app, id, user.id, &session_hash).await {
         reject_socket(&mut out, reason).await;
         return;
     }
@@ -745,13 +810,7 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
             _ = &mut lease_expiry, if negotiated_presence => { break; },
             _=heartbeat.tick()=>{
                 if !negotiated_presence && last_seen.elapsed().as_secs()>45 {break};
-                let valid=tokio::time::timeout(std::time::Duration::from_secs(2),database_checks::boolean(&app.db,sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND expires_at>now())").bind(&session_hash),1500)).await;
-                match valid {
-                    Ok(Ok(true)) => {},
-                    Ok(Ok(false)) => {reject_with_presence(&mut out, "session_expired", presence_lease.as_ref()).await;break},
-                    _ => {reject_with_presence(&mut out, "service_unavailable", presence_lease.as_ref()).await;break},
-                }
-                if let Err(reason)=socket_access(&app,id,user.id,&session_hash,negotiated_presence).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
+                if let Err(reason)=socket_access(&app,id,user.id,&session_hash).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
                 let payload = if negotiated_presence {
                     let nonce = Uuid::new_v4().as_bytes().to_vec();
                     if probes.len() == 3 { probes.pop_front(); }
@@ -767,7 +826,7 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                     last_seen=Instant::now();
                     if let Some(lease) = &presence_lease && let Some(index) = probes.iter().position(|probe| probe.as_slice() == payload.as_ref()) {
                             probes.remove(index);
-                            if let Err(reason) = socket_access(&app,id,user.id,&session_hash,true).await { reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break; }
+                            if let Err(reason) = socket_access(&app,id,user.id,&session_hash).await { reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break; }
                             if !lease.renew() { break; }
                             if let Some(deadline) = lease.deadline() { lease_expiry.as_mut().reset(tokio::time::Instant::from_std(deadline)); }
                     }
@@ -783,7 +842,7 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                     continue;
                 }
                 last_seen=Instant::now();
-                if let Err(reason)=socket_access(&app,id,user.id,&session_hash,negotiated_presence).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
+                if let Err(reason)=socket_access(&app,id,user.id,&session_hash).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
                 match v["type"].as_str().unwrap_or("") {
                     "CLOCK_SYNC"=>{let t2=app.now();json!({"type":"CLOCK_SYNC_REPLY","t1":v["t1"],"t2":t2,"t3":app.now(),"clock_epoch":app.epoch})},
                     "CLIENT_STATUS"=>{app.metrics.report(&v["status"]);let _=handle.events.send(json!({"type":"CLIENT_STATUS","user_id":user.id,"status":v["status"]}));continue},
@@ -803,7 +862,7 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                         let identity=match profile::value(&app,user.id).await{Ok(value)=>value,Err(_)=>{reject_with_presence(&mut out, "database_error", presence_lease.as_ref()).await;break}};
                         let reply=json!({"type":"CHAT","id":cid,"user_id":user.id,"username":identity["username"],"display_name":identity["display_name"],"avatar_url":identity["avatar_url"],"avatar_version":identity["avatar_version"],"body":body,"client_message_id":client_message_id});
                         if replayed {
-                            if let Err(reason)=socket_access(&app,id,user.id,&session_hash,negotiated_presence).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
+                            if let Err(reason)=socket_access(&app,id,user.id,&session_hash).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
                             if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Text(reply.to_string().into()))).await,Ok(Ok(()))) {break}
                         } else {let _=handle.events.send(reply);}
                         continue
@@ -815,7 +874,7 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                             let _ = tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Text(message.to_string().into()))).await;
                             continue
                         };let(tx,rx)=oneshot::channel();
-                        if handle.tx.try_send(Request{user:user.clone(),command,reply:tx}).is_err(){socket_error("room_busy",command_id)}else{match rx.await{Ok(v)=>v,Err(_)=>break}}
+                        if handle.tx.try_send(Request{user_id:user.id,session_hash:session_hash.clone(),command,reply:tx}).is_err(){socket_error("room_busy",command_id)}else{match rx.await{Ok(v)=>v,Err(_)=>break}}
                     }
                 }
             }
@@ -846,9 +905,7 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
                 Some("CONTROL_EPOCH_REQUIRED" | "CONTROL_EPOCH_EXPIRED")
             );
         if renew_control {
-            if let Err(reason) =
-                socket_access(&app, id, user.id, &session_hash, negotiated_presence).await
-            {
+            if let Err(reason) = socket_access(&app, id, user.id, &session_hash).await {
                 reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;
                 break;
             }
@@ -858,8 +915,7 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
         }
         // Presence has just checked recipient and subjects in one final read.
         if value["type"] != "PRESENCE_SNAPSHOT"
-            && let Err(reason) =
-                socket_access(&app, id, user.id, &session_hash, negotiated_presence).await
+            && let Err(reason) = socket_access(&app, id, user.id, &session_hash).await
         {
             reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;
             break;

@@ -171,7 +171,8 @@ async function controller(f, client, room) {
   };
 }
 function syntheticVideo() {
-  let callback;
+  const callbacks = new Map();
+  let nextFrameId = 0;
   const el = Object.assign(new EventTarget(), {
     src: "",
     readyState: 4,
@@ -199,20 +200,24 @@ function syntheticVideo() {
       el.dispatchEvent(new Event("playing"));
     },
     requestVideoFrameCallback(next) {
-      callback = next;
-      return 1;
+      const id = ++nextFrameId;
+      callbacks.set(id, next);
+      return id;
     },
-    cancelVideoFrameCallback() {
-      callback = undefined;
+    cancelVideoFrameCallback(id) {
+      callbacks.delete(id);
     },
   });
   return {
     el,
     frame() {
-      const next = callback;
-      callback = undefined;
-      assert.ok(next);
-      next(performance.now(), { presentationTime: performance.now() });
+      // A real element supports independent RVFC registrations for both the
+      // measurement binding and the separate first-frame deadline.
+      const current = [...callbacks.values()];
+      callbacks.clear();
+      assert.ok(current.length);
+      const presentedAt=performance.now();
+      for(const next of current) next(presentedAt, { presentationTime: presentedAt });
     },
   };
 }
@@ -392,7 +397,8 @@ try {
     await runtime.loadMedia();
     assert.equal(prepares.length, 1);
     const original = prepares[0];
-    assert.equal(original.response.playback_metrics_version, 1);
+    assert.equal(original.response.playback_metrics_version, 2);
+    assert.deepEqual(original.body.playback_metrics_supported_versions,[1,2]);
     assert.equal(
       original.body.playback_metrics.meter_start_generation,
       original.body.plan_generation,
@@ -417,7 +423,12 @@ try {
     assert.equal(credited.elapsed - before.elapsed, first.body.elapsed_ms);
     assert.equal(slot(original.body).seq, first.body.seq);
     assert.equal(first.response.metrics_seq, first.body.seq);
+    assert.equal(first.body.version,2);
     assert.equal(first.body.first_frame.evidence, "video_frame_callback");
+    assert.equal(first.body.first_frame_plan_generation,original.response.plan_generation);
+    assert.equal(Object.values(first.body.startup_phases).reduce((sum,value)=>sum+value,0),first.body.first_frame.confirmed_elapsed_ms);
+    assert.ok(first.body.startup_phases.preparation_ms > 0);
+    assert.equal(f.sql(`SELECT metrics_first_frame_source||':'||metrics_first_frame_mode FROM playback_viewer_plans WHERE viewer_id=${quote(original.body.viewer_id)}`),'local:direct');
     assert.equal(first.body.source, undefined);
     assert.equal(first.body.generation, undefined);
     check(
@@ -478,6 +489,8 @@ try {
     assert.ok(continued.body.seq > first.body.seq);
     assert.ok(continued.body.elapsed_ms > first.body.elapsed_ms);
     assert.deepEqual(continued.body.first_frame, first.body.first_frame);
+    assert.equal(continued.body.first_frame_plan_generation,original.response.plan_generation);
+    assert.deepEqual(continued.body.startup_phases,first.body.startup_phases);
     assert.equal(
       continued.body.meter_start_generation,
       first.body.meter_start_generation,
@@ -640,6 +653,7 @@ try {
       );
       senders.add(sender);
       sender.bind({
+        version:1,
         sessionId: grant.plan.session_id,
         planGeneration: grant.plan.plan_generation,
         mediaGeneration: grant.plan.media_generation,

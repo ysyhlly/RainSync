@@ -11,6 +11,7 @@ mod health;
 mod http_representation;
 mod limits;
 mod media;
+mod media_authorization;
 mod media_previews;
 mod media_titles;
 mod metrics;
@@ -30,6 +31,10 @@ mod room_lifecycle;
 mod room_ownership;
 mod rooms;
 mod source_access;
+mod source_key_check;
+mod static_hls_contract;
+mod static_hls_input_cipher;
+mod static_hls_operation_cipher;
 mod upstream;
 mod upstream_policy;
 mod upstream_profiles;
@@ -339,6 +344,25 @@ async fn ws(State(app): State<App>, h: HeaderMap, upgrade: WebSocketUpgrade) -> 
 }
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--source-access-contract") {
+        anyhow::ensure!(
+            std::env::args().len() == 2,
+            "invalid capability probe arguments"
+        );
+        println!("{}", providers::source_access_contract::SERVER);
+        return Ok(());
+    }
+    // Offline cutover probe: no runtime, environment loading, database or listener.
+    if std::env::args().nth(1).as_deref() == Some("--media-authorization-contract") {
+        anyhow::ensure!(
+            std::env::args().len() == 2,
+            "invalid capability probe arguments"
+        );
+        println!(
+            "{{\"schema_version\":1,\"contract\":\"media-login-binding-v1\",\"migration\":41,\"legacy\":\"fixed-expiry\",\"caller\":\"exact-login\"}}"
+        );
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -368,7 +392,17 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
+    let deployment = media_core::deployment_config::Settings::from_env(
+        media_core::deployment_config::Role::Server,
+    )?;
+    let key = STANDARD.decode(std::env::var("SOURCE_ENCRYPTION_KEY")?)?;
+    anyhow::ensure!(
+        key.len() == 32,
+        "SOURCE_ENCRYPTION_KEY must decode to 32 bytes"
+    );
+    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
     let db = persistence::connect(&std::env::var("DATABASE_URL")?).await?;
+    source_key_check::verify(&db, &cipher).await?;
     persistence::migrate(&db).await?;
     let mut lock = db.acquire().await?;
     let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(72614931)")
@@ -449,12 +483,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
             .execute(&db)
             .await?;
     }
-    let key = STANDARD.decode(std::env::var("SOURCE_ENCRYPTION_KEY")?)?;
-    anyhow::ensure!(
-        key.len() == 32,
-        "SOURCE_ENCRYPTION_KEY must decode to 32 bytes"
-    );
-    let public_origin = std::env::var("PUBLIC_ORIGIN").unwrap_or("http://localhost:5173".into());
+    let public_origin = deployment.public_origin;
     let app = App {
         presence_sequence: presence::Sequence::default(),
         account_security: account_security::Security::configured()?,
@@ -467,7 +496,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         db: db.clone(),
         secure: public_origin.starts_with("https://"),
         origin: public_origin,
-        key: Arc::new(Aes256Gcm::new_from_slice(&key).unwrap()),
+        key: Arc::new(cipher),
         epoch: Uuid::new_v4(),
         start: Instant::now(),
         rooms: Default::default(),
@@ -481,12 +510,15 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     // proof. Unknown preparation/resource receipts remain unconfirmed.
     upstream_policy::startup(&app).await?;
     let mut recovery = db.begin().await?;
-    sqlx::query("UPDATE playback_requests SET status='failed',error_status=409,error_code='playback_request_interrupted' WHERE status='pending'")
+    // Keep legacy startup semantics in their own transaction. It must not
+    // acquire pending-custody room locks after these legacy request locks.
+    sqlx::query("UPDATE playback_requests SET status='failed',error_status=409,error_code='playback_request_interrupted' WHERE status='pending' AND static_hls_input_version IS NULL")
         .execute(&mut *recovery).await?;
     sqlx::query("UPDATE playback_sessions SET stopped=true WHERE id IN(SELECT session_id FROM playback_requests WHERE status='failed' AND error_code='playback_request_interrupted')")
         .execute(&mut *recovery).await?;
     persistence::upstream_reservations::recover(&mut recovery, app.epoch).await?;
     recovery.commit().await?;
+    persistence::static_hls_pending::recover_pending(&db).await?;
     persistence::room_diagnostics::reset_clock(&db, app.epoch).await?;
     let cleanup = db.clone();
     tokio::spawn(async move {
@@ -502,7 +534,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
                 "DELETE FROM agent_transfers WHERE expires_at<now()",
                 "UPDATE agent_transfer_runs SET status='failed',reason='transfer_owner_lost',updated_at=now(),finished_at=now(),agent_drained_at=CASE WHEN dispatched_at IS NULL AND NOT legacy_unconfirmed THEN COALESCE(agent_drained_at,clock_timestamp()) ELSE agent_drained_at END WHERE finished_at IS NULL AND lease_until<=now()",
                 "DELETE FROM agent_transfer_runs WHERE NOT legacy_unconfirmed AND finished_at<now()-interval '24 hours' AND (session_id IS NULL OR agent_drained_at IS NOT NULL)",
-                "DELETE FROM playback_requests r WHERE r.expires_at<now() AND NOT EXISTS(SELECT 1 FROM playback_sessions p WHERE p.id=r.session_id AND NOT p.stopped AND p.expires_at>now())",
+                "DELETE FROM playback_requests r WHERE r.static_hls_input_version IS NULL AND NOT EXISTS(SELECT 1 FROM static_hls_captures c WHERE c.session_id=r.session_id) AND r.expires_at<now() AND NOT EXISTS(SELECT 1 FROM playback_sessions p WHERE p.id=r.session_id AND NOT p.stopped AND p.expires_at>now())",
                 // Preserve the positive ledger proof across a failed marker write.
                 // These statements acquire session rows only; do not invert the
                 // session-before-upstream lock order used by Stop/close.
@@ -523,6 +555,19 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     let upstream = app.upstream.clone();
     let router = Router::new()
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
+        .route(
+            "/api/v1/deployment/health",
+            get(|| async {
+                (
+                    [(header::CACHE_CONTROL, "no-store")],
+                    Json(json!({"service":"rainsync-server","live":true})),
+                )
+            }),
+        )
+        .route(
+            "/api/v1/deployment/static-hls-contract",
+            post(static_hls_contract::endpoint),
+        )
         .route("/api/v1/auth/login", post(login))
         .route(
             "/api/v1/auth/registration-invites/validate",
@@ -644,6 +689,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .layer(axum::extract::DefaultBodyLimit::max(65536))
         .layer(axum::middleware::from_fn(http_api::errors))
         .route("/ready", get(health::endpoint))
+        .route("/api/v1/deployment/ready", get(health::endpoint))
         .with_state(app);
     let listener =
         tokio::net::TcpListener::bind(std::env::var("BIND").unwrap_or("0.0.0.0:8080".into()))

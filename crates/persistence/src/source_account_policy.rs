@@ -37,9 +37,21 @@ pub async fn lock(
 /// Caller holds its room/lifecycle admission lock through commit. This locks
 /// source authority only; the final statement must also recheck stopped/expiry.
 pub async fn lock_session(tx: &mut Transaction<'_, Postgres>, session: Uuid) -> Result<bool> {
-    let row = sqlx::query("SELECT m.source_id,p.resource,p.user_id,p.room_id,COALESCE((p.resource->>'source_policy_revision')::bigint,0) AS revision,(p.resource->>'account_policy_generation')::bigint AS generation FROM playback_sessions p JOIN media_items m ON m.id=p.media_id WHERE p.id=$1")
+    let row = sqlx::query("SELECT m.source_id,p.resource,p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch,COALESCE((p.resource->>'source_policy_revision')::bigint,0) AS revision,(p.resource->>'account_policy_generation')::bigint AS generation FROM playback_sessions p JOIN media_items m ON m.id=p.media_id WHERE p.id=$1")
         .bind(session).fetch_optional(&mut **tx).await?;
     let Some(row) = row else { return Ok(false) };
+    if let Some(login) = row.get::<Option<String>, _>("auth_login_hash")
+        && !crate::media_authorization::lock_origin(
+            tx,
+            row.get("user_id"),
+            row.get("room_id"),
+            Some(&login),
+            row.get("auth_membership_epoch"),
+        )
+        .await?
+    {
+        return Ok(false);
+    }
     let resource = row.get("resource");
     if !crate::http_file_authorization::resource_scope_matches(
         &resource,
@@ -59,9 +71,20 @@ pub async fn lock_reservation(
     tx: &mut Transaction<'_, Postgres>,
     reservation: Uuid,
 ) -> Result<bool> {
-    let row = sqlx::query("SELECT source_id,source_policy_revision,account_policy_generation FROM upstream_reservations WHERE id=$1")
+    let row = sqlx::query("SELECT source_id,source_policy_revision,account_policy_generation,user_id,room_id,auth_login_hash,auth_membership_epoch FROM upstream_reservations WHERE id=$1")
         .bind(reservation).fetch_optional(&mut **tx).await?;
     let Some(row) = row else { return Ok(false) };
+    if !crate::media_authorization::lock_origin(
+        tx,
+        row.get("user_id"),
+        row.get("room_id"),
+        row.get::<Option<String>, _>("auth_login_hash").as_deref(),
+        row.get("auth_membership_epoch"),
+    )
+    .await?
+    {
+        return Ok(false);
+    }
     lock(
         tx,
         row.get("source_id"),

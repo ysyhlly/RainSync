@@ -313,14 +313,18 @@ impl Execution {
     }
 }
 
-pub async fn protect(
-    prepare: impl Future<Output = super::Result<Response>> + Send + 'static,
+pub async fn protect<Fut>(
+    prepare: impl FnOnce(bool) -> Fut + Send + 'static,
     pool: PgPool,
     id: Uuid,
     token_hash: String,
     registry: Registry,
     input_cancel: crate::input_failure::Observation,
-) -> super::Result<Response> {
+    entry_candidate: bool,
+) -> super::Result<Response>
+where
+    Fut: Future<Output = super::Result<Response>> + Send + 'static,
+{
     let admission = registry
         .admit()
         .ok_or_else(|| Denied::Unavailable.response())?;
@@ -329,9 +333,15 @@ pub async fn protect(
     // must be acknowledged, never left behind by a vanished HTTP waiter.
     tokio::spawn(async move {
         let owner = Uuid::new_v4();
-        let registered =
-            persistence::media_executions::begin_delivery(&pool, id, &token_hash, owner).await;
-        let execution_id = match registered {
+        let registered = persistence::media_executions::begin_delivery(
+            &pool,
+            id,
+            &token_hash,
+            owner,
+            entry_candidate,
+        )
+        .await;
+        let registered = match registered {
             Ok(Some(id)) => id,
             Ok(None) => {
                 let _ = sender.send(Err(Denied::Revoked.response()));
@@ -345,7 +355,7 @@ pub async fn protect(
         let scope = media_core::child_process::Scope::new();
         let execution = Execution {
             pool: pool.clone(),
-            id: execution_id,
+            id: registered.execution_id,
             owner,
             scope: scope.clone(),
             admission,
@@ -355,7 +365,7 @@ pub async fn protect(
             _ = shutdown(Some(registry.0.stop.subscribe())) => Some(Err(Denied::Unavailable.response())),
             _ = sender.closed() => None,
             _ = input_cancel.stopped() => Some(Err(Denied::Unavailable.response())),
-            result = scope.run(prepare_response(prepare, pool.clone(), id, token_hash.clone())) => Some(result),
+            result = scope.run(prepare_response(prepare(registered.first_output_entry), pool.clone(), id, token_hash.clone())) => Some(result),
         };
         match result {
             Some(Ok((response, confirmed))) => {

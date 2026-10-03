@@ -9,6 +9,7 @@ export function bindPlaybackMetricEvents(ctx: {
   element: HTMLVideoElement;
   meter: PlaybackMetrics;
   fence: PlaybackMetricsFence;
+  planGeneration: number;
   current: () => boolean;
   state: () => Omit<
     PlaybackMetricsObservation,
@@ -16,7 +17,7 @@ export function bindPlaybackMetricEvents(ctx: {
   > & { buffering: boolean };
   now?: () => number;
 }) {
-  const { element: el, meter, fence } = ctx;
+  const { element: el, meter, fence, planGeneration } = ctx;
   const now = ctx.now ?? (() => performance.now());
   let active = true;
   const attached: [string, EventListener][] = [];
@@ -85,7 +86,11 @@ export function bindPlaybackMetricEvents(ctx: {
       if (!first && typeof el.requestVideoFrameCallback !== "function") {
         first = meter.firstFrame(
           fence,
-          { presentedAtMs: now(), evidence: "playing_time_advance" },
+          {
+            presentedAtMs: now(),
+            evidence: "playing_time_advance",
+            planGeneration,
+          },
           read(),
         );
       }
@@ -147,6 +152,7 @@ export function bindPlaybackMetricEvents(ctx: {
         {
           presentedAtMs: metadata.presentationTime,
           evidence: "video_frame_callback",
+          planGeneration,
         },
         read(),
       )
@@ -167,6 +173,13 @@ export function bindPlaybackMetricEvents(ctx: {
     close();
   }
   return {
+    attachSource: () => {
+      let attached = false;
+      guard(() => {
+        if (current()) attached = meter.attachSource(fence, read());
+      });
+      return attached;
+    },
     read,
     progress: () => guard(progress),
     stop: close,

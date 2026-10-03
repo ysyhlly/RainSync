@@ -1,0 +1,17 @@
+ARG NODE_IMAGE
+ARG CADDY_IMAGE
+FROM ${NODE_IMAGE} AS build
+WORKDIR /build
+COPY package.json package-lock.json ./
+COPY apps/web/package.json ./apps/web/package.json
+RUN npm ci
+COPY apps/web ./apps/web
+COPY packages ./packages
+RUN npm run build
+FROM ${CADDY_IMAGE}
+ARG SOURCE_MANIFEST_SHA256
+ARG PRODUCTION_MANIFEST_SHA256
+LABEL org.rainsync.full-source-manifest="${SOURCE_MANIFEST_SHA256}"
+LABEL org.rainsync.source-manifest="${PRODUCTION_MANIFEST_SHA256}"
+COPY --from=build /build/apps/web/dist /srv
+COPY deploy/Caddyfile /etc/caddy/Caddyfile

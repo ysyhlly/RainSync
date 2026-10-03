@@ -9,14 +9,16 @@ import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import WS from "ws";
 import { isolatedServer } from "./fixtures/server.mjs";
+import { mediaLoginUpstreamCases } from "./media-login-upstream-cases.mjs";
 
 const runtime = resolve(process.env.RAINSYNC_RUNTIME_ROOT ?? ".runtime");
 const artifacts = resolve(runtime, "upstream-reservations");
+const loginBindingOnly = process.argv.slice(2).includes("--login-binding-only");
 const crashUnknownOnly = process.argv.slice(2).includes("--crash-unknown-only");
 const metadataShutdownOnly = process.argv.slice(2).includes("--metadata-shutdown-only");
-assert.ok(!(crashUnknownOnly && metadataShutdownOnly), "choose one focused scenario");
+assert.ok([crashUnknownOnly,metadataShutdownOnly,loginBindingOnly].filter(Boolean).length<=1, "choose one focused scenario");
 assert.ok(
-  process.argv.slice(2).every((arg) => ["--crash-unknown-only", "--metadata-shutdown-only"].includes(arg)),
+  process.argv.slice(2).every((arg) => ["--crash-unknown-only", "--metadata-shutdown-only", "--login-binding-only"].includes(arg)),
   "only documented focused scenario selectors are supported",
 );
 process.env.RAINSYNC_ARTIFACT_DIR = artifacts;
@@ -43,7 +45,7 @@ const report = {
   scope:
     "native Server + isolated PostgreSQL; controlled Jellyfin/Emby HTTP contracts; no real upstream/Worker/browser decode claim",
   result: "running",
-  selection: crashUnknownOnly ? "crash-unknown-only" : metadataShutdownOnly ? "metadata-shutdown-only" : "all",
+  selection: loginBindingOnly ? "login-binding-only" : crashUnknownOnly ? "crash-unknown-only" : metadataShutdownOnly ? "metadata-shutdown-only" : "all",
   entry_sha256: await digest(entry),
   fixture_entry_sha256: await digest(fixtureEntry),
   binary: {
@@ -526,7 +528,10 @@ try {
             "Emby encoding cleanup is independently observed",
           );
       }
-      if (!crashUnknownOnly && !metadataShutdownOnly) {
+      if (loginBindingOnly) {
+        await mediaLoginUpstreamCases({fixture,controller,media,prepare,record,closed,assertKnownStop,contract,scenario,until,deferred});
+      }
+      if (!crashUnknownOnly && !metadataShutdownOnly && !loginBindingOnly) {
         for (const kind of ["jellyfin", "emby"]) {
           await controller.change(media[kind]);
           await scenario(
@@ -1333,7 +1338,7 @@ try {
           },
         );
       }
-      if (!crashUnknownOnly) {
+      if (!crashUnknownOnly && !loginBindingOnly) {
         for (const kind of ["jellyfin", "emby"]) {
           await controller.change(media[kind]);
           await scenario(`${kind}: shutdown during metadata GET drains preparation without a POST`, async (result) => {
@@ -1359,7 +1364,7 @@ try {
           });
         }
       }
-      if (!metadataShutdownOnly) {
+      if (!metadataShutdownOnly && !loginBindingOnly) {
       await controller.change(media.jellyfin);
       await scenario(
         "process death before SID checkpoint remains unknown after recovery and same-key retry",

@@ -96,7 +96,7 @@
     "playback_metrics": {
       "anyOf": [
         {
-          "$ref": "#/$defs/PlaybackMetricsGrant"
+          "$ref": "#/$defs/PlaybackMetricsGrantWire"
         },
         {
           "type": "null"
@@ -110,7 +110,7 @@
         "null"
       ],
       "format": "uint32",
-      "maximum": 1,
+      "maximum": 2,
       "minimum": 1
     },
     "playback_url": {
@@ -141,6 +141,17 @@
       "type": [
         "string",
         "null"
+      ]
+    },
+    "selected_output": {
+      "description": "Server-selected bound configuration, not measured output or playback.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PlaybackSelectedOutput"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "session_id": {
@@ -259,6 +270,44 @@
         "language"
       ]
     },
+    "PlaybackCandidate": {
+      "description": "A server-issued exact input/output configuration, not an arbitrary device profile.",
+      "type": "object",
+      "properties": {
+        "audio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AudioCapabilityConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "delivery_mode": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "transport": {
+          "type": "string"
+        },
+        "video": {
+          "$ref": "#/$defs/VideoCapabilityConfiguration"
+        }
+      },
+      "required": [
+        "id",
+        "delivery_mode",
+        "transport",
+        "content_type",
+        "video"
+      ]
+    },
     "PlaybackMediaRange": {
       "description": "A measured or otherwise established interval in original-media time.\nThe start is inclusive and the end is exclusive; an empty interval is omitted.",
       "type": "object",
@@ -352,6 +401,55 @@
         "closed"
       ]
     },
+    "PlaybackMetricsGrantV2": {
+      "type": "object",
+      "properties": {
+        "closed": {
+          "type": "boolean"
+        },
+        "last_sample": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlaybackMetricsSampleV2"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "meter_start_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "metrics_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "startup_origin": {
+          "$ref": "#/$defs/PlaybackMetricsOrigin"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "meter_start_generation",
+        "startup_origin",
+        "metrics_seq",
+        "closed"
+      ]
+    },
+    "PlaybackMetricsGrantWire": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PlaybackMetricsGrant"
+        },
+        {
+          "$ref": "#/$defs/PlaybackMetricsGrantV2"
+        }
+      ]
+    },
     "PlaybackMetricsOrigin": {
       "type": "string",
       "enum": [
@@ -428,6 +526,118 @@
         "final"
       ]
     },
+    "PlaybackMetricsSampleV2": {
+      "type": "object",
+      "properties": {
+        "elapsed_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "final": {
+          "type": "boolean"
+        },
+        "first_frame": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlaybackMetricsFirstFrame"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "first_frame_plan_generation": {
+          "description": "The originating published grant, never a local source callback counter.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "media_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "meter_start_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "plan_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "startup_origin": {
+          "$ref": "#/$defs/PlaybackMetricsOrigin"
+        },
+        "startup_phases": {
+          "$ref": "#/$defs/PlaybackMetricsStartupPhases"
+        },
+        "totals": {
+          "$ref": "#/$defs/PlaybackMetricsTotals"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 2,
+          "minimum": 2
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "media_generation",
+        "plan_generation",
+        "meter_start_generation",
+        "seq",
+        "startup_origin",
+        "elapsed_ms",
+        "totals",
+        "startup_phases",
+        "final"
+      ]
+    },
+    "PlaybackMetricsStartupPhases": {
+      "description": "Separate cumulative startup coverage through first-frame confirmation.\nThis is not a breakdown of the mutually exclusive playback state counters.",
+      "type": "object",
+      "properties": {
+        "loading_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "preparation_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "unobserved_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "preparation_ms",
+        "loading_ms",
+        "unobserved_ms"
+      ]
+    },
     "PlaybackMetricsTotals": {
       "type": "object",
       "properties": {
@@ -490,6 +700,40 @@
         "rebuffer_ms",
         "playing_ms",
         "unobserved_ms"
+      ]
+    },
+    "PlaybackOutputBasis": {
+      "type": "string",
+      "enum": [
+        "source_probe",
+        "constrained_encoder_recipe"
+      ]
+    },
+    "PlaybackSelectedOutput": {
+      "description": "Bound selected configuration. Neither basis is measured encoded output or\nan observation of playback; copied and encoded tracks have separate bases.",
+      "type": "object",
+      "properties": {
+        "audio_basis": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlaybackOutputBasis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "configuration": {
+          "$ref": "#/$defs/PlaybackCandidate"
+        },
+        "video_basis": {
+          "$ref": "#/$defs/PlaybackOutputBasis"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "configuration",
+        "video_basis"
       ]
     },
     "SubtitleDeliveryMode": {

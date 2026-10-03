@@ -26,6 +26,49 @@ pub struct PlaybackCandidate {
     pub audio: Option<AudioCapabilityConfiguration>,
 }
 
+/// Why the server offered or omitted a route, before any device test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackRouteReason {
+    SourceConfiguration,
+    ConstrainedEncoderRecipe,
+    VideoConfigurationUnavailable,
+    VideoCopyUnsupported,
+    SampleEntryUnsupported,
+    VideoTransformRequired,
+    ContainerUnsupported,
+    TrackMappingRequired,
+    AudioConfigurationUnavailable,
+    NoAudioTrack,
+    NonzeroCopyOrigin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct PlaybackRouteDecision {
+    pub candidate_id: String,
+    /// Offered for concrete client testing, not proven device decoding.
+    pub offered: bool,
+    pub reason: PlaybackRouteReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackOutputBasis {
+    SourceProbe,
+    ConstrainedEncoderRecipe,
+}
+
+/// Bound selected configuration. Neither basis is measured encoded output or
+/// an observation of playback; copied and encoded tracks have separate bases.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct PlaybackSelectedOutput {
+    pub configuration: PlaybackCandidate,
+    pub video_basis: PlaybackOutputBasis,
+    pub audio_basis: Option<PlaybackOutputBasis>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PlaybackCandidateSet {
     pub schema_version: u32,
@@ -37,6 +80,10 @@ pub struct PlaybackCandidateSet {
     pub binding: Option<String>,
     pub candidates: Vec<PlaybackCandidate>,
     pub decision_reason: String,
+    /// At most the four server routes. Absent on legacy/unsupported providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub route_decisions: Option<Vec<PlaybackRouteDecision>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
@@ -88,8 +135,18 @@ mod tests {
             binding: None,
             candidates: Vec::new(),
             decision_reason: "provider_requires_legacy_negotiation".into(),
+            route_decisions: None,
         };
         let legacy_response = serde_json::to_value(&response).unwrap();
+        assert!(legacy_response.get("route_decisions").is_none());
+        assert!(
+            serde_json::from_value::<PlaybackRouteReason>(serde_json::json!("device_supported"))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<PlaybackOutputBasis>(serde_json::json!("measured_output"))
+                .is_err()
+        );
         assert!(
             legacy_response
                 .get("http_file_capabilities_version")

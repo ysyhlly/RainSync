@@ -5,7 +5,14 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import {
   availableParallelism,
@@ -188,6 +195,23 @@ export async function verifyCandidate(candidatePath) {
       "candidate input hash changed",
     );
   }
+  // Runtime/build outputs are not source inputs. Any other added source file
+  // invalidates the freeze, even when all originally listed hashes still match.
+  const scan = async (directory, prefix = "") => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if ([".runtime", "node_modules", "target", "dist"].includes(entry.name))
+        continue;
+      const path = prefix + entry.name;
+      if (entry.isDirectory())
+        await scan(resolve(directory, entry.name), path + "/");
+      else
+        assert.ok(
+          paths.has(path) && !entry.isSymbolicLink(),
+          "unlisted or linked candidate source input: " + path,
+        );
+    }
+  };
+  await scan(source);
   assert.ok(
     ["Cargo.lock", "package-lock.json"].every((path) =>
       candidate.source_manifest.some(
@@ -197,6 +221,23 @@ export async function verifyCandidate(candidatePath) {
     "lockfiles must be bound",
   );
   if (candidate.status === "built") {
+    assert.ok(
+      Array.isArray(candidate.production_manifest) &&
+        candidate.production_manifest.length > 0,
+      "production manifest required",
+    );
+    assert.equal(
+      digestJson(candidate.production_manifest),
+      candidate.production_manifest_sha256,
+      "production manifest digest mismatch",
+    );
+    for (const entry of candidate.production_manifest)
+      assert.ok(
+        candidate.source_manifest.some(
+          (source) => digestJson(source) === digestJson(entry),
+        ),
+        "production input differs from frozen source",
+      );
     assert.match(
       candidate.image?.id ?? "",
       /^sha256:[0-9a-f]{64}$/,
@@ -322,19 +363,41 @@ export function preparePlan(candidate, environment, samples = null) {
           "self-owned or licensed samples",
         ],
       ),
-      gate("weak-network", 1800, null, [
-        "dedicated isolated network namespace; no host-wide tc",
-        "independent clock calibration",
-        "N1-N6, >=3 repeats/scenario",
-        "workload runner and measured RTT/loss/bandwidth still required",
-      ]),
-      gate("soak-72-hours", 259200, null, [
-        "final source/image unchanged for full window",
-        "loop/seek/join/leave/cache eviction/fault workload runner still required",
-        "phase-matched RSS/FD/socket/process/cache trends",
-        "D SIGKILL requires external supervisor/cgroup plus startup-generation drain proof; TERM is insufficient",
-        "restart from zero after lifecycle-affecting fixes",
-      ]),
+      gate(
+        "weak-network",
+        1800,
+        [
+          "node",
+          "tests/sync-network.mjs",
+          "--config=<network-config.json>",
+          "--adapter=<approved-adapter.mjs>",
+          "--output=<new-directory>",
+        ],
+        [
+          "dedicated isolated network namespace; no host-wide tc",
+          "independent clock calibration",
+          "N1-N6, >=3 repeats/scenario",
+          "approved namespace/probe adapter and actual RTT/loss/bandwidth observations required",
+        ],
+      ),
+      gate(
+        "soak-72-hours",
+        259200,
+        [
+          "node",
+          "tests/soak.mjs",
+          "--config=<soak-config.json>",
+          "--adapter=<approved-adapter.mjs>",
+          "--output=<new-directory>",
+        ],
+        [
+          "final source/image unchanged for full window",
+          "deployment-specific loop/seek/join/leave/cache eviction/F1–F4 adapter required",
+          "phase-matched RSS/FD/socket/process/cache trends",
+          "D SIGKILL requires external supervisor/cgroup plus startup-generation drain proof; TERM is insufficient",
+          "restart from zero after lifecycle-affecting fixes",
+        ],
+      ),
       gate("device-matrix", null, null, [
         "real Android Chrome, iOS Safari, desktop Safari and arm64 execution",
         "exact OS/browser/hardware/artifact/sample identities",
@@ -352,7 +415,7 @@ export function preparePlan(candidate, environment, samples = null) {
       ),
     ],
     execution:
-      "No workload has been launched. Commands are proposals for the controller after final candidate freeze; null entries identify missing runners, not accepted gates.",
+      "No workload has been launched. Commands are proposals for the controller after final candidate freeze; network/soak execution requires an explicit approved deployment adapter. Runner presence does not close acceptance gates.",
   };
 }
 

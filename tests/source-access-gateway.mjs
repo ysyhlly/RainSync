@@ -18,6 +18,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
 import { delay } from "./fixtures/server.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -75,6 +76,7 @@ const coordinatorInputs = [];
 for (const path of [
   "tests/source-access-gateway.mjs",
   "tests/fixtures/server.mjs",
+  "tests/fixtures/playback-admission.mjs",
   "tests/fixtures/media-stack.mjs",
   "tests/fixtures/postgres.mjs",
 ]) {
@@ -537,9 +539,11 @@ try {
         encrypted: encrypt(resource),
         source_policy_revision: revision,
       };
-      f.sql(
-        `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch) SELECT ${quote(id)},${quote(user.id)},r.id,${quote(src.media)},(s.state->>'media_generation')::bigint,${quote(digest(token))},${json(envelope)},now()+interval '1 hour',r.lifecycle_epoch FROM rooms r JOIN room_snapshots s ON s.room_id=r.id WHERE r.id=${quote(room.id)}`,
-      );
+      const insert = `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch) SELECT ${quote(id)},${quote(user.id)},r.id,${quote(src.media)},(s.state->>'media_generation')::bigint,${quote(digest(token))},${json(envelope)},now()+interval '1 hour',r.lifecycle_epoch FROM rooms r JOIN room_snapshots s ON s.room_id=r.id WHERE r.id=${quote(room.id)}`;
+      // The Agent fixture is outside this login-binding repair lane; its existing
+      // setup is deliberately unchanged and the mixed full suite is not rerun.
+      if (src.kind === "agent") f.sql(insert);
+      else withPlaybackAdmission(f, { client: admin, user: user.id, room: room.id, session: id }, insert);
       assert.equal(
         f.sql(
           `SELECT resource->>'source_policy_revision' FROM playback_sessions WHERE id=${quote(id)}`,
@@ -1208,12 +1212,12 @@ try {
             item: "fixture-item",
           });
           const seed = (ready) => {
-            const id = randomUUID(),
+            const id = randomUUID(), key = randomUUID(),
               sid = `fixture-${id}`;
             // Ledger identities are audit data without FKs by design. This is
             // the minimal received negotiation needed by actual bounded Stop.
-            f.sql(`INSERT INTO upstream_reservations(id,user_id,request_key,owner_epoch,room_id,media_id,source_id,generation,kind,device_id,origin_key,scope_encrypted,play_session_id,media_source_id,state,negotiation,cleanup_after,cleanup_deadline,source_policy_revision,lifecycle_epoch)
-              SELECT ${quote(id)},${quote(user.id)},${quote(randomUUID())},${quote(randomUUID())},r.id,${quote(mediaId)},${quote(src.id)},(s.state->>'media_generation')::bigint,'jellyfin',${quote(`rainsync-${id}`)},${quote(digest(stopOrigin))},${quote(scope)},${quote(sid)},'fixture-source','closing','received',clock_timestamp()+interval '${ready ? "0" : "3600"} seconds',clock_timestamp()+interval '1 hour',${revision},r.lifecycle_epoch
+            withPlaybackAdmission(f, { client: admin, user: user.id, room: room.id, session: id, key }, `INSERT INTO upstream_reservations(id,user_id,request_key,owner_epoch,room_id,media_id,source_id,generation,kind,device_id,origin_key,scope_encrypted,play_session_id,media_source_id,state,negotiation,cleanup_after,cleanup_deadline,source_policy_revision,lifecycle_epoch)
+              SELECT ${quote(id)},${quote(user.id)},${quote(key)},${quote(randomUUID())},r.id,${quote(mediaId)},${quote(src.id)},(s.state->>'media_generation')::bigint,'jellyfin',${quote(`rainsync-${id}`)},${quote(digest(stopOrigin))},${quote(scope)},${quote(sid)},'fixture-source','closing','received',clock_timestamp()+interval '${ready ? "0" : "3600"} seconds',clock_timestamp()+interval '1 hour',${revision},r.lifecycle_epoch
               FROM rooms r JOIN room_snapshots s ON s.room_id=r.id WHERE r.id=${quote(room.id)}`);
             return { id, sid };
           };

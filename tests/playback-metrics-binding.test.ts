@@ -44,12 +44,14 @@ function setup(rvfc = false) {
       element: el,
       meter,
       fence: saved,
+      planGeneration: 42,
       current: () => live && saved === fence,
       state: () => state,
       now: () => now,
     });
   };
   const binding = bind();
+  binding.attachSource();
   return {
     el,
     meter,
@@ -64,7 +66,9 @@ function setup(rvfc = false) {
       binding.stop();
       fence = { identity: fence.identity, generation: fence.generation + 1 };
       meter.beginAttempt(fence, binding.read());
-      return bind();
+      const replacement = bind();
+      replacement.attachSource();
+      return replacement;
     },
     stale: () => (live = false),
   };

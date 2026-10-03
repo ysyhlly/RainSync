@@ -3,6 +3,8 @@ mod cache_outputs;
 mod cache_read;
 mod execution_failure;
 mod file_delivery;
+#[path = "../../server/src/source_key_check.rs"]
+mod source_key_check;
 use media_core::child_process;
 use media_core::runtime_metrics::{Cache, CacheDecision, Layer};
 mod http_identity;
@@ -11,6 +13,7 @@ mod input_failure;
 mod metric_stream;
 mod metrics;
 mod output_decode;
+mod output_entry_metrics;
 mod output_publish;
 mod output_read;
 mod outputs;
@@ -21,6 +24,7 @@ mod process;
 mod readiness;
 mod relay;
 mod source_version;
+mod static_hls_contract;
 mod transfer_state;
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use axum::{
@@ -95,9 +99,29 @@ async fn delivery(
     let input_cancel = app.input_failures.observe(id, q.execution);
     let measure = method == axum::http::Method::GET && path != "probe";
     let metrics = app.metrics.clone();
-    let response = delivery_response(app, id, path, q, h, method);
-    let response =
-        playback_access::protect(response, pool, id, token_hash, deliveries, input_cancel).await?;
+    let entry_candidate =
+        method == axum::http::Method::GET && path == "index.m3u8" && q.url.is_none();
+    let observe_pool = pool.clone();
+    let response = playback_access::protect(
+        move |first_entry| delivery_response(app, id, path, q, h, method, first_entry),
+        pool,
+        id,
+        token_hash,
+        deliveries,
+        input_cancel,
+        entry_candidate,
+    )
+    .await?;
+    if response.status().is_success()
+        && let Some(observation) = response
+            .extensions()
+            .get::<output_entry_metrics::Ready>()
+            .copied()
+    {
+        // Classification may be lost, but never delays delivery or changes its
+        // result. The compulsory receipt prevents later reclassification.
+        output_entry_metrics::record_ready(observe_pool, id, observation);
+    }
     if !measure || !response.status().is_success() || response.status() == StatusCode::NO_CONTENT {
         return Ok(response);
     }
@@ -137,6 +161,7 @@ async fn delivery_response(
     q: Params,
     h: HeaderMap,
     method: axum::http::Method,
+    first_entry: bool,
 ) -> Result<Response> {
     let row=sqlx::query("SELECT p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN rooms r ON r.id=p.room_id WHERE r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND p.id=$1 AND p.delivery_token_hash=$2 AND p.expires_at>now() AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource) AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)").bind(id).bind(hash(&q.token)).fetch_optional(&app.db).await.map_err(failure)?.ok_or((StatusCode::UNAUTHORIZED,"invalid_playback_session".into()))?;
     let data: Value = row.get("resource");
@@ -195,7 +220,7 @@ async fn delivery_response(
                 return Err((StatusCode::FORBIDDEN, "cross_origin_subtitle".into()));
             }
             let config = providers::resource_config(&resource).map_err(failure)?;
-            let request = providers::source_request(
+            let request = providers::source_media_request(
                 &config,
                 url.as_str(),
                 reqwest::Method::GET,
@@ -307,9 +332,11 @@ async fn delivery_response(
         }
         let mut output = None;
         let mut cache_hit = true;
+        let mut entry =
+            output_entry_metrics::Entry::new(first_entry && !head && path == "index.m3u8");
         for _ in 0..30 {
             let job =
-                sqlx::query("SELECT j.status,j.error,j.attempt,o.status AS output_status,o.manifest_sha256,o.validation_version,o.visible_manifest,(j.status='succeeded' OR (j.status='running' AND j.lease_until>clock_timestamp())) AS readable FROM media_jobs j LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt WHERE j.id=$1")
+                sqlx::query("SELECT j.status,j.error,j.attempt,j.metrics_queue_ms,j.metrics_queue_complete,j.metrics_queue_accounted_attempt,o.status AS output_status,o.manifest_sha256,o.validation_version,o.visible_manifest,(j.status='succeeded' OR (j.status='running' AND j.lease_until>clock_timestamp())) AS readable FROM media_jobs j LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt WHERE j.id=$1")
                     .bind(id)
                     .fetch_optional(&app.db)
                     .await
@@ -326,6 +353,9 @@ async fn delivery_response(
             // child URLs must remain pinned, including the init segment.
             if path != "index.m3u8" && q.attempt.is_none() {
                 return Err((StatusCode::CONFLICT, "stale_media".into()));
+            }
+            if entry.lookup(&status, attempt) {
+                output_entry_metrics::record_cold(app.db.clone(), id);
             }
             if status == "cancelled" {
                 return Err((StatusCode::GONE, "media_job_cancelled".into()));
@@ -422,6 +452,12 @@ async fn delivery_response(
                     manifest,
                     reader,
                     opened,
+                    entry.ready(
+                        attempt,
+                        job.get::<Option<i64>, _>("metrics_queue_ms"),
+                        job.get::<Option<bool>, _>("metrics_queue_complete"),
+                        job.get::<Option<i64>, _>("metrics_queue_accounted_attempt"),
+                    ),
                 ));
                 break;
             }
@@ -433,7 +469,7 @@ async fn delivery_response(
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-        let (file, attempt, complete, manifest_digest, manifest, reader, opened) =
+        let (file, attempt, complete, manifest_digest, manifest, reader, opened, entry_ready) =
             output.ok_or((StatusCode::SERVICE_UNAVAILABLE, "media_unavailable".into()))?;
         if !reader.healthy() {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "media_unavailable".into()));
@@ -462,7 +498,7 @@ async fn delivery_response(
             if cache_hit {
                 app.metrics.cache_lookup(CacheDecision::Hit);
             }
-            return Ok(with_cache(
+            let mut response = with_cache(
                 (
                     [
                         (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
@@ -472,7 +508,11 @@ async fn delivery_response(
                 )
                     .into_response(),
                 cache,
-            ));
+            );
+            if let Some(ready) = entry_ready {
+                response.extensions_mut().insert(ready);
+            }
+            return Ok(response);
         }
         let response = file_delivery::response(&file, &h, head, Some(reader), opened, None).await?;
         if cache_hit {
@@ -745,7 +785,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             // Completion/error/exit all release only after the child is reaped.
-            // On database failure, the next budget snapshot reclaims dead jobs.
+            // On database failure, the next budget snapshot uses this receipt.
             let _ = tokio::time::timeout(
                 Duration::from_secs(3),
                 persistence::cache_budget::release(&app.db, id, owner, attempt),
@@ -768,23 +808,39 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
+fn main() -> anyhow::Result<()> {
+    // Probe before the Tokio runtime, tracing, configuration or secret loading.
+    if std::env::args().nth(1).as_deref() == Some("--source-access-contract") {
+        anyhow::ensure!(
+            std::env::args().len() == 2,
+            "invalid capability probe arguments"
+        );
+        println!("{}", providers::source_access_contract::WORKER);
+        return Ok(());
+    }
+    run()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let db = persistence::connect(&std::env::var("DATABASE_URL")?).await?;
+    let deployment = media_core::deployment_config::Settings::from_env(
+        media_core::deployment_config::Role::Worker,
+    )?;
     let key = STANDARD.decode(std::env::var("SOURCE_ENCRYPTION_KEY")?)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| anyhow::anyhow!("SOURCE_ENCRYPTION_KEY must decode to 32 bytes"))?;
+    let db = persistence::connect(&std::env::var("DATABASE_URL")?).await?;
+    source_key_check::verify(&db, &cipher).await?;
     let runtime_readiness = readiness::Runtime::default();
     let app = App {
         readiness: runtime_readiness.clone(),
         metrics: Default::default(),
         db,
-        key: Arc::new(
-            Aes256Gcm::new_from_slice(&key)
-                .map_err(|_| anyhow::anyhow!("invalid encryption key"))?,
-        ),
-        cache: PathBuf::from(std::env::var("CACHE_ROOT").unwrap_or("/cache".into())),
+        key: Arc::new(cipher),
+        cache: deployment.cache_root,
         client: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -796,7 +852,7 @@ async fn main() -> anyhow::Result<()> {
         input_failures: Default::default(),
         preview_inputs: Default::default(),
         deliveries: playback_access::Registry::with_readiness(runtime_readiness.clone()),
-        public_url: std::env::var("PUBLIC_ORIGIN").unwrap_or("http://localhost:8088".into()),
+        public_url: deployment.agent_data_origin,
     };
     tokio::fs::create_dir_all(&app.cache).await?;
     let (stop, mut server_stop) = tokio::sync::watch::channel(false);
@@ -806,7 +862,30 @@ async fn main() -> anyhow::Result<()> {
     let deliveries = app.deliveries.clone();
     let router = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route(
+            "/media-delivery/health",
+            get(|| async {
+                (
+                    [(header::CACHE_CONTROL, "no-store")],
+                    axum::Json(json!({"service":"rainsync-worker","live":true})),
+                )
+            }),
+        )
+        .route(
+            "/agent-data/health",
+            get(|| async {
+                (
+                    [(header::CACHE_CONTROL, "no-store")],
+                    axum::Json(json!({"service":"rainsync-worker","live":true})),
+                )
+            }),
+        )
         .route("/metrics", get(metrics::endpoint))
+        .route(
+            "/media-delivery/static-hls-contract",
+            axum::routing::post(static_hls_contract::endpoint)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
         .route("/media-delivery/{id}/{path}", get(delivery).head(delivery))
         .route("/agent-data/{id}", get(relay::connect))
         .route(
@@ -816,6 +895,10 @@ async fn main() -> anyhow::Result<()> {
         .layer(axum::middleware::from_fn(http_api::errors))
         .route(
             "/ready",
+            get(|State(app): State<App>| async move { app.readiness.response() }),
+        )
+        .route(
+            "/media-delivery/ready",
             get(|State(app): State<App>| async move { app.readiness.response() }),
         )
         .with_state(app);

@@ -15,6 +15,14 @@ export class PlaybackCancelled extends Error {
     this.name = "PlaybackCancelled";
   }
 }
+/** Only requestPlayback creates this after the first, certain pre-mutation
+ * rejection. Raw errors after retries are deliberately not rotation authority. */
+export class PlaybackViewerOriginRequired extends Error {
+  constructor(failure: RequestFailure) {
+    super(failure.message);
+    this.name = "PlaybackViewerOriginRequired";
+  }
+}
 export class PlaybackTimeout extends Error {
   constructor() {
     super("播放准备超时，请重新发起播放");
@@ -62,6 +70,7 @@ export async function requestPlayback(
   );
   let networkFailures = 0;
   let preparationFailures = 0;
+  let sentAttempts = 0;
   try {
     for (;;) {
       if (controller.signal.aborted) throw controller.signal.reason;
@@ -74,6 +83,7 @@ export async function requestPlayback(
           65000,
         );
         try {
+          ++sentAttempts;
           const plan = await send(request, attempt.signal);
           if (attempt.signal.aborted) throw attempt.signal.reason;
           if (
@@ -106,6 +116,12 @@ export async function requestPlayback(
         }
       } catch (error) {
         if (controller.signal.aborted) throw controller.signal.reason;
+        if (
+          sentAttempts === 1 &&
+          error instanceof RequestFailure &&
+          error.code === "PLAYBACK_VIEWER_ORIGIN_REQUIRED"
+        )
+          throw new PlaybackViewerOriginRequired(error);
         const pending =
           error instanceof RequestFailure &&
           error.code === "PLAYBACK_REQUEST_IN_PROGRESS";
@@ -302,12 +318,14 @@ export class PlaybackRequests {
     this.save();
     const controller = new AbortController();
     this.controller = controller;
+    let published = false;
     try {
       const plan = await requestPlayback(
         this.send,
         { ...input, idempotency_key: key },
         controller.signal,
       );
+      published = true;
       if (serial !== this.serial) throw new PlaybackCancelled();
       if (plan.rebuild_on_seek && this.readiness)
         await waitPlaybackReady(
@@ -334,6 +352,14 @@ export class PlaybackRequests {
       this.completed = { key, plan };
       return plan;
     } catch (error) {
+      if (!published && error instanceof PlaybackViewerOriginRequired) {
+        // The dedicated response guarantees this new key never existed. Do not
+        // create a cancellation tombstone or adopt the legacy viewer row.
+        this.keys.delete(key);
+        this.save();
+        if (serial !== this.serial) throw new PlaybackCancelled();
+        throw error;
+      }
       // Failed revocation remains in storage and blocks the next preparation.
       try {
         await this.revoke(key);

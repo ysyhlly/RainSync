@@ -61,7 +61,9 @@ test("preparation never approves candidates or marks gates/release ready", () =>
     plan.gates.every((gate) => gate.status === "not-run" && !gate.accepted),
   );
   assert.ok(
-    plan.gates.find((gate) => gate.id === "soak-72-hours").entry === null,
+    plan.gates
+      .find((gate) => gate.id === "soak-72-hours")
+      .entry.includes("tests/soak.mjs"),
   );
   assert.ok(!assessEvidence(plan, controlEvidence(plan)).accepted);
 });

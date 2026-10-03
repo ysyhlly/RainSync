@@ -1,3 +1,4 @@
+import { reapOwnedChildren } from "../../deploy/owned-process.mjs";
 import { spawn, execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
@@ -45,7 +46,14 @@ export class Client {
           : body instanceof Uint8Array
             ? body
             : JSON.stringify(body),
-      signal: signal ?? AbortSignal.timeout(20000),
+      signal:
+        signal ??
+        (this.fixture.abortSignal
+          ? AbortSignal.any([
+              this.fixture.abortSignal,
+              AbortSignal.timeout(20000),
+            ])
+          : AbortSignal.timeout(20000)),
     });
     const cookie = response.headers.get("set-cookie");
     if (cookie) this.cookie = cookie.split(";")[0];
@@ -96,13 +104,16 @@ export async function isolatedServer(name, run, options = {}) {
   const container = database.container;
   const target = resolve(process.env.CARGO_TARGET_DIR ?? "target", "debug");
   const fixture = {
+    abortSignal: options.signal,
     id,
     root,
     container,
     password,
     origin,
     env: null,
-    get serverPid() { return server?.exitCode === null ? server.pid : undefined; },
+    get serverPid() {
+      return server?.exitCode === null ? server.pid : undefined;
+    },
     target,
     databaseKind: database.kind,
     postgresDiagnostics: database.diagnostics,
@@ -168,12 +179,13 @@ export async function isolatedServer(name, run, options = {}) {
       throw new Error("Database condition did not become true");
     },
     async stopServer({ signal = "SIGTERM" } = {}) {
-      if (!server || server.exitCode !== null) return;
+      if (!server) return null;
       const child = server;
-      const closed = new Promise((done) => child.once("close", done));
-      child.kill(signal);
-      await closed;
+      if (child.exitCode === null && child.signalCode === null)
+        child.kill(signal);
+      const outcome = await child.fixtureClosed;
       server = undefined;
+      return outcome;
     },
     async startServer(
       extra = {},
@@ -182,7 +194,9 @@ export async function isolatedServer(name, run, options = {}) {
         `rainsync-server${process.platform === "win32" ? ".exe" : ""}`,
       ),
     ) {
+      options.signal?.throwIfAborted();
       await fixture.stopServer();
+      options.signal?.throwIfAborted();
       const log = createWriteStream(resolve(root, `server-${++launches}.log`));
       streams.push(log);
       server = spawn(binary, [], {
@@ -206,17 +220,26 @@ export async function isolatedServer(name, run, options = {}) {
       child.once("error", (error) => {
         failure = error;
       });
-      child.once("close", (code, signal) => {
-        children.delete(child);
-        Object.assign(record, {
-          closed_at: new Date().toISOString(),
-          exit_code: code,
-          signal,
-        });
-      });
+      child.fixtureClosed = new Promise((done) =>
+        child.once("close", (code, signal) => {
+          children.delete(child);
+          Object.assign(record, {
+            closed_at: new Date().toISOString(),
+            exit_code: code,
+            signal,
+          });
+          done({
+            pid: child.pid ?? null,
+            observed_close: true,
+            exit_code: code,
+            signal,
+          });
+        }),
+      );
       child.stdout.pipe(log, { end: false });
       child.stderr.pipe(log, { end: false });
       for (let i = 0; i < 120; i++) {
+        options.signal?.throwIfAborted();
         if (failure || child.exitCode !== null)
           throw new Error(`Fixture Server failed to start; inspect ${root}`);
         try {
@@ -235,7 +258,9 @@ export async function isolatedServer(name, run, options = {}) {
     },
   };
   try {
+    options.signal?.throwIfAborted();
     await database.start();
+    options.signal?.throwIfAborted();
     fixture.env = {
       ...process.env,
       DATABASE_URL: database.url,
@@ -252,18 +277,20 @@ export async function isolatedServer(name, run, options = {}) {
     };
     if (options.beforeStart) await options.beforeStart(fixture);
     await fixture.startServer({}, options.binary);
+    options.signal?.throwIfAborted();
     await run(fixture);
   } finally {
-    for (const child of children) child.kill();
-    await Promise.all(
-      [...children].map((child) =>
-        child.exitCode === null
-          ? new Promise((done) => child.once("close", done))
-          : undefined,
-      ),
-    );
+    let childCleanupError;
+    try {
+      await reapOwnedChildren(
+        [...children].map((child) => ({ child, closed: child.fixtureClosed })),
+      );
+    } catch (error) {
+      childCleanupError = error;
+    }
     await database.stop();
     for (const stream of streams) await new Promise((done) => stream.end(done));
     cleanupCompleted = true;
+    if (childCleanupError) throw childCleanupError;
   }
 }

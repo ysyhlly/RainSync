@@ -101,6 +101,20 @@
         }
       ]
     },
+    "playback_metrics_supported_versions": {
+      "description": "Outer offer is ignored by old servers. Absence preserves canonical hashes.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0
+      },
+      "maxItems": 2,
+      "minItems": 1
+    },
     "playback_metrics_version": {
       "description": "Optional independent client-reported metrics; observations v1 is unchanged.",
       "type": [
