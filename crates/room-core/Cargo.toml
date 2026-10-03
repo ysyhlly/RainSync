@@ -1,7 +1,0 @@
-[package]
-name = "room-core"
-version.workspace = true
-edition.workspace = true
-[dependencies]
-protocol.workspace = true
-uuid.workspace = true
