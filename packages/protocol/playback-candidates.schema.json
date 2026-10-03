@@ -28,6 +28,16 @@
       "maximum": 255,
       "minimum": 0
     },
+    "route_decisions": {
+      "description": "At most the four server routes. Absent on legacy/unsupported providers.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/PlaybackRouteDecision"
+      }
+    },
     "schema_version": {
       "type": "integer",
       "format": "uint32",
@@ -103,6 +113,44 @@
         "transport",
         "content_type",
         "video"
+      ]
+    },
+    "PlaybackRouteDecision": {
+      "type": "object",
+      "properties": {
+        "candidate_id": {
+          "type": "string"
+        },
+        "offered": {
+          "description": "Offered for concrete client testing, not proven device decoding.",
+          "type": "boolean"
+        },
+        "reason": {
+          "$ref": "#/$defs/PlaybackRouteReason"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "offered",
+        "reason"
+      ]
+    },
+    "PlaybackRouteReason": {
+      "description": "Why the server offered or omitted a route, before any device test.",
+      "type": "string",
+      "enum": [
+        "source_configuration",
+        "constrained_encoder_recipe",
+        "video_configuration_unavailable",
+        "video_copy_unsupported",
+        "sample_entry_unsupported",
+        "video_transform_required",
+        "container_unsupported",
+        "track_mapping_required",
+        "audio_configuration_unavailable",
+        "no_audio_track",
+        "nonzero_copy_origin"
       ]
     },
     "VideoCapabilityConfiguration": {

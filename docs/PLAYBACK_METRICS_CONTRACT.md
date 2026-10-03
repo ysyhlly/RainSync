@@ -67,3 +67,180 @@ Final POST starts before the existing owned Stop but is never awaited by cleanup
 Five focused checks run the actual Vite-loaded playback runtime, sampler, media-event binding and sender against isolated real Server/Worker/PostgreSQL public APIs. They verify accepted durable receipts, one credit after an identical lost-ACK retry, direct-to-remux automatic fallback retaining cumulative sequence/time/frame, cancellation and media revocation, and final POST ordering without delaying Stop. In the final run the held final POST returned410 after Stop won, while Stop completed in16ms; this is a measured short-fixture result, not a universal latency guarantee. The same frozen backend hashes are verified before and after. Video events/capabilities in this test are synthetic; the additional browser-real assertions require actual Chromium playback callbacks and remain pending final CI.
 
 CI integration also exposed a validation-harness boundary: package-scoped Worker Cargo tests can relink the non-test binary with different feature unification. The reliability test now copies its owned test/example executables and restores the workspace service build before subsequent frozen-hash checks. The exact failure was reproduced without weakening binding checks; restored binaries match all three original hashes, reliability passes, and all24 unchanged upstream-observation scenarios pass in that same order.
+
+## Negotiated v2 startup coverage and originating-grant attribution
+
+An additive outer request offer `playback_metrics_supported_versions: [1,2]`
+accompanies the unchanged version-1 intent. An absent offer serializes exactly as
+before, including the canonical request hash. Old servers ignore that outer
+field and may return the existing v1 grant. A new server stores its selection in
+the existing bounded viewer slot; retries and automatic fallback retain it. The
+browser freezes the first valid selected version for its logical meter. A
+missing, malformed, closed or version-changing optional marker cannot stop
+playback. There is no same-key negotiation rewrite or downgrade retry.
+
+`PlaybackMetricsSample` and `PlaybackMetricsGrant` remain the strict v1 DTOs.
+The new packet wrapper dispatches on integer version before strict parsing.
+Version 2 has the same common counters plus required `startup_phases` containing
+cumulative integer `preparation_ms`, `loading_ms`, and `unobserved_ms`. These are
+independent coverage of intent t0 through first-frame confirmation, not a
+subdivision of the eight playback-state totals. Preparation includes clock
+readiness, discovery, plan preparation and readiness before actual source
+attachment. Loading begins on the actual source attachment edge. A gap above
+15 seconds is wholly unobserved. Automatic fallback can re-enter preparation
+without resetting t0 or totals. The phases sum to elapsed time until a first
+frame is confirmed, then sum to its immutable confirmation time and freeze.
+Background and autoplay-blocked time remain represented in the existing state
+partition independently. No queue duration is subtracted from client startup.
+
+Version 2 pairs a first-frame report with `first_frame_plan_generation`, copied
+from its immutable published grant at the presentation callback. The local
+source-attachment callback generation is a different fence and is never sent as
+this field. If a direct-grant first frame is reported for the first time on a
+later remux grant, it retains the original direct generation. Both the first
+frame and that generation become immutable after acceptance.
+
+Migration 0040 adds only bounded fields to existing viewer/session rows and
+permits session versions 1 and 2. It assigns v1 only to existing known metrics
+slots and leaves historical attribution unknown. Publication freezes the
+bounded source kind and delivery mode from the server's actual selected
+resource, separately from the encrypted resource and its mutable authorization
+or representation wrapper. The receiver resolves the first-frame generation
+within the same user, room, viewer, logical meter, media generation and lifecycle
+using those publication facts. A missing or ambiguous historical grant produces
+`unknown`; it is never relabeled with the current grant. Historical lookup is
+attribution only: all existing locks, current owned-grant authorization, expiry,
+fixed anchors and commit-before-credit requirements still gate acceptance.
+The accepted attribution is saved with the cumulative packet on the viewer slot.
+
+The collector adds six origin/phase counters and at most 576 attributed
+first-frame histogram series: six fixed source kinds × four fixed modes × two
+evidence kinds × twelve histogram series. It never expands the eight playback
+state counters by these dimensions. The exact 582-series additional budget and
+fixed 16 KiB snapshot ceiling have tests. Unmeasured phases and attribution are
+absent, not invented zeros. The existing first-frame evidence distinction and
+`client_reported` namespace remain explicit.
+
+Worker output-entry availability and independently observed overlapping queue
+correlation are separate producer work. This v2 client/server change does not
+claim general cache hotness, cross-client synchronization error, a tester's
+network-restored boundary, physical screen presentation, or device acceptance.
+
+### V2 implementation verification (2026-10-02)
+
+The isolated step1 checkout passed 708 frontend tests, strict Vue types and the
+production Vite build; focused Rust checks cover 96 media-core tests (one
+existing ignored process fixture), 34 protocol tests including strict duplicate
+JSON rejection, one roundtrip test, and 11 receiver transition tests. Targeted
+all-target Clippy with warnings denied, formatting and generated export checks
+passed. The unchanged v1 sample/receipt schemas have no generated diff.
+
+A successful source-bound workspace binary/example build then ran 32 real
+Server/PostgreSQL receiver groups, including v2 negotiation, source/mode capture,
+pre-first-report direct→remux fallback attribution, phase regression, same-key
+conflicts, fixed version across fallback, restart deduplication, all existing v1
+authority/anchor/rate/capacity checks and final Stop. Five real frontend-runtime
+HTTP integration checks additionally exercised the actual v2 producer/binding/
+sender with synthetic media events, immutable lost-ACK retry and original-frame
+attribution through fallback. Owned Server, Worker and PostgreSQL PIDs/listeners
+were positively verified stopped. Migration39→40 preserved all 1,024 generated
+viewer values and prior session values and passed ten constraint rejections.
+
+Two initial fixture failures were retained: the old source-revision race left
+corrupt ciphertext, correctly rejected by the startup key guard; it now rotates
+to another actual server-encrypted generated configuration. The old synthetic
+video supported only one RVFC callback, overwriting the independent metrics
+observer; it now models independent callback IDs. Neither fix weakened a
+production guard. These are generated short-fixture results, with no real
+browser/device, actual upstream product, sustained load or release acceptance.
+
+## Worker output-entry availability and overlapping queue cutoff
+
+Migration 0042 and the actual Worker route implement a deliberately narrow
+cohort: the initial eligible non-HEAD `index.m3u8` output lookup. Its first
+queued/running job observation is `cold_waiting`. An already-succeeded initial
+lookup becomes `warm` only after output/manifest validation, a healthy read lease,
+a constructed response and the normal final authorization gate. Later readiness
+never promotes initial cold. Other delivery modes are server-published
+`not_applicable`; missing, historical, failed or ambiguous observations remain
+`unknown`. None of these labels means general cache hotness or cached bytes.
+
+Eligibility rides the existing compulsory, cancellation-owned delivery execution
+receipt before any output lookup. New writers distinguish eligible index
+requests from HEAD/source/probe/segment admissions with a nullable boolean.
+Older NULL receipts are unknown and prevent first-entry claims. The existing
+room admission lock serializes first eligibility; an optional, 100 ms read-only
+savepoint failure leaves the mandatory receipt committed and grants no permit.
+The response classification is best-effort, with at most eight concurrent writes
+and a 250 ms deadline, and never delays or changes playback. A missed cold write,
+failed first request, process exit or Worker restart cannot let a later warm
+request claim to be first.
+
+Receipt pruning explicitly excludes one deterministic true-or-NULL delivery
+receipt per live, unstopped v2 grant as a durable existence witness. Pruning
+shares the existing room admission lock with renewal and skips busy rooms.
+An explicit READ COMMITTED transaction fully consumes the room-lock SELECT,
+then executes DELETE as a separate statement with a fresh snapshot and bound
+locked-room UUIDs; clock_timestamp expiry cannot use a pre-renewal snapshot. Stopped or expired
+grants can release the witness without changing historical unknown facts.
+UUID ordering selects a
+representative, not chronological evidence. Every bulk deletion sees that same
+excluded witness; “some other row exists” is insufficient and is not used. HEAD
+and segment receipts still age out normally. The separate cache-writer rule
+retaining job physical-reaping evidence until eviction/reservation release is
+unchanged. No new identity table or all-segment retention is introduced.
+
+New queue writers initialize a bounded cumulative prefix only when enqueueing a
+new job. An observational trigger retains witnessed queued exits using the locked
+OLD 0039 phase tuple and validated NEW transition, including the actual attempt
+increment. It never changes scheduling, source authorization, ownership or
+lease fields, and never fills legacy NULL. Unrelated/heartbeat updates preserve
+the prefix. Missing phase continuity, corrupt metadata, overflow or clock
+regression irreversibly make coverage incomplete; a later valid phase cannot
+turn an unknown prefix into measured zero. Running duration is excluded.
+
+The first eligible request pins its initial expected output attempt: queued N
+expects N+1, running/succeeded N expects N. Only its own validated response at that
+attempt may freeze a complete cumulative queue prefix. If that request fails,
+or its output moves to a replacement attempt, queue stays unknown. A later
+request cannot capture extra retry queue after an earlier presented frame. The
+queue prefix is an independently observed, overlapping component at that
+specific response cutoff, not a disjoint client startup phase and not subtracted
+from end-to-end startup. First-frame receipt resolves and freezes the historical
+originating grant's availability and queue under the same exact-login scope as
+source/mode attribution; the untrusted client DTO gains no cache or queue claims.
+
+The collector adds at most 111 fixed series independently of source/mode/state:
+four entry cohorts × two evidence kinds × twelve first-frame histogram series,
+one twelve-series complete-queue histogram, and three coverage counters
+(complete/not_applicable/unknown). Together with step1, this is 693 additional
+series and remains under the fixed 16 KiB snapshot budget. Old v1 samples do not
+acquire invented v2 cohorts or queue zeros.
+
+### Output-entry verification (2026-10-02)
+
+After correcting the reviewed same-statement snapshot race, 13 real PostgreSQL
+regression groups passed. A deterministic advisory gate establishes the room-lock
+statement snapshot, lets a valid renewal commit after the old expiry but before
+room-lock acquisition, then verifies the separate DELETE sees the renewed grant
+and retains its witness. Queue-claim rollback, corruption/old-writer gaps,
+monotonic completeness, bulk/concurrent pruning, expired/stopped cleanup and
+historical unknown preservation are covered.
+
+A fresh source-bound build with all 12 required helper executables passed the
+five actual Worker cohort groups: warm with HEAD/concurrent admission, immutable
+initial cold, failed first-request queue unknown, classification-write failure
+surviving pruning/restart, and frozen server attribution. That same post-fix
+binding passed 33 receiver groups, five runtime-to-receiver wire groups, five
+recovery checks (including all 42 schema checksums), and eight native/Server/
+Worker timing groups. Owned processes and listeners were verified stopped.
+Targeted strict Clippy, formatting, 27 collector tests, two Worker producer tests
+and 11 receiver unit tests also passed. Pre-fix results remain separate evidence.
+
+Earlier owned fixture failures were retained: actual disk headroom protection
+prevented output generation below its unchanged 10% floor, and a fixture held
+completed grants until the default two-session quota was reached. Disk cache
+cleanup restored headroom; completed cases now stop their grants. No production
+capacity or authorization guard was weakened. These remain short generated
+fixtures and synthetic client frame reports, not browser/device, independent
+network-recovery, cross-client synchronization, sustained-load or release proof.

@@ -75,6 +75,7 @@ function metrics(
     element: el as unknown as HTMLVideoElement,
     meter,
     fence: { identity: {}, generation: 1 },
+    planGeneration: 9,
     current: options.current ?? (() => true),
     state: options.state ?? state,
   });
@@ -389,4 +390,20 @@ test("a healthy metric first-frame miss rearms once and later presentation succe
   expect(meter.firstFrame).toHaveBeenCalledTimes(2);
   binding.stop();
   expect(el.listenerCount).toBe(0);
+});
+
+test("a throwing optional source-phase capture does not escape media attachment", () => {
+  const el = new Media();
+  const meter = {
+    attachSource: vi.fn(() => {
+      throw new Error("source phase unavailable");
+    }),
+    observe: vi.fn(),
+    firstFrame: vi.fn(),
+  };
+  const { binding } = metrics(el, { meter });
+  expect(() => binding.attachSource()).not.toThrow();
+  expect(el.listenerCount).toBe(0);
+  expect(() => binding.stop()).not.toThrow();
+  expect(meter.attachSource).toHaveBeenCalledTimes(1);
 });

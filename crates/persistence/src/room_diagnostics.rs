@@ -125,10 +125,7 @@ pub async fn reset_clock(pool: &PgPool, epoch: Uuid) -> Result<()> {
             None,
             life,
             life,
-            Operation::Checkpoint {
-                reason: room_core::diagnostics::CheckpointReason::ServerRestart,
-                command: None,
-            },
+            Operation::ServerRestart { clock_epoch: epoch },
         );
         sqlx::query("UPDATE room_snapshots SET state=$2 WHERE room_id=$1")
             .bind(room)

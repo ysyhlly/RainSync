@@ -11,6 +11,7 @@ import {
   PlaybackRateSupport,
   availablePlaybackRanges,
   containsPlaybackPosition,
+  hasUsablePlaybackTimeline,
 } from "../../../../../packages/player-core";
 import {
   Corrector,
@@ -29,10 +30,11 @@ import type {
   UpstreamProfileCandidateSet,
   UpstreamProfileReport,
 } from "../../../../../packages/protocol";
-import { RequestFailure } from "../../errors";
+import { RequestFailure, isUnsupportedTimelineResponse } from "../../errors";
 import { StaleIdentity } from "../../shared/api/client";
 import {
   PlaybackCancelled,
+  PlaybackViewerOriginRequired,
   PlaybackRequests,
   waitPlaybackReady,
 } from "../../playback-request";
@@ -52,6 +54,7 @@ import {
   type PlaybackSummary,
 } from "./playback-summary";
 import { createPlaybackMetricsSender } from "./metrics-sender";
+import { createFirstFrameDeadline } from "./first-frame-deadline";
 
 const CANDIDATE_LIFETIME_MS = 5 * 60 * 1000;
 const candidateError = "播放候选无法安全使用，请重新加载播放";
@@ -137,6 +140,10 @@ export function createPlaybackRuntime(ctx: {
   let mediaDataLoad:
     | { sourceChanged: () => void; sync: () => void; stop: () => void }
     | undefined;
+  let firstFrameDeadline:
+    ReturnType<typeof createFirstFrameDeadline> | undefined;
+  const firstFrameTimeoutError =
+    "播放首帧等待超时，尚未确认画面呈现，请重新加载播放";
   const mediaDataTimeoutError = "媒体数据加载超时，请检查连接或重新加载播放";
   const corrector = new Corrector();
   let rates: PlaybackRateSupport | undefined,
@@ -214,7 +221,7 @@ export function createPlaybackRuntime(ctx: {
     pendingUserSeek ||= userSeek;
     clockAction ??= "apply";
   }
-  const planGenerations = new PlaybackPlanGenerations();
+  let planGenerations = new PlaybackPlanGenerations();
   const currentPlan = (p: PlaybackPlan) =>
     plan === p && planGenerations.current(p);
   let playbackRequests: PlaybackRequests | undefined;
@@ -245,7 +252,8 @@ export function createPlaybackRuntime(ctx: {
     meter?: PlaybackMetrics;
     last?: PlaybackMetricsSnapshot;
     disabled: boolean;
-    enabledPlan?: PlaybackPlan;
+    metricsVersion?: 1 | 2;
+    originRecoveryUsed: boolean;
   };
   type CandidateDiscovery = {
     capabilities: PlaybackCapabilities;
@@ -412,6 +420,7 @@ export function createPlaybackRuntime(ctx: {
   }
   function visibilityChanged() {
     mediaDataLoad?.sync();
+    firstFrameDeadline?.sync();
     observeMetrics();
     updateRecovery();
   }
@@ -440,7 +449,17 @@ export function createPlaybackRuntime(ctx: {
     restart = false,
   ) {
     const m = metricIntent;
-    if (!m?.meter || !metricCurrent(m) || m.enabledPlan !== p) return;
+    // Local evidence precedes optional negotiation. A later valid grant may
+    // enable this same meter; never reconstruct its source phases or frame then.
+    if (
+      !m?.meter ||
+      !metricCurrent(m) ||
+      m.disabled ||
+      !Number.isInteger(p.plan_generation) ||
+      p.plan_generation! < 1 ||
+      p.plan_generation! > 0xffff_ffff
+    )
+      return;
     if (restart) advanceMetricAttempt(m);
     const fence = m.fence;
     const meter = m.meter;
@@ -449,6 +468,7 @@ export function createPlaybackRuntime(ctx: {
         element: el,
         meter,
         fence,
+        planGeneration: p.plan_generation!,
         current: () =>
           metricCurrent(m) &&
           m.fence === fence &&
@@ -458,33 +478,58 @@ export function createPlaybackRuntime(ctx: {
       }),
     );
   }
+  function attachMetricSource() {
+    const m = metricIntent;
+    if (!m?.meter || m.disabled || !metricCurrent(m)) return;
+    if (bestEffort(() => metricSource?.attachSource()) !== true) {
+      // An actual source edge was lost. Do not emit coherent-looking phase
+      // totals reconstructed from the later playback state.
+      m.disabled = true;
+      bestEffort(() => metricSender.unbind());
+      bestEffort(() => metricSource?.stop());
+      metricSource = undefined;
+    }
+  }
   function bindMetricGrant(p: PlaybackPlan) {
     const m = metricIntent,
-      grant = p.playback_metrics;
+      grant = p.playback_metrics,
+      version = p.playback_metrics_version;
     if (
       !m ||
       !metricCurrent(m) ||
       m.disabled ||
-      p.playback_metrics_version !== 1 ||
+      (version !== 1 && version !== 2) ||
+      !Number.isInteger(p.plan_generation) ||
+      p.plan_generation! < m.startGeneration ||
+      p.plan_generation! > 0xffff_ffff ||
+      (m.metricsVersion !== undefined && m.metricsVersion !== version) ||
       !grant ||
       grant.closed !== false ||
       grant.meter_start_generation !== m.startGeneration ||
       grant.startup_origin !== m.origin ||
       !Number.isSafeInteger(grant.metrics_seq) ||
       grant.metrics_seq < 0 ||
-      grant.metrics_seq > (m.last?.seq ?? 0)
+      grant.metrics_seq > (m.last?.seq ?? 0) ||
+      (grant.last_sample !== undefined &&
+        (grant.last_sample.version !== version ||
+          grant.last_sample.seq !== grant.metrics_seq ||
+          grant.last_sample.meter_start_generation !== m.startGeneration ||
+          grant.last_sample.startup_origin !== m.origin))
     ) {
       if (
         m &&
         grant &&
-        (grant.closed || grant.metrics_seq > (m.last?.seq ?? 0))
+        (grant.closed ||
+          grant.metrics_seq > (m.last?.seq ?? 0) ||
+          (m.metricsVersion !== undefined && m.metricsVersion !== version))
       )
         m.disabled = true;
       return;
     }
-    m.enabledPlan = p;
+    m.metricsVersion ??= version;
     bestEffort(() =>
       metricSender.bind({
+        version,
         sessionId: p.session_id,
         planGeneration: p.plan_generation!,
         mediaGeneration: p.media_generation,
@@ -619,16 +664,26 @@ export function createPlaybackRuntime(ctx: {
               throw new PlaybackCancelled();
             checkCandidateLifetime(snapshot);
           }
-          return session.api<PlaybackPlan>(
-            body.upstream_profile_report
-              ? "/playback-sessions/upstream-profile"
-              : body.http_file_fallback
-                ? "/playback-sessions/http-file-continuation"
-                : "/playback-sessions",
-            "POST",
-            body.upstream_profile_report ? structuredClone(body) : body,
-            signal,
-          );
+          return session
+            .api<PlaybackPlan>(
+              body.upstream_profile_report
+                ? "/playback-sessions/upstream-profile"
+                : body.http_file_fallback
+                  ? "/playback-sessions/http-file-continuation"
+                  : "/playback-sessions",
+              "POST",
+              body.upstream_profile_report ? structuredClone(body) : body,
+              signal,
+            )
+            .then((result) => {
+              // Check before readiness arithmetic, subtitle binding, seeking or
+              // observations can consume an unproven/nonfinite scalar origin.
+              if (!hasUsablePlaybackTimeline(result))
+                throw new RequestFailure({
+                  error: { code: "UNSUPPORTED_TIMELINE" },
+                });
+              return result;
+            });
         },
         (key, signal) => {
           if (session.epoch !== epoch) throw new StaleIdentity();
@@ -691,10 +746,11 @@ export function createPlaybackRuntime(ctx: {
     bestEffort(() => metricSource?.stop());
     metricSource = undefined;
     bestEffort(() => metricSender.unbind(true));
-    if (metricIntent) metricIntent.enabledPlan = undefined;
     // Capture the old element before teardown changes its time or identity.
     const finalObservation = bestEffort(() => observations?.stop());
     observations = undefined;
+    firstFrameDeadline?.stop();
+    firstFrameDeadline = undefined;
     mediaDataLoad?.stop();
     mediaDataLoad = undefined;
     if (capabilityProbe !== preserveCandidates?.candidateDiscovery?.probe) {
@@ -759,7 +815,10 @@ export function createPlaybackRuntime(ctx: {
       beforeCleanup ? Promise.resolve() : deletePrevious(),
     ]);
   }
-  function beginLoad(origin: PlaybackMetricsOrigin) {
+  function beginLoad(
+    origin: PlaybackMetricsOrigin,
+    originRecoveryUsed = false,
+  ): Promise<void> | undefined {
     if (!roomIsActive()) return;
     const s = state.value;
     if (!s?.media_id) return;
@@ -784,6 +843,7 @@ export function createPlaybackRuntime(ctx: {
       failedCandidates: [],
       element: video.value,
       disabled: false,
+      originRecoveryUsed,
     };
     metricIntent = m;
     rates?.reset();
@@ -1068,7 +1128,7 @@ export function createPlaybackRuntime(ctx: {
       parent: PlaybackPlan;
       capabilities: PlaybackCapabilities;
     },
-  ) {
+  ): Promise<void> {
     if (!candidateIntentCurrent(metrics)) return;
     const s = state.value!;
     const pending = {
@@ -1161,10 +1221,11 @@ export function createPlaybackRuntime(ctx: {
         observation_version: 1,
         http_file_fallback_version: 1,
         playback_metrics_version: 1,
-        playback_metrics: {
+        playback_metrics_supported_versions: freezeCandidateSnapshot([1, 2]),
+        playback_metrics: freezeCandidateSnapshot({
           meter_start_generation: metrics.startGeneration,
           startup_origin: metrics.origin,
-        },
+        }),
       };
       waiting.value = true;
       const requestedSeek = seekSerial;
@@ -1252,7 +1313,7 @@ export function createPlaybackRuntime(ctx: {
         subtitleIndex.value = undefined;
       await nextTick();
       if (serial !== loadSerial || !currentPlan(p)) return;
-      bindMetricGrant(p);
+      bestEffort(() => bindMetricGrant(p));
       applySubtitles();
       const el = video.value;
       if (p.observation_version === 1) {
@@ -1298,6 +1359,27 @@ export function createPlaybackRuntime(ctx: {
       };
       waiting.value = true;
       let recoveries = 0;
+      firstFrameDeadline = createFirstFrameDeadline({
+        element: el,
+        current: () =>
+          serial === loadSerial && currentPlan(p) && metricCurrent(metrics),
+        suspended: () =>
+          !!generationWait ||
+          generationWaitFailed ||
+          blocked.value ||
+          !foreground() ||
+          state.value?.playback_status !== "playing",
+        eligible: () =>
+          !generationWait &&
+          !generationWaitFailed &&
+          !blocked.value &&
+          foreground(),
+        timeout: () => {
+          recoveringHls = false;
+          waiting.value = false;
+          if (!error.value) error.value = firstFrameTimeoutError;
+        },
+      });
       // This bounds usable media data for the attached plan, not a
       // presented first frame. Server queue/generated waits keep their own
       // deadlines. Known gesture/background suspension excludes time when
@@ -1478,6 +1560,7 @@ export function createPlaybackRuntime(ctx: {
         recoveringHls = true;
         waiting.value = true;
         invalidatePlayActions();
+        firstFrameDeadline?.detachSource();
         mediaDataLoad?.sourceChanged();
         const position = playbackPosition();
         if (mse && hls) {
@@ -1486,6 +1569,7 @@ export function createPlaybackRuntime(ctx: {
           hls.config.startPosition = position;
           hls.loadSource(p.playback_url);
           hls.startLoad(position);
+          attachMetricSource();
         } else {
           // Native media errors do not expose the failing HTTP status. Retry the
           // unfenced entry with a bounded cache-busting URL and room-time fragment.
@@ -1495,7 +1579,9 @@ export function createPlaybackRuntime(ctx: {
           url.hash = `t=${position}`;
           el.src = url.href;
           el.load();
+          attachMetricSource();
         }
+        firstFrameDeadline?.attachSource();
         return true;
       };
       el.onerror = () => {
@@ -1527,6 +1613,7 @@ export function createPlaybackRuntime(ctx: {
             recoveringHls = true;
             waiting.value = true;
             invalidatePlayActions();
+            firstFrameDeadline?.detachSource();
             mediaDataLoad?.sourceChanged();
             el.pause();
             bestEffort(() => metricSource?.stop());
@@ -1534,6 +1621,7 @@ export function createPlaybackRuntime(ctx: {
             el.load();
             bindMetricSource(p, el, true);
             attachHls();
+            firstFrameDeadline?.attachSource();
             return;
           }
           if (recover()) return;
@@ -1559,6 +1647,7 @@ export function createPlaybackRuntime(ctx: {
         });
         hls.loadSource(p.playback_url);
         hls.attachMedia(el);
+        attachMetricSource();
         hls.on(Hls.Events.ERROR, (_, data) => {
           if (
             serial === loadSerial &&
@@ -1567,6 +1656,24 @@ export function createPlaybackRuntime(ctx: {
             roomIsActive() &&
             data.fatal
           ) {
+            if (
+              isUnsupportedTimelineResponse(
+                data.response?.code,
+                bestEffort(() =>
+                  data.networkDetails && "responseText" in data.networkDetails
+                    ? data.networkDetails.responseText
+                    : undefined,
+                ),
+              )
+            ) {
+              firstFrameDeadline?.stop();
+              recoveringHls = false;
+              waiting.value = false;
+              error.value = new RequestFailure({
+                error: { code: "UNSUPPORTED_TIMELINE" },
+              }).message;
+              return;
+            }
             if (data.response?.code === 409 && recover()) return;
             if (data.type === "mediaError" && retryDecode()) return;
             recoveringHls = false;
@@ -1577,8 +1684,12 @@ export function createPlaybackRuntime(ctx: {
       };
       bindMetricSource(p, el);
       if (mse) attachHls();
-      else el.src = p.playback_url;
+      else {
+        el.src = p.playback_url;
+        attachMetricSource();
+      }
       mediaDataLoad.sourceChanged();
+      firstFrameDeadline.attachSource();
       el.onloadedmetadata = () => {
         if (serial !== loadSerial || !currentPlan(p) || !metricCurrent(metrics))
           return;
@@ -1595,6 +1706,16 @@ export function createPlaybackRuntime(ctx: {
         return;
       waiting.value = false;
       pendingLoad = undefined;
+      if (
+        !continuation &&
+        !metrics.originRecoveryUsed &&
+        e instanceof PlaybackViewerOriginRequired
+      ) {
+        // Explicitly pre-mutation, first-attempt rejection only. This starts a
+        // new logical meter/intent; no metrics packet or old key is relabeled.
+        planGenerations = new PlaybackPlanGenerations();
+        return beginLoad(metrics.origin, true);
+      }
       if (
         continuation &&
         e instanceof RequestFailure &&
@@ -1625,6 +1746,7 @@ export function createPlaybackRuntime(ctx: {
     generationWait = controller;
     invalidatePlayActions();
     mediaDataLoad?.sync();
+    firstFrameDeadline?.sync();
     observeMetrics();
     waiting.value = true;
     video.value?.pause();
@@ -1678,9 +1800,12 @@ export function createPlaybackRuntime(ctx: {
         const url = new URL(p.playback_url, location.href);
         url.hash = `t=${position}`;
         invalidatePlayActions();
+        firstFrameDeadline?.detachSource();
         mediaDataLoad?.sourceChanged();
         video.value.src = url.href;
         video.value.load();
+        attachMetricSource();
+        firstFrameDeadline?.attachSource();
       }
     } catch (e) {
       if (controller.signal.aborted || !currentPlan(p) || !roomIsActive())
@@ -1695,6 +1820,7 @@ export function createPlaybackRuntime(ctx: {
     } finally {
       if (generationWait === controller) generationWait = undefined;
       mediaDataLoad?.sync();
+      firstFrameDeadline?.sync();
       observeMetrics();
     }
   }
@@ -1777,6 +1903,7 @@ export function createPlaybackRuntime(ctx: {
       generationWait?.abort();
       generationWait = undefined;
       mediaDataLoad?.sync();
+      firstFrameDeadline?.sync();
     }
     if (generationWait || generationWaitFailed) return;
     const relative = (target(s, clock.now()) - p.timeline_origin_ms) / 1000;
@@ -1984,6 +2111,7 @@ export function createPlaybackRuntime(ctx: {
     generationWait = undefined;
     generationWaitFailed = false;
     mediaDataLoad?.sync();
+    firstFrameDeadline?.sync();
     queueApply();
     if (pendingLoad && !pendingLoad.preparing) clockAction = "load";
     recoveryPending = !!plan || !!pendingLoad;
@@ -2050,6 +2178,7 @@ export function createPlaybackRuntime(ctx: {
       state.value?.room_id,
       state.value?.media_id,
       state.value?.media_generation,
+      state.value?.playback_status,
       session.user?.id,
       session.epoch,
       connected.value,
@@ -2059,6 +2188,7 @@ export function createPlaybackRuntime(ctx: {
     ],
     () => {
       mediaDataLoad?.sync();
+      firstFrameDeadline?.sync();
       updateRecovery();
     },
     { flush: "sync" },
@@ -2069,21 +2199,66 @@ export function createPlaybackRuntime(ctx: {
     5000,
   );
   const metricsTimer = setInterval(sampleMetrics, 5000);
+  // Only an explicit legacy receipt establishes this non-renewable boundary.
+  // An ordinary 200 never means a fabricated extra 30 minutes.
+  let legacyExpiry: { plan: PlaybackPlan; deadline: number } | undefined;
+  let renewing: PlaybackPlan | undefined;
   const renewTimer = setInterval(() => {
-    const current = plan?.session_id;
-    if (current && roomIsActive())
-      void session
-        .api(`/playback-sessions/${current}`, "POST")
-        .catch((failure) => {
-          if (
-            plan?.session_id === current &&
-            failure instanceof RequestFailure &&
-            ["INVALID_PLAYBACK_SESSION", "SESSION_EXPIRED"].includes(
-              failure.code,
-            )
-          )
-            error.value = "播放会话已失效，请重新加载";
-        });
+    const current = plan;
+    if (!current || !roomIsActive() || renewing === current) return;
+    const epoch = session.epoch;
+    renewing = current;
+    void session
+      .api(`/playback-sessions/${current.session_id}`, "POST")
+      .then((receipt: unknown) => {
+        if (!currentPlan(current) || session.epoch !== epoch) return;
+        if (
+          receipt &&
+          typeof receipt === "object" &&
+          "legacy_expiry_unchanged" in receipt &&
+          receipt.legacy_expiry_unchanged === true &&
+          "expires_in_seconds" in receipt &&
+          typeof receipt.expires_in_seconds === "number" &&
+          Number.isInteger(receipt.expires_in_seconds) &&
+          receipt.expires_in_seconds >= 0 &&
+          receipt.expires_in_seconds <= 1800
+        ) {
+          const deadline =
+            performance.now() + receipt.expires_in_seconds * 1000;
+          legacyExpiry = {
+            plan: current,
+            deadline:
+              legacyExpiry?.plan === current
+                ? Math.min(legacyExpiry.deadline, deadline)
+                : deadline,
+          };
+        }
+      })
+      .catch((failure) => {
+        if (
+          !currentPlan(current) ||
+          session.epoch !== epoch ||
+          !(failure instanceof RequestFailure)
+        )
+          return;
+        if (
+          failure.code === "INVALID_PLAYBACK_SESSION" &&
+          legacyExpiry?.plan === current &&
+          performance.now() >= legacyExpiry.deadline
+        ) {
+          // Server rejection after its truthful fixed expiry permits one new
+          // intent. A 200 with zero remaining merely waits for normal cadence.
+          legacyExpiry = undefined;
+          void run(() => beginLoad("automatic_load") ?? Promise.resolve());
+        } else if (
+          ["INVALID_PLAYBACK_SESSION", "SESSION_EXPIRED"].includes(failure.code)
+        ) {
+          error.value = "播放会话已失效，请重新加载";
+        }
+      })
+      .finally(() => {
+        if (renewing === current) renewing = undefined;
+      });
   }, 600000);
   onScopeDispose(() => {
     clearInterval(timer);

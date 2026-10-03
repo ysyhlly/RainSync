@@ -26,13 +26,89 @@ permitted addresses; the documentation example is not a deployment policy.
 The DNS wait is bounded to three seconds, 64 returned addresses and eight owned
 OS resolver jobs. Cancellation does not release a resolver slot before its
 blocking lookup finishes. Each scoped client pins the checked addresses while
-retaining HTTP Host/TLS SNI/certificate verification. Redirects are rejected.
+retaining HTTP Host/TLS SNI/certificate verification. Redirects remain rejected
+unless the administrator enables the bounded media policy below.
 Environment proxies are not used for source traffic. Proxy-dependent deployments
 need a separately verified transport contract before using this path.
 
 Only the configured source origin receives configured credentials. Additional
 explicit strict origins receive no configured credential headers. Authority,
 proxy and hop-by-hop headers cannot be supplied through source configuration.
+
+## Controlled media redirects (opt-in)
+
+An administrator may add `"redirects":{"max_hops":5}` to a strict version-one
+access policy. `max_hops` must be 1–5; omission preserves no-follow behavior.
+Legacy origin-only sources cannot enable redirect following. Each origin includes
+its exact protocol and effective port, and needs explicit CIDRs. Adding the
+redirect option uses the existing access-policy update endpoint and revision
+invalidation described below; it is not a client playback parameter.
+
+Only registered media **GET and HEAD** requests follow 301, 302, 303, 307 and 308.
+HEAD stays HEAD, including on 303; no request body is replayed. Each hop, including
+a same-origin hop, gets a new validated DNS answer and pinned client. Loops,
+ambiguous/missing Location headers, invalid URLs and HTTPS-to-HTTP downgrades fail
+closed. At most the initial request plus five redirect requests are sent. Header
+preparation has a 30-second chain deadline; streaming retains existing ownership,
+cancellation and read-timeout checks.
+
+All configured source headers, including Authorization, Cookie, custom secrets
+and Referer, are sent only to the exact configured primary origin. Additional
+allowed origins receive none of them. Only application-owned Range, If-Range,
+If-Match, If-Unmodified-Since and identity Accept-Encoding controls survive a
+cross-origin hop. No response cookie store, Referer generation, original-query
+inheritance or guessed token names are used. Independently configured CDN
+credentials are not supported in this version.
+
+Primary media delivery, guarded media probes, decoder preview inputs, child HLS
+resources and upstream subtitle media reads share the bounded request path. HLS
+relative references are resolved against the **final manifest URL**, and each
+child read is independently authorized and address-pinned. Encrypted tickets
+continue to name registered resources and captured source-policy revisions; no
+arbitrary URL/header endpoint is added.
+
+Generic HTTP representation evidence remains keyed by the original registered
+URL. Redirected responses additionally capture `final_target_sha256` in their
+internal identity metadata. It covers the complete canonical final URL including
+its query. Missing legacy evidence permits only original-equals-final reads.
+Changing CDN, path or query, or changing between redirected and direct delivery,
+invalidates the existing grant even when ETag and size match. HEAD and partial
+responses obey the same destination comparison. Preview registrations similarly
+pin their final destination. Rotating signed redirect URLs therefore require a
+new grant/attempt: there is no claim that arbitrary auth-query rotation preserves
+resource identity.
+
+Provider metadata/listing/account APIs, PlaybackInfo POST and session/lifecycle
+POST/DELETE calls deliberately retain their no-follow contract. Absolute
+cross-origin PlaybackInfo routes still do not satisfy the existing negotiated
+route/provenance checks; an allowed media redirect from the validated origin does
+not relax those checks. General HTTP redirect semantics, authenticated CDN
+configuration and real HTTPS/CDN deployment acceptance remain unsupported or
+unverified boundaries, not completed integration claims.
+
+## Paired binary identity declaration
+
+Server and Worker expose an offline `--source-access-contract` probe before
+runtime construction, configuration, key, database or listener access. Each emits
+one exact single-line declaration with ordered fields `schema_version`,
+`contract`, `identity`, `credential_origin`, `methods`, `default`, `role`. Version
+one names `controlled-media-redirects-v1`, `final-target-sha256-v1`,
+`configured-origin`, GET/HEAD and `no-follow`, plus its server/worker role.
+This is an exact supported contract, not a health/readiness result or permission
+to treat arbitrary newer versions as compatible.
+
+Both strict readers must understand the optional internal final-destination digest.
+The Server's private HTTP metadata preserves and validates the same lowercase
+64-hex field through candidate bindings, independent grant seeds, continuation
+claims and replay. Legacy omission remains unchanged in serialized JSON. An old
+Server that rejects unknown metadata fields cannot consume a new redirected
+Worker identity, so paired deployment needs a matching declaration.
+
+Durable representation evidence applies specifically to generic `kind=http`
+grants. Preview targets have per-attempt in-memory destination pins. Raw
+Jellyfin/Emby media retain their existing provider/SID contract, with policy checks
+and final-manifest rewriting; these flows do not gain a universal immutable
+cross-request byte-identity claim from this feature.
 
 ## Policy revision and revocation
 
@@ -91,6 +167,38 @@ claim that arbitrary demuxer formats are supported.
 Actual HTTPS/CDN deployments, reliable remote representation identity when an
 upstream provides no honest validator, additional product versions, real devices,
 network filesystems and long-running acceptance remain separately unverified.
+
+## Controlled-redirect verification (2026-10-02 UTC)
+
+Scoped local checks for the additive media redirect contract passed:
+
+- Provider package: 38 unit tests, 11 dedicated redirect fixtures, 12 access-policy
+  tests and 13 adapter tests; the isolated proxy-environment helper also passed
+  through its owning subprocess test (its standalone entry remains ignored).
+- Worker preview gateway: 32 unit fixtures, including nested final-base HLS,
+  per-child media checks and changed-destination revocation.
+- Durable HTTP identity: 6 units plus the fresh PostgreSQL/owned HTTP fixture
+  coordinator, extended with redirected GET/HEAD/ranges, old evidence rejection,
+  signed-query change detection and encrypted final-base child tickets.
+- Strict Clippy for providers and media-worker all-targets, formatting and diff
+  whitespace checks passed. The known ts-rs serde-attribute notice remains.
+
+A follow-up source-bound public-API runner, `tests/http-controlled-redirects.mjs`,
+passed four additional groups: redirected candidate/grant/replay; unchanged-ETag
+candidate rejection after signed-destination change; ordinary root/continuation
+with actual transcoded HLS and segment read plus replay; and continuation rejection
+after destination change. All state-changing actions used public APIs, including
+ordinary room control; SQL was read-only evidence. The same run verified exact
+Server/Worker declarations with an empty environment and no source secrets or
+signed queries in process logs. Six focused Server identity units and the shared
+contract unit passed, alongside strict Server/Worker/provider Clippy. The public
+runner verified Server, Worker, database, source/CDN listeners and room sockets
+were closed; its report and frozen source/binary binding live under the configured
+artifact/runtime roots.
+
+The database coordinator confirmed its owned PostgreSQL process exited and its
+listener closed. These are scoped media/provider checks, not full combined
+backend, Agent/NAS, real-CDN/TLS, browser/device or release acceptance.
 
 ## Validation checkpoint (2026-09-30 UTC)
 

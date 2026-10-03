@@ -472,6 +472,7 @@ it("a seek rebuild gets another plan generation without changing the room state"
         ? {
             ...result,
             session_id: `generation-${body.plan_generation}`,
+            delivery_mode: "transcode",
             timeline_origin_ms: 10000,
             rebuild_on_seek: true,
           }

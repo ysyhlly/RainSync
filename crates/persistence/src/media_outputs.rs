@@ -77,7 +77,7 @@ pub async fn publish(
     }
     let mut tx = pool.begin().await?;
     let query = format!(
-        "SELECT {OLD_PHASE_SQL} FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND NOT p.stopped AND p.expires_at>clock_timestamp() FOR UPDATE OF j"
+        "SELECT {OLD_PHASE_SQL} FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND j.lease_until>clock_timestamp() AND NOT p.stopped AND p.expires_at>clock_timestamp() AND playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch) FOR UPDATE OF j"
     );
     let owned = sqlx::query(&query)
         .bind(claim.id)
@@ -127,7 +127,7 @@ UPDATE media_jobs j SET status=CASE WHEN $4 THEN 'succeeded' ELSE j.status END,
 FROM locked l CROSS JOIN tick t,playback_sessions p
 WHERE j.id=l.id AND j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running'
     AND j.lease_until>clock_timestamp() AND p.id=j.session_id
-    AND NOT p.stopped AND p.expires_at>clock_timestamp()
+    AND NOT p.stopped AND p.expires_at>clock_timestamp() AND playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch)
 RETURNING {SINGLE_PHASE_SQL}"#
     );
     let ended = sqlx::query(&query)

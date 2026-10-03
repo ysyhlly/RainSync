@@ -1045,12 +1045,15 @@ name = "media-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "http",
+ "ipnet",
  "libc",
  "protocol",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "url",
  "uuid",
  "windows",
 ]

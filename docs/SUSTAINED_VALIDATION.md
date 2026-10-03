@@ -6,10 +6,10 @@
 
 在活仓库根目录运行：
 
-~~~powershell
+```powershell
 node scripts/validation-candidate.mjs --id=<本次编号> --build --image=<本次镜像标签> --frontend-ref=origin/front/rainsync-implementation
 node scripts/validation-candidate.mjs --verify=<本次编号>
-~~~
+```
 
 候选保存在 .runtime/validation-candidates/<本次编号>。candidate.json 记录允许源码的逐文件清单、生产清单、Git 差异摘要、锁文件、宿主与 Docker 分配资源、构建输入、镜像 ID、源码 label、实际三份二进制 SHA-256 和 FFmpeg 构建信息。复制前后检查活源码；构建前后检查冻结源码和 vendor。此工具不读取 .env、密钥、容器配置或用户媒体。
 
@@ -44,3 +44,9 @@ node tests/nas-soak.mjs --duration-seconds=7200 使用真实 Server、Worker、A
 专门的 node tests/agent-backpressure.mjs 先保持健康背压超过四十秒，再恢复并核对完整 Range 字节；普通 Ping/Pong 不延长无进展期限。另验证停止专用健康信号后的有界释放、已收到健康信号后 Close 与控制撤销的五秒释放。该专测使用受控消费者，不能替代浏览器连续观影。
 
 原始证据：source/.runtime/nas-soak/<随机编号> 的 samples/progress/report 与各服务日志。文件系统身份和变化时间的保证、真实网络文件系统、Windows 全服务链路和移动实机仍按原计划单独验收。
+
+## 独立同步/网络与 72 小时协调
+
+新增 `tests/sync-network.mjs` 和 `tests/soak.mjs`，先通过 `--dry-run` 生成无副作用调度，再接入明确批准的隔离部署适配器。独立四时间戳校准、真实浏览器呈现观察驱动、N1–N6 多轮协调、72h 绝对时间调度、阶段匹配资源序列、失败采样和脱敏产物契约见 [验收协调器说明](ACCEPTANCE_RUNNERS.md)。
+
+入口存在不代表发布验收完成：双向网络/故障和应用生命周期适配器、可见时间码解码、真实运行与原始证据审阅仍未完成；§12.2–12.4 保留部分实现状态。合成测试和预演一律不能关闭正式门槛。

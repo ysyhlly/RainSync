@@ -108,20 +108,16 @@ pub async fn scan(
     let mut batch = Vec::with_capacity(32);
     for mut item in items {
         if row.get::<String, _>("kind") == "local"
-            && let Ok(path) =
-                media_core::safe_path(std::path::Path::new(&config.root), &item.resource)
-            && let Ok(meta) = media_core::probe(&path.to_string_lossy()).await
+            && let Ok((meta, version)) =
+                playback_capabilities::probe_local(&config.root, &item.resource).await
         {
             item.duration_ms = meta["format"]["duration"]
                 .as_str()
                 .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
                 .map(|v| v * 1000.0);
             item.metadata = meta;
-            if let Ok(file) = std::fs::File::open(&path)
-                && let Ok(snapshot) = media_core::file_version::snapshot_file(&file)
-            {
-                item.metadata["preview_file_version"] = json!(snapshot.version);
-            }
+            item.metadata["preview_file_version"] = json!(version);
             let mut sidecars = serde_json::Map::new();
             for (i, ext) in ["srt", "vtt"].iter().enumerate() {
                 let relative = std::path::Path::new(&item.resource)
@@ -387,30 +383,45 @@ async fn prepare_playback(
             serde_json::to_value(&authority.context).map_err(anyhow::Error::from)?;
     }
     let mut meta: Value = row.get("metadata");
+    // Never choose a new local plan from scan-time facts. One guarded probe
+    // supplies its mode, tracks, duration and the version carried by delivery
+    // and jobs, including clients without a concrete candidate report.
     let local_fact_version = if kind == "local" {
-        Some(playback_capabilities::current_local_version(
-            &config.root,
-            &item,
-        )?)
+        let (mut current, version) =
+            playback_capabilities::probe_local(&config.root, &item).await?;
+        if meta.get("sidecars").is_some() {
+            current["sidecars"] = meta["sidecars"].clone();
+        }
+        current["preview_file_version"] = json!(version);
+        meta = current;
+        resource["source_version"] = json!(version);
+        Some(version)
     } else {
         None
     };
     let mut current_metadata = match kind.as_str() {
-        "local" => local_fact_version.as_deref().is_some_and(|version| {
-            meta["capability_source_version"].as_str() == Some(version)
-                || meta["preview_file_version"].as_str() == Some(version)
-        }),
+        "local" => true,
         "agent" => source_version
             .as_deref()
             .is_some_and(|version| meta["capability_source_version"].as_str() == Some(version)),
         _ => false,
     };
-    let mut probed = false;
+    if kind == "local" {
+        media_core::capabilities::validate_source(&meta)
+            .map_err(playback_capabilities::probe_error)?;
+    }
+    let mut probed = kind == "local";
     let mut negotiated_info = None;
     // A concrete HTTP intent learns timing only from this attempt's pinned
     // probe. Cached media-item duration must not clamp a new representation.
     let mut duration: Option<f64> = if let Some(selection) = &upstream_profile {
         Some(selection.metadata.runtime_ticks as f64 / 10_000.0)
+    } else if kind == "local" {
+        meta["format"]["duration"]
+            .as_str()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| v * 1000.0)
     } else if kind == "http" && http_file.is_some_and(|authority| authority.candidate.is_some()) {
         None
     } else {
@@ -432,7 +443,7 @@ async fn prepare_playback(
         )?
     } else if body.candidate_report.is_some() {
         let version = if kind == "local" {
-            playback_capabilities::current_local_version(&config.root, &item)?
+            local_fact_version.clone().expect("local probe version")
         } else if kind == "agent" {
             source_version
                 .clone()
@@ -454,7 +465,7 @@ async fn prepare_playback(
     if mode == "auto" {
         mode = if kind == "local" {
             media_core::compatible_mode(&meta, body.audio_index.is_some())
-                .map_err(|_| err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_video_or_hdr"))?
+                .map_err(playback_capabilities::probe_error)?
         } else {
             "direct"
         };
@@ -749,7 +760,7 @@ async fn prepare_playback(
             .filter(|v| v.is_finite() && *v >= 0.0)
             .map(|v| v * 1000.0);
         let detected = media_core::compatible_mode(&meta, body.audio_index.is_some())
-            .map_err(|_| err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_video_or_hdr"))?;
+            .map_err(playback_capabilities::probe_error)?;
         if requested_mode == "auto" {
             mode = detected;
         }
@@ -832,8 +843,8 @@ async fn prepare_playback(
         && mode == "direct"
         && matches!(kind.as_str(), "local" | "http" | "agent")
     {
-        mode = media_core::compatible_mode(&meta, true)
-            .map_err(|_| err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_video_or_hdr"))?;
+        mode =
+            media_core::compatible_mode(&meta, true).map_err(playback_capabilities::probe_error)?;
     }
     if let Some(selection) = &selected {
         mode = &selection.candidate.delivery_mode;
@@ -863,6 +874,13 @@ async fn prepare_playback(
     }
     position_ms = protocol::bounded_position(position_ms, duration);
     let local_job = matches!(kind.as_str(), "local" | "http" | "agent") && mode != "direct";
+    playback_plan::require_legacy_job_mapping(
+        &kind,
+        local_job,
+        &meta,
+        body.audio_index,
+        current_metadata && probed && (kind != "local" || local_fact_version.is_some()),
+    )?;
     if local_job {
         if selected.is_none()
             && mode == "remux"
@@ -870,8 +888,12 @@ async fn prepare_playback(
         {
             mode = "transcode";
         }
+        // A concrete remux was probed as stream-copy, so it must not silently
+        // become the nonzero exact-decode recipe in hls_args. No measured
+        // keyframe origin exists for that route; request a new compatible plan.
+        timeline = playback_plan::local_timeline_origin(position_ms, mode)
+            .ok_or_else(|| err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_timeline"))?;
         transport = "hls";
-        timeline = position_ms;
         resource["job_id"] = json!(id);
     }
     resource["transport"] = json!(transport);
@@ -883,6 +905,15 @@ async fn prepare_playback(
         vec![]
     } else if let Some(info) = &negotiated_info {
         playback_plan::upstream_fallbacks(info, mode, hls_supported, &config.url)
+    } else if matches!(kind.as_str(), "local" | "http") {
+        playback_plan::legacy_mapped_fallbacks(
+            &meta,
+            body.audio_index,
+            mode,
+            position_ms,
+            current_metadata,
+            hls_supported,
+        )
     } else {
         playback_plan::local_fallbacks(&meta, mode, position_ms, current_metadata, hls_supported)
     };
@@ -898,6 +929,24 @@ async fn prepare_playback(
     } else {
         protocol::SubtitleDeliveryMode::None
     };
+    let selected_output = if current_metadata && matches!(kind.as_str(), "local" | "http") {
+        selected
+            .as_ref()
+            .map(|selection| {
+                playback_capabilities::selected_output(
+                    selection,
+                    &meta,
+                    body.audio_index,
+                    body.position_ms,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(facts) = &selected_output {
+        resource["selected_output"] = serde_json::to_value(facts).map_err(anyhow::Error::from)?;
+    }
     let plan = protocol::PlaybackPlan {
         http_file_fallback_version: None,
         upstream_profile: upstream_profile
@@ -945,6 +994,7 @@ async fn prepare_playback(
             },
         ),
         selected_candidate_id: selected.as_ref().map(|s| s.candidate.id.clone()),
+        selected_output,
         subtitle_mode: Some(subtitle_mode),
         seekable_media_ranges_ms: None,
         pending_job_id: None,
@@ -969,7 +1019,17 @@ async fn prepare_playback(
     if kind == "http" {
         http_representation::guard(&mut tx, id).await?;
         playback_requests::http_file_fallback::verify_pin(&mut tx, id, http_file).await?;
-        if http_file.is_some()
+        if local_job {
+            // Reuse this attempt's existing probe pin under the publication
+            // fence. HLS, multiple targets and unreliable identities cannot
+            // establish the single Binary input used by the legacy recipe.
+            let (digest, _) =
+                playback_requests::http_file_fallback::single_identity(&mut tx, id).await?;
+            if digest != playback_requests::http_file_fallback::target(&resource)? {
+                return Err(err(StatusCode::CONFLICT, "source_changed"));
+            }
+        }
+        let root_marked = http_file.is_some()
             && !continuation
             && !http_file.is_some_and(|authority| authority.candidate.is_some())
             && reservation.viewer_id.is_some()
@@ -982,9 +1042,13 @@ async fn prepare_playback(
                 mode,
                 hls_supported,
             )
-            .await?
-        {
+            .await?;
+        if root_marked {
             plan["http_file_fallback_version"] = json!(protocol::HTTP_FILE_FALLBACK_VERSION);
+        } else if mode == "direct" {
+            // Original direct playback needs no generated mapping proof. Its
+            // continuation hints require the separate reliable Binary root.
+            plan["decoder_fallback_modes"] = json!([]);
         }
     }
     let current: Value =
@@ -1021,9 +1085,25 @@ async fn prepare_playback(
     }
     if kind == "local"
         && let Some(version) = &local_fact_version
-        && playback_capabilities::current_local_version(&config.root, &item)? != *version
+        && playback_capabilities::current_local_version(&config.root, &item)
+            .ok()
+            .as_ref()
+            != Some(version)
     {
         return Err(err(StatusCode::CONFLICT, "source_changed"));
+    }
+    if kind == "local" {
+        let updated = sqlx::query(
+            "UPDATE media_items SET metadata=$2,duration_ms=$3 WHERE id=$1 AND available",
+        )
+        .bind(media)
+        .bind(&meta)
+        .bind(duration)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(err(StatusCode::CONFLICT, "source_changed"));
+        }
     }
     sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch,viewer_id,plan_generation) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '30 minutes',$8,$9,$10) ON CONFLICT(id) DO UPDATE SET resource=EXCLUDED.resource,expires_at=EXCLUDED.expires_at,stopped=false,lifecycle_epoch=EXCLUDED.lifecycle_epoch,viewer_id=EXCLUDED.viewer_id,plan_generation=EXCLUDED.plan_generation").bind(id).bind(u.id).bind(body.room_id).bind(media).bind(i64::from(body.media_generation)).bind(hash(&t)).bind(playback_requests::http_file_fallback::wrap_resource(app, &resource, http_file, source_policy_revision, account_policy_generation)?).bind(reservation.lifecycle_epoch).bind(reservation.viewer_id).bind(reservation.plan_generation.map(i64::from)).execute(&mut *tx).await?;
     if body.observation_version == Some(1) {
@@ -1038,13 +1118,15 @@ async fn prepare_playback(
         };
         let estimated_output_bytes =
             media_core::estimated_output_bytes(&meta, duration, timeline, mode == "transcode");
-        let spec = json!({"root":config.root,"resource":item,"source_kind":kind,"input_ticket":input_ticket,"start_seconds":timeline/1000.0,"transcode":mode=="transcode","audio_index":body.audio_index,"estimated_output_bytes":estimated_output_bytes,"negotiated_mode":selected.as_ref().map(|s|&s.candidate.delivery_mode),"source_version":selected.as_ref().map(|s|&s.source_version)});
+        let spec = json!({"root":config.root,"resource":item,"source_kind":kind,"input_ticket":input_ticket,"start_seconds":timeline/1000.0,"transcode":mode=="transcode","audio_index":body.audio_index,"estimated_output_bytes":estimated_output_bytes,"negotiated_mode":selected.as_ref().map(|s|&s.candidate.delivery_mode),"source_version":local_fact_version.as_ref().or_else(|| selected.as_ref().and_then(|s|s.source_version.as_ref()))});
         if !persistence::media_queue::enqueue(&mut tx, id, &spec, app.queue_limit).await? {
             return Err(err(StatusCode::SERVICE_UNAVAILABLE, "media_queue_full"));
         }
     }
-    if let Some(grant) = playback_metrics::publish(&mut tx, u.id, body, id).await? {
-        plan["playback_metrics_version"] = json!(protocol::PLAYBACK_METRICS_VERSION);
+    if let Some((version, grant)) =
+        playback_metrics::publish(&mut tx, u.id, body, id, &resource).await?
+    {
+        plan["playback_metrics_version"] = json!(version);
         plan["playback_metrics"] = serde_json::to_value(grant).map_err(anyhow::Error::from)?;
     }
     playback_plan::refresh(app, &mut tx, u.id, id, &mut plan).await?;
@@ -1106,9 +1188,14 @@ pub async fn readiness(
         return Err(err(StatusCode::BAD_REQUEST, "invalid_position"));
     }
     // One statement gives permission and the current attempt a consistent snapshot.
-    let row = sqlx::query(playback_plan::AUTHORIZED_SNAPSHOT_SQL)
+    let query_sql = format!(
+        "{} AND playback_caller_allowed(p.resource,$2,$3)",
+        playback_plan::AUTHORIZED_SNAPSHOT_SQL
+    );
+    let row = sqlx::query(&query_sql)
         .bind(id)
         .bind(u.id)
+        .bind(media_authorization::login_hash(&h)?)
         .fetch_optional(&app.db)
         .await?
         .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
@@ -1207,7 +1294,9 @@ pub async fn stop(
             .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_observation"))
     };
     let mut tx = app.db.begin().await?;
-    let grant = playback_observations::lock_grant(&mut tx, id, u.id).await?;
+    let grant =
+        playback_observations::lock_grant(&mut tx, id, u.id, &media_authorization::login_hash(&h)?)
+            .await?;
     let final_error = match final_sample {
         Ok(None) => None,
         candidate => {
@@ -1290,12 +1379,31 @@ pub async fn renew(
     if member.is_none() {
         return Err(err(StatusCode::GONE, "invalid_playback_session"));
     }
+    media_authorization::lock_caller(&mut tx, id, u.id, &media_authorization::login_hash(&h)?)
+        .await?;
+    let bound: bool =
+        sqlx::query_scalar("SELECT auth_login_hash IS NOT NULL FROM playback_sessions WHERE id=$1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
     if !persistence::source_account_policy::lock_session(&mut tx, id).await? {
         return Err(err(StatusCode::GONE, "invalid_playback_session"));
     }
+    if !bound {
+        // A legacy keepalive must not make an old client stop early. Acknowledge
+        // only the already-live grant; never extend its original deadline.
+        let remaining: Option<i64> = sqlx::query_scalar("SELECT CEIL(EXTRACT(EPOCH FROM(p.expires_at-clock_timestamp())))::bigint FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource) AND p.expires_at>clock_timestamp() AND p.lifecycle_epoch=$3 AND (s.state->>'media_generation')::bigint=p.generation AND (p.viewer_id IS NULL OR EXISTS(SELECT 1 FROM playback_viewer_plans g WHERE g.user_id=p.user_id AND g.room_id=p.room_id AND g.viewer_id=p.viewer_id AND g.plan_generation=p.plan_generation))")
+            .bind(id).bind(u.id).bind(epoch).fetch_optional(&mut *tx).await?;
+        let remaining =
+            remaining.ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
+        tx.commit().await?;
+        return Ok(Json(
+            json!({"ok":true,"expires_in_seconds":remaining,"legacy_expiry_unchanged":true}),
+        ));
+    }
     sqlx::query("UPDATE playback_requests SET expires_at=GREATEST(expires_at,now()+interval '48 hours') WHERE session_id=$1 AND user_id=$2")
         .bind(id).bind(u.id).execute(&mut *tx).await?;
-    let r=sqlx::query("UPDATE playback_sessions p SET expires_at=now()+interval '30 minutes' FROM room_snapshots s WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource) AND p.expires_at>now() AND p.lifecycle_epoch=$3 AND s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation AND (p.viewer_id IS NULL OR EXISTS(SELECT 1 FROM playback_viewer_plans g WHERE g.user_id=p.user_id AND g.room_id=p.room_id AND g.viewer_id=p.viewer_id AND g.plan_generation=p.plan_generation))").bind(id).bind(u.id).bind(epoch).execute(&mut *tx).await?;
+    let r=sqlx::query("UPDATE playback_sessions p SET expires_at=clock_timestamp()+interval '30 minutes' FROM room_snapshots s WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource) AND p.expires_at>clock_timestamp() AND p.lifecycle_epoch=$3 AND s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation AND (p.viewer_id IS NULL OR EXISTS(SELECT 1 FROM playback_viewer_plans g WHERE g.user_id=p.user_id AND g.room_id=p.room_id AND g.viewer_id=p.viewer_id AND g.plan_generation=p.plan_generation))").bind(id).bind(u.id).bind(epoch).execute(&mut *tx).await?;
     if r.rows_affected() == 0 {
         return Err(err(StatusCode::GONE, "invalid_playback_session"));
     };

@@ -12,6 +12,7 @@ import { resolve, dirname } from "node:path";
 import { cpus, totalmem, platform, release } from "node:os";
 import { performance } from "node:perf_hooks";
 import WebSocket from "ws";
+import { redactEvidence } from "../scripts/acceptance-runtime.mjs";
 
 const args = new Map(
   process.argv.slice(2).map((v) => {
@@ -51,7 +52,7 @@ if (candidate) {
 }
 const name = "rainsync-load-" + randomUUID().slice(0, 8);
 const root = resolve(".runtime/control-load", name);
-await mkdir(root, { recursive: true });
+await mkdir(root, { recursive: true, mode: 0o700 });
 const run = promisify(execFile);
 async function docker(...args) {
   const { stdout } = await run("docker", args, {
@@ -86,6 +87,17 @@ const clients = [],
   sockets = new Set(),
   commands = new Map();
 const report = {
+  schema_version: 1,
+  cleanup_confirmed: false,
+  command: [process.execPath, ...process.argv.slice(1)],
+  lockfile_sha256: Object.fromEntries(
+    await Promise.all(
+      ["Cargo.lock", "package-lock.json"].map(async (path) => [
+        path,
+        sha(await readFile(path)),
+      ]),
+    ),
+  ),
   started_at: new Date().toISOString(),
   duration_seconds_per_topology: duration,
   sustained_gate_requested: duration >= 3600,
@@ -168,7 +180,11 @@ if (candidate) {
   };
 }
 const record = (value) =>
-  appendFile(resolve(root, "samples.jsonl"), JSON.stringify(value) + "\n");
+  appendFile(
+    resolve(root, "samples.jsonl"),
+    JSON.stringify(redactEvidence(value, [password, key.toString("base64")])) +
+      "\n",
+  );
 const sql = (q) =>
   docker(
     "exec",
@@ -1063,7 +1079,11 @@ try {
         root,
         report.status === "failed" ? "failed-report.json" : "report.json",
       ),
-      JSON.stringify(report, null, 2) + "\n",
+      JSON.stringify(
+        redactEvidence(report, [password, key.toString("base64")]),
+        null,
+        2,
+      ) + "\n",
     );
   } finally {
     const cleanup = [];
@@ -1081,13 +1101,31 @@ try {
     }
     process.removeListener("SIGINT", onSigint);
     process.removeListener("SIGTERM", onSigterm);
+    report.cleanup_confirmed = cleanup.length === 0;
     if (cleanup.length) {
       report.status = "failed";
       report.cleanup_errors = cleanup;
       process.exitCode = 1;
       await writeFile(
         resolve(root, "failed-report.json"),
-        JSON.stringify(report, null, 2) + "\n",
+        JSON.stringify(
+          redactEvidence(report, [password, key.toString("base64")]),
+          null,
+          2,
+        ) + "\n",
+      );
+    } else {
+      await writeFile(
+        resolve(
+          root,
+          report.status === "failed" ? "failed-report.json" : "report.json",
+        ),
+        JSON.stringify(
+          redactEvidence(report, [password, key.toString("base64")]),
+          null,
+          2,
+        ) + "\n",
+        { mode: 0o600 },
       );
     }
   }

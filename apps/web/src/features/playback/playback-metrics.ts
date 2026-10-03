@@ -33,6 +33,8 @@ export type PlaybackFrameEvidence =
 export type PlaybackMetricsFrame = Readonly<{
   presentedAtMs: number;
   evidence: PlaybackFrameEvidence;
+  /** Published server plan, never the local callback fence generation. */
+  planGeneration: number;
 }>;
 export type PlaybackMetricsConfig = {
   t0: number;
@@ -52,6 +54,11 @@ export type PlaybackMetricsTotals = Readonly<{
   playing_ms: number;
   unobserved_ms: number;
 }>;
+export type PlaybackMetricsStartupPhases = Readonly<{
+  preparation_ms: number;
+  loading_ms: number;
+  unobserved_ms: number;
+}>;
 export type PlaybackMetricsSnapshot = Readonly<{
   source: "client_reported";
   seq: number;
@@ -63,6 +70,8 @@ export type PlaybackMetricsSnapshot = Readonly<{
    * Startup, block, background, pause and unknown coverage are excluded. */
   expected_playback_ms: number;
   totals: PlaybackMetricsTotals;
+  startup_phases: PlaybackMetricsStartupPhases;
+  first_frame_plan_generation?: number;
   first_frame?: Readonly<{
     elapsed_ms: number;
     confirmed_elapsed_ms: number;
@@ -127,11 +136,18 @@ export function createPlaybackMetrics(config: PlaybackMetricsConfig) {
   let generation = config.fence.generation;
   let reliableAt = created;
   let attemptAt = created;
+  let attachedAt: number | undefined;
   let lastSampleAt = created;
   let active = true;
   let seq = 0;
   let state = copyObservation(config.initial);
   let first: PlaybackMetricsSnapshot["first_frame"];
+  let firstPlanGeneration: number | undefined;
+  const startupPhases = {
+    preparation_ms: 0,
+    loading_ms: 0,
+    unobserved_ms: Math.floor(created) - Math.floor(t0),
+  };
   let attemptFrame: PlaybackMetricsFrame | undefined;
   // Time before this meter existed has no state witness, even with a valid t0.
   const totals = {
@@ -197,6 +213,17 @@ export function createPlaybackMetrics(config: PlaybackMetricsConfig) {
         ? "unobserved_ms"
         : category();
     totals[key] += interval;
+    // Independent from playback-state classification: hidden or blocked startup
+    // still belongs to its witnessed phase, until first-frame CONFIRMATION.
+    if (!first) {
+      const phase =
+        at - reliableAt > PLAYBACK_METRICS_MAX_GAP_MS
+          ? "unobserved_ms"
+          : attachedAt === undefined
+            ? "preparation_ms"
+            : "loading_ms";
+      startupPhases[phase] += interval;
+    }
     reliableAt = at;
   }
   function accept(
@@ -224,7 +251,13 @@ export function createPlaybackMetrics(config: PlaybackMetricsConfig) {
       expected_playback_ms:
         totals.playing_ms + totals.rebuffer_ms + totals.seeking_ms,
       totals: Object.freeze({ ...totals }),
-      ...(first ? { first_frame: first } : {}),
+      startup_phases: Object.freeze({ ...startupPhases }),
+      ...(first
+        ? {
+            first_frame: first,
+            first_frame_plan_generation: firstPlanGeneration!,
+          }
+        : {}),
       final,
     });
   }
@@ -241,8 +274,20 @@ export function createPlaybackMetrics(config: PlaybackMetricsConfig) {
       advance(at);
       generation = fence.generation;
       attemptAt = at;
+      attachedAt = undefined;
       attemptFrame = undefined;
       state = copyObservation(observation);
+      return true;
+    },
+    /** Called only after a source has actually been attached to this attempt. */
+    attachSource(
+      fence: PlaybackMetricsFence,
+      observation: PlaybackMetricsObservation,
+    ): boolean {
+      if (attachedAt !== undefined) return allowed(fence);
+      const at = accept(fence, observation);
+      if (at === undefined) return false;
+      attachedAt = at;
       return true;
     },
     observe(
@@ -266,6 +311,9 @@ export function createPlaybackMetrics(config: PlaybackMetricsConfig) {
         !validObservation(observation) ||
         !frame ||
         !validTime(frame.presentedAtMs) ||
+        !Number.isInteger(frame.planGeneration) ||
+        frame.planGeneration < 1 ||
+        frame.planGeneration > 0xffff_ffff ||
         !["video_frame_callback", "playing_time_advance"].includes(
           frame.evidence,
         )
@@ -274,12 +322,14 @@ export function createPlaybackMetrics(config: PlaybackMetricsConfig) {
       if (attemptFrame)
         return (
           attemptFrame.presentedAtMs === frame.presentedAtMs &&
-          attemptFrame.evidence === frame.evidence
+          attemptFrame.evidence === frame.evidence &&
+          attemptFrame.planGeneration === frame.planGeneration
         );
       const at = time();
       if (
         at === undefined ||
-        frame.presentedAtMs < attemptAt ||
+        attachedAt === undefined ||
+        frame.presentedAtMs < Math.max(attemptAt, attachedAt) ||
         frame.presentedAtMs > at
       )
         return false;
@@ -288,7 +338,9 @@ export function createPlaybackMetrics(config: PlaybackMetricsConfig) {
       attemptFrame = {
         presentedAtMs: frame.presentedAtMs,
         evidence: frame.evidence,
+        planGeneration: frame.planGeneration,
       };
+      if (!first) firstPlanGeneration = frame.planGeneration;
       first ??= Object.freeze({
         elapsed_ms: Math.floor(frame.presentedAtMs) - Math.floor(t0),
         confirmed_elapsed_ms: Math.floor(at) - Math.floor(t0),

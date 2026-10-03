@@ -43,6 +43,20 @@ fn fallback(reason: &str) -> Json<PlaybackCandidateSet> {
         binding: None,
         candidates: Vec::new(),
         decision_reason: reason.into(),
+        route_decisions: None,
+    })
+}
+
+fn refused_legacy_mapping(
+    analysis: media_core::capabilities::CandidateAnalysis,
+) -> Json<PlaybackCandidateSet> {
+    Json(PlaybackCandidateSet {
+        schema_version: 1,
+        http_file_capabilities_version: None,
+        binding: None,
+        candidates: analysis.candidates,
+        decision_reason: "no_supported_legacy_mapped_route".into(),
+        route_decisions: Some(analysis.route_decisions),
     })
 }
 
@@ -81,6 +95,7 @@ pub async fn candidates(
             observation_version: None,
             playback_metrics_version: None,
             playback_metrics: None,
+            playback_metrics_supported_versions: None,
             viewer_id: None,
             plan_generation: None,
             idempotency_key: Some(Uuid::new_v4()),
@@ -93,11 +108,7 @@ pub async fn candidates(
             candidate_report: None,
             upstream_profile_report: None,
         };
-        let start = if body.http_file_capabilities_version == Some(1) {
-            playback_requests::begin_authenticated(&app, user.id, &request, login_hash.as_deref()).await?
-        } else {
-            playback_requests::begin(&app, user.id, &request).await?
-        };
+        let start = playback_requests::begin_authenticated(&app, user.id, &request, login_hash.as_deref()).await?;
         let reservation = match start {
             playback_requests::Start::Reserved(value) => value,
             playback_requests::Start::Replay(_) => {
@@ -161,23 +172,7 @@ async fn preflight(
     }
     let old: Value = row.get("metadata");
     let (mut meta, version) = if kind == "local" {
-        let path = media_core::safe_path(
-            std::path::Path::new(&config.root),
-            &row.get::<String, _>("resource"),
-        )?;
-        let file = std::fs::File::open(&path).map_err(anyhow::Error::from)?;
-        let before = media_core::file_version::snapshot_file(&file).map_err(anyhow::Error::from)?;
-        let meta = media_core::probe(&path.to_string_lossy())
-            .await
-            .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_probe_failed"))?;
-        let current = std::fs::File::open(&path).map_err(anyhow::Error::from)?;
-        if media_core::file_version::snapshot_file(&file).map_err(anyhow::Error::from)? != before
-            || media_core::file_version::snapshot_file(&current).map_err(anyhow::Error::from)?
-                != before
-        {
-            return Err(err(StatusCode::CONFLICT, "source_changed"));
-        }
-        (meta, before.version)
+        probe_local(&config.root, &row.get::<String, _>("resource")).await?
     } else if kind == "agent" {
         let version: Option<String> = row.get("source_version");
         let Some(version) = version.filter(|v| media_core::file_version::valid_file_version(v))
@@ -237,16 +232,16 @@ async fn preflight(
     if old.get("sidecars").is_some() {
         meta["sidecars"] = old["sidecars"].clone();
     }
-    let candidates =
-        media_core::capabilities::candidates(&meta, body.audio_index, body.position_ms).map_err(
-            |error| {
-                if error.to_string() == "invalid_audio_track" {
-                    err(StatusCode::BAD_REQUEST, "invalid_audio_track")
-                } else {
-                    err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_video_or_hdr")
-                }
-            },
-        )?;
+    let analysis = if kind == "local" {
+        media_core::capabilities::analyze_legacy_mapped_source(
+            &meta,
+            body.audio_index,
+            body.position_ms,
+        )
+    } else {
+        media_core::capabilities::analyze(&meta, body.audio_index, body.position_ms)
+    }
+    .map_err(probe_error)?;
     let mut tx = app.db.begin().await?;
     playback_requests::guard(app, &mut tx, reservation).await?;
     let current: Value =
@@ -269,6 +264,10 @@ async fn preflight(
     if !membership {
         return Err(err(StatusCode::FORBIDDEN, "not_a_member"));
     }
+    if kind == "local" && analysis.candidates.is_empty() {
+        return Ok(refused_legacy_mapping(analysis));
+    }
+    let candidates = analysis.candidates;
     meta["capability_source_version"] = json!(version);
     let duration = meta["format"]["duration"]
         .as_str()
@@ -318,7 +317,55 @@ async fn preflight(
         binding: Some(app.encrypt(&serde_json::to_value(binding).map_err(anyhow::Error::from)?)?),
         candidates,
         decision_reason: "actual_source_and_constrained_output_candidates".into(),
+        route_decisions: Some(analysis.route_decisions),
     }))
+}
+
+/// Translate only known media classifications; never expose raw probe details.
+pub fn probe_error(error: anyhow::Error) -> Error {
+    let reason = error.to_string();
+    match reason.as_str() {
+        "invalid_audio_track" => err(StatusCode::BAD_REQUEST, "invalid_audio_track"),
+        "legacy_stream_mapping_unsupported" => err(StatusCode::UNPROCESSABLE_ENTITY, &reason),
+        "hdr_unsupported" | "drm_unsupported" => err(StatusCode::UNPROCESSABLE_ENTITY, &reason),
+        _ => err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_video_or_hdr"),
+    }
+}
+
+/// Publish facts only after the current guarded probe reproduces this exact
+/// server-bound candidate. Mixed copy/encode routes keep track-specific bases.
+pub fn selected_output(
+    selection: &Selection,
+    meta: &Value,
+    audio_index: Option<u32>,
+    position_ms: f64,
+) -> Result<protocol::PlaybackSelectedOutput> {
+    let actual = media_core::capabilities::candidates(meta, audio_index, position_ms)
+        .map_err(|_| err(StatusCode::CONFLICT, "source_changed"))?;
+    let expected = serde_json::to_value(&selection.candidate).map_err(anyhow::Error::from)?;
+    if !actual
+        .iter()
+        .any(|candidate| serde_json::to_value(candidate).ok().as_ref() == Some(&expected))
+    {
+        return Err(err(StatusCode::CONFLICT, "source_changed"));
+    }
+    use protocol::PlaybackOutputBasis::{ConstrainedEncoderRecipe, SourceProbe};
+    let mode = selection.candidate.delivery_mode.as_str();
+    Ok(protocol::PlaybackSelectedOutput {
+        configuration: selection.candidate.clone(),
+        video_basis: if mode == "transcode" {
+            ConstrainedEncoderRecipe
+        } else {
+            SourceProbe
+        },
+        audio_basis: selection.candidate.audio.as_ref().map(|_| {
+            if matches!(mode, "transcode" | "audio_transcode") {
+                ConstrainedEncoderRecipe
+            } else {
+                SourceProbe
+            }
+        }),
+    })
 }
 
 pub struct Selection {
@@ -445,6 +492,29 @@ fn select_candidates(
         StatusCode::UNPROCESSABLE_ENTITY,
         "device_has_no_compatible_playback_transport",
     ))
+}
+
+/// Bind ffprobe facts to a held local file and the current authorized path.
+/// Stat identity detects ordinary replacement/edits; it is not an immutable
+/// snapshot or a content hash. Delivery and jobs must keep checking the version.
+pub async fn probe_local(root: &str, item: &str) -> Result<(Value, String)> {
+    let path = media_core::safe_path(std::path::Path::new(root), item)?;
+    let file = std::fs::File::open(&path).map_err(anyhow::Error::from)?;
+    let before = media_core::file_version::snapshot_file(&file).map_err(anyhow::Error::from)?;
+    let probe = media_core::probe(&path.to_string_lossy()).await;
+    // Re-resolve the source-relative path too: an ancestor or symlink may have
+    // changed while ffprobe used the previously canonicalized path.
+    let unchanged = (|| -> anyhow::Result<bool> {
+        let current_path = media_core::safe_path(std::path::Path::new(root), item)?;
+        let current = std::fs::File::open(current_path)?;
+        Ok(media_core::file_version::snapshot_file(&file)? == before
+            && media_core::file_version::snapshot_file(&current)? == before)
+    })();
+    if !matches!(unchanged, Ok(true)) {
+        return Err(err(StatusCode::CONFLICT, "source_changed"));
+    }
+    let meta = probe.map_err(|_| err(StatusCode::BAD_GATEWAY, "source_probe_failed"))?;
+    Ok((meta, before.version))
 }
 
 pub fn current_local_version(root: &str, item: &str) -> Result<String> {
@@ -614,16 +684,16 @@ async fn http_preflight(
     {
         return Ok(fallback("provider_requires_legacy_negotiation"));
     }
-    let candidates =
-        media_core::capabilities::candidates(&meta, body.audio_index, body.position_ms).map_err(
-            |error| {
-                if error.to_string() == "invalid_audio_track" {
-                    err(StatusCode::BAD_REQUEST, "invalid_audio_track")
-                } else {
-                    err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_video_or_hdr")
-                }
-            },
-        )?;
+    let analysis = media_core::capabilities::analyze_legacy_mapped_source(
+        &meta,
+        body.audio_index,
+        body.position_ms,
+    )
+    .map_err(probe_error)?;
+    if analysis.candidates.is_empty() {
+        return Ok(refused_legacy_mapping(analysis));
+    }
+    let candidates = analysis.candidates;
     http_representation::guard(&mut tx, reservation.session).await?;
     let (target_sha256, identity) = match http_file::single_identity(&mut tx, reservation.session)
         .await
@@ -664,6 +734,7 @@ async fn http_preflight(
         binding: Some(binding),
         candidates,
         decision_reason: "actual_http_binary_and_constrained_output_candidates".into(),
+        route_decisions: Some(analysis.route_decisions),
     }))
 }
 
@@ -693,9 +764,50 @@ pub(crate) async fn require_live_probe(
 mod tests {
     use super::*;
 
+    #[test]
+    fn refused_mapping_is_unmarked_unbound_and_has_four_negative_decisions() {
+        let meta = json!({"streams":[
+            {"index":0,"codec_type":"video","disposition":{"attached_pic":1}},
+            {"index":7,"codec_type":"video","disposition":{"attached_pic":0}}
+        ]});
+        let analysis =
+            media_core::capabilities::analyze_legacy_mapped_source(&meta, None, 0.0).unwrap();
+        let Json(set) = refused_legacy_mapping(analysis);
+        assert!(set.http_file_capabilities_version.is_none());
+        assert!(set.binding.is_none());
+        assert!(set.candidates.is_empty());
+        let decisions = set.route_decisions.unwrap();
+        assert_eq!(decisions.len(), 4);
+        assert!(decisions.iter().all(|decision| !decision.offered));
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| decision.reason
+                    == protocol::PlaybackRouteReason::TrackMappingRequired)
+        );
+    }
+
+    #[test]
+    fn mapping_probe_errors_are_distinct_from_hdr_and_invalid_audio() {
+        let error = probe_error(anyhow::anyhow!("legacy_stream_mapping_unsupported"));
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.1, "legacy_stream_mapping_unsupported");
+        assert_eq!(
+            probe_error(anyhow::anyhow!("hdr_unsupported")).1,
+            "hdr_unsupported"
+        );
+        assert_eq!(
+            probe_error(anyhow::anyhow!("drm_unsupported")).1,
+            "drm_unsupported"
+        );
+        let audio = probe_error(anyhow::anyhow!("invalid_audio_track"));
+        assert_eq!(audio.0, StatusCode::BAD_REQUEST);
+        assert_eq!(audio.1, "invalid_audio_track");
+    }
+
     fn candidates() -> Vec<PlaybackCandidate> {
-        media_core::capabilities::candidates(&json!({"format":{"format_name":"mov,mp4","bit_rate":"1000000"},
-            "streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p","width":640,"height":360,
+        media_core::capabilities::candidates(&json!({"format":{"format_name":"mov,mp4","tags":{"major_brand":"isom"},"bit_rate":"1000000"},
+            "streams":[{"codec_type":"video","codec_name":"h264","codec_tag_string":"avc1","pix_fmt":"yuv420p","width":640,"height":360,
                 "avg_frame_rate":"25/1","r_frame_rate":"25/1","extradata":"\n00000000: 0164 000d ffe1 0000                      .d......\n"}]}), None, 0.0).unwrap()
     }
     fn body() -> protocol::PlaybackRequest {
@@ -784,5 +896,64 @@ mod tests {
                 .1,
             "invalid_request"
         );
+    }
+    #[test]
+    fn configuration_facts_require_current_exact_candidate_equivalence() {
+        let meta = json!({"format":{"format_name":"mp4","tags":{"major_brand":"isom"},"bit_rate":"1000000"},"streams":[
+            {"codec_type":"video","codec_name":"h264","codec_tag_string":"avc1","pix_fmt":"yuv420p","width":640,"height":360,
+             "avg_frame_rate":"25/1","r_frame_rate":"25/1","extradata":"\n00000000: 0164 000d ffe1 0000  ........\n"},
+            {"index":1,"codec_type":"audio","codec_name":"aac","profile":"LC","channels":2,"sample_rate":"48000","bit_rate":"128000","extradata":"\n00000000: 1190  ..\n"}]});
+        for candidate in media_core::capabilities::candidates(&meta, None, 0.0).unwrap() {
+            let mut selection = Selection {
+                candidate,
+                source_version: Some("current".into()),
+            };
+            let facts = selected_output(&selection, &meta, None, 0.0).unwrap();
+            use protocol::PlaybackOutputBasis::{ConstrainedEncoderRecipe, SourceProbe};
+            assert_eq!(
+                facts.video_basis,
+                if selection.candidate.delivery_mode == "transcode" {
+                    ConstrainedEncoderRecipe
+                } else {
+                    SourceProbe
+                }
+            );
+            assert_eq!(
+                facts.audio_basis,
+                Some(
+                    if matches!(
+                        selection.candidate.delivery_mode.as_str(),
+                        "transcode" | "audio_transcode"
+                    ) {
+                        ConstrainedEncoderRecipe
+                    } else {
+                        SourceProbe
+                    }
+                )
+            );
+            selection.candidate.video.width += 1;
+            assert_eq!(
+                selected_output(&selection, &meta, None, 0.0).unwrap_err().1,
+                "source_changed"
+            );
+        }
+    }
+    #[test]
+    fn hevc_passthrough_still_requires_concrete_file_decode_estimate() {
+        let mut candidate = candidates().remove(0);
+        candidate.content_type = "video/mp4; codecs=\"hvc1.1.6.L93.B0\"".into();
+        candidate.video.content_type = candidate.content_type.clone();
+        let body = body();
+        let caps = body.capabilities.as_ref().unwrap();
+        let mut result = body.candidate_report.as_ref().unwrap().results[0].clone();
+        assert!(playable(&candidate, &result, caps));
+        result.file_decoding = None;
+        assert!(!playable(&candidate, &result, caps));
+        result.file_decoding = Some(protocol::MediaDecodingSupport {
+            supported: false,
+            smooth: true,
+            power_efficient: true,
+        });
+        assert!(!playable(&candidate, &result, caps));
     }
 }

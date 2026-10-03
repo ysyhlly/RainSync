@@ -287,3 +287,192 @@ export function syncErrors(
     pair_clock_uncertainty_ms: distribution(samples.uncertainties),
   }));
 }
+
+// Four-timestamp exchanges are made by the test controller, independently of
+// RainSync's synchronizer. offset maps a client monotonic clock to the controller.
+// The interval is conservative even on an asymmetric link; it does not assume
+// the forward and return delays are equal.
+export function calibrateClock(
+  exchanges,
+  { client_id, clock_id, drift_ppm = 100, max_age_ms = 60000 } = {},
+) {
+  assert.ok(
+    typeof client_id === "string" && client_id,
+    "client identity required",
+  );
+  assert.ok(typeof clock_id === "string" && clock_id, "clock epoch required");
+  finite(drift_ppm, "clock drift bound");
+  finite(max_age_ms, "calibration lifetime");
+  assert.ok(
+    exchanges.length >= 3,
+    "at least three independent clock exchanges required",
+  );
+  let lower = -Infinity,
+    upper = Infinity,
+    newest = 0;
+  const observations = exchanges.map((exchange) => {
+    assert.equal(exchange.client_id, client_id, "cross-client calibration");
+    assert.equal(exchange.clock_id, clock_id, "client clock epoch changed");
+    const {
+      reference_send_ms: a,
+      client_receive_ms: b,
+      client_send_ms: c,
+      reference_receive_ms: d,
+    } = exchange;
+    const referenceDuration = elapsed(a, d),
+      clientDuration = elapsed(b, c);
+    assert.ok(
+      referenceDuration >= clientDuration,
+      "invalid clock exchange duration",
+    );
+    newest = Math.max(newest, c);
+    return {
+      lower: a - b,
+      upper: d - c,
+      client_ms: c,
+      rtt_ms: referenceDuration - clientDuration,
+    };
+  });
+  for (const observation of observations) {
+    const drift = ((newest - observation.client_ms) * drift_ppm) / 1e6;
+    lower = Math.max(lower, observation.lower - drift);
+    upper = Math.min(upper, observation.upper + drift);
+  }
+  assert.ok(
+    lower <= upper,
+    "clock exchanges disagree: reset or drift bound exceeded",
+  );
+  return {
+    client_id,
+    clock_id,
+    method: "independent-four-timestamp",
+    reference_offset_ms: (lower + upper) / 2,
+    clock_uncertainty_ms: (upper - lower) / 2,
+    calibrated_client_ms: newest,
+    max_age_ms,
+    drift_ppm,
+    exchanges: exchanges.length,
+    round_trip_ms: distribution(
+      observations.map((observation) => observation.rtt_ms),
+    ),
+  };
+}
+
+export function applyCalibration(sample, calibration) {
+  assert.equal(
+    sample.client_id,
+    calibration.client_id,
+    "cross-client calibration",
+  );
+  assert.equal(
+    sample.clock_id,
+    calibration.clock_id,
+    "client clock epoch changed",
+  );
+  finite(sample.monotonic_ms, "client sample time");
+  const age = sample.monotonic_ms - calibration.calibrated_client_ms;
+  assert.ok(Math.abs(age) <= calibration.max_age_ms, "stale clock calibration");
+  // Never accept offsets supplied by the player under test.
+  return {
+    ...sample,
+    reference_offset_ms: calibration.reference_offset_ms,
+    clock_uncertainty_ms:
+      calibration.clock_uncertainty_ms +
+      (Math.abs(age) * calibration.drift_ppm) / 1e6,
+  };
+}
+
+export function syncSummary(attempts, options = {}) {
+  const rooms = syncErrors(attempts, options);
+  const pooled =
+    syncErrors(
+      attempts.map((attempt) => ({ ...attempt, room: "all-observations" })),
+      options,
+    )[0] ?? null;
+  return {
+    rooms,
+    // Pooled distribution is computed from observations, never averaged p95s.
+    pooled,
+    worst_room:
+      rooms
+        .filter((room) => room.valid > 0)
+        .sort((a, b) => b.peer_error_ms.p95 - a.peer_error_ms.p95)[0]?.room ??
+      null,
+  };
+}
+
+// Phase-matched time series, not just first/last RSS. Slopes are descriptive;
+// thresholds are explicit run configuration, not invented universal leak limits.
+export function resourceTrends(
+  samples,
+  { warmup_ms = 0, minimum_samples = 6 } = {},
+) {
+  finite(warmup_ms, "resource warmup");
+  assert.ok(Number.isInteger(minimum_samples) && minimum_samples >= 4);
+  const keys = [
+    "rss_bytes",
+    "fd_count",
+    "socket_count",
+    "process_count",
+    "cache_bytes",
+  ];
+  const groups = new Map();
+  for (const sample of samples) {
+    finite(sample.elapsed_ms, "resource sample time");
+    if (sample.elapsed_ms < warmup_ms) continue;
+    assert.ok(
+      sample.entity && sample.phase && sample.instance_id,
+      "resource entity, phase and instance required",
+    );
+    const group = JSON.stringify([
+      sample.entity,
+      sample.phase,
+      sample.instance_id,
+    ]);
+    const values = groups.get(group) ?? [];
+    assert.ok(
+      !values.length || sample.elapsed_ms > values.at(-1).elapsed_ms,
+      "resource times must increase within a phase",
+    );
+    for (const key of keys) finite(sample[key], key);
+    finite(sample.cache_quota_bytes, "cache quota");
+    assert.ok(
+      sample.cache_bytes <= sample.cache_quota_bytes,
+      "cache exceeds quota",
+    );
+    values.push(sample);
+    groups.set(group, values);
+  }
+  return [...groups.values()].map((values) => {
+    const result = {
+      entity: values[0].entity,
+      phase: values[0].phase,
+      instance_id: values[0].instance_id,
+      count: values.length,
+      sufficient: values.length >= minimum_samples,
+      metrics: {},
+    };
+    const n = values.length,
+      third = Math.max(1, Math.floor(n / 3));
+    const mean = (array) => array.reduce((a, b) => a + b, 0) / array.length;
+    const xs = values.map(
+      (sample) => (sample.elapsed_ms - values[0].elapsed_ms) / 3600000,
+    );
+    const xm = mean(xs),
+      variance = xs.reduce((sum, x) => sum + (x - xm) ** 2, 0);
+    for (const key of keys) {
+      const ys = values.map((sample) => sample[key]),
+        ym = mean(ys);
+      result.metrics[key] = {
+        ...distribution(ys),
+        early_mean: mean(ys.slice(0, third)),
+        late_mean: mean(ys.slice(-third)),
+        slope_per_hour: variance
+          ? xs.reduce((sum, x, i) => sum + (x - xm) * (ys[i] - ym), 0) /
+            variance
+          : null,
+      };
+    }
+    return result;
+  });
+}

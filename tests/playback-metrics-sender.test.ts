@@ -8,6 +8,7 @@ import { RequestFailure } from "../apps/web/src/errors";
 
 afterEach(() => vi.useRealTimers());
 const binding = (generation = 1): PlaybackMetricsBinding => ({
+  version: 1,
   sessionId: `session-${generation}`,
   planGeneration: generation,
   meterStartGeneration: 1,
@@ -24,6 +25,11 @@ const snapshot = (seq: number, final = false): PlaybackMetricsSnapshot => ({
   observed_ms: seq * 5000,
   expected_playback_ms: 0,
   final,
+  startup_phases: {
+    preparation_ms: seq * 5000,
+    loading_ms: 0,
+    unobserved_ms: 0,
+  },
   totals: {
     startup_ms: seq * 5000,
     autoplay_blocked_ms: 0,
@@ -218,5 +224,117 @@ test("terminal rejection or invalid receipt disables transport; invalid/horizon 
   await settle();
   expect(send).toHaveBeenCalledTimes(1);
   expect(sender.offer(snapshot(2))).toBe(false);
+  sender.stop();
+});
+
+test("v2 packets preserve immutable phases and originating server generation across retry", async () => {
+  vi.useFakeTimers();
+  const send = vi
+    .fn()
+    .mockRejectedValueOnce(new TypeError("lost ACK"))
+    .mockImplementation(async (b, body) => receipt(b, body));
+  const sender = createPlaybackMetricsSender(send);
+  sender.bind({ ...binding(5), version: 2 });
+  const input = {
+    ...snapshot(1),
+    startup_phases: { preparation_ms: 700, loading_ms: 300, unobserved_ms: 0 },
+    first_frame: {
+      elapsed_ms: 950,
+      confirmed_elapsed_ms: 1000,
+      evidence: "video_frame_callback" as const,
+    },
+    first_frame_plan_generation: 3,
+  };
+  expect(sender.offer(input)).toBe(true);
+  input.startup_phases.preparation_ms = 999;
+  input.first_frame_plan_generation = 99;
+  await vi.advanceTimersByTimeAsync(1000);
+  const packet = send.mock.calls[0][1];
+  expect(packet).toBe(send.mock.calls[1][1]);
+  expect(packet).toMatchObject({
+    version: 2,
+    plan_generation: 5,
+    first_frame_plan_generation: 3,
+    startup_phases: { preparation_ms: 700, loading_ms: 300, unobserved_ms: 0 },
+  });
+  expect(Object.isFrozen(packet.startup_phases)).toBe(true);
+  expect(Object.isFrozen(packet.first_frame)).toBe(true);
+  expect(JSON.stringify(packet).length).toBeLessThan(4096);
+  sender.stop();
+});
+
+test("v2 rejects missing, nonpartitioning or invalid phases and unpaired frame generations", () => {
+  const sender = createPlaybackMetricsSender(async (b, body) =>
+    receipt(b, body),
+  );
+  sender.bind({ ...binding(3), version: 2 });
+  for (const invalid of [
+    { startup_phases: undefined },
+    {
+      startup_phases: {
+        preparation_ms: -1,
+        loading_ms: 5001,
+        unobserved_ms: 0,
+      },
+    },
+    {
+      startup_phases: { preparation_ms: 5000, loading_ms: 1, unobserved_ms: 0 },
+    },
+    {
+      startup_phases: {
+        preparation_ms: 4999.5,
+        loading_ms: 0.5,
+        unobserved_ms: 0,
+      },
+    },
+    {
+      startup_phases: { preparation_ms: NaN, loading_ms: 0, unobserved_ms: 0 },
+    },
+    { first_frame_plan_generation: 1 },
+    {
+      first_frame: {
+        elapsed_ms: 0,
+        confirmed_elapsed_ms: 5000,
+        evidence: "video_frame_callback",
+      },
+    },
+    ...[0, 4, 1.5, NaN].map((first_frame_plan_generation) => ({
+      first_frame: {
+        elapsed_ms: 0,
+        confirmed_elapsed_ms: 5000,
+        evidence: "video_frame_callback",
+      },
+      first_frame_plan_generation,
+    })),
+  ])
+    expect(sender.offer({ ...snapshot(1), ...invalid } as any)).toBe(false);
+  expect(sender.offer(snapshot(1))).toBe(true);
+  sender.stop();
+});
+
+test("v1 strips v2-only fields even when a complete v2 local receipt exists", async () => {
+  const send = vi.fn(async (b, body) => receipt(b, body));
+  const sender = createPlaybackMetricsSender(send);
+  sender.bind(binding(3));
+  expect(
+    sender.offer({
+      ...snapshot(1),
+      first_frame_plan_generation: 1,
+      first_frame: {
+        elapsed_ms: 900,
+        confirmed_elapsed_ms: 1000,
+        evidence: "video_frame_callback",
+      },
+    }),
+  ).toBe(true);
+  const body = send.mock.calls[0][1];
+  expect(body.version).toBe(1);
+  expect(body).not.toHaveProperty("startup_phases");
+  expect(body).not.toHaveProperty("first_frame_plan_generation");
+  expect(body.first_frame).toEqual({
+    elapsed_ms: 900,
+    confirmed_elapsed_ms: 1000,
+    evidence: "video_frame_callback",
+  });
   sender.stop();
 });

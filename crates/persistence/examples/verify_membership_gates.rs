@@ -23,9 +23,7 @@ impl Gate {
         match self {
             Self::Commit => {
                 let now = state.anchor_server_time_ms;
-                let next = room_core::reduce(&state, &command, user, false, now)
-                    .map_err(anyhow::Error::msg)?;
-                persistence::commit(&db, &next, &command, user, state.revision, false, now).await?;
+                persistence::commit(&db, &command, user, &user.to_string(), now, None).await?;
             }
             Self::Replay => {
                 ensure!(
@@ -69,6 +67,9 @@ async fn fixture(db: &PgPool) -> Result<(RoomState, Command, Uuid)> {
         .bind(user)
         .execute(db)
         .await?;
+    // This fixture owns a distinct login for each disposable account.
+    sqlx::query("INSERT INTO sessions(token_hash,user_id,csrf,expires_at) VALUES($1,$2,'owned-fixture',clock_timestamp()+interval '1 hour')")
+        .bind(user.to_string()).bind(user).execute(db).await?;
     let state = RoomState {
         room_id: room,
         revision: 1,

@@ -41,6 +41,14 @@ async fn main() -> anyhow::Result<()> {
         "unscoped reader protects all attempts"
     );
     cache::release(&db, legacy).await?;
+    assert!(
+        !cache_outputs::candidates(&db).await?.contains(&(id, 1)),
+        "an obsolete but unreaped attempt is not a cleanup candidate"
+    );
+    assert!(cache_outputs::claim(&db, id, 1).await?.is_none());
+    // This database-only fixture started no process for the first claim.
+    persistence::media_executions::acknowledge_job(&db, first.id, first.attempt, first.owner)
+        .await?;
     assert!(cache_outputs::candidates(&db).await?.contains(&(id, 1)));
     let (a, b) = tokio::join!(
         cache_outputs::claim(&db, id, 1),
@@ -65,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
         .bind(id).execute(&db).await?;
     assert!(
         cache_outputs::claim(&db, id, 1).await?.is_some(),
-        "revisit late writes after cleanup"
+        "revisit residual files of a positively reaped attempt"
     );
     assert!(media_jobs::renew(&db, &second).await?);
     cache::release(&db, current_reader).await?;

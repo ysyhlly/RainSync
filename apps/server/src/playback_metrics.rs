@@ -1,9 +1,14 @@
 //! Independent, optional client-reported measurements. Durable viewer state is
 //! the authority; process-local rate entries and aggregates never replace it.
 use super::*;
+use media_core::runtime_metrics::{
+    PlaybackAttribution, PlaybackMode, PlaybackSource, WorkerOutputEntry,
+    WorkerOutputEntryAvailability,
+};
 use protocol::{
-    PlaybackMetricsFirstFrame, PlaybackMetricsGrant, PlaybackMetricsOrigin, PlaybackMetricsReceipt,
-    PlaybackMetricsSample, PlaybackMetricsTotals, PlaybackRequest,
+    PlaybackMetricsFirstFrame, PlaybackMetricsOrigin, PlaybackMetricsPacket,
+    PlaybackMetricsReceipt, PlaybackMetricsSample, PlaybackMetricsStartupPhases,
+    PlaybackMetricsTotals, PlaybackRequest,
 };
 use sqlx::{Connection, Postgres, Transaction, pool::PoolConnection};
 use std::{sync::OnceLock, time::Duration};
@@ -138,6 +143,15 @@ pub fn validate(body: &PlaybackRequest) -> Result<()> {
             "unsupported_playback_metrics_version",
         ));
     }
+    if let Some(versions) = &body.playback_metrics_supported_versions
+        && (body.playback_metrics_version != Some(1)
+            || versions.is_empty()
+            || versions.len() > 2
+            || versions.iter().any(|version| !matches!(version, 1 | 2))
+            || (versions.len() == 2 && versions[0] == versions[1]))
+    {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid_playback_metrics"));
+    }
     match (body.playback_metrics_version, &body.playback_metrics) {
         (None, None) => Ok(()),
         (Some(1), Some(intent))
@@ -160,14 +174,15 @@ struct Slot {
     origin: Option<String>,
     seq: i64,
     closed: bool,
-    payload: Option<PlaybackMetricsSample>,
+    payload: Option<PlaybackMetricsPacket>,
+    version: Option<i32>,
     anchor_elapsed_ms: Option<i64>,
 }
 impl Slot {
     fn decode(row: &sqlx::postgres::PgRow) -> Result<Self> {
         let payload: Option<Value> = row.try_get("metrics_payload")?;
         let payload = payload
-            .map(serde_json::from_value::<PlaybackMetricsSample>)
+            .map(serde_json::from_value::<PlaybackMetricsPacket>)
             .transpose()
             .map_err(anyhow::Error::from)?;
         Ok(Self {
@@ -179,6 +194,7 @@ impl Slot {
             seq: row.try_get("metrics_seq")?,
             closed: row.try_get("metrics_closed")?,
             payload,
+            version: row.try_get("metrics_version")?,
             anchor_elapsed_ms: row.try_get("metrics_anchor_elapsed_ms")?,
         })
     }
@@ -190,7 +206,7 @@ impl Slot {
                 && self.origin.as_deref() == Some(origin_name(intent.startup_origin))
         })
     }
-    fn grant(&self) -> Result<PlaybackMetricsGrant> {
+    fn grant(&self) -> Result<Value> {
         let start = self
             .start_generation
             .and_then(|value| u32::try_from(value).ok())
@@ -201,13 +217,12 @@ impl Slot {
             Some("automatic_load") => PlaybackMetricsOrigin::AutomaticLoad,
             _ => return Err(err(StatusCode::CONFLICT, "stale_playback_metrics")),
         };
-        Ok(PlaybackMetricsGrant {
-            meter_start_generation: start,
-            startup_origin: origin,
-            metrics_seq: u64::try_from(self.seq).map_err(anyhow::Error::from)?,
-            closed: self.closed,
-            last_sample: self.payload.clone(),
-        })
+        let mut grant = json!({"meter_start_generation":start,"startup_origin":origin,
+            "metrics_seq":u64::try_from(self.seq).map_err(anyhow::Error::from)?,"closed":self.closed});
+        if let Some(payload) = &self.payload {
+            grant["last_sample"] = serde_json::to_value(payload).map_err(anyhow::Error::from)?;
+        }
+        Ok(grant)
     }
 }
 async fn slot(
@@ -288,10 +303,12 @@ pub async fn admit(
                 .playback_metrics
                 .as_ref()
                 .expect("validated metrics replacement");
-            sqlx::query("UPDATE playback_viewer_plans SET metrics_meter_start_generation=$4,metrics_media_generation=$5,metrics_lifecycle_epoch=$6,metrics_startup_origin=$7,metrics_seq=0,metrics_payload=NULL,metrics_closed=false,metrics_admitted_at=clock_timestamp(),metrics_anchor_elapsed_ms=NULL,metrics_anchor_received_at=NULL WHERE user_id=$1 AND room_id=$2 AND viewer_id=$3")
+            sqlx::query("UPDATE playback_viewer_plans SET metrics_meter_start_generation=$4,metrics_media_generation=$5,metrics_lifecycle_epoch=$6,metrics_startup_origin=$7,metrics_seq=0,metrics_payload=NULL,metrics_closed=false,metrics_admitted_at=clock_timestamp(),metrics_anchor_elapsed_ms=NULL,metrics_anchor_received_at=NULL,metrics_version=$8,metrics_first_frame_source=NULL,metrics_first_frame_mode=NULL,metrics_first_frame_output_entry=NULL,metrics_first_frame_queue_ms=NULL WHERE user_id=$1 AND room_id=$2 AND viewer_id=$3")
             .bind(user).bind(body.room_id).bind(viewer).bind(i64::from(generation))
             .bind(i64::from(body.media_generation)).bind(lifecycle_epoch)
-            .bind(origin_name(intent.startup_origin)).execute(&mut **tx).await?;
+            .bind(origin_name(intent.startup_origin))
+            .bind(if body.playback_metrics_supported_versions.as_ref().is_some_and(|versions| versions.contains(&2)) { 2_i32 } else { 1_i32 })
+            .execute(&mut **tx).await?;
         }
     }
     Ok(())
@@ -304,7 +321,8 @@ pub async fn publish(
     user: Uuid,
     body: &PlaybackRequest,
     session: Uuid,
-) -> Result<Option<PlaybackMetricsGrant>> {
+    resource: &Value,
+) -> Result<Option<(u32, Value)>> {
     validate(body)?;
     let Some(intent) = &body.playback_metrics else {
         return Ok(None);
@@ -323,19 +341,30 @@ pub async fn publish(
     {
         return Err(err(StatusCode::CONFLICT, "stale_playback_metrics"));
     }
-    let published = sqlx::query("UPDATE playback_sessions p SET playback_metrics_version=1,metrics_meter_start_generation=$4 WHERE p.id=$1 AND p.user_id=$2 AND p.room_id=$3 AND p.viewer_id=$5 AND p.plan_generation=$6 AND p.generation=$7 AND p.lifecycle_epoch=$8 AND NOT p.stopped AND p.expires_at>clock_timestamp() AND playback_source_allowed(p.media_id,p.resource) AND EXISTS(SELECT 1 FROM rooms r WHERE r.id=p.room_id AND r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch) AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
+    let version = current
+        .version
+        .ok_or_else(|| err(StatusCode::CONFLICT, "stale_playback_metrics"))?;
+    let attribution = PlaybackAttribution::from_publication(
+        resource["kind"].as_str(),
+        resource["delivery_mode"].as_str(),
+    );
+    let published = sqlx::query("UPDATE playback_sessions p SET playback_metrics_version=$9,metrics_meter_start_generation=$4,metrics_source_kind=COALESCE(p.metrics_source_kind,$10),metrics_delivery_mode=COALESCE(p.metrics_delivery_mode,$11),metrics_output_entry_availability=COALESCE(p.metrics_output_entry_availability,$12) WHERE p.id=$1 AND p.user_id=$2 AND p.room_id=$3 AND p.viewer_id=$5 AND p.plan_generation=$6 AND p.generation=$7 AND p.lifecycle_epoch=$8 AND NOT p.stopped AND p.expires_at>clock_timestamp() AND playback_source_allowed(p.media_id,p.resource) AND EXISTS(SELECT 1 FROM rooms r WHERE r.id=p.room_id AND r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch) AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
         .bind(session).bind(user).bind(body.room_id).bind(i64::from(intent.meter_start_generation))
         .bind(viewer).bind(i64::from(generation)).bind(i64::from(body.media_generation))
-        .bind(current.lifecycle_epoch).execute(&mut **tx).await?;
+        .bind(current.lifecycle_epoch).bind(version)
+        .bind((version == 2).then_some(attribution.source.label()))
+        .bind((version == 2).then_some(attribution.mode.label()))
+        .bind((version == 2 && resource.get("job_id").is_none()).then_some("not_applicable"))
+        .execute(&mut **tx).await?;
     if published.rows_affected() != 1 {
         return Err(err(StatusCode::GONE, "invalid_playback_session"));
     }
-    Ok(Some(current.grant()?))
+    Ok(Some((version as u32, current.grant()?)))
 }
 
 /// Refresh current durable seq/closed/payload on encrypted same-key replay.
 pub async fn refresh(tx: &mut Transaction<'_, Postgres>, plan: &mut Value) -> Result<()> {
-    if plan["playback_metrics_version"] != 1 {
+    if !matches!(plan["playback_metrics_version"].as_u64(), Some(1 | 2)) {
         return Ok(());
     }
     let id: Uuid =
@@ -353,7 +382,7 @@ pub async fn refresh(tx: &mut Transaction<'_, Postgres>, plan: &mut Value) -> Re
         ));
     };
     let current = slot(tx, user, room, viewer).await?;
-    if identity.try_get::<Option<i32>, _>("playback_metrics_version")? != Some(1)
+    if identity.try_get::<Option<i32>, _>("playback_metrics_version")? != current.version
         || identity.try_get::<Option<i64>, _>("plan_generation")? != Some(current.plan_generation)
         || identity.try_get::<Option<i64>, _>("metrics_meter_start_generation")?
             != current.start_generation
@@ -365,8 +394,8 @@ pub async fn refresh(tx: &mut Transaction<'_, Postgres>, plan: &mut Value) -> Re
     Ok(())
 }
 
-fn validate_sample(sample: &PlaybackMetricsSample) -> Result<()> {
-    if sample.version != 1 {
+fn validate_sample(sample: &PlaybackMetricsPacket) -> Result<()> {
+    if !matches!(sample.common().version, 1 | 2) {
         return Err(err(
             StatusCode::BAD_REQUEST,
             "unsupported_playback_metrics_version",
@@ -385,13 +414,20 @@ fn validate_sample(sample: &PlaybackMetricsSample) -> Result<()> {
 struct Credit {
     delta: PlaybackMetricsTotals,
     first: Option<PlaybackMetricsFirstFrame>,
+    phases: Option<PlaybackMetricsStartupPhases>,
+    attribution: Option<PlaybackAttribution>,
+    output: Option<WorkerOutputEntry>,
 }
-fn transition(current: &Slot, sample: &PlaybackMetricsSample) -> Result<Option<Credit>> {
+fn transition(current: &Slot, packet: &PlaybackMetricsPacket) -> Result<Option<Credit>> {
+    let sample = &packet.common();
+    if Some(sample.version as i32) != current.version {
+        return Err(err(StatusCode::CONFLICT, "playback_metrics_conflict"));
+    }
     if sample.seq < current.seq as u64 {
         return Err(err(StatusCode::CONFLICT, "playback_metrics_sequence_stale"));
     }
     if sample.seq == current.seq as u64 {
-        if current.payload.as_ref() != Some(sample) {
+        if current.payload.as_ref() != Some(packet) {
             return Err(err(StatusCode::CONFLICT, "playback_metrics_conflict"));
         }
         return Ok(None);
@@ -403,8 +439,30 @@ fn transition(current: &Slot, sample: &PlaybackMetricsSample) -> Result<Option<C
         return Ok(Some(Credit {
             delta: sample.totals.clone(),
             first: sample.first_frame.clone(),
+            phases: packet.startup_phases().cloned(),
+            attribution: None,
+            output: None,
         }));
     };
+    if previous.first_frame_plan_generation().is_some()
+        && previous.first_frame_plan_generation() != packet.first_frame_plan_generation()
+    {
+        return Err(err(StatusCode::CONFLICT, "playback_metrics_conflict"));
+    }
+    let phases = match (previous.startup_phases(), packet.startup_phases()) {
+        (None, None) => None,
+        (Some(before), Some(after)) => {
+            let delta = after
+                .checked_delta(before)
+                .ok_or_else(|| err(StatusCode::CONFLICT, "playback_metrics_conflict"))?;
+            if previous.common().first_frame.is_some() && delta.sum() != 0 {
+                return Err(err(StatusCode::CONFLICT, "playback_metrics_conflict"));
+            }
+            Some(delta)
+        }
+        _ => return Err(err(StatusCode::CONFLICT, "playback_metrics_conflict")),
+    };
+    let previous = previous.common();
     let elapsed_delta = sample
         .elapsed_ms
         .checked_sub(previous.elapsed_ms)
@@ -426,6 +484,9 @@ fn transition(current: &Slot, sample: &PlaybackMetricsSample) -> Result<Option<C
     }
     Ok(Some(Credit {
         delta,
+        phases,
+        attribution: None,
+        output: None,
         first: if previous.first_frame.is_none() {
             sample.first_frame.clone()
         } else {
@@ -450,8 +511,9 @@ async fn receive(
     headers: &HeaderMap,
     session_hash: &str,
     id: Uuid,
-    sample: &PlaybackMetricsSample,
+    packet: &PlaybackMetricsPacket,
 ) -> Result<(PlaybackMetricsReceipt, Option<Credit>)> {
+    let sample = &packet.common();
     // Auth shares the cancellation-owned connection and statement limits. Do
     // not call the normal pool-based auth outside the whole request deadline.
     let authentication = sqlx::query("SELECT u.id,s.csrf FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>clock_timestamp()")
@@ -469,8 +531,8 @@ async fn receive(
     // Historical or already revoked grants cannot allocate a rate bucket or
     // consume the allowance of their current viewer's successor. This is only
     // a pre-contention filter; every authority is checked again under locks.
-    let identity = sqlx::query("SELECT p.room_id,p.viewer_id,p.playback_metrics_version FROM playback_sessions p WHERE p.id=$1 AND p.user_id=$2 AND NOT p.stopped AND p.expires_at>clock_timestamp() AND (p.viewer_id IS NULL OR EXISTS(SELECT 1 FROM playback_viewer_plans g WHERE g.user_id=p.user_id AND g.room_id=p.room_id AND g.viewer_id=p.viewer_id AND g.plan_generation=p.plan_generation)) AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
-        .bind(id).bind(user).fetch_optional(&mut **tx).await?
+    let identity = sqlx::query("SELECT p.room_id,p.viewer_id,p.playback_metrics_version FROM playback_sessions p WHERE p.id=$1 AND p.user_id=$2 AND playback_caller_allowed(p.resource,$2,$3) AND NOT p.stopped AND p.expires_at>clock_timestamp() AND (p.viewer_id IS NULL OR EXISTS(SELECT 1 FROM playback_viewer_plans g WHERE g.user_id=p.user_id AND g.room_id=p.room_id AND g.viewer_id=p.viewer_id AND g.plan_generation=p.plan_generation)) AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)")
+        .bind(id).bind(user).bind(session_hash).fetch_optional(&mut **tx).await?
         .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
     let room: Option<Uuid> = identity.try_get("room_id")?;
     let viewer: Option<Uuid> = identity.try_get("viewer_id")?;
@@ -480,7 +542,9 @@ async fn receive(
             "playback_metrics_not_negotiated",
         ));
     };
-    if identity.try_get::<Option<i32>, _>("playback_metrics_version")? != Some(1) {
+    if identity.try_get::<Option<i32>, _>("playback_metrics_version")?
+        != Some(sample.version as i32)
+    {
         return Err(err(
             StatusCode::BAD_REQUEST,
             "playback_metrics_not_negotiated",
@@ -520,6 +584,9 @@ async fn receive(
     {
         return Err(err(StatusCode::FORBIDDEN, "not_a_member"));
     }
+    // Recheck and lock the exact original caller before mutable viewer state.
+    // Never substitute another still-live login belonging to the same user.
+    media_authorization::lock_caller(tx, id, user, session_hash).await?;
     let current = slot(tx, user, room, viewer).await?;
     if !persistence::source_account_policy::lock_session(tx, id).await? {
         return Err(err(StatusCode::GONE, "invalid_playback_session"));
@@ -533,7 +600,8 @@ async fn receive(
             .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
     if grant.try_get::<Option<Uuid>, _>("room_id")? != Some(room)
         || grant.try_get::<Option<Uuid>, _>("viewer_id")? != Some(viewer)
-        || grant.try_get::<Option<i32>, _>("playback_metrics_version")? != Some(1)
+        || grant.try_get::<Option<i32>, _>("playback_metrics_version")?
+            != Some(sample.version as i32)
     {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -564,12 +632,74 @@ async fn receive(
     }
     // Recheck expiry and all volatile source/account authority only after every
     // contended lock. A replay is authorized by today's grant, not its old ACK.
-    let live: bool = sqlx::query_scalar("SELECT NOT p.stopped AND p.expires_at>clock_timestamp() AND playback_source_allowed(p.media_id,p.resource) AND EXISTS(SELECT 1 FROM rooms r WHERE r.id=p.room_id AND r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch) AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id) AND EXISTS(SELECT 1 FROM sessions s WHERE s.token_hash=$3 AND s.user_id=p.user_id AND s.expires_at>clock_timestamp()) FROM playback_sessions p WHERE p.id=$1 AND p.user_id=$2")
+    let live: bool = sqlx::query_scalar("SELECT NOT p.stopped AND p.expires_at>clock_timestamp() AND playback_caller_allowed(p.resource,$2,$3) AND playback_source_allowed(p.media_id,p.resource) AND EXISTS(SELECT 1 FROM rooms r WHERE r.id=p.room_id AND r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch) AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id) AND EXISTS(SELECT 1 FROM sessions s WHERE s.token_hash=$3 AND s.user_id=p.user_id AND s.expires_at>clock_timestamp()) FROM playback_sessions p WHERE p.id=$1 AND p.user_id=$2")
         .bind(id).bind(user).bind(session_hash).fetch_one(&mut **tx).await?;
     if !live {
         return Err(err(StatusCode::GONE, "invalid_playback_session"));
     }
-    let credit = transition(&current, sample)?;
+    let mut credit = transition(&current, packet)?;
+    if let Some(accepted) = &mut credit
+        && accepted.first.is_some()
+        && sample.version == 2
+    {
+        // This historical row supplies attribution only. Today's grant above
+        // alone authorizes receipt; an old stopped grant is never revived.
+        let frame_generation = packet
+            .first_frame_plan_generation()
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid_playback_metrics"))?;
+        let historical = sqlx::query("SELECT metrics_source_kind,metrics_delivery_mode,metrics_output_entry_availability,metrics_output_entry_completed,metrics_output_entry_queue_ms FROM playback_sessions WHERE user_id=$1 AND room_id=$2 AND viewer_id=$3 AND generation=$4 AND lifecycle_epoch=$5 AND metrics_meter_start_generation=$6 AND plan_generation=$7 AND auth_login_hash IS NOT DISTINCT FROM $8 AND playback_metrics_version=2 LIMIT 2")
+                .bind(user).bind(room).bind(viewer).bind(i64::from(sample.media_generation)).bind(epoch)
+                .bind(i64::from(sample.meter_start_generation)).bind(i64::from(frame_generation))
+                .bind(grant.try_get::<Option<String>, _>("auth_login_hash")?)
+                .fetch_all(&mut **tx).await?;
+        // Ambiguous/reclaimed history remains unknown, never the current grant.
+        let attribution = if historical.len() == 1 {
+            PlaybackAttribution::from_publication(
+                historical[0]
+                    .try_get::<Option<String>, _>("metrics_source_kind")?
+                    .as_deref(),
+                historical[0]
+                    .try_get::<Option<String>, _>("metrics_delivery_mode")?
+                    .as_deref(),
+            )
+        } else {
+            PlaybackAttribution {
+                source: PlaybackSource::Unknown,
+                mode: PlaybackMode::Unknown,
+            }
+        };
+        accepted.attribution = Some(attribution);
+        let output = if historical.len() == 1 {
+            let availability = WorkerOutputEntryAvailability::from_name(
+                historical[0]
+                    .try_get::<Option<String>, _>("metrics_output_entry_availability")?
+                    .as_deref(),
+            );
+            let queue_ms = if historical[0].try_get::<bool, _>("metrics_output_entry_completed")?
+                && matches!(
+                    availability,
+                    WorkerOutputEntryAvailability::ColdWaiting
+                        | WorkerOutputEntryAvailability::Warm
+                ) {
+                historical[0]
+                    .try_get::<Option<i64>, _>("metrics_output_entry_queue_ms")?
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value <= protocol::PLAYBACK_METRICS_MAX_ELAPSED_MS)
+            } else {
+                None
+            };
+            WorkerOutputEntry {
+                availability,
+                queue_ms,
+            }
+        } else {
+            WorkerOutputEntry {
+                availability: WorkerOutputEntryAvailability::Unknown,
+                queue_ms: None,
+            }
+        };
+        accepted.output = Some(output);
+    }
     if credit.is_some() {
         if let Some(anchor) = current.anchor_elapsed_ms {
             let elapsed: i64 = sqlx::query_scalar("SELECT GREATEST(0,FLOOR(EXTRACT(EPOCH FROM(clock_timestamp()-metrics_anchor_received_at))*1000))::bigint FROM playback_viewer_plans WHERE user_id=$1 AND room_id=$2 AND viewer_id=$3")
@@ -578,10 +708,15 @@ async fn receive(
                 return Err(err(StatusCode::CONFLICT, "playback_metrics_time_invalid"));
             }
         }
-        let payload = serde_json::to_value(sample).map_err(anyhow::Error::from)?;
-        sqlx::query("UPDATE playback_viewer_plans SET metrics_seq=$4,metrics_payload=$5,metrics_closed=$6,metrics_anchor_elapsed_ms=COALESCE(metrics_anchor_elapsed_ms,$7),metrics_anchor_received_at=COALESCE(metrics_anchor_received_at,clock_timestamp()) WHERE user_id=$1 AND room_id=$2 AND viewer_id=$3")
+        let payload = serde_json::to_value(packet).map_err(anyhow::Error::from)?;
+        sqlx::query("UPDATE playback_viewer_plans SET metrics_seq=$4,metrics_payload=$5,metrics_closed=$6,metrics_anchor_elapsed_ms=COALESCE(metrics_anchor_elapsed_ms,$7),metrics_anchor_received_at=COALESCE(metrics_anchor_received_at,clock_timestamp()),metrics_first_frame_source=COALESCE(metrics_first_frame_source,$8),metrics_first_frame_mode=COALESCE(metrics_first_frame_mode,$9),metrics_first_frame_output_entry=COALESCE(metrics_first_frame_output_entry,$10),metrics_first_frame_queue_ms=COALESCE(metrics_first_frame_queue_ms,$11) WHERE user_id=$1 AND room_id=$2 AND viewer_id=$3")
             .bind(user).bind(room).bind(viewer).bind(sample.seq as i64).bind(payload)
-            .bind(sample.final_sample).bind(i64::from(sample.elapsed_ms)).execute(&mut **tx).await?;
+            .bind(sample.final_sample).bind(i64::from(sample.elapsed_ms))
+            .bind(credit.as_ref().and_then(|credit| credit.attribution).map(|value| value.source.label()))
+            .bind(credit.as_ref().and_then(|credit| credit.attribution).map(|value| value.mode.label()))
+            .bind(credit.as_ref().and_then(|credit| credit.output).map(|value| value.availability.label()))
+            .bind(credit.as_ref().and_then(|credit| credit.output).and_then(|value| value.queue_ms).map(i64::from))
+            .execute(&mut **tx).await?;
     }
     Ok((
         PlaybackMetricsReceipt {
@@ -602,7 +737,7 @@ pub async fn endpoint(
     State(app): State<App>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-    Json(sample): Json<PlaybackMetricsSample>,
+    Json(sample): Json<PlaybackMetricsPacket>,
 ) -> Result<Json<PlaybackMetricsReceipt>> {
     use media_core::runtime_metrics::ClientMetricsDrop;
     let deadline = tokio::time::Instant::now() + REQUEST_DEADLINE;
@@ -667,10 +802,13 @@ pub async fn endpoint(
     // Persistence is authoritative. A crash in this small commit/collector gap
     // can lose credit; replay deliberately never credits the aggregate twice.
     if let Some(credit) = credit {
-        app.metrics.runtime.client_playback_sample(
-            sample.startup_origin,
+        app.metrics.runtime.client_playback_sample_with_output(
+            sample.common().startup_origin,
             &credit.delta,
             credit.first.as_ref(),
+            credit.phases.as_ref(),
+            credit.attribution,
+            credit.output,
         );
     }
     Ok(Json(receipt))
@@ -682,6 +820,9 @@ mod tests {
     fn sample(elapsed: u32, seq: u64) -> PlaybackMetricsSample {
         serde_json::from_value(json!({"version":1,"media_generation":1,"plan_generation":2,"meter_start_generation":1,"seq":seq,"startup_origin":"user_intent","elapsed_ms":elapsed,"totals":{"startup_ms":elapsed,"autoplay_blocked_ms":0,"background_ms":0,"paused_ms":0,"seeking_ms":0,"rebuffer_ms":0,"playing_ms":0,"unobserved_ms":0},"final":false})).unwrap()
     }
+    fn transition(current: &Slot, sample: &PlaybackMetricsSample) -> Result<Option<Credit>> {
+        super::transition(current, &PlaybackMetricsPacket::V1(sample.clone()))
+    }
     fn current(payload: Option<PlaybackMetricsSample>) -> Slot {
         Slot {
             plan_generation: 2,
@@ -692,11 +833,88 @@ mod tests {
             seq: payload.as_ref().map_or(0, |value| value.seq as i64),
             closed: payload.as_ref().is_some_and(|value| value.final_sample),
             anchor_elapsed_ms: payload.as_ref().map(|value| i64::from(value.elapsed_ms)),
-            payload,
+            payload: payload.map(PlaybackMetricsPacket::V1),
+            version: Some(1),
         }
     }
     fn reason<T>(result: Result<T>) -> String {
         result.err().expect("must fail").1
+    }
+    fn v2(elapsed: u32, seq: u64) -> PlaybackMetricsPacket {
+        let mut value = serde_json::to_value(sample(elapsed, seq)).unwrap();
+        value["version"] = json!(2);
+        value["startup_phases"] =
+            json!({"preparation_ms":elapsed,"loading_ms":0,"unobserved_ms":0});
+        serde_json::from_value(value).unwrap()
+    }
+    #[test]
+    fn v2_phase_regression_and_frame_generation_relabeling_reject() {
+        let mut previous = v2(2000, 1);
+        if let PlaybackMetricsPacket::V2(sample) = &mut previous {
+            sample.first_frame = Some(PlaybackMetricsFirstFrame {
+                elapsed_ms: 1900,
+                confirmed_elapsed_ms: 2000,
+                evidence: protocol::PlaybackMetricsFrameEvidence::VideoFrameCallback,
+            });
+            sample.first_frame_plan_generation = Some(1);
+        }
+        let mut slot = current(None);
+        slot.version = Some(2);
+        slot.seq = 1;
+        slot.payload = Some(previous.clone());
+        assert!(super::transition(&slot, &previous).unwrap().is_none());
+        let mut next = previous.clone();
+        if let PlaybackMetricsPacket::V2(sample) = &mut next {
+            sample.elapsed_ms = 3000;
+            sample.seq = 2;
+            sample.totals.startup_ms = 3000;
+        }
+        let credit = super::transition(&slot, &next).unwrap().unwrap();
+        assert!(credit.first.is_none());
+        assert_eq!(credit.phases.unwrap().sum(), 0);
+        if let PlaybackMetricsPacket::V2(sample) = &mut next {
+            sample.first_frame_plan_generation = Some(2);
+        }
+        assert_eq!(
+            reason(super::transition(&slot, &next)),
+            "playback_metrics_conflict"
+        );
+        if let PlaybackMetricsPacket::V2(sample) = &mut next {
+            sample.first_frame_plan_generation = Some(1);
+            sample.startup_phases.preparation_ms -= 1;
+            sample.startup_phases.loading_ms += 1;
+        }
+        assert_eq!(
+            reason(super::transition(&slot, &next)),
+            "playback_metrics_conflict"
+        );
+        assert_eq!(
+            reason(super::transition(
+                &slot,
+                &PlaybackMetricsPacket::V1(sample(3000, 2))
+            )),
+            "playback_metrics_conflict"
+        );
+    }
+    #[test]
+    fn v2_offer_is_outer_optional_and_legacy_canonical_request_stays_identical() {
+        let raw = json!({"room_id":Uuid::nil(),"media_generation":1});
+        let mut request: PlaybackRequest = serde_json::from_value(raw).unwrap();
+        let before = serde_json::to_value(&request).unwrap();
+        assert!(before.get("playback_metrics_supported_versions").is_none());
+        request.playback_metrics_version = Some(1);
+        request.viewer_id = Some(Uuid::nil());
+        request.plan_generation = Some(1);
+        request.playback_metrics = Some(protocol::PlaybackMetricsIntent {
+            meter_start_generation: 1,
+            startup_origin: PlaybackMetricsOrigin::UserIntent,
+        });
+        request.playback_metrics_supported_versions = Some(vec![1, 2]);
+        assert!(validate(&request).is_ok());
+        for versions in [vec![], vec![1, 1], vec![1, 2, 2], vec![3]] {
+            request.playback_metrics_supported_versions = Some(versions);
+            assert!(validate(&request).is_err());
+        }
     }
     #[test]
     fn negotiation_is_paired_and_requires_current_viewer_generation() {

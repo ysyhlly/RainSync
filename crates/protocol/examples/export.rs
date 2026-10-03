@@ -46,6 +46,10 @@ fn main() {
         CapabilityReport::decl(),
         PlaybackCandidateRequest::decl(),
         PlaybackCandidate::decl(),
+        PlaybackRouteReason::decl(),
+        PlaybackRouteDecision::decl(),
+        PlaybackOutputBasis::decl(),
+        PlaybackSelectedOutput::decl(),
         PlaybackCandidateSet::decl(),
         PlaybackCandidateResult::decl(),
         PlaybackCandidateReport::decl(),
@@ -67,6 +71,11 @@ fn main() {
         PlaybackMetricsTotals::decl(),
         PlaybackMetricsFirstFrame::decl(),
         PlaybackMetricsSample::decl(),
+        PlaybackMetricsStartupPhases::decl(),
+        PlaybackMetricsSampleV2::decl(),
+        PlaybackMetricsPacket::decl(),
+        PlaybackMetricsGrantV2::decl(),
+        PlaybackMetricsGrantWire::decl(),
         PlaybackMetricsGrant::decl(),
         PlaybackMetricsReceipt::decl(),
         PlaybackObservationEvent::decl(),
@@ -105,6 +114,14 @@ fn main() {
         (
             "playback-metrics-sample",
             schemars::schema_for!(PlaybackMetricsSample),
+        ),
+        (
+            "playback-metrics-v2-sample",
+            schemars::schema_for!(PlaybackMetricsSampleV2),
+        ),
+        (
+            "playback-metrics-packet",
+            schemars::schema_for!(PlaybackMetricsPacket),
         ),
         (
             "playback-metrics-receipt",

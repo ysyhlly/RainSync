@@ -83,12 +83,16 @@ pub enum ErrorCode {
     StaleMedia,
     InvalidPlanGeneration,
     PlaybackViewerLimitExceeded,
+    PlaybackViewerOriginRequired,
     StalePlaybackPlan,
     InvalidPosition,
     InvalidRate,
     NoMedia,
     InvalidMode,
     UnsupportedVideoOrHdr,
+    HdrUnsupported,
+    DrmUnsupported,
+    UnsupportedTimeline,
     UpstreamPlaybackFailed,
     UpstreamPolicyDenied,
     UpstreamPolicyChanged,
@@ -173,6 +177,7 @@ impl ErrorCode {
         match reason {
             "wrong_room" => Self::RoomMismatch,
             "try_later" => Self::RateLimited,
+            "legacy_stream_mapping_unsupported" => Self::UnsupportedVideoOrHdr,
             _ => serde_json::from_value(serde_json::Value::String(reason.to_ascii_uppercase()))
                 .unwrap_or_else(|_| Self::from_status(status)),
         }
@@ -204,6 +209,10 @@ impl ErrorCode {
 
     fn message(self) -> &'static str {
         match self {
+            Self::HdrUnsupported => {
+                "此片源含 HDR 视频，当前不支持 HDR 播放或 HDR 转 SDR；请使用 SDR 版本"
+            }
+            Self::DrmUnsupported => "此片源含加密或受保护的媒体轨道，当前不支持此类播放",
             Self::UnsupportedPlaybackMetricsVersion => "播放指标协议版本不受支持",
             Self::InvalidPlaybackMetrics => "播放指标格式或范围无效",
             Self::PlaybackMetricsNotNegotiated => "此播放会话未启用独立指标采集",
@@ -219,6 +228,7 @@ impl ErrorCode {
             }
             Self::InvalidPlanGeneration => "播放方案代次格式无效，请更新客户端",
             Self::StalePlaybackPlan => "此播放方案已被新的操作替代，请重新加载当前播放",
+            Self::PlaybackViewerOriginRequired => "此旧播放器身份缺少登录归属，请重新进入播放器",
             Self::PlaybackViewerLimitExceeded => {
                 "此账号在该房间的播放器身份已达上限，现有播放器可继续使用；新播放器需使用新房间"
             }
@@ -299,6 +309,7 @@ impl ErrorCode {
             }
             Self::RateLimited | Self::TooManyPlaybackSessions => "请求或播放会话过多，请稍后重试",
             Self::UnsupportedVideoOrHdr => "此视频或 HDR 格式暂不支持",
+            Self::UnsupportedTimeline => "此媒体时间轴无法安全映射；暂不支持不连续或滑动窗口播放",
             Self::DeviceHasNoCompatiblePlaybackTransport
             | Self::UpstreamNoCompatibleStream
             | Self::UpstreamDeviceProfileRequired => "设备没有兼容的播放方式",
@@ -364,6 +375,34 @@ pub struct ErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_mapping_refusal_reuses_the_existing_terminal_video_code() {
+        assert_eq!(
+            ErrorCode::from_reason("legacy_stream_mapping_unsupported", 422),
+            ErrorCode::UnsupportedVideoOrHdr
+        );
+        assert!(!ErrorCode::UnsupportedVideoOrHdr.retryable());
+        assert_eq!(
+            ErrorCode::from_reason("unsupported_video_or_hdr", 422),
+            ErrorCode::UnsupportedVideoOrHdr
+        );
+        assert_eq!(
+            ErrorCode::from_reason("hdr_unsupported", 422),
+            ErrorCode::HdrUnsupported
+        );
+        assert_eq!(
+            ErrorCode::from_reason("drm_unsupported", 422),
+            ErrorCode::DrmUnsupported
+        );
+    }
+    #[test]
+    fn unsupported_timeline_is_explicit_and_not_retried_as_transient() {
+        let code = ErrorCode::from_reason("unsupported_timeline", 422);
+        assert_eq!(code, ErrorCode::UnsupportedTimeline);
+        let error = ApiError::new(code, Uuid::nil());
+        assert!(!error.retryable);
+        assert!(error.message.contains("时间轴"));
+    }
     #[test]
     fn stale_plan_is_explicit_and_not_blindly_retried() {
         assert_eq!(
@@ -489,5 +528,17 @@ mod tests {
             assert!(!ApiError::new(code, Uuid::nil()).retryable);
         }
         assert!(ApiError::new(ErrorCode::AgentTimeout, Uuid::nil()).retryable);
+    }
+    #[test]
+    fn explicit_hdr_and_protection_boundaries_are_safe_terminal_errors() {
+        for (reason, expected) in [
+            ("hdr_unsupported", ErrorCode::HdrUnsupported),
+            ("drm_unsupported", ErrorCode::DrmUnsupported),
+        ] {
+            let code = ErrorCode::from_reason(reason, 422);
+            assert_eq!(code, expected);
+            assert!(!code.retryable());
+            assert!(!ApiError::new(code, Uuid::nil()).message.is_empty());
+        }
     }
 }

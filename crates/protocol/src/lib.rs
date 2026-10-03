@@ -120,6 +120,10 @@ pub struct PlaybackPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub selected_candidate_id: Option<String>,
+    /// Server-selected bound configuration, not measured output or playback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub selected_output: Option<PlaybackSelectedOutput>,
     /// Available delivery pipeline, not the user's currently selected subtitle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -152,11 +156,11 @@ pub struct PlaybackPlan {
     /// Optional independent client-reported metrics; observations v1 is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    #[schemars(range(min = 1, max = 1))]
+    #[schemars(range(min = 1, max = 2))]
     pub playback_metrics_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub playback_metrics: Option<PlaybackMetricsGrant>,
+    pub playback_metrics: Option<PlaybackMetricsGrantWire>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
@@ -366,6 +370,11 @@ pub struct PlaybackRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub playback_metrics: Option<PlaybackMetricsIntent>,
+    /// Outer offer is ignored by old servers. Absence preserves canonical hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(length(min = 1, max = 2))]
+    pub playback_metrics_supported_versions: Option<Vec<u32>>,
 }
 
 impl PlaybackCapabilities {

@@ -1,6 +1,7 @@
 import type {
   PlaybackMetricsReceipt,
   PlaybackMetricsSample,
+  PlaybackMetricsPacket,
 } from "../../../../../packages/protocol";
 import { RequestFailure } from "../../errors";
 import {
@@ -9,6 +10,7 @@ import {
 } from "./playback-metrics";
 
 export type PlaybackMetricsBinding = Readonly<{
+  version: 1 | 2;
   sessionId: string;
   planGeneration: number;
   meterStartGeneration: number;
@@ -16,14 +18,14 @@ export type PlaybackMetricsBinding = Readonly<{
   startupOrigin: PlaybackMetricsSample["startup_origin"];
   current: () => boolean;
 }>;
-type Packet = { binding: PlaybackMetricsBinding; body: PlaybackMetricsSample };
+type Packet = { binding: PlaybackMetricsBinding; body: PlaybackMetricsPacket };
 
 /** One player owns one bounded sender, including through logical intent changes.
  * seq belongs to the cumulative meter. Binding changes never rewrite old packets. */
 export function createPlaybackMetricsSender(
   send: (
     binding: PlaybackMetricsBinding,
-    body: PlaybackMetricsSample,
+    body: PlaybackMetricsPacket,
     signal: AbortSignal,
   ) => Promise<PlaybackMetricsReceipt>,
 ) {
@@ -135,6 +137,7 @@ export function createPlaybackMetricsSender(
     bind(next: PlaybackMetricsBinding) {
       cancelBackoff?.();
       binding = Object.freeze({
+        version: next.version,
         sessionId: next.sessionId,
         planGeneration: next.planGeneration,
         meterStartGeneration: next.meterStartGeneration,
@@ -161,6 +164,7 @@ export function createPlaybackMetricsSender(
         !active ||
         !binding ||
         !current(binding) ||
+        ![1, 2].includes(binding.version) ||
         !Number.isInteger(binding.planGeneration) ||
         binding.planGeneration < 1 ||
         binding.planGeneration > 0xffff_ffff ||
@@ -197,8 +201,28 @@ export function createPlaybackMetricsSender(
             snapshot.first_frame.confirmed_elapsed_ms > snapshot.elapsed_ms))
       )
         return false;
-      const body: PlaybackMetricsSample = Object.freeze({
-        version: 1,
+      const phases = snapshot.startup_phases;
+      const originGeneration = snapshot.first_frame_plan_generation;
+      if (
+        binding.version === 2 &&
+        (!phases ||
+          [phases.preparation_ms, phases.loading_ms, phases.unobserved_ms].some(
+            (v) =>
+              !Number.isInteger(v) ||
+              v < 0 ||
+              v > PLAYBACK_METRICS_MAX_ELAPSED_MS,
+          ) ||
+          phases.preparation_ms + phases.loading_ms + phases.unobserved_ms !==
+            (snapshot.first_frame?.confirmed_elapsed_ms ??
+              snapshot.elapsed_ms) ||
+          !!snapshot.first_frame !== (originGeneration !== undefined) ||
+          (originGeneration !== undefined &&
+            (!Number.isInteger(originGeneration) ||
+              originGeneration < binding.meterStartGeneration ||
+              originGeneration > binding.planGeneration)))
+      )
+        return false;
+      const fields = {
         media_generation: binding.mediaGeneration,
         plan_generation: binding.planGeneration,
         meter_start_generation: binding.meterStartGeneration,
@@ -216,7 +240,24 @@ export function createPlaybackMetricsSender(
             }
           : {}),
         final: snapshot.final,
-      });
+      };
+      const body: PlaybackMetricsPacket =
+        binding.version === 1
+          ? Object.freeze({ version: 1, ...fields })
+          : Object.freeze({
+              version: 2,
+              ...fields,
+              startup_phases: Object.freeze({
+                preparation_ms: phases.preparation_ms,
+                loading_ms: phases.loading_ms,
+                unobserved_ms: phases.unobserved_ms,
+              }),
+              ...(originGeneration === undefined
+                ? {}
+                : {
+                    first_frame_plan_generation: originGeneration,
+                  }),
+            });
       if (new TextEncoder().encode(JSON.stringify(body)).byteLength > 4096)
         return false;
       offeredSeq = snapshot.seq;

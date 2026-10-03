@@ -50,9 +50,10 @@ async fn finish(app: &App, task: &Task) -> anyhow::Result<Option<(protocol::Room
         None,
         persistence::room_diagnostics::lifecycle("closing", task.epoch)?,
         persistence::room_diagnostics::lifecycle("closed", task.epoch)?,
-        room_core::diagnostics::Operation::Checkpoint {
-            reason: room_core::diagnostics::CheckpointReason::Closed,
-            command: None,
+        room_core::diagnostics::Operation::Lifecycle {
+            transition: room_core::diagnostics::LifecycleTransition::Closed,
+            expected_revision: state.revision - 1,
+            server_time_ms: None,
         },
     );
     persistence::room_diagnostics::append(&mut tx, &state, diagnostic).await?;
@@ -85,6 +86,9 @@ pub async fn run(app: App) {
                             "playback_preparation_drain_unconfirmed"
                         }
                         "media_execution_drain_unconfirmed" => "media_execution_drain_unconfirmed",
+                        "static_hls_capture_drain_unconfirmed" => {
+                            "static_hls_capture_drain_unconfirmed"
+                        }
                         "agent_transfer_drain_unconfirmed" => "agent_transfer_drain_unconfirmed",
                         "upstream_cleanup_failed" => "upstream_cleanup_failed",
                         "legacy_upstream_cleanup_unconfirmed" => {

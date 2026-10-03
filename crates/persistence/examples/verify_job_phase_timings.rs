@@ -10,6 +10,7 @@ use persistence::{
     media_queue,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::time::Duration;
 use uuid::Uuid;
@@ -151,15 +152,25 @@ async fn enqueue_scoped(
     db: &PgPool,
     owned: &mut Vec<Uuid>,
     user: Uuid,
-    room: Option<Uuid>,
+    room: Uuid,
+    login: &str,
 ) -> Result<Uuid> {
     let id = Uuid::new_v4();
     owned.push(id);
-    // Room identity is immutable: fixture scope must be present at insertion.
-    sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES($1,$2,$3,0,$4,'{}',clock_timestamp()+interval '1 hour')")
-        .bind(id).bind(user).bind(room).bind(id.to_string()).execute(db).await?;
     let mut tx = db.begin().await?;
+    let epoch = persistence::room_lifecycle::lock_active(&mut tx, room).await?;
+    let membership = persistence::media_authorization::capture(&mut tx, user, room, login)
+        .await?
+        .context("explicit owned fixture login and membership")?;
+    // These scoped synthetic jobs use a deliberately created, known test login.
+    // No historical NULL row is adopted and no arbitrary current login is read.
+    sqlx::query("INSERT INTO playback_requests(user_id,idempotency_key,request_hash,session_id,owner_epoch,status,lease_until,expires_at,room_id,lifecycle_epoch,auth_login_hash,auth_membership_epoch) VALUES($1,$2,'owned-scoped-timing-fixture',$2,$3,'pending',clock_timestamp()+interval '1 minute',clock_timestamp()+interval '1 hour',$4,$5,$6,$7)")
+        .bind(user).bind(id).bind(Uuid::new_v4()).bind(room).bind(epoch).bind(login).bind(membership).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch) VALUES($1,$2,$3,0,$4,'{}',clock_timestamp()+interval '1 hour',$5)")
+        .bind(id).bind(user).bind(room).bind(id.to_string()).bind(epoch).execute(&mut *tx).await?;
     ensure!(media_queue::enqueue(&mut tx, id, &json!({}), 10000).await?);
+    sqlx::query("UPDATE playback_requests SET status='completed',response_encrypted='owned-synthetic-fixture-not-api-replay' WHERE session_id=$1")
+        .bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(id)
 }
@@ -801,7 +812,22 @@ async fn run(
         .bind(format!("phase-{user}"))
         .execute(db)
         .await?;
-    let id = enqueue_scoped(db, owned, user, None).await?;
+    let room = Uuid::new_v4();
+    rooms.push(room);
+    let login = hex::encode(Sha256::digest(Uuid::new_v4().as_bytes()));
+    sqlx::query("INSERT INTO sessions(token_hash,user_id,csrf,expires_at) VALUES($1,$2,'owned-phase-fixture',clock_timestamp()+interval '1 hour')")
+        .bind(&login).bind(user).execute(db).await?;
+    sqlx::query("INSERT INTO rooms(id,name,owner_id) VALUES($1,'timing scopes',$2)")
+        .bind(room)
+        .bind(user)
+        .execute(db)
+        .await?;
+    sqlx::query("INSERT INTO room_members(room_id,user_id) VALUES($1,$2)")
+        .bind(room)
+        .bind(user)
+        .execute(db)
+        .await?;
+    let id = enqueue_scoped(db, owned, user, room, &login).await?;
     let unrelated = enqueue(db, owned).await?;
     let before = observations().0;
     cancel(
@@ -839,15 +865,8 @@ async fn run(
     );
     cancel(db, CancellationScope::Session(unrelated)).await?;
 
-    let room = Uuid::new_v4();
-    rooms.push(room);
-    sqlx::query("INSERT INTO rooms(id,name,owner_id) VALUES($1,'timing scopes',$2)")
-        .bind(room)
-        .bind(user)
-        .execute(db)
-        .await?;
-    let stopped = enqueue_scoped(db, owned, user, Some(room)).await?;
-    let live = enqueue_scoped(db, owned, user, Some(room)).await?;
+    let stopped = enqueue_scoped(db, owned, user, room, &login).await?;
+    let live = enqueue_scoped(db, owned, user, room, &login).await?;
     let outside = enqueue(db, owned).await?;
     sqlx::query("UPDATE playback_sessions SET stopped=true WHERE id=$1")
         .bind(stopped)
@@ -1046,6 +1065,14 @@ async fn main() -> Result<()> {
         .await?;
     sqlx::query("DELETE FROM playback_sessions WHERE id=ANY($1)")
         .bind(&owned)
+        .execute(&db)
+        .await?;
+    sqlx::query("DELETE FROM playback_requests WHERE session_id=ANY($1)")
+        .bind(&owned)
+        .execute(&db)
+        .await?;
+    sqlx::query("DELETE FROM sessions WHERE user_id=ANY($1)")
+        .bind(&users)
         .execute(&db)
         .await?;
     sqlx::query("DELETE FROM rooms WHERE id=ANY($1)")

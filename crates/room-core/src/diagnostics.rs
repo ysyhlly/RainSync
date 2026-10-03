@@ -1,16 +1,30 @@
 //! Bounded, offline diagnostics for committed room transitions.
 //!
 //! These facts explain a manual window; they are not credentials or proof of
-//! provider work. External media, lifecycle and process changes are explicit
-//! checkpoints, never transitions verified by the ordinary room reducer.
+//! provider work. Version 2 records the resolved media inputs and deterministic
+//! lifecycle/clock transitions. Version 1 checkpoints retain their old meaning;
+//! state replay never certifies or repeats external resource disposal.
 
 use protocol::{Action, Command, PlaybackStatus, RoomState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const FORMAT_VERSION: u8 = 1;
-pub const REDUCER_VERSION: &str = "room-diagnostics/1";
+pub const FORMAT_VERSION: u8 = 2;
+pub const REDUCER_VERSION: &str = "room-diagnostics/2";
+pub const LEGACY_FORMAT_VERSION: u8 = 1;
+pub const LEGACY_REDUCER_VERSION: &str = "room-diagnostics/1";
+
+fn supported_version(version: u8, reducer: &str) -> bool {
+    matches!(
+        (version, reducer),
+        (1, LEGACY_REDUCER_VERSION) | (2, REDUCER_VERSION)
+    )
+}
+
+#[path = "diagnostics_transitions.rs"]
+mod transitions;
+pub use transitions::{LifecycleTransition, ResolvedMedia};
 pub const MAX_EVENTS: usize = 256;
 pub const MAX_BUNDLE_BYTES: usize = 512 * 1024;
 pub const MAX_STATE_BYTES: usize = 4096;
@@ -122,6 +136,19 @@ pub enum Operation {
     Ownership {
         expected_revision: u32,
         controller_user_id: Uuid,
+    },
+    MediaControl {
+        command: SafeCommand,
+        server_time_ms: f64,
+        resolved_media: ResolvedMedia,
+    },
+    Lifecycle {
+        transition: LifecycleTransition,
+        expected_revision: u32,
+        server_time_ms: Option<f64>,
+    },
+    ServerRestart {
+        clock_epoch: Uuid,
     },
     Checkpoint {
         reason: CheckpointReason,
@@ -254,7 +281,26 @@ fn strict_state_fields(value: &serde_json::Value) -> Result<(), &'static str> {
 }
 
 fn strict_envelope_fields(value: &serde_json::Value) -> Result<(), &'static str> {
-    strict_state_fields(value.get("before").ok_or("malformed_envelope")?)
+    strict_state_fields(value.get("before").ok_or("malformed_envelope")?)?;
+    if value["operation"]["kind"] == "media_control" {
+        let resolved = value["operation"]["resolved_media"]
+            .as_object()
+            .ok_or("malformed_envelope")?;
+        if resolved.len() != 2
+            || !resolved.contains_key("media_id")
+            || !resolved.contains_key("duration_ms")
+        {
+            return Err("malformed_envelope");
+        }
+    }
+    if value["operation"]["kind"] == "lifecycle"
+        && !value["operation"]
+            .as_object()
+            .is_some_and(|operation| operation.contains_key("server_time_ms"))
+    {
+        return Err("malformed_envelope");
+    }
+    Ok(())
 }
 
 pub fn decode_envelope(bytes: &[u8]) -> Result<Envelope, &'static str> {
@@ -293,7 +339,7 @@ pub fn decode_window(bytes: &[u8]) -> Result<Window, &'static str> {
         }
     }
     let window: Window = serde_json::from_slice(bytes).map_err(|_| "malformed_window")?;
-    if window.format_version != FORMAT_VERSION || window.reducer_version != REDUCER_VERSION {
+    if !supported_version(window.format_version, &window.reducer_version) {
         return Err("unsupported_window_version");
     }
     if window.captured_at_ms < 0 || window.events.iter().any(|event| event.recorded_at_ms < 0) {
@@ -370,7 +416,17 @@ fn validate_command(command: &SafeCommand) -> Result<(), &'static str> {
 }
 
 fn validate_envelope(envelope: &Envelope) -> Result<(), &'static str> {
-    if envelope.schema_version != FORMAT_VERSION || envelope.reducer_version != REDUCER_VERSION {
+    if !supported_version(envelope.schema_version, &envelope.reducer_version) {
+        return Err("unsupported_envelope_version");
+    }
+    if envelope.schema_version == LEGACY_FORMAT_VERSION
+        && matches!(
+            envelope.operation,
+            Operation::MediaControl { .. }
+                | Operation::Lifecycle { .. }
+                | Operation::ServerRestart { .. }
+        )
+    {
         return Err("unsupported_envelope_version");
     }
     validate_state(&envelope.before)?;
@@ -383,6 +439,25 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), &'static str> {
         } => {
             validate_command(command)?;
             if !server_time_ms.is_finite() || *server_time_ms < 0.0 {
+                return Err("invalid_event_time");
+            }
+        }
+        Operation::MediaControl {
+            command,
+            server_time_ms,
+            resolved_media,
+        } => {
+            validate_command(command)?;
+            if !server_time_ms.is_finite() || *server_time_ms < 0.0 {
+                return Err("invalid_event_time");
+            }
+            resolved_media.validate()?;
+        }
+        Operation::Lifecycle {
+            server_time_ms: Some(time),
+            ..
+        } => {
+            if !time.is_finite() || *time < 0.0 {
                 return Err("invalid_event_time");
             }
         }
@@ -515,6 +590,9 @@ fn verify_event(window: &Window, event: &Event) -> Result<StepKind, IssueCode> {
     validate_state(after).map_err(envelope_error)?;
     let envelope = event.envelope.as_ref().ok_or(IssueCode::Legacy)?;
     validate_envelope(envelope).map_err(envelope_error)?;
+    if envelope.schema_version > window.format_version {
+        return Err(IssueCode::UnsupportedVersion);
+    }
     if after.room_id != window.room_id || envelope.before.room_id != window.room_id {
         return Err(IssueCode::WrongRoom);
     }
@@ -585,6 +663,18 @@ fn verify_event(window: &Window, event: &Event) -> Result<StepKind, IssueCode> {
             }
             Ok(StepKind::Verified)
         }
+        Operation::MediaControl { .. }
+        | Operation::Lifecycle { .. }
+        | Operation::ServerRestart { .. } => {
+            let (next, lifecycle) = transitions::apply(envelope)?;
+            if &next != after {
+                return Err(IssueCode::CommittedStateMismatch);
+            }
+            if lifecycle != envelope.lifecycle_after {
+                return Err(IssueCode::LifecycleMismatch);
+            }
+            Ok(StepKind::Verified)
+        }
         Operation::Checkpoint { reason, command } => {
             if !checkpoint_valid(envelope, after, *reason, command) {
                 return Err(IssueCode::InvalidCheckpoint);
@@ -619,24 +709,23 @@ pub fn verify(window: &Window) -> Report {
         }
         report.continuous = false;
     };
-    let fatal =
-        if window.format_version != FORMAT_VERSION || window.reducer_version != REDUCER_VERSION {
-            Some(IssueCode::UnsupportedVersion)
-        } else if window.events.len() > MAX_EVENTS {
-            Some(IssueCode::OversizedWindow)
-        } else if window.captured_at_ms < 0 {
-            Some(IssueCode::InvalidMetadata)
-        } else if validate_state(&window.snapshot).is_err() {
-            Some(IssueCode::InvalidState)
-        } else if window.snapshot.room_id != window.room_id {
-            Some(IssueCode::WrongRoom)
-        } else if validate_lifecycle(window.lifecycle).is_err() {
-            Some(IssueCode::InvalidLifecycle)
-        } else if !serde_json::to_vec(window).is_ok_and(|bytes| bytes.len() <= MAX_BUNDLE_BYTES) {
-            Some(IssueCode::OversizedWindow)
-        } else {
-            None
-        };
+    let fatal = if !supported_version(window.format_version, &window.reducer_version) {
+        Some(IssueCode::UnsupportedVersion)
+    } else if window.events.len() > MAX_EVENTS {
+        Some(IssueCode::OversizedWindow)
+    } else if window.captured_at_ms < 0 {
+        Some(IssueCode::InvalidMetadata)
+    } else if validate_state(&window.snapshot).is_err() {
+        Some(IssueCode::InvalidState)
+    } else if window.snapshot.room_id != window.room_id {
+        Some(IssueCode::WrongRoom)
+    } else if validate_lifecycle(window.lifecycle).is_err() {
+        Some(IssueCode::InvalidLifecycle)
+    } else if !serde_json::to_vec(window).is_ok_and(|bytes| bytes.len() <= MAX_BUNDLE_BYTES) {
+        Some(IssueCode::OversizedWindow)
+    } else {
+        None
+    };
     if let Some(code) = fatal {
         issue(&mut report, None, None, code);
         report.unverifiable_steps = window.events.len();

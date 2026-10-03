@@ -55,6 +55,10 @@ pub struct Identity {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Metadata {
+    // Same closed Worker identity shape. Legacy omission proves only an
+    // original-equals-final URL; never strip this field during grant handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_target_sha256: Option<String>,
     etag: Option<String>,
     modified: Option<String>,
     reliable_modified: bool,
@@ -190,6 +194,16 @@ impl Identity {
         self.version == 1
             && self.class.as_deref() == Some("binary")
             && !self.changed
+            && self
+                .metadata
+                .final_target_sha256
+                .as_ref()
+                .is_none_or(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
             && self.metadata.size.is_some()
             && self.metadata.modified.as_deref().is_none_or(canonical_date)
             && if let Some(etag) = &self.metadata.etag {
@@ -412,7 +426,7 @@ pub async fn mark_root(
         || resource["transport"] != "progressive"
         || !current_metadata
         || !hls_supported
-        || !playback_plan::local_fallbacks(meta, mode, 0.0, true, true)
+        || !playback_plan::legacy_mapped_fallbacks(meta, None, mode, 0.0, true, true)
             .contains(&protocol::DecoderFallbackMode::Transcode)
         || meta["format"]["format_name"]
             .as_str()
@@ -473,7 +487,7 @@ pub async fn claim(
     // Worker always takes HTTP fence before session locks. Final observation
     // and retirement follow that order in this same transaction.
     http_representation::guard(tx, parent).await?;
-    let grant = playback_observations::lock_grant(tx, parent, user)
+    let grant = playback_observations::lock_grant(tx, parent, user, &context.login_hash)
         .await?
         .ok_or_else(invalid_grant)?;
     let row = &grant.row;
@@ -735,6 +749,66 @@ mod tests {
     }
 
     #[test]
+    fn final_destination_digest_survives_frozen_candidate_and_claim_round_trips() {
+        let legacy = identity();
+        let legacy_wire = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_wire["metadata"].get("final_target_sha256").is_none());
+        assert!(
+            serde_json::from_value::<Identity>(legacy_wire)
+                .unwrap()
+                .eligible()
+        );
+        let mut redirected = identity();
+        let final_digest = hash("https://cdn.invalid/file?signature=private");
+        redirected.metadata.final_target_sha256 = Some(final_digest.clone());
+        assert!(redirected.eligible());
+        let original = hash("https://source.invalid/root");
+        let candidate = CandidateExpectation {
+            target_sha256: original.clone(),
+            identity: redirected.clone(),
+            expires: 123,
+        };
+        let candidate: CandidateExpectation =
+            serde_json::from_value(serde_json::to_value(candidate).unwrap()).unwrap();
+        assert_eq!(candidate.identity, redirected);
+        let claim = Claim {
+            parent: Uuid::nil(),
+            target_sha256: original,
+            identity: candidate.identity,
+            deadline_ms: 123_000.0,
+            audio: Audio { index: None },
+        };
+        let serialized = serde_json::to_string(&claim).unwrap();
+        assert!(!serialized.contains("signature"));
+        assert!(!serialized.contains("private"));
+        let claim: Claim = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            claim.identity.metadata.final_target_sha256,
+            Some(final_digest)
+        );
+        assert_ne!(claim.identity.metadata, legacy.metadata);
+        let mut changed = redirected.clone();
+        changed.metadata.final_target_sha256 =
+            Some(hash("https://cdn.invalid/file?signature=rotated"));
+        assert_ne!(
+            redirected.metadata, changed.metadata,
+            "identical ETags cannot erase final resource identity"
+        );
+        for invalid in [
+            "",
+            "private",
+            &"0".repeat(63),
+            &"0".repeat(65),
+            &"A".repeat(64),
+            &"g".repeat(64),
+        ] {
+            let mut invalid_identity = redirected.clone();
+            invalid_identity.metadata.final_target_sha256 = Some(invalid.into());
+            assert!(!invalid_identity.eligible());
+        }
+    }
+
+    #[test]
     fn target_matches_worker_fragment_normalization_without_rewriting_queries() {
         let plain = target(&json!({"url":"https://source.invalid/file?b=2&a=1"})).unwrap();
         assert_eq!(
@@ -974,7 +1048,7 @@ mod tests {
     async fn isolated_atomic_claim_contract() {
         let app = test_app().await;
         // Initial opt-in is global on the client. Non-HTTP reservations keep
-        // legacy admission without requiring a login hash or HTTP context.
+        // their provider path, but universal origin admission still needs login.
         for kind in ["local", "agent", "jellyfin", "emby"] {
             let f = fixture(&app).await;
             sqlx::query("UPDATE sources SET kind=$2 WHERE id=(SELECT source_id FROM media_items WHERE id=(SELECT media_id FROM playback_sessions WHERE id=$1))")
@@ -983,7 +1057,9 @@ mod tests {
             request.idempotency_key = Some(Uuid::new_v4());
             request.viewer_id = Some(Uuid::new_v4());
             let super::super::Start::Reserved(reservation) =
-                super::super::begin(&app, f.user, &request).await.unwrap()
+                super::super::begin_authenticated(&app, f.user, &request, Some(&f.login))
+                    .await
+                    .unwrap()
             else {
                 panic!("non-HTTP reservation");
             };
@@ -1291,7 +1367,7 @@ mod tests {
             expires,
         });
         let candidates = media_core::capabilities::candidates(
-            &json!({"streams":[{"codec_type":"video","codec_name":"h264"}]}),
+            &json!({"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p"}]}),
             None,
             0.0,
         )

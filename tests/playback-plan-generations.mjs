@@ -5,6 +5,7 @@ import { writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
 import { delay } from "./fixtures/server.mjs";
+import { testLoginHash } from "./fixtures/playback-admission.mjs";
 
 const report = { schema_version: 1, checks: [], status: "running" };
 let fixture;
@@ -383,7 +384,7 @@ try {
       setMedia(capRoom.id);
       const capViewer = "00000000-0000-4000-8000-000000000001";
       f.sql(
-        `INSERT INTO playback_viewer_plans(user_id,room_id,viewer_id,plan_generation) SELECT '${identity.id}','${capRoom.id}',('00000000-0000-4000-8000-' || lpad(i::text,12,'0'))::uuid,1 FROM generate_series(1,1024) i`,
+        `INSERT INTO playback_viewer_plans(user_id,room_id,viewer_id,plan_generation,auth_login_hash) SELECT '${identity.id}','${capRoom.id}',('00000000-0000-4000-8000-' || lpad(i::text,12,'0'))::uuid,1,'${testLoginHash(f,admin)}' FROM generate_series(1,1024) i`,
       );
       const cappedKey = randomUUID(),
         cappedViewer = randomUUID();

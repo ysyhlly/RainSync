@@ -470,10 +470,10 @@ async fn retire(pool: &PgPool) -> anyhow::Result<()> {
     bounded(async {
         let mut db = Database::acquire(pool).await?;
         let mut tx = db.transaction().await?;
-        sqlx::query("UPDATE playback_sessions p SET stopped=true FROM media_items m JOIN sources s ON s.id=m.source_id WHERE p.media_id=m.id AND NOT p.stopped AND s.kind IN('jellyfin','emby') AND NOT playback_source_allowed(p.media_id,p.resource)")
+        sqlx::query("UPDATE playback_sessions p SET stopped=true FROM media_items m JOIN sources s ON s.id=m.source_id WHERE p.media_id=m.id AND NOT p.stopped AND ((p.auth_login_hash IS NOT NULL AND NOT playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch)) OR (s.kind IN('jellyfin','emby') AND NOT playback_source_allowed(p.media_id,p.resource)))")
             .execute(&mut *tx).await?;
         let job_health = cancel_jobs(&mut *tx, CancellationScope::StoppedSessions).await?;
-        sqlx::query("UPDATE upstream_reservations u SET state='closing',close_reason=COALESCE(close_reason,CASE WHEN EXISTS(SELECT 1 FROM sources s WHERE s.id=u.source_id AND s.access_policy_revision=u.source_policy_revision) THEN 'upstream_policy_changed' ELSE 'source_changed' END),cleanup_after=COALESCE(cleanup_after,clock_timestamp()),cleanup_deadline=COALESCE(cleanup_deadline,clock_timestamp()+interval '60 seconds'),updated_at=clock_timestamp() WHERE u.state IN('preparing','active') AND NOT source_account_policy_allowed(u.source_id,u.source_policy_revision,u.account_policy_generation)")
+        sqlx::query("UPDATE upstream_reservations u SET state='closing',close_reason=COALESCE(close_reason,CASE WHEN EXISTS(SELECT 1 FROM sources s WHERE s.id=u.source_id AND s.access_policy_revision=u.source_policy_revision) THEN 'upstream_policy_changed' ELSE 'source_changed' END),cleanup_after=COALESCE(cleanup_after,clock_timestamp()),cleanup_deadline=COALESCE(cleanup_deadline,clock_timestamp()+interval '60 seconds'),updated_at=clock_timestamp() WHERE u.state IN('preparing','active') AND (NOT playback_origin_allowed(u.user_id,u.room_id,u.auth_login_hash,u.auth_membership_epoch) OR NOT source_account_policy_allowed(u.source_id,u.source_policy_revision,u.account_policy_generation))")
             .execute(&mut *tx).await?;
         let observation = job_health.into_commit_observation();
         tx.commit().await?;

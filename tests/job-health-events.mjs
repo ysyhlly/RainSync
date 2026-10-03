@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
 import { sourceMedia } from "./fixtures/source-grant.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 import { delay } from "./fixtures/server.mjs";
 import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
 
@@ -40,7 +41,7 @@ for (const path of ["crates/media-core/src/job_health.rs", "crates/persistence/s
   "apps/server/src/media.rs", "apps/server/src/room_lifecycle.rs", "crates/persistence/src/lib.rs"])
   assert.ok(binding.source.some((item) => item.path === path), `Bound producer/helper source ${path}`);
 const coordinator = await Promise.all(["tests/job-health-events.mjs", "tests/fixtures/server.mjs",
-  "tests/fixtures/media-stack.mjs", "tests/fixtures/postgres.mjs", "tests/fixtures/source-grant.mjs"]
+  "tests/fixtures/media-stack.mjs", "tests/fixtures/postgres.mjs", "tests/fixtures/source-grant.mjs", "tests/fixtures/playback-admission.mjs"]
   .map(async (path) => ({ path, sha256: digest(await readFile(resolve(repo, path))) })));
 async function hashFile(path) {
   const hash = createHash("sha256");
@@ -286,11 +287,12 @@ try {
       const nonce = randomBytes(12), cipher = createCipheriv("aes-256-gcm", Buffer.from(f.env.SOURCE_ENCRYPTION_KEY, "base64"), nonce);
       return Buffer.concat([nonce, cipher.update(JSON.stringify(value)), cipher.final(), cipher.getAuthTag()]).toString("base64");
     };
+    // Synthetic job state bypasses preparation, never current login provenance.
     const legacy = (where, path, maximum = 2) => {
       const id = randomUUID(), token = randomBytes(24).toString("hex");
       const resource = { kind: "http", job_id: id, url: `http://127.0.0.1:${upstreamPort}${path}`, headers: {} };
       const mediaId = sourceMedia(f, resource);
-      f.sql(`INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES(${quote(id)},${quote(identity.id)},${quote(where.id)},${quote(mediaId)},1,${quote(digest(token))},${quote(JSON.stringify({ encrypted: encrypt(resource) }))}::jsonb,clock_timestamp()+interval '1 hour'); INSERT INTO media_jobs(id,session_id,status,spec,max_attempts) VALUES(${quote(id)},${quote(id)},'queued',${quote(JSON.stringify({ input_ticket: encrypt({ token }), source_kind: "http", transcode: true, start_seconds: 0, estimated_output_bytes: 65536 }))}::jsonb,${maximum})`);
+      withPlaybackAdmission(f, { client: admin, user: identity.id, room: where.id, session: id }, `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES(${quote(id)},${quote(identity.id)},${quote(where.id)},${quote(mediaId)},1,${quote(digest(token))},${quote(JSON.stringify({ encrypted: encrypt(resource) }))}::jsonb,clock_timestamp()+interval '1 hour'); INSERT INTO media_jobs(id,session_id,status,spec,max_attempts) VALUES(${quote(id)},${quote(id)},'queued',${quote(JSON.stringify({ input_ticket: encrypt({ token }), source_kind: "http", transcode: true, start_seconds: 0, estimated_output_bytes: 65536 }))}::jsonb,${maximum})`);
       return id;
     };
     await check("actual Worker expiry normalization and transport retry expose committed fixed counts", async () => {

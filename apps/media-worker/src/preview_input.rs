@@ -64,6 +64,7 @@ struct Target {
     url: String,
     depth: u8,
     kind: Option<hls_manifest::Kind>,
+    final_target_sha256: Option<String>,
 }
 #[derive(Default)]
 struct Targets {
@@ -101,7 +102,15 @@ impl Targets {
         );
         let key = Uuid::new_v4();
         self.by_url.insert((url.clone(), depth), key);
-        self.by_key.insert(key, Target { url, depth, kind });
+        self.by_key.insert(
+            key,
+            Target {
+                url,
+                depth,
+                kind,
+                final_target_sha256: None,
+            },
+        );
         Ok(key)
     }
 }
@@ -316,7 +325,7 @@ async fn remote(
     let mut cancel = grant.cancel.subscribe();
     let mut req = tokio::select! {biased;
         _=cancel.changed()=>return Err((StatusCode::UNAUTHORIZED,"invalid_resource".into())),
-        result=providers::source_request(&config,target.as_str(),if head {reqwest::Method::HEAD}else{reqwest::Method::GET},&config.headers)=>result.map_err(failure)?,
+        result=providers::source_media_request(&config,target.as_str(),if head {reqwest::Method::HEAD}else{reqwest::Method::GET},&config.headers)=>result.map_err(failure)?,
     };
     if !head {
         for name in [header::RANGE, header::IF_RANGE] {
@@ -344,6 +353,32 @@ async fn remote(
         _ = cancel.changed() => return Err((StatusCode::UNAUTHORIZED, "invalid_resource".into())),
         response = req.send() => response.map_err(failure)?,
     };
+    // Bind the exact final destination before comparing validators or exposing
+    // any bytes. Equal ETags on different URLs do not prove equal resources.
+    // This also bounds mutable playlist redirects; signed query changes require
+    // a new attempt rather than guessing which parameters are authentication.
+    if response.status().is_success() || response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        let digest = hash(response.url().as_str());
+        let mut targets = grant.targets.lock().unwrap();
+        let key = targets
+            .by_url
+            .get(&(registration.url.clone(), registration.depth))
+            .copied()
+            .ok_or_else(|| failure("invalid_resource"))?;
+        let registered = targets
+            .by_key
+            .get_mut(&key)
+            .ok_or_else(|| failure("invalid_resource"))?;
+        if registered
+            .final_target_sha256
+            .as_ref()
+            .is_some_and(|old| old != &digest)
+        {
+            grant.stop();
+            return Err((StatusCode::CONFLICT, "source_changed".into()));
+        }
+        registered.final_target_sha256 = Some(digest);
+    }
     if response.status() == StatusCode::PRECONDITION_FAILED {
         grant.stop();
         return Err((StatusCode::CONFLICT, "source_changed".into()));
@@ -382,10 +417,11 @@ async fn remote(
     }
     http_delivery::validate_range_response(response.status(), response.headers())
         .map_err(failure)?;
+    let final_target = response.url().clone();
     let response_status = response.status();
     let response_headers = response.headers().clone();
     let mut playlist = registration.kind == Some(hls_manifest::Kind::Playlist)
-        || target.path().ends_with(".m3u8")
+        || final_target.path().ends_with(".m3u8")
         || response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -536,7 +572,7 @@ async fn remote(
             .references()
             .iter()
             .map(|reference| {
-                let joined = target.join(reference.uri).map_err(failure)?;
+                let joined = final_target.join(reference.uri).map_err(failure)?;
                 let joined = providers::validate_url(joined.as_str()).map_err(failure)?;
                 if access.authorize_url(joined.as_str()).is_err() {
                     return Err((StatusCode::FORBIDDEN, "cross_origin_media_rejected".into()));
@@ -695,6 +731,177 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         source_task.abort();
         forbidden_task.abort();
+    }
+
+    fn redirect_grant(source: &str, cdn: &str) -> (Arc<Grant>, Lifecycle) {
+        let (cancel, _) = watch::channel(false);
+        Registry::default().register(attempt(), json!({"url":format!("{source}/root"),"source_url":source,
+            "headers":{"Authorization":"Bearer fixture", "Cookie":"fixture=secret", "X-Source-Key":"fixture-secret"},
+            "access_policy":{"schema_version":1,"origins":[
+                {"origin":source,"cidrs":["127.0.0.1/32"]},{"origin":cdn,"cidrs":["127.0.0.1/32"]}
+            ],"redirects":{"max_hops":5}}}), 16 * 1024 * 1024, cancel)
+    }
+
+    #[tokio::test]
+    async fn opted_in_redirect_uses_final_manifest_base_and_checks_every_child_request() {
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = requests.clone();
+        let (cdn, cdn_task) = origin(axum::Router::new().fallback(move |uri: axum::http::Uri, headers: HeaderMap| {
+            let seen=seen.clone();
+            async move {
+                assert!(!headers.contains_key(header::AUTHORIZATION));
+                assert!(!headers.contains_key(header::COOKIE));
+                assert!(!headers.contains_key("x-source-key"));
+                seen.lock().unwrap().push(uri.to_string());
+                match uri.path() {
+                    "/nested/master.m3u8" => Response::new(Body::from("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nchild/list.m3u8\n")),
+                    "/nested/child/list.m3u8" => Response::new(Body::from("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:1,\nsegment.ts\n#EXT-X-ENDLIST\n")),
+                    "/nested/child/key.bin" => Response::builder().header(header::CONTENT_LENGTH,16).body(Body::from(vec![7;16])).unwrap(),
+                    "/nested/child/segment.ts" => Response::builder().status(302).header(header::LOCATION,"http://unauthorized.invalid/private?signature=never-log").body(Body::empty()).unwrap(),
+                    _ => Response::new(Body::from("fixture-init")),
+                }
+            }
+        })).await;
+        let location = format!("{cdn}/nested/master.m3u8?signature=fixture");
+        let (source, source_task) =
+            origin(axum::Router::new().fallback(move |headers: HeaderMap| {
+                let location = location.clone();
+                async move {
+                    assert_eq!(headers[header::AUTHORIZATION], "Bearer fixture");
+                    Response::builder()
+                        .status(302)
+                        .header(header::LOCATION, location)
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            }))
+            .await;
+        let (grant, _lifecycle) = redirect_grant(&source, &cdn);
+        let root = format!("{source}/root");
+        let result = remote(
+            &client(),
+            grant.clone(),
+            target(&grant, &root),
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        let rewritten = axum::body::to_bytes(result.into_body(), 4096)
+            .await
+            .unwrap();
+        let rewritten = String::from_utf8(rewritten.to_vec()).unwrap();
+        assert!(!rewritten.contains(&cdn));
+        assert!(!rewritten.contains("signature"));
+        let child = format!("{cdn}/nested/child/list.m3u8");
+        assert!(
+            grant
+                .targets
+                .lock()
+                .unwrap()
+                .by_url
+                .contains_key(&(child.clone(), 1))
+        );
+        let child_registration = {
+            let targets = grant.targets.lock().unwrap();
+            targets.by_key[&targets.by_url[&(child.clone(), 1)]].clone()
+        };
+        remote(
+            &client(),
+            grant.clone(),
+            child_registration,
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        for (path, kind) in [
+            ("init.mp4", hls_manifest::Kind::Initialization),
+            ("key.bin", hls_manifest::Kind::Key),
+            ("segment.ts", hls_manifest::Kind::Segment),
+        ] {
+            let child = format!("{cdn}/nested/child/{path}");
+            let registration = {
+                let targets = grant.targets.lock().unwrap();
+                targets.by_key[&targets.by_url[&(child, 2)]].clone()
+            };
+            assert_eq!(registration.kind, Some(kind));
+            let result = remote(
+                &client(),
+                grant.clone(),
+                registration,
+                &HeaderMap::new(),
+                false,
+            )
+            .await;
+            if path == "segment.ts" {
+                assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+        assert_eq!(requests.lock().unwrap().len(), 5);
+        source_task.abort();
+        cdn_task.abort();
+    }
+
+    #[tokio::test]
+    async fn redirect_final_destination_changes_revoke_preview_even_with_equal_etags() {
+        let destination = Arc::new(Mutex::new("/stable?signature=one".to_owned()));
+        let (cdn, cdn_task) = origin(axum::Router::new().fallback(|| async {
+            Response::builder()
+                .header(header::ETAG, "\"same\"")
+                .header(header::CONTENT_LENGTH, 6)
+                .body(Body::from("binary"))
+                .unwrap()
+        }))
+        .await;
+        let selected = destination.clone();
+        let edge = cdn.clone();
+        let (source, source_task) = origin(axum::Router::new().fallback(move || {
+            let location = format!("{}{}", edge, selected.lock().unwrap());
+            async move {
+                Response::builder()
+                    .status(302)
+                    .header(header::LOCATION, location)
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        }))
+        .await;
+        let root = format!("{source}/root");
+        let (grant, _lifecycle) = redirect_grant(&source, &cdn);
+        for _ in 0..2 {
+            let response = remote(
+                &client(),
+                grant.clone(),
+                target(&grant, &root),
+                &HeaderMap::new(),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 16)
+                    .await
+                    .unwrap(),
+                "binary"
+            );
+        }
+        *destination.lock().unwrap() = "/stable?signature=two".into();
+        let result = remote(
+            &client(),
+            grant.clone(),
+            target(&grant, &root),
+            &HeaderMap::new(),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(result, (StatusCode::CONFLICT, "source_changed".into()));
+        assert!(*grant.cancel.borrow());
+        source_task.abort();
+        cdn_task.abort();
     }
 
     #[tokio::test]

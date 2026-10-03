@@ -63,5 +63,7 @@ jobs:
       - run: npm run test:chat
       - run: node tests/playlist-scan.mjs
       - run: npx playwright install --with-deps chromium && npm run test:e2e
+      - name: Verify independent browser measurement driver
+        run: RAINSYNC_PLAYWRIGHT_MODULE="$PWD/node_modules/@playwright/test/index.mjs" node --test tests/acceptance-browser.test.mjs
       - run: npm run test:browser-real
       - run: node tests/playlist-real.mjs

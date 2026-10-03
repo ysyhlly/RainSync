@@ -5,7 +5,9 @@ use uuid::Uuid;
 pub mod cache;
 pub mod cache_budget;
 pub mod cache_outputs;
+mod cache_writers;
 pub mod http_file_authorization;
+pub mod media_authorization;
 pub mod media_executions;
 pub mod media_job_timing;
 pub mod media_jobs;
@@ -16,11 +18,25 @@ pub mod room_cleanup;
 pub mod room_diagnostics;
 pub mod room_lifecycle;
 pub mod source_account_policy;
+pub mod static_hls;
+pub mod static_hls_activation;
+pub mod static_hls_pending;
 pub mod upstream_reservations;
 
 pub async fn connect(url: &str) -> Result<PgPool> {
     Ok(PgPoolOptions::new()
         .max_connections(12)
+        // Custom GUC is established on every physical connection, including
+        // replacements. It is purpose-specific and leaves NULL legacy grants
+        // unchanged; frozen old binaries do not inherit it from this pool.
+        .after_connect(|connection, _| {
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('rainsync.static_hls_reader','1',false)")
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(url)
         .await?)
 }
@@ -142,40 +158,60 @@ pub async fn previous(
 }
 pub async fn commit(
     pool: &PgPool,
-    state: &RoomState,
     command: &Command,
     user: Uuid,
-    previous_revision: u32,
-    actor_is_admin: bool,
+    session_hash: &str,
     server_time_ms: f64,
-) -> Result<()> {
+    resolved_media: Option<room_core::diagnostics::ResolvedMedia>,
+) -> Result<RoomState> {
+    let previous_revision = command.expected_revision;
     let mut tx = pool.begin().await?;
     // Match room management's room -> snapshot lock order before inserting
     // rows whose foreign keys also need a key-share lock on rooms.
-    let lifecycle_epoch = room_lifecycle::lock_active(&mut tx, state.room_id).await?;
+    let lifecycle_epoch = room_lifecycle::lock_active(&mut tx, command.room_id).await?;
     // Validate wall-clock expiry after acquiring the state lock, so a command
     // that expired while waiting cannot execute when that lock is released.
     let current: serde_json::Value =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
-            .bind(state.room_id)
+            .bind(command.room_id)
             .fetch_one(&mut *tx)
             .await?;
-    lock_membership(&mut tx, state.room_id, user).await?;
-    check_control_epoch(&mut *tx, state.room_id, user, command.control_epoch).await?;
-    // A management transaction can replace controller ownership outside the
-    // in-memory playback actor. Never commit a reduction against an old owner.
+    lock_membership(&mut tx, command.room_id, user).await?;
+    check_control_epoch(&mut *tx, command.room_id, user, command.control_epoch).await?;
+    // Match the REST gate's room -> snapshot -> member -> user -> session
+    // ordering. SHARE also blocks non-key admin/expiry updates; KEY SHARE
+    // would only protect against deletion. Never use the socket's cached role.
+    let actor_is_admin: Option<bool> =
+        sqlx::query_scalar("SELECT admin FROM users WHERE id=$1 FOR SHARE")
+            .bind(user)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let login: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM sessions WHERE token_hash=$1 AND user_id=$2 FOR SHARE",
+    )
+    .bind(session_hash)
+    .bind(user)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let actor_is_admin = actor_is_admin
+        .filter(|_| login.is_some())
+        .ok_or_else(|| anyhow::anyhow!("session_expired"))?;
+    check_control_login(&mut tx, user, session_hash).await?;
+    // Ownership and role can change while the actor or these locks wait.
+    // Compute both the committed state and its diagnostic with the same
+    // admitted authorization, rather than accepting an optimistic reduction.
     let current: RoomState = serde_json::from_value(current)?;
-    if current.revision != previous_revision {
-        bail!("revision_conflict");
+    let mut state = room_core::reduce(&current, command, user, actor_is_admin, server_time_ms)
+        .map_err(anyhow::Error::msg)?;
+    if let Some(resolved) = &resolved_media {
+        state.media_id = Some(resolved.media_id);
+        state.duration_ms = resolved.duration_ms;
     }
-    if current.controller_user_id != state.controller_user_id {
-        bail!("controller_required");
-    }
-    let value = serde_json::to_value(state)?;
+    let value = serde_json::to_value(&state)?;
     let result = sqlx::query(
         "UPDATE room_snapshots SET state=$2 WHERE room_id=$1 AND (state->>'revision')::bigint=$3",
     )
-    .bind(state.room_id)
+    .bind(command.room_id)
     .bind(&value)
     .bind(i64::from(previous_revision))
     .execute(&mut *tx)
@@ -186,23 +222,28 @@ pub async fn commit(
     // The snapshot lock is shared with playlist mutation; play-and-enqueue is atomic.
     if let protocol::Action::ChangeMedia { media_id } = command.action {
         sqlx::query("INSERT INTO playlist_items SELECT $1,$2,$3,COALESCE(max(sort_order),0)+1 FROM playlist_items WHERE room_id=$2 HAVING NOT EXISTS(SELECT 1 FROM playlist_items WHERE room_id=$2 AND media_id=$3)")
-            .bind(Uuid::new_v4()).bind(state.room_id).bind(media_id).execute(&mut *tx).await?;
+            .bind(Uuid::new_v4()).bind(command.room_id).bind(media_id).execute(&mut *tx).await?;
     }
-    use room_core::diagnostics::{CheckpointReason, Operation, SafeCommand};
+    use room_core::diagnostics::{Operation, SafeCommand};
     let safe_command = SafeCommand::from_command(command);
     let operation = match command.action {
-        protocol::Action::ChangeMedia { .. } => Operation::Checkpoint {
-            reason: CheckpointReason::MediaChanged,
-            command: Some(safe_command),
-        },
-        protocol::Action::EndMedia { .. } => Operation::Checkpoint {
-            reason: CheckpointReason::MediaAdvanced,
-            command: Some(safe_command),
-        },
-        _ => Operation::Control {
-            command: safe_command,
-            server_time_ms,
-        },
+        protocol::Action::ChangeMedia { .. } | protocol::Action::EndMedia { .. } => {
+            Operation::MediaControl {
+                command: safe_command,
+                server_time_ms,
+                resolved_media: resolved_media
+                    .ok_or_else(|| anyhow::anyhow!("missing_resolved_media_fact"))?,
+            }
+        }
+        _ => {
+            if resolved_media.is_some() {
+                bail!("unexpected_resolved_media_fact");
+            }
+            Operation::Control {
+                command: safe_command,
+                server_time_ms,
+            }
+        }
     };
     let lifecycle = room_diagnostics::lifecycle("active", lifecycle_epoch)?;
     let diagnostic = room_diagnostics::envelope(
@@ -213,30 +254,51 @@ pub async fn commit(
         lifecycle,
         operation,
     );
-    room_diagnostics::append(&mut tx, state, diagnostic).await?;
+    room_diagnostics::append(&mut tx, &state, diagnostic).await?;
     sqlx::query(
         "INSERT INTO command_results(room_id,command_id,user_id,state,request_payload) VALUES($1,$2,$3,$4,$5)",
     )
-    .bind(state.room_id)
+    .bind(command.room_id)
     .bind(command.command_id)
     .bind(user)
     .bind(value)
     .bind(serde_json::to_value(command)?)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("UPDATE playback_sessions SET stopped=true WHERE room_id=$1 AND generation<>$2 AND NOT stopped").bind(state.room_id).bind(i64::from(state.media_generation)).execute(&mut *tx).await?;
-    upstream_reservations::close_room(&mut tx, state.room_id, i64::from(state.media_generation))
+    sqlx::query("UPDATE playback_sessions SET stopped=true WHERE room_id=$1 AND generation<>$2 AND NOT stopped").bind(command.room_id).bind(i64::from(state.media_generation)).execute(&mut *tx).await?;
+    upstream_reservations::close_room(&mut tx, command.room_id, i64::from(state.media_generation))
         .await?;
     let job_health = media_job_timing::cancel_jobs(
         &mut *tx,
-        media_job_timing::CancellationScope::StoppedRoom(state.room_id),
+        media_job_timing::CancellationScope::StoppedRoom(command.room_id),
     )
     .await?;
     // Only the acknowledged logical transition is observed. Child-process
     // drainage remains owned by the existing execution supervisors/receipts.
     let job_health = job_health.into_commit_observation();
+    // Locks prevent logout and role mutation, not natural expiry during a
+    // later write/cleanup wait. Reject the whole transition at final admission.
+    check_control_login(&mut tx, user, session_hash).await?;
     tx.commit().await?;
     job_health.confirmed();
+    Ok(state)
+}
+
+async fn check_control_login(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: Uuid,
+    session_hash: &str,
+) -> Result<()> {
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>clock_timestamp())",
+    )
+    .bind(session_hash)
+    .bind(user)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !valid {
+        bail!("session_expired");
+    }
     Ok(())
 }
 pub mod media_previews;

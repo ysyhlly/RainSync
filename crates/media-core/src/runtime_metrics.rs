@@ -3,7 +3,8 @@
 use protocol::{
     ControlRecoveryMetricsSample, NAS_METRIC_MAX_ACTIVE, NasUplinkDelta, NasUplinkOutcomeTotals,
     NasUplinkTotals, PLAYBACK_METRICS_MAX_ELAPSED_MS, PlaybackMetricsFirstFrame,
-    PlaybackMetricsFrameEvidence, PlaybackMetricsOrigin, PlaybackMetricsTotals,
+    PlaybackMetricsFrameEvidence, PlaybackMetricsOrigin, PlaybackMetricsStartupPhases,
+    PlaybackMetricsTotals,
 };
 use std::fmt::Write;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -11,7 +12,12 @@ use std::time::Instant;
 
 pub const MAX_ACTIVE_TRANSFERS: usize = 1024;
 /// Fixed aggregate storage, including the two separately named report families.
-pub const MAX_METRIC_SNAPSHOT_BYTES: usize = 4096;
+pub const MAX_METRIC_SNAPSHOT_BYTES: usize = 16_384;
+/// New startup series: 6 phase counters plus 6 sources × 4 modes × 2 evidence
+/// histogram sets (9 finite buckets + Inf + sum + count). No state expansion.
+pub const PLAYBACK_V2_MAX_ADDITIONAL_SERIES: usize = 6 + 6 * 4 * 2 * 12;
+/// Independent entry/evidence histogram, one queue-prefix histogram and coverage.
+pub const PLAYBACK_ENTRY_MAX_ADDITIONAL_SERIES: usize = 4 * 2 * 12 + 12 + 3;
 const BOUNDS_US: [u64; 9] = [
     10_000,
     50_000,
@@ -45,6 +51,99 @@ const CLIENT_DROP_REASONS: [&str; 5] = [
     "overflow",
 ];
 const CLIENT_BOUNDS_MS: [u64; 9] = [10, 50, 100, 500, 1_000, 5_000, 30_000, 120_000, 600_000];
+
+const CLIENT_PHASES: [&str; 3] = ["preparation", "loading", "unobserved"];
+const PLAYBACK_SOURCES: [&str; 6] = ["local", "http", "agent", "jellyfin", "emby", "unknown"];
+const PLAYBACK_MODES: [&str; 4] = ["direct", "remux", "transcode", "unknown"];
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaybackSource {
+    Local,
+    Http,
+    Agent,
+    Jellyfin,
+    Emby,
+    Unknown,
+}
+impl PlaybackSource {
+    pub fn label(self) -> &'static str {
+        PLAYBACK_SOURCES[self as usize]
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaybackMode {
+    Direct,
+    Remux,
+    Transcode,
+    Unknown,
+}
+impl PlaybackMode {
+    pub fn label(self) -> &'static str {
+        PLAYBACK_MODES[self as usize]
+    }
+}
+/// Server-resolved publication facts only, never labels accepted from a client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaybackAttribution {
+    pub source: PlaybackSource,
+    pub mode: PlaybackMode,
+}
+impl PlaybackAttribution {
+    pub fn from_publication(source: Option<&str>, mode: Option<&str>) -> Self {
+        Self {
+            source: match source {
+                Some("local") => PlaybackSource::Local,
+                Some("http") => PlaybackSource::Http,
+                Some("agent") => PlaybackSource::Agent,
+                Some("jellyfin") => PlaybackSource::Jellyfin,
+                Some("emby") => PlaybackSource::Emby,
+                _ => PlaybackSource::Unknown,
+            },
+            mode: match mode {
+                Some("direct") => PlaybackMode::Direct,
+                Some("remux") => PlaybackMode::Remux,
+                Some("transcode") => PlaybackMode::Transcode,
+                _ => PlaybackMode::Unknown,
+            },
+        }
+    }
+}
+const WORKER_ENTRY_AVAILABILITY: [&str; 4] = ["cold_waiting", "warm", "not_applicable", "unknown"];
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerOutputEntryAvailability {
+    ColdWaiting,
+    Warm,
+    NotApplicable,
+    Unknown,
+}
+impl WorkerOutputEntryAvailability {
+    pub fn label(self) -> &'static str {
+        WORKER_ENTRY_AVAILABILITY[self as usize]
+    }
+    pub fn from_name(value: Option<&str>) -> Self {
+        match value {
+            Some("cold_waiting") => Self::ColdWaiting,
+            Some("warm") => Self::Warm,
+            Some("not_applicable") => Self::NotApplicable,
+            _ => Self::Unknown,
+        }
+    }
+}
+/// Server/Worker evidence frozen at the first eligible validated output response.
+/// Queue is overlapping with client startup, never a subtracted state category.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkerOutputEntry {
+    pub availability: WorkerOutputEntryAvailability,
+    pub queue_ms: Option<u32>,
+}
+#[derive(Clone, Copy, Default)]
+struct StartupAggregate {
+    phase_seen: [bool; 2],
+    phase_ms: [[u64; 3]; 2],
+    first_frames: [[[ClientHistogram; 2]; 4]; 6],
+    entry_frames: [[ClientHistogram; 2]; 4],
+    queue_prefix: ClientHistogram,
+    queue_coverage: [u64; 3],
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum Process {
@@ -185,6 +284,7 @@ struct Snapshot {
     failures: [u64; 4],
     failures_seen: bool,
     client_playback: [ClientPlaybackAggregate; 2],
+    client_startup: StartupAggregate,
     client_dropped: [u64; 5],
     control_recovery: [ControlRecoveryAggregate; 2],
     control_dropped: [u64; 7],
@@ -406,6 +506,29 @@ impl RuntimeMetrics {
         delta: &PlaybackMetricsTotals,
         first: Option<&PlaybackMetricsFirstFrame>,
     ) -> bool {
+        self.client_playback_sample_with_startup(origin, delta, first, None, None)
+    }
+    /// Phases are independent client coverage; attribution comes from the
+    /// immutable originating published grant. Commit all aggregate changes or none.
+    pub fn client_playback_sample_with_startup(
+        &self,
+        origin: PlaybackMetricsOrigin,
+        delta: &PlaybackMetricsTotals,
+        first: Option<&PlaybackMetricsFirstFrame>,
+        phases: Option<&PlaybackMetricsStartupPhases>,
+        attribution: Option<PlaybackAttribution>,
+    ) -> bool {
+        self.client_playback_sample_with_output(origin, delta, first, phases, attribution, None)
+    }
+    pub fn client_playback_sample_with_output(
+        &self,
+        origin: PlaybackMetricsOrigin,
+        delta: &PlaybackMetricsTotals,
+        first: Option<&PlaybackMetricsFirstFrame>,
+        phases: Option<&PlaybackMetricsStartupPhases>,
+        attribution: Option<PlaybackAttribution>,
+        output: Option<WorkerOutputEntry>,
+    ) -> bool {
         let values = delta.values();
         let elapsed_ms = values
             .iter()
@@ -417,6 +540,21 @@ impl RuntimeMetrics {
             && first.is_none_or(|frame| {
                 frame.elapsed_ms <= frame.confirmed_elapsed_ms
                     && frame.confirmed_elapsed_ms <= PLAYBACK_METRICS_MAX_ELAPSED_MS
+            });
+        let valid = valid
+            && phases.is_none_or(|phase| phase.sum() <= u64::from(PLAYBACK_METRICS_MAX_ELAPSED_MS))
+            && (attribution.is_none() || (phases.is_some() && first.is_some()))
+            && output.is_none_or(|entry| {
+                attribution.is_some()
+                    && first.is_some()
+                    && entry.queue_ms.is_none_or(|value| {
+                        value <= PLAYBACK_METRICS_MAX_ELAPSED_MS
+                            && matches!(
+                                entry.availability,
+                                WorkerOutputEntryAvailability::ColdWaiting
+                                    | WorkerOutputEntryAvailability::Warm
+                            )
+                    })
             });
         let mut state = lock(&self.inner);
         if !valid {
@@ -439,7 +577,50 @@ impl RuntimeMetrics {
             *count = count.saturating_add(1);
             return false;
         }
+        let mut startup = state.client_startup;
+        let update = (|| {
+            if let Some(phases) = phases {
+                startup.phase_seen[index] = true;
+                for (total, delta) in startup.phase_ms[index].iter_mut().zip(phases.values()) {
+                    *total = total.checked_add(u64::from(delta))?;
+                }
+            }
+            if let (Some(first), Some(attribution)) = (first, attribution) {
+                let evidence = match first.evidence {
+                    PlaybackMetricsFrameEvidence::VideoFrameCallback => 0,
+                    PlaybackMetricsFrameEvidence::PlayingTimeAdvance => 1,
+                };
+                startup.first_frames[attribution.source as usize][attribution.mode as usize]
+                    [evidence]
+                    .checked_observe(u64::from(first.elapsed_ms))?;
+            }
+            if let (Some(first), Some(entry)) = (first, output) {
+                let evidence = match first.evidence {
+                    PlaybackMetricsFrameEvidence::VideoFrameCallback => 0,
+                    PlaybackMetricsFrameEvidence::PlayingTimeAdvance => 1,
+                };
+                startup.entry_frames[entry.availability as usize][evidence]
+                    .checked_observe(u64::from(first.elapsed_ms))?;
+                let coverage = if let Some(queue_ms) = entry.queue_ms {
+                    startup.queue_prefix.checked_observe(u64::from(queue_ms))?;
+                    0
+                } else if entry.availability == WorkerOutputEntryAvailability::NotApplicable {
+                    1
+                } else {
+                    2
+                };
+                startup.queue_coverage[coverage] =
+                    startup.queue_coverage[coverage].checked_add(1)?;
+            }
+            Some(())
+        })();
+        if update.is_none() {
+            let count = &mut state.client_dropped[ClientMetricsDrop::Overflow as usize];
+            *count = count.saturating_add(1);
+            return false;
+        }
         state.client_playback[index] = next;
+        state.client_startup = startup;
         true
     }
     /// Count known loss at the receiver without storing identities or packets.
@@ -604,6 +785,79 @@ impl RuntimeMetrics {
                         frame.confirmation_lag,
                     );
                 }
+            }
+        }
+        if state.client_startup.phase_seen.iter().any(|seen| *seen) {
+            out.push_str("# HELP rainsync_client_reported_playback_startup_phase_milliseconds_total Cumulative client startup coverage through frame confirmation; independent of playback states and overlapping server queue.\n# TYPE rainsync_client_reported_playback_startup_phase_milliseconds_total counter\n");
+            for (index, origin) in CLIENT_ORIGINS.iter().enumerate() {
+                if state.client_startup.phase_seen[index] {
+                    for (phase, duration) in CLIENT_PHASES
+                        .iter()
+                        .zip(state.client_startup.phase_ms[index])
+                    {
+                        writeln!(out, "rainsync_client_reported_playback_startup_phase_milliseconds_total{{origin=\"{origin}\",phase=\"{phase}\"}} {duration}").unwrap();
+                    }
+                }
+            }
+            out.push_str("# HELP rainsync_client_reported_playback_first_frame_attributed_milliseconds Client first-frame evidence, attributed by its originating grant's server-frozen source and mode; absent history is unknown.\n# TYPE rainsync_client_reported_playback_first_frame_attributed_milliseconds histogram\n");
+            for (source_index, source) in PLAYBACK_SOURCES.iter().enumerate() {
+                for (mode_index, mode) in PLAYBACK_MODES.iter().enumerate() {
+                    for (evidence_index, evidence) in CLIENT_EVIDENCE.iter().enumerate() {
+                        let histogram = state.client_startup.first_frames[source_index][mode_index]
+                            [evidence_index];
+                        if histogram.count > 0 {
+                            let labels = format!(
+                                "source=\"{source}\",mode=\"{mode}\",evidence=\"{evidence}\""
+                            );
+                            render_client_histogram(
+                                &mut out,
+                                "rainsync_client_reported_playback_first_frame_attributed_milliseconds",
+                                &labels,
+                                histogram,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if state
+            .client_startup
+            .queue_coverage
+            .iter()
+            .any(|count| *count > 0)
+        {
+            out.push_str("# HELP rainsync_client_reported_playback_first_frame_worker_output_entry_milliseconds Client first-frame elapsed grouped only by initial Worker output-entry availability; not general cache hotness.\n# TYPE rainsync_client_reported_playback_first_frame_worker_output_entry_milliseconds histogram\n");
+            for (entry_index, availability) in WORKER_ENTRY_AVAILABILITY.iter().enumerate() {
+                for (evidence_index, evidence) in CLIENT_EVIDENCE.iter().enumerate() {
+                    let histogram = state.client_startup.entry_frames[entry_index][evidence_index];
+                    if histogram.count > 0 {
+                        let labels = format!(
+                            "entry_availability=\"{availability}\",evidence=\"{evidence}\""
+                        );
+                        render_client_histogram(
+                            &mut out,
+                            "rainsync_client_reported_playback_first_frame_worker_output_entry_milliseconds",
+                            &labels,
+                            histogram,
+                        );
+                    }
+                }
+            }
+            out.push_str("# HELP rainsync_worker_observed_playback_entry_queue_milliseconds Complete queue-phase prefix at first eligible validated output response; overlaps client startup and excludes replacement attempts.\n# TYPE rainsync_worker_observed_playback_entry_queue_milliseconds histogram\n");
+            if state.client_startup.queue_prefix.count > 0 {
+                render_client_histogram(
+                    &mut out,
+                    "rainsync_worker_observed_playback_entry_queue_milliseconds",
+                    "cutoff=\"first_validated_entry_response\"",
+                    state.client_startup.queue_prefix,
+                );
+            }
+            out.push_str("# HELP rainsync_worker_observed_playback_entry_queue_capture_total Frozen queue cutoff coverage; unknown is not measured zero.\n# TYPE rainsync_worker_observed_playback_entry_queue_capture_total counter\n");
+            for (coverage, count) in ["complete", "not_applicable", "unknown"]
+                .iter()
+                .zip(state.client_startup.queue_coverage)
+            {
+                writeln!(out,"rainsync_worker_observed_playback_entry_queue_capture_total{{coverage=\"{coverage}\"}} {count}").unwrap();
             }
         }
         if state.client_dropped.iter().any(|count| *count > 0) {

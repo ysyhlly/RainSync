@@ -7,6 +7,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { isolatedServer, delay } from "./fixtures/server.mjs";
+import { sourceMedia } from "./fixtures/source-grant.mjs";
 
 let fixture;
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -78,10 +79,13 @@ try {
     await viewer.request(`/rooms/${room.id}/join`, "POST", {
       token: invitation.token,
     });
-    const source = randomUUID(),
-      media = randomUUID();
+    const media = sourceMedia(f, {
+      kind: "local",
+      root: f.root,
+      resource: "SECRET_MEDIA_RESOURCE",
+    });
     f.sql(
-      `INSERT INTO sources(id,name,kind,config_encrypted) VALUES(${quote(source)},'SECRET_SOURCE_NAME','local','SECRET_SOURCE_CONFIG'); INSERT INTO media_items(id,source_id,title,resource,duration_ms) VALUES(${quote(media)},${quote(source)},'SECRET_MEDIA_TITLE','https://secret.invalid/?token=SECRET_SOURCE_TOKEN',30000)`,
+      `UPDATE sources SET name='SECRET_SOURCE_NAME' WHERE id=(SELECT source_id FROM media_items WHERE id=${quote(media)}); UPDATE media_items SET title='SECRET_MEDIA_TITLE',duration_ms=30000 WHERE id=${quote(media)}`,
     );
     const sockets = new Set();
     const connect = async (client) => {
@@ -179,12 +183,12 @@ try {
           const counts = sideEffects();
           const { value, text } = await download();
           const result = await replay(value);
-          assert.equal(result.verified_steps, 4);
-          assert.equal(result.checkpoint_steps, 1);
+          assert.equal(result.verified_steps, 5);
+          assert.equal(result.checkpoint_steps, 0);
           assert.equal(result.unverifiable_steps, 0);
           assert.equal(result.continuous, true);
           assert.equal(result.reaches_snapshot, true);
-          assert.equal(result.all_transitions_verified, false);
+          assert.equal(result.all_transitions_verified, true);
           assert.deepEqual(value.snapshot, current);
           assert.equal(value.events.length, 5);
           for (const secret of [
@@ -242,6 +246,38 @@ try {
         },
       );
       await check(
+        "actual playlist advancement captures resolved media inputs and replays exactly",
+        async () => {
+          const selected = sourceMedia(f, {
+            kind: "local",
+            root: f.root,
+            resource: "SECRET_NEXT_MEDIA",
+          });
+          f.sql(
+            `UPDATE media_items SET duration_ms=45000 WHERE id=${quote(selected)}; INSERT INTO playlist_items(id,room_id,media_id,sort_order) VALUES(${quote(randomUUID())},${quote(room.id)},${quote(selected)},2)`,
+          );
+          await command("SEEK", { position_ms: 30000 });
+          await command("END_MEDIA", { position_ms: 30000 });
+          assert.equal(current.media_id, selected);
+          assert.equal(current.duration_ms, 45000);
+          const value = (await download()).value;
+          const operation = value.events.at(-1).envelope.operation;
+          assert.equal(operation.kind, "media_control");
+          assert.deepEqual(operation.resolved_media, {
+            media_id: selected,
+            duration_ms: 45000,
+          });
+          assert.equal((await replay(value)).all_transitions_verified, true);
+          const tampered = structuredClone(value);
+          tampered.events.at(-1).envelope.operation.resolved_media.duration_ms =
+            45001;
+          assert.equal(
+            (await replay(tampered, false)).all_transitions_verified,
+            false,
+          );
+        },
+      );
+      await check(
         "bounded windows explicitly retain incomplete coverage",
         async () => {
           const value = (await download(admin, "?limit=2")).value;
@@ -253,7 +289,7 @@ try {
         },
       );
       await check(
-        "ownership and lifecycle transitions stay atomic explicit checkpoints without credential issuance",
+        "ownership and lifecycle transitions replay atomically without credential issuance",
         async () => {
           const transfer = await admin.request(
             `/rooms/${room.id}/owner`,
@@ -269,7 +305,10 @@ try {
             value.events.at(-1).envelope.operation.kind,
             "ownership",
           );
-          assert.equal((await replay(value)).verified_steps, 5);
+          assert.equal(
+            (await replay(value)).verified_steps,
+            value.events.length,
+          );
           await admin.request(`/rooms/${room.id}/close`, "POST", {
             expected_revision: current.revision,
           });
@@ -292,13 +331,35 @@ try {
             15000,
           );
           status = await admin.request(`/rooms/${room.id}/lifecycle`);
+          const oldClock = status.state.clock_epoch;
+          for (const s of sockets) s.terminate();
+          await f.startServer();
+          status = await admin.request(`/rooms/${room.id}/lifecycle`);
+          assert.notEqual(status.state.clock_epoch, oldClock);
+          await admin.request(`/rooms/${room.id}/reopen`, "POST", {
+            expected_revision: status.state.revision,
+          });
+          status = await admin.request(`/rooms/${room.id}/lifecycle`);
+          await admin.request(`/rooms/${room.id}/close`, "POST", {
+            expected_revision: status.state.revision,
+          });
+          await f.waitForSql(
+            `SELECT lifecycle FROM rooms WHERE id=${quote(room.id)}`,
+            "closed",
+            15000,
+          );
+          status = await admin.request(`/rooms/${room.id}/lifecycle`);
+          assert.equal(
+            (await replay((await download()).value)).all_transitions_verified,
+            true,
+          );
           await admin.request(`/rooms/${room.id}/archive`, "POST", {
             expected_revision: status.state.revision,
           });
           value = (await download()).value;
           const reasons = value.events
-            .filter((e) => e.envelope.operation.kind === "checkpoint")
-            .map((e) => e.envelope.operation.reason);
+            .filter((e) => e.envelope.operation.kind === "lifecycle")
+            .map((e) => e.envelope.operation.transition);
           for (const reason of ["closing", "closed", "reopened", "archived"])
             assert.ok(reasons.includes(reason));
           assert.equal((await replay(value)).continuous, true);
@@ -306,7 +367,7 @@ try {
         },
       );
       await check(
-        "restart adds a durable checkpoint while preserving conservative pause and old history",
+        "restart records a replayable clock input while preserving conservative pause and old history",
         async () => {
           const before = (await download()).value;
           for (const s of sockets) s.terminate();
@@ -319,12 +380,12 @@ try {
           );
           assert.equal(value.snapshot.playback_status, "paused");
           assert.equal(
-            value.events.at(-1).envelope.operation.reason,
+            value.events.at(-1).envelope.operation.kind,
             "server_restart",
           );
           assert.equal(
-            (await replay(value)).checkpoint_steps,
-            (await replay(before)).checkpoint_steps + 1,
+            (await replay(value)).verified_steps,
+            (await replay(before)).verified_steps + 1,
           );
         },
       );

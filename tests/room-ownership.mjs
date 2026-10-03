@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 import { isolatedServer, delay } from "./fixtures/server.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
+import { sourceMedia } from "./fixtures/source-grant.mjs";
 
 await isolatedServer("room-ownership", async (f) => {
   const admin = f.client();
@@ -19,8 +21,8 @@ await isolatedServer("room-ownership", async (f) => {
   for (const user of [successor, member]) {
     await user.client.request(`/rooms/${room.id}/join`, "POST", { token: invite.token });
   }
-  const source = randomUUID(), media = randomUUID(), playback = randomUUID();
-  f.sql(`INSERT INTO sources(id,name,kind,config_encrypted) VALUES('${source}','ownership source','local','fixture'); INSERT INTO media_items(id,source_id,title,resource,duration_ms) VALUES('${media}','${source}','ownership media','fixture',30000)`);
+  const media = sourceMedia(f, { kind: "local", root: f.root, resource: "fixture" }), playback = randomUUID();
+  f.sql(`UPDATE media_items SET duration_ms=30000 WHERE id='${media}'`);
   const sockets = new Set();
   async function connect(client) {
     const ws = new WebSocket(f.origin.replace("http", "ws") + "/api/v1/ws", { headers: { Origin: f.origin, Cookie: client.cookie } });
@@ -50,7 +52,7 @@ await isolatedServer("room-ownership", async (f) => {
     const start = command(a.snapshot.state, a.snapshot.control_epoch.id, "CHANGE_MEDIA", { media_id: media });
     a.send(start);
     let state = (await a.next("ACK", value => value.command_id === start.command_id)).state;
-    f.sql(`INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES('${playback}','${member.identity.id}','${room.id}','${media}',${state.media_generation},'ownership-fixture','{}',now()+interval '1 hour')`);
+    withPlaybackAdmission(f, { client: member.client, user: member.identity.id, room: room.id, session: playback }, `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES('${playback}','${member.identity.id}','${room.id}','${media}',${state.media_generation},'ownership-fixture','{}',now()+interval '1 hour')`);
     assert.equal((await owner.client.request(`/rooms/${room.id}/members`)).length, 3);
     assert.equal((await outsider.client.request(`/rooms/${room.id}/members`, "GET", undefined, 403)).error.code, "NOT_A_MEMBER");
     assert.equal((await transfer(member.client, successor.identity.id, state.revision, 403)).error.code, "FORBIDDEN");

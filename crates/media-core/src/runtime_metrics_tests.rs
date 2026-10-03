@@ -738,3 +738,192 @@ fn client_concurrent_updates_and_scrapes_preserve_one_coherent_aggregate() {
     assert_eq!(state.client_playback[0].first_frames[0].elapsed.count, 1000);
     assert_eq!(state.client_dropped, [0; 5]);
 }
+
+#[test]
+fn v2_startup_has_exact_bounded_series_without_expanding_playback_states() {
+    let metrics = RuntimeMetrics::default();
+    let totals = PlaybackMetricsTotals {
+        startup_ms: 1,
+        autoplay_blocked_ms: 0,
+        background_ms: 0,
+        paused_ms: 0,
+        seeking_ms: 0,
+        rebuffer_ms: 0,
+        playing_ms: 0,
+        unobserved_ms: 0,
+    };
+    let phases = PlaybackMetricsStartupPhases {
+        preparation_ms: 1,
+        loading_ms: 0,
+        unobserved_ms: 0,
+    };
+    for source in [
+        PlaybackSource::Local,
+        PlaybackSource::Http,
+        PlaybackSource::Agent,
+        PlaybackSource::Jellyfin,
+        PlaybackSource::Emby,
+        PlaybackSource::Unknown,
+    ] {
+        for mode in [
+            PlaybackMode::Direct,
+            PlaybackMode::Remux,
+            PlaybackMode::Transcode,
+            PlaybackMode::Unknown,
+        ] {
+            for evidence in [
+                PlaybackMetricsFrameEvidence::VideoFrameCallback,
+                PlaybackMetricsFrameEvidence::PlayingTimeAdvance,
+            ] {
+                let frame = PlaybackMetricsFirstFrame {
+                    elapsed_ms: 1,
+                    confirmed_elapsed_ms: 1,
+                    evidence,
+                };
+                assert!(metrics.client_playback_sample_with_startup(
+                    PlaybackMetricsOrigin::UserIntent,
+                    &totals,
+                    Some(&frame),
+                    Some(&phases),
+                    Some(PlaybackAttribution { source, mode })
+                ));
+            }
+        }
+    }
+    assert!(metrics.client_playback_sample_with_startup(
+        PlaybackMetricsOrigin::AutomaticLoad,
+        &totals,
+        None,
+        Some(&phases),
+        None
+    ));
+    let output = metrics.render_for(Process::Server);
+    let new_series = output
+        .lines()
+        .filter(|line| {
+            line.starts_with("rainsync_client_reported_playback_startup_phase_")
+                || line.starts_with("rainsync_client_reported_playback_first_frame_attributed_")
+        })
+        .count();
+    assert_eq!(new_series, PLAYBACK_V2_MAX_ADDITIONAL_SERIES);
+    assert_eq!(new_series, 582);
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.starts_with("rainsync_client_reported_playback_state_duration_"))
+            .count(),
+        16
+    );
+    assert!(std::mem::size_of::<Snapshot>() <= MAX_METRIC_SNAPSHOT_BYTES);
+    assert!(!output.contains("plan_generation"));
+}
+#[test]
+fn v2_phase_overflow_cannot_partially_credit_existing_state_counters() {
+    let metrics = RuntimeMetrics::default();
+    lock(&metrics.inner).client_startup.phase_ms[0][0] = u64::MAX;
+    let totals = PlaybackMetricsTotals {
+        startup_ms: 1,
+        autoplay_blocked_ms: 0,
+        background_ms: 0,
+        paused_ms: 0,
+        seeking_ms: 0,
+        rebuffer_ms: 0,
+        playing_ms: 0,
+        unobserved_ms: 0,
+    };
+    let phases = PlaybackMetricsStartupPhases {
+        preparation_ms: 1,
+        loading_ms: 0,
+        unobserved_ms: 0,
+    };
+    assert!(!metrics.client_playback_sample_with_startup(
+        PlaybackMetricsOrigin::UserIntent,
+        &totals,
+        None,
+        Some(&phases),
+        None
+    ));
+    assert_eq!(lock(&metrics.inner).client_playback[0].samples, 0);
+    assert_eq!(
+        lock(&metrics.inner).client_dropped[ClientMetricsDrop::Overflow as usize],
+        1
+    );
+}
+
+#[test]
+fn output_entry_series_are_separate_bounded_and_unknown_queue_is_not_zero() {
+    let metrics = RuntimeMetrics::default();
+    let totals = PlaybackMetricsTotals {
+        startup_ms: 1,
+        autoplay_blocked_ms: 0,
+        background_ms: 0,
+        paused_ms: 0,
+        seeking_ms: 0,
+        rebuffer_ms: 0,
+        playing_ms: 0,
+        unobserved_ms: 0,
+    };
+    let phases = PlaybackMetricsStartupPhases {
+        preparation_ms: 1,
+        loading_ms: 0,
+        unobserved_ms: 0,
+    };
+    for availability in [
+        WorkerOutputEntryAvailability::ColdWaiting,
+        WorkerOutputEntryAvailability::Warm,
+        WorkerOutputEntryAvailability::NotApplicable,
+        WorkerOutputEntryAvailability::Unknown,
+    ] {
+        for evidence in [
+            PlaybackMetricsFrameEvidence::VideoFrameCallback,
+            PlaybackMetricsFrameEvidence::PlayingTimeAdvance,
+        ] {
+            let first = PlaybackMetricsFirstFrame {
+                elapsed_ms: 1,
+                confirmed_elapsed_ms: 1,
+                evidence,
+            };
+            let queue_ms = matches!(
+                availability,
+                WorkerOutputEntryAvailability::ColdWaiting | WorkerOutputEntryAvailability::Warm
+            )
+            .then_some(0);
+            assert!(metrics.client_playback_sample_with_output(
+                PlaybackMetricsOrigin::UserIntent,
+                &totals,
+                Some(&first),
+                Some(&phases),
+                Some(PlaybackAttribution {
+                    source: PlaybackSource::Local,
+                    mode: PlaybackMode::Remux
+                }),
+                Some(WorkerOutputEntry {
+                    availability,
+                    queue_ms
+                })
+            ));
+        }
+    }
+    let rendered = metrics.render_for(Process::Server);
+    let count = rendered
+        .lines()
+        .filter(|line| {
+            line.starts_with("rainsync_client_reported_playback_first_frame_worker_output_entry_")
+                || line.starts_with("rainsync_worker_observed_playback_entry_queue_")
+        })
+        .count();
+    assert_eq!(count, PLAYBACK_ENTRY_MAX_ADDITIONAL_SERIES);
+    assert_eq!(count, 111);
+    assert_eq!(lock(&metrics.inner).client_startup.queue_prefix.count, 4);
+    assert_eq!(
+        lock(&metrics.inner).client_startup.queue_coverage,
+        [4, 2, 2]
+    );
+    assert!(std::mem::size_of::<Snapshot>() < MAX_METRIC_SNAPSHOT_BYTES);
+    for line in rendered.lines().filter(|line| {
+        line.starts_with("rainsync_client_reported_playback_first_frame_worker_output_entry_")
+    }) {
+        assert!(!line.contains("source="));
+        assert!(!line.contains("mode="));
+    }
+}

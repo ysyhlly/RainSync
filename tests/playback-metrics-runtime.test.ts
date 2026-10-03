@@ -1,6 +1,8 @@
 import { afterEach, expect, test, vi } from "vitest";
 import { effectScope, ref } from "vue";
 import { createPlaybackRuntime } from "../apps/web/src/features/playback/playback-runtime";
+import { RequestFailure } from "../apps/web/src/errors";
+import * as playbackMetrics from "../apps/web/src/features/playback/playback-metrics";
 
 vi.mock("hls.js", () => ({
   default: class {
@@ -24,6 +26,11 @@ afterEach(() => {
 function setup(
   options: {
     marker?: boolean;
+    versions?: number[];
+    prepareFailures?: number;
+    prepareCodes?: (string | null)[];
+    renewal?: "legacy" | "bound" | "zero";
+    prepareDelay?: number;
     closed?: boolean;
     restoredSeq?: number;
     hls?: boolean;
@@ -48,7 +55,8 @@ function setup(
   });
   vi.stubGlobal("document", document);
   const callbacks: ((at: number, metadata: any) => void)[] = [];
-  const cancel = vi.fn();
+  const pendingFrames = new Set<number>();
+  const cancel = vi.fn((id: number) => pendingFrames.delete(id));
   const el: any = Object.assign(new EventTarget(), {
     src: "",
     readyState: 4,
@@ -75,11 +83,15 @@ function setup(
     },
     requestVideoFrameCallback: (cb: (typeof callbacks)[number]) => {
       callbacks.push(cb);
+      pendingFrames.add(callbacks.length);
       return callbacks.length;
     },
     cancelVideoFrameCallback: cancel,
   });
   let grants = 0;
+  let prepareAttempts = 0;
+  let fixtureExpiry = 1800000;
+  let prepareFailures = options.prepareFailures ?? 0;
   const candidates = {
     schema_version: 1,
     binding: "source-binding",
@@ -108,6 +120,13 @@ function setup(
     ): Promise<any> => {
       if (path === "/playback-candidates") return candidates;
       if (path === "/playback-sessions" && method === "POST") {
+        const code = options.prepareCodes?.[prepareAttempts++];
+        if (code) throw new RequestFailure({ error: { code } });
+        if (prepareFailures-- > 0) throw new TypeError("lost grant ACK");
+        if (options.prepareDelay)
+          await new Promise((resolve) =>
+            setTimeout(resolve, options.prepareDelay),
+          );
         const candidate = candidates.candidates.find(
           (c) => !body.candidate_report.excluded_candidates.includes(c.id),
         )!;
@@ -131,13 +150,35 @@ function setup(
           ...(options.marker === false
             ? {}
             : {
-                playback_metrics_version: 1,
+                playback_metrics_version: options.versions?.[grants - 1] ?? 1,
                 playback_metrics: {
                   ...body.playback_metrics,
                   metrics_seq: options.restoredSeq ?? 0,
                   closed: options.closed ?? false,
                 },
               }),
+        };
+      }
+      if (
+        options.renewal &&
+        /^\/playback-sessions\/session-\d+$/.test(path) &&
+        method === "POST"
+      ) {
+        if (options.renewal !== "zero" && performance.now() >= fixtureExpiry)
+          throw new RequestFailure({
+            error: { code: "INVALID_PLAYBACK_SESSION" },
+          });
+        if (options.renewal === "bound") {
+          fixtureExpiry = performance.now() + 1800000;
+          return { ok: true };
+        }
+        return {
+          ok: true,
+          expires_in_seconds:
+            options.renewal === "zero"
+              ? 0
+              : Math.ceil((fixtureExpiry - performance.now()) / 1000),
+          legacy_expiry_unchanged: true,
         };
       }
       if (path.endsWith("/metrics")) {
@@ -199,7 +240,11 @@ function setup(
       ),
     frame: (time = performance.now()) => {
       el.paused = false;
-      callbacks.at(-1)!(performance.now(), { presentationTime: time });
+      // Browsers deliver every registered observer for this presentation.
+      for (const id of [...pendingFrames]) {
+        pendingFrames.delete(id);
+        callbacks[id - 1](performance.now(), { presentationTime: time });
+      }
     },
     cleanup: () => scope.stop(),
   };
@@ -217,6 +262,7 @@ test("paired request opts in, but absent/closed/incoherent grant marker never se
       await vi.advanceTimersByTimeAsync(10000);
       expect(s.prepares()[0][2]).toMatchObject({
         playback_metrics_version: 1,
+        playback_metrics_supported_versions: [1, 2],
         playback_metrics: {
           meter_start_generation: 1,
           startup_origin: "user_intent",
@@ -224,7 +270,8 @@ test("paired request opts in, but absent/closed/incoherent grant marker never se
         observation_version: 1,
       });
       expect(s.metrics()).toHaveLength(0);
-      expect(s.callbacks).toHaveLength(0);
+      // Presentation safety remains active without an optional metrics grant.
+      expect(s.callbacks).toHaveLength(options.marker === false ? 2 : 1);
       expect(s.el.src).toBe("/authorized-1");
     } finally {
       s.cleanup();
@@ -430,3 +477,303 @@ test("auth replacement ignores old frame and stops further metrics", async () =>
     s.cleanup();
   }
 });
+
+test("v2 separates clock/preparation delay from attachment loading and confirmation delay", async () => {
+  const s = setup({ versions: [2], clockReady: false, prepareDelay: 1000 });
+  try {
+    await s.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(6000);
+    s.clock.ready = true;
+    s.runtime.onClockReady();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(s.el.src).toBe("/authorized-1");
+    await vi.advanceTimersByTimeAsync(1000);
+    s.frame(7950);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(s.metrics()[0][2]).toMatchObject({
+      version: 2,
+      plan_generation: 1,
+      first_frame_plan_generation: 1,
+      startup_phases: {
+        preparation_ms: 7000,
+        loading_ms: 1000,
+        unobserved_ms: 0,
+      },
+      first_frame: { elapsed_ms: 7950, confirmed_elapsed_ms: 8000 },
+    });
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("v2 pre-first-sample fallback retains first frame's originating grant", async () => {
+  const s = setup({ versions: [2, 2] });
+  try {
+    await s.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(1000);
+    s.frame(950);
+    await vi.advanceTimersByTimeAsync(1000);
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.metrics()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1000);
+    s.frame(2950);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(s.metrics()[0][2]).toMatchObject({
+      version: 2,
+      plan_generation: 2,
+      first_frame_plan_generation: 1,
+      first_frame: { elapsed_ms: 950, confirmed_elapsed_ms: 1000 },
+      startup_phases: { preparation_ms: 0, loading_ms: 1000, unobserved_ms: 0 },
+    });
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("v2 same-grant source replacement never labels its local callback generation as a plan", async () => {
+  const s = setup({ versions: [2], hls: true });
+  try {
+    await s.runtime.loadMedia();
+    const stale = s.callbacks[0];
+    await vi.advanceTimersByTimeAsync(1000);
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    await vi.advanceTimersByTimeAsync(1000);
+    stale(2000, { presentationTime: 1950 });
+    s.frame(1950);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(s.metrics()[0][2]).toMatchObject({
+      version: 2,
+      plan_generation: 1,
+      first_frame_plan_generation: 1,
+      first_frame: { elapsed_ms: 1950 },
+      startup_phases: { preparation_ms: 0, loading_ms: 2000, unobserved_ms: 0 },
+    });
+  } finally {
+    s.cleanup();
+  }
+});
+
+test.each([
+  [1, 2],
+  [2, 1],
+])(
+  "selected metrics version cannot change across fallback %j",
+  async (first, second) => {
+    const s = setup({ versions: [first, second] });
+    try {
+      await s.runtime.loadMedia();
+      await vi.advanceTimersByTimeAsync(1000);
+      s.frame();
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(s.metrics()[0][2].version).toBe(first);
+      s.el.error = { code: 3 };
+      s.el.onerror();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(s.el.src).toBe("/authorized-2");
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(s.metrics()).toHaveLength(1);
+      expect(s.prepares()[1][2].playback_metrics_supported_versions).toEqual([
+        1, 2,
+      ]);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+test("new client old-server v1 negotiation keeps exact v1 packets", async () => {
+  const s = setup();
+  try {
+    await s.runtime.loadMedia();
+    s.frame();
+    await vi.advanceTimersByTimeAsync(5000);
+    const request = s.prepares()[0][2];
+    expect(request.playback_metrics_version).toBe(1);
+    expect(request.playback_metrics_supported_versions).toEqual([1, 2]);
+    expect(Object.isFrozen(request.playback_metrics_supported_versions)).toBe(
+      true,
+    );
+    const packet = s.metrics()[0][2];
+    expect(packet.version).toBe(1);
+    expect(packet).not.toHaveProperty("startup_phases");
+    expect(packet).not.toHaveProperty("first_frame_plan_generation");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("preparation retries retain exact negotiation body and idempotency key", async () => {
+  const s = setup({ versions: [2], prepareFailures: 1 });
+  try {
+    const loading = s.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(1000);
+    await loading;
+    const calls = s.prepares();
+    expect(calls).toHaveLength(2);
+    expect(calls[0][2]).toBe(calls[1][2]);
+    expect(calls[0][2].idempotency_key).toBe(calls[1][2].idempotency_key);
+    expect(calls[0][2].playback_metrics_supported_versions).toEqual([1, 2]);
+    await vi.advanceTimersByTimeAsync(1000);
+    s.frame(1950);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(s.metrics()[0][2].startup_phases).toEqual({
+      preparation_ms: 1000,
+      loading_ms: 1000,
+      unobserved_ms: 0,
+    });
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("first valid grant selects v2 without losing an earlier source's local evidence", async () => {
+  const s = setup({ versions: [99, 2] });
+  try {
+    await s.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(1000);
+    s.frame(950);
+    await vi.advanceTimersByTimeAsync(1000);
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(s.metrics()[0][2]).toMatchObject({
+      version: 2,
+      plan_generation: 2,
+      first_frame_plan_generation: 1,
+      first_frame: { elapsed_ms: 950, confirmed_elapsed_ms: 1000 },
+      startup_phases: { preparation_ms: 0, loading_ms: 1000, unobserved_ms: 0 },
+    });
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("lost source-phase observation disables optional telemetry without stopping playback", async () => {
+  const original = playbackMetrics.createPlaybackMetrics;
+  const factory = vi
+    .spyOn(playbackMetrics, "createPlaybackMetrics")
+    .mockImplementation((config) => ({
+      ...original(config),
+      attachSource: () => false,
+    }));
+  const s = setup({ versions: [2] });
+  try {
+    await s.runtime.loadMedia();
+    expect(s.el.src).toBe("/authorized-1");
+    s.frame();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(s.metrics()).toHaveLength(0);
+    await s.runtime.reset();
+    expect(
+      s.api.mock.calls.some(
+        ([path, method]) =>
+          path === "/playback-sessions/session-1" && method === "DELETE",
+      ),
+    ).toBe(true);
+  } finally {
+    s.cleanup();
+    factory.mockRestore();
+  }
+});
+
+test("dedicated unmapped legacy viewer rejection rotates once into a fresh logical metrics intent", async () => {
+  const s = setup({
+    versions: [2],
+    prepareCodes: ["PLAYBACK_VIEWER_ORIGIN_REQUIRED", null],
+  });
+  try {
+    await s.runtime.loadMedia();
+    const [first, next] = s.prepares().map((call) => call[2]);
+    expect(s.prepares()).toHaveLength(2);
+    expect(next.viewer_id).not.toBe(first.viewer_id);
+    expect(next.idempotency_key).not.toBe(first.idempotency_key);
+    expect(next.plan_generation).toBe(1);
+    expect(next.playback_metrics.meter_start_generation).toBe(1);
+    expect(
+      s.api.mock.calls.filter(
+        ([path, method]) =>
+          method === "DELETE" && path.includes(first.idempotency_key),
+      ),
+    ).toHaveLength(0);
+    s.frame();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(s.metrics()[0][2]).toMatchObject({
+      version: 2,
+      plan_generation: 1,
+      meter_start_generation: 1,
+      first_frame_plan_generation: 1,
+    });
+  } finally {
+    s.cleanup();
+  }
+});
+test("repeated dedicated origin rejection stops after exactly one viewer rotation", async () => {
+  const s = setup({
+    prepareCodes: [
+      "PLAYBACK_VIEWER_ORIGIN_REQUIRED",
+      "PLAYBACK_VIEWER_ORIGIN_REQUIRED",
+      null,
+    ],
+  });
+  try {
+    await expect(s.runtime.loadMedia()).rejects.toMatchObject({
+      name: "PlaybackViewerOriginRequired",
+    });
+    expect(s.prepares()).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(s.prepares()).toHaveLength(2);
+    expect(s.metrics()).toHaveLength(0);
+  } finally {
+    s.cleanup();
+  }
+});
+test.each(["FORBIDDEN", "STALE_PLAYBACK_PLAN", "ORIGIN_REJECTED"])(
+  "generic %s never rotates the viewer",
+  async (code) => {
+    const s = setup({ prepareCodes: [code, null] });
+    try {
+      await expect(s.runtime.loadMedia()).rejects.toMatchObject({ code });
+      expect(s.prepares()).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+test.each(["legacy", "bound", "zero"] as const)(
+  "%s renewal keeps fixed cadence and honors actual original expiry",
+  async (renewal) => {
+    const s = setup({
+      renewal,
+      prepareCodes: [null, "PLAYBACK_VIEWER_ORIGIN_REQUIRED", null],
+    });
+    try {
+      await s.runtime.loadMedia();
+      s.frame();
+      s.document.visibilityState = "hidden";
+      await vi.advanceTimersByTimeAsync(1200000);
+      const renews = () =>
+        s.api.mock.calls.filter(
+          ([path, method]) =>
+            /^\/playback-sessions\/session-\d+$/.test(path) &&
+            method === "POST",
+        );
+      expect(renews()).toHaveLength(2);
+      expect(s.prepares()).toHaveLength(1);
+      s.document.visibilityState = "visible";
+      await vi.advanceTimersByTimeAsync(600000);
+      expect(renews()).toHaveLength(3);
+      expect(s.prepares()).toHaveLength(renewal === "legacy" ? 3 : 1);
+      if (renewal === "legacy") {
+        const inputs = s.prepares().map((call) => call[2]);
+        expect(inputs[2].viewer_id).not.toBe(inputs[0].viewer_id);
+        expect(inputs[2].plan_generation).toBe(1);
+      }
+    } finally {
+      s.cleanup();
+    }
+  },
+);

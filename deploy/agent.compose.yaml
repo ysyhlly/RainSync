@@ -5,6 +5,7 @@ services:
     command: ["rainsync-nas-agent"]
     environment:
       SERVER_URL: ${SERVER_URL:?Set SERVER_URL}
+      AGENT_DATA_ORIGIN: ${AGENT_DATA_ORIGIN:-${SERVER_URL}}
       PAIR_CODE: ${PAIR_CODE:-}
       AGENT_CREDENTIAL_FILE: /state/credentials.json
       MEDIA_ROOT: /media

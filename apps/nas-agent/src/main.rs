@@ -408,7 +408,10 @@ async fn retry_or_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) ->
 }
 
 async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
-    let server = std::env::var("SERVER_URL")?;
+    let deployment = media_core::deployment_config::Settings::from_env(
+        media_core::deployment_config::Role::Agent,
+    )?;
+    let server = deployment.public_origin;
     let configured_root = PathBuf::from(std::env::var("MEDIA_ROOT")?);
     let credential = PathBuf::from(
         std::env::var("AGENT_CREDENTIAL_FILE").unwrap_or("agent-credentials.json".into()),
@@ -609,7 +612,7 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
                         }
                         // Data ingress shares the configured service origin; localhost in server configuration is not the NAS host.
                         if let Some(value)=request["data_url"].as_str() {
-                            let Ok(mut url)=reqwest::Url::parse(&std::env::var("AGENT_DATA_ORIGIN").unwrap_or_else(|_|server.clone())) else { if let Some(id)=receipt { let _=receipts.add(id).await; } continue };
+                            let Ok(mut url)=reqwest::Url::parse(&deployment.agent_data_origin) else { if let Some(id)=receipt { let _=receipts.add(id).await; } continue };
                             let Ok(data)=reqwest::Url::parse(value) else { if let Some(id)=receipt { let _=receipts.add(id).await; } continue };
                             url.set_path(data.path());url.set_query(data.query());
                             let scheme=if url.scheme()=="https" {"wss"} else {"ws"};

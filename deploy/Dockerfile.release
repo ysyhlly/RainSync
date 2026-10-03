@@ -1,0 +1,35 @@
+# No floating defaults. deploy/release-lock.mjs supplies verified digest references.
+ARG RUST_IMAGE
+ARG DEBIAN_IMAGE
+FROM ${RUST_IMAGE} AS build
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY apps/server ./apps/server
+COPY apps/media-worker ./apps/media-worker
+COPY apps/nas-agent ./apps/nas-agent
+COPY migrations ./migrations
+RUN cargo build --release --locked --workspace
+
+FROM ${DEBIAN_IMAGE}
+ARG DEBIAN_SNAPSHOT
+ARG FFMPEG_VERSION
+ARG CA_CERTIFICATES_VERSION
+ARG SOURCE_MANIFEST_SHA256
+ARG PRODUCTION_MANIFEST_SHA256
+RUN test -n "$DEBIAN_SNAPSHOT" && test -n "$FFMPEG_VERSION" && test -n "$CA_CERTIFICATES_VERSION" \
+    && rm -f /etc/apt/sources.list.d/debian.sources \
+    && printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s bookworm main\ndeb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/%s bookworm-security main\n' "$DEBIAN_SNAPSHOT" "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends "ca-certificates=$CA_CERTIFICATES_VERSION" "ffmpeg=$FFMPEG_VERSION" \
+    && test "$(dpkg-query -W -f='${Version}' ffmpeg)" = "$FFMPEG_VERSION" \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -u 10001 -m rainsync && mkdir -p /cache /media /state && chown rainsync:rainsync /cache /state
+COPY --from=build /build/target/release/rainsync-server /build/target/release/rainsync-media-worker /build/target/release/rainsync-nas-agent /usr/local/bin/
+COPY --chmod=755 deploy/backend-entrypoint.sh /usr/local/bin/rainsync-source-access-entrypoint
+LABEL org.rainsync.full-source-manifest="${SOURCE_MANIFEST_SHA256}"
+LABEL org.rainsync.source-manifest="${PRODUCTION_MANIFEST_SHA256}"
+USER rainsync
+ENV RUST_LOG=info
+ENTRYPOINT ["/usr/local/bin/rainsync-source-access-entrypoint"]
+CMD ["rainsync-server"]

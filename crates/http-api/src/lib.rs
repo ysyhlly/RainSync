@@ -36,6 +36,11 @@ pub async fn errors(request: Request, next: Next) -> Response {
         .unwrap_or("");
     let code = ErrorCode::from_reason(reason, parts.status.as_u16());
     let mut error = ApiError::new(code, request_id);
+    if reason == "legacy_stream_mapping_unsupported" {
+        // Fixed wording for this known internal alias. Unknown diagnostic
+        // strings and source/user values are never reflected into messages.
+        error.message = "此片源的媒体轨道映射无法安全用于当前生成播放路径".into();
+    }
     if code == ErrorCode::RateLimited {
         error.retry_after_ms = parts
             .headers
@@ -71,6 +76,46 @@ mod tests {
     use super::*;
     use axum::{Router, routing::get};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn mapping_refusal_has_specific_wording_and_preserves_prior_video_errors() {
+        for reason in [
+            "legacy_stream_mapping_unsupported",
+            "unsupported_video_or_hdr",
+            "hdr_unsupported",
+            "drm_unsupported",
+        ] {
+            let router = Router::new()
+                .route(
+                    "/",
+                    get(move || async move {
+                        (
+                            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(serde_json::json!({"error":reason})),
+                        )
+                    }),
+                )
+                .layer(axum::middleware::from_fn(errors));
+            let response = router
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 422);
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            let decoded: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(decoded.error.code, ErrorCode::from_reason(reason, 422));
+            assert!(!decoded.error.retryable);
+            if reason == "legacy_stream_mapping_unsupported" {
+                assert!(decoded.error.message.contains("轨道映射"));
+                assert!(!decoded.error.message.contains("HDR"));
+            } else {
+                assert_eq!(
+                    decoded.error.message,
+                    ApiError::new(decoded.error.code, Uuid::nil()).message
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn oversized_and_stalled_upstream_error_bodies_are_bounded() {

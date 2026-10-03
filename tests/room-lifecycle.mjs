@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 import { isolatedServer, delay } from "./fixtures/server.mjs";
+import { sourceMedia } from "./fixtures/source-grant.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 
 await isolatedServer("room-lifecycle", async f => {
   const admin = f.client();
@@ -16,8 +18,8 @@ await isolatedServer("room-lifecycle", async f => {
   const room = await owner.client.request("/rooms", "POST", { name: "lifecycle fixture" });
   const invite = await owner.client.request(`/rooms/${room.id}/invites`, "POST");
   await viewer.client.request(`/rooms/${room.id}/join`, "POST", { token: invite.token });
-  const source = randomUUID(), media = randomUUID(), playback = randomUUID(), execution = randomUUID(), key = randomUUID();
-  f.sql(`INSERT INTO sources(id,name,kind,config_encrypted) VALUES('${source}','lifecycle source','local','fixture'); INSERT INTO media_items(id,source_id,title,resource,duration_ms) VALUES('${media}','${source}','lifecycle media','fixture',1)`);
+  const media = sourceMedia(f, { kind: "local", root: f.root, resource: "fixture" }), playback = randomUUID(), execution = randomUUID(), key = randomUUID();
+  f.sql(`UPDATE media_items SET duration_ms=1 WHERE id='${media}'`);
   const sockets = new Set();
   async function connect(client) {
     const ws = new WebSocket(f.origin.replace("http", "ws") + "/api/v1/ws", { headers: { Origin: f.origin, Cookie: client.cookie } });
@@ -73,7 +75,7 @@ await isolatedServer("room-lifecycle", async f => {
     state = (await a.next("ACK", value => value.command_id === winningPlay.command_id)).state;
     assert.equal((await staleClose).error.code, "REVISION_CONFLICT");
     assert.equal((await status()).lifecycle, "active");
-    f.sql(`INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES('${playback}','${viewer.identity.id}','${room.id}','${media}',${state.media_generation},'lifecycle-grant','{"upstream_closed":true}',now()+interval '1 hour'); INSERT INTO media_executions(id,session_id,kind,owner_id) VALUES('${execution}','${playback}','delivery','${randomUUID()}'); INSERT INTO playback_requests(user_id,idempotency_key,request_hash,session_id,owner_epoch,status,response_encrypted,lease_until,expires_at,room_id,lifecycle_epoch) VALUES('${viewer.identity.id}','${key}','lifecycle-digest','${playback}','${randomUUID()}','completed','fixture',now()+interval '1 minute',now()+interval '1 day','${room.id}',0)`);
+    withPlaybackAdmission(f, { client: viewer.client, user: viewer.identity.id, room: room.id, session: playback, key }, `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES('${playback}','${viewer.identity.id}','${room.id}','${media}',${state.media_generation},'lifecycle-grant','{"upstream_closed":true}',now()+interval '1 hour'); INSERT INTO media_executions(id,session_id,kind,owner_id) VALUES('${execution}','${playback}','delivery','${randomUUID()}')`);
     // The close owns the room lock and is waiting for the snapshot. An already
     // connected controller queues behind it and must not PLAY after revocation.
     const lockTag = `lifecycle-lock-${randomUUID()}`;
