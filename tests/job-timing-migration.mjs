@@ -127,12 +127,12 @@ let failure;
 const fixtures = [];
 try {
   const names = (await readdir(resolve(repo, "migrations")))
-    .filter((name) => /^\d+_.+\.sql$/.test(name))
+    .filter((name) => /^\d+_.+\.sql$/.test(name) && Number(name.split("_")[0]) <= 39)
     .sort();
   assert.deepEqual(
     names.map((name) => Number(name.split("_")[0])),
     Array.from({ length: 39 }, (_, index) => index + 1),
-    "current branch has exactly migrations 1–39",
+    "historical timing upgrade window has exactly migrations 1–39",
   );
   const inputs = [];
   for (const name of names) {
@@ -392,7 +392,7 @@ try {
   fresh.sql(sqlxTable);
   for (const input of inputs) apply(fresh, input);
   check(
-    "separate fresh owned database installs all 39 current migration sources and accepts unknown legacy-style rows",
+    "separate fresh owned database installs all 39 timing-window migration sources and accepts unknown legacy-style rows",
     () => {
       assert.equal(
         fresh.sql("SELECT count(*) FROM _sqlx_migrations WHERE success"),
