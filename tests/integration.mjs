@@ -549,15 +549,20 @@ try {
     `SELECT metadata FROM media_items WHERE id='${state.media_id}'`,
   );
   const rotatedPath = resolve(root, "rotation-fixture.tmp");
+  const explicitRotation = execFileSync("ffmpeg", ["-hide_banner", "-h", "full"], {
+    timeout: 10000, encoding: "utf8", maxBuffer: 8 * 1024 * 1024,
+  }).includes("-display_rotation");
   execFileSync("ffmpeg", [
-    "-v", "error", "-nostdin", "-y", "-i", fixturePath,
-    "-map", "0", "-c", "copy", "-metadata:s:v:0", "rotate=90",
+    "-v", "error", "-nostdin", "-y",
+    ...(explicitRotation ? ["-display_rotation:v:0", "90"] : []),
+    "-i", fixturePath, "-map", "0", "-c", "copy",
+    ...(explicitRotation ? [] : ["-metadata:s:v:0", "rotate=90"]),
     "-f", "mp4", rotatedPath,
   ], { timeout: 30000, stdio: "inherit" });
   const rotatedMetadata = JSON.parse(execFileSync("ffprobe", [
     "-v", "error", "-select_streams", "v:0", "-show_streams", "-of", "json", rotatedPath,
   ], { timeout: 10000, encoding: "utf8" }));
-  assert.ok(rotatedMetadata.streams[0].side_data_list.some((entry) =>
+  assert.ok((rotatedMetadata.streams[0].side_data_list ?? []).some((entry) =>
     entry.side_data_type === "Display Matrix" && entry.rotation === 90));
   await rename(rotatedPath, fixturePath);
   try {
