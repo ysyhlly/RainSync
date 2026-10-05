@@ -1,5 +1,6 @@
 use crate::*;
 use ipnet::IpNet;
+use sqlx::{Postgres, Transaction};
 use std::net::{IpAddr, SocketAddr};
 use tokio::sync::Semaphore;
 
@@ -87,26 +88,40 @@ pub async fn rate_limit(
     limit: i32,
     seconds: i32,
 ) -> Result<()> {
-    let key = hash(&format!("account-rate:{scope}:{source}"));
     let mut tx = db.begin().await?;
+    let retry_after = claim_rate_limit(&mut tx, scope, source, limit, seconds).await?;
+    tx.commit().await?;
+    match retry_after {
+        Some(seconds) => Err(limited(seconds)),
+        None => Ok(()),
+    }
+}
+
+/// Claim a fixed-window attempt in the caller's transaction. Returning the
+/// delay separately lets the caller commit a denial without opening a second
+/// database connection while holding its admission locks.
+pub async fn claim_rate_limit(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &str,
+    source: &str,
+    limit: i32,
+    seconds: i32,
+) -> Result<Option<i64>> {
+    let key = hash(&format!("account-rate:{scope}:{source}"));
     sqlx::query("LOCK TABLE account_rate_limits IN SHARE ROW EXCLUSIVE MODE")
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM account_rate_limits WHERE expires_at<=clock_timestamp()")
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     let full: bool = sqlx::query_scalar("SELECT (SELECT count(*) FROM account_rate_limits)>=10000 AND NOT EXISTS(SELECT 1 FROM account_rate_limits WHERE scope=$1 AND key_hash=$2)")
-        .bind(scope).bind(&key).fetch_one(&mut *tx).await?;
+        .bind(scope).bind(&key).fetch_one(&mut **tx).await?;
     if full {
-        return Err(limited(60));
+        return Ok(Some(60));
     }
     let row = sqlx::query("INSERT INTO account_rate_limits(scope,key_hash,window_started,expires_at,attempts) VALUES($1,$2,clock_timestamp(),clock_timestamp()+$3*interval '1 second',1) ON CONFLICT(scope,key_hash) DO UPDATE SET attempts=LEAST(account_rate_limits.attempts+1,$4+1) RETURNING attempts,ceil(extract(epoch FROM expires_at-clock_timestamp()))::bigint AS remaining")
-        .bind(scope).bind(key).bind(seconds).bind(limit).fetch_one(&mut *tx).await?;
-    tx.commit().await?;
-    if row.get::<i32, _>("attempts") > limit {
-        return Err(limited(row.get("remaining")));
-    }
-    Ok(())
+        .bind(scope).bind(key).bind(seconds).bind(limit).fetch_one(&mut **tx).await?;
+    Ok((row.get::<i32, _>("attempts") > limit).then(|| row.get("remaining")))
 }
 
 pub async fn password_hash(app: &App, password: String) -> Result<String> {

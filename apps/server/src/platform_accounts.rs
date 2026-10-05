@@ -774,14 +774,6 @@ pub async fn start_login(
             "platform_storage_consent_required",
         ));
     }
-    account_security::rate_limit(
-        &app.db,
-        "platform-login-start",
-        &user.id.to_string(),
-        10,
-        600,
-    )
-    .await?;
     let mut tx = app.db.begin().await?;
     guard_login(&mut tx, user.id, &login).await?;
     let account = lock_account(&mut tx, user.id).await?;
@@ -821,6 +813,20 @@ pub async fn start_login(
         .bind(user.id).fetch_one(&mut *tx).await?;
     if active {
         return Err(err(StatusCode::CONFLICT, "platform_login_in_progress"));
+    }
+    // Re-reading the same exact-login request never generates another QR.
+    // Charge only a new admission, atomically with its exclusive request row.
+    if let Some(seconds) = account_security::claim_rate_limit(
+        &mut tx,
+        "platform-login-start",
+        &user.id.to_string(),
+        10,
+        600,
+    )
+    .await?
+    {
+        tx.commit().await?;
+        return Err(account_security::limited(seconds));
     }
     let nonce = Uuid::new_v4();
     sqlx::query("INSERT INTO platform_login_requests(id,user_id,auth_login_hash,provider,status,expires_at,next_poll_at,operation_nonce,operation_expires_at,account_id,account_revision,consent_to_renew) VALUES($1,$2,$3,'bilibili','pending',clock_timestamp()+$4*interval '1 second',clock_timestamp()+$5*interval '1 second',$6,clock_timestamp()+$7*interval '1 second',$8,$9,$10)")

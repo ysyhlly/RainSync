@@ -360,10 +360,16 @@ onBeforeUnmount(() => {
       <button
         v-if="login.phase === 'idle' || login.phase === 'uncertain'"
         class="primary"
-        :disabled="!consent || busy"
+        :disabled="!consent || busy || !!login.retryAfterSeconds"
         @click="begin"
       >
-        {{ login.phase === "uncertain" ? "重试同一登录" : "生成登录二维码" }}
+        {{
+          login.retryAfterSeconds
+            ? `等待 ${login.retryAfterSeconds} 秒后重试`
+            : login.phase === "uncertain"
+              ? "重试同一登录"
+              : "生成登录二维码"
+        }}
       </button>
       <button
         v-if="login.phase === 'expired' || login.phase === 'failed'"

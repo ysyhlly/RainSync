@@ -20,8 +20,8 @@ function response(extra: Partial<PlatformLogin> = {}): PlatformLogin {
   };
 }
 function flow(
-  start: () => Promise<PlatformLogin>,
-  poll: () => Promise<PlatformLogin>,
+  start: (key: string, signal: AbortSignal) => Promise<PlatformLogin>,
+  poll: (id: string, signal: AbortSignal) => Promise<PlatformLogin>,
 ) {
   const change = vi.fn(),
     cancel = vi.fn(async () => {}),
@@ -114,7 +114,7 @@ it("keeps a compatible start QR when the server intentionally omits its payload 
   await login.close();
 });
 
-it("never accepts a missing start QR, even when an earlier response populated the local QR", async () => {
+it("never accepts a missing start QR or borrows one from a completed flow", async () => {
   vi.useFakeTimers();
   vi.setSystemTime(0);
   const poll = vi.fn(async () => response({ qr_payload: null }));
@@ -133,11 +133,14 @@ it("never accepts a missing start QR, even when an earlier response populated th
   const second = flow(start, poll);
   await second.login.start();
   expect(second.change.mock.calls.at(-1)?.[0].phase).toBe("pending");
-  await second.login.start();
-  expect(second.change.mock.calls.at(-1)?.[0].phase).toBe("uncertain");
+  await second.login.close();
+  const third = flow(start, poll);
+  await third.login.start();
+  expect(third.change.mock.calls.at(-1)?.[0].phase).toBe("uncertain");
+  expect(third.change.mock.calls.some(([s]) => s.payload)).toBe(false);
   await vi.advanceTimersByTimeAsync(9000);
   expect(poll).not.toHaveBeenCalled();
-  await second.login.close();
+  await third.login.close();
 });
 
 it.each([
@@ -202,6 +205,11 @@ it.each([
     const { login, change } = flow(async () => response({ qr_payload }), poll);
     await login.start();
     expect(change.mock.calls.at(-1)?.[0].phase).toBe("uncertain");
+    expect(change.mock.calls.at(-1)?.[0].code).toBe(
+      "PLATFORM_LOGIN_RESPONSE_INVALID",
+    );
+    expect(change.mock.calls.at(-1)?.[0].message).toContain("未通过安全校验");
+    expect(change.mock.calls.at(-1)?.[0].message).not.toContain(qr_payload);
     expect(change.mock.calls.some(([s]) => s.payload)).toBe(false);
     await vi.advanceTimersByTimeAsync(12000);
     expect(poll).not.toHaveBeenCalled();
@@ -239,15 +247,20 @@ it("retains the validated QR through an upstream poll failure and retries the sa
   vi.setSystemTime(0);
   const requestId = "00000000-0000-4000-8000-000000000002";
   const start = vi.fn(async () => response());
-  const poll = vi.fn(async () => {
-    throw new RequestFailure({
-      error: {
-        code: "PLATFORM_LOGIN_UPSTREAM_FAILED",
-        request_id: requestId,
-        retryable: true,
-      },
-    });
-  });
+  const poll = vi
+    .fn<() => Promise<PlatformLogin>>()
+    .mockRejectedValueOnce(
+      new RequestFailure({
+        error: {
+          code: "PLATFORM_LOGIN_UPSTREAM_FAILED",
+          request_id: requestId,
+          retryable: true,
+        },
+      }),
+    )
+    .mockResolvedValueOnce(
+      response({ qr_payload: null, server_time: 3000, next_poll_at: 6000 }),
+    );
   const { login, change } = flow(start, poll);
   await login.start();
   await vi.advanceTimersByTimeAsync(3000);
@@ -258,12 +271,136 @@ it("retains the validated QR through an upstream poll failure and retries the sa
     requestId,
   });
   await login.start();
-  expect(start).toHaveBeenLastCalledWith(id, expect.any(AbortSignal));
+  expect(start).toHaveBeenCalledTimes(1);
+  expect(poll).toHaveBeenCalledTimes(2);
+  expect(poll).toHaveBeenLastCalledWith(id, expect.any(AbortSignal));
   expect(change.mock.calls.at(-1)?.[0]).toMatchObject({
     phase: "pending",
     payload,
   });
   await login.close();
+});
+
+function rateLimited(retryAfterMs?: number) {
+  return new RequestFailure({
+    error: {
+      code: "RATE_LIMITED",
+      message: "private upstream response",
+      request_id: "00000000-0000-4000-8000-000000000002",
+      retryable: true,
+      retry_after_ms: retryAfterMs,
+    },
+  });
+}
+
+it("honors the server cooldown and retries the original creation only after an explicit click", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  const start = vi
+    .fn<(key: string, signal: AbortSignal) => Promise<PlatformLogin>>()
+    .mockRejectedValueOnce(rateLimited(6500))
+    .mockResolvedValueOnce(response({ server_time: 6500, next_poll_at: 9500 }));
+  const poll = vi.fn(async () => response());
+  const { login, change } = flow(start, poll);
+  await login.start();
+  expect(change.mock.calls.at(-1)?.[0]).toMatchObject({
+    phase: "uncertain",
+    code: "RATE_LIMITED",
+    retryAfterSeconds: 7,
+  });
+  expect(change.mock.calls.at(-1)?.[0].message).not.toContain("private");
+  await login.start();
+  await vi.advanceTimersByTimeAsync(6000);
+  expect(change.mock.calls.at(-1)?.[0].retryAfterSeconds).toBe(1);
+  await login.start();
+  expect(start).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(500);
+  expect(change.mock.calls.at(-1)?.[0].retryAfterSeconds).toBeUndefined();
+  expect(start).toHaveBeenCalledTimes(1);
+  expect(poll).not.toHaveBeenCalled();
+  await login.start();
+  expect(start).toHaveBeenCalledTimes(2);
+  expect(start.mock.calls.map((args) => args[0])).toEqual([id, id]);
+  expect(change.mock.calls.at(-1)?.[0]).toMatchObject({
+    phase: "pending",
+    payload,
+  });
+  await login.close();
+});
+
+it("keeps the exact QR during a limited poll and resumes polling without another creation", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  const start = vi.fn(async () => response());
+  const poll = vi
+    .fn<() => Promise<PlatformLogin>>()
+    .mockRejectedValueOnce(rateLimited(5000))
+    .mockResolvedValueOnce(
+      response({ qr_payload: null, server_time: 8000, next_poll_at: 11000 }),
+    );
+  const { login, change } = flow(start, poll);
+  await login.start();
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(change.mock.calls.at(-1)?.[0]).toMatchObject({
+    payload,
+    retryAfterSeconds: 5,
+  });
+  await login.start();
+  expect(poll).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(change.mock.calls.at(-1)?.[0]).toMatchObject({
+    phase: "uncertain",
+    payload,
+  });
+  expect(poll).toHaveBeenCalledTimes(1);
+  await login.start();
+  expect(start).toHaveBeenCalledTimes(1);
+  expect(poll).toHaveBeenCalledTimes(2);
+  expect(change.mock.calls.at(-1)?.[0]).toMatchObject({
+    phase: "pending",
+    payload,
+  });
+  await login.close();
+});
+
+it("expires the original QR during cooldown without extending it or creating another", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  const start = vi.fn(async () => response({ expires_at: 5000 }));
+  const poll = vi.fn(async () => {
+    throw rateLimited(60000);
+  });
+  const { login, change } = flow(start, poll);
+  await login.start();
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(change.mock.calls.at(-1)?.[0].payload).toBe(payload);
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(change.mock.calls.at(-1)?.[0]).toEqual({
+    phase: "expired",
+    message: "二维码已过期，请重新确认登录",
+  });
+  expect(start).toHaveBeenCalledTimes(1);
+  expect(poll).toHaveBeenCalledTimes(1);
+  await login.close();
+});
+
+it("close cancels the original request and fences cooldown updates and retries", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  const start = vi.fn(async () => {
+    throw rateLimited(60000);
+  });
+  const poll = vi.fn(async () => response());
+  const { login, change, cancel } = flow(start, poll);
+  await login.start();
+  await login.close();
+  expect(cancel).toHaveBeenCalledWith(id);
+  const updates = change.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(60000);
+  await login.start();
+  expect(change).toHaveBeenCalledTimes(updates);
+  expect(start).toHaveBeenCalledTimes(1);
+  expect(poll).not.toHaveBeenCalled();
 });
 
 it("rejects a poll that attempts to replace the QR capability of the same login", async () => {
