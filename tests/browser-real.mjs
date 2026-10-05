@@ -63,6 +63,7 @@ function observe(page) {
     errors: [],
     commands: [],
     plans: [],
+    metrics: [],
   };
   page.on("pageerror", (e) => stats.errors.push(e.message));
   page.on("websocket", (ws) => {
@@ -83,6 +84,21 @@ function observe(page) {
       stats.prepares++;
   });
   page.on("response", async (r) => {
+    const metricSession = new URL(r.url()).pathname.match(
+      /^\/api\/v1\/playback-sessions\/([0-9a-f-]{36})\/metrics$/,
+    );
+    if (metricSession && r.request().method() === "POST") {
+      try {
+        stats.metrics.push({
+          session: metricSession[1],
+          status: r.status(),
+          sample: r.request().postDataJSON(),
+          receipt: await r.json(),
+        });
+      } catch (error) {
+        stats.errors.push(`metrics response: ${error.message}`);
+      }
+    }
     if (
       new URL(r.url()).pathname === "/api/v1/playback-sessions" &&
       r.request().method() === "POST" &&
@@ -384,7 +400,7 @@ await isolatedServer(
           exact: true,
         }),
       ).toBeVisible();
-      await expect(admin.locator(".connection-status")).toHaveText("已连接");
+      await expect(admin.locator(".connection-status")).toHaveText("房间连接正常");
       await admin
         .getByRole("button", { name: "房间邀请", exact: true })
         .click();
@@ -442,6 +458,63 @@ await isolatedServer(
           timeout: 20000,
         })
         .toBeGreaterThan(2);
+      evidence.clientReportedMetrics = [];
+      for (const [label, stats] of [
+        ["owner", as],
+        ["viewer", vs],
+      ]) {
+        await expect
+          .poll(
+            () =>
+              stats.metrics.some(
+                (m) => m.status === 200 && m.sample.first_frame,
+              ),
+            { timeout: 15000 },
+          )
+          .toBe(true);
+        const measurement = stats.metrics.find(
+          (m) => m.status === 200 && m.sample.first_frame,
+        );
+        const { sample, receipt, session } = measurement;
+        assert.equal(sample.version, 1);
+        assert.equal(Object.keys(sample.totals).length, 8);
+        assert.ok(
+          Object.values(sample.totals).every(
+            (v) => Number.isInteger(v) && v >= 0,
+          ),
+        );
+        assert.equal(
+          Object.values(sample.totals).reduce((sum, v) => sum + v, 0),
+          sample.elapsed_ms,
+        );
+        assert.ok(
+          sample.first_frame.elapsed_ms <=
+            sample.first_frame.confirmed_elapsed_ms,
+        );
+        assert.ok(sample.first_frame.confirmed_elapsed_ms <= sample.elapsed_ms);
+        assert.ok(
+          ["video_frame_callback", "playing_time_advance"].includes(
+            sample.first_frame.evidence,
+          ),
+        );
+        assert.deepEqual(receipt, {
+          session_id: session,
+          meter_start_generation: sample.meter_start_generation,
+          metrics_seq: sample.seq,
+          closed: sample.final,
+        });
+        const persisted = JSON.parse(
+          fixture.sql(
+            `SELECT g.metrics_payload::text FROM playback_sessions p JOIN playback_viewer_plans g ON g.user_id=p.user_id AND g.room_id=p.room_id AND g.viewer_id=p.viewer_id WHERE p.id='${session}'`,
+          ),
+        );
+        assert.ok(persisted.seq >= sample.seq);
+        assert.deepEqual(persisted.first_frame, sample.first_frame);
+        evidence.clientReportedMetrics.push({ user: label, sample, receipt });
+      }
+      stage(
+        "actual browser presentation callbacks produce conserved client-reported metrics accepted and persisted by the real receiver for both users",
+      );
       await expect(
         viewer.getByRole("button", { name: "暂停", exact: true }),
       ).toBeDisabled();

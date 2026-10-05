@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import ComputePolicyPanel from "./ComputePolicyPanel.vue";
 import { ref, onMounted, onBeforeUnmount } from "vue";
 import { useSession } from "../auth/session.store";
 import type { Agent } from "../../shared/api/types";
@@ -88,6 +89,7 @@ onBeforeUnmount(() => {
     <button v-if="!open && !revokeOpen" :disabled="busy" @click="run(load)">
       {{ busy ? "正在刷新…" : "刷新设备状态" }}
     </button>
+    <ComputePolicyPanel />
     <div v-if="loaded && !rows.length" class="empty-state">
       <AppIcon name="server" :size="40" />
       <h2>暂无NAS设备</h2>

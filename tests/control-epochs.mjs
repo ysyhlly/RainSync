@@ -109,7 +109,8 @@ export async function controlEpochs({
   sql(`DELETE FROM command_results WHERE command_id='${command.command_id}'`);
   await rejected(command, "CONTROL_EPOCH_EXPIRED");
 
-  // Expire a valid command while its final transaction waits for the room lock.
+  // Expire a valid command while its replay/commit authorization waits for the snapshot.
+  // The direct final-commit expiry race is also covered by room-membership-gates.
   const lock = sqlProcess(undefined, { interactive: true });
   const locked = new Promise((resolve, reject) => {
     lock.stdout.on("data", (data) => {
@@ -134,7 +135,7 @@ export async function controlEpochs({
     let blocked = "0";
     for (let i = 0; i < 30 && blocked === "0"; i++) {
       blocked = sql(
-        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT state FROM room_snapshots%FOR UPDATE%'",
+        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND (query LIKE 'SELECT state FROM room_snapshots%FOR UPDATE%' OR query LIKE 'SELECT room_id FROM room_snapshots%FOR SHARE%')",
       );
       if (blocked === "0")
         await new Promise((resolve) => setTimeout(resolve, 25));

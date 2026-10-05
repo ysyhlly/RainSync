@@ -3,6 +3,16 @@
   "title": "PlaybackPlan",
   "type": "object",
   "properties": {
+    "advanced_playback": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AdvancedPlaybackFacts"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "audio_tracks": {
       "type": "array",
       "items": {
@@ -15,8 +25,28 @@
         "null"
       ]
     },
+    "decoder_fallback_modes": {
+      "description": "Evidence-backed next request modes, never access or decode guarantees.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/DecoderFallbackMode"
+      }
+    },
     "delivery_mode": {
       "type": "string"
+    },
+    "distributed_compute": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DistributedComputePlaybackFacts"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "duration_ms": {
       "type": [
@@ -30,6 +60,26 @@
       "format": "uint32",
       "minimum": 0
     },
+    "http_file_fallback_version": {
+      "description": "This live root grant supports one same-representation HTTP file→transcode\ntransition. Absent for legacy, unsupported inputs and successor grants.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1
+    },
+    "local_hls_ladder": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LocalHlsLadderFacts"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "media_generation": {
       "type": "integer",
       "format": "uint32",
@@ -38,6 +88,16 @@
     "media_id": {
       "type": "string",
       "format": "uuid"
+    },
+    "native_platform": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NativePlatformPlaybackBinding"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "observation_seq": {
       "type": [
@@ -56,11 +116,58 @@
       "format": "uint32",
       "minimum": 0
     },
+    "pending_job_id": {
+      "description": "A real authorized local job only while queued or running.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "plan_generation": {
+      "description": "Per-viewer intent generation; absent for legacy grants. Never room revision.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 1
+    },
+    "playback_metrics": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PlaybackMetricsGrantWire"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "playback_metrics_version": {
+      "description": "Optional independent client-reported metrics; observations v1 is unchanged.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "maximum": 2,
+      "minimum": 1
+    },
     "playback_url": {
       "type": "string"
     },
     "rebuild_on_seek": {
       "type": "boolean"
+    },
+    "seekable_media_ranges_ms": {
+      "description": "Original-media intervals; absent is unknown, while [] is known empty.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/PlaybackMediaRange"
+      }
     },
     "selected_audio_track": {
       "type": [
@@ -76,9 +183,41 @@
         "null"
       ]
     },
+    "selected_output": {
+      "description": "Server-selected bound configuration, not measured output or playback.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PlaybackSelectedOutput"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "session_id": {
       "type": "string",
       "format": "uuid"
+    },
+    "static_hls_fallback_version": {
+      "description": "Server-verified static-HLS root may claim one decode-failure child.\nAbsent for legacy/ineligible parents and every successor grant.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1
+    },
+    "subtitle_mode": {
+      "description": "Available delivery pipeline, not the user's currently selected subtitle.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SubtitleDeliveryMode"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "subtitle_tracks": {
       "type": "array",
@@ -92,6 +231,17 @@
     },
     "transport": {
       "type": "string"
+    },
+    "upstream_profile": {
+      "description": "Negotiated upstream recipe envelope; not measured media configuration.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UpstreamTranscodeProfileEnvelope"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "required": [
@@ -108,6 +258,285 @@
     "subtitle_tracks"
   ],
   "$defs": {
+    "AdvancedPlaybackFacts": {
+      "description": "Committed constrained recipe intent, never a measured encoder result.",
+      "type": "object",
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/AdvancedPlaybackRequest"
+        },
+        "subtitle_codec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdvancedSubtitleCodec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "video_basis": {
+          "$ref": "#/$defs/PlaybackOutputBasis"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "request",
+        "video_basis"
+      ]
+    },
+    "AdvancedPlaybackRequest": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 1,
+          "minimum": 1
+        },
+        "subtitle_stream_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tone_map_hdr": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "tone_map_hdr"
+      ]
+    },
+    "AdvancedSubtitleCodec": {
+      "type": "string",
+      "enum": [
+        "ass",
+        "ssa",
+        "pgs"
+      ]
+    },
+    "AudioCapabilityConfiguration": {
+      "type": "object",
+      "properties": {
+        "bitrate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "channels": {
+          "type": "string"
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "samplerate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "content_type",
+        "channels",
+        "bitrate",
+        "samplerate"
+      ]
+    },
+    "DecoderFallbackMode": {
+      "description": "A next request mode justified by existing source/output evidence. It is\nneither authorization nor a guarantee that the device will decode it.",
+      "type": "string",
+      "enum": [
+        "remux",
+        "transcode"
+      ]
+    },
+    "DistributedComputePlaybackFacts": {
+      "description": "Independently server-verified output and authenticated NAS source measurements.\nThis is qualification evidence, not observed browser playback.",
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "audio_channels": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "audio_codec": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "audio_sample_rate": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "directory_url": {
+          "type": "string"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "manifest_sha256": {
+          "type": "string"
+        },
+        "output_generation": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "p2p_enabled": {
+          "type": "boolean"
+        },
+        "qualification_sha256": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "source_audio_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "source_duration_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "source_video_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "timestamp_shift_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "video_codec": {
+          "type": "string"
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "job_id",
+        "output_generation",
+        "attempt",
+        "qualification_sha256",
+        "manifest_sha256",
+        "directory_url",
+        "p2p_enabled",
+        "source_video_index",
+        "video_codec",
+        "width",
+        "height",
+        "source_duration_ms",
+        "timestamp_shift_ms"
+      ]
+    },
+    "LocalHlsLadderFacts": {
+      "description": "Exact server master recipe, never the client's currently decoded level.",
+      "type": "object",
+      "properties": {
+        "renditions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LocalHlsRendition"
+          }
+        },
+        "request": {
+          "$ref": "#/$defs/LocalHlsLadderRequest"
+        },
+        "video_basis": {
+          "$ref": "#/$defs/PlaybackOutputBasis"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "request",
+        "renditions",
+        "video_basis"
+      ]
+    },
+    "LocalHlsLadderRequest": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 1,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version"
+      ]
+    },
+    "LocalHlsRendition": {
+      "type": "object",
+      "properties": {
+        "bandwidth": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "codecs": {
+          "type": "string"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string"
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "width",
+        "height",
+        "bandwidth",
+        "codecs"
+      ]
+    },
     "MediaTrack": {
       "type": "object",
       "properties": {
@@ -133,6 +562,994 @@
         "index",
         "label",
         "language"
+      ]
+    },
+    "NativePlatformCompatibilityBinding": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/NativePlatformCompatibilityMode"
+        },
+        "output": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativePlatformCompatibilityOutput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 1,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "mode"
+      ]
+    },
+    "NativePlatformCompatibilityMode": {
+      "description": "A closed, explicit request for the server-owned clear-media recipe.\nIt never carries extractor flags, upstream URLs or credential material.",
+      "type": "string",
+      "enum": [
+        "hls_avc_aac",
+        "hls_avc_aac_ladder"
+      ]
+    },
+    "NativePlatformCompatibilityOutput": {
+      "description": "Qualified encoded output, never the selected provider/source quality.\nAbsent while queued, and attached only after the actual attempt is known.",
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "format": "int64",
+          "minimum": 1
+        },
+        "codecs": {
+          "type": "string"
+        },
+        "complete": {
+          "description": "Full immutable publication for this exact attempt; prefix readiness from\nan earlier retry cannot supply its completion or forward-lead policy.",
+          "type": "boolean"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "renditions": {
+          "description": "Qualified renditions belonging to this exact ladder attempt. The scalar\ndimensions describe the highest rendition, not the player's current\nautomatically selected level. Absent for the single-output recipe.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/LocalHlsRendition"
+          },
+          "maxItems": 3,
+          "minItems": 1
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "attempt",
+        "complete",
+        "codecs",
+        "width",
+        "height"
+      ]
+    },
+    "NativePlatformLiveBinding": {
+      "type": "object",
+      "properties": {
+        "broadcast_id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 5
+        },
+        "sync_mode": {
+          "$ref": "#/$defs/NativePlatformLiveSyncMode"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 2,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "broadcast_id",
+        "sync_mode"
+      ]
+    },
+    "NativePlatformLiveSyncMode": {
+      "description": "No shared program-date-time mapping is certified. Only live-edge playback\nand room play/pause controls are shared, never a frame-aligned VOD clock.",
+      "type": "string",
+      "enum": [
+        "live_edge_control"
+      ]
+    },
+    "NativePlatformMaxHeight": {
+      "description": "Closed height ceilings. These are application policy, never extractor flags\nor a promise that a provider has a rendition at the named height.",
+      "type": "string",
+      "enum": [
+        "auto",
+        "p144",
+        "p240",
+        "p360",
+        "p480",
+        "p720",
+        "p1080",
+        "p1440",
+        "p2160",
+        "p4320"
+      ]
+    },
+    "NativePlatformPlaybackBinding": {
+      "type": "object",
+      "properties": {
+        "compatibility": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativePlatformCompatibilityBinding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "course_version": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "maximum": 1,
+          "minimum": 1
+        },
+        "credential_mode": {
+          "$ref": "#/$defs/NativePlatformResolvedCredentialMode"
+        },
+        "live": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativePlatformLiveBinding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "$ref": "#/$defs/NativePlatformProvider"
+        },
+        "quality": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativePlatformQualityBinding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "refresh_after_seconds": {
+          "description": "An application refresh policy, not a promise about upstream URL TTL.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 1,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "provider",
+        "credential_mode",
+        "refresh_after_seconds"
+      ]
+    },
+    "NativePlatformProvider": {
+      "type": "string",
+      "enum": [
+        "bilibili",
+        "douyin",
+        "tiktok",
+        "youtube"
+      ]
+    },
+    "NativePlatformQualityBinding": {
+      "type": "object",
+      "properties": {
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NativePlatformQualityOption"
+          },
+          "maxItems": 9,
+          "minItems": 1
+        },
+        "requested_max_height": {
+          "$ref": "#/$defs/NativePlatformMaxHeight"
+        },
+        "selected_height": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4320,
+          "minimum": 1
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 1,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "requested_max_height",
+        "selected_height",
+        "options"
+      ]
+    },
+    "NativePlatformQualityOption": {
+      "type": "object",
+      "properties": {
+        "height": {
+          "description": "Observed compatible provider rendition, used for truthful UI labels.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4320,
+          "minimum": 1
+        },
+        "max_height": {
+          "$ref": "#/$defs/NativePlatformMaxHeight"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_height",
+        "height"
+      ]
+    },
+    "NativePlatformResolvedCredentialMode": {
+      "type": "string",
+      "enum": [
+        "own_account",
+        "anonymous"
+      ]
+    },
+    "PlaybackCandidate": {
+      "description": "A server-issued exact input/output configuration, not an arbitrary device profile.",
+      "type": "object",
+      "properties": {
+        "audio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AudioCapabilityConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "delivery_mode": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "transport": {
+          "type": "string"
+        },
+        "video": {
+          "$ref": "#/$defs/VideoCapabilityConfiguration"
+        }
+      },
+      "required": [
+        "id",
+        "delivery_mode",
+        "transport",
+        "content_type",
+        "video"
+      ]
+    },
+    "PlaybackMediaRange": {
+      "description": "A measured or otherwise established interval in original-media time.\nThe start is inclusive and the end is exclusive; an empty interval is omitted.",
+      "type": "object",
+      "properties": {
+        "end_ms": {
+          "type": "number",
+          "format": "double",
+          "minimum": 0
+        },
+        "start_ms": {
+          "type": "number",
+          "format": "double",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "start_ms",
+        "end_ms"
+      ]
+    },
+    "PlaybackMetricsFirstFrame": {
+      "type": "object",
+      "properties": {
+        "confirmed_elapsed_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "evidence": {
+          "$ref": "#/$defs/PlaybackMetricsFrameEvidence"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "elapsed_ms",
+        "confirmed_elapsed_ms",
+        "evidence"
+      ]
+    },
+    "PlaybackMetricsFrameEvidence": {
+      "type": "string",
+      "enum": [
+        "video_frame_callback",
+        "playing_time_advance"
+      ]
+    },
+    "PlaybackMetricsGrant": {
+      "type": "object",
+      "properties": {
+        "closed": {
+          "type": "boolean"
+        },
+        "last_sample": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlaybackMetricsSample"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "meter_start_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "metrics_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "startup_origin": {
+          "$ref": "#/$defs/PlaybackMetricsOrigin"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "meter_start_generation",
+        "startup_origin",
+        "metrics_seq",
+        "closed"
+      ]
+    },
+    "PlaybackMetricsGrantV2": {
+      "type": "object",
+      "properties": {
+        "closed": {
+          "type": "boolean"
+        },
+        "last_sample": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlaybackMetricsSampleV2"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "meter_start_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "metrics_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "startup_origin": {
+          "$ref": "#/$defs/PlaybackMetricsOrigin"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "meter_start_generation",
+        "startup_origin",
+        "metrics_seq",
+        "closed"
+      ]
+    },
+    "PlaybackMetricsGrantWire": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PlaybackMetricsGrant"
+        },
+        {
+          "$ref": "#/$defs/PlaybackMetricsGrantV2"
+        }
+      ]
+    },
+    "PlaybackMetricsOrigin": {
+      "type": "string",
+      "enum": [
+        "user_intent",
+        "automatic_load"
+      ]
+    },
+    "PlaybackMetricsSample": {
+      "type": "object",
+      "properties": {
+        "elapsed_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "final": {
+          "type": "boolean"
+        },
+        "first_frame": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlaybackMetricsFirstFrame"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "media_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "meter_start_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "plan_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "startup_origin": {
+          "$ref": "#/$defs/PlaybackMetricsOrigin"
+        },
+        "totals": {
+          "$ref": "#/$defs/PlaybackMetricsTotals"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 1,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "media_generation",
+        "plan_generation",
+        "meter_start_generation",
+        "seq",
+        "startup_origin",
+        "elapsed_ms",
+        "totals",
+        "final"
+      ]
+    },
+    "PlaybackMetricsSampleV2": {
+      "type": "object",
+      "properties": {
+        "elapsed_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "final": {
+          "type": "boolean"
+        },
+        "first_frame": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlaybackMetricsFirstFrame"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "first_frame_plan_generation": {
+          "description": "The originating published grant, never a local source callback counter.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "media_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "meter_start_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "plan_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "startup_origin": {
+          "$ref": "#/$defs/PlaybackMetricsOrigin"
+        },
+        "startup_phases": {
+          "$ref": "#/$defs/PlaybackMetricsStartupPhases"
+        },
+        "totals": {
+          "$ref": "#/$defs/PlaybackMetricsTotals"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 2,
+          "minimum": 2
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "media_generation",
+        "plan_generation",
+        "meter_start_generation",
+        "seq",
+        "startup_origin",
+        "elapsed_ms",
+        "totals",
+        "startup_phases",
+        "final"
+      ]
+    },
+    "PlaybackMetricsStartupPhases": {
+      "description": "Separate cumulative startup coverage through first-frame confirmation.\nThis is not a breakdown of the mutually exclusive playback state counters.",
+      "type": "object",
+      "properties": {
+        "loading_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "preparation_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "unobserved_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "preparation_ms",
+        "loading_ms",
+        "unobserved_ms"
+      ]
+    },
+    "PlaybackMetricsTotals": {
+      "type": "object",
+      "properties": {
+        "autoplay_blocked_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "background_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "paused_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "playing_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "rebuffer_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "seeking_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "startup_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "unobserved_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "startup_ms",
+        "autoplay_blocked_ms",
+        "background_ms",
+        "paused_ms",
+        "seeking_ms",
+        "rebuffer_ms",
+        "playing_ms",
+        "unobserved_ms"
+      ]
+    },
+    "PlaybackOutputBasis": {
+      "type": "string",
+      "enum": [
+        "source_probe",
+        "constrained_encoder_recipe"
+      ]
+    },
+    "PlaybackSelectedOutput": {
+      "description": "Bound selected configuration. Neither basis is measured encoded output or\nan observation of playback; copied and encoded tracks have separate bases.",
+      "type": "object",
+      "properties": {
+        "audio_basis": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlaybackOutputBasis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "configuration": {
+          "$ref": "#/$defs/PlaybackCandidate"
+        },
+        "video_basis": {
+          "$ref": "#/$defs/PlaybackOutputBasis"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "configuration",
+        "video_basis"
+      ]
+    },
+    "SubtitleDeliveryMode": {
+      "description": "Subtitle delivery available in the plan, independent of local selection.",
+      "type": "string",
+      "enum": [
+        "none",
+        "external_vtt",
+        "burned_in"
+      ]
+    },
+    "UpstreamAudioProfileBounds": {
+      "type": "object",
+      "properties": {
+        "codec": {
+          "description": "AAC is requested. A particular AAC profile is not promised by this field.",
+          "type": "string"
+        },
+        "max_bitrate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_channels": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "requested_sample_rate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "codec",
+        "max_channels",
+        "requested_sample_rate",
+        "max_bitrate"
+      ]
+    },
+    "UpstreamAudioRateContract": {
+      "description": "A discrete allowed set, separate from the requested rate and measured output.",
+      "type": "object",
+      "properties": {
+        "allowed_sample_rates": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "mse_samples": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AudioCapabilityConfiguration"
+          }
+        },
+        "source_sample_rate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "allowed_sample_rates",
+        "source_sample_rate",
+        "mse_samples"
+      ]
+    },
+    "UpstreamProfileProbeSample": {
+      "description": "A finite browser estimate for MSE after HLS transmuxing, not measured output.",
+      "type": "object",
+      "properties": {
+        "audio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AudioCapabilityConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "video": {
+          "$ref": "#/$defs/VideoCapabilityConfiguration"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "video"
+      ]
+    },
+    "UpstreamProfileSemantics": {
+      "description": "Advisory output recipe, deliberately separate from exact media candidates.",
+      "type": "string",
+      "enum": [
+        "upstream_transcode_profile_envelope"
+      ]
+    },
+    "UpstreamTranscodeProfileEnvelope": {
+      "type": "object",
+      "properties": {
+        "audio_rate_contract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpstreamAudioRateContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "configuration_semantics": {
+          "$ref": "#/$defs/UpstreamProfileSemantics"
+        },
+        "container": {
+          "type": "string"
+        },
+        "mse_sample": {
+          "$ref": "#/$defs/UpstreamProfileProbeSample"
+        },
+        "profile_id": {
+          "type": "string"
+        },
+        "profile_version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "requested_audio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpstreamAudioProfileBounds"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "requested_video": {
+          "$ref": "#/$defs/UpstreamVideoProfileBounds"
+        },
+        "transport": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile_version",
+        "profile_id",
+        "configuration_semantics",
+        "transport",
+        "container",
+        "requested_video",
+        "mse_sample"
+      ]
+    },
+    "UpstreamVideoProfileBounds": {
+      "type": "object",
+      "properties": {
+        "codec": {
+          "type": "string"
+        },
+        "max_bitrate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_framerate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_level": {
+          "type": "string"
+        },
+        "max_width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "profile": {
+          "type": "string"
+        },
+        "requested_bit_depth": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "requested_range": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "codec",
+        "profile",
+        "max_level",
+        "max_width",
+        "max_height",
+        "max_framerate",
+        "max_bitrate",
+        "requested_bit_depth",
+        "requested_range"
+      ]
+    },
+    "VideoCapabilityConfiguration": {
+      "type": "object",
+      "properties": {
+        "bitrate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "framerate": {
+          "type": "number",
+          "format": "double"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "content_type",
+        "width",
+        "height",
+        "bitrate",
+        "framerate"
       ]
     }
   }

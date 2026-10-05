@@ -50,6 +50,7 @@ async function setup(
     await route.fulfill({
       json: {
         session_id: "observed-video",
+        plan_generation: route.request().postDataJSON().plan_generation,
         media_id: "movie",
         media_generation: 1,
         delivery_mode: "direct",

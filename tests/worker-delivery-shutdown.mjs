@@ -1,3 +1,4 @@
+import { sourceMedia } from "./fixtures/source-grant.mjs";
 import assert from "node:assert/strict";
 import {
   createCipheriv,
@@ -10,6 +11,7 @@ import { open, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
 import { delay } from "./fixtures/server.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 
 if (process.platform === "win32") {
   console.log(
@@ -84,8 +86,10 @@ await isolatedMediaStack("worker-delivery-shutdown", async (f) => {
             url: `http://127.0.0.1:${upstream.address().port}/${id}`,
             headers: {},
           };
-    f.sql(
-      `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${user.id}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}","upstream_closed":true}',now()+interval '1 hour')`,
+    withPlaybackAdmission(
+      f,
+      { client, user: user.id, room: room.id, session: id },
+      `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f,resource)}','${id}','${user.id}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}","upstream_closed":true}',now()+interval '1 hour')`,
     );
     return {
       kind,

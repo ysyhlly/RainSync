@@ -32,8 +32,18 @@ test("queue thumbnail image retry is reachable inside its compact bounds", async
     exact: true,
   });
   await expect(retry).toBeVisible();
-  const outer = await thumbnail.boundingBox(),
-    inner = await retry.boundingBox();
+  // Compare the two rectangles in one browser task. Room/video startup can
+  // move the entire queue between separate awaited locator measurements.
+  const { outer, inner } = await thumbnail.evaluate((element) => {
+    const button = element.querySelector('button[aria-label="重新加载封面"]');
+    if (!(button instanceof HTMLButtonElement))
+      return { outer: null, inner: null };
+    const bounds = (node: Element) => {
+      const { x, y, width, height } = node.getBoundingClientRect();
+      return { x, y, width, height };
+    };
+    return { outer: bounds(element), inner: bounds(button) };
+  });
   expect(outer).not.toBeNull();
   expect(inner).not.toBeNull();
   expect(inner!.height).toBeGreaterThanOrEqual(44);

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UpstreamProfileCandidateRequest",
+  "description": "The dedicated endpoint only describes explicit-transcode eligibility.",
+  "type": "object",
+  "properties": {
+    "audio_index": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "media_generation": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "position_ms": {
+      "type": "number",
+      "format": "double",
+      "default": 0.0
+    },
+    "profile_version": {
+      "description": "Maximum supported dedicated contract version; response keeps its actual version.",
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
+    "room_id": {
+      "type": "string",
+      "format": "uuid"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "profile_version",
+    "room_id",
+    "media_generation"
+  ]
+}

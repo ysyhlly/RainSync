@@ -7,6 +7,8 @@ import RoomsPage from "../features/rooms/RoomsPage.vue";
 import LibraryPage from "../features/library/LibraryPage.vue";
 import RoomPage from "../features/rooms/RoomPage.vue";
 import NotFoundPage from "./NotFoundPage.vue";
+import PrivateLibrariesPage from "../features/private-library/PrivateLibrariesPage.vue";
+import PluginsPage from "../features/plugins/PluginsPage.vue";
 import SourcesPage from "../features/admin/SourcesPage.vue";
 import AgentsPage from "../features/admin/AgentsPage.vue";
 import RegistrationInvitesPage from "../features/admin/RegistrationInvitesPage.vue";
@@ -38,6 +40,8 @@ export function createApplicationRouter(base = "/") {
         meta: { title: "观影", room: true },
       },
       { path: "/library", component: LibraryPage, meta: { title: "媒体库" } },
+      { path: "/libraries", component: PrivateLibrariesPage, meta: { title: "私有媒体库" } },
+      { path: "/admin/plugins", component: PluginsPage, meta: { title: "插件管理", requiresAdmin: true } },
       { path: "/admin", redirect: "/admin/sources" },
       {
         path: "/admin/sources",

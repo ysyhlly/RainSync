@@ -8,6 +8,7 @@ import {
 import type { RoomState } from "../../../../../packages/protocol";
 import type {
   Room,
+  RoomMember,
   RoomLifecycle,
   Message,
   QueueItem,
@@ -19,31 +20,89 @@ import { StaleIdentity } from "../../shared/api/client";
 import { PlaybackCancelled } from "../../playback-request";
 import { useMediaCatalog } from "../library/media-catalog.store";
 import { useSession } from "../auth/session.store";
+import { usePlatformAccount } from "../account/platform-account.store";
 import { createPlaybackRuntime } from "../playback/playback-runtime";
 import { lifecycleLabels } from "./room-lifecycle";
+import { clientPlaybackStatus } from "./client-playback-status";
+import {
+  PresenceState,
+  readPresenceSnapshot,
+  type OnlineSnapshot,
+} from "./presence-state";
+import {
+  createControlRecoveryMetrics,
+  type ControlRecoveryMetricsFence,
+} from "./control-recovery-metrics";
 
 export const useRoomRuntime = defineStore("room-runtime", () => {
   const session = useSession(),
-    catalog = useMediaCatalog();
+    catalog = useMediaCatalog(),
+    platformAccount = usePlatformAccount();
   const error = ref(""),
     busy = ref(false),
     room = ref<Room | null>(null),
     state = ref<RoomState | null>(null),
     connected = ref(false),
     connectionStopped = ref(false);
+  const presence = ref<OnlineSnapshot>(),
+    presenceNames = ref<Record<string, string>>({});
+  const presenceState = new PresenceState();
+  let namesRequest = 0,
+    namesPending = false;
+  function clearPresence() {
+    presenceState.begin("");
+    presence.value = undefined;
+  }
+  async function refreshPresenceNames(serial: number) {
+    const selected = room.value?.id;
+    if (
+      !selected ||
+      namesPending ||
+      !presence.value?.members.some(
+        (member) => !presenceNames.value[member.userId],
+      )
+    )
+      return;
+    namesPending = true;
+    const request = ++namesRequest;
+    try {
+      const members = await session.api<RoomMember[]>(
+        `/rooms/${selected}/members`,
+      );
+      if (
+        request !== namesRequest ||
+        serial !== connectionSerial ||
+        room.value?.id !== selected
+      )
+        return;
+      presenceNames.value = Object.fromEntries(
+        members
+          .slice(0, 80)
+          .map((member) => [member.id, member.display_name || member.username]),
+      );
+    } catch {
+      /* Names are optional; membership never establishes online status. */
+    } finally {
+      if (request === namesRequest) namesPending = false;
+    }
+  }
+  const lastChatDeletion = ref<string>();
+  const deletedMessages = new Set<string>();
   const messages = ref<Message[]>([]),
     playlist = ref<QueueItem[]>([]),
     chat = ref("");
   const remember = catalog.remember;
   const currentTitle = computed(() =>
     state.value?.media_id
-      ? (catalog.records[state.value.media_id]?.title ?? "正在播放")
+      ? (catalog.roomRecord(room.value?.id, state.value.media_id)?.title ??
+        "正在播放")
       : "尚未选择影片",
   );
   watch(
     () => state.value?.media_id,
     (id) => {
-      if (id) void catalog.ensure(id, true).catch(() => {});
+      if (id && room.value)
+        void catalog.ensureRoom(room.value.id, id, true).catch(() => {});
     },
   );
   let metadataRefresh = 0;
@@ -66,11 +125,20 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         identity === session.epoch
       ) {
         const id = ids.shift()!;
-        await catalog.ensure(id, true).catch(() => {});
+        if (room.value)
+          await catalog.ensureRoom(room.value.id, id, true).catch(() => {});
       }
     };
     void Promise.all(Array.from({ length: Math.min(4, ids.length) }, work));
   }
+  watch(
+    () => state.value?.media_generation,
+    () => {
+      catalog.clearRoom();
+      refreshMetadata();
+    },
+    { flush: "sync" },
+  );
   watch(
     () => playlist.value.map((item) => item.media_id).join(","),
     refreshMetadata,
@@ -84,11 +152,64 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     connectionSerial = 0,
     roomSerial = 0,
     controlEpoch: string | undefined;
+  let recoveryIdentity: object | undefined,
+    recoveryAuthEpoch = -1;
+  const recovery = createControlRecoveryMetrics({
+    current: () =>
+      room.value && recoveryIdentity && recoveryAuthEpoch === session.epoch
+        ? { identity: recoveryIdentity, generation: connectionSerial }
+        : undefined,
+    foreground: () => document.visibilityState !== "hidden",
+  });
   let pendingChat: { id: string; body: string } | undefined;
   let chatTimer: ReturnType<typeof setTimeout> | undefined;
   const chatPending = ref(false),
     chatFailed = ref(false);
   const clockSamples = new Set<ReturnType<typeof setTimeout>>();
+  let snapshotReady = false;
+  let visibility = document.visibilityState;
+  let lastClockCheck = { monotonic: performance.now(), wall: Date.now() };
+  function clearClockSamples() {
+    clockSamples.forEach(clearTimeout);
+    clockSamples.clear();
+  }
+  function invalidateClock() {
+    clearClockSamples();
+    clock.reset();
+    playback.onClockInvalidated();
+    lastClockCheck = { monotonic: performance.now(), wall: Date.now() };
+  }
+  function calibrateClock() {
+    invalidateClock();
+    if (!snapshotReady || !connected.value || !roomActive.value) return;
+    const serial = connectionSerial,
+      revision = clock.revision;
+    sampleClock();
+    for (let i = 1; i < 8; i++) {
+      const timer = setTimeout(() => {
+        clockSamples.delete(timer);
+        if (serial === connectionSerial && revision === clock.revision)
+          sampleClock();
+      }, i * 150);
+      clockSamples.add(timer);
+    }
+  }
+  function checkClockContinuity() {
+    const now = { monotonic: performance.now(), wall: Date.now() },
+      monotonicGap = now.monotonic - lastClockCheck.monotonic,
+      wallGap = now.wall - lastClockCheck.wall;
+    lastClockCheck = now;
+    // performance.now() can stop on suspended systems. A long monotonic gap,
+    // backwards clock, or a long wall gap absent from it is evidence to resample.
+    if (
+      roomActive.value &&
+      document.visibilityState !== "hidden" &&
+      (monotonicGap < 0 ||
+        monotonicGap > 10000 ||
+        (wallGap > 10000 && wallGap - monotonicGap > 5000))
+    )
+      calibrateClock();
+  }
   const roomActive = computed(
     () => !!room.value && (room.value.lifecycle ?? "active") === "active",
   );
@@ -97,11 +218,29 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
   );
   const cleanupError = ref("");
   const playback = createPlaybackRuntime({
+    staticHlsFallback: true,
     session,
     state,
     connected,
     active: roomActive,
+    resolveMedia: (room, media) => catalog.ensureRoom(room, media),
+    platformAccountChange: computed(() => platformAccount.change),
+    youtubePlatformAccountChange: computed(() => platformAccount.youtubeChange),
+    youtubePlatformAccountId: computed(() =>
+      platformAccount.youtubeStatus?.state === "connected"
+        ? (platformAccount.youtubeStatus.id ?? undefined)
+        : undefined,
+    ),
+    shortPlatformAccountChanges: computed(() => platformAccount.shortChanges),
+    shortPlatformAccountIds: computed(() =>
+      Object.fromEntries(
+        Object.entries(platformAccount.shortStatuses)
+          .filter(([, value]) => value.state === "connected" && value.id)
+          .map(([provider, value]) => [provider, value.id!]),
+      ),
+    ),
     clock,
+    checkClock: checkClockContinuity,
     error,
     run,
     ended: (position_ms) => send("END_MEDIA", { position_ms }),
@@ -120,9 +259,9 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       (room.value.owner_id === session.user?.id || !!session.user?.admin),
   );
   let actionSerial = 0;
-  async function run(action: () => Promise<void>) {
+  async function run(action: () => Promise<void>, preserveError = false) {
     const serial = ++actionSerial;
-    error.value = "";
+    if (!preserveError) error.value = "";
     busy.value = true;
     try {
       await action();
@@ -138,11 +277,18 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     }
   }
   async function leave() {
+    catalog.clearRoom();
+    recovery.reset();
+    recoveryIdentity = undefined;
+    clearPresence();
+    presenceNames.value = {};
+    ++namesRequest;
+    namesPending = false;
     ++roomSerial;
     ++connectionSerial;
     clearTimeout(retry);
-    clockSamples.forEach(clearTimeout);
-    clockSamples.clear();
+    snapshotReady = false;
+    invalidateClock();
     socket?.close();
     socket = undefined;
     connected.value = false;
@@ -153,12 +299,13 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     state.value = null;
     playlist.value = [];
     messages.value = [];
+    deletedMessages.clear();
+    lastChatDeletion.value=undefined;
     pendingChat = undefined;
     clearTimeout(chatTimer);
     chatPending.value = false;
     chatFailed.value = false;
     chat.value = "";
-    clock.reset();
     await playback.reset();
   }
   watch(
@@ -176,6 +323,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     await cleanup;
     if (serial !== roomSerial) return;
     room.value = r;
+    recoveryIdentity = {};
+    recoveryAuthEpoch = session.epoch;
     connect();
     const items = await session.api<QueueItem[]>(
       "/rooms/" + r.id + "/playlist",
@@ -191,20 +340,33 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         `/rooms/${id}/messages${after ? `?after=${after}` : ""}`,
       );
       if (serial !== connectionSerial || room.value?.id !== id) return;
+      for(const m of history)if(m.deleted)deletedMessages.add(m.id);
       recovered.push(...history);
       messages.value = [
         ...new Map(
           [...before, ...recovered, ...messages.value].map((m) => [m.id, m]),
         ).values(),
-      ];
-      if (history.length < 100) return;
+      ].slice(-2000).map(m=>deletedMessages.has(m.id)?{...m,body:"",deleted:true}:m);
+      if (history.length < 100) break;
       after = history.at(-1)?.id;
     } while (after);
+    // Deletions during disconnection can affect messages before the forward
+    // cursor. Revalidate only cached IDs in bounded same-room batches.
+    const cached=messages.value.map(m=>m.id);
+    for(let i=0;i<cached.length;i+=100){
+      const history=await session.api<Message[]>(`/rooms/${id}/messages?check_ids=${cached.slice(i,i+100).join(",")}`);
+      if(serial!==connectionSerial||room.value?.id!==id)return;
+      for(const m of history)if(m.deleted)deletedMessages.add(m.id);
+      messages.value=messages.value.map(m=>deletedMessages.has(m.id)?{...m,body:"",deleted:true}:m);
+    }
   }
   function connect() {
+    clearPresence();
+    ++namesRequest;
+    namesPending = false;
     controlEpoch = undefined;
-    clockSamples.forEach(clearTimeout);
-    clockSamples.clear();
+    snapshotReady = false;
+    invalidateClock();
     clearTimeout(retry);
     connectionSerial++;
     const serial = connectionSerial;
@@ -214,17 +376,26 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     connectionStopped.value = false;
     if (!room.value) return;
     const selected = room.value.id;
-    socket = new WebSocket(
+    const recoveryFence: ControlRecoveryMetricsFence | undefined =
+      recoveryIdentity && recoveryAuthEpoch === session.epoch
+        ? { identity: recoveryIdentity, generation: serial }
+        : undefined;
+    if (recoveryFence) recovery.beginAttempt(recoveryFence);
+    const presenceGeneration = presenceState.begin(selected);
+    const connection = new WebSocket(
       `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/v1/ws`,
     );
-    clock.reset();
+    socket = connection;
     socket.onopen = () => {
       if (serial !== connectionSerial) return;
+      if (recoveryFence) recovery.opened(recoveryFence);
       connected.value = true;
       attempt = 0;
       socket!.send(
         JSON.stringify({
           type: "RESUME",
+          presence_version: 1,
+          control_recovery_metrics_version: 1,
           room_id: selected,
           revision: state.value?.revision ?? 0,
           clock_epoch: state.value?.clock_epoch,
@@ -238,20 +409,18 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         if (serial === connectionSerial)
           error.value = e instanceof Error ? e.message : String(e);
       });
-      for (let i = 0; i < 8; i++) {
-        const timer = setTimeout(() => {
-          clockSamples.delete(timer);
-          if (serial === connectionSerial) sampleClock();
-        }, i * 150);
-        clockSamples.add(timer);
-      }
     };
     socket.onclose = async () => {
       if (serial !== connectionSerial) return;
+      if (recoveryFence) recovery.disconnected(recoveryFence, retryAllowed);
+      presenceState.end(presenceGeneration);
+      presence.value = undefined;
       clearTimeout(chatTimer);
       chatPending.value = false;
       chatFailed.value = !!pendingChat;
       connected.value = false;
+      snapshotReady = false;
+      invalidateClock();
       if (retryAllowed) {
         // Browsers do not expose a rejected upgrade's HTTP status. Check the
         // login session before reconnecting so expired cookies cannot loop.
@@ -269,6 +438,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           }
           if (failure instanceof RequestFailure && stopsReconnect(failure)) {
             retryAllowed = false;
+            recovery.reset();
             error.value = failure.message;
           }
         }
@@ -279,16 +449,67 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     };
     socket.onmessage = (event) => {
       if (serial !== connectionSerial) return;
-      const v = JSON.parse(event.data);
+      let v;
+      try {
+        v = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (!v || typeof v !== "object") return;
+      if (
+        v.type === "PRESENCE_SNAPSHOT" ||
+        (v.type === "SNAPSHOT" &&
+          typeof v.presence_connection_id === "string" &&
+          v.presence)
+      ) {
+        const snapshot = readPresenceSnapshot(
+          v.type === "PRESENCE_SNAPSHOT" ? v : v.presence,
+        );
+        if (snapshot) {
+          const result =
+            v.type === "PRESENCE_SNAPSHOT"
+              ? presenceState.accept(presenceGeneration, snapshot)
+              : presenceState.bind(
+                  presenceGeneration,
+                  v.presence_connection_id,
+                  snapshot,
+                );
+          if (result === "resync") {
+            connect();
+            return;
+          }
+          if (result === "applied") {
+            presence.value = presenceState.current;
+            void refreshPresenceNames(serial);
+          }
+        }
+        if (v.type === "PRESENCE_SNAPSHOT") return;
+      }
       if (!v.state && typeof v.control_epoch?.id === "string")
         controlEpoch = v.control_epoch.id;
       if (v.type === "CLOCK_SYNC_REPLY") {
-        if (clock.sample(v.t1, v.t2, v.t3, performance.now()))
+        checkClockContinuity();
+        if (
+          connected.value &&
+          snapshotReady &&
+          state.value &&
+          clock.acceptReply(v, state.value.clock_epoch, performance.now())
+        )
           playback.onClockReady();
         return;
       }
+      if (v.type === "CHAT_DELETED" && typeof v.id === "string") {
+        deletedMessages.add(v.id);
+        lastChatDeletion.value=v.id;
+        messages.value = messages.value.map((m) => m.id === v.id ? { ...m, body: "", deleted: true } : m);
+        return;
+      }
       if (v.type === "CHAT") {
-        if (!messages.value.some((m) => m.id === v.id)) messages.value.push(v);
+        if(v.deleted===true)deletedMessages.add(v.id);
+        if(deletedMessages.has(v.id)){v.body="";v.deleted=true;}
+        const index=messages.value.findIndex(m=>m.id===v.id);
+        if(index<0)messages.value=[...messages.value,v].slice(-2000);
+        else if(v.deleted===true)messages.value[index]={...messages.value[index],body:"",deleted:true};
         if (pendingChat && v.client_message_id === pendingChat.id) {
           clearTimeout(chatTimer);
           if (chat.value === pendingChat.body) chat.value = "";
@@ -306,6 +527,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         chatFailed.value = !!pendingChat;
         error.value = failure.message;
         if (stopsReconnect(failure)) {
+          recovery.reset();
+          clearPresence();
           retryAllowed = false;
           socket?.close();
           if (failure.code === "NOT_A_MEMBER") void leave();
@@ -321,6 +544,19 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         )
           return;
         if (next.room_id !== room.value?.id) return;
+        if (
+          v.type !== "SNAPSHOT" &&
+          (!snapshotReady ||
+            !old ||
+            old.clock_epoch !== next.clock_epoch ||
+            next.revision > old.revision + 1)
+        ) {
+          // Full state on an EVENT/ACK does not recover missed ownership or
+          // lifecycle metadata. Fence controls and request the existing RESUME
+          // snapshot before applying another revision or playback side effect.
+          if (retryAllowed) connect();
+          return;
+        }
         if (typeof v.owner_id === "string") room.value.owner_id = v.owner_id;
         const wasActive = roomActive.value;
         if (
@@ -334,11 +570,43 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           controlEpoch = undefined;
         else if (typeof v.control_epoch?.id === "string")
           controlEpoch = v.control_epoch.id;
-        if (old && old.clock_epoch !== next.clock_epoch) {
-          clock.reset();
-          sampleClock();
-        }
+        const needsCalibration =
+          !snapshotReady || old?.clock_epoch !== next.clock_epoch;
+        snapshotReady = true;
         state.value = next;
+        if (v.type === "SNAPSHOT" && recoveryFence) {
+          // State/owner/lifecycle/control epoch are now applied. Calibration and
+          // media work are independent; telemetry cannot delay either of them.
+          try {
+            const sample = recovery.snapshotApplied(
+              recoveryFence,
+              v.control_recovery_metrics_version,
+            );
+            if (
+              sample &&
+              retryAllowed &&
+              serial === connectionSerial &&
+              recoveryIdentity === recoveryFence.identity &&
+              recoveryAuthEpoch === session.epoch &&
+              room.value?.id === selected &&
+              connected.value &&
+              socket === connection &&
+              connection.readyState === WebSocket.OPEN
+            ) {
+              const payload = JSON.stringify(sample);
+              // Best effort once: a busy/closing socket drops measurement.
+              if (
+                Number.isSafeInteger(connection.bufferedAmount) &&
+                connection.bufferedAmount >= 0 &&
+                connection.bufferedAmount + payload.length <= 65_536
+              )
+                connection.send(payload);
+            }
+          } catch {
+            /* Optional measurement must never change control recovery. */
+          }
+        }
+        if (needsCalibration) calibrateClock();
         if (!roomActive.value) {
           clearTimeout(chatTimer);
           chatPending.value = false;
@@ -350,7 +618,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         if (
           !wasActive ||
           !old ||
-          old.media_generation !== next.media_generation
+          old.media_generation !== next.media_generation ||
+          old.live?.broadcast_id !== next.live?.broadcast_id
         ) {
           playback.mediaChanged();
           const serial = roomSerial,
@@ -362,7 +631,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
             })
             .catch(() => {});
         } else if (v.action?.type === "SEEK")
-          void run(() => applyState(true, true));
+          void run(() => applyState(true, true), true);
         else {
           const serial = roomSerial;
           void applyState().catch((e) => {
@@ -374,16 +643,43 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     };
   }
   function sampleClock() {
-    if (socket?.readyState === WebSocket.OPEN)
-      socket.send(
-        JSON.stringify({ type: "CLOCK_SYNC", t1: performance.now() }),
-      );
+    if (
+      !snapshotReady ||
+      !connected.value ||
+      !state.value ||
+      !roomActive.value ||
+      document.visibilityState === "hidden" ||
+      socket?.readyState !== WebSocket.OPEN
+    )
+      return;
+    const t1 = clock.registerRequest(
+      state.value.clock_epoch,
+      performance.now(),
+    );
+    if (t1 !== undefined) {
+      try {
+        socket.send(JSON.stringify({ type: "CLOCK_SYNC", t1 }));
+      } catch {
+        // An upgrade can close between readyState and send; reconnect will
+        // invalidate the pending request. Sampling never stops local playback.
+      }
+    }
   }
   function send(type: string, payload?: unknown) {
     if (!connected.value || !owner.value || !state.value || !controlEpoch)
       return;
+    if (
+      state.value.live &&
+      (type === "SEEK" ||
+        type === "END_MEDIA" ||
+        (type === "SET_RATE" && (payload as { rate?: number })?.rate !== 1))
+    )
+      return;
     socket?.send(
       JSON.stringify({
+        ...(state.value.live || type === "CHANGE_MEDIA" || type === "END_MEDIA"
+          ? { live_version: 1 }
+          : {}),
         protocol_version: 1,
         type,
         payload,
@@ -411,11 +707,13 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     if (
       serial !== roomSerial ||
       room.value?.id !== result.state.room_id ||
-      (state.value && state.value.revision > result.state.revision)
+      (state.value &&
+        state.value.clock_epoch === result.state.clock_epoch &&
+        state.value.revision > result.state.revision)
     )
       return;
     room.value.owner_id = result.owner_id;
-    state.value = result.state;
+    acceptHttpState(result.state);
   }
   async function makeInvite() {
     if (!room.value || !roomActive.value) throw Error("房间当前未开放");
@@ -497,6 +795,17 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       completed: boolean;
     } | null;
   };
+  function acceptHttpState(next: RoomState) {
+    const epochChanged = state.value?.clock_epoch !== next.clock_epoch;
+    state.value = next;
+    if (epochChanged) {
+      snapshotReady = false;
+      // A newer HTTP epoch must be confirmed by this socket's RESUME snapshot
+      // before any calibration or controls can use it.
+      if (connected.value && roomActive.value) connect();
+      else invalidateClock();
+    }
+  }
   function acceptLifecycle(value: LifecycleView, serial: number) {
     if (
       serial !== roomSerial ||
@@ -509,7 +818,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     room.value.lifecycle = value.lifecycle;
     room.value.lifecycle_epoch = value.lifecycle_epoch;
     room.value.owner_id = value.owner_id;
-    state.value = value.state;
+    acceptHttpState(value.state);
     cleanupError.value = value.cleanup?.last_error
       ? "清理尚未完成，服务端将继续重试。"
       : "";
@@ -560,6 +869,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     send("SEEK", { position_ms: position.value * 1000 });
   }
   const statusTimer = setInterval(() => {
+    checkClockContinuity();
     if (room.value?.lifecycle === "closing")
       void refreshLifecycle().catch(() => {});
     if (
@@ -572,25 +882,41 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       socket?.send(
         JSON.stringify({
           type: "CLIENT_STATUS",
-          status: {
-            buffering: waiting.value || blocked.value,
-            drift_ms: target(state.value, clock.now()) - position.value * 1000,
-          },
+          status: clientPlaybackStatus(
+            state.value,
+            clock.now(),
+            position.value,
+            waiting.value || blocked.value,
+          ),
         }),
       );
   }, 5000);
-  const clockTimer = setInterval(sampleClock, 30000);
+  const clockTimer = setInterval(() => {
+    checkClockContinuity();
+    sampleClock();
+  }, 30000);
   function wake() {
-    if (document.visibilityState === "visible") {
-      sampleClock();
-      if (roomActive.value) void run(() => applyState(true));
+    recovery.visibilityChanged(document.visibilityState !== "hidden");
+    const previous = visibility;
+    visibility = document.visibilityState;
+    if (previous !== visibility)
+      lastClockCheck = { monotonic: performance.now(), wall: Date.now() };
+    if (previous === "hidden" && visibility === "visible") calibrateClock();
+  }
+  function pageShown(event: PageTransitionEvent) {
+    if (event.persisted) {
+      recovery.suspended();
+      calibrateClock();
     }
   }
   document.addEventListener("visibilitychange", wake);
+  window.addEventListener("pageshow", pageShown);
   onScopeDispose(() => {
+    recovery.dispose();
     clearInterval(statusTimer);
     clearInterval(clockTimer);
     document.removeEventListener("visibilitychange", wake);
+    window.removeEventListener("pageshow", pageShown);
     void leave().catch(() => {});
   });
   return {
@@ -598,7 +924,10 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     state,
     connected,
     connectionStopped,
+    presence,
+    presenceNames,
     messages,
+    lastChatDeletion,
     playlist,
     chat,
     chatPending,

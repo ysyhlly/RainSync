@@ -3,6 +3,17 @@
   "title": "PlaybackCandidateSet",
   "type": "object",
   "properties": {
+    "advanced_playback": {
+      "description": "Fresh local source eligibility, independent of Worker device support.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AdvancedPlaybackCapabilities"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "binding": {
       "type": [
         "string",
@@ -18,6 +29,36 @@
     "decision_reason": {
       "type": "string"
     },
+    "http_file_capabilities_version": {
+      "description": "Present only for a verified HTTP Binary binding. The client retains the\noriginal binding across automatic route changes within the same intent.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
+    "local_hls_ladder": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LocalHlsLadderCapabilities"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "route_decisions": {
+      "description": "At most the four server routes. Absent on legacy/unsupported providers.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/PlaybackRouteDecision"
+      }
+    },
     "schema_version": {
       "type": "integer",
       "format": "uint32",
@@ -30,6 +71,71 @@
     "decision_reason"
   ],
   "$defs": {
+    "AdvancedPlaybackCapabilities": {
+      "description": "Source eligibility only. The Worker independently checks its real FFmpeg\ninventory and owned input before running; no device execution is asserted.",
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 1,
+          "minimum": 1
+        },
+        "subtitle_streams": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AdvancedSubtitleTrack"
+          }
+        },
+        "tone_map_hdr": {
+          "type": "boolean"
+        },
+        "worker_runtime_required": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "tone_map_hdr",
+        "subtitle_streams",
+        "worker_runtime_required"
+      ]
+    },
+    "AdvancedSubtitleCodec": {
+      "type": "string",
+      "enum": [
+        "ass",
+        "ssa",
+        "pgs"
+      ]
+    },
+    "AdvancedSubtitleTrack": {
+      "type": "object",
+      "properties": {
+        "codec": {
+          "$ref": "#/$defs/AdvancedSubtitleCodec"
+        },
+        "index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "label": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "codec",
+        "label",
+        "language"
+      ]
+    },
     "AudioCapabilityConfiguration": {
       "type": "object",
       "properties": {
@@ -55,6 +161,67 @@
         "channels",
         "bitrate",
         "samplerate"
+      ]
+    },
+    "LocalHlsLadderCapabilities": {
+      "description": "Fresh local source eligibility; Worker runtime/output qualification is separate.",
+      "type": "object",
+      "properties": {
+        "renditions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LocalHlsRendition"
+          }
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 1,
+          "minimum": 1
+        },
+        "worker_runtime_required": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "renditions",
+        "worker_runtime_required"
+      ]
+    },
+    "LocalHlsRendition": {
+      "type": "object",
+      "properties": {
+        "bandwidth": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "codecs": {
+          "type": "string"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string"
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "width",
+        "height",
+        "bandwidth",
+        "codecs"
       ]
     },
     "PlaybackCandidate": {
@@ -93,6 +260,44 @@
         "transport",
         "content_type",
         "video"
+      ]
+    },
+    "PlaybackRouteDecision": {
+      "type": "object",
+      "properties": {
+        "candidate_id": {
+          "type": "string"
+        },
+        "offered": {
+          "description": "Offered for concrete client testing, not proven device decoding.",
+          "type": "boolean"
+        },
+        "reason": {
+          "$ref": "#/$defs/PlaybackRouteReason"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "offered",
+        "reason"
+      ]
+    },
+    "PlaybackRouteReason": {
+      "description": "Why the server offered or omitted a route, before any device test.",
+      "type": "string",
+      "enum": [
+        "source_configuration",
+        "constrained_encoder_recipe",
+        "video_configuration_unavailable",
+        "video_copy_unsupported",
+        "sample_entry_unsupported",
+        "video_transform_required",
+        "container_unsupported",
+        "track_mapping_required",
+        "audio_configuration_unavailable",
+        "no_audio_track",
+        "nonzero_copy_origin"
       ]
     },
     "VideoCapabilityConfiguration": {

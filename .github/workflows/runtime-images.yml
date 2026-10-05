@@ -1,0 +1,47 @@
+name: bounded runtime images
+on:
+  push:
+    branches: ['codex/rainsync-deploy-*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: rainsync-runtime-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  runtime-images:
+    if: startsWith(github.ref, 'refs/heads/codex/rainsync-deploy-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check bounded artifact validation offline
+        run: python3 tests/runtime-images.test.py
+      - name: Build, probe and package only the three runtime images
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          OUTPUT_DIRECTORY: ${{ runner.temp }}/rainsync-runtime-artifact
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          docker build --platform linux/amd64 --pull \
+            --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \
+            -f deploy/Dockerfile -t "rainsync-backend:$SOURCE_COMMIT" .
+          docker build --platform linux/amd64 --pull \
+            --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \
+            -f deploy/Dockerfile.web -t "rainsync-web:$SOURCE_COMMIT" .
+          docker pull --platform linux/amd64 postgres:17
+          docker tag postgres:17 "rainsync-postgres:17-$SOURCE_COMMIT"
+          python3 deploy/runtime-images.py package \
+            --source "$SOURCE_COMMIT" --directory "$OUTPUT_DIRECTORY"
+      - name: Upload verified offline runtime bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: rainsync-runtime-linux-amd64-${{ github.sha }}
+          path: ${{ runner.temp }}/rainsync-runtime-artifact/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

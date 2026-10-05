@@ -1,20 +1,62 @@
+mod advanced_media;
+mod advanced_remote;
 mod cache;
 mod cache_outputs;
 mod cache_read;
+mod execution_failure;
 mod file_delivery;
+mod local_hls_ladder;
+mod local_hls_ladder_read;
+mod native_platform_ladder;
+mod native_platform_transcode;
+mod remote_assets;
+#[path = "../../server/src/source_key_check.rs"]
+mod source_key_check;
 use media_core::child_process;
+use media_core::runtime_metrics::{Cache, CacheDecision, Layer};
+mod http_identity;
+mod http_media;
 mod input_failure;
+mod metric_stream;
+mod metrics;
 mod output_decode;
+mod output_entry_metrics;
 mod output_publish;
 mod output_read;
 mod outputs;
+mod owned_http;
 mod playback_access;
 mod preview_input;
 mod previews;
 mod process;
+mod readiness;
 mod relay;
 mod source_version;
+mod static_hls_child_delivery;
+mod static_hls_child_dispatch;
+mod static_hls_child_encoder;
+mod static_hls_child_gate;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../server/src/static_hls_child_plan.rs"]
+mod static_hls_child_plan;
+mod static_hls_child_read;
+mod static_hls_child_registry;
+mod static_hls_contract;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../server/src/static_hls_input_cipher.rs"]
+mod static_hls_input_cipher;
+mod static_hls_operation;
+#[path = "../../server/src/static_hls_operation_cipher.rs"]
+mod static_hls_operation_cipher;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../server/src/static_hls_operation_client.rs"]
+mod static_hls_operation_client;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../server/src/static_hls_parent_plan.rs"]
+mod static_hls_parent_plan;
+mod static_hls_read;
 mod transfer_state;
+mod upstream_output;
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use axum::{
     Router,
@@ -34,6 +76,8 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 struct App {
+    readiness: readiness::Runtime,
+    metrics: media_core::runtime_metrics::RuntimeMetrics,
     db: PgPool,
     key: Arc<Aes256Gcm>,
     cache: PathBuf,
@@ -45,6 +89,10 @@ struct App {
     input_failures: input_failure::Registry,
     preview_inputs: preview_input::Registry,
     deliveries: playback_access::Registry,
+    static_hls_operations: static_hls_operation::Registry,
+    static_hls_children: static_hls_child_registry::Registry,
+    static_hls_child_dispatch: static_hls_child_dispatch::Registry,
+    static_hls_child_encoders: static_hls_child_encoder::Registry,
 }
 fn hash(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
@@ -83,9 +131,65 @@ async fn delivery(
     let pool = app.db.clone();
     let deliveries = app.deliveries.clone();
     let token_hash = hash(&q.token);
-    let response = delivery_response(app, id, path, q, h, method);
-    playback_access::protect(response, pool, id, token_hash, deliveries).await
+    let input_cancel = app.input_failures.observe(id, q.execution);
+    let measure =
+        method == axum::http::Method::GET && !matches!(path.as_str(), "probe" | "upstream-output");
+    let metrics = app.metrics.clone();
+    let entry_candidate =
+        method == axum::http::Method::GET && path == "index.m3u8" && q.url.is_none();
+    let observe_pool = pool.clone();
+    let response = playback_access::protect(
+        move |first_entry| delivery_response(app, id, path, q, h, method, first_entry),
+        pool,
+        id,
+        token_hash,
+        deliveries,
+        input_cancel,
+        entry_candidate,
+    )
+    .await?;
+    if response.status().is_success()
+        && let Some(observation) = response
+            .extensions()
+            .get::<output_entry_metrics::Ready>()
+            .copied()
+    {
+        // Classification may be lost, but never delays delivery or changes its
+        // result. The compulsory receipt prevents later reclassification.
+        output_entry_metrics::record_ready(observe_pool, id, observation);
+    }
+    if !measure || !response.status().is_success() || response.status() == StatusCode::NO_CONTENT {
+        return Ok(response);
+    }
+    let cache = response
+        .extensions()
+        .get::<Cache>()
+        .copied()
+        .unwrap_or(Cache::NotHit);
+    let body_length = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let (parts, body) = response.into_parts();
+    Ok(Response::from_parts(
+        parts,
+        Body::from_stream(
+            metric_stream::wrap(
+                body.into_data_stream(),
+                &metrics,
+                Layer::WorkerEgress,
+                cache,
+            )
+            .with_body_length(body_length),
+        ),
+    ))
 }
+fn with_cache(mut response: Response, cache: Cache) -> Response {
+    response.extensions_mut().insert(cache);
+    response
+}
+
 async fn delivery_response(
     app: App,
     id: Uuid,
@@ -93,12 +197,39 @@ async fn delivery_response(
     q: Params,
     h: HeaderMap,
     method: axum::http::Method,
+    first_entry: bool,
 ) -> Result<Response> {
-    let row=sqlx::query("SELECT p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN rooms r ON r.id=p.room_id WHERE r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND p.id=$1 AND p.delivery_token_hash=$2 AND p.expires_at>now() AND NOT p.stopped AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)").bind(id).bind(hash(&q.token)).fetch_optional(&app.db).await.map_err(failure)?.ok_or((StatusCode::UNAUTHORIZED,"invalid_playback_session".into()))?;
+    let row=sqlx::query("SELECT p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN rooms r ON r.id=p.room_id WHERE r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND p.id=$1 AND p.delivery_token_hash=$2 AND p.expires_at>now() AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource,p.id) AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id)").bind(id).bind(hash(&q.token)).fetch_optional(&app.db).await.map_err(failure)?.ok_or((StatusCode::UNAUTHORIZED,"invalid_playback_session".into()))?;
     let data: Value = row.get("resource");
+    if data.get("native_platform_context").is_some() {
+        return Err((StatusCode::UNAUTHORIZED, "unsupported_delivery_kind".into()));
+    }
     let resource = decrypt(&app, data["encrypted"].as_str().unwrap_or("")).map_err(failure)?;
+    // Platform grants have their own authenticated Server gateway. Never let
+    // an unknown resource kind reach probe/subtitle/job or generic HTTP code.
+    if data.get("native_platform_context").is_some()
+        || !matches!(
+            resource["kind"].as_str(),
+            Some("local" | "agent" | "http" | "jellyfin" | "emby")
+        )
+    {
+        return Err((StatusCode::UNAUTHORIZED, "unsupported_delivery_kind".into()));
+    }
+    // Ladder grants have a closed route and validation5 proof. Never expose
+    // their private per-rung files through the generic single-output adapter.
+    if data.get("local_hls_ladder_version").is_some()
+        || resource.get("local_hls_ladder_version").is_some()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "dedicated_ladder_endpoint_required".into(),
+        ));
+    }
     let head = method == axum::http::Method::HEAD;
     let input_failure = app.input_failures.observe(id, q.execution);
+    if path == "upstream-output" {
+        return upstream_output::response(&app, id, &resource, &q, head).await;
+    }
     if path == "probe" {
         let _permit = app
             .probes
@@ -110,18 +241,46 @@ async fn delivery_response(
             source_url(id, &q.token).map_err(failure)?,
             observed.token()
         );
-        let metadata = media_core::probe(&source).await;
-        if let Some(reason) = match observed.failure() {
-            Some(persistence::media_jobs::JobFailure::SourceChanged) => Some("source_changed"),
+        let metadata = if resource["http_owned_large_response_version"] == 1
+            || resource["http_finite_hls_version"] == 1
+        {
+            owned_http::probe_owned(&app, id, &resource).await
+        } else {
+            advanced_media::probe_advertised(&source, &resource).await
+        };
+        if let Some((status, reason)) = match observed.failure() {
+            Some(persistence::media_jobs::JobFailure::SourceChanged) => {
+                Some((StatusCode::CONFLICT, "source_changed"))
+            }
             Some(persistence::media_jobs::JobFailure::SourceVersionRequired) => {
-                Some("source_version_required")
+                Some((StatusCode::CONFLICT, "source_version_required"))
+            }
+            Some(persistence::media_jobs::JobFailure::SourceSeekUnsupported) => {
+                Some((StatusCode::UNPROCESSABLE_ENTITY, "source_seek_unsupported"))
+            }
+            Some(persistence::media_jobs::JobFailure::InputDenied) => {
+                Some((StatusCode::BAD_GATEWAY, "media_input_denied"))
             }
             _ => None,
         } {
-            return Err((StatusCode::CONFLICT, reason.into()));
+            return Err((status, reason.into()));
         }
-        let metadata = metadata.map_err(failure)?;
+        let mut metadata = metadata.map_err(failure)?;
+        remote_assets::discover(
+            &app,
+            id,
+            &resource,
+            &q,
+            app.input_failures.observe(id, Some(observed.token())),
+            &mut metadata,
+        )
+        .await
+        .map_err(failure)?;
         return Ok(axum::Json(metadata).into_response());
+    }
+    if path.starts_with("asset-") {
+        return remote_assets::response(&app, id, &resource, &q, &h, head, input_failure, &path)
+            .await;
     }
     if path.starts_with("subtitle-") && path.ends_with(".vtt") {
         let index = path
@@ -142,14 +301,15 @@ async fn delivery_response(
             if url.origin() != base.origin() {
                 return Err((StatusCode::FORBIDDEN, "cross_origin_subtitle".into()));
             }
-            let mut request = app.client.get(url);
-            if let Some(headers) = resource["headers"].as_object() {
-                for (k, v) in headers {
-                    if let Some(v) = v.as_str() {
-                        request = request.header(k, v);
-                    }
-                }
-            }
+            let config = providers::resource_config(&resource).map_err(failure)?;
+            let request = providers::source_media_request(
+                &config,
+                url.as_str(),
+                reqwest::Method::GET,
+                &config.headers,
+            )
+            .await
+            .map_err(failure)?;
             let response = request
                 .send()
                 .await
@@ -157,7 +317,12 @@ async fn delivery_response(
                 .error_for_status()
                 .map_err(failure)?;
             use futures_util::StreamExt;
-            let mut stream = response.bytes_stream();
+            let mut stream = metric_stream::wrap(
+                response.bytes_stream(),
+                &app.metrics,
+                Layer::UpstreamRead,
+                Cache::NotHit,
+            );
             let mut bytes = Vec::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(failure)?;
@@ -204,6 +369,11 @@ async fn delivery_response(
             }
         }
         let mut command = tokio::process::Command::new("ffmpeg");
+        media_core::input_policy::clean_environment(&mut command);
+        command.args(media_core::input_policy::args(
+            input.starts_with("http://"),
+            resource["kind"] == "http",
+        ));
         command
             .args(["-v", "error", "-nostdin", "-i"])
             .arg(input)
@@ -243,9 +413,12 @@ async fn delivery_response(
             return Err((StatusCode::BAD_REQUEST, "invalid_resource".into()));
         }
         let mut output = None;
+        let mut cache_hit = true;
+        let mut entry =
+            output_entry_metrics::Entry::new(first_entry && !head && path == "index.m3u8");
         for _ in 0..30 {
             let job =
-                sqlx::query("SELECT j.status,j.error,j.attempt,o.status AS output_status,o.manifest_sha256,o.validation_version,o.visible_manifest,(j.status='succeeded' OR (j.status='running' AND j.lease_until>clock_timestamp())) AS readable FROM media_jobs j LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt WHERE j.id=$1")
+                sqlx::query("SELECT j.status,j.error,j.attempt,j.metrics_queue_ms,j.metrics_queue_complete,j.metrics_queue_accounted_attempt,o.status AS output_status,o.manifest_sha256,o.validation_version,o.visible_manifest,(j.status='succeeded' OR (j.status='running' AND j.lease_until>clock_timestamp())) AS readable FROM media_jobs j LEFT JOIN media_outputs o ON o.job_id=j.id AND o.attempt=j.attempt WHERE j.id=$1")
                     .bind(id)
                     .fetch_optional(&app.db)
                     .await
@@ -262,6 +435,9 @@ async fn delivery_response(
             // child URLs must remain pinned, including the init segment.
             if path != "index.m3u8" && q.attempt.is_none() {
                 return Err((StatusCode::CONFLICT, "stale_media".into()));
+            }
+            if entry.lookup(&status, attempt) {
+                output_entry_metrics::record_cold(app.db.clone(), id);
             }
             if status == "cancelled" {
                 return Err((StatusCode::GONE, "media_job_cancelled".into()));
@@ -280,6 +456,10 @@ async fn delivery_response(
                 || (status == "running" && output_status.as_deref() != Some("writing"))
             {
                 return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
+            }
+            if status != "succeeded" && cache_hit {
+                app.metrics.cache_lookup(CacheDecision::Miss);
+                cache_hit = false;
             }
             let manifest_digest: Option<String> = job.get("manifest_sha256");
             let persisted = job
@@ -338,7 +518,12 @@ async fn delivery_response(
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         continue;
                     }
-                    _ => return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into())),
+                    _ => {
+                        if cache_hit {
+                            app.metrics.cache_lookup(CacheDecision::Miss);
+                        }
+                        return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
+                    }
                 };
                 let manifest = (path == "index.m3u8").then_some(text);
                 output = Some((
@@ -349,19 +534,29 @@ async fn delivery_response(
                     manifest,
                     reader,
                     opened,
+                    entry.ready(
+                        attempt,
+                        job.get::<Option<i64>, _>("metrics_queue_ms"),
+                        job.get::<Option<bool>, _>("metrics_queue_complete"),
+                        job.get::<Option<i64>, _>("metrics_queue_accounted_attempt"),
+                    ),
                 ));
                 break;
             }
             if status == "succeeded" {
+                if cache_hit {
+                    app.metrics.cache_lookup(CacheDecision::Miss);
+                }
                 return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-        let (file, attempt, complete, manifest_digest, manifest, reader, opened) =
+        let (file, attempt, complete, manifest_digest, manifest, reader, opened, entry_ready) =
             output.ok_or((StatusCode::SERVICE_UNAVAILABLE, "media_unavailable".into()))?;
         if !reader.healthy() {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "media_unavailable".into()));
         }
+        let cache = if cache_hit { Cache::Hit } else { Cache::NotHit };
         if let Some(manifest) = manifest {
             if complete && manifest_digest.is_some_and(|digest| hash(&manifest) != digest) {
                 return Err((StatusCode::BAD_GATEWAY, "media_job_failed".into()));
@@ -382,16 +577,30 @@ async fn delivery_response(
                     q.token
                 )
             });
-            return Ok((
-                [
-                    (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
-                    (header::CACHE_CONTROL, "no-store"),
-                ],
-                if head { String::new() } else { text },
-            )
-                .into_response());
+            if cache_hit {
+                app.metrics.cache_lookup(CacheDecision::Hit);
+            }
+            let mut response = with_cache(
+                (
+                    [
+                        (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+                        (header::CACHE_CONTROL, "no-store"),
+                    ],
+                    if head { String::new() } else { text },
+                )
+                    .into_response(),
+                cache,
+            );
+            if let Some(ready) = entry_ready {
+                response.extensions_mut().insert(ready);
+            }
+            return Ok(response);
         }
-        return file_delivery::response(&file, &h, head, Some(reader), opened, None).await;
+        let response = file_delivery::response(&file, &h, head, Some(reader), opened, None).await?;
+        if cache_hit {
+            app.metrics.cache_lookup(CacheDecision::Hit);
+        }
+        return Ok(with_cache(response, cache));
     }
     if resource["kind"] == "agent" {
         return relay::fetch(&app, &resource, &h, head, input_failure, Some(id)).await;
@@ -412,147 +621,9 @@ async fn delivery_response(
         )
         .await;
     }
-    let original = url::Url::parse(resource["url"].as_str().unwrap_or("")).map_err(failure)?;
-    let target = if let Some(encoded) = q.url.as_deref() {
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(encoded)
-            .map_err(failure)?;
-        if bytes.len() < 12 {
-            return Err((StatusCode::BAD_REQUEST, "invalid_resource".into()));
-        }
-        let plain = app
-            .key
-            .decrypt(bytes[..12].into(), &bytes[12..])
-            .map_err(|_| (StatusCode::FORBIDDEN, "invalid_resource_signature".into()))?;
-        let grant: Value = serde_json::from_slice(&plain).map_err(failure)?;
-        if grant["session"] != id.to_string() {
-            return Err((StatusCode::FORBIDDEN, "wrong_resource_session".into()));
-        }
-        url::Url::parse(grant["url"].as_str().unwrap_or("")).map_err(failure)?
-    } else {
-        original.clone()
-    };
-    // Never forward source credentials to a different origin. Redirects are disabled.
-    if target.origin() != original.origin() || !matches!(target.scheme(), "http" | "https") {
-        return Err((StatusCode::FORBIDDEN, "cross_origin_media_rejected".into()));
-    }
-    let mut request = if head {
-        app.client.head(target.clone())
-    } else {
-        app.client.get(target.clone())
-    };
-    if let Some(headers) = resource["headers"].as_object() {
-        for (k, v) in headers {
-            if let Some(v) = v.as_str() {
-                request = request.header(k, v);
-            }
-        }
-    }
-    if let Some(range) = h.get(header::RANGE) {
-        request = request.header(header::RANGE, range)
-    }
-    let response = request.send().await.map_err(|error| {
-        input_failure.network(&error);
-        failure(error)
-    })?;
-    let status = response.status();
-    input_failure.status(status);
-    if !status.is_success() {
-        return Err((
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            "upstream_media_error".into(),
-        ));
-    }
-    let is_playlist = target.path().ends_with(".m3u8")
-        || response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|s| s.contains("mpegurl"));
-    if is_playlist && !head {
-        if response.content_length().unwrap_or(0) > 2 * 1024 * 1024 {
-            return Err((StatusCode::BAD_GATEWAY, "manifest_too_large".into()));
-        }
-        let mut bytes = Vec::new();
-        let mut stream = response.bytes_stream();
-        use futures_util::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            bytes.extend_from_slice(&chunk.map_err(|error| {
-                input_failure.network(&error);
-                failure(error)
-            })?);
-            if bytes.len() > 2 * 1024 * 1024 {
-                return Err((StatusCode::BAD_GATEWAY, "manifest_too_large".into()));
-            }
-        }
-        let manifest = String::from_utf8(bytes).map_err(failure)?;
-        let text = rewrite_manifest(&manifest, |uri| {
-            let absolute = target.join(uri).map(|v| v.to_string()).unwrap_or_default();
-            let nonce = Uuid::new_v4();
-            let nonce = &nonce.as_bytes()[..12];
-            let data = serde_json::to_vec(&json!({"session":id,"url":absolute})).unwrap();
-            let cipher = app
-                .key
-                .encrypt(nonce.into(), data.as_slice())
-                .expect("valid nonce");
-            let grant = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode([nonce.to_vec(), cipher].concat());
-            let extension = target
-                .join(uri)
-                .ok()
-                .and_then(|url| {
-                    url.path()
-                        .rsplit('.')
-                        .next()
-                        .filter(|ext| {
-                            matches!(*ext, "m3u8" | "ts" | "m4s" | "mp4" | "aac" | "vtt" | "key")
-                        })
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| "bin".into());
-            let execution = q
-                .execution
-                .map(|t| format!("&execution={t}"))
-                .unwrap_or_default();
-            format!(
-                "/media-delivery/{id}/segment.{extension}?token={}&url={grant}{execution}",
-                q.token
-            )
-        });
-        return Ok((
-            [
-                (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            text,
-        )
-            .into_response());
-    }
-    let mut builder = Response::builder().status(status);
-    for key in [
-        header::CONTENT_TYPE,
-        header::CONTENT_LENGTH,
-        header::CONTENT_RANGE,
-        header::ACCEPT_RANGES,
-    ] {
-        if let Some(v) = response.headers().get(&key) {
-            builder = builder.header(key, v)
-        }
-    }
-    builder
-        .header(header::CACHE_CONTROL, "private, no-store")
-        .body(if head {
-            Body::empty()
-        } else {
-            Body::from_stream(response.bytes_stream().map(move |chunk| {
-                if let Err(error) = &chunk {
-                    input_failure.network(error);
-                }
-                chunk
-            }))
-        })
-        .map_err(failure)
+    http_media::response(&app, id, &resource, &q, &h, head, input_failure).await
 }
+
 fn rewrite_manifest(input: &str, mut uri: impl FnMut(&str) -> String) -> String {
     input
         .lines()
@@ -618,6 +689,7 @@ fn source_url_for_bind(mut bind: std::net::SocketAddr, id: Uuid, token: &str) ->
 }
 async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
     use std::time::Duration;
+    let _claim_loop = app.readiness.claim_loop_guard();
     let worker = Uuid::new_v4();
     loop {
         let mut reservation = None;
@@ -628,20 +700,47 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             let claim = tokio::select! {
                 biased;
                 _ = process::stopped(&mut stop) => return Ok(()),
-                claim = tokio::time::timeout(Duration::from_secs(3), persistence::media_jobs::claim(&app.db, worker)) => claim??,
+                claim = tokio::time::timeout(Duration::from_secs(3), persistence::media_jobs::claim_platform_capable(&app.db, worker)) => {
+                    match &claim { Ok(Ok(value)) => app.readiness.claim_succeeded(value.is_some()), _ => app.readiness.claim_failed() }
+                    claim??
+                },
             };
             let Some(claim) = claim else { return Ok(()) };
             reservation = Some((claim.id, claim.owner, claim.attempt));
+            if claim.spec["kind"] == persistence::local_hls_ladder::KIND
+                || claim.spec["kind"] == persistence::local_hls_ladder::ADVANCED_KIND
+                || claim.spec["kind"] == persistence::local_hls_ladder::OWNED_ADVANCED_KIND
+                || claim.spec["kind"] == persistence::native_platform_ladder::KIND {
+                let result=if claim.spec["kind"] == persistence::native_platform_ladder::KIND {
+                    native_platform_ladder::run(&app,&claim,&mut stop,&mut writer_stopped).await
+                } else {
+                    local_hls_ladder::run(&app,&claim,&mut stop,&mut writer_stopped).await
+                };
+                if result.as_ref().is_err_and(|error|error.is::<process::LeaseInterrupted>()) {return result;}
+                if *stop.borrow() && writer_stopped {
+                    tokio::time::timeout(Duration::from_secs(3),persistence::media_jobs::release(&app.db,&claim)).await??;
+                } else if let Err(error)=result {
+                    tokio::time::timeout(Duration::from_secs(3),persistence::media_jobs::finish(&app.db,&claim,Some(error.downcast_ref::<persistence::media_jobs::JobFailure>().copied().unwrap_or(persistence::media_jobs::JobFailure::ExecutionFailed)),None)).await??;
+                }
+                return Ok(());
+            }
             let output_builder: output_publish::Shared = Default::default();
             let input_failure = app.input_failures.register(claim.id);
-            // Preparation has no child and can be cancelled. Once spawned,
-            // supervision must finish its explicit kill/wait before release.
+            // Advanced preparation can own bounded metadata children in this
+            // scope. Cancellation is drained before the execution receipt;
+            // encoder supervision must finish explicit kill/wait before release.
             let prepare = async {
+                let native=claim.spec["kind"]==persistence::native_platform_transcode::KIND;
+                if native {persistence::native_platform_transcode::validate_spec(&claim.spec)?;}
+                else if claim.spec["kind"]==persistence::owned_http::KIND {persistence::owned_http::validate_spec(&claim.spec)?;}
+                else if !advanced_media::admit_claim(&claim.spec)? {
+                    static_hls_child_gate::reject_unsupported_claim(&claim)?;
+                }
                 cache::ensure_capacity(&app).await?;
                 cache::reserve_output(&app, &claim).await?;
                 let spec = &claim.spec;
                 source_version::verify(spec).await?;
-                let input = if let Some(ticket) = spec["input_ticket"].as_str() {
+                let input = if native {let spec=persistence::native_platform_transcode::validate_spec(spec)?;native_platform_transcode::source_url(&claim,&spec.tracks[0].key,input_failure.token())?} else if let Some(ticket) = spec["input_ticket"].as_str() {
                     let ticket = decrypt(&app, ticket)?;
                     let token = ticket["token"].as_str().ok_or_else(|| anyhow::anyhow!("invalid_input_ticket"))?;
                     format!("{}&execution={}", source_url(claim.id, token)?, input_failure.token())
@@ -652,13 +751,23 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 let dir = persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt);
                 child_process::blocking({ let dir=dir.clone(); move || std::fs::create_dir_all(dir) }).await?.map_err(cache::write_error)?;
                 let audio_index = spec["audio_index"].as_u64().map(u32::try_from).transpose()?;
-                let args = if let Some(mode)=spec["negotiated_mode"].as_str() {
+                let advanced = if native {Some(native_platform_transcode::prepare(&app,&claim,&dir.join("index.m3u8"),input_failure.token()).await?)} else {advanced_media::prepare_scoped(&app, &claim, &input, &dir.join("index.m3u8"), audio_index).await?};
+                let mut args = if let Some(advanced) = &advanced {
+                    advanced.args.clone()
+                } else if let Some(mode)=spec["negotiated_mode"].as_str() {
                     media_core::capabilities::negotiated_hls_args(&input,dir.join("index.m3u8").to_str().unwrap(),spec["start_seconds"].as_f64().unwrap_or(0.0),mode,audio_index)
                 } else {media_core::hls_args(&input, dir.join("index.m3u8").to_str().unwrap(), spec["start_seconds"].as_f64().unwrap_or(0.0), spec["transcode"].as_bool().unwrap_or(true), audio_index)};
-                let confirmed_until = process::finalization_deadline(Duration::from_secs(3), process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim))).await?
+                if advanced.is_none() {
+                    owned_http::constrain_finite_job(&app,&claim,&mut args).await?;
+                    media_core::input_policy::constrain(&mut args, input.starts_with("http://"), spec["source_kind"] == "http");
+                }
+                let decoder_input = args.iter().position(|argument| argument == "-i")
+                    .and_then(|at| args.get(at + 1)).cloned().ok_or_else(|| anyhow::anyhow!("decoder_input_missing"))?;
+                let confirmation = app.readiness.check_lease(process::finalization_deadline(Duration::from_secs(3), process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim)))).await;
+                let confirmed_until = confirmation?
                     .filter(|until| *until > tokio::time::Instant::now())
                     .ok_or_else(|| anyhow::anyhow!("lease_lost_before_spawn"))?;
-                Ok::<_, anyhow::Error>((args, confirmed_until))
+                Ok::<_, anyhow::Error>((args, confirmed_until, decoder_input, advanced))
             };
             let prepared = tokio::select! {
                 biased;
@@ -666,28 +775,46 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 result = prepare => result,
             };
             let mut execution_stopped = true;
+            let mut diagnostic_failure = None;
             let mut result = async {
-                let (args, confirmed_until) = prepared?;
+                let (args, confirmed_until, input, advanced) = prepared?;
                 anyhow::ensure!(!*stop.borrow(), "worker_shutdown");
                 let mut command = tokio::process::Command::new("ffmpeg");
-                command.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+        media_core::input_policy::clean_environment(&mut command);
+                if claim.spec["kind"]==persistence::native_platform_transcode::KIND {native_platform_transcode::clean_native_environment(&mut command);}
+                command.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+                if let Some(advanced) = &advanced {
+                    advanced.install(&mut command)?;
+                    output_decoder.configure_advanced(advanced.recipe.clone()).await?;
+                }
                 #[cfg(windows)]
                 command.creation_flags(0x08000000);
                 anyhow::ensure!(confirmed_until > tokio::time::Instant::now(), "lease_lost_before_spawn");
                 let mut child = child_process::spawn(command)?;
+                let diagnostics = child.stderr.take().expect("piped encoder diagnostics");
                 writer_stopped = false;
                 execution_stopped = false;
-                let result = process::supervise(&mut child, &mut stop, confirmed_until, || async {
-                    process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim)).await
+                let supervised = process::supervise(&mut child, &mut stop, confirmed_until, || async {
+                    app.readiness.check_lease(process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim))).await
                 }, async {
                     tokio::select! {
-                        error = source_version::monitor(&claim.spec) => error,
+                        error = advanced_media::monitor_scope(&app, &claim, advanced.as_ref()) => error,
                         error = cache::monitor(&app) => error,
                         error = output_publish::monitor(&app.db, &claim, persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt), output_builder.clone(), &output_decoder) => error,
                     }
-                }).await;
+                });
+                let (result, evidence) = execution_failure::observe_with_input(supervised, diagnostics, &input).await;
+                diagnostic_failure = evidence;
                 execution_stopped = child.try_wait()?.is_some();
                 writer_stopped = execution_stopped;
+                if result.as_ref().is_err_and(|error| error.is::<process::EncodingFailed>())
+                    && advanced.as_ref().is_some_and(|prepared| prepared.backend() != media_core::advanced_media::Backend::Software) {
+                    tracing::warn!(backend=?advanced.as_ref().unwrap().backend(), "hardware encoder failed; attempt remains fenced and is not rewritten with software");
+                }
+                if result.is_ok() && let Some(prepared) = &advanced {
+                    prepared.verify()?;
+                    process::finalization_deadline(Duration::from_secs(10), prepared.verify_remote()).await?;
+                }
                 result
             }.await;
             if result.as_ref().is_err_and(|e| e.is::<process::LeaseInterrupted>()) {
@@ -711,12 +838,27 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 // source transport failure must not publish that partial movie.
                 result = Err(failure.into());
             }
+            if execution_stopped && !*stop.borrow()
+                && result.as_ref().is_err_and(|error| error.is::<process::EncodingFailed>())
+                && let Some(evidence) = diagnostic_failure {
+                // Stderr can refine a known encoder exit only. Independent
+                // input, source, capacity, cancellation and ownership evidence
+                // always keeps precedence; no retry is inferred from text.
+                use persistence::media_jobs::JobFailure;
+                result = Err(match evidence {
+                    execution_failure::Kind::InputInvalid => JobFailure::InputInvalid,
+                    execution_failure::Kind::DecoderUnavailable => JobFailure::DecoderUnavailable,
+                    execution_failure::Kind::EncoderUnavailable => JobFailure::EncoderUnavailable,
+                }.into());
+            }
             let mut publication = None;
             if result.is_ok() && !*stop.borrow() {
                 let directory = persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt);
                 result = match process::finalization_deadline(Duration::from_secs(10), async {
                     let proof=output_publish::prepare(output_builder.clone(), directory, true, &output_decoder).await?;
                     source_version::verify(&claim.spec).await?;
+                    advanced_media::verify_scope(&app, &claim).await?;
+                    if claim.spec["kind"]==persistence::native_platform_transcode::KIND {native_platform_transcode::validate_completed(&claim.spec,&proof)?;}
                     Ok(proof)
                 }).await {
                     Ok(proof) => { publication = Some(proof); Ok(()) },
@@ -737,7 +879,11 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             }
             Ok(())
         }).await;
+        if reservation.is_some() {
+            app.readiness.receipt_pending(true);
+        }
         if output_decoder.stop().await.is_err() {
+            app.readiness.drain_failed();
             tracing::error!("first segment decoder could not be reaped");
             // Keep the gate alive and retry cleanup before accepting more work.
             while output_decoder.stop().await.is_err() {
@@ -745,6 +891,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             }
         }
         if execution_scope.shutdown().await.is_err() {
+            app.readiness.drain_failed();
             writer_stopped = false;
             tracing::error!("media execution resource drain unconfirmed");
         }
@@ -767,12 +914,15 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             // Completion/error/exit all release only after the child is reaped.
-            // On database failure, the next budget snapshot reclaims dead jobs.
+            // On database failure, the next budget snapshot uses this receipt.
             let _ = tokio::time::timeout(
                 Duration::from_secs(3),
                 persistence::cache_budget::release(&app.db, id, owner, attempt),
             )
             .await;
+        }
+        if writer_stopped {
+            app.readiness.receipt_pending(false);
         }
         if *stop.borrow() {
             break;
@@ -787,20 +937,40 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
+fn main() -> anyhow::Result<()> {
+    // Probe before the Tokio runtime, tracing, configuration or secret loading.
+    if std::env::args().nth(1).as_deref() == Some("--source-access-contract") {
+        anyhow::ensure!(
+            std::env::args().len() == 2,
+            "invalid capability probe arguments"
+        );
+        println!("{}", providers::source_access_contract::WORKER);
+        return Ok(());
+    }
+    run()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let db = persistence::connect(&std::env::var("DATABASE_URL")?).await?;
+    let deployment = media_core::deployment_config::Settings::from_env(
+        media_core::deployment_config::Role::Worker,
+    )?;
+    advanced_media::preference_from_env()?;
     let key = STANDARD.decode(std::env::var("SOURCE_ENCRYPTION_KEY")?)?;
-    let app = App {
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| anyhow::anyhow!("SOURCE_ENCRYPTION_KEY must decode to 32 bytes"))?;
+    let db = persistence::connect(&std::env::var("DATABASE_URL")?).await?;
+    source_key_check::verify(&db, &cipher).await?;
+    let runtime_readiness = readiness::Runtime::default();
+    let mut app = App {
+        readiness: runtime_readiness.clone(),
+        metrics: Default::default(),
         db,
-        key: Arc::new(
-            Aes256Gcm::new_from_slice(&key)
-                .map_err(|_| anyhow::anyhow!("invalid encryption key"))?,
-        ),
-        cache: PathBuf::from(std::env::var("CACHE_ROOT").unwrap_or("/cache".into())),
+        key: Arc::new(cipher),
+        cache: deployment.cache_root,
         client: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -811,33 +981,138 @@ async fn main() -> anyhow::Result<()> {
         output_checks: Default::default(),
         input_failures: Default::default(),
         preview_inputs: Default::default(),
-        deliveries: Default::default(),
-        public_url: std::env::var("PUBLIC_ORIGIN").unwrap_or("http://localhost:8088".into()),
+        deliveries: playback_access::Registry::with_readiness(runtime_readiness.clone()),
+        static_hls_operations: Default::default(),
+        static_hls_children: Default::default(),
+        static_hls_child_dispatch: Default::default(),
+        static_hls_child_encoders: Default::default(),
+        public_url: deployment.agent_data_origin,
     };
     tokio::fs::create_dir_all(&app.cache).await?;
+    // Opt-in installs the real bounded pipeline. This switch is not a media
+    // qualification receipt; every request still needs original owners and
+    // complete runtime proofs. Default deployment behavior remains unchanged.
+    let child_requested = match std::env::var("STATIC_HLS_CHILD_EXECUTION_ENABLED") {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == "0" => false,
+        Ok(value) if value == "1" => true,
+        _ => anyhow::bail!("invalid STATIC_HLS_CHILD_EXECUTION_ENABLED"),
+    };
+    if child_requested {
+        let queue_limit: i64 = match std::env::var("MEDIA_QUEUE_LIMIT") {
+            Err(std::env::VarError::NotPresent) => 20,
+            Ok(value) => value.parse()?,
+            Err(error) => return Err(error.into()),
+        };
+        let runtime =
+            static_hls_child_encoder::InstalledRuntime::install(&app, queue_limit).await?;
+        app.static_hls_child_dispatch = static_hls_child_dispatch::Registry::installed(runtime)?;
+    }
+
     let (stop, mut server_stop) = tokio::sync::watch::channel(false);
     let job_app = app.clone();
+    let readiness_db = app.db.clone();
+    let readiness_cache = app.cache.clone();
     let deliveries = app.deliveries.clone();
+    let static_hls_operations = app.static_hls_operations.clone();
+    let static_hls_children = app.static_hls_children.clone();
+    let static_hls_child_dispatch = app.static_hls_child_dispatch.clone();
+    let static_hls_child_encoders = app.static_hls_child_encoders.clone();
+    let child_cleanup_app = app.clone();
     let router = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route(
+            "/media-delivery/health",
+            get(|| async {
+                (
+                    [(header::CACHE_CONTROL, "no-store")],
+                    axum::Json(json!({"service":"rainsync-worker","live":true})),
+                )
+            }),
+        )
+        .route(
+            "/agent-data/health",
+            get(|| async {
+                (
+                    [(header::CACHE_CONTROL, "no-store")],
+                    axum::Json(json!({"service":"rainsync-worker","live":true})),
+                )
+            }),
+        )
+        .route("/metrics", get(metrics::endpoint))
+        .route(
+            "/media-delivery/static-hls-contract",
+            axum::routing::post(static_hls_contract::endpoint)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/media-delivery/static-hls-operation",
+            axum::routing::post(static_hls_operation::endpoint)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
         .route("/media-delivery/{id}/{path}", get(delivery).head(delivery))
+        .route(
+            "/media-delivery/{id}/ladder/{*path}",
+            get(local_hls_ladder_read::endpoint).head(local_hls_ladder_read::endpoint),
+        )
+        .route(
+            "/media-delivery/{id}/static-hls/{token}/{path}",
+            get(static_hls_read::endpoint).head(static_hls_read::endpoint),
+        )
+        .route(
+            "/media-delivery/{id}/static-hls-child/{token}/{path}",
+            get(static_hls_child_read::endpoint).head(static_hls_child_read::endpoint),
+        )
+        .route(
+            "/native-platform-input/{id}/{key}",
+            get(native_platform_transcode::input).head(native_platform_transcode::input),
+        )
+        .route(
+            "/native-platform-output/{id}/{*path}",
+            get(native_platform_transcode::output).head(native_platform_transcode::output),
+        )
         .route("/agent-data/{id}", get(relay::connect))
         .route(
             "/preview-input/{id}/{key}",
             get(preview_input::read).head(preview_input::read),
         )
-        .with_state(app)
-        .layer(axum::middleware::from_fn(http_api::errors));
+        .layer(axum::middleware::from_fn(http_api::errors))
+        .route(
+            "/ready",
+            get(|State(app): State<App>| async move { app.readiness.response() }),
+        )
+        .route(
+            "/media-delivery/ready",
+            get(|State(app): State<App>| async move { app.readiness.response() }),
+        )
+        .with_state(app);
     let listener = tokio::net::TcpListener::bind(
         std::env::var("WORKER_BIND").unwrap_or("0.0.0.0:8081".into()),
     )
     .await?;
-    let cleaner = tokio::spawn(cache_outputs::run(job_app.clone(), stop.subscribe()));
-    let preview_queue = tokio::spawn(previews::run(
-        job_app.clone(),
-        persistence::media_previews::Settings::configured()?,
-        stop.subscribe(),
-    ));
+    let preview_settings = persistence::media_previews::Settings::configured()?;
+    let readiness_monitor =
+        readiness::start(runtime_readiness.clone(), readiness_db, readiness_cache);
+    runtime_readiness.accepting(true);
+    static_hls_operations.open();
+    static_hls_children.open();
+    static_hls_child_dispatch.open();
+    let cleaner_app = job_app.clone();
+    let cleaner_readiness = runtime_readiness.clone();
+    let cleaner_stop = stop.subscribe();
+    let cleaner = tokio::spawn(async move {
+        let _lifetime =
+            cleaner_readiness.background_task_guard(readiness::BackgroundTask::CacheCleaner);
+        cache_outputs::run(cleaner_app, cleaner_stop).await
+    });
+    let preview_app = job_app.clone();
+    let preview_readiness = runtime_readiness.clone();
+    let preview_stop = stop.subscribe();
+    let preview_queue = tokio::spawn(async move {
+        let _lifetime =
+            preview_readiness.background_task_guard(readiness::BackgroundTask::PreviewQueue);
+        previews::run(preview_app, preview_settings, preview_stop).await
+    });
     let queue = tokio::spawn(jobs(job_app, stop.subscribe()));
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { process::stopped(&mut server_stop).await })
@@ -849,6 +1124,14 @@ async fn main() -> anyhow::Result<()> {
     };
     // Fence even handlers already accepted by Axum, then cancel paused sources
     // independently of the HTTP drain and retain their receipt owners.
+    runtime_readiness.accepting(false);
+    static_hls_child_dispatch.close().await;
+    static_hls_child_encoders.close();
+    static_hls_children.close().await;
+    static_hls_operations.close().await;
+    readiness_monitor.stop();
+    native_platform_transcode::close_admission();
+    owned_http::close();
     deliveries.close();
     let _ = stop.send(true);
     let grace = signal_result
@@ -867,12 +1150,32 @@ async fn main() -> anyhow::Result<()> {
     // Includes late INSERT/COMMIT admission and receipt retries. An unavailable
     // DB or uninterruptible file read cannot be converted to a positive ACK.
     deliveries.drain().await;
+    owned_http::shutdown().await;
+    let native_transcode_result = native_platform_transcode::drain().await;
+    static_hls_operations.drain().await;
+    static_hls_child_dispatch.drain().await;
+    let child_encoder_obligations = static_hls_child_encoders.drain().await;
+    if child_encoder_obligations
+        .iter()
+        .any(|owner| owner.claim_unknown || owner.output_unknown || owner.reservation_retained)
+    {
+        tracing::warn!(
+            owners = child_encoder_obligations.len(),
+            "child encoder shutdown retains unresolved accounting obligations"
+        );
+    }
+    static_hls_children
+        .drain_until_confirmed(&child_cleanup_app)
+        .await;
     // HTTP draining may stop before a cancelled probe/subtitle owner finishes.
     // Close admission and reap every registered owner before returning from main,
     // even when the queue or cleanup task failed.
+    let readiness_result = readiness_monitor.shutdown().await;
     let process_result = child_process::shutdown().await;
     let cleaner_result = cleaner.await;
     let preview_result = preview_queue.await;
+    readiness_result?;
+    native_transcode_result?;
     process_result?;
     queue_result?;
     cleaner_result?;

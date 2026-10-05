@@ -15,5 +15,6 @@ export const watchNavigation = [
 export const adminNavigation = [
   { to: "/admin/sources", label: "片源管理", icon: "movie" },
   { to: "/admin/agents", label: "NAS 设备", icon: "server" },
+  { to: "/admin/plugins", label: "插件管理", icon: "server" },
   { to: "/admin/registration-invites", label: "账号与注册", icon: "key" },
 ] as const;

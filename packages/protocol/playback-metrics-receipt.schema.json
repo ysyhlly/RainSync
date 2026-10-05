@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaybackMetricsReceipt",
+  "type": "object",
+  "properties": {
+    "closed": {
+      "type": "boolean"
+    },
+    "meter_start_generation": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 1
+    },
+    "metrics_seq": {
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 9007199254740991,
+      "minimum": 0
+    },
+    "session_id": {
+      "type": "string",
+      "format": "uuid"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "session_id",
+    "meter_start_generation",
+    "metrics_seq",
+    "closed"
+  ]
+}

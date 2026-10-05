@@ -6,8 +6,11 @@ import { useRoomRuntime } from "./room-runtime";
 import { roomsApi } from "./rooms.api";
 import type { RoomInvitation, RoomMember } from "../../shared/api/types";
 import { useAction } from "../../shared/use-action";
+import DistributedComputePanel from "../playback/DistributedComputePanel.vue";
 import PlaybackInformation from "../playback/PlaybackInformation.vue";
+import PlatformMediaImport from "./PlatformMediaImport.vue";
 import ChatPanel from "./ChatPanel.vue";
+import PresencePanel from "./PresencePanel.vue";
 import AppSegmented from "../../shared/ui/AppSegmented.vue";
 import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
@@ -150,7 +153,16 @@ async function transferOwnership() {
         class="room-chat"
         :class="{ 'mobile-hidden': mobilePanel !== 'chat' }"
       >
+        <PresencePanel
+          class="panel"
+          :snapshot="r.presence"
+          :names="r.presenceNames"
+          :self-id="session.user?.id"
+        />
         <ChatPanel />
+        <DistributedComputePanel v-if="r.room && r.state && r.roomActive" :room-id="r.room.id" :media-generation="r.state.media_generation"
+          :audio-index="r.audioIndex" :active-job="r.distributedFacts?.job_id" :sharing="r.peerSharing" :stats="r.peerStats"
+          :activate="r.useDistributedOutput" :original="r.useOriginalSource" :share="r.startPeerSharing" :stop-sharing="r.stopPeerSharing" />
       </div>
       <section
         id="room-queue"
@@ -208,6 +220,7 @@ async function transferOwnership() {
           </button>
           <button @click="run(leave)">离开观看</button>
         </div>
+        <PlatformMediaImport />
         <div class="queue-panel panel">
           <header>
             <h2>待播列表</h2>
@@ -219,14 +232,27 @@ async function transferOwnership() {
           <article v-for="item in r.playlist" :key="item.id" class="queue-row">
             <MediaThumbnail
               small
-              :cover="catalog.records[item.media_id]?.cover ?? item.cover"
-              :alt="catalog.records[item.media_id]?.title ?? item.title"
+              :cover="
+                catalog.roomRecord(r.room?.id, item.media_id)?.cover ??
+                item.cover
+              "
+              :alt="
+                catalog.roomRecord(r.room?.id, item.media_id)?.title ??
+                item.title
+              "
             />
-            <h3>{{ catalog.records[item.media_id]?.title ?? item.title }}</h3>
+            <h3>
+              {{
+                catalog.roomRecord(r.room?.id, item.media_id)?.title ??
+                item.title
+              }}
+            </h3>
             <button
               class="icon-button"
               :aria-label="
-                '播放 ' + (catalog.records[item.media_id]?.title ?? item.title)
+                '播放 ' +
+                (catalog.roomRecord(r.room?.id, item.media_id)?.title ??
+                  item.title)
               "
               :disabled="!r.owner || !r.connected"
               @click="r.choose(item.media_id)"

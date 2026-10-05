@@ -6,25 +6,37 @@ import type { Media } from "../../shared/api/types";
 import { mediaApi } from "./media.api";
 export const useMediaCatalog = defineStore("media-catalog", () => {
   const session = useSession(),
-    records = ref<Record<string, Media>>({});
+    records = ref<Record<string, Media>>({}),
+    roomRecords = ref<Record<string, Media>>({});
   const api = mediaApi(
     (...args: Parameters<typeof session.api>) => session.api(...args) as any,
   );
   let controller = new AbortController(),
+    roomController = new AbortController(),
     sequence = 0;
   const pending = new Map<string, Promise<Media>>(),
+    roomPending = new Map<string, Promise<Media>>(),
     covers = new Map<string, number>();
   function reset() {
     controller.abort();
     controller = new AbortController();
+    roomController.abort();
+    roomController = new AbortController();
+    roomPending.clear();
     records.value = {};
+    roomRecords.value = {};
     pending.clear();
     covers.clear();
     sequence++;
   }
   function remember(items: Media[], started = ++sequence) {
     for (const item of items) {
-      if (!item?.id || typeof item.title !== "string") continue;
+      if (
+        !item?.id ||
+        typeof item.title !== "string" ||
+        item.kind === "native_platform"
+      )
+        continue;
       // Transitional older servers/fixtures retain a safe original title.
       const next: Media = {
         ...item,
@@ -80,6 +92,54 @@ export const useMediaCatalog = defineStore("media-catalog", () => {
     pending.set(id, work);
     return work;
   }
+  // Room-only metadata must never escape into the public library cache.
+  const roomKey = (room: string, id: string) =>
+    `${session.epoch}:${room}:${id}`;
+  function roomRecord(room: string | undefined, id: string | undefined) {
+    if (!room || !id) return;
+    const scoped = roomRecords.value[roomKey(room, id)];
+    return scoped?.kind === "native_platform"
+      ? scoped
+      : (records.value[id] ?? scoped);
+  }
+  function rememberRoom(room: string, items: Media[]) {
+    for (const item of items)
+      if (item?.id && typeof item.title === "string") {
+        if (item.kind !== "native_platform") remember([item]);
+        roomRecords.value[roomKey(room, item.id)] = item;
+      }
+  }
+  function clearRoom() {
+    roomController.abort();
+    roomController = new AbortController();
+    roomRecords.value = {};
+    roomPending.clear();
+    ++sequence;
+  }
+  function ensureRoom(room: string, id: string, force = false): Promise<Media> {
+    const key = roomKey(room, id);
+    if (roomPending.has(key)) return roomPending.get(key)!;
+    const cached = roomRecord(room, id);
+    if (!force && cached) return Promise.resolve(cached);
+    const epoch = session.epoch,
+      signal = roomController.signal;
+    const work = api
+      .roomDetail(room, id, signal)
+      .then((item) => {
+        if (epoch !== session.epoch || signal.aborted)
+          throw new StaleIdentity();
+        if (item.id !== id) throw Error("房间媒体详情身份不一致");
+        rememberRoom(room, [item]);
+        const result = roomRecord(room, id);
+        if (!result) throw Error("房间媒体详情响应不完整");
+        return result;
+      })
+      .finally(() => {
+        if (roomPending.get(key) === work) roomPending.delete(key);
+      });
+    roomPending.set(key, work);
+    return work;
+  }
   async function rename(
     id: string,
     scope: "personal" | "shared",
@@ -124,6 +184,11 @@ export const useMediaCatalog = defineStore("media-catalog", () => {
   onScopeDispose(reset);
   return {
     records,
+    roomRecords,
+    roomRecord,
+    rememberRoom,
+    ensureRoom,
+    clearRoom,
     remember,
     ensure,
     reset,

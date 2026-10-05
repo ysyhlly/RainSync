@@ -1,3 +1,5 @@
+import type { NativePlatformProvider } from "../../../../../packages/protocol";
+export type { NativePlatformProvider } from "../../../../../packages/protocol";
 /** REST DTOs checked against Server handlers; playback types remain generated. */
 export interface Avatar {
   avatar_url: string | null;
@@ -27,11 +29,71 @@ export interface RoomMember {
   username: string;
   display_name: string;
 }
+export type NativePlatformMedia =
+  | {
+      version: 1;
+      provider: NativePlatformProvider;
+      content_id: string;
+      part: number;
+    }
+  | {
+      version: 2;
+      provider: "bilibili";
+      content_id: string;
+      part: 1;
+      resource: {
+        kind: "bilibili_pgc";
+        ep_id: string;
+        cid: string;
+        season_id: string;
+      };
+    }
+  | {
+      version: 3;
+      provider: "bilibili";
+      content_id: string;
+      part: 1;
+      resource: {
+        kind: "bilibili_live";
+        room_id: string;
+        uid: string;
+        broadcast_id: string;
+      };
+    }
+  | {
+      version: 4;
+      provider: "bilibili";
+      content_id: string;
+      part: 1;
+      resource: {
+        kind: "bilibili_course";
+        ep_id: string;
+        aid: string;
+        cid: string;
+        season_id: string;
+      };
+    }
+  | {
+      version: 5;
+      provider: "youtube" | "douyin" | "tiktok";
+      content_id: string;
+      part: 1;
+      resource: {
+        kind: "other_live";
+        provider: "youtube" | "douyin" | "tiktok";
+        resource_id: string;
+        broadcaster_id: string;
+        started_at: number;
+        broadcast_id: string;
+        canonical_url: string;
+      };
+    };
 export interface Media {
   id: string;
   title: string;
   duration_ms: number | null;
   kind: string;
+  platform?: NativePlatformMedia;
   original_title: string;
   shared_title: string | null;
   shared_title_revision: string;
@@ -66,6 +128,7 @@ export interface Agent {
     "empty" | "ready" | "rescan_required" | "upgrade_required";
 }
 export interface Message extends Partial<Avatar> {
+  deleted?: boolean;
   id: string;
   user_id?: string;
   username: string;

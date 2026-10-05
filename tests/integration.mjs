@@ -624,8 +624,10 @@ try {
     method: "HEAD",
     headers: { Range: "bytes=9999-" },
   });
-  assert.equal(r.status, 416);
-  assert.equal(r.headers.get("content-range"), "bytes */2048");
+  // RFC 9110 Range semantics apply to GET only; HEAD describes the full entity.
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get("content-range"), null);
+  assert.equal(r.headers.get("content-length"), "2048");
   assert.equal(await r.text(), "");
   r = await fetch(worker + plan.playback_url, { method: "HEAD" });
   assert.equal(r.headers.get("content-length"), "2048");
@@ -732,6 +734,9 @@ try {
           res.setHeader("Content-Type", "application/json");
           res.end(JSON.stringify(probeMetadata));
         } else probeResponse = res;
+      } else if (req.url === "/Users/test-user") {
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({Id:"test-user",Policy:{IsDisabled:false,EnableMediaPlayback:true}}));
       } else if (req.url.startsWith("/Users/test-user/Items")) {
         const kind = req.headers["x-emby-token"] ? "emby" : "jellyfin";
         assert.ok(
@@ -778,7 +783,7 @@ try {
                     ],
                   },
                 ],
-                PlaySessionId: "mock-session",
+                PlaySessionId: randomUUID(),
               }),
             ),
           1000,
@@ -1196,6 +1201,18 @@ try {
     state,
     sql,
   });
+  const localRestartRoom = await admin.request("/rooms", "POST", {name:"local restart compatibility"});
+  const localRestartSocket = await connect(admin, localRestartRoom.id);
+  const localSnapshot = (await localRestartSocket.wait(v=>v.type==="SNAPSHOT")).state;
+  localRestartSocket.ws.send(JSON.stringify({
+    protocol_version:1,room_id:localRestartRoom.id,command_id:randomUUID(),
+    control_epoch:localRestartSocket.controlEpoch,expected_revision:localSnapshot.revision,
+    media_generation:localSnapshot.media_generation,type:"CHANGE_MEDIA",payload:{media_id:media[0].id},
+  }));
+  const localRestartState=(await localRestartSocket.wait(v=>v.type==="ACK")).state;
+  const localPlaybackRestart=await preparePlaybackRestart({admin,room:localRestartRoom,state:localRestartState,sql});
+  assert.equal(localPlaybackRestart.accountBound,false);
+  localRestartSocket.ws.close();
   a.ws.close();
   b.ws.close();
   const loginBody = { username: "restart-limit-fixture", password: "wrong" };
@@ -1240,6 +1257,7 @@ try {
   assert.notEqual(recoveredState.clock_epoch, oldEpoch);
   assert.ok(recoveredState.revision > state.revision);
   await verifyPlaybackRestart({ admin, sql }, playbackRestart);
+  await verifyPlaybackRestart({ admin, sql }, localPlaybackRestart);
   recovered.ws.send(JSON.stringify(command));
   assert.deepEqual(
     (await recovered.wait((v) => v.type === "ACK")).state,

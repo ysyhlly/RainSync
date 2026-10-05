@@ -3,10 +3,34 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
+mod presence;
+pub use presence::{PRESENCE_VERSION, PresenceMember, PresenceSnapshot};
+
 mod errors;
 pub use errors::{ApiError, ErrorCode, ErrorResponse};
+mod playback_metrics;
+pub use playback_metrics::*;
 mod playback_candidates;
 pub use playback_candidates::*;
+mod upstream_profiles;
+pub use upstream_profiles::*;
+mod upstream_output;
+pub use upstream_output::*;
+mod playback_facts;
+pub use playback_facts::*;
+mod http_file_fallback;
+pub use http_file_fallback::*;
+mod transport_metrics;
+pub use transport_metrics::*;
+mod native_platform;
+pub use native_platform::*;
+mod local_hls_ladder;
+pub use local_hls_ladder::*;
+mod advanced_playback;
+pub use advanced_playback::*;
+
+mod distributed_compute;
+pub use distributed_compute::*;
 
 pub const VERSION: u8 = 1;
 /// Unknown-duration media is bounded to one week. Known durations are authoritative.
@@ -29,6 +53,10 @@ pub enum PlaybackStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
 pub struct RoomState {
+    /// Derived from the selected immutable room-private media by the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub live: Option<NativePlatformLiveBinding>,
     pub room_id: Uuid,
     pub revision: u32,
     pub media_id: Option<Uuid>,
@@ -55,6 +83,11 @@ pub enum Action {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct Command {
+    /// Old clients must opt in before controlling or selecting live media.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1, max = 1))]
+    pub live_version: Option<u32>,
     pub protocol_version: u8,
     pub room_id: Uuid,
     pub command_id: Uuid,
@@ -77,7 +110,28 @@ pub struct ControlEpoch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PlaybackPlan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub distributed_compute: Option<DistributedComputePlaybackFacts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub local_hls_ladder: Option<LocalHlsLadderFacts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub advanced_playback: Option<AdvancedPlaybackFacts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub native_platform: Option<NativePlatformPlaybackBinding>,
+    /// Negotiated upstream recipe envelope; not measured media configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub upstream_profile: Option<UpstreamTranscodeProfileEnvelope>,
     pub session_id: Uuid,
+    /// Per-viewer intent generation; absent for legacy grants. Never room revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1))]
+    pub plan_generation: Option<u32>,
     pub media_id: Uuid,
     pub media_generation: u32,
     pub delivery_mode: String,
@@ -98,6 +152,38 @@ pub struct PlaybackPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub selected_candidate_id: Option<String>,
+    /// Server-selected bound configuration, not measured output or playback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub selected_output: Option<PlaybackSelectedOutput>,
+    /// Available delivery pipeline, not the user's currently selected subtitle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub subtitle_mode: Option<SubtitleDeliveryMode>,
+    /// Original-media intervals; absent is unknown, while [] is known empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub seekable_media_ranges_ms: Option<Vec<PlaybackMediaRange>>,
+    /// A real authorized local job only while queued or running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pending_job_id: Option<Uuid>,
+    /// Evidence-backed next request modes, never access or decode guarantees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub decoder_fallback_modes: Option<Vec<DecoderFallbackMode>>,
+    /// This live root grant supports one same-representation HTTP file→transcode
+    /// transition. Absent for legacy, unsupported inputs and successor grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1, max = 1))]
+    pub http_file_fallback_version: Option<u32>,
+    /// Server-verified static-HLS root may claim one decode-failure child.
+    /// Absent for legacy/ineligible parents and every successor grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1, max = 1))]
+    pub static_hls_fallback_version: Option<u32>,
     /// Present only when this grant negotiated actual viewer observations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -105,6 +191,14 @@ pub struct PlaybackPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub observation_seq: Option<u64>,
+    /// Optional independent client-reported metrics; observations v1 is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1, max = 2))]
+    pub playback_metrics_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub playback_metrics: Option<PlaybackMetricsGrantWire>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
@@ -156,11 +250,23 @@ pub enum PreparationStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PlaybackReadiness {
     pub session_id: Uuid,
+    /// Echoes the immutable grant generation, independent of job attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1))]
+    pub plan_generation: Option<u32>,
     pub status: PreparationStatus,
     pub complete: bool,
     /// Exclusive end of the published prefix, relative to the plan's timeline origin.
     /// None means this source/legacy output has no measured generated interval.
     pub available_until_ms: Option<f64>,
+    /// Original-media intervals; absent is unknown, while [] is known empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub seekable_media_ranges_ms: Option<Vec<PlaybackMediaRange>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pending_job_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub observation_version: Option<u32>,
@@ -253,6 +359,55 @@ pub struct PlaybackCapabilities {
 /// Missing optional fields preserve the original v1 playback request defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PlaybackRequest {
+    /// Dedicated primary NAS output endpoint; absence preserves legacy hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub distributed_compute: Option<DistributedComputePlaybackIntent>,
+    /// Explicit finite-HLS local transcode admission only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1, max = 1))]
+    pub finite_hls_version: Option<u32>,
+    /// Dedicated local multirendition endpoint only; absence preserves legacy hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub local_hls_ladder: Option<LocalHlsLadderRequest>,
+    /// Dedicated advanced-local route only. Absence preserves legacy hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub advanced_playback: Option<AdvancedPlaybackRequest>,
+    /// Dedicated native-platform route only. Absence preserves legacy hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub native_platform: Option<NativePlatformPlaybackIntent>,
+    /// Opt into verified static-HLS parent preparation. Absence is legacy.
+    /// A child continuation is advertised separately only when implemented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1, max = 1))]
+    pub static_hls_fallback_version: Option<u32>,
+    /// Dedicated upstream-profile route only; absence preserves legacy hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub upstream_profile_report: Option<UpstreamProfileReport>,
+    /// Negotiate single-hop verified HTTP-file continuation; absence is legacy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1, max = 1))]
+    pub http_file_fallback_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub http_file_fallback: Option<HttpFileFallback>,
+    /// Opaque per-player identity for ordering only, never authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub viewer_id: Option<Uuid>,
+    /// Positive monotonic intent generation within user/room/viewer scope.
+    /// Must be supplied together with viewer_id; same-key retries retain it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1))]
+    pub plan_generation: Option<u32>,
     #[serde(default)]
     #[ts(optional)]
     pub idempotency_key: Option<Uuid>,
@@ -272,6 +427,19 @@ pub struct PlaybackRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub candidate_report: Option<PlaybackCandidateReport>,
+    /// Optional independent client-reported metrics; observations v1 is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(range(min = 1, max = 1))]
+    pub playback_metrics_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub playback_metrics: Option<PlaybackMetricsIntent>,
+    /// Outer offer is ignored by old servers. Absence preserves canonical hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[schemars(length(min = 1, max = 2))]
+    pub playback_metrics_supported_versions: Option<Vec<u32>>,
 }
 
 impl PlaybackCapabilities {
@@ -330,7 +498,31 @@ mod capability_tests {
         assert!(request.capabilities.is_none());
         assert!(request.observation_version.is_none());
         assert!(request.candidate_report.is_none());
+        assert!(request.viewer_id.is_none());
+        assert!(request.plan_generation.is_none());
     }
+    #[test]
+    fn plan_generation_fields_are_additive_and_bounded_on_decode() {
+        let legacy = serde_json::json!({"room_id": Uuid::nil(), "media_generation": 1});
+        let request: PlaybackRequest = serde_json::from_value(legacy.clone()).unwrap();
+        let canonical = serde_json::to_value(request).unwrap();
+        assert!(canonical.get("viewer_id").is_none());
+        assert!(canonical.get("plan_generation").is_none());
+        let mut current = legacy;
+        current["viewer_id"] = serde_json::json!(Uuid::new_v4());
+        current["plan_generation"] = serde_json::json!(u32::MAX);
+        let request: PlaybackRequest = serde_json::from_value(current.clone()).unwrap();
+        assert_eq!(request.plan_generation, Some(u32::MAX));
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(4294967296_u64),
+            serde_json::json!(1.5),
+        ] {
+            current["plan_generation"] = value;
+            assert!(serde_json::from_value::<PlaybackRequest>(current.clone()).is_err());
+        }
+    }
+
     #[test]
     fn refuses_unplayable_output_and_distinguishes_transports() {
         let mut caps = PlaybackCapabilities {

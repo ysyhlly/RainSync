@@ -10,7 +10,7 @@ pub async fn run(app: App, settings: Settings, mut stop: tokio::sync::watch::Rec
             break;
         }
         while tasks.len() < settings.concurrency {
-            match media_previews::claim(&app.db, owner).await {
+            match media_previews::claim_with_limit(&app.db, owner, settings.queue_limit).await {
                 Ok(Some(a)) => {
                     let app = app.clone();
                     let settings = settings.clone();
@@ -35,7 +35,7 @@ async fn resource(app: &App, a: &Attempt) -> anyhow::Result<(Value, Vec<String>)
         serde_json::from_value(decrypt(app, &row.get::<String, _>("config_encrypted"))?)?;
     let kind: String = row.get("kind");
     let item: String = row.get("resource");
-    let mut resource = json!({"kind":kind,"resource":item,"root":config.root,"url":config.url,"headers":config.headers});
+    let mut resource = json!({"kind":kind,"resource":item,"root":config.root,"url":config.url,"headers":config.headers,"source_url":config.url,"access_policy":config.access_policy});
     let mut posters = vec![];
     match kind.as_str() {
         "local" => {
@@ -99,7 +99,15 @@ async fn execute(
             let key = grant.target(target.clone());
             let url = preview_input::url(a.attempt_id, key)?;
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match media_core::preview::generate(&url, poster, remaining, receiver.clone()).await {
+            match media_core::preview::generate(
+                &url,
+                poster,
+                !matches!(resource["kind"].as_str(), Some("local" | "agent")),
+                remaining,
+                receiver.clone(),
+            )
+            .await
+            {
                 Ok(bytes) => return Ok(bytes),
                 Err(_) if poster => continue,
                 Err(e) => return Err(e),

@@ -9,6 +9,9 @@ import UserAvatar from "../../shared/ui/UserAvatar.vue";
 import Notice from "../../shared/ui/Notice.vue";
 import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
+import PlatformAccountPanel from "./PlatformAccountPanel.vue";
+import ShortPlatformAccountPanel from "./ShortPlatformAccountPanel.vue";
+import YoutubePlatformAccountPanel from "./YoutubePlatformAccountPanel.vue";
 import AvatarCropDialog from "./avatar/AvatarCropDialog.vue";
 import { decodeAvatar } from "./avatar/image-input";
 const session = useSession(),
@@ -291,6 +294,10 @@ onBeforeUnmount(() => {
         </form>
       </section>
     </div>
+    <PlatformAccountPanel />
+    <ShortPlatformAccountPanel provider="douyin" />
+    <ShortPlatformAccountPanel provider="tiktok" />
+    <YoutubePlatformAccountPanel />
     <AvatarCropDialog
       v-if="selected"
       :image="selected"

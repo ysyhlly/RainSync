@@ -3,6 +3,26 @@
   "title": "PlaybackCandidateRequest",
   "type": "object",
   "properties": {
+    "advanced_playback": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AdvancedPlaybackRequest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "advanced_playback_capabilities_version": {
+      "description": "Opt in to source-eligible advanced controls while retaining legacy\ncandidate/error behavior for clients that omit this offer.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint8",
+      "maximum": 1,
+      "minimum": 1
+    },
     "audio_index": {
       "type": [
         "integer",
@@ -11,6 +31,35 @@
       "format": "uint32",
       "default": null,
       "minimum": 0
+    },
+    "http_file_capabilities_version": {
+      "description": "Opt in to version-bound, reliable single-file HTTP candidates.\nOmitted by explicit-direct requests, which must not force source probing.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
+    "local_hls_ladder": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LocalHlsLadderRequest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "local_hls_ladder_capabilities_version": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint8",
+      "maximum": 1,
+      "minimum": 1
     },
     "media_generation": {
       "type": "integer",
@@ -30,5 +79,49 @@
   "required": [
     "room_id",
     "media_generation"
-  ]
+  ],
+  "$defs": {
+    "AdvancedPlaybackRequest": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 1,
+          "minimum": 1
+        },
+        "subtitle_stream_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tone_map_hdr": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "tone_map_hdr"
+      ]
+    },
+    "LocalHlsLadderRequest": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 1,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version"
+      ]
+    }
+  }
 }

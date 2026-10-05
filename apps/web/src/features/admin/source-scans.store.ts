@@ -44,7 +44,7 @@ export const useSourceScans = defineStore("source-scans", () => {
       failed: false,
     };
     try {
-      const value = await session.api<{ status?: string; count: number }>(
+      const value = await session.api<{ status?: string; count: number; has_more?: boolean }>(
         source.kind === "agent"
           ? `/agents/${source.id}/scan`
           : `/sources/${source.id}/test`,
@@ -53,14 +53,14 @@ export const useSourceScans = defineStore("source-scans", () => {
         AbortSignal.timeout(125000),
       );
       if (epoch !== session.epoch) return;
-      const failed = !!value.status && value.status !== "complete";
+      const failed = !!value.status && !["complete", "completed", "running"].includes(value.status);
       results[source.id] = {
         name: source.name,
         busy: false,
         failed,
         message: failed
           ? (labels[value.status!] ?? "扫描未完成")
-          : `本次扫描发现 ${value.count} 部影片`,
+          : value.has_more ? `已保存 ${value.count} 部影片的索引，点击检测继续下一页` : `本次扫描发现 ${value.count} 部影片`,
       };
     } catch (failure) {
       if (epoch === session.epoch)

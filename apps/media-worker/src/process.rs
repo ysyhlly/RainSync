@@ -12,6 +12,17 @@ impl std::fmt::Display for LeaseInterrupted {
 }
 impl std::error::Error for LeaseInterrupted {}
 
+/// A nonzero encoder exit, distinct from cancellation, loss of ownership,
+/// process cleanup failure, and an independently observed resource failure.
+#[derive(Debug)]
+pub struct EncodingFailed;
+impl std::fmt::Display for EncodingFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ffmpeg_failed")
+    }
+}
+impl std::error::Error for EncodingFailed {}
+
 /// Missing finalization evidence is recoverable; never turn a deadline into
 /// a permanent encoder failure or publish an unverified output.
 pub async fn finalization_deadline<T>(
@@ -66,7 +77,7 @@ where
                 error = &mut capacity => return Err(error),
                 _ = tokio::time::sleep_until(confirmed_until) => return Err(LeaseInterrupted.into()),
                 status = child.wait() => {
-                    anyhow::ensure!(status?.success(), "ffmpeg_failed");
+                    anyhow::ensure!(status?.success(), EncodingFailed);
                     return Ok(());
                 }
                 _ = tokio::time::sleep_until(next_check) => {
@@ -76,7 +87,7 @@ where
                         error = &mut capacity => return Err(error),
                         _ = tokio::time::sleep_until(confirmed_until) => return Err(LeaseInterrupted.into()),
                         status = child.wait() => {
-                            anyhow::ensure!(status?.success(), "ffmpeg_failed");
+                            anyhow::ensure!(status?.success(), EncodingFailed);
                             return Ok(());
                         }
                         result = tokio::time::timeout(Duration::from_secs(3), healthy()) => {
@@ -138,6 +149,43 @@ mod tests {
 
     fn lease() -> Instant {
         Instant::now() + Duration::from_secs(30)
+    }
+
+    #[tokio::test]
+    async fn stalled_active_renewal_marks_readiness_failed_before_lease_expiry() {
+        let mut child = child();
+        let (sender, mut stop) = watch::channel(false);
+        let readiness = crate::readiness::Runtime::default();
+        readiness.claim_succeeded(true);
+        let until = lease();
+        readiness.observe_lease(&Ok::<_, ()>(Some(until)));
+        let inspected = readiness.clone();
+        let observer = async move {
+            tokio::time::timeout(Duration::from_secs(9), async {
+                loop {
+                    if inspected.snapshot().checks["task_ownership"]
+                        == crate::readiness::Outcome::Failed
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(Instant::now() < until);
+            sender.send(true).unwrap();
+        };
+        let execution = supervise(
+            &mut child,
+            &mut stop,
+            until,
+            || readiness.check_lease(std::future::pending::<anyhow::Result<Option<Instant>>>()),
+            std::future::pending::<anyhow::Error>(),
+        );
+        let (_, result) = tokio::join!(observer, execution);
+        assert!(result.is_err());
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[tokio::test]

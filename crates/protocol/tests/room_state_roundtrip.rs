@@ -15,6 +15,7 @@ fn room_state_json_preserves_authoritative_float_values() {
             playback_rate: 1.0,
             controller_user_id: Uuid::nil(),
             duration_ms: Some(86400000.0),
+            live: None,
             clock_epoch: Uuid::nil(),
         };
         let json = serde_json::to_vec(&state).unwrap();

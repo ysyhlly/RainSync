@@ -5,6 +5,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Migration checks compare immutable bytes with a published ancestor.
+          fetch-depth: 0
       - name: Isolate validation outputs
         run: |
           mkdir -p "$RUNNER_TEMP/rainsync-validation"
@@ -17,8 +20,19 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - name: Install media validation prerequisites
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Verify or install media validation prerequisites
+        timeout-minutes: 20
+        run: |
+          packages=()
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then packages+=(ffmpeg); fi
+          if ! command -v pg_config >/dev/null || ! test -x "$(pg_config --bindir)/initdb"; then packages+=(postgresql); fi
+          if ((${#packages[@]})); then
+            sudo timeout --kill-after=15s 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+            sudo timeout --kill-after=15s 900s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends "${packages[@]}"
+          fi
+          ffmpeg -version
+          ffprobe -version
+          test -x "$(pg_config --bindir)/initdb"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -28,6 +42,19 @@ jobs:
       - run: cargo build --workspace --bins --examples --locked && node tests/integration.mjs
       - run: npm run test:priority-remediation
       - run: npm run test:lifecycle-capabilities
+      - run: npm run test:playback-generations
+      - name: Verify integrated B-F regressions
+        run: |
+          echo "RAINSYNC_FFMPEG_BIN=/usr/bin" >> "$GITHUB_ENV"
+          export RAINSYNC_NATIVE_POSTGRES_BIN="$(pg_config --bindir)"
+          test -x "$RAINSYNC_NATIVE_POSTGRES_BIN/initdb"
+          # Native PostgreSQL belongs to this batch. The later avatar image
+          # fixture intentionally requires its own Docker database/network.
+          node scripts/bind-native-backend.mjs > "$RUNNER_TEMP/rainsync-validation/binding-path.txt"
+          BINDING="$(tail -n 1 "$RUNNER_TEMP/rainsync-validation/binding-path.txt")"
+          echo "W03_BACKEND_BINDING=$BINDING" >> "$GITHUB_ENV"
+          export W03_BACKEND_BINDING="$BINDING"
+          npm run test:parallel-integration
       - run: npm run test:accounts
       - name: Verify avatars with the deployment image's FFmpeg
         run: |
@@ -36,5 +63,7 @@ jobs:
       - run: npm run test:chat
       - run: node tests/playlist-scan.mjs
       - run: npx playwright install --with-deps chromium && npm run test:e2e
+      - name: Verify independent browser measurement driver
+        run: RAINSYNC_PLAYWRIGHT_MODULE="$PWD/node_modules/@playwright/test/index.mjs" node --test tests/acceptance-browser.test.mjs
       - run: npm run test:browser-real
       - run: node tests/playlist-real.mjs

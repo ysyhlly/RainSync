@@ -1,3 +1,4 @@
+import { sourceMedia } from "./fixtures/source-grant.mjs";
 import assert from "node:assert/strict";
 import {
   createCipheriv,
@@ -14,6 +15,7 @@ import { delay } from "./fixtures/server.mjs";
 
 const LIMIT_MS = 10000;
 const SIZE = 1024 * 1024 * 1024;
+const ETAG = '"stream-revocation-v1"';
 const selected = process.env.RAINSYNC_STREAM_CASE;
 const cases = [];
 async function until(check, label, timeout = LIMIT_MS) {
@@ -37,7 +39,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
   const upstreams = new Map();
   const upstream = createServer((req, res) => {
     const key = new URL(req.url, "http://fixture").pathname.slice(1);
-    const state = { closed: false, bytes: 0 };
+    const state = { closed: false, bytes: 0, range: req.headers.range };
     upstreams.set(key, state);
     let timer;
     res.on("close", () => {
@@ -65,16 +67,31 @@ await isolatedMediaStack("stream-revocation", async (f) => {
       return;
     }
     const ranged = Boolean(req.headers.range);
+    // Initial ranged delivery first classifies bytes 0-1023. The origin must
+    // honor that probe and pin the same representation for the long stream.
+    const range = ranged ? /^bytes=(\d+)-(\d+)$/.exec(req.headers.range) : null;
+    if (ranged) assert.ok(range, "fixture expects a single bounded byte range");
+    const start = ranged ? Number(range[1]) : 0;
+    const end = ranged ? Math.min(Number(range[2]), SIZE - 1) : SIZE - 1;
+    assert.ok(start <= end && start < SIZE, "fixture range is satisfiable");
+    if (req.headers["if-match"]) assert.equal(req.headers["if-match"], ETAG);
+    if (req.headers["if-range"]) assert.equal(req.headers["if-range"], ETAG);
+    let remaining = end - start + 1;
     res.writeHead(ranged ? 206 : 200, {
       "Content-Type": "video/mp4",
-      "Content-Length": SIZE,
+      "Content-Length": remaining,
       "Accept-Ranges": "bytes",
-      ...(ranged ? { "Content-Range": `bytes 0-${SIZE - 1}/${SIZE}` } : {}),
+      ETag: ETAG,
+      ...(ranged ? { "Content-Range": `bytes ${start}-${end}/${SIZE}` } : {}),
     });
+    if (req.method === "HEAD") return res.end();
     const send = () => {
       if (res.destroyed) return;
-      state.bytes += 65536;
-      const ready = res.write(Buffer.alloc(65536));
+      const length = Math.min(65536, remaining);
+      state.bytes += length;
+      remaining -= length;
+      const ready = res.write(Buffer.alloc(length));
+      if (!remaining) return res.end();
       // A genuinely slow remote source also tests pending .next(), not only
       // a source that always has a chunk ready. Stop before declaring EOF.
       if (ready) timer = setTimeout(send, 20);
@@ -168,7 +185,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
             ? { kind, root: f.root, resource: "long.mp4" }
             : { kind, url: `${upstreamOrigin}/${id}.mp4`, headers: {} };
         f.sql(
-          `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
+          `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
         );
         const url = `${f.workerOrigin}/media-delivery/${id}/source?token=${token}`;
         const ranged = revoke === "membership" || revoke === "expiry";
@@ -182,6 +199,22 @@ await isolatedMediaStack("stream-revocation", async (f) => {
           );
         assert.equal(Number(state.response.headers["content-length"]), SIZE);
         await delay(250); // Fill downstream buffers before revoking.
+        const source = kind === "http" ? upstreams.get(`${id}.mp4`) : undefined;
+        if (kind === "http") {
+          assert.ok(source, `${label}: long upstream request admitted`);
+          assert.equal(
+            source.range,
+            ranged ? `bytes=0-${SIZE - 1}` : undefined,
+            "observe the delivery request rather than its classification probe",
+          );
+          assert.equal(
+            source.closed,
+            false,
+            "source is live before revocation",
+          );
+          assert.ok(source.bytes > 0 && source.bytes < SIZE);
+          assert.equal(state.response.headers.etag, ETAG);
+        }
         if (kind === "local" && process.platform === "linux")
           assert.ok((await openHandles()) > 0);
         let lock;
@@ -218,10 +251,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
             `${label}: local descriptor released`,
           );
         if (kind === "http")
-          await until(
-            () => upstreams.get(`${id}.mp4`)?.closed,
-            `${label}: upstream released`,
-          );
+          await until(() => source.closed, `${label}: upstream released`);
         const releasedMs = Date.now() - began;
         if (revoke !== "consumer-drop") {
           state.response.resume();
@@ -286,7 +316,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
           : {}),
       };
       f.sql(
-        `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
+        `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
       );
       const path = mode === "subtitle" ? "subtitle-0.vtt" : "source";
       const url = `${f.workerOrigin}/media-delivery/${id}/${path}?token=${token}`;
@@ -360,7 +390,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
           token = randomBytes(32).toString("hex");
         const resource = { kind: "local", root: f.root, resource: "long.mp4" };
         f.sql(
-          `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
+          `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
         );
         streams.push(
           start(
@@ -388,7 +418,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
       );
       const blockedChecks = Number(
         f.sql(
-          `SELECT count(*) FROM pg_stat_activity WHERE application_name='${workerApplication}' AND wait_event_type='Lock' AND query LIKE 'SELECT EXISTS(SELECT 1 FROM playback_sessions%'`,
+          `SELECT count(*) FROM pg_stat_activity WHERE application_name='${workerApplication}' AND wait_event_type='Lock' AND query LIKE 'SELECT src.id AS source_id,%' AND query LIKE '%p.delivery_token_hash=$2%' AND query LIKE '%playback_source_allowed(p.media_id,p.resource)%'`,
         ),
       );
       assert.ok(

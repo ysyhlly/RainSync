@@ -4,6 +4,13 @@ export function mediaApi(api: ReturnType<typeof useSession>["api"]) {
   return {
     detail: (id: string, signal?: AbortSignal) =>
       api<Media>(`/media/${encodeURIComponent(id)}`, "GET", undefined, signal),
+    roomDetail: (room: string, id: string, signal?: AbortSignal) =>
+      api<Media>(
+        `/rooms/${encodeURIComponent(room)}/media/${encodeURIComponent(id)}`,
+        "GET",
+        undefined,
+        signal,
+      ),
     rename: (
       id: string,
       scope: "personal" | "shared",

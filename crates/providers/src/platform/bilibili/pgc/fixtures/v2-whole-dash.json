@@ -1,0 +1,146 @@
+{
+  "code": 0,
+  "result": {
+    "ep_id": 9007199254740993,
+    "cid": 9007199254740995,
+    "season_id": 12345,
+    "play_check": {
+      "play_detail": "PLAY_WHOLE"
+    },
+    "play_video_type": "whole",
+    "plugins": [
+      {
+        "name": "AreaLimitPanel",
+        "config": {
+          "is_block": false
+        }
+      }
+    ],
+    "video_info": {
+      "quality": 80,
+      "timelength": 90090,
+      "accept_quality": [
+        80,
+        64,
+        32
+      ],
+      "accept_description": [
+        "1080P",
+        "720P",
+        "480P"
+      ],
+      "support_formats": [
+        {
+          "quality": 80,
+          "need_login": true,
+          "need_vip": true
+        },
+        {
+          "quality": 64,
+          "need_login": false,
+          "need_vip": false
+        },
+        {
+          "quality": 32,
+          "need_login": false,
+          "need_vip": false
+        }
+      ],
+      "is_preview": 0,
+      "dash": {
+        "duration": 90.09,
+        "minBufferTime": 1.5,
+        "video": [
+          {
+            "id": 80,
+            "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/synthetic-80-7.m4s?deadline=1700003600",
+            "backupUrl": [],
+            "mimeType": "video/mp4",
+            "codecs": "avc1.640028",
+            "codecid": 7,
+            "bandwidth": 1200000,
+            "width": 1920,
+            "height": 1080,
+            "frameRate": "30000/1001",
+            "sar": "1:1",
+            "startWithSap": 1,
+            "SegmentBase": {
+              "Initialization": "0-999",
+              "indexRange": "1000-1999"
+            }
+          },
+          {
+            "id": 64,
+            "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/synthetic-64-7.m4s?deadline=1700003600",
+            "backupUrl": [],
+            "mimeType": "video/mp4",
+            "codecs": "avc1.640028",
+            "codecid": 7,
+            "bandwidth": 1200000,
+            "width": 1280,
+            "height": 720,
+            "frameRate": "30000/1001",
+            "sar": "1:1",
+            "startWithSap": 1,
+            "SegmentBase": {
+              "Initialization": "0-999",
+              "indexRange": "1000-1999"
+            }
+          },
+          {
+            "id": 32,
+            "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/synthetic-32-7.m4s?deadline=1700003600",
+            "backupUrl": [],
+            "mimeType": "video/mp4",
+            "codecs": "avc1.640028",
+            "codecid": 7,
+            "bandwidth": 1200000,
+            "width": 853,
+            "height": 480,
+            "frameRate": "30000/1001",
+            "sar": "1:1",
+            "startWithSap": 1,
+            "SegmentBase": {
+              "Initialization": "0-999",
+              "indexRange": "1000-1999"
+            }
+          },
+          {
+            "id": 80,
+            "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/synthetic-80-12.m4s?deadline=1700003600",
+            "backupUrl": [],
+            "mimeType": "video/mp4",
+            "codecs": "hev1.1.6.L120",
+            "codecid": 12,
+            "bandwidth": 1200000,
+            "width": 1920,
+            "height": 1080,
+            "frameRate": "30000/1001",
+            "sar": "1:1",
+            "startWithSap": 1,
+            "SegmentBase": {
+              "Initialization": "0-999",
+              "indexRange": "1000-1999"
+            }
+          }
+        ],
+        "audio": [
+          {
+            "id": 30280,
+            "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/synthetic-audio.m4s?deadline=1700003500",
+            "backupUrl": [],
+            "mimeType": "audio/mp4",
+            "codecs": "mp4a.40.2",
+            "bandwidth": 192000,
+            "audioSamplingRate": "48000",
+            "startWithSap": 1,
+            "SegmentBase": {
+              "Initialization": "0-699",
+              "indexRange": "700-899"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

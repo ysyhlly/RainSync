@@ -36,7 +36,7 @@ try {
   await isolatedServer("legacy-nas-scope", async f => {
     fixture = f;
     report.postgres = f.postgresDiagnostics();
-    assert.equal(f.sql("SELECT max(version) FROM _sqlx_migrations WHERE success"), "30");
+    assert.equal(f.sql("SELECT count(*) FROM _sqlx_migrations WHERE version=30 AND success"), "1");
     assert.equal(f.sql("SELECT ordinal FROM room_cleanup_birth_counter"), "1");
     assert.equal(f.sql(`SELECT count(*) FROM agent_transfer_runs WHERE id IN('${oldRuns.join("','")}') AND legacy_unconfirmed AND possible_room_cutoff=1 AND agent_drained_at IS NULL`), "3");
     const admin = f.client(); await admin.login();

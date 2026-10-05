@@ -1,14 +1,41 @@
-//! Final and periodic identity checks for negotiated local encoder input.
+//! Final and periodic identity checks for version-bound local encoder input.
 use anyhow::Result;
 use serde_json::Value;
 use std::{path::PathBuf, time::Duration};
 
 pub async fn verify(spec: &Value) -> Result<()> {
+    if spec["source_kind"] == "local"
+        && let Some(value) = spec.get("advanced_assets")
+    {
+        let catalog: media_core::advanced_media::AssetCatalog =
+            serde_json::from_value(value.clone())?;
+        catalog.validate(
+            spec["resource"].as_str().unwrap_or(""),
+            spec["source_version"].as_str().unwrap_or(""),
+        )?;
+        let root = PathBuf::from(spec["root"].as_str().unwrap_or(""));
+        let checked = media_core::child_process::blocking(move || -> Result<()> {
+            catalog.verify_files(&root)
+        })
+        .await?;
+        if let Err(error) = checked {
+            if error.to_string() == "source_changed"
+                || error.to_string() == "advanced_asset_symlink_unsupported"
+                || error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(persistence::media_jobs::JobFailure::SourceChanged.into());
+            }
+            return Err(error);
+        }
+    }
+
     let Some(expected) = spec["source_version"].as_str() else {
         return Ok(());
     };
     // Remote providers own their own input version checks. Legacy jobs without
-    // a negotiated identity retain their existing execution path.
+    // a recorded identity retain their existing execution path.
     if spec["source_kind"]
         .as_str()
         .is_some_and(|kind| kind != "local")
@@ -42,6 +69,18 @@ pub async fn monitor(spec: &Value) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn persisted_legacy_jobs_do_not_invent_a_source_version() {
+        for spec in [
+            serde_json::json!({"source_kind":"local","root":"missing-legacy-root","resource":"input.mp4"}),
+            serde_json::json!({"source_kind":"local","root":"missing-legacy-root","resource":"input.mp4","source_version":null}),
+        ] {
+            let before = spec.clone();
+            verify(&spec).await.unwrap();
+            assert_eq!(spec, before);
+        }
+    }
+
     #[tokio::test]
     async fn final_identity_check_detects_changed_or_missing_local_file() {
         let root =

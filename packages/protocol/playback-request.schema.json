@@ -4,6 +4,17 @@
   "description": "Missing optional fields preserve the original v1 playback request defaults.",
   "type": "object",
   "properties": {
+    "advanced_playback": {
+      "description": "Dedicated advanced-local route only. Absence preserves legacy hashes.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AdvancedPlaybackRequest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "audio_index": {
       "type": [
         "integer",
@@ -34,6 +45,47 @@
       ],
       "default": null
     },
+    "distributed_compute": {
+      "description": "Dedicated primary NAS output endpoint; absence preserves legacy hashes.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DistributedComputePlaybackIntent"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "finite_hls_version": {
+      "description": "Explicit finite-HLS local transcode admission only.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1
+    },
+    "http_file_fallback": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HttpFileFallback"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "http_file_fallback_version": {
+      "description": "Negotiate single-hop verified HTTP-file continuation; absence is legacy.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1
+    },
     "idempotency_key": {
       "type": [
         "string",
@@ -41,6 +93,17 @@
       ],
       "format": "uuid",
       "default": null
+    },
+    "local_hls_ladder": {
+      "description": "Dedicated local multirendition endpoint only; absence preserves legacy hashes.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LocalHlsLadderRequest"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "media_generation": {
       "type": "integer",
@@ -54,6 +117,17 @@
       ],
       "default": null
     },
+    "native_platform": {
+      "description": "Dedicated native-platform route only. Absence preserves legacy hashes.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NativePlatformPlaybackIntent"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "observation_version": {
       "type": [
         "integer",
@@ -61,6 +135,49 @@
       ],
       "format": "uint32",
       "minimum": 0
+    },
+    "plan_generation": {
+      "description": "Positive monotonic intent generation within user/room/viewer scope.\nMust be supplied together with viewer_id; same-key retries retain it.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 1
+    },
+    "playback_metrics": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PlaybackMetricsIntent"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "playback_metrics_supported_versions": {
+      "description": "Outer offer is ignored by old servers. Absence preserves canonical hashes.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0
+      },
+      "maxItems": 2,
+      "minItems": 1
+    },
+    "playback_metrics_version": {
+      "description": "Optional independent client-reported metrics; observations v1 is unchanged.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1
     },
     "position_ms": {
       "type": "number",
@@ -70,6 +187,35 @@
     "room_id": {
       "type": "string",
       "format": "uuid"
+    },
+    "static_hls_fallback_version": {
+      "description": "Opt into verified static-HLS parent preparation. Absence is legacy.\nA child continuation is advertised separately only when implemented.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1
+    },
+    "upstream_profile_report": {
+      "description": "Dedicated upstream-profile route only; absence preserves legacy hashes.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UpstreamProfileReport"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "viewer_id": {
+      "description": "Opaque per-player identity for ordering only, never authorization.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
     }
   },
   "required": [
@@ -77,6 +223,33 @@
     "media_generation"
   ],
   "$defs": {
+    "AdvancedPlaybackRequest": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 1,
+          "minimum": 1
+        },
+        "subtitle_stream_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tone_map_hdr": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "tone_map_hdr"
+      ]
+    },
     "AudioCapabilityConfiguration": {
       "type": "object",
       "properties": {
@@ -123,6 +296,71 @@
       "required": [
         "schema_version",
         "candidates"
+      ]
+    },
+    "DistributedComputePlaybackIntent": {
+      "description": "Dedicated primary endpoint only. An output ID is a choice, never authority.",
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "output_generation": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 1,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "job_id",
+        "output_generation"
+      ]
+    },
+    "HttpFileFallback": {
+      "description": "A parent ID is only an authenticated lookup key, never a bearer grant.\nThe final observation is captured once before detaching the parent's media.",
+      "type": "object",
+      "properties": {
+        "final_observation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlaybackObservation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parent_session_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "parent_session_id"
+      ]
+    },
+    "LocalHlsLadderRequest": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 1,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version"
       ]
     },
     "MediaCapabilityCandidate": {
@@ -204,6 +442,160 @@
         "unsupported",
         "maybe",
         "probably"
+      ]
+    },
+    "NativePlatformCompatibilityIntent": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/NativePlatformCompatibilityMode"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 1,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "mode"
+      ]
+    },
+    "NativePlatformCompatibilityMode": {
+      "description": "A closed, explicit request for the server-owned clear-media recipe.\nIt never carries extractor flags, upstream URLs or credential material.",
+      "type": "string",
+      "enum": [
+        "hls_avc_aac",
+        "hls_avc_aac_ladder"
+      ]
+    },
+    "NativePlatformCredentialMode": {
+      "type": "string",
+      "enum": [
+        "own_or_anonymous",
+        "anonymous"
+      ]
+    },
+    "NativePlatformMaxHeight": {
+      "description": "Closed height ceilings. These are application policy, never extractor flags\nor a promise that a provider has a rendition at the named height.",
+      "type": "string",
+      "enum": [
+        "auto",
+        "p144",
+        "p240",
+        "p360",
+        "p480",
+        "p720",
+        "p1080",
+        "p1440",
+        "p2160",
+        "p4320"
+      ]
+    },
+    "NativePlatformPlaybackIntent": {
+      "type": "object",
+      "properties": {
+        "account_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "compatibility": {
+          "description": "Dedicated compatibility prepare route only; absence preserves v1 hashes.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativePlatformCompatibilityIntent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "course_version": {
+          "description": "Explicit opt-in to the distinct, positively entitled course route.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "maximum": 1,
+          "minimum": 1
+        },
+        "credential_mode": {
+          "$ref": "#/$defs/NativePlatformCredentialMode"
+        },
+        "live_version": {
+          "description": "Explicit opt-in to live-edge/control semantics; absence is legacy VOD.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "maximum": 2,
+          "minimum": 1
+        },
+        "quality": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NativePlatformQualityIntent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 1,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "credential_mode"
+      ]
+    },
+    "NativePlatformProvider": {
+      "type": "string",
+      "enum": [
+        "bilibili",
+        "douyin",
+        "tiktok",
+        "youtube"
+      ]
+    },
+    "NativePlatformQualityIntent": {
+      "type": "object",
+      "properties": {
+        "max_height": {
+          "$ref": "#/$defs/NativePlatformMaxHeight"
+        },
+        "media_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "provider": {
+          "$ref": "#/$defs/NativePlatformProvider"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 1,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "provider",
+        "media_id",
+        "max_height"
       ]
     },
     "PlaybackCandidateReport": {
@@ -302,6 +694,166 @@
         "progressive_h264_aac",
         "native_hls",
         "mse_h264_aac"
+      ]
+    },
+    "PlaybackMetricsIntent": {
+      "type": "object",
+      "properties": {
+        "meter_start_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "startup_origin": {
+          "$ref": "#/$defs/PlaybackMetricsOrigin"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "meter_start_generation",
+        "startup_origin"
+      ]
+    },
+    "PlaybackMetricsOrigin": {
+      "type": "string",
+      "enum": [
+        "user_intent",
+        "automatic_load"
+      ]
+    },
+    "PlaybackObservation": {
+      "description": "An immutable sample of the actual media element, relative to its plan.\n`has_played` is cumulative for that grant, even when the latest sample pauses.",
+      "type": "object",
+      "properties": {
+        "buffering": {
+          "type": "boolean"
+        },
+        "event": {
+          "$ref": "#/$defs/PlaybackObservationEvent"
+        },
+        "has_played": {
+          "type": "boolean"
+        },
+        "media_generation": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "media_time_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "paused": {
+          "type": "boolean"
+        },
+        "playback_rate": {
+          "type": "number",
+          "format": "double"
+        },
+        "seeking": {
+          "type": "boolean"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "media_generation",
+        "seq",
+        "event",
+        "media_time_ms",
+        "paused",
+        "seeking",
+        "buffering",
+        "playback_rate",
+        "has_played"
+      ]
+    },
+    "PlaybackObservationEvent": {
+      "type": "string",
+      "enum": [
+        "playing",
+        "pause",
+        "progress",
+        "seeking",
+        "seeked",
+        "buffering",
+        "ended"
+      ]
+    },
+    "UpstreamAudioRateReport": {
+      "type": "object",
+      "properties": {
+        "mse_decoding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MediaDecodingSupport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mse_supported": {
+          "type": "boolean"
+        },
+        "sample_rate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sample_rate",
+        "mse_supported"
+      ]
+    },
+    "UpstreamProfileReport": {
+      "description": "Only the dedicated preparation endpoint accepts this report. It grants no\nauthority and cannot describe a replacement recipe or automatic fallback.",
+      "type": "object",
+      "properties": {
+        "audio_rate_reports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UpstreamAudioRateReport"
+          }
+        },
+        "binding": {
+          "type": "string"
+        },
+        "mse_decoding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MediaDecodingSupport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mse_supported": {
+          "type": "boolean"
+        },
+        "profile_id": {
+          "type": "string"
+        },
+        "profile_version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile_version",
+        "binding",
+        "profile_id",
+        "mse_supported"
       ]
     },
     "VideoCapabilityConfiguration": {

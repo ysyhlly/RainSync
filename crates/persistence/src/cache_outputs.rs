@@ -1,5 +1,5 @@
-//! Obsolete attempts are never current again. Keep their records and revisit
-//! them: a paused, fenced writer can recreate private files after a cleanup.
+//! Obsolete attempts are never current again, but fencing is not writer exit.
+//! Delete only after the attempt's owner positively acknowledged resource drain.
 use anyhow::Result;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -12,7 +12,8 @@ pub struct Cleanup {
 }
 
 pub async fn candidates(pool: &PgPool) -> Result<Vec<(Uuid, i64)>> {
-    let rows = sqlx::query("SELECT o.job_id,o.attempt FROM media_outputs o JOIN media_jobs j ON j.id=o.job_id LEFT JOIN cache_entries e ON e.id=o.job_id WHERE (e.id IS NULL OR e.state='ready') AND o.attempt>0 AND o.attempt<j.attempt AND o.status IN ('abandoned','failed') AND o.cleanup_after<=clock_timestamp() AND (o.cleanup_until IS NULL OR o.cleanup_until<=clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM cache_read_leases r WHERE r.cache_id=o.job_id AND (r.attempt IS NULL OR r.attempt=o.attempt) AND r.expires_at>clock_timestamp()) ORDER BY o.cleanup_after,o.job_id,o.attempt LIMIT 32")
+    let reaped = crate::cache_writers::reaped("o.job_id", "o.attempt", "o.owner_id");
+    let rows = sqlx::query(&format!("SELECT o.job_id,o.attempt FROM media_outputs o JOIN media_jobs j ON j.id=o.job_id LEFT JOIN cache_entries e ON e.id=o.job_id WHERE (e.id IS NULL OR e.state='ready') AND o.attempt>0 AND o.attempt<j.attempt AND o.status IN ('abandoned','failed') AND {reaped} AND o.cleanup_after<=clock_timestamp() AND (o.cleanup_until IS NULL OR o.cleanup_until<=clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM cache_read_leases r WHERE r.cache_id=o.job_id AND (r.attempt IS NULL OR r.attempt=o.attempt) AND r.expires_at>clock_timestamp()) ORDER BY o.cleanup_after,o.job_id,o.attempt LIMIT 32"))
         .fetch_all(pool).await?;
     Ok(rows
         .into_iter()
@@ -39,7 +40,8 @@ pub async fn claim(pool: &PgPool, job_id: Uuid, attempt: i64) -> Result<Option<C
     };
     // This entry lock also serializes read admission. Current-attempt readers
     // do not pin obsolete directories; unscoped legacy readers pin all of them.
-    let changed = sqlx::query("UPDATE media_outputs o SET cleanup_owner=$3,cleanup_until=clock_timestamp()+interval '30 seconds',cleanup_after=clock_timestamp()+interval '60 seconds' FROM media_jobs j WHERE o.job_id=$1 AND j.id=o.job_id AND o.attempt=$2 AND o.attempt>0 AND o.attempt<j.attempt AND o.status IN ('abandoned','failed') AND o.cleanup_after<=clock_timestamp() AND (o.cleanup_until IS NULL OR o.cleanup_until<=clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM cache_read_leases r WHERE r.cache_id=o.job_id AND (r.attempt IS NULL OR r.attempt=o.attempt) AND r.expires_at>clock_timestamp())")
+    let reaped = crate::cache_writers::reaped("o.job_id", "o.attempt", "o.owner_id");
+    let changed = sqlx::query(&format!("UPDATE media_outputs o SET cleanup_owner=$3,cleanup_until=clock_timestamp()+interval '30 seconds',cleanup_after=clock_timestamp()+interval '60 seconds' FROM media_jobs j WHERE o.job_id=$1 AND j.id=o.job_id AND o.attempt=$2 AND o.attempt>0 AND o.attempt<j.attempt AND o.status IN ('abandoned','failed') AND {reaped} AND o.cleanup_after<=clock_timestamp() AND (o.cleanup_until IS NULL OR o.cleanup_until<=clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM cache_read_leases r WHERE r.cache_id=o.job_id AND (r.attempt IS NULL OR r.attempt=o.attempt) AND r.expires_at>clock_timestamp())"))
         .bind(job_id).bind(attempt).bind(cleanup.owner).execute(&mut *tx).await?.rows_affected();
     tx.commit().await?;
     Ok((changed == 1).then_some(cleanup))

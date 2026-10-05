@@ -2,6 +2,7 @@ use super::*;
 
 // $1 is always the authenticated viewer, never an input user id.
 pub const SELECT: &str = "SELECT m.id,COALESCE(u.title,m.shared_title,m.title) AS title,m.title AS original_title,m.shared_title,m.shared_title_revision,u.title AS personal_title,COALESCE(u.revision,0) AS personal_title_revision,m.duration_ms,s.kind,p.status AS preview_status,p.result_revision AS preview_revision FROM media_items m JOIN sources s ON s.id=m.source_id LEFT JOIN media_user_titles u ON u.media_id=m.id AND u.user_id=$1 LEFT JOIN media_previews p ON p.media_id=m.id AND p.source_generation=m.preview_generation AND p.recipe_version=2 AND (s.kind IN ('local','agent') OR p.generated_at IS NULL OR p.generated_at>clock_timestamp()-interval '24 hours')";
+pub const BROWSE: &str = "m.available AND (s.kind<>'agent' OR EXISTS(SELECT 1 FROM agents a WHERE a.id=s.id AND NOT a.revoked)) AND library_media_allowed($1,m.id,'browse',NULL)";
 pub const VISIBLE: &str = "m.available AND (s.kind<>'agent' OR EXISTS(SELECT 1 FROM agents a WHERE a.id=s.id AND NOT a.revoked))";
 
 pub fn media(row: &sqlx::postgres::PgRow) -> Value {
@@ -22,7 +23,7 @@ pub fn private_json(value: Value) -> Response {
 }
 
 pub async fn read(app: &App, viewer: Uuid, id: Uuid) -> Result<Value> {
-    let row = sqlx::query(&format!("{SELECT} WHERE {VISIBLE} AND m.id=$2"))
+    let row = sqlx::query(&format!("{SELECT} WHERE {BROWSE} AND m.id=$2"))
         .bind(viewer)
         .bind(id)
         .fetch_optional(&app.db)
@@ -106,10 +107,16 @@ async fn change(app: App, h: HeaderMap, id: Uuid, body: Value, shared: bool) -> 
     let (title, revision) = validate(body)?;
     let mut tx = app.db.begin().await?;
     // Serialize first writes, source removal and existing updates on this media.
-    let exists = sqlx::query(&format!("SELECT m.id FROM media_items m JOIN sources s ON s.id=m.source_id WHERE {VISIBLE} AND m.id=$1 FOR UPDATE OF m"))
-        .bind(id).fetch_optional(&mut *tx).await?.is_some();
+    let exists = sqlx::query(&format!("SELECT m.id FROM media_items m JOIN sources s ON s.id=m.source_id WHERE {VISIBLE} AND m.id=$1 AND library_media_allowed($2,m.id,'browse',NULL) FOR UPDATE OF m"))
+        .bind(id).bind(user.id).fetch_optional(&mut *tx).await?.is_some();
     if !exists {
         return Err(err(StatusCode::NOT_FOUND, "media_not_found"));
+    }
+    if shared {
+        let manage: bool = sqlx::query_scalar("SELECT library_allowed($1,s.library_id,'manage') FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$2").bind(user.id).bind(id).fetch_one(&mut *tx).await?;
+        if !manage {
+            return Err(err(StatusCode::NOT_FOUND, "media_not_found"));
+        }
     }
     let changed = if shared {
         sqlx::query("UPDATE media_items SET shared_title=$2,shared_title_revision=shared_title_revision+1 WHERE id=$1 AND shared_title_revision=$3")

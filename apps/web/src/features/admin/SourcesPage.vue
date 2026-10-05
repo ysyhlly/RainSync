@@ -9,6 +9,7 @@ import AppIcon from "../../shared/ui/AppIcon.vue";
 import Notice from "../../shared/ui/Notice.vue";
 import ScanAllSources from "./ScanAllSources.vue";
 import { useSourceScans } from "./source-scans.store";
+import { parseHttpAssetAssociation } from "./http-asset-association";
 const scans = useSourceScans();
 const session = useSession(),
   { busy, error, message, run } = useAction();
@@ -21,7 +22,8 @@ const rows = ref<Source[]>([]),
   url = ref(""),
   userId = ref(""),
   token = ref(""),
-  headers = ref("{}");
+  headers = ref("{}"),
+  advancedAssets = ref("");
 let alive = true;
 async function load() {
   const value = await session.api<Source[]>("/sources");
@@ -47,11 +49,19 @@ async function create() {
       throw Error("请求头须为JSON对象，名称和值都须为字符串");
     }
   }
+  const association =
+    kind.value === "http"
+      ? parseHttpAssetAssociation(advancedAssets.value)
+      : undefined;
   const config =
     kind.value === "local"
       ? { root: root.value }
       : kind.value === "http"
-        ? { url: url.value, headers: parsed }
+        ? {
+            url: url.value,
+            headers: parsed,
+            ...(association ? { advanced_assets: association } : {}),
+          }
         : { url: url.value, user_id: userId.value, token: token.value };
   await session.api<{ id: string }>("/sources", "POST", {
     name: name.value,
@@ -61,6 +71,7 @@ async function create() {
   if (!alive) return;
   token.value = "";
   headers.value = "{}";
+  advancedAssets.value = "";
   open.value = false;
   name.value = "";
   await load();
@@ -70,6 +81,7 @@ watch(open, (value) => {
   if (!value) {
     token.value = "";
     headers.value = "{}";
+    advancedAssets.value = "";
   }
 });
 onMounted(() => run(load));
@@ -77,6 +89,7 @@ onBeforeUnmount(() => {
   alive = false;
   token.value = "";
   headers.value = "{}";
+  advancedAssets.value = "";
 });
 </script>
 <template>
@@ -161,6 +174,15 @@ onBeforeUnmount(() => {
             v-model="headers"
             spellcheck="false"
           /></label
+        ><label v-if="kind === 'http'"
+          >外部字幕/字体关联 JSON（可选）<textarea
+            v-model="advancedAssets"
+            spellcheck="false"
+            maxlength="32768"
+            placeholder='{"schema_version":1,"subtitles":["ass"],"fonts":["body.ttf"]}'
+          /><span class="helper"
+            >关联同名 ASS、SSA、SUP 和同名 .fonts 目录内的指定字体文件</span
+          ></label
         ><Notice :message="error" error /><button
           class="primary"
           :disabled="busy"

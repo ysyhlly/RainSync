@@ -15,6 +15,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 media-core.workspace = true
+protocol.workspace = true
 persistence.workspace = true
 providers.workspace = true
 http-api.workspace = true
@@ -25,3 +26,7 @@ base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
 fs2 = "0.4"
+httpdate = "1"
+
+[dev-dependencies]
+protocol = { path = "../../crates/protocol" }

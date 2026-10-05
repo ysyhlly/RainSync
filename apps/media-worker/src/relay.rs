@@ -74,7 +74,29 @@ pub async fn fetch(
             .replace("https://", "wss://")
             .replace("http://", "ws://")
     );
-    let request = json!({"data_url":data_url,"resource":resource["resource"],"source_version":source_version,"range":h.get(header::RANGE).and_then(|v|v.to_str().ok()),"head":head,"drain_receipt_required":session_id.is_some()});
+    let mut request = json!({"data_url":data_url,"resource":resource["resource"],"source_version":source_version,"range":file_delivery::range_request(h, head).header_value(),"head":head,"drain_receipt_required":session_id.is_some()});
+    if resource["advanced_asset_catalog"] == true {
+        request["advanced_asset_catalog"] = json!(true);
+    }
+    if let Some(catalog) = resource.get("bound_asset_catalog") {
+        let catalog: media_core::advanced_media::AssetCatalog =
+            serde_json::from_value(catalog.clone()).map_err(failure)?;
+        catalog
+            .validate(&catalog.source_resource, &catalog.source_version)
+            .map_err(failure)?;
+        let asset = catalog
+            .subtitles
+            .iter()
+            .map(|s| &s.file)
+            .chain(catalog.fonts.iter())
+            .find(|f| {
+                resource["resource"].as_str() == Some(f.resource.as_str())
+                    && resource["source_version"].as_str() == Some(f.source_version.as_str())
+            })
+            .ok_or_else(|| failure("advanced_asset_association_required"))?;
+        let _ = asset;
+        request["bound_asset_catalog"] = serde_json::to_value(catalog).map_err(failure)?;
+    }
     let (cancel, cancelled) = oneshot::channel();
     let registration = Registration {
         id,

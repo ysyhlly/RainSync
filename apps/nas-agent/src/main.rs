@@ -1,6 +1,10 @@
 mod drain;
+mod receipt_mode;
+mod uplink_metrics;
+mod uplink_reporter;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use media_core::runtime_metrics::{NasUplinkMetrics, Outcome};
 use serde_json::{Value, json};
 use std::io::{Read, Seek};
 use std::{
@@ -88,10 +92,47 @@ where
     }
 }
 
+fn associated_asset_source(
+    root: &std::path::Path,
+    request: &Value,
+) -> Result<Option<Arc<media_core::advanced_media::OwnedLocalInput>>> {
+    let Some(value) = request.get("bound_asset_catalog") else {
+        return Ok(None);
+    };
+    let catalog: media_core::advanced_media::AssetCatalog = serde_json::from_value(value.clone())?;
+    let resource = request["resource"].as_str().context("resource")?;
+    let expected = request["source_version"]
+        .as_str()
+        .context("source_version")?;
+    catalog.validate(&catalog.source_resource, &catalog.source_version)?;
+    anyhow::ensure!(
+        catalog.schema_version == 1,
+        "advanced_asset_association_required"
+    );
+    anyhow::ensure!(
+        catalog
+            .subtitles
+            .iter()
+            .map(|s| &s.file)
+            .chain(catalog.fonts.iter())
+            .any(|f| f.resource == resource && f.source_version == expected),
+        "advanced_asset_association_required"
+    );
+    catalog.verify_files(root)?;
+    Ok(Some(Arc::new(
+        media_core::advanced_media::OwnedLocalInput::open(
+            root,
+            &catalog.source_resource,
+            &catalog.source_version,
+        )?,
+    )))
+}
+
 async fn transfer(
     root: PathBuf,
     request: Value,
     mut cancel: tokio::sync::watch::Receiver<bool>,
+    metrics: Option<NasUplinkMetrics>,
 ) -> Result<()> {
     let url = request["data_url"].as_str().context("data_url")?;
     let (socket, _) = tokio::select! {
@@ -103,6 +144,7 @@ async fn transfer(
     let (liveness, mut signals) = tokio::sync::watch::channel(tokio::time::Instant::now());
     let mut headers_started = false;
     let operations = drain::FileOps::default();
+    let mut measurement = uplink_metrics::BodyMeasurement::default();
     let work = async {
         if request["busy"].as_bool().unwrap_or(false) {
             headers_started = true;
@@ -117,6 +159,45 @@ async fn transfer(
             .await??;
             return Ok(());
         }
+        if request["advanced_asset_catalog"] == true {
+            let resource = request["resource"].as_str().context("resource")?.to_owned();
+            let version = request["source_version"]
+                .as_str()
+                .context("source_version")?
+                .to_owned();
+            let root = root.clone();
+            let version_reply = version.clone();
+            let bytes = operations
+                .run(move || -> Result<Vec<u8>> {
+                    let source = media_core::advanced_media::OwnedLocalInput::open(
+                        &root, &resource, &version,
+                    )?;
+                    let catalog = media_core::advanced_media::AssetCatalog::discover(
+                        &root, &resource, &version,
+                    )?;
+                    catalog.verify_files(&root)?;
+                    source.verify()?;
+                    let bytes = serde_json::to_vec(&catalog)?;
+                    anyhow::ensure!(bytes.len() <= 65536, "advanced_asset_bound");
+                    Ok(bytes)
+                })
+                .await?;
+            headers_started = true;
+            tokio::time::timeout(std::time::Duration::from_secs(3),writer.send(Message::Text(json!({"status":200,"content-length":bytes.len().to_string(),"content-type":"application/json","source_version":version_reply}).to_string().into()))).await??;
+            if !request["head"].as_bool().unwrap_or(false) {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    writer.send(Message::Binary(bytes.into())),
+                )
+                .await??;
+            }
+            return Ok(());
+        }
+        let asset_root = root.clone();
+        let asset_request = request.clone();
+        let associated_source = operations
+            .run(move || associated_asset_source(&asset_root, &asset_request))
+            .await?;
         let resource = request["resource"].as_str().context("resource")?.to_owned();
         let expected = request["source_version"].as_str().map(str::to_owned);
         let (path, file, snapshot) = operations
@@ -131,9 +212,18 @@ async fn transfer(
             })
             .await?;
         let size = snapshot.len;
-        let range = match media_core::byte_range(request["range"].as_str(), size) {
-            Ok(value) => value,
-            Err(_) => {
+        // Also normalize at the file owner for older Workers. HEAD always
+        // describes the complete representation; malformed/multi-range input
+        // is ignored, while a valid range selecting no bytes remains 416.
+        let range_request = if request["head"].as_bool().unwrap_or(false) {
+            media_core::http_range::Request::default()
+        } else {
+            media_core::http_range::Request::parse(request["range"].as_str())
+        };
+        let range = match range_request.resolve(size) {
+            media_core::http_range::Selection::Full => None,
+            media_core::http_range::Selection::Partial(start, end) => Some((start, end)),
+            media_core::http_range::Selection::Unsatisfiable => {
                 headers_started = true;
                 tokio::time::timeout(std::time::Duration::from_secs(30), writer.send(Message::Text(json!({"status":416,"content-range":format!("bytes */{size}"),"content-length":"0"}).to_string().into()))).await??;
                 return Ok(());
@@ -152,6 +242,7 @@ async fn transfer(
         )
         .await??;
         if !request["head"].as_bool().unwrap_or(false) {
+            measurement = uplink_metrics::BodyMeasurement::begin(metrics.as_ref(), len);
             let seek_file = file.clone();
             operations
                 .run(move || Ok((&*seek_file).seek(std::io::SeekFrom::Start(start))?))
@@ -161,10 +252,14 @@ async fn transfer(
                 let wanted = remaining.min(65536) as usize;
                 let read_file = file.clone();
                 let version = snapshot.version.clone();
+                let associated_source = associated_source.clone();
                 let buf = operations
                     .run(move || -> Result<Vec<u8>> {
                         if media_core::file_version::snapshot_file(&read_file)?.version != version {
                             return Err(SourceChanged.into());
+                        }
+                        if let Some(source) = &associated_source {
+                            source.verify()?;
                         }
                         let mut bytes = vec![0; wanted];
                         let n = (&*read_file).read(&mut bytes)?;
@@ -174,46 +269,59 @@ async fn transfer(
                         {
                             return Err(SourceChanged.into());
                         }
+                        if let Some(source) = &associated_source {
+                            source.verify()?;
+                        }
                         bytes.truncate(n);
                         Ok(bytes)
                     })
                     .await?;
                 let n = buf.len();
-                send_with_backpressure_health(
-                    writer.send(Message::Binary(buf.into())),
-                    &mut signals,
-                )
-                .await?;
+                measurement
+                    .send_frame(
+                        n,
+                        send_with_backpressure_health(
+                            writer.send(Message::Binary(buf.into())),
+                            &mut signals,
+                        ),
+                    )
+                    .await?;
                 remaining -= n as u64;
             }
         }
-        Ok(())
+        Ok::<(), anyhow::Error>(())
     };
     // Poll the peer while file I/O or a backpressured write is pending. Merely
     // sending frames does not observe a Close promptly on every socket state.
-    let result: Result<()> = tokio::select! {
+    let (result, outcome): (Result<()>, Outcome) = tokio::select! {
         biased;
-        _ = drain::cancelled(&mut cancel) => Ok(()),
-        result = work => result,
-        _ = async {
-            while let Some(Ok(message)) = reader.next().await {
-                match message {
-                    Message::Ping(payload) => {
+        _ = drain::cancelled(&mut cancel) => (Ok(()), Outcome::Cancelled),
+        result = work => {
+            let outcome = if result.is_err() { Outcome::Failed } else { Outcome::Complete };
+            (result, outcome)
+        },
+        outcome = async {
+            loop {
+                match reader.next().await {
+                    Some(Ok(Message::Ping(payload))) => {
                         if payload.as_ref() == BACKPRESSURE_HEARTBEAT {
                             liveness.send_replace(tokio::time::Instant::now());
                         }
                     }
-                    Message::Pong(_) => {},
-                    _ => break,
+                    Some(Ok(Message::Pong(_))) => {},
+                    Some(Err(_)) => return Outcome::Failed,
+                    _ => return Outcome::Cancelled,
                 }
             }
-        } => Ok(()),
+        } => (Ok(()), outcome),
     };
+    // End byte observation independently, before socket/file disposal is proved.
+    measurement.finish(outcome);
     if result.is_err() && !headers_started {
         let changed = result
             .as_ref()
             .err()
-            .is_some_and(|e| e.is::<SourceChanged>());
+            .is_some_and(|e| e.is::<SourceChanged>() || e.to_string() == "source_changed");
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             writer.send(Message::Text(
@@ -382,49 +490,99 @@ async fn retry_or_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) ->
 }
 
 async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
-    let server = std::env::var("SERVER_URL")?;
-    let root = PathBuf::from(std::env::var("MEDIA_ROOT")?).canonicalize()?;
+    let deployment = media_core::deployment_config::Settings::from_env(
+        media_core::deployment_config::Role::Agent,
+    )?;
+    let server = deployment.public_origin;
+    let configured_root = PathBuf::from(std::env::var("MEDIA_ROOT")?);
     let credential = PathBuf::from(
         std::env::var("AGENT_CREDENTIAL_FILE").unwrap_or("agent-credentials.json".into()),
     );
-    let token = tokio::select! {
+    // Durable receipts and unchanged existing credentials do not depend on the
+    // media mount. Pairing is allowed only after a valid root has been observed.
+    let (mut token, mut receipts) = tokio::select! {
         biased;
         _ = drain::cancelled(&mut shutdown) => return Ok(()),
-        token = async {
-    let token = if let Ok(token) = std::env::var("AGENT_TOKEN") {
-        token
-    } else if credential.is_file() {
-        serde_json::from_slice::<Value>(&tokio::fs::read(&credential).await?)?["token"]
-            .as_str()
-            .context("token")?
-            .to_string()
-    } else {
-        let code = std::env::var("PAIR_CODE")?;
-        let v: Value = reqwest::Client::new()
-            .post(format!("{server}/api/v1/agents/pair"))
-            .json(&json!({"code":code}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        tokio::fs::write(&credential, serde_json::to_vec(&v)?).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).await?;
-        }
-        v["token"].as_str().context("pair token")?.to_string()
+        loaded = async {
+            let receipts = drain::Receipts::load(&credential).await?;
+            let token = receipt_mode::existing_token(&credential).await?;
+            Ok::<_, anyhow::Error>((token, receipts))
+        } => loaded?,
     };
-            Ok::<_, anyhow::Error>(token)
-        } => token?,
-    };
-    let mut receipts = drain::Receipts::load(&credential).await?;
+    let mut root_check = receipt_mode::RootCheck::default();
     let slots = Arc::new(Semaphore::new(16));
     let rejections = Arc::new(Semaphore::new(4));
     let scans = Arc::new(Semaphore::new(1));
     let index_interval = std::time::Duration::from_secs(index_interval_seconds()?);
+    let uplink = NasUplinkMetrics::default();
     loop {
+        let Some(root) = root_check
+            .validated(&configured_root, &mut shutdown)
+            .await?
+        else {
+            if *shutdown.borrow() {
+                break;
+            }
+            if let Some(token) = token.as_deref()
+                && receipt_mode::replay(
+                    &server,
+                    token,
+                    &mut receipts,
+                    &mut root_check,
+                    &configured_root,
+                    &mut shutdown,
+                )
+                .await
+                .is_err()
+            {
+                tracing::warn!("receipt-only control ended; durable receipts retained for retry");
+            }
+            // No existing token means no receipt connection, pairing, or write
+            // of credentials while the media root is unavailable.
+            if retry_or_shutdown(&mut shutdown).await {
+                break;
+            }
+            continue;
+        };
+        if token.is_none() {
+            // A restored mount may also make an existing credential/journal
+            // visible. Re-read them before considering the original pairing
+            // flow, so recovery never overwrites newly available credentials.
+            let restored = tokio::select! {
+                biased;
+                _ = drain::cancelled(&mut shutdown) => break,
+                restored = receipt_mode::existing_token(&credential) => restored?,
+            };
+            if let Some(restored) = restored {
+                receipts = drain::Receipts::load(&credential).await?;
+                token = Some(restored);
+            }
+        }
+        if token.is_none() {
+            token = Some(tokio::select! {
+                    biased;
+                    _ = drain::cancelled(&mut shutdown) => break,
+                    token = async {
+            let code = std::env::var("PAIR_CODE")?;
+            let v: Value = reqwest::Client::new()
+                .post(format!("{server}/api/v1/agents/pair"))
+                .json(&json!({"code":code}))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            tokio::fs::write(&credential, serde_json::to_vec(&v)?).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).await?;
+            }
+                        Ok::<_, anyhow::Error>(v["token"].as_str().context("pair token")?.to_string())
+                    } => token?,
+                });
+        }
+        let token = token.as_deref().unwrap();
         let url = format!(
             "{}/api/v1/agents/ws",
             server
@@ -440,8 +598,14 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
             result = tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(req)) => result,
         };
         if let Ok(Ok((mut socket, _))) = connection {
-            if send_control(&mut socket, json!({"type":"HELLO","manual_scan":true,"source_versions":true,"drain_receipts":true}), &shutdown).await.is_err() {
-                if retry_or_shutdown(&mut shutdown).await { break; }
+            let mut reporter = uplink_reporter::Reporter::new(uplink.snapshot());
+            if send_control(&mut socket, reporter.hello(), &shutdown)
+                .await
+                .is_err()
+            {
+                if retry_or_shutdown(&mut shutdown).await {
+                    break;
+                }
                 continue;
             }
             let mut transfers = tokio::task::JoinSet::new();
@@ -484,9 +648,13 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
                         }
                         if receipt_failed { break; }
                         if scan.as_ref().is_some_and(|s| s.awaiting_ack && s.sent_at.elapsed().as_secs() > 60) { break }
-                        if send_control(&mut socket, json!({"type":"HEARTBEAT"}), &shutdown).await.is_err() { break }
+                        if send_control(&mut socket, reporter.heartbeat(uplink.snapshot()), &shutdown).await.is_err() { break }
                     }
                     message=socket.next()=>{let text = match message { Some(Ok(Message::Text(text))) => text, Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue, _ => break };let Ok(v)=serde_json::from_str::<Value>(&text)else{continue};
+                        if v["type"] == "NAS_METRICS_READY" {
+                            reporter.ready(&text);
+                            continue;
+                        }
                         if v["type"] == "TRANSFER_DRAINED_ACK" && (v["accepted"] == true || v["rejected_permanently"] == true) {
                             if let Some(id)=v["id"].as_str().and_then(|id|uuid::Uuid::parse_str(id).ok()) && receipts.acknowledged(id).await.is_err() { tracing::warn!("drain receipt acknowledgement persistence failed"); }
                             continue;
@@ -526,7 +694,7 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
                         }
                         // Data ingress shares the configured service origin; localhost in server configuration is not the NAS host.
                         if let Some(value)=request["data_url"].as_str() {
-                            let Ok(mut url)=reqwest::Url::parse(&std::env::var("AGENT_DATA_ORIGIN").unwrap_or_else(|_|server.clone())) else { if let Some(id)=receipt { let _=receipts.add(id).await; } continue };
+                            let Ok(mut url)=reqwest::Url::parse(&deployment.agent_data_origin) else { if let Some(id)=receipt { let _=receipts.add(id).await; } continue };
                             let Ok(data)=reqwest::Url::parse(value) else { if let Some(id)=receipt { let _=receipts.add(id).await; } continue };
                             url.set_path(data.path());url.set_query(data.query());
                             let scheme=if url.scheme()=="https" {"wss"} else {"ws"};
@@ -542,9 +710,10 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
                             }; request["busy"] = json!(true); permit }
                         };
                         let cancel=cancelled_transfers.clone();
+                        let metrics=reporter.is_ready().then(||uplink.clone());
                         transfers.spawn(async move {
                             let _permit=permit;
-                            let result=transfer(root,request,cancel).await;
+                            let result=transfer(root,request,cancel,metrics).await;
                             let confirmed=!result.as_ref().is_err_and(|error|error.is::<drain::DrainUnconfirmed>());
                             if result.is_err(){tracing::warn!("transfer ended with error")}
                             receipt.filter(|_|confirmed)
@@ -641,5 +810,44 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
         let (sender, _) = tokio::sync::mpsc::channel(1);
         assert!(index(&root, &sender, &AtomicBool::new(false)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod remote_asset_tests {
+    use super::*;
+    #[test]
+    fn nas_assets_hold_original_source_and_cannot_borrow_files() {
+        let root =
+            std::env::temp_dir().join(format!("rainsync-nas-assets-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.mkv"), b"original source").unwrap();
+        std::fs::write(
+            root.join("a.ass"),
+            b"[Script Info]\n[Events]\nFormat: Layer, Text\n",
+        )
+        .unwrap();
+        let version = media_core::file_version::snapshot_file(
+            &std::fs::File::open(root.join("a.mkv")).unwrap(),
+        )
+        .unwrap()
+        .version;
+        let catalog =
+            media_core::advanced_media::AssetCatalog::discover(&root, "a.mkv", &version).unwrap();
+        let file = &catalog.subtitles[0].file;
+        let request = json!({"resource":file.resource,"source_version":file.source_version,"bound_asset_catalog":catalog});
+        let held = associated_asset_source(&root, &request).unwrap().unwrap();
+        held.verify().unwrap();
+        let mut borrowed = request.clone();
+        borrowed["resource"] = json!("b.ass");
+        assert!(associated_asset_source(&root, &borrowed).is_err());
+        let mut unversioned = request.clone();
+        unversioned["source_version"] = Value::Null;
+        assert!(associated_asset_source(&root, &unversioned).is_err());
+        std::fs::write(root.join("a.mkv"), b"changed original").unwrap();
+        assert!(held.verify().is_err());
+        assert!(associated_asset_source(&root, &request).is_err());
+        drop(held);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

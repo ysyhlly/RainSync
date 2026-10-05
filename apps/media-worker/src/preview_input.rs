@@ -10,7 +10,110 @@ use std::{
     },
 };
 use tokio::sync::watch;
-type HttpValidators = (Option<String>, Option<String>);
+#[path = "hls_manifest.rs"]
+pub(crate) mod hls_manifest;
+#[path = "http_delivery.rs"]
+pub(crate) mod http_delivery;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HttpValidators {
+    etag: Option<String>,
+    modified: Option<String>,
+    size: Option<u64>,
+}
+impl HttpValidators {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        let text = |name| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let size = if headers.contains_key(header::CONTENT_RANGE) {
+            headers
+                .get(header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| http_delivery::ContentRange::parse(v).ok())
+                .and_then(|v| v.total())
+        } else {
+            headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok())
+        };
+        Self {
+            etag: text(header::ETAG),
+            modified: text(header::LAST_MODIFIED),
+            size,
+        }
+    }
+    fn strong_etag(&self) -> Option<&str> {
+        self.etag.as_deref().filter(|v| {
+            v.starts_with('"')
+                && v.ends_with('"')
+                && v.len() >= 2
+                && !v[1..v.len() - 1]
+                    .bytes()
+                    .any(|v| v == b'"' || v.is_ascii_control())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct Target {
+    url: String,
+    depth: u8,
+    kind: Option<hls_manifest::Kind>,
+    final_target_sha256: Option<String>,
+}
+#[derive(Default)]
+struct Targets {
+    by_key: HashMap<Uuid, Target>,
+    by_url: HashMap<(String, u8), Uuid>,
+}
+impl Targets {
+    fn insert(&mut self, url: String, depth: u8) -> anyhow::Result<Uuid> {
+        self.insert_kind(url, depth, None)
+    }
+    fn insert_kind(
+        &mut self,
+        url: String,
+        depth: u8,
+        kind: Option<hls_manifest::Kind>,
+    ) -> anyhow::Result<Uuid> {
+        if let Some(key) = self.by_url.get(&(url.clone(), depth)) {
+            let existing = self.by_key.get_mut(key).expect("registered target");
+            // Only exclusively cryptographic key inputs may bypass demuxer
+            // sniffing. Reusing a key grant for a segment (or vice versa) would
+            // expose unclassified upstream bytes to the decoder.
+            anyhow::ensure!(
+                (existing.kind == Some(hls_manifest::Kind::Key))
+                    == (kind == Some(hls_manifest::Kind::Key)),
+                "manifest_key_resource_conflict"
+            );
+            if kind == Some(hls_manifest::Kind::Playlist) || existing.kind.is_none() {
+                existing.kind = kind;
+            }
+            return Ok(*key);
+        }
+        anyhow::ensure!(
+            self.by_key.len() < hls_manifest::MAX_REFERENCES,
+            "manifest_resource_limit"
+        );
+        let key = Uuid::new_v4();
+        self.by_url.insert((url.clone(), depth), key);
+        self.by_key.insert(
+            key,
+            Target {
+                url,
+                depth,
+                kind,
+                final_target_sha256: None,
+            },
+        );
+        Ok(key)
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct Registry(Arc<Mutex<HashMap<Uuid, Arc<Grant>>>>);
@@ -20,7 +123,7 @@ pub struct Grant {
     pub cancel: watch::Sender<bool>,
     input_failure: input_failure::Observation,
     remaining: AtomicU64,
-    targets: Mutex<HashMap<Uuid, String>>,
+    targets: Mutex<Targets>,
     validators: Mutex<HashMap<String, HttpValidators>>,
 }
 /// Owned by the leased attempt, independently of retained proxy bodies.
@@ -53,13 +156,20 @@ impl Grant {
         self.input_failure.stop();
     }
     pub fn target(&self, url: String) -> Uuid {
-        let key = Uuid::new_v4();
-        self.targets.lock().unwrap().insert(key, url);
-        key
+        // Root targets are the bounded, provider-generated video/poster list.
+        // A failed registration yields an unregistered key, never a URL bypass.
+        self.targets
+            .lock()
+            .unwrap()
+            .insert(url, 0)
+            .unwrap_or_else(|_| {
+                self.stop();
+                Uuid::new_v4()
+            })
     }
     fn charge(&self, n: usize) -> std::io::Result<()> {
         self.remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(n as u64)
             })
             .map(|_| ())
@@ -139,6 +249,7 @@ pub async fn read(
         .targets
         .lock()
         .unwrap()
+        .by_key
         .get(&key)
         .cloned()
         .ok_or_else(unauthorized)?;
@@ -168,7 +279,7 @@ pub async fn read(
         "agent" => {
             relay::fetch(&app, resource, &h, head, grant.input_failure.clone(), None).await?
         }
-        _ => return remote(&app, grant, target, &h, head).await,
+        _ => return remote(&app.client, grant, target, &h, head).await,
     };
     Ok(bounded(response, grant, head))
 }
@@ -197,32 +308,31 @@ fn bounded(response: Response, grant: Arc<Grant>, head: bool) -> Response {
     Response::from_parts(parts, Body::from_stream(stream))
 }
 async fn remote(
-    app: &App,
+    _client: &reqwest::Client,
     grant: Arc<Grant>,
-    target: String,
+    registration: Target,
     h: &HeaderMap,
     head: bool,
 ) -> Result<Response> {
-    let original =
-        providers::validate_url(grant.resource["url"].as_str().unwrap_or("")).map_err(failure)?;
-    let target = providers::validate_url(&target).map_err(failure)?;
-    if target.origin() != original.origin() {
-        return Err((StatusCode::FORBIDDEN, "cross_origin_media_rejected".into()));
-    }
-    let mut req = if head {
-        app.client.head(target.clone())
-    } else {
-        app.client.get(target.clone())
+    let target = providers::validate_url(&registration.url).map_err(failure)?;
+    let config = providers::resource_config(&grant.resource).map_err(failure)?;
+    let access =
+        providers::access_policy::SourceAccess::new(&config.url, config.access_policy.as_ref())
+            .map_err(failure)?;
+    access
+        .authorize_url(target.as_str())
+        .map_err(|_| (StatusCode::FORBIDDEN, "cross_origin_media_rejected".into()))?;
+    let mut cancel = grant.cancel.subscribe();
+    let mut req = tokio::select! {biased;
+        _=cancel.changed()=>return Err((StatusCode::UNAUTHORIZED,"invalid_resource".into())),
+        result=providers::source_media_request(&config,target.as_str(),if head {reqwest::Method::HEAD}else{reqwest::Method::GET},&config.headers)=>result.map_err(failure)?,
     };
-    if let Some(headers) = grant.resource["headers"].as_object() {
-        for (k, v) in headers {
-            if let Some(v) = v.as_str() {
-                req = req.header(k, v)
+    if !head {
+        for name in [header::RANGE, header::IF_RANGE] {
+            if let Some(value) = h.get(&name) {
+                req = req.header(name, value)
             }
         }
-    }
-    if let Some(range) = h.get(header::RANGE) {
-        req = req.header(header::RANGE, range)
     }
     let previous = grant
         .validators
@@ -230,47 +340,218 @@ async fn remote(
         .unwrap()
         .get(target.as_str())
         .cloned();
-    if let Some((etag, modified)) = &previous {
-        if let Some(etag) = etag {
-            req = req.header(header::IF_MATCH, etag)
-        } else if let Some(modified) = modified {
-            req = req.header(header::IF_UNMODIFIED_SINCE, modified)
-        }
-    }
-    let response = req.send().await.map_err(failure)?;
-    if !response.status().is_success() {
-        return Err((StatusCode::BAD_GATEWAY, "upstream_media_error".into()));
-    }
-    let validator = (
-        response
-            .headers()
-            .get(header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned),
-        response
-            .headers()
-            .get(header::LAST_MODIFIED)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned),
-    );
+    if let Some(previous) = &previous
+        && let Some(etag) = previous.strong_etag()
     {
-        let mut validators = grant.validators.lock().unwrap();
-        if validators
-            .get(target.as_str())
-            .is_some_and(|v| v != &validator)
+        req = req.header(header::IF_MATCH, etag)
+    }
+    let mut cancel = grant.cancel.subscribe();
+    if *cancel.borrow() {
+        return Err((StatusCode::UNAUTHORIZED, "invalid_resource".into()));
+    }
+    let response = tokio::select! {biased;
+        _ = cancel.changed() => return Err((StatusCode::UNAUTHORIZED, "invalid_resource".into())),
+        response = req.send() => response.map_err(failure)?,
+    };
+    // Bind the exact final destination before comparing validators or exposing
+    // any bytes. Equal ETags on different URLs do not prove equal resources.
+    // This also bounds mutable playlist redirects; signed query changes require
+    // a new attempt rather than guessing which parameters are authentication.
+    if response.status().is_success() || response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        let digest = hash(response.url().as_str());
+        let mut targets = grant.targets.lock().unwrap();
+        let key = targets
+            .by_url
+            .get(&(registration.url.clone(), registration.depth))
+            .copied()
+            .ok_or_else(|| failure("invalid_resource"))?;
+        let registered = targets
+            .by_key
+            .get_mut(&key)
+            .ok_or_else(|| failure("invalid_resource"))?;
+        if registered
+            .final_target_sha256
+            .as_ref()
+            .is_some_and(|old| old != &digest)
         {
+            grant.stop();
             return Err((StatusCode::CONFLICT, "source_changed".into()));
         }
-        validators.insert(target.to_string(), validator);
+        registered.final_target_sha256 = Some(digest);
     }
-    let playlist = target.path().ends_with(".m3u8")
+    if response.status() == StatusCode::PRECONDITION_FAILED {
+        grant.stop();
+        return Err((StatusCode::CONFLICT, "source_changed".into()));
+    }
+    if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        let range = http_delivery::validate_range_response(response.status(), response.headers())
+            .map_err(failure)?;
+        if previous
+            .as_ref()
+            .and_then(|v| v.size)
+            .zip(range.and_then(|v| v.total()))
+            .is_some_and(|(old, new)| old != new)
+        {
+            grant.stop();
+            return Err((StatusCode::CONFLICT, "source_changed".into()));
+        }
+        let mut result = Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_LENGTH, 0)
+            .header(header::CACHE_CONTROL, "private, no-store");
+        for name in [header::CONTENT_RANGE, header::ACCEPT_RANGES] {
+            if let Some(value) = response.headers().get(&name) {
+                result = result.header(name, value);
+            }
+        }
+        return result.body(Body::empty()).map_err(failure);
+    }
+    if !response.status().is_success() {
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            grant.stop();
+        }
+        return Err((StatusCode::BAD_GATEWAY, "upstream_media_error".into()));
+    }
+    http_delivery::validate_range_response(response.status(), response.headers())
+        .map_err(failure)?;
+    let final_target = response.url().clone();
+    let response_status = response.status();
+    let response_headers = response.headers().clone();
+    let mut playlist = registration.kind == Some(hls_manifest::Kind::Playlist)
+        || final_target.path().ends_with(".m3u8")
         || response
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains("mpegurl"));
+            .is_some_and(|v| v.to_ascii_lowercase().contains("mpegurl"));
+    let key_input = registration.kind == Some(hls_manifest::Kind::Key);
+    // Only AES-128 is accepted by the manifest parser. A key must never
+    // become a manifest or forward an unbounded, unclassified body.
+    if key_input
+        && (playlist
+            || response_headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some_and(|length| length != 16))
+    {
+        return Err(failure("invalid_aes128_key"));
+    }
+    let mut source = response.bytes_stream();
+    let mut prefix = Vec::new();
+    let mut buffered = Vec::new();
+    if !head && key_input {
+        let mut bytes = Vec::with_capacity(16);
+        loop {
+            let next = tokio::select! {biased;
+                _ = cancel.changed() => return Err((StatusCode::UNAUTHORIZED, "invalid_resource".into())),
+                next = source.next() => next,
+            };
+            let Some(chunk) = next else { break };
+            let chunk = chunk.map_err(failure)?;
+            if chunk.len() > 16 - bytes.len() {
+                return Err(failure("invalid_aes128_key"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() != 16 {
+            return Err(failure("invalid_aes128_key"));
+        }
+        // Wait for EOF before publishing even the first byte. The usual
+        // bounded response below still charges these bytes exactly once and
+        // stops retained bodies when the attempt ends.
+        buffered.push(axum::body::Bytes::from(bytes));
+    } else if !head {
+        while prefix.len() < http_delivery::SNIFF_BYTES {
+            let next = tokio::select! {biased;
+                _ = cancel.changed() => return Err((StatusCode::UNAUTHORIZED, "invalid_resource".into())),
+                next = source.next() => next,
+            };
+            let Some(chunk) = next else { break };
+            let chunk = chunk.map_err(failure)?;
+            prefix.extend_from_slice(
+                &chunk[..chunk.len().min(http_delivery::SNIFF_BYTES - prefix.len())],
+            );
+            buffered.push(chunk);
+        }
+        playlist |= http_delivery::hls_prefix(&prefix).map_err(failure)?;
+    }
+    let stream = futures_util::stream::iter(buffered.into_iter().map(Ok)).chain(source);
+    {
+        let mut targets = grant.targets.lock().unwrap();
+        let registered_key = targets
+            .by_url
+            .get(&(registration.url.clone(), registration.depth))
+            .copied();
+        let current_kind = registered_key
+            .and_then(|key| targets.by_key.get(&key))
+            .and_then(|v| v.kind);
+        let mut validators = grant.validators.lock().unwrap();
+        if head && current_kind == Some(hls_manifest::Kind::Playlist) {
+            playlist = true;
+        }
+        if playlist {
+            // Every stored validator belongs to a body classified as binary. An
+            // upstream switch to HLS is a representation change, even if it ignores
+            // If-Match or reuses its ETag; do not silently upgrade that prior body.
+            if previous.is_some() || validators.contains_key(target.as_str()) {
+                grant.stop();
+                return Err((StatusCode::CONFLICT, "source_changed".into()));
+            }
+            if let Some(key) = registered_key {
+                targets
+                    .by_key
+                    .get_mut(&key)
+                    .expect("registered target")
+                    .kind = Some(hls_manifest::Kind::Playlist);
+            }
+            validators.remove(target.as_str());
+        } else if current_kind == Some(hls_manifest::Kind::Playlist) {
+            grant.stop();
+            return Err((StatusCode::CONFLICT, "source_changed".into()));
+        } else if !head || previous.is_some() {
+            // An unknown HEAD has no body evidence: it could describe a mutable,
+            // extensionless playlist. Compare already-bound binary bodies only.
+            let validator = HttpValidators::from_headers(&response_headers);
+            if validators
+                .get(target.as_str())
+                .is_some_and(|v| v != &validator)
+            {
+                grant.stop();
+                return Err((StatusCode::CONFLICT, "source_changed".into()));
+            }
+            validators.insert(target.to_string(), validator);
+        }
+    }
+    if playlist && head {
+        // The upstream length/ETag describe its original playlist, not the
+        // representation whose URIs we rewrite. HEAD may omit fields that can
+        // only be determined by generating the GET body (RFC 9110 9.3.2).
+        return Ok((
+            [
+                (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+                (header::CACHE_CONTROL, "private, no-store"),
+            ],
+            Body::empty(),
+        )
+            .into_response());
+    }
     if playlist && !head {
-        let mut stream = response.bytes_stream();
+        if registration.depth >= hls_manifest::MAX_DEPTH {
+            return Err(failure("manifest_depth_limit"));
+        }
+        if response_headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|v| v > hls_manifest::MAX_BYTES as u64)
+        {
+            return Err(failure("manifest_limit"));
+        }
+        let mut stream = stream;
         let mut bytes = vec![];
         let mut cancel = grant.cancel.subscribe();
         loop {
@@ -278,66 +559,81 @@ async fn remote(
             let Some(chunk) = chunk else { break };
             let chunk = chunk.map_err(failure)?;
             grant.charge(chunk.len()).map_err(failure)?;
-            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+            if bytes.len() + chunk.len() > hls_manifest::MAX_BYTES {
                 return Err(failure("manifest_limit"));
             }
             bytes.extend_from_slice(&chunk);
         }
         let text = String::from_utf8(bytes).map_err(failure)?;
-        let mut invalid = false;
-        let rewritten = rewrite_manifest(&text, |child| {
-            let joined = target.join(child).ok().filter(|v| {
-                v.origin() == original.origin()
-                    && matches!(v.scheme(), "http" | "https")
-                    && v.username().is_empty()
-                    && v.password().is_none()
-            });
-            match joined {
-                Some(v) => {
-                    let key = grant.target(v.to_string());
-                    let extension = v
+        let manifest = hls_manifest::Manifest::parse(&text).map_err(failure)?;
+        // Validate all references before registering any grants. Relative URLs
+        // always resolve against the current playlist, not its root ancestor.
+        let children = manifest
+            .references()
+            .iter()
+            .map(|reference| {
+                let joined = final_target.join(reference.uri).map_err(failure)?;
+                let joined = providers::validate_url(joined.as_str()).map_err(failure)?;
+                if access.authorize_url(joined.as_str()).is_err() {
+                    return Err((StatusCode::FORBIDDEN, "cross_origin_media_rejected".into()));
+                }
+                Ok(joined)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut children = children.into_iter();
+        let rewritten = manifest
+            .rewrite(|reference| {
+                let child = children.next().expect("one child per parsed reference");
+                let key = grant.targets.lock().unwrap().insert_kind(
+                    child.to_string(),
+                    registration.depth + 1,
+                    Some(reference.kind),
+                )?;
+                let extension = if reference.kind == hls_manifest::Kind::Playlist {
+                    "m3u8"
+                } else {
+                    child
                         .path()
                         .rsplit('.')
                         .next()
-                        .filter(|v| matches!(*v, "m3u8" | "ts" | "m4s" | "mp4" | "aac" | "key"))
-                        .unwrap_or("bin");
-                    format!(
-                        "{}.{}",
-                        url(grant.attempt.attempt_id, key).unwrap_or_default(),
-                        extension
-                    )
-                }
-                None => {
-                    invalid = true;
-                    String::new()
-                }
-            }
-        });
-        if invalid {
-            return Err((StatusCode::FORBIDDEN, "cross_origin_media_rejected".into()));
-        }
+                        .filter(|v| matches!(*v, "ts" | "m4s" | "mp4" | "aac" | "key" | "vtt"))
+                        .unwrap_or("bin")
+                };
+                Ok(format!(
+                    "{}.{}",
+                    url(grant.attempt.attempt_id, key)?,
+                    extension
+                ))
+            })
+            .map_err(failure)?;
         return Ok((
-            [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+            [
+                (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+                (header::CACHE_CONTROL, "private, no-store"),
+            ],
             rewritten,
         )
             .into_response());
     }
-    let mut result = Response::builder().status(response.status());
+    let mut result = Response::builder().status(response_status);
     for name in [
         header::CONTENT_TYPE,
         header::CONTENT_LENGTH,
         header::CONTENT_RANGE,
         header::ACCEPT_RANGES,
+        header::ETAG,
+        header::LAST_MODIFIED,
     ] {
-        if let Some(v) = response.headers().get(&name) {
+        if let Some(v) = response_headers.get(&name) {
             result = result.header(name, v)
         }
     }
     let response = result
+        .header(header::CACHE_CONTROL, "private, no-store")
         .body(if head {
             Body::empty()
         } else {
-            Body::from_stream(response.bytes_stream())
+            Body::from_stream(stream)
         })
         .map_err(failure)?;
     Ok(bounded(response, grant, head))
@@ -355,6 +651,1398 @@ mod tests {
             owner_id: Uuid::new_v4(),
             generation: 1,
         }
+    }
+
+    async fn origin(router: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(socket, router).await.unwrap() });
+        (format!("http://{address}"), task)
+    }
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+    fn http_grant(url: &str) -> (Arc<Grant>, Lifecycle) {
+        let (cancel, _) = watch::channel(false);
+        Registry::default().register(attempt(), json!({"url": url, "headers": {"Authorization": "Bearer fixture", "Cookie": "fixture=secret", "X-Source-Key": "fixture-secret"}}), 16 * 1024 * 1024, cancel)
+    }
+    fn target(grant: &Grant, url: &str) -> Target {
+        let key = grant.target(url.to_owned());
+        grant.targets.lock().unwrap().by_key[&key].clone()
+    }
+    fn key_target(grant: &Grant, url: &str) -> Target {
+        let mut targets = grant.targets.lock().unwrap();
+        let key = targets
+            .insert_kind(url.to_owned(), 1, Some(hls_manifest::Kind::Key))
+            .unwrap();
+        targets.by_key[&key].clone()
+    }
+
+    #[tokio::test]
+    async fn redirect_cannot_forward_source_credentials_to_another_origin() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let seen = hits.clone();
+        let (forbidden, forbidden_task) = origin(axum::Router::new().fallback(move || {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                "unexpected"
+            }
+        }))
+        .await;
+        let location = format!("{forbidden}/stolen");
+        let (source, source_task) =
+            origin(axum::Router::new().fallback(move |headers: HeaderMap| {
+                let location = location.clone();
+                async move {
+                    assert_eq!(headers[header::AUTHORIZATION], "Bearer fixture");
+                    Response::builder()
+                        .status(302)
+                        .header(header::LOCATION, location)
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            }))
+            .await;
+        let url = format!("{source}/video.mp4");
+        let (grant, _lifecycle) = http_grant(&url);
+        let result = remote(
+            &client(),
+            grant.clone(),
+            target(&grant, &url),
+            &HeaderMap::new(),
+            false,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        let result = remote(
+            &client(),
+            grant.clone(),
+            target(&grant, &forbidden),
+            &HeaderMap::new(),
+            false,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().0, StatusCode::FORBIDDEN);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        source_task.abort();
+        forbidden_task.abort();
+    }
+
+    fn redirect_grant(source: &str, cdn: &str) -> (Arc<Grant>, Lifecycle) {
+        let (cancel, _) = watch::channel(false);
+        Registry::default().register(attempt(), json!({"url":format!("{source}/root"),"source_url":source,
+            "headers":{"Authorization":"Bearer fixture", "Cookie":"fixture=secret", "X-Source-Key":"fixture-secret"},
+            "access_policy":{"schema_version":1,"origins":[
+                {"origin":source,"cidrs":["127.0.0.1/32"]},{"origin":cdn,"cidrs":["127.0.0.1/32"]}
+            ],"redirects":{"max_hops":5}}}), 16 * 1024 * 1024, cancel)
+    }
+
+    #[tokio::test]
+    async fn opted_in_redirect_uses_final_manifest_base_and_checks_every_child_request() {
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = requests.clone();
+        let (cdn, cdn_task) = origin(axum::Router::new().fallback(move |uri: axum::http::Uri, headers: HeaderMap| {
+            let seen=seen.clone();
+            async move {
+                assert!(!headers.contains_key(header::AUTHORIZATION));
+                assert!(!headers.contains_key(header::COOKIE));
+                assert!(!headers.contains_key("x-source-key"));
+                seen.lock().unwrap().push(uri.to_string());
+                match uri.path() {
+                    "/nested/master.m3u8" => Response::new(Body::from("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nchild/list.m3u8\n")),
+                    "/nested/child/list.m3u8" => Response::new(Body::from("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:1,\nsegment.ts\n#EXT-X-ENDLIST\n")),
+                    "/nested/child/key.bin" => Response::builder().header(header::CONTENT_LENGTH,16).body(Body::from(vec![7;16])).unwrap(),
+                    "/nested/child/segment.ts" => Response::builder().status(302).header(header::LOCATION,"http://unauthorized.invalid/private?signature=never-log").body(Body::empty()).unwrap(),
+                    _ => Response::new(Body::from("fixture-init")),
+                }
+            }
+        })).await;
+        let location = format!("{cdn}/nested/master.m3u8?signature=fixture");
+        let (source, source_task) =
+            origin(axum::Router::new().fallback(move |headers: HeaderMap| {
+                let location = location.clone();
+                async move {
+                    assert_eq!(headers[header::AUTHORIZATION], "Bearer fixture");
+                    Response::builder()
+                        .status(302)
+                        .header(header::LOCATION, location)
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            }))
+            .await;
+        let (grant, _lifecycle) = redirect_grant(&source, &cdn);
+        let root = format!("{source}/root");
+        let result = remote(
+            &client(),
+            grant.clone(),
+            target(&grant, &root),
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        let rewritten = axum::body::to_bytes(result.into_body(), 4096)
+            .await
+            .unwrap();
+        let rewritten = String::from_utf8(rewritten.to_vec()).unwrap();
+        assert!(!rewritten.contains(&cdn));
+        assert!(!rewritten.contains("signature"));
+        let child = format!("{cdn}/nested/child/list.m3u8");
+        assert!(
+            grant
+                .targets
+                .lock()
+                .unwrap()
+                .by_url
+                .contains_key(&(child.clone(), 1))
+        );
+        let child_registration = {
+            let targets = grant.targets.lock().unwrap();
+            targets.by_key[&targets.by_url[&(child.clone(), 1)]].clone()
+        };
+        remote(
+            &client(),
+            grant.clone(),
+            child_registration,
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        for (path, kind) in [
+            ("init.mp4", hls_manifest::Kind::Initialization),
+            ("key.bin", hls_manifest::Kind::Key),
+            ("segment.ts", hls_manifest::Kind::Segment),
+        ] {
+            let child = format!("{cdn}/nested/child/{path}");
+            let registration = {
+                let targets = grant.targets.lock().unwrap();
+                targets.by_key[&targets.by_url[&(child, 2)]].clone()
+            };
+            assert_eq!(registration.kind, Some(kind));
+            let result = remote(
+                &client(),
+                grant.clone(),
+                registration,
+                &HeaderMap::new(),
+                false,
+            )
+            .await;
+            if path == "segment.ts" {
+                assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+        assert_eq!(requests.lock().unwrap().len(), 5);
+        source_task.abort();
+        cdn_task.abort();
+    }
+
+    #[tokio::test]
+    async fn redirect_final_destination_changes_revoke_preview_even_with_equal_etags() {
+        let destination = Arc::new(Mutex::new("/stable?signature=one".to_owned()));
+        let (cdn, cdn_task) = origin(axum::Router::new().fallback(|| async {
+            Response::builder()
+                .header(header::ETAG, "\"same\"")
+                .header(header::CONTENT_LENGTH, 6)
+                .body(Body::from("binary"))
+                .unwrap()
+        }))
+        .await;
+        let selected = destination.clone();
+        let edge = cdn.clone();
+        let (source, source_task) = origin(axum::Router::new().fallback(move || {
+            let location = format!("{}{}", edge, selected.lock().unwrap());
+            async move {
+                Response::builder()
+                    .status(302)
+                    .header(header::LOCATION, location)
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        }))
+        .await;
+        let root = format!("{source}/root");
+        let (grant, _lifecycle) = redirect_grant(&source, &cdn);
+        for _ in 0..2 {
+            let response = remote(
+                &client(),
+                grant.clone(),
+                target(&grant, &root),
+                &HeaderMap::new(),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 16)
+                    .await
+                    .unwrap(),
+                "binary"
+            );
+        }
+        *destination.lock().unwrap() = "/stable?signature=two".into();
+        let result = remote(
+            &client(),
+            grant.clone(),
+            target(&grant, &root),
+            &HeaderMap::new(),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(result, (StatusCode::CONFLICT, "source_changed".into()));
+        assert!(*grant.cancel.borrow());
+        source_task.abort();
+        cdn_task.abort();
+    }
+
+    #[tokio::test]
+    async fn every_hls_reference_is_checked_before_any_child_grant_is_registered() {
+        let (source, task) = origin(axum::Router::new().fallback(|| async {
+            "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"http://other.example/key\"\nsegment.ts\n"
+        })).await;
+        let url = format!("{source}/root.m3u8");
+        let (grant, _lifecycle) = http_grant(&url);
+        let registered = target(&grant, &url);
+        let result = remote(
+            &client(),
+            grant.clone(),
+            registered,
+            &HeaderMap::new(),
+            false,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().0, StatusCode::FORBIDDEN);
+        assert_eq!(grant.targets.lock().unwrap().by_key.len(), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn extensionless_octet_stream_variant_cannot_bypass_child_authorization() {
+        let (source, task) = origin(axum::Router::new().fallback(
+            |uri: axum::http::Uri| async move {
+                let body = if uri.path() == "/master.m3u8" {
+                    "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nnested/variant\n"
+                } else {
+                    "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nhttp://other.example/escape.ts\n"
+                };
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(body))
+                    .unwrap()
+            },
+        ))
+        .await;
+        let url = format!("{source}/master.m3u8");
+        let (grant, _lifecycle) = http_grant(&url);
+        remote(
+            &client(),
+            grant.clone(),
+            target(&grant, &url),
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        let child = grant
+            .targets
+            .lock()
+            .unwrap()
+            .by_key
+            .values()
+            .find(|v| v.depth == 1)
+            .unwrap()
+            .clone();
+        assert_eq!(child.kind, Some(hls_manifest::Kind::Playlist));
+        assert!(child.url.ends_with("/nested/variant"));
+        assert_eq!(
+            remote(&client(), grant.clone(), child, &HeaderMap::new(), false)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn misleading_root_metadata_cannot_hide_hls_or_unsupported_dash() {
+        let (source, task) = origin(axum::Router::new().fallback(|uri: axum::http::Uri| async move {
+            let body = if uri.path() == "/dash.mp4" {
+                "<?xml version=\"1.0\"?><MPD><BaseURL>http://other.example/escape</BaseURL></MPD>"
+            } else {
+                "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nhttp://other.example/escape.ts\n"
+            };
+            Response::builder().header(header::CONTENT_TYPE, "video/mp4").body(Body::from(body)).unwrap()
+        })).await;
+        for (path, status) in [
+            ("hidden.mp4", StatusCode::FORBIDDEN),
+            ("dash.mp4", StatusCode::BAD_GATEWAY),
+        ] {
+            let url = format!("{source}/{path}");
+            let (grant, _lifecycle) = http_grant(&url);
+            assert_eq!(
+                remote(
+                    &client(),
+                    grant.clone(),
+                    target(&grant, &url),
+                    &HeaderMap::new(),
+                    false
+                )
+                .await
+                .unwrap_err()
+                .0,
+                status
+            );
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn long_whitespace_padding_cannot_defer_mpd_detection_into_decoder_probing() {
+        let (source, task) = origin(axum::Router::new().fallback(|| async {
+            let body = futures_util::stream::iter([
+                Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b' '; 700])),
+                Ok(axum::body::Bytes::from(format!(
+                    "{}<MPD><BaseURL>http://other.example/escape</BaseURL></MPD>",
+                    " ".repeat(700)
+                ))),
+            ]);
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from_stream(body))
+                .unwrap()
+        }))
+        .await;
+        let url = format!("{source}/movie.mp4");
+        let (grant, _lifecycle) = http_grant(&url);
+        assert_eq!(
+            remote(
+                &client(),
+                grant.clone(),
+                target(&grant, &url),
+                &HeaderMap::new(),
+                false
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::BAD_GATEWAY
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn nested_manifest_uses_its_own_base_and_stable_keys_for_byte_ranges() {
+        let (source, task) = origin(axum::Router::new().fallback(|headers: HeaderMap| async move {
+            assert_eq!(headers[header::COOKIE], "fixture=secret");
+            assert_eq!(headers["x-source-key"], "fixture-secret");
+            "#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"s\",NAME=\"Subtitles\",URI=\"../subs/list.m3u8\"\n#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"100@0\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXT-X-BYTERANGE:10@100\nmedia.mp4\n#EXT-X-DISCONTINUITY\n#EXT-X-BYTERANGE:10\nmedia.mp4\n"
+        })).await;
+        let url = format!("{source}/root.m3u8");
+        let nested = format!("{source}/nested/list.m3u8");
+        let (grant, _lifecycle) = http_grant(&url);
+        let registration = target(&grant, &nested);
+        let first = remote(
+            &client(),
+            grant.clone(),
+            registration.clone(),
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.headers()[header::CACHE_CONTROL], "private, no-store");
+        let first = axum::body::to_bytes(first.into_body(), 4096).await.unwrap();
+        let second = remote(
+            &client(),
+            grant.clone(),
+            registration,
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        let second = axum::body::to_bytes(second.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        let rewritten = String::from_utf8(first.to_vec()).unwrap();
+        assert!(!rewritten.contains(&source));
+        let segments: Vec<_> = rewritten.lines().filter(|v| !v.starts_with('#')).collect();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0], segments[1]);
+        let targets = grant.targets.lock().unwrap();
+        assert_eq!(targets.by_key.len(), 5);
+        assert!(
+            targets
+                .by_url
+                .contains_key(&(format!("{source}/subs/list.m3u8"), 1))
+        );
+        assert!(
+            targets
+                .by_url
+                .contains_key(&(format!("{source}/nested/init.mp4"), 1))
+        );
+        assert!(
+            targets
+                .by_url
+                .contains_key(&(format!("{source}/nested/key.bin"), 1))
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn playlist_cycles_stop_at_four_levels_and_live_updates_do_not_pin_old_etags() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let seen = reads.clone();
+        let (source, task) = origin(axum::Router::new().fallback(move || {
+            let seen = seen.clone();
+            async move {
+                let version = seen.fetch_add(1, Ordering::SeqCst);
+                Response::builder()
+                    .header(header::ETAG, format!("\"{version}\""))
+                    .body(Body::from(
+                        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nloop.m3u8\n",
+                    ))
+                    .unwrap()
+            }
+        }))
+        .await;
+        let url = format!("{source}/loop.m3u8");
+        let (grant, _lifecycle) = http_grant(&url);
+        let registration = target(&grant, &url);
+        remote(
+            &client(),
+            grant.clone(),
+            registration.clone(),
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        remote(
+            &client(),
+            grant.clone(),
+            registration,
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(grant.validators.lock().unwrap().is_empty());
+        for depth in 1..hls_manifest::MAX_DEPTH {
+            let registration = grant
+                .targets
+                .lock()
+                .unwrap()
+                .by_key
+                .values()
+                .find(|v| v.depth == depth)
+                .unwrap()
+                .clone();
+            remote(
+                &client(),
+                grant.clone(),
+                registration,
+                &HeaderMap::new(),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        let deepest = grant
+            .targets
+            .lock()
+            .unwrap()
+            .by_key
+            .values()
+            .find(|v| v.depth == hls_manifest::MAX_DEPTH)
+            .unwrap()
+            .clone();
+        let result = remote(&client(), grant.clone(), deepest, &HeaderMap::new(), false).await;
+        assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            grant.targets.lock().unwrap().by_key.len(),
+            hls_manifest::MAX_DEPTH as usize + 1
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn mutually_recursive_playlists_cannot_reset_depth_through_key_deduplication() {
+        let (source, task) = origin(axum::Router::new().fallback(
+            |uri: axum::http::Uri| async move {
+                if uri.path() == "/a.m3u8" {
+                    "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nb.m3u8\n"
+                } else {
+                    "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\na.m3u8\n"
+                }
+            },
+        ))
+        .await;
+        let url = format!("{source}/a.m3u8");
+        let (grant, _lifecycle) = http_grant(&url);
+        let mut registration = target(&grant, &url);
+        for depth in 0..hls_manifest::MAX_DEPTH {
+            assert_eq!(registration.depth, depth);
+            remote(
+                &client(),
+                grant.clone(),
+                registration,
+                &HeaderMap::new(),
+                false,
+            )
+            .await
+            .unwrap();
+            registration = grant
+                .targets
+                .lock()
+                .unwrap()
+                .by_key
+                .values()
+                .find(|v| v.depth == depth + 1)
+                .unwrap()
+                .clone();
+        }
+        assert_eq!(registration.depth, hls_manifest::MAX_DEPTH);
+        assert_eq!(
+            remote(
+                &client(),
+                grant.clone(),
+                registration,
+                &HeaderMap::new(),
+                false
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            grant.targets.lock().unwrap().by_key.len(),
+            hls_manifest::MAX_DEPTH as usize + 1
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_head_cannot_pin_extensionless_live_hls_and_sniffed_kind_is_retained() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let seen = reads.clone();
+        let (source, task) = origin(axum::Router::new().fallback(move |headers: HeaderMap| {
+            let seen = seen.clone();
+            async move {
+                assert!(!headers.contains_key(header::IF_MATCH));
+                let version = seen.fetch_add(1, Ordering::SeqCst);
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .header(header::ETAG, format!("\"{version}\""))
+                    .body(Body::from(
+                        "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nseg.ts\n",
+                    ))
+                    .unwrap()
+            }
+        }))
+        .await;
+        let url = format!("{source}/live");
+        let (grant, _lifecycle) = http_grant(&url);
+        let registration = target(&grant, &url);
+        remote(
+            &client(),
+            grant.clone(),
+            registration,
+            &HeaderMap::new(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(grant.validators.lock().unwrap().is_empty());
+        let registration = target(&grant, &url);
+        remote(
+            &client(),
+            grant.clone(),
+            registration,
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            target(&grant, &url).kind,
+            Some(hls_manifest::Kind::Playlist)
+        );
+        for head in [true, false, true, false] {
+            remote(
+                &client(),
+                grant.clone(),
+                target(&grant, &url),
+                &HeaderMap::new(),
+                head,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(grant.validators.lock().unwrap().is_empty());
+        assert!(!*grant.cancel.borrow());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_binary_resource_cannot_change_into_hls_even_if_upstream_ignores_if_match() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let seen = reads.clone();
+        let (source, task) = origin(axum::Router::new().fallback(move || {
+            let seen = seen.clone();
+            async move {
+                let body = if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    b"\0\0\0\x18ftypisom".as_slice()
+                } else {
+                    b"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nseg.ts\n".as_slice()
+                };
+                Response::builder()
+                    .header(header::ETAG, "\"reused\"")
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+        }))
+        .await;
+        let url = format!("{source}/media");
+        let (grant, _lifecycle) = http_grant(&url);
+        remote(
+            &client(),
+            grant.clone(),
+            target(&grant, &url),
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            remote(
+                &client(),
+                grant.clone(),
+                target(&grant, &url),
+                &HeaderMap::new(),
+                false
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert!(*grant.cancel.borrow());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_late_hls_cannot_erase_an_already_published_binary_binding() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = reads.clone();
+        let observed = entered.clone();
+        let gate = release.clone();
+        let (source, task) = origin(axum::Router::new().fallback(move || {
+            let (seen, observed, gate) = (seen.clone(), observed.clone(), gate.clone());
+            async move {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    observed.notify_one();
+                    gate.notified().await;
+                    Body::from("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nseg.ts\n")
+                } else {
+                    Body::from("binary body")
+                }
+            }
+        }))
+        .await;
+        let url = format!("{source}/media");
+        let (grant, _lifecycle) = http_grant(&url);
+        let registration = target(&grant, &url);
+        let owned = grant.clone();
+        let late = tokio::spawn(async move {
+            remote(&client(), owned, registration, &HeaderMap::new(), false).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        remote(
+            &client(),
+            grant.clone(),
+            target(&grant, &url),
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        release.notify_one();
+        assert_eq!(late.await.unwrap().unwrap_err().0, StatusCode::CONFLICT);
+        assert!(*grant.cancel.borrow());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn playlist_head_does_not_claim_the_length_or_etag_of_unrewritten_bytes() {
+        let (source, task) = origin(axum::Router::new().fallback(|| async {
+            Response::builder()
+                .header(header::ETAG, "\"raw-playlist\"")
+                .body(Body::from("#EXTM3U\nseg.ts\n"))
+                .unwrap()
+        }))
+        .await;
+        let url = format!("{source}/a.m3u8");
+        let (grant, _lifecycle) = http_grant(&url);
+        let response = remote(
+            &client(),
+            grant.clone(),
+            target(&grant, &url),
+            &HeaderMap::new(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/vnd.apple.mpegurl"
+        );
+        assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+        assert!(!response.headers().contains_key(header::ETAG));
+        assert!(
+            axum::body::to_bytes(response.into_body(), 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        task.abort();
+    }
+
+    #[test]
+    fn key_grants_cannot_alias_any_decoder_resource_in_either_order() {
+        use hls_manifest::Kind;
+        for other in [
+            None,
+            Some(Kind::Playlist),
+            Some(Kind::Segment),
+            Some(Kind::Initialization),
+            Some(Kind::Data),
+        ] {
+            for (first, second) in [(Some(Kind::Key), other), (other, Some(Kind::Key))] {
+                let mut targets = Targets::default();
+                let url = "http://media/shared.bin".to_owned();
+                let key = targets.insert_kind(url.clone(), 1, first).unwrap();
+                assert_eq!(
+                    targets.insert_kind(url.clone(), 1, first).unwrap(),
+                    key,
+                    "same-role references keep their stable grant"
+                );
+                assert!(
+                    targets.insert_kind(url, 1, second).is_err(),
+                    "accepted conflicting roles {first:?} then {second:?}"
+                );
+                assert_eq!(targets.by_key[&key].kind, first);
+                assert_eq!(targets.by_key.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unused_key_alias_cannot_turn_a_segment_into_unclassified_input() {
+        let child_reads = Arc::new(AtomicU64::new(0));
+        let seen = child_reads.clone();
+        let (source, task) = origin(axum::Router::new().fallback(
+            move |uri: axum::http::Uri| {
+                let seen = seen.clone();
+                async move {
+                    match uri.path() {
+                        "/key-first.m3u8" => "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-KEY:METHOD=AES-128,URI=\"shared.bin\"\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:1,\nshared.bin\n#EXT-X-ENDLIST\n",
+                        "/segment-first.m3u8" => "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nshared.bin\n#EXT-X-KEY:METHOD=AES-128,URI=\"shared.bin\"\n#EXT-X-KEY:METHOD=NONE\n#EXT-X-ENDLIST\n",
+                        _ => {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            "<MPD><BaseURL>http://other.example/escape</BaseURL></MPD>"
+                        }
+                    }
+                }
+            },
+        ))
+        .await;
+        for path in ["key-first.m3u8", "segment-first.m3u8"] {
+            let url = format!("{source}/{path}");
+            let (grant, _lifecycle) = http_grant(&url);
+            let response = remote(
+                &client(),
+                grant.clone(),
+                target(&grant, &url),
+                &HeaderMap::new(),
+                false,
+            )
+            .await;
+            assert_eq!(response.unwrap_err().0, StatusCode::BAD_GATEWAY);
+        }
+        assert_eq!(child_reads.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn exclusively_cryptographic_keys_preserve_arbitrary_sixteen_byte_values() {
+        let bytes = vec![b'<'; 16];
+        let upstream_bytes = bytes.clone();
+        let (source, task) = origin(axum::Router::new().fallback(move || {
+            let bytes = upstream_bytes.clone();
+            async move { bytes }
+        }))
+        .await;
+        let url = format!("{source}/secret.bin");
+        let (grant, _lifecycle) = http_grant(&url);
+        let registration = key_target(&grant, &url);
+        let budget = grant.remaining.load(Ordering::SeqCst);
+        let response = remote(
+            &client(),
+            grant.clone(),
+            registration,
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 16)
+                .await
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(grant.remaining.load(Ordering::SeqCst), budget - 16);
+        assert!(!*grant.cancel.borrow());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn aes128_keys_reject_short_and_long_declared_lengths_including_head() {
+        let (source, task) = origin(axum::Router::new().fallback(
+            |uri: axum::http::Uri| async move {
+                let length: usize = uri.path().trim_start_matches('/').parse().unwrap();
+                vec![0_u8; length]
+            },
+        ))
+        .await;
+        for length in [0, 15, 17, 64 * 1024] {
+            let url = format!("{source}/{length}");
+            for head in [false, true] {
+                let (grant, _lifecycle) = http_grant(&url);
+                let result = remote(
+                    &client(),
+                    grant.clone(),
+                    key_target(&grant, &url),
+                    &HeaderMap::new(),
+                    head,
+                )
+                .await;
+                assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);
+                assert!(grant.validators.lock().unwrap().is_empty());
+            }
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn aes128_key_metadata_cannot_reclassify_its_grant_as_a_playlist() {
+        let (source, task) = origin(axum::Router::new().fallback(|| async {
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                .body(Body::from("#EXTM3U\nseg.ts\n\n"))
+                .unwrap()
+        }))
+        .await;
+        let url = format!("{source}/key");
+        let (grant, _lifecycle) = http_grant(&url);
+        let registration = key_target(&grant, &url);
+        for head in [false, true] {
+            assert_eq!(
+                remote(
+                    &client(),
+                    grant.clone(),
+                    registration.clone(),
+                    &HeaderMap::new(),
+                    head,
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::BAD_GATEWAY
+            );
+            assert_eq!(key_target(&grant, &url).kind, Some(hls_manifest::Kind::Key));
+            assert_eq!(grant.targets.lock().unwrap().by_key.len(), 1);
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn aes128_keys_require_exact_length_without_content_length() {
+        let (source, task) = origin(axum::Router::new().fallback(
+            |uri: axum::http::Uri| async move {
+                let length: usize = uri.path().trim_start_matches('/').parse().unwrap();
+                let bytes = futures_util::stream::iter(
+                    (0..length)
+                        .map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"<"))),
+                );
+                Response::builder().body(Body::from_stream(bytes)).unwrap()
+            },
+        ))
+        .await;
+        for length in [0, 15, 16, 17] {
+            let url = format!("{source}/{length}");
+            let (grant, _lifecycle) = http_grant(&url);
+            let result = remote(
+                &client(),
+                grant.clone(),
+                key_target(&grant, &url),
+                &HeaderMap::new(),
+                false,
+            )
+            .await;
+            if length == 16 {
+                let response = result.unwrap();
+                assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), 16)
+                        .await
+                        .unwrap(),
+                    vec![b'<'; 16]
+                );
+            } else {
+                assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);
+                assert!(grant.validators.lock().unwrap().is_empty());
+            }
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn aes128_keys_reject_the_seventeenth_byte_without_waiting_for_eof() {
+        let (source, task) = origin(axum::Router::new().fallback(|| async {
+            let bytes = futures_util::stream::iter([
+                Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![0; 16])),
+                Ok(axum::body::Bytes::from_static(b"x")),
+            ])
+            .chain(futures_util::stream::pending());
+            Response::builder().body(Body::from_stream(bytes)).unwrap()
+        }))
+        .await;
+        let url = format!("{source}/key");
+        let (grant, _lifecycle) = http_grant(&url);
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            remote(
+                &client(),
+                grant.clone(),
+                key_target(&grant, &url),
+                &HeaderMap::new(),
+                false,
+            ),
+        )
+        .await
+        .expect("oversized key must fail without draining the source");
+        assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn aes128_key_reads_wait_for_eof_and_cancel_without_publishing_a_prefix() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let observed = entered.clone();
+        let (source, task) = origin(axum::Router::new().fallback(move || {
+            let observed = observed.clone();
+            async move {
+                let bytes = futures_util::stream::once(async move {
+                    observed.notify_one();
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![0; 16]))
+                })
+                .chain(futures_util::stream::pending());
+                Response::builder().body(Body::from_stream(bytes)).unwrap()
+            }
+        }))
+        .await;
+        let url = format!("{source}/key");
+        let (grant, lifecycle) = http_grant(&url);
+        let registration = key_target(&grant, &url);
+        let owned = grant.clone();
+        let mut request = tokio::spawn(async move {
+            remote(&client(), owned, registration, &HeaderMap::new(), false).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut request)
+                .await
+                .is_err(),
+            "sixteen bytes alone do not prove the key body ended"
+        );
+        lifecycle.stop();
+        let result = tokio::time::timeout(Duration::from_millis(500), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().0, StatusCode::UNAUTHORIZED);
+        grant.input_failure.stopped().await;
+        assert!(grant.validators.lock().unwrap().is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn validated_keys_keep_budget_and_retained_body_cancellation() {
+        let (source, task) =
+            origin(axum::Router::new().fallback(|| async { vec![0_u8; 16] })).await;
+        let url = format!("{source}/key");
+        for exhausted in [false, true] {
+            let (grant, lifecycle) = http_grant(&url);
+            let response = remote(
+                &client(),
+                grant.clone(),
+                key_target(&grant, &url),
+                &HeaderMap::new(),
+                false,
+            )
+            .await
+            .unwrap();
+            if exhausted {
+                grant.remaining.store(15, Ordering::SeqCst);
+                assert!(
+                    axum::body::to_bytes(response.into_body(), 16)
+                        .await
+                        .is_err()
+                );
+            } else {
+                lifecycle.stop();
+                assert!(
+                    axum::body::to_bytes(response.into_body(), 16)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            assert!(*grant.cancel.borrow());
+            tokio::time::timeout(Duration::from_millis(500), grant.input_failure.stopped())
+                .await
+                .unwrap();
+        }
+        task.abort();
+    }
+
+    #[test]
+    fn target_budget_and_validator_strength_are_explicit() {
+        let mut targets = Targets::default();
+        let first = targets.insert("http://media/0".into(), 0).unwrap();
+        assert_eq!(targets.insert("http://media/0".into(), 0).unwrap(), first);
+        targets
+            .insert_kind(
+                "http://media/0".into(),
+                0,
+                Some(hls_manifest::Kind::Playlist),
+            )
+            .unwrap();
+        targets
+            .insert_kind(
+                "http://media/0".into(),
+                0,
+                Some(hls_manifest::Kind::Segment),
+            )
+            .unwrap();
+        assert_eq!(
+            targets.by_key[&first].kind,
+            Some(hls_manifest::Kind::Playlist)
+        );
+        for i in 1..hls_manifest::MAX_REFERENCES {
+            targets.insert(format!("http://media/{i}"), 0).unwrap();
+        }
+        assert!(targets.insert("http://media/extra".into(), 0).is_err());
+        for etag in ["W/\"weak\"", "unquoted", "\"broken\"tag\""] {
+            let validator = HttpValidators {
+                etag: Some(etag.into()),
+                modified: None,
+                size: None,
+            };
+            assert!(validator.strong_etag().is_none());
+        }
+        let validator = HttpValidators {
+            etag: Some("\"strong\"".into()),
+            modified: None,
+            size: None,
+        };
+        assert_eq!(validator.strong_etag(), Some("\"strong\""));
+    }
+
+    #[tokio::test]
+    async fn upstream_range_head_if_range_and_416_keep_their_actual_semantics() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let (source, task) = origin(axum::Router::new().fallback(
+            move |method: axum::http::Method, headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push((method, headers.clone()));
+                    if headers.get(header::RANGE).is_some_and(|v| v == "bytes=3-") {
+                        Response::builder()
+                            .status(416)
+                            .header(header::CONTENT_RANGE, "bytes */3")
+                            .header(header::ACCEPT_RANGES, "bytes")
+                            .body(Body::empty())
+                            .unwrap()
+                    } else {
+                        // A server that ignores Range keeps its 200 and full length.
+                        Response::builder()
+                            .header(header::CONTENT_LENGTH, 3)
+                            .header(header::ETAG, "W/\"weak\"")
+                            .body(Body::from("abc"))
+                            .unwrap()
+                    }
+                }
+            },
+        ))
+        .await;
+        let url = format!("{source}/video.mp4");
+        let (grant, _lifecycle) = http_grant(&url);
+        let registration = target(&grant, &url);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "bytes=1-2".parse().unwrap());
+        headers.insert(header::IF_RANGE, "\"earlier\"".parse().unwrap());
+        let response = remote(
+            &client(),
+            grant.clone(),
+            registration.clone(),
+            &headers,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "3");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 3).await.unwrap(),
+            "abc"
+        );
+        let response = remote(
+            &client(),
+            grant.clone(),
+            registration.clone(),
+            &headers,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "3");
+        assert!(
+            axum::body::to_bytes(response.into_body(), 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        headers.insert(header::RANGE, "bytes=3-".parse().unwrap());
+        let response = remote(&client(), grant.clone(), registration, &headers, false)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 416);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes */3");
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].1[header::IF_RANGE], "\"earlier\"");
+        assert_eq!(requests[1].0, axum::http::Method::HEAD);
+        assert!(!requests[1].1.contains_key(header::RANGE));
+        assert!(!requests[1].1.contains_key(header::IF_RANGE));
+        assert!(
+            requests
+                .iter()
+                .all(|(_, h)| !h.contains_key(header::IF_MATCH))
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn changed_representation_cancels_retained_bodies_and_412_becomes_conflict() {
+        let changed = Arc::new(AtomicU64::new(0));
+        let seen = changed.clone();
+        let (source, task) = origin(axum::Router::new().fallback(move |headers: HeaderMap| {
+            let seen = seen.clone();
+            async move {
+                if seen.load(Ordering::SeqCst) == 1 {
+                    assert_eq!(headers[header::IF_MATCH], "\"original\"");
+                    Response::builder().status(412).body(Body::empty()).unwrap()
+                } else {
+                    Response::builder()
+                        .header(header::ETAG, "\"original\"")
+                        .header(header::CONTENT_LENGTH, 3)
+                        .body(Body::from("abc"))
+                        .unwrap()
+                }
+            }
+        }))
+        .await;
+        let url = format!("{source}/video.mp4");
+        let (grant, _lifecycle) = http_grant(&url);
+        let registration = target(&grant, &url);
+        let retained = remote(
+            &client(),
+            grant.clone(),
+            registration.clone(),
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        changed.store(1, Ordering::SeqCst);
+        let result = remote(
+            &client(),
+            grant.clone(),
+            registration,
+            &HeaderMap::new(),
+            false,
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err(),
+            (StatusCode::CONFLICT, "source_changed".into())
+        );
+        assert!(*grant.cancel.borrow());
+        assert!(
+            axum::body::to_bytes(retained.into_body(), 3)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        grant.input_failure.stopped().await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn length_changes_without_a_strong_etag_still_invalidate_the_attempt() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let seen = reads.clone();
+        let (source, task) = origin(axum::Router::new().fallback(move || {
+            let seen = seen.clone();
+            async move {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    "abc"
+                } else {
+                    "abcdef"
+                }
+            }
+        }))
+        .await;
+        let url = format!("{source}/video.mp4");
+        let (grant, _lifecycle) = http_grant(&url);
+        let registration = target(&grant, &url);
+        let first = remote(
+            &client(),
+            grant.clone(),
+            registration.clone(),
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            axum::body::to_bytes(first.into_body(), 3).await.unwrap(),
+            "abc"
+        );
+        let result = remote(
+            &client(),
+            grant.clone(),
+            registration,
+            &HeaderMap::new(),
+            false,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
+        assert!(*grant.cancel.borrow());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_new_416_resource_length_invalidates_the_attempt() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let seen = reads.clone();
+        let (source, task) = origin(axum::Router::new().fallback(move || {
+            let seen = seen.clone();
+            async move {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Response::new(Body::from("abcdef"))
+                } else {
+                    Response::builder()
+                        .status(416)
+                        .header(header::CONTENT_RANGE, "bytes */3")
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            }
+        }))
+        .await;
+        let url = format!("{source}/video.mp4");
+        let (grant, _lifecycle) = http_grant(&url);
+        let registration = target(&grant, &url);
+        let first = remote(
+            &client(),
+            grant.clone(),
+            registration.clone(),
+            &HeaderMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        axum::body::to_bytes(first.into_body(), 6).await.unwrap();
+        let result = remote(
+            &client(),
+            grant.clone(),
+            registration,
+            &HeaderMap::new(),
+            false,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
+        assert!(*grant.cancel.borrow());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_header_wait_without_a_body_poll() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let seen = entered.clone();
+        let (source, task) = origin(axum::Router::new().fallback(move || {
+            let seen = seen.clone();
+            async move {
+                seen.notify_one();
+                std::future::pending::<&'static str>().await
+            }
+        }))
+        .await;
+        let url = format!("{source}/video.mp4");
+        let (grant, lifecycle) = http_grant(&url);
+        let registration = target(&grant, &url);
+        let owned = grant.clone();
+        let request = tokio::spawn(async move {
+            remote(&client(), owned, registration, &HeaderMap::new(), false).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        lifecycle.stop();
+        let result = tokio::time::timeout(Duration::from_millis(500), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().0, StatusCode::UNAUTHORIZED);
+        task.abort();
     }
 
     #[tokio::test]

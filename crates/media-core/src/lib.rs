@@ -1,3 +1,17 @@
+pub mod advanced_media;
+pub mod bounded_decode;
+pub mod deployment_config;
+pub mod distributed_compute;
+pub mod finite_delivery;
+pub mod finite_hls;
+pub mod hls_ladder;
+pub mod http_range;
+pub mod input_policy;
+pub mod job_health;
+pub mod motion_video;
+pub mod runtime_metrics;
+pub mod static_hls;
+pub mod static_hls_probe;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 pub mod capabilities;
@@ -61,7 +75,15 @@ pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 pub async fn probe(path: &str) -> Result<serde_json::Value> {
+    probe_with_policy(path, false).await
+}
+pub async fn probe_with_policy(path: &str, rewritten_hls: bool) -> Result<serde_json::Value> {
     let mut command = tokio::process::Command::new("ffprobe");
+    input_policy::clean_environment(&mut command);
+    command.args(input_policy::args(
+        path.starts_with("http://"),
+        rewritten_hls,
+    ));
     command.args([
         "-v",
         "error",
@@ -90,32 +112,33 @@ pub fn hls_needs_video_transform(meta: &serde_json::Value) -> bool {
         streams
             .iter()
             .filter(|s| s["codec_type"] == "video")
-            .any(|video| {
-                let rotated = |value: &serde_json::Value| {
-                    value
-                        .as_f64()
-                        .or_else(|| value.as_str()?.parse().ok())
-                        .is_some_and(|rotation: f64| {
-                            !rotation.is_finite() || rotation.rem_euclid(360.0).abs() > 0.01
-                        })
-                };
-                let rate = |value: &serde_json::Value| -> Option<f64> {
-                    let (n, d) = value.as_str()?.split_once('/')?;
-                    let fps = n.parse::<f64>().ok()? / d.parse::<f64>().ok()?;
-                    (fps.is_finite() && fps > 0.0).then_some(fps)
-                };
-                let irregular_rate = rate(&video["r_frame_rate"])
-                    .zip(rate(&video["avg_frame_rate"]))
-                    .is_some_and(|(nominal, average)| (nominal / average - 1.0).abs() > 0.01);
-                irregular_rate
-                    || rotated(&video["tags"]["rotate"])
-                    || video["side_data_list"].as_array().is_some_and(|rows| {
-                        rows.iter().any(|row| {
-                            row["side_data_type"] == "Display Matrix" && rotated(&row["rotation"])
-                        })
-                    })
-            })
+            .any(video_needs_transform)
     })
+}
+
+/// Transform facts apply only to the selected stream in the opt-in recipe.
+pub fn video_needs_transform(video: &serde_json::Value) -> bool {
+    let rotated = |value: &serde_json::Value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str()?.parse().ok())
+            .is_some_and(|rotation: f64| {
+                !rotation.is_finite() || rotation.rem_euclid(360.0).abs() > 0.01
+            })
+    };
+    let rate = |value: &serde_json::Value| -> Option<f64> {
+        let (n, d) = value.as_str()?.split_once('/')?;
+        let fps = n.parse::<f64>().ok()? / d.parse::<f64>().ok()?;
+        (fps.is_finite() && fps > 0.0).then_some(fps)
+    };
+    rate(&video["r_frame_rate"])
+        .zip(rate(&video["avg_frame_rate"]))
+        .is_some_and(|(nominal, average)| (nominal / average - 1.0).abs() > 0.01)
+        || rotated(&video["tags"]["rotate"])
+        || video["side_data_list"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row["side_data_type"] == "Display Matrix" && rotated(&row["rotation"]))
+        })
 }
 
 /// Admission estimate, not a bitrate guarantee for CRF video. Disk usage is
@@ -179,6 +202,48 @@ pub fn hls_args(
     transcode: bool,
     audio_index: Option<u32>,
 ) -> Vec<String> {
+    hls_args_for_video(
+        input,
+        output,
+        start_seconds,
+        transcode,
+        motion_video::VideoMapping::LegacyFirstVideo,
+        audio_index,
+    )
+}
+
+/// Source-resolved opt-in recipe; its default audio uses the same canonical
+/// selection as motion candidate facts. Existing hls_args behavior is retained.
+pub fn hls_args_for_motion_source(
+    meta: &serde_json::Value,
+    input: &str,
+    output: &str,
+    start_seconds: f64,
+    transcode: bool,
+    audio_index: Option<u32>,
+) -> Result<Vec<String>> {
+    let video = capabilities::validate_motion_source(meta)?;
+    let audio = motion_video::selected_audio_index(meta, audio_index)?;
+    Ok(hls_args_for_video(
+        input,
+        output,
+        start_seconds,
+        transcode,
+        video.identity.mapping,
+        audio,
+    ))
+}
+
+/// Explicit selected-video recipe; the compatibility wrapper retains old jobs
+/// and fixture callers. Calling this does not establish Worker compatibility.
+pub fn hls_args_for_video(
+    input: &str,
+    output: &str,
+    start_seconds: f64,
+    transcode: bool,
+    video_mapping: motion_video::VideoMapping,
+    audio_index: Option<u32>,
+) -> Vec<String> {
     // Stream copy seeks to an earlier keyframe and cannot honor the plan's
     // requested timeline origin. Decode/discard preroll for nonzero starts.
     let transcode = transcode || start_seconds > 0.0;
@@ -192,7 +257,7 @@ pub fn hls_args(
         "-i".into(),
         input.into(),
         "-map".into(),
-        "0:v:0".into(),
+        video_mapping.ffmpeg_specifier(),
         "-map".into(),
         // API track indices are absolute stream indices, not audio ordinals.
         audio_index.map_or_else(|| "0:a:0?".into(), |index| format!("0:{index}")),
@@ -261,19 +326,54 @@ mod tests {
 
 /// Conservative single-profile browser fallback. Unknown/HDR video is never silently tone-mapped.
 pub fn compatible_mode(meta: &serde_json::Value, selected_audio: bool) -> Result<&'static str> {
+    let video = capabilities::validate_source(meta)?;
+    compatible_mode_for_video(meta, video, selected_audio)
+}
+
+/// Pure compatible-mode helper for the paired motion recipe. Direct still
+/// requires one total source video, including attached pictures.
+pub fn compatible_motion_mode(
+    meta: &serde_json::Value,
+    selected_audio: bool,
+) -> Result<&'static str> {
+    let selected = capabilities::validate_motion_source(meta)?;
+    let video = selected.stream;
+    if video_needs_transform(video)
+        || !matches!(
+            video["sample_aspect_ratio"].as_str(),
+            None | Some("1:1" | "N/A")
+        )
+    {
+        return Ok("transcode");
+    }
+    let mode = compatible_mode_for_video(meta, video, selected_audio)?;
+    let streams = meta["streams"].as_array().expect("validated streams");
+    if mode == "direct"
+        && (streams
+            .iter()
+            .filter(|row| row["codec_type"] == "video")
+            .count()
+            != 1
+            || streams
+                .iter()
+                .filter(|row| row["codec_type"] == "audio")
+                .count()
+                > 1)
+    {
+        return Ok("remux");
+    }
+
+    Ok(mode)
+}
+
+fn compatible_mode_for_video(
+    meta: &serde_json::Value,
+    video: &serde_json::Value,
+    selected_audio: bool,
+) -> Result<&'static str> {
     let streams = meta["streams"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("no_streams"))?;
-    let video = streams
-        .iter()
-        .find(|s| s["codec_type"] == "video")
-        .ok_or_else(|| anyhow::anyhow!("no_video"))?;
-    if matches!(
-        video["color_transfer"].as_str(),
-        Some("smpte2084" | "arib-std-b67")
-    ) {
-        bail!("hdr_unsupported");
-    }
     if video["codec_name"] != "h264"
         || !matches!(video["pix_fmt"].as_str(), Some("yuv420p" | "yuvj420p"))
     {
@@ -328,6 +428,11 @@ mod compatibility_tests {
         assert_eq!(compatible_mode(&m, false).unwrap(), "direct");
         assert_eq!(compatible_mode(&m, true).unwrap(), "remux");
         m["streams"][0]["pix_fmt"] = json!("yuv420p10le");
+        assert_eq!(
+            compatible_mode(&m, false).unwrap_err().to_string(),
+            "unclassified_video_range"
+        );
+        m["streams"][0]["color_transfer"] = json!("bt709");
         assert_eq!(compatible_mode(&m, false).unwrap(), "transcode");
         m["streams"][0]["color_transfer"] = json!("smpte2084");
         assert!(compatible_mode(&m, false).is_err());

@@ -332,10 +332,36 @@ await isolatedMediaStack(
     f.sql(
       `UPDATE room_snapshots SET state=jsonb_set(jsonb_set(state,'{media_id}','"${agentMedia}"'),'{media_generation}','3') WHERE room_id='${room.id}'`,
     );
-    const nas = await client.request("/playback-candidates", "POST", {
-      ...request,
-      media_generation: 3,
-    });
+    // The response follows physical probe shutdown, while its durable ACK is
+    // persisted by an owned task. Hold that exact ACK path to prove the response
+    // can arrive first, then require the actual receipt after releasing the lock.
+    const ackKey = 345612987;
+    const ackLock = f.sqlProcess(undefined, { interactive: true });
+    ackLock.stdout.resume();
+    ackLock.stdin.write(`BEGIN; SELECT pg_advisory_xact_lock(${ackKey});\n`);
+    await f.waitForSql(`SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=${ackKey} AND granted`, "1", 5000);
+    f.sql(`CREATE FUNCTION fixture_hold_candidate_ack() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.drained_at IS NOT NULL AND OLD.drained_at IS NULL AND EXISTS(SELECT 1 FROM playback_sessions WHERE id=NEW.session_id AND media_id='${agentMedia}') THEN
+        PERFORM pg_advisory_xact_lock(${ackKey});
+      END IF; RETURN NEW; END $$;
+      CREATE TRIGGER fixture_hold_candidate_ack BEFORE UPDATE OF drained_at ON playback_preparations FOR EACH ROW EXECUTE FUNCTION fixture_hold_candidate_ack();`);
+    let nas;
+    const probeReceipts = `FROM playback_preparations p JOIN playback_sessions s ON s.id=p.session_id WHERE s.media_id='${agentMedia}'`;
+    try {
+      nas = await client.request("/playback-candidates", "POST", {
+        ...request,
+        media_generation: 3,
+      });
+      assert.equal(f.sql(`SELECT count(*) ${probeReceipts}`), "1", "one owned provisional NAS grant");
+      await f.waitForSql(`SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=${ackKey} AND NOT granted`, "1", 5000);
+      assert.equal(f.sql(`SELECT count(*) ${probeReceipts} AND p.drained_at IS NULL`), "1", "HTTP success does not fabricate an uncommitted drain receipt");
+    } finally {
+      ackLock.stdin.end("COMMIT;\n");
+      await ackLock.done;
+    }
+    await f.waitForSql(`SELECT count(*) ${probeReceipts} AND p.drained_at IS NOT NULL`, "1", 5000);
+    f.sql("DROP TRIGGER fixture_hold_candidate_ack ON playback_preparations; DROP FUNCTION fixture_hold_candidate_ack();");
+    await f.waitForSql("SELECT count(*) FROM playback_preparations WHERE drained_at IS NULL", "0", 5000);
     assert.ok(nas.binding);
     assert.equal(nas.candidates[0].id, "direct");
     assert.equal(
@@ -357,7 +383,7 @@ await isolatedMediaStack(
       "0",
     );
     console.log(
-      "PASS: first-use NAS candidates use verified versioned Worker probe and drain their temporary grant",
+      "PASS: first-use NAS candidates return before an intentionally held ACK, then persist their exact drain receipt and leave no live temporary grant",
     );
     const nasReport = {
       binding: nas.binding,

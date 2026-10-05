@@ -1,3 +1,4 @@
+import { reapOwnedChildren } from "../../deploy/owned-process.mjs";
 import { isolatedServer, delay } from "./server.mjs";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
@@ -15,6 +16,7 @@ export async function isolatedMediaStack(name, run, options = {}) {
     let worker, agent, agentPair, launch = 0;
     const workerPort = await port(); f.workerOrigin = `http://127.0.0.1:${workerPort}`;
     const start = (binary, env, args = []) => {
+      f.abortSignal?.throwIfAborted();
       const log = createWriteStream(resolve(f.root, `child-${++launch}.log`)); streams.push(log);
       const child = spawn(binary, args, { env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
       children.add(child); child.failure = null;
@@ -22,27 +24,33 @@ export async function isolatedMediaStack(name, run, options = {}) {
       child.done = new Promise(r => child.once("close", code => { children.delete(child); r(code); }));
       child.stdout.pipe(log, { end: false }); child.stderr.pipe(log, { end: false }); return child;
     };
-    const stop = async child => { if (child && child.exitCode === null) { child.kill(); await child.done; } };
+    const stop = async child => {
+      if (!child) return null;
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      const code = await child.done;
+      return { pid: child.pid ?? null, observed_close: true, exit_code: code, signal: child.signalCode };
+    };
     f.startWorker = async (extra = {}) => {
       if (worker?.exitCode === null) throw Error("Worker already owned and running");
       worker = start(resolve(f.target, `rainsync-media-worker${process.platform === "win32" ? ".exe" : ""}`), { ...f.env, WORKER_BIND: `127.0.0.1:${workerPort}`, PUBLIC_ORIGIN: f.workerOrigin, ...extra });
       f.workerPid = worker.pid;
       for (let i=0; i<100; i++) {
+        f.abortSignal?.throwIfAborted();
         if (worker.failure || worker.exitCode !== null) throw Error("Fixture Worker failed; inspect child log");
         try { if ((await fetch(f.workerOrigin + "/health")).ok) return; } catch {}
         await delay(100);
       }
       throw Error("Fixture Worker timeout");
     };
-    f.stopWorker = async () => { await stop(worker); worker = undefined; };
-    f.startAgent = async () => {
+    f.stopWorker = async () => { const outcome = await stop(worker); worker = undefined; return outcome; };
+    f.startAgent = async ({ mediaRoot = f.root } = {}) => {
       const admin = f.client(); await admin.login();
       const created = agentPair ??= await admin.request("/agents", "POST", { name: "owned preview agent" });
-      agent = start(resolve(f.target, `rainsync-nas-agent${process.platform === "win32" ? ".exe" : ""}`), { ...f.env, SERVER_URL: f.origin, AGENT_DATA_ORIGIN: f.workerOrigin, PAIR_CODE: created.pair_code, MEDIA_ROOT: f.root, AGENT_CREDENTIAL_FILE: resolve(f.root, "agent-token") });
+      agent = start(resolve(f.target, `rainsync-nas-agent${process.platform === "win32" ? ".exe" : ""}`), { ...f.env, SERVER_URL: f.origin, AGENT_DATA_ORIGIN: f.workerOrigin, PAIR_CODE: created.pair_code, MEDIA_ROOT: mediaRoot, AGENT_CREDENTIAL_FILE: resolve(f.root, "agent-token") });
       f.agentPid = agent.pid;
       return { agentId: created.id };
     };
-    f.stopAgent = async () => { await stop(agent); agent = undefined; };
+    f.stopAgent = async () => { const outcome = await stop(agent); agent = undefined; return outcome; };
     f.makeClip = async (name, { blackSeconds = 0, pictureSeconds = 1, width = 640, height = 360, color = "red", rotate = 0 } = {}) => {
       const file = resolve(f.root, name);
       const filter = blackSeconds ? `color=black:s=${width}x${height}:r=25:d=${blackSeconds}[a];color=${color}:s=${width}x${height}:r=25:d=${pictureSeconds}[b];[a][b]concat=n=2:v=1:a=0` : `color=${color}:s=${width}x${height}:r=25:d=${pictureSeconds}`;
@@ -66,6 +74,9 @@ export async function isolatedMediaStack(name, run, options = {}) {
       throw Error(`Preview did not become ${expectedStatus}`);
     };
     try { await writeFile(resolve(f.root, "ownership.json"), JSON.stringify({ fixture: f.id, container: f.container, workerPort })); await run(f); }
-    finally { for (const child of children) child.kill(); await Promise.all([...children].map(c => c.done)); for (const stream of streams) await new Promise(r => stream.end(r)); }
+    finally {
+      try { await reapOwnedChildren([...children].map(child => ({ child, closed: child.done }))); }
+      finally { for (const stream of streams) await new Promise(r => stream.end(r)); }
+    }
   }, options);
 }

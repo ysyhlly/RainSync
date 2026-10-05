@@ -26,6 +26,17 @@
       ],
       "format": "double"
     },
+    "live": {
+      "description": "Derived from the selected immutable room-private media by the server.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NativePlatformLiveBinding"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "media_generation": {
       "type": "integer",
       "format": "uint32",
@@ -67,6 +78,38 @@
     "clock_epoch"
   ],
   "$defs": {
+    "NativePlatformLiveBinding": {
+      "type": "object",
+      "properties": {
+        "broadcast_id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 5
+        },
+        "sync_mode": {
+          "$ref": "#/$defs/NativePlatformLiveSyncMode"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 2,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "broadcast_id",
+        "sync_mode"
+      ]
+    },
+    "NativePlatformLiveSyncMode": {
+      "description": "No shared program-date-time mapping is certified. Only live-edge playback\nand room play/pause controls are shared, never a frame-aligned VOD clock.",
+      "type": "string",
+      "enum": [
+        "live_edge_control"
+      ]
+    },
     "PlaybackStatus": {
       "type": "string",
       "enum": [

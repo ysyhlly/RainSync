@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlaybackMetricsSampleV2",
+  "type": "object",
+  "properties": {
+    "elapsed_ms": {
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 604800000,
+      "minimum": 0
+    },
+    "final": {
+      "type": "boolean"
+    },
+    "first_frame": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PlaybackMetricsFirstFrame"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "first_frame_plan_generation": {
+      "description": "The originating published grant, never a local source callback counter.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 1
+    },
+    "media_generation": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "meter_start_generation": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 1
+    },
+    "plan_generation": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 1
+    },
+    "seq": {
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 9007199254740991,
+      "minimum": 1
+    },
+    "startup_origin": {
+      "$ref": "#/$defs/PlaybackMetricsOrigin"
+    },
+    "startup_phases": {
+      "$ref": "#/$defs/PlaybackMetricsStartupPhases"
+    },
+    "totals": {
+      "$ref": "#/$defs/PlaybackMetricsTotals"
+    },
+    "version": {
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 2,
+      "minimum": 2
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "media_generation",
+    "plan_generation",
+    "meter_start_generation",
+    "seq",
+    "startup_origin",
+    "elapsed_ms",
+    "totals",
+    "startup_phases",
+    "final"
+  ],
+  "$defs": {
+    "PlaybackMetricsFirstFrame": {
+      "type": "object",
+      "properties": {
+        "confirmed_elapsed_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "evidence": {
+          "$ref": "#/$defs/PlaybackMetricsFrameEvidence"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "elapsed_ms",
+        "confirmed_elapsed_ms",
+        "evidence"
+      ]
+    },
+    "PlaybackMetricsFrameEvidence": {
+      "type": "string",
+      "enum": [
+        "video_frame_callback",
+        "playing_time_advance"
+      ]
+    },
+    "PlaybackMetricsOrigin": {
+      "type": "string",
+      "enum": [
+        "user_intent",
+        "automatic_load"
+      ]
+    },
+    "PlaybackMetricsStartupPhases": {
+      "description": "Separate cumulative startup coverage through first-frame confirmation.\nThis is not a breakdown of the mutually exclusive playback state counters.",
+      "type": "object",
+      "properties": {
+        "loading_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "preparation_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "unobserved_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "preparation_ms",
+        "loading_ms",
+        "unobserved_ms"
+      ]
+    },
+    "PlaybackMetricsTotals": {
+      "type": "object",
+      "properties": {
+        "autoplay_blocked_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "background_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "paused_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "playing_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "rebuffer_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "seeking_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "startup_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        },
+        "unobserved_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 604800000,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "startup_ms",
+        "autoplay_blocked_ms",
+        "background_ms",
+        "paused_ms",
+        "seeking_ms",
+        "rebuffer_ms",
+        "playing_ms",
+        "unobserved_ms"
+      ]
+    }
+  }
+}

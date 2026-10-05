@@ -1,7 +1,14 @@
+pub mod diagnostics;
+pub mod replay;
+
 use protocol::{Action, Command, PlaybackStatus, RoomState, VERSION};
 use uuid::Uuid;
 
 pub fn position(state: &RoomState, now: f64) -> f64 {
+    if state.live.is_some() {
+        // An elapsed room clock is not a broadcast timeline.
+        return 0.0;
+    }
     let elapsed = if state.playback_status == PlaybackStatus::Playing {
         (now - state.anchor_server_time_ms).max(0.0) * state.playback_rate
     } else {
@@ -51,13 +58,25 @@ pub fn reduce(
     if state.media_id.is_none() && !matches!(command.action, Action::ChangeMedia { .. }) {
         return Err("no_media");
     }
+    if state.live.is_some() {
+        if command.live_version != Some(1) {
+            return Err("native_live_client_unsupported");
+        }
+        match command.action {
+            Action::Seek { .. } => return Err("native_live_seek_unsupported"),
+            Action::SetRate { rate } if rate != 1.0 => return Err("native_live_rate_unsupported"),
+            Action::EndMedia { .. } => return Err("native_live_end_unsupported"),
+            _ => {}
+        }
+    }
     let mut next = state.clone();
     next.anchor_position_ms = position(state, now);
     next.anchor_server_time_ms = now;
     match command.action {
         Action::Play => {
-            if state.playback_status == PlaybackStatus::Ended
-                || state.duration_ms.is_some_and(|d| position(state, now) >= d)
+            if state.live.is_none()
+                && (state.playback_status == PlaybackStatus::Ended
+                    || state.duration_ms.is_some_and(|d| position(state, now) >= d))
             {
                 next.anchor_position_ms = 0.0;
                 next.media_generation = next
@@ -104,6 +123,10 @@ pub fn reduce(
                 .ok_or("generation_overflow")?;
             next.anchor_position_ms = 0.0;
             next.duration_ms = None;
+            if state.live.is_some() {
+                next.playback_rate = 1.0;
+            }
+            next.live = None;
             next.playback_status = PlaybackStatus::Playing;
         }
     }
@@ -126,12 +149,14 @@ mod tests {
             playback_rate: 2.0,
             controller_user_id: Uuid::new_v4(),
             duration_ms: Some(10000.0),
+            live: None,
             clock_epoch: Uuid::new_v4(),
         };
         let c = Command {
             protocol_version: VERSION,
             room_id: s.room_id,
             command_id: Uuid::new_v4(),
+            live_version: None,
             control_epoch: None,
             expected_revision: 4,
             media_generation: 2,

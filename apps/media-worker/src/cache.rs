@@ -40,7 +40,7 @@ pub async fn reserve_output(
     claim: &persistence::media_jobs::Claim,
 ) -> anyhow::Result<()> {
     use persistence::cache_budget::{self, Admission};
-    let bytes = claim.spec["estimated_output_bytes"]
+    let output_bytes = claim.spec["estimated_output_bytes"]
         .as_u64()
         .unwrap_or_else(|| {
             std::env::var("CACHE_UNKNOWN_OUTPUT_BYTES")
@@ -49,20 +49,52 @@ pub async fn reserve_output(
                 .filter(|v| *v > 0)
                 .unwrap_or(2 * 1024 * 1024 * 1024)
         });
+    // Descriptor-backed remote subtitle/HDR recipes reserve their complete
+    // finite materialization together with the original output writer slot.
+    // Asset copies are source-associated and bounded before this admission.
+    let input_bytes = claim.spec["held_input_bytes"].as_u64().unwrap_or(0);
+    let asset_bytes = if let Some(value) = claim.spec.get("advanced_assets") {
+        let catalog: media_core::advanced_media::AssetCatalog =
+            serde_json::from_value(value.clone())?;
+        if claim.spec["kind"] == "remote_asset_transcode_v1" {
+            let remote: media_core::advanced_media::RemoteAssetCatalog =
+                serde_json::from_value(claim.spec["advanced_remote_assets"].clone())?;
+            remote.validate(
+                claim.spec["source_kind"].as_str().unwrap_or(""),
+                claim.spec["resource"].as_str().unwrap_or(""),
+                claim.spec["source_version"].as_str(),
+            )?;
+            anyhow::ensure!(
+                remote.catalog == catalog,
+                "advanced_asset_source_binding_required"
+            );
+        } else {
+            catalog.validate(
+                claim.spec["resource"].as_str().unwrap_or(""),
+                claim.spec["source_version"].as_str().unwrap_or(""),
+            )?;
+        }
+        let copied_fonts = if claim.spec["kind"] == "remote_asset_transcode_v1" {
+            catalog.fonts.iter().map(|f| f.bytes).sum()
+        } else {
+            0
+        };
+        catalog
+            .bytes()
+            .checked_add(copied_fonts)
+            .ok_or_else(|| anyhow::anyhow!("advanced_media_cache_bound"))?
+    } else {
+        0
+    };
+    let bytes = output_bytes
+        .checked_add(input_bytes)
+        .and_then(|v| v.checked_add(asset_bytes))
+        .ok_or_else(|| anyhow::anyhow!("advanced_media_cache_bound"))?;
     for _ in 0..4 {
         let revision = cache_budget::snapshot(&app.db).await?;
         let root = app.cache.clone();
-        let headroom = media_core::child_process::blocking(move || -> anyhow::Result<u64> {
-            let max = std::env::var("CACHE_MAX_BYTES")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(20 * 1024 * 1024 * 1024);
-            let quota = max.saturating_sub(size(&root)?);
-            let free = fs2::available_space(&root)?;
-            let disk = free.saturating_sub(fs2::total_space(&root)? / 10);
-            Ok(quota.min(disk))
-        })
-        .await??;
+        let headroom =
+            media_core::child_process::blocking(move || reservation_headroom(&root)).await??;
         match cache_budget::reserve(&app.db, claim, revision, bytes, headroom).await? {
             Admission::Reserved => return Ok(()),
             Admission::Changed => continue,
@@ -74,6 +106,19 @@ pub async fn reserve_output(
         }
     }
     Err(process::LeaseInterrupted.into())
+}
+
+/// Read-only capacity observation. A caller must obtain the budget revision
+/// before this filesystem observation and recheck it in the admission transaction.
+pub(super) fn reservation_headroom(root: &std::path::Path) -> anyhow::Result<u64> {
+    let max = std::env::var("CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(20 * 1024 * 1024 * 1024);
+    let quota = max.saturating_sub(size(root)?);
+    let free = fs2::available_space(root)?;
+    let disk = free.saturating_sub(fs2::total_space(root)? / 10);
+    Ok(quota.min(disk))
 }
 fn size(path: &std::path::Path) -> std::io::Result<u64> {
     let mut bytes = 0;

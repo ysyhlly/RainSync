@@ -1,0 +1,30 @@
+{
+  "code": 0,
+  "result": {
+    "season_id": 12345,
+    "title": "Synthetic PGC series",
+    "rights": {
+      "area_limit": 0
+    },
+    "episodes": [
+      {
+        "id": 1,
+        "title": "1",
+        "is_preview": 1
+      },
+      {
+        "id": 9007199254740993,
+        "aid": 9007199254740997,
+        "bvid": "BV1xx411c7mD",
+        "cid": 9007199254740995,
+        "duration": 90090,
+        "title": "2",
+        "long_title": "Synthetic full episode",
+        "season_id": 12345,
+        "rights": {
+          "area_limit": 0
+        }
+      }
+    ]
+  }
+}

@@ -3,6 +3,7 @@ import { ref, watch, nextTick, onMounted } from "vue";
 import { useRoomRuntime } from "./room-runtime";
 import UserAvatar from "../../shared/ui/UserAvatar.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
+import TimelineChatPanel from "./TimelineChatPanel.vue";
 const r = useRoomRuntime(),
   log = ref<HTMLElement>(),
   atBottom = ref(true),
@@ -64,7 +65,7 @@ onMounted(bottom);
               })
             }}</time
           >
-          <p>{{ m.body }}</p>
+          <p>{{ m.body || "消息已删除" }}</p>
         </div>
       </article>
     </div>
@@ -95,5 +96,6 @@ onMounted(bottom);
         r.chatPending ? "正在等待发送确认…" : "消息未确认，保留原编号以供重试。"
       }}
     </p>
+    <TimelineChatPanel />
   </aside>
 </template>

@@ -1,10 +1,28 @@
+pub mod access_policy;
+pub mod media_request;
+pub mod platform;
+pub mod source_access_contract;
+pub mod static_hls;
+pub use media_request::source_media_request;
+pub mod account_policy;
+pub mod upstream_profiles;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+pub mod emby;
+pub mod jellyfin;
 pub mod preview;
+pub mod s3;
+mod upstream_common;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advanced_assets: Option<media_core::advanced_media::HttpAssetAssociation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3: Option<s3::S3Config>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_policy: Option<access_policy::SourceAccessPolicy>,
     #[serde(default)]
     pub root: String,
     #[serde(default)]
@@ -55,14 +73,12 @@ pub fn upstream_url(base: &reqwest::Url, path: &str) -> Result<reqwest::Url> {
     anyhow::ensure!(url.origin() == base.origin(), "upstream_origin_mismatch");
     Ok(url)
 }
-fn base(config: &SourceConfig) -> Result<String> {
-    Ok(validate_url(&config.url)?
-        .as_str()
-        .trim_end_matches('/')
-        .to_string())
-}
 
 pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> {
+    anyhow::ensure!(
+        kind == "s3" || config.s3.is_none(),
+        "s3_source_kind_mismatch"
+    );
     match kind {
         "local" => {
             let root = std::path::PathBuf::from(&config.root).canonicalize()?;
@@ -112,61 +128,9 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
                 metadata: json!({}),
             }])
         }
-        "jellyfin" | "emby" => {
-            if config.user_id.is_empty() || config.token.is_empty() {
-                bail!("upstream_credentials_required")
-            }
-            let mut result = vec![];
-            let mut start = 0;
-            let mut expected_total = None;
-            loop {
-                let url = format!("{}/Users/{}/Items", base(config)?, config.user_id);
-                let mut req = client().get(url).query(&[
-                    ("Recursive", "true"),
-                    ("IncludeItemTypes", "Movie,Episode,Video,MusicVideo"),
-                    ("Limit", "200"),
-                    ("StartIndex", &start.to_string()),
-                ]);
-                req = if kind == "jellyfin" {
-                    req.header(
-                        "Authorization",
-                        format!("MediaBrowser Token=\"{}\"", config.token),
-                    )
-                } else {
-                    req.header("X-Emby-Token", &config.token)
-                };
-                let value: Value = req.send().await?.error_for_status()?.json().await?;
-                let total = value["TotalRecordCount"]
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("invalid_library_total"))?;
-                anyhow::ensure!(
-                    expected_total.is_none_or(|n| n == total),
-                    "library_changed_during_scan"
-                );
-                expected_total = Some(total);
-                let rows = value["Items"]
-                    .as_array()
-                    .ok_or_else(|| anyhow::anyhow!("invalid_library_response"))?;
-                for v in rows {
-                    result.push(Item {
-                        title: v["Name"].as_str().unwrap_or("Untitled").into(),
-                        resource: v["Id"]
-                            .as_str()
-                            .ok_or_else(|| anyhow::anyhow!("missing_id"))?
-                            .into(),
-                        duration_ms: v["RunTimeTicks"].as_f64().map(|v| v / 10000.0),
-                        metadata: json!({"ImageTags":v["ImageTags"],"BackdropImageTags":v["BackdropImageTags"]}),
-                    });
-                }
-                start += rows.len();
-                anyhow::ensure!(start as u64 <= total, "invalid_library_total");
-                if start as u64 == total {
-                    break;
-                };
-                anyhow::ensure!(!rows.is_empty(), "incomplete_library_response");
-            }
-            Ok(result)
-        }
+        "jellyfin" => jellyfin::list_items(config).await,
+        "emby" => emby::list_items(config).await,
+        "s3" => s3::list_items(config).await,
         _ => bail!("source_requires_agent_index"),
     }
 }
@@ -175,6 +139,7 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
 pub struct PlaybackOptions {
     pub position_ms: f64,
     pub audio_index: Option<u32>,
+    pub media_source_id: Option<String>,
     pub progressive: bool,
     pub hls: bool,
     pub force_transcode: bool,
@@ -184,7 +149,7 @@ pub fn playback_request(config: &SourceConfig, options: &PlaybackOptions) -> Val
     let direct = options.progressive && !options.force_transcode && options.audio_index.is_none();
     json!({"UserId":config.user_id,"IsPlayback":true,"AutoOpenLiveStream":false,
     "StartTimeTicks":(options.position_ms * 10000.0).round() as i64,
-    "AudioStreamIndex":options.audio_index,"SubtitleStreamIndex":-1,
+    "AudioStreamIndex":options.audio_index,"MediaSourceId":options.media_source_id,"SubtitleStreamIndex":-1,
     "EnableDirectPlay":direct,"EnableDirectStream":options.hls && !options.force_transcode,
     "EnableTranscoding":options.hls,"AllowVideoStreamCopy":!options.force_transcode,
     "DeviceProfile":{"Name":"RainSync Web","MaxStreamingBitrate":12000000,
@@ -201,17 +166,47 @@ pub async fn upstream_plan(
     options: &PlaybackOptions,
     device_id: &str,
 ) -> Result<Value> {
-    let body = playback_request(config, options);
-    let mut url = validate_url(&format!("{}/", base(config)?))?;
-    url.path_segments_mut()
-        .map_err(|_| anyhow::anyhow!("invalid_upstream_base"))?
-        .pop_if_empty()
-        .extend(["Items", item, "PlaybackInfo"]);
-    let mut req = client().post(url).json(&body);
-    for (name, value) in upstream_headers(kind, config, device_id)? {
-        req = req.header(name, value);
+    match kind {
+        "jellyfin" => jellyfin::upstream_plan(config, item, options, device_id).await,
+        "emby" => emby::upstream_plan(config, item, options, device_id).await,
+        _ => bail!("invalid_upstream_kind"),
     }
-    Ok(req.send().await?.error_for_status()?.json().await?)
+}
+
+/// Discover an explicit audio track's source without allocating a play session.
+pub async fn upstream_audio_source(
+    kind: &str,
+    config: &SourceConfig,
+    item: &str,
+    audio_index: u32,
+    device_id: &str,
+) -> Result<String> {
+    upstream_common::audio_source(
+        config,
+        item,
+        audio_index,
+        upstream_headers(kind, config, device_id)?,
+    )
+    .await
+}
+
+/// Explicit profile recipe only. The caller owns the reservation and must
+/// checkpoint its complete response before validating the returned route.
+pub async fn upstream_profile_plan(
+    kind: &str,
+    config: &SourceConfig,
+    item: &str,
+    options: &PlaybackOptions,
+    metadata: &upstream_profiles::UpstreamProfileMetadata,
+    device_id: &str,
+) -> Result<Value> {
+    match kind {
+        "jellyfin" => {
+            jellyfin::upstream_profile_plan(config, item, options, metadata, device_id).await
+        }
+        "emby" => emby::upstream_profile_plan(config, item, options, metadata, device_id).await,
+        _ => bail!("invalid_upstream_kind"),
+    }
 }
 
 /// The same device identity must accompany negotiation, media/subtitle delivery
@@ -291,6 +286,68 @@ pub fn checkin_confirmed(status: reqwest::StatusCode) -> bool {
         status,
         reqwest::StatusCode::OK | reqwest::StatusCode::NO_CONTENT
     )
+}
+
+/// Source headers are scoped to the configured origin. Authority/hop headers
+/// cannot turn an allowed endpoint into a different routing or framing target.
+pub fn validate_source_headers(headers: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        anyhow::ensure!(
+            !matches!(
+                lower.as_str(),
+                "host"
+                    | "connection"
+                    | "proxy-authorization"
+                    | "proxy-connection"
+                    | "transfer-encoding"
+                    | "content-length"
+                    | "upgrade"
+                    | "te"
+                    | "trailer"
+                    | "keep-alive"
+            ),
+            "invalid_source_header"
+        );
+        reqwest::header::HeaderName::from_bytes(name.as_bytes())?;
+        reqwest::header::HeaderValue::from_str(value)?;
+    }
+    Ok(())
+}
+pub async fn source_request(
+    config: &SourceConfig,
+    target: &str,
+    method: reqwest::Method,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Result<reqwest::RequestBuilder> {
+    anyhow::ensure!(config.s3.is_none(), "s3_requires_read_transport");
+    validate_source_headers(headers)?;
+    let access = access_policy::SourceAccess::new(&config.url, config.access_policy.as_ref())?;
+    let client = access.client_for(target).await?;
+    let mut request = client.request(method);
+    if client.source_credentials_allowed() {
+        for (name, value) in headers {
+            request = request.header(name, value)
+        }
+    }
+    Ok(request)
+}
+
+/// Internal encrypted resource envelope; old grants retain the legacy origin.
+pub fn resource_config(resource: &Value) -> Result<SourceConfig> {
+    let url = resource["source_url"]
+        .as_str()
+        .or_else(|| resource["upstream_base"].as_str())
+        .or_else(|| resource["url"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid_source_url"))?;
+    let headers = resource
+        .get("headers")
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    Ok(serde_json::from_value(
+        json!({"url":url,"headers":headers,"access_policy":resource.get("access_policy"),"s3":resource.get("s3")}),
+    )?)
 }
 
 #[cfg(test)]
@@ -409,6 +466,7 @@ mod playback_tests {
         let options = PlaybackOptions {
             position_ms: 1234.5,
             audio_index: Some(2),
+            media_source_id: Some("observed-source".into()),
             progressive: true,
             hls: true,
             force_transcode: false,
@@ -416,6 +474,7 @@ mod playback_tests {
         let body = playback_request(&config, &options);
         assert_eq!(body["StartTimeTicks"], 12345000);
         assert_eq!(body["AudioStreamIndex"], 2);
+        assert_eq!(body["MediaSourceId"], "observed-source");
         assert_eq!(body["EnableDirectPlay"], false);
         assert_eq!(body["AllowVideoStreamCopy"], true);
         let body = playback_request(

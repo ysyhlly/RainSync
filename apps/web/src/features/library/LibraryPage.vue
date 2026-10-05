@@ -9,6 +9,7 @@ import { useSession } from "../auth/session.store";
 import { useRouter } from "vue-router";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import MediaThumbnail from "./MediaThumbnail.vue";
+import PluginMetadata from "../plugins/PluginMetadata.vue";
 import Notice from "../../shared/ui/Notice.vue";
 import { formatTime } from "../../shared/use-action";
 import ScanAllSources from "../admin/ScanAllSources.vue";
@@ -65,6 +66,7 @@ onBeforeUnmount(() => {
         <p>浏览片源中的影片，在当前房间播放或加入待播。</p>
       </div>
     </div>
+    <RouterLink class="button" to="/libraries">我的媒体库与共享授权</RouterLink>
     <ScanAllSources v-if="session.user?.admin" @complete="refresh" />
     <form class="search-form" role="search" @submit.prevent="submit">
       <AppIcon name="search" /><input
@@ -134,6 +136,7 @@ onBeforeUnmount(() => {
               : "时长未知"
           }}
         </p>
+        <PluginMetadata :media-id="item.id" :refresh-key="library.refreshKey" />
         <div class="media-actions">
           <button
             :aria-label="'重命名 ' + item.title"

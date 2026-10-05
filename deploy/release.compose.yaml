@@ -1,0 +1,68 @@
+# Explicit release-only service selection. Before starting, validate digest refs
+# and runtime proof using release-lock.mjs. No floating images or source builds.
+name: ${RAINSYNC_PROJECT:?Set a distinct release project name}
+services:
+  db:
+    image: ${RAINSYNC_POSTGRES_IMAGE:?Set measured platform PostgreSQL digest reference}
+    environment:
+      POSTGRES_USER: rainsync
+      POSTGRES_DB: rainsync
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes: [database:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U rainsync"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+  server:
+    image: ${RAINSYNC_BACKEND_IMAGE:?Set measured platform backend digest reference}
+    # An older image lacking this minimum-contract gate cannot be started here.
+    entrypoint: ["/usr/local/bin/rainsync-source-access-entrypoint"]
+    environment: &backend
+      DATABASE_URL: postgres://rainsync:${POSTGRES_PASSWORD}@db/rainsync
+      SOURCE_ENCRYPTION_KEY: ${SOURCE_ENCRYPTION_KEY:?Set SOURCE_ENCRYPTION_KEY}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN}
+      MEDIA_ORIGIN: ${MEDIA_ORIGIN:-${PUBLIC_ORIGIN}}
+      AGENT_DATA_ORIGIN: ${AGENT_DATA_ORIGIN:-${PUBLIC_ORIGIN}}
+      WORKER_URL: http://worker:8081
+      MEDIA_ROOT: /media
+      CACHE_ROOT: /cache
+      CACHE_MAX_BYTES: ${CACHE_MAX_BYTES:-21474836480}
+      CACHE_UNKNOWN_OUTPUT_BYTES: ${CACHE_UNKNOWN_OUTPUT_BYTES:-2147483648}
+      PLAYBACK_SESSION_LIMIT: ${PLAYBACK_SESSION_LIMIT:-2}
+      MEDIA_QUEUE_LIMIT: ${MEDIA_QUEUE_LIMIT:-20}
+      STATIC_HLS_PARENT_PREPARE_ENABLED: ${STATIC_HLS_PARENT_PREPARE_ENABLED:-0}
+      RUST_LOG: info
+    volumes: ["${MEDIA_PATH:?Set MEDIA_PATH}:/media:ro", "cache:/cache"]
+    depends_on:
+      db: { condition: service_healthy }
+    # Stop grace is a bound, never positive resource-release proof if exceeded.
+    stop_grace_period: 60s
+    restart: unless-stopped
+  worker:
+    image: ${RAINSYNC_BACKEND_IMAGE:?Set measured platform backend digest reference}
+    command: [rainsync-media-worker]
+    environment:
+      <<: *backend
+      RAINSYNC_VIDEO_ENCODER: ${RAINSYNC_VIDEO_ENCODER:-software}
+      STATIC_HLS_CHILD_EXECUTION_ENABLED: ${STATIC_HLS_CHILD_EXECUTION_ENABLED:-0}
+      SERVER_INTERNAL_URL: http://server:8080
+    volumes: ["${MEDIA_PATH:?Set MEDIA_PATH}:/media:ro", "cache:/cache"]
+    depends_on: [server]
+    stop_grace_period: 60s
+    restart: unless-stopped
+  web:
+    image: ${RAINSYNC_WEB_IMAGE:?Set measured platform web digest reference}
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports: ["${HTTP_PORT:-8088}:80", "${HTTPS_PORT:-8443}:443"]
+    volumes: [caddy_data:/data, caddy_config:/config]
+    depends_on: [server, worker]
+    restart: unless-stopped
+volumes:
+  database:
+  cache:
+  caddy_data:
+  caddy_config:

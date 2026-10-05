@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ControlRecoveryMetricsSample",
+  "description": "Successful state application reported by a client, not physical network\nrestoration, playback recovery, authority, or independent timing evidence.",
+  "type": "object",
+  "properties": {
+    "background": {
+      "type": "boolean"
+    },
+    "disconnect_observed_to_state_applied_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "socket_open_to_state_applied_ms": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "type": {
+      "$ref": "#/$defs/ControlRecoveryMessageType"
+    },
+    "version": {
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "type",
+    "version",
+    "socket_open_to_state_applied_ms",
+    "background"
+  ],
+  "$defs": {
+    "ControlRecoveryMessageType": {
+      "type": "string",
+      "enum": [
+        "CONTROL_RECOVERY_METRICS"
+      ]
+    }
+  }
+}

@@ -36,7 +36,47 @@ pub async fn errors(request: Request, next: Next) -> Response {
         .unwrap_or("");
     let code = ErrorCode::from_reason(reason, parts.status.as_u16());
     let mut error = ApiError::new(code, request_id);
-    if code == ErrorCode::RateLimited {
+    // Fixed allowlisted wording. Never reflect source/probe/provider text.
+    match reason {
+        "legacy_stream_mapping_unsupported" => {
+            error.message = "此片源的媒体轨道映射无法安全用于当前生成播放路径".into()
+        }
+        "local_hls_ladder_source_required" => {
+            error.message = "多清晰度 HLS 当前仅支持已核对版本的本地片源".into()
+        }
+        "local_hls_ladder_source_unsupported" => {
+            error.message = "当前片源不满足多清晰度 HLS 的 SDR、轨道或画面要求".into()
+        }
+        "local_hls_ladder_duration_required" => {
+            error.message =
+                "多清晰度 HLS 需要已验证的时长（最长 24 小时），且起点必须早于结尾".into()
+        }
+        "local_hls_ladder_advanced_incompatible" => {
+            error.message = "多清晰度 HLS 暂不能与 HDR 色调映射或字幕烧录一起使用".into()
+        }
+        "dedicated_local_hls_ladder_endpoint_required" => {
+            error.message = "多清晰度 HLS 需要受支持的专用接口，请更新客户端和服务端".into()
+        }
+        "advanced_local_source_required" => {
+            error.message = "高级播放当前仅支持由 Server 完整持有并核对版本的本地片源".into()
+        }
+        "dedicated_advanced_endpoint_required" => {
+            error.message = "高级播放需要受支持的专用接口，请更新客户端和服务端".into()
+        }
+        "invalid_subtitle_track" => {
+            error.message = "所选嵌入字幕不可用或无法安全烧录，请重新加载片源信息".into()
+        }
+        _ => {}
+    }
+    if matches!(
+        code,
+        ErrorCode::RateLimited
+            | ErrorCode::ChatRateLimited
+            | ErrorCode::ReactionRateLimited
+            | ErrorCode::ComputeRoomQueueFull
+            | ErrorCode::P2pSignalBudgetExceeded
+            | ErrorCode::P2pRoomPeerBudgetExceeded
+    ) {
         error.retry_after_ms = parts
             .headers
             .get(header::RETRY_AFTER)
@@ -71,6 +111,122 @@ mod tests {
     use super::*;
     use axum::{Router, routing::get};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn chat_and_reaction_limits_preserve_explicit_bounded_backoff() {
+        for (reason, expected) in [
+            ("chat_rate_limited", ErrorCode::ChatRateLimited),
+            ("reaction_rate_limited", ErrorCode::ReactionRateLimited),
+        ] {
+            let router = Router::new()
+                .route(
+                    "/",
+                    get(move || async move {
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            [(header::RETRY_AFTER, "2")],
+                            Json(serde_json::json!({"error":reason})),
+                        )
+                    }),
+                )
+                .layer(axum::middleware::from_fn(errors));
+            let response = router
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            let value: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value.error.code, expected);
+            assert!(value.error.retryable);
+            assert_eq!(value.error.retry_after_ms, Some(2000));
+        }
+    }
+    #[tokio::test]
+    async fn advanced_aliases_have_fixed_nonretryable_messages() {
+        for (reason, status, code, text) in [
+            (
+                "advanced_local_source_required",
+                422,
+                ErrorCode::UnsupportedVideoOrHdr,
+                "本地片源",
+            ),
+            (
+                "dedicated_advanced_endpoint_required",
+                400,
+                ErrorCode::InvalidRequest,
+                "专用接口",
+            ),
+            (
+                "invalid_subtitle_track",
+                400,
+                ErrorCode::InvalidSubtitle,
+                "嵌入字幕",
+            ),
+        ] {
+            let router = Router::new()
+                .route(
+                    "/",
+                    get(move || async move {
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            Json(serde_json::json!({"error":reason})),
+                        )
+                    }),
+                )
+                .layer(axum::middleware::from_fn(errors));
+            let response = router
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            let decoded: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(decoded.error.code, code);
+            assert!(decoded.error.message.contains(text));
+            assert!(!decoded.error.retryable);
+        }
+    }
+
+    #[tokio::test]
+    async fn mapping_refusal_has_specific_wording_and_preserves_prior_video_errors() {
+        for reason in [
+            "legacy_stream_mapping_unsupported",
+            "unsupported_video_or_hdr",
+            "hdr_unsupported",
+            "drm_unsupported",
+        ] {
+            let router = Router::new()
+                .route(
+                    "/",
+                    get(move || async move {
+                        (
+                            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(serde_json::json!({"error":reason})),
+                        )
+                    }),
+                )
+                .layer(axum::middleware::from_fn(errors));
+            let response = router
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 422);
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            let decoded: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(decoded.error.code, ErrorCode::from_reason(reason, 422));
+            assert!(!decoded.error.retryable);
+            if reason == "legacy_stream_mapping_unsupported" {
+                assert!(decoded.error.message.contains("轨道映射"));
+                assert!(!decoded.error.message.contains("HDR"));
+            } else {
+                assert_eq!(
+                    decoded.error.message,
+                    ApiError::new(decoded.error.code, Uuid::nil()).message
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn oversized_and_stalled_upstream_error_bodies_are_bounded() {

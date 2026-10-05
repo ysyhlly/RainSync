@@ -18,6 +18,8 @@ pub struct Reservation<'a> {
     pub room: Uuid,
     pub media: Uuid,
     pub source: Uuid,
+    pub source_policy_revision: i64,
+    pub account_policy_generation: Option<i64>,
     pub generation: i64,
     pub kind: &'a str,
     pub device_id: &'a str,
@@ -28,10 +30,10 @@ pub struct Reservation<'a> {
 
 pub async fn reserve(tx: &mut Transaction<'_, Postgres>, r: &Reservation<'_>) -> Result<()> {
     let epoch = crate::room_lifecycle::lock_active(tx, r.room).await?;
-    sqlx::query("INSERT INTO upstream_reservations(id,user_id,request_key,owner_epoch,room_id,media_id,source_id,generation,kind,device_id,origin_key,scope_encrypted,observation_version,lifecycle_epoch) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)")
+    sqlx::query("INSERT INTO upstream_reservations(id,user_id,request_key,owner_epoch,room_id,media_id,source_id,generation,kind,device_id,origin_key,scope_encrypted,observation_version,lifecycle_epoch,source_policy_revision,account_policy_generation) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)")
         .bind(r.id).bind(r.user).bind(r.request_key).bind(r.owner_epoch).bind(r.room)
         .bind(r.media).bind(r.source).bind(r.generation).bind(r.kind).bind(r.device_id)
-        .bind(r.origin_key).bind(r.scope_encrypted).bind(r.observation_version.map(|version| version as i32)).bind(epoch).execute(&mut **tx).await?;
+        .bind(r.origin_key).bind(r.scope_encrypted).bind(r.observation_version.map(|version| version as i32)).bind(epoch).bind(r.source_policy_revision).bind(r.account_policy_generation).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -83,10 +85,12 @@ async fn lock_admission(tx: &mut Transaction<'_, Postgres>, id: Uuid) -> Result<
 /// proof. Once the call is claimed, a missing SID can only be uncertain.
 pub async fn begin_negotiation(pool: &PgPool, id: Uuid, epoch: Uuid, token: Uuid) -> Result<bool> {
     let mut tx = pool.begin().await?;
-    if !lock_admission(&mut tx, id).await? {
+    if !lock_admission(&mut tx, id).await?
+        || !crate::source_account_policy::lock_reservation(&mut tx, id).await?
+    {
         return Ok(false);
     }
-    let n=sqlx::query("UPDATE upstream_reservations u SET negotiation='running',negotiation_token=$3,negotiation_deadline=clock_timestamp()+interval '30 seconds',io_claim=$3,io_kind='negotiate',io_lease_until=clock_timestamp()+interval '35 seconds',updated_at=clock_timestamp() WHERE u.id=$1 AND u.owner_epoch=$2 AND u.state='preparing' AND u.negotiation='reserved' AND EXISTS(SELECT 1 FROM playback_requests r WHERE r.user_id=u.user_id AND r.idempotency_key=u.request_key AND r.session_id=u.id AND r.owner_epoch=$2 AND r.status='pending' AND r.lease_until>clock_timestamp()) AND EXISTS(SELECT 1 FROM room_snapshots s JOIN room_members m ON m.room_id=s.room_id WHERE s.room_id=u.room_id AND m.user_id=u.user_id AND (s.state->>'media_generation')::bigint=u.generation)")
+    let n=sqlx::query("UPDATE upstream_reservations u SET negotiation='running',negotiation_token=$3,negotiation_deadline=clock_timestamp()+interval '30 seconds',io_claim=$3,io_kind='negotiate',io_lease_until=clock_timestamp()+interval '35 seconds',updated_at=clock_timestamp() WHERE u.id=$1 AND u.owner_epoch=$2 AND u.state='preparing' AND u.negotiation='reserved' AND u.auth_login_hash IS NOT NULL AND playback_origin_allowed(u.user_id,u.room_id,u.auth_login_hash,u.auth_membership_epoch) AND source_account_policy_allowed(u.source_id,u.source_policy_revision,u.account_policy_generation) AND EXISTS(SELECT 1 FROM playback_requests r WHERE r.user_id=u.user_id AND r.idempotency_key=u.request_key AND r.session_id=u.id AND r.owner_epoch=$2 AND r.status='pending' AND r.lease_until>clock_timestamp()) AND EXISTS(SELECT 1 FROM room_snapshots s JOIN room_members m ON m.room_id=s.room_id WHERE s.room_id=u.room_id AND m.user_id=u.user_id AND (s.state->>'media_generation')::bigint=u.generation)")
         .bind(id).bind(epoch).bind(token).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(n.rows_affected() == 1)
@@ -120,18 +124,20 @@ pub async fn activate(
     id: Uuid,
     play_method: &str,
 ) -> Result<bool> {
-    if !lock_admission(tx, id).await? {
+    if !lock_admission(tx, id).await?
+        || !crate::source_account_policy::lock_reservation(tx, id).await?
+    {
         return Ok(false);
     }
-    let n=sqlx::query("UPDATE upstream_reservations SET state='active',play_method=$2,updated_at=clock_timestamp() WHERE id=$1 AND state='preparing' AND negotiation='received' AND play_session_id IS NOT NULL AND io_claim IS NULL")
+    let n=sqlx::query("UPDATE upstream_reservations SET state='active',play_method=$2,updated_at=clock_timestamp() WHERE id=$1 AND auth_login_hash IS NOT NULL AND playback_origin_allowed(user_id,room_id,auth_login_hash,auth_membership_epoch) AND source_account_policy_allowed(source_id,source_policy_revision,account_policy_generation) AND state='preparing' AND negotiation='received' AND play_session_id IS NOT NULL AND io_claim IS NULL")
         .bind(id).bind(play_method).execute(&mut **tx).await?;
     Ok(n.rows_affected() == 1)
 }
 
-/// Reconcile authorization, not application epoch. Completed playback grants
-/// remain authorized across a server restart. Old pending owners do not.
+/// Reconcile room, request and source authorization. Account-observed upstream
+/// grants are invalidated on restart before this maintenance loop starts.
 pub async fn reconcile(pool: &PgPool, epoch: Uuid) -> Result<()> {
-    sqlx::query("UPDATE upstream_reservations u SET state='closing',close_reason=COALESCE(close_reason,'upstream_authorization_lost'),cleanup_after=COALESCE(cleanup_after,clock_timestamp()),cleanup_deadline=COALESCE(cleanup_deadline,clock_timestamp()+interval '60 seconds'),updated_at=clock_timestamp() WHERE (u.state IN('preparing','active') AND NOT EXISTS(SELECT 1 FROM rooms life WHERE life.id=u.room_id AND life.lifecycle='active' AND life.lifecycle_epoch=u.lifecycle_epoch) OR u.state='preparing' AND NOT EXISTS(SELECT 1 FROM playback_requests r WHERE r.user_id=u.user_id AND r.idempotency_key=u.request_key AND r.session_id=u.id AND r.status='pending' AND r.owner_epoch=$1 AND r.lease_until>clock_timestamp()) OR u.state='active' AND NOT EXISTS(SELECT 1 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN room_members m ON m.room_id=p.room_id AND m.user_id=p.user_id WHERE p.id=u.id AND NOT p.stopped AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation))")
+    sqlx::query("UPDATE upstream_reservations u SET state='closing',close_reason=COALESCE(close_reason,'upstream_authorization_lost'),cleanup_after=COALESCE(cleanup_after,clock_timestamp()),cleanup_deadline=COALESCE(cleanup_deadline,clock_timestamp()+interval '60 seconds'),updated_at=clock_timestamp() WHERE (u.state IN('preparing','active') AND NOT EXISTS(SELECT 1 FROM rooms life WHERE life.id=u.room_id AND life.lifecycle='active' AND life.lifecycle_epoch=u.lifecycle_epoch) OR u.state='preparing' AND (u.auth_login_hash IS NULL OR NOT playback_origin_allowed(u.user_id,u.room_id,u.auth_login_hash,u.auth_membership_epoch)) OR u.state='preparing' AND NOT EXISTS(SELECT 1 FROM playback_requests r WHERE r.user_id=u.user_id AND r.idempotency_key=u.request_key AND r.session_id=u.id AND r.status='pending' AND r.owner_epoch=$1 AND r.lease_until>clock_timestamp()) OR u.state='active' AND NOT EXISTS(SELECT 1 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN room_members m ON m.room_id=p.room_id AND m.user_id=p.user_id WHERE p.id=u.id AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource,p.id) AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation))")
         .bind(epoch).execute(pool).await?;
     sqlx::query("UPDATE upstream_reservations SET state='closed',negotiation='not_sent',close_reason=COALESCE(close_reason,'upstream_authorization_lost'),closed_at=clock_timestamp(),updated_at=clock_timestamp() WHERE state='closing' AND negotiation='reserved'")
         .execute(pool).await?;
@@ -239,7 +245,10 @@ pub async fn ready(pool: &PgPool, stop: bool) -> Result<Vec<(Uuid, String)>> {
 
 pub async fn claim_io(pool: &PgPool, id: Uuid, stop: bool) -> Result<Option<Claim>> {
     let mut tx = pool.begin().await?;
-    if !stop && !lock_admission(&mut tx, id).await? {
+    if !stop
+        && (!lock_admission(&mut tx, id).await?
+            || !crate::source_account_policy::lock_reservation(&mut tx, id).await?)
+    {
         return Ok(None);
     }
     let token = Uuid::new_v4();
@@ -250,7 +259,7 @@ pub async fn claim_io(pool: &PgPool, id: Uuid, stop: bool) -> Result<Option<Clai
         )
     } else {
         format!(
-            "UPDATE upstream_reservations u SET io_claim=$2,io_kind=CASE WHEN start_reported THEN 'progress' ELSE 'start' END,io_lease_until=clock_timestamp()+interval '10 seconds',{capture},updated_at=clock_timestamp() WHERE id=$1 AND state='active' AND NOT io_uncertain AND io_claim IS NULL AND ((u.observation_version IS NULL AND NOT EXISTS(SELECT 1 FROM playback_observations o WHERE o.session_id=u.id) AND (NOT start_reported OR last_report_at IS NULL OR last_report_at<=clock_timestamp()-interval '10 seconds')) OR EXISTS(SELECT 1 FROM playback_observations o WHERE o.session_id=u.id AND o.has_played AND o.seq>o.reported_seq)) AND EXISTS(SELECT 1 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN room_members m ON m.room_id=p.room_id AND m.user_id=p.user_id WHERE p.id=u.id AND NOT p.stopped AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation) RETURNING u.*,(SELECT state FROM room_snapshots WHERE room_id=u.room_id) AS room_state,NULL::double precision AS cleanup_remaining_ms"
+            "UPDATE upstream_reservations u SET io_claim=$2,io_kind=CASE WHEN start_reported THEN 'progress' ELSE 'start' END,io_lease_until=clock_timestamp()+interval '10 seconds',{capture},updated_at=clock_timestamp() WHERE id=$1 AND state='active' AND NOT io_uncertain AND io_claim IS NULL AND ((u.observation_version IS NULL AND NOT EXISTS(SELECT 1 FROM playback_observations o WHERE o.session_id=u.id) AND (NOT start_reported OR last_report_at IS NULL OR last_report_at<=clock_timestamp()-interval '10 seconds')) OR EXISTS(SELECT 1 FROM playback_observations o WHERE o.session_id=u.id AND o.has_played AND o.seq>o.reported_seq)) AND EXISTS(SELECT 1 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN room_members m ON m.room_id=p.room_id AND m.user_id=p.user_id WHERE p.id=u.id AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource,p.id) AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation) RETURNING u.*,(SELECT state FROM room_snapshots WHERE room_id=u.room_id) AS room_state,NULL::double precision AS cleanup_remaining_ms"
         )
     };
     let claimed_at = std::time::Instant::now();

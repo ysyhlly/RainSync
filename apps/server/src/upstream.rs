@@ -1,6 +1,6 @@
 use super::*;
 use persistence::upstream_reservations as ledger;
-use std::{collections::BTreeMap, sync::Weak, time::Duration};
+use std::{sync::Weak, time::Duration};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Default)]
@@ -133,12 +133,37 @@ pub struct Prepare<'a> {
     pub room: Uuid,
     pub media: Uuid,
     pub source: Uuid,
+    pub source_policy_revision: i64,
+    pub account_policy_generation: Option<i64>,
     pub generation: u32,
     pub kind: &'a str,
     pub config: &'a providers::SourceConfig,
     pub item: &'a str,
     pub options: providers::PlaybackOptions,
     pub observation_version: Option<u32>,
+    pub profile: Option<upstream_profiles::Selection>,
+}
+
+/// Metadata-only preflight shares the bounded global and per-origin lane. Its
+/// preparation owner supplies cancellation and an overall elapsed-time bound.
+pub async fn profile_metadata(
+    app: &App,
+    kind: &str,
+    config: &providers::SourceConfig,
+    item: &str,
+    audio_index: Option<u32>,
+    device_id: &str,
+) -> Result<providers::upstream_profiles::UpstreamProfileMetadata> {
+    let origin = hash(
+        providers::validate_url(&config.url)?
+            .origin()
+            .ascii_serialization()
+            .as_str(),
+    );
+    let _permits = app.upstream.negotiate_permit(&origin).await?;
+    providers::upstream_profiles::metadata(kind, config, item, audio_index, device_id)
+        .await
+        .map_err(|_| err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"))
 }
 
 fn identifier(value: &Value) -> Option<&str> {
@@ -162,6 +187,9 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
     let scope = app.encrypt(&json!({"config":p.config,"item":p.item}))?;
     let mut tx = app.db.begin().await?;
     playback_requests::guard(app, &mut tx, p.reservation).await?;
+    if let Some(selection) = &p.profile {
+        upstream_profiles::guard(app, &mut tx, p.reservation, selection).await?;
+    }
     let state: Value =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
             .bind(p.room)
@@ -170,6 +198,14 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
     if state["media_generation"].as_u64() != Some(u64::from(p.generation)) {
         return Err(err(StatusCode::CONFLICT, "stale_media"));
     }
+    source_access::guard(&mut tx, p.source, p.source_policy_revision).await?;
+    upstream_policy::guard(
+        &mut tx,
+        p.source,
+        p.source_policy_revision,
+        p.account_policy_generation,
+    )
+    .await?;
     ledger::reserve(
         &mut tx,
         &ledger::Reservation {
@@ -180,6 +216,8 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
             room: p.room,
             media: p.media,
             source: p.source,
+            source_policy_revision: p.source_policy_revision,
+            account_policy_generation: p.account_policy_generation,
             generation: i64::from(p.generation),
             kind: p.kind,
             device_id: &device_id,
@@ -195,11 +233,60 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
     let kind = p.kind.to_owned();
     let config = p.config.clone();
     let item = p.item.to_owned();
-    let options = p.options;
+    let mut options = p.options;
+    let profile_reservation = p.profile.as_ref().map(|_| playback_requests::Reservation {
+        prepare_until: tokio::time::Instant::now() + std::time::Duration::from_secs(45),
+        static_hls: None,
+        key: p.reservation.key,
+        session: p.reservation.session,
+        user: p.reservation.user,
+        room_id: p.reservation.room_id,
+        lifecycle_epoch: p.reservation.lifecycle_epoch,
+        viewer_id: p.reservation.viewer_id,
+        plan_generation: p.reservation.plan_generation,
+        http_file: None,
+    });
+    let profile = p.profile;
     let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let _permits = permits;
         let result: Result<Value> = async {
+            // Read-only discovery cannot allocate a play session. Keep the
+            // ledger reserved so timeout/cancel has a positive no-POST proof.
+            if let Some(selection) = &profile {
+                let observed = providers::upstream_profiles::metadata(
+                    &kind, &config, &item,
+                    selection.requested_audio(), &device_id,
+                ).await;
+                if !observed.is_ok_and(|metadata| metadata == selection.metadata) {
+                    let mut tx = app.db.begin().await?;
+                    ledger::close(&mut tx, id, "upstream_profile_metadata_changed").await?;
+                    tx.commit().await?;
+                    return Err(err(StatusCode::CONFLICT, "source_changed"));
+                }
+                // Discovery is read-only while negotiation remains reserved.
+                // Recheck identity, authority and DB expiry after its I/O.
+                let reservation = profile_reservation.as_ref().expect("profile reservation");
+                let mut tx = app.db.begin().await?;
+                playback_requests::guard(&app, &mut tx, reservation).await?;
+                upstream_profiles::guard(&app, &mut tx, reservation, selection).await?;
+                tx.commit().await?;
+                options.media_source_id = Some(selection.metadata.media_source_id.clone());
+                options.audio_index = selection.metadata.audio.as_ref().map(|audio| audio.index);
+                options.progressive = false;
+                options.hls = true;
+                options.force_transcode = true;
+            } else if let Some(audio) = options.audio_index {
+                match providers::upstream_audio_source(&kind, &config, &item, audio, &device_id).await {
+                    Ok(source) => options.media_source_id = Some(source),
+                    Err(_) => {
+                        let mut tx = app.db.begin().await?;
+                        ledger::close(&mut tx, id, "upstream_metadata_failed").await?;
+                        tx.commit().await?;
+                        return Err(err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"));
+                    }
+                }
+            }
             let token = Uuid::new_v4();
             if !ledger::begin_negotiation(&app.db, id, app.epoch, token).await? {
                 let mut tx = app.db.begin().await?;
@@ -209,7 +296,13 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
             }
             let result = tokio::time::timeout(
                 Duration::from_secs(ledger::NEGOTIATION_SECONDS),
-                providers::upstream_plan(&kind, &config, &item, &options, &device_id)
+                async {
+                    if let Some(selection) = &profile {
+                        providers::upstream_profile_plan(&kind, &config, &item, &options, &selection.metadata, &device_id).await
+                    } else {
+                        providers::upstream_plan(&kind, &config, &item, &options, &device_id).await
+                    }
+                }
             ).await;
             let info = match result {
                 Ok(Ok(info)) => info,
@@ -226,9 +319,28 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
             if !ledger::checkpoint(&app.db, id, token, &encrypted, sid, media_source, live_stream).await? || sid.is_none() {
                 return Err(err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"));
             }
+            if let Some(selection) = &profile
+                && providers::upstream_profiles::complete_route(&kind, &config, &selection.metadata, &info, &device_id).is_err()
+            {
+                let mut tx = app.db.begin().await?;
+                ledger::close(&mut tx, id, "upstream_profile_route_mismatch").await?;
+                tx.commit().await?;
+                return Err(err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"));
+            }
+            // Preserve the complete response/SID before rejecting a product
+            // which ignored the observed source/track binding; cleanup owns it.
+            if let Some(audio) = options.audio_index
+                && (media_source != options.media_source_id.as_deref()
+                    || source.and_then(|s| s["DefaultAudioStreamIndex"].as_u64()) != Some(u64::from(audio)))
+            {
+                let mut tx = app.db.begin().await?;
+                ledger::close(&mut tx, id, "upstream_audio_selection_mismatch").await?;
+                tx.commit().await?;
+                return Err(err(StatusCode::BAD_GATEWAY, "upstream_playback_failed"));
+            }
             // A late checkpoint is retained after revoke. Only final activation
             // can grant media, and its transaction still checks request ownership.
-            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM upstream_reservations u JOIN playback_requests r ON r.session_id=u.id JOIN room_snapshots s ON s.room_id=u.room_id JOIN rooms life ON life.id=u.room_id AND life.lifecycle='active' AND life.lifecycle_epoch=u.lifecycle_epoch JOIN room_members m ON m.room_id=u.room_id AND m.user_id=u.user_id WHERE u.id=$1 AND u.state='preparing' AND r.status='pending' AND r.owner_epoch=$2 AND r.lease_until>clock_timestamp() AND (s.state->>'media_generation')::bigint=u.generation)")
+            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM upstream_reservations u JOIN playback_requests r ON r.session_id=u.id JOIN room_snapshots s ON s.room_id=u.room_id JOIN rooms life ON life.id=u.room_id AND life.lifecycle='active' AND life.lifecycle_epoch=u.lifecycle_epoch JOIN room_members m ON m.room_id=u.room_id AND m.user_id=u.user_id WHERE u.id=$1 AND u.state='preparing' AND u.auth_login_hash IS NOT NULL AND playback_origin_allowed(u.user_id,u.room_id,u.auth_login_hash,u.auth_membership_epoch) AND source_account_policy_allowed(u.source_id,u.source_policy_revision,u.account_policy_generation) AND r.status='pending' AND r.owner_epoch=$2 AND r.lease_until>clock_timestamp() AND (s.state->>'media_generation')::bigint=u.generation)")
                 .bind(id).bind(app.epoch).fetch_one(&app.db).await?;
             if !valid {
                 let mut tx = app.db.begin().await?;
@@ -243,15 +355,6 @@ pub async fn negotiate(app: &App, p: Prepare<'_>) -> Result<Value> {
     receiver
         .await
         .map_err(|_| err(StatusCode::CONFLICT, "playback_request_interrupted"))?
-}
-
-fn request_headers(
-    request: reqwest::RequestBuilder,
-    headers: &BTreeMap<String, String>,
-) -> reqwest::RequestBuilder {
-    headers.iter().fold(request, |request, (name, value)| {
-        request.header(name, value)
-    })
 }
 
 fn report_body(app: &App, claim: &ledger::Claim, item: &str) -> anyhow::Result<Value> {
@@ -306,7 +409,25 @@ fn report_body(app: &App, claim: &ledger::Claim, item: &str) -> anyhow::Result<V
 
 async fn perform(app: &App, claim: ledger::Claim) -> anyhow::Result<()> {
     let scope = app.decrypt(&claim.scope_encrypted)?;
-    let config: providers::SourceConfig = serde_json::from_value(scope["config"].clone())?;
+    let mut config: providers::SourceConfig = serde_json::from_value(scope["config"].clone())?;
+    let current=tokio::time::timeout(Duration::from_secs(1),database_checks::text(&app.db,
+        sqlx::query_scalar("SELECT COALESCE(s.config_encrypted,'') FROM upstream_reservations u LEFT JOIN source_access_policy_snapshots s ON s.source_id=u.source_id WHERE u.id=$1").bind(claim.id),750)).await??;
+    if current.is_empty() {
+        // Only pre-policy legacy cleanup may lack a retained destination policy.
+        // Modern deletions keep the last effective policy in the durable snapshot.
+        anyhow::ensure!(
+            claim.event == "stop" && config.access_policy.is_none(),
+            "source_changed"
+        );
+    } else {
+        let current: providers::SourceConfig = serde_json::from_value(app.decrypt(&current)?)?;
+        anyhow::ensure!(
+            providers::validate_url(&current.url)?.origin()
+                == providers::validate_url(&config.url)?.origin(),
+            "source_changed"
+        );
+        config.access_policy = current.access_policy;
+    }
     let item = scope["item"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("upstream_scope_invalid"))?;
@@ -322,10 +443,17 @@ async fn perform(app: &App, claim: ledger::Claim) -> anyhow::Result<()> {
     if claim.event != "stop" {
         let successful = matches!(
             tokio::time::timeout(Duration::from_secs(ledger::CLEANUP_SECONDS), async {
-                let response = request_headers(providers::client().post(url).json(&body), &headers)
-                    .send()
-                    .await?;
-                Ok::<_, reqwest::Error>(providers::checkin_confirmed(response.status()))
+                let response = providers::source_request(
+                    &config,
+                    url.as_str(),
+                    reqwest::Method::POST,
+                    &headers,
+                )
+                .await?
+                .json(&body)
+                .send()
+                .await?;
+                Ok::<_, anyhow::Error>(providers::checkin_confirmed(response.status()))
             })
             .await,
             Ok(Ok(true))
@@ -344,9 +472,12 @@ async fn perform(app: &App, claim: ledger::Claim) -> anyhow::Result<()> {
     // A successful Stopped POST alone does not confirm its encoder stopped.
     let _ = tokio::time::timeout(budget, async {
         if !stopped {
-            let response = request_headers(providers::client().post(url).json(&body), &headers)
-                .send()
-                .await?;
+            let response =
+                providers::source_request(&config, url.as_str(), reqwest::Method::POST, &headers)
+                    .await?
+                    .json(&body)
+                    .send()
+                    .await?;
             anyhow::ensure!(
                 providers::checkin_confirmed(response.status()),
                 "upstream_stop_unconfirmed"
@@ -358,11 +489,13 @@ async fn perform(app: &App, claim: ledger::Claim) -> anyhow::Result<()> {
             url.query_pairs_mut()
                 .append_pair("DeviceId", &claim.device_id)
                 .append_pair("PlaySessionId", &claim.sid);
-            let response = request_headers(providers::client().delete(url), &headers)
-                .send()
-                .await?;
+            let response =
+                providers::source_request(&config, url.as_str(), reqwest::Method::DELETE, &headers)
+                    .await?
+                    .send()
+                    .await?;
             anyhow::ensure!(
-                response.status() == reqwest::StatusCode::OK,
+                providers::checkin_confirmed(response.status()),
                 "upstream_encoding_stop_unconfirmed"
             );
             encoding_stopped = true;
@@ -400,6 +533,14 @@ pub async fn report(app: &App, id: Uuid, event: &str) -> anyhow::Result<()> {
                 .bind(id)
                 .fetch_optional(&app.db)
                 .await?;
+        if encrypted
+            .as_ref()
+            .is_some_and(|resource| resource.get("native_platform_context").is_some())
+        {
+            // Native platform grants have no upstream playback reporter or
+            // mutable legacy I/O ledger in their immutable resource envelope.
+            return Ok(());
+        }
         let origin = encrypted
             .and_then(|value| app.decrypt(value["encrypted"].as_str().unwrap_or("")).ok())
             .and_then(|resource| {
@@ -442,7 +583,9 @@ pub async fn maintenance(app: App) {
     tokio::spawn(legacy_maintenance(app.clone()));
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        if ledger::reconcile(&app.db, app.epoch).await.is_err() {
+        if source_access::retire(&app.db).await.is_err()
+            || ledger::reconcile(&app.db, app.epoch).await.is_err()
+        {
             tracing::warn!("upstream reconciliation failed");
             continue;
         }
@@ -489,10 +632,13 @@ async fn legacy_report(app: &App, id: Uuid, event: &str) -> anyhow::Result<()> {
             return Ok(());
         };
         persistence::room_lifecycle::lock_epoch(&mut admission, room, epoch).await?;
+        if !persistence::source_account_policy::lock_session(&mut admission, id).await? {
+            return Ok(());
+        }
     }
     let claim_started = tokio::time::Instant::now();
     let token = Uuid::new_v4().to_string();
-    let claimed: Option<Value> = sqlx::query_scalar("UPDATE playback_sessions p SET stopped=stopped OR $3::text='stop',resource=resource||jsonb_build_object('upstream_io_claim',$2::text,'upstream_io_kind',$3::text,'upstream_io_lease_until',CASE WHEN $3::text='stop' THEN LEAST(clock_timestamp()+interval '10 seconds',COALESCE((resource->>'upstream_cleanup_deadline')::timestamptz,clock_timestamp()+interval '60 seconds')) ELSE clock_timestamp()+interval '10 seconds' END,'upstream_io_pending',true,'upstream_io_uncertain',COALESCE((resource->>'upstream_io_uncertain')::boolean,false) OR (COALESCE((resource->>'upstream_io_pending')::boolean,false) AND COALESCE(resource->>'upstream_io_kind','progress')<>'stop'))||CASE WHEN $3::text='stop' THEN jsonb_build_object('upstream_cleanup_attempts',COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)+1,'upstream_cleanup_deadline',COALESCE((resource->>'upstream_cleanup_deadline')::timestamptz,clock_timestamp()+interval '60 seconds'),'upstream_cleanup_after',clock_timestamp()+make_interval(secs=>LEAST(16,power(2,COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)+1)::integer))) ELSE jsonb_build_object('upstream_last_report_at',clock_timestamp()) END WHERE id=$1 AND NOT(resource ? 'upstream_closed') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id) AND (NOT(resource ? 'upstream_io_claim') OR (resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp()) AND CASE WHEN $3::text='stop' THEN COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)<5 AND (NOT(resource ? 'upstream_cleanup_deadline') OR (resource->>'upstream_cleanup_deadline')::timestamptz>clock_timestamp()) AND (NOT(resource ? 'upstream_cleanup_after') OR (resource->>'upstream_cleanup_after')::timestamptz<=clock_timestamp()) AND (stopped OR expires_at<=clock_timestamp() OR EXISTS(SELECT 1 FROM room_snapshots s WHERE s.room_id=p.room_id AND (s.state->>'media_generation')::bigint<>p.generation)) ELSE NOT stopped AND expires_at>clock_timestamp() AND NOT COALESCE((resource->>'upstream_io_pending')::boolean,false) AND NOT COALESCE((resource->>'upstream_io_uncertain')::boolean,false) AND ($3::text='start' OR NOT(resource ? 'upstream_last_report_at') OR (resource->>'upstream_last_report_at')::timestamptz<=clock_timestamp()-interval '10 seconds') AND EXISTS(SELECT 1 FROM room_snapshots s WHERE s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation) END RETURNING jsonb_build_object('resource',resource,'cleanup_remaining_ms',CASE WHEN $3::text='stop' THEN EXTRACT(epoch FROM ((resource->>'upstream_cleanup_deadline')::timestamptz-clock_timestamp()))*1000 ELSE 3000 END)")
+    let claimed: Option<Value> = sqlx::query_scalar("UPDATE playback_sessions p SET stopped=stopped OR $3::text='stop',resource=resource||jsonb_build_object('upstream_io_claim',$2::text,'upstream_io_kind',$3::text,'upstream_io_lease_until',CASE WHEN $3::text='stop' THEN LEAST(clock_timestamp()+interval '10 seconds',COALESCE((resource->>'upstream_cleanup_deadline')::timestamptz,clock_timestamp()+interval '60 seconds')) ELSE clock_timestamp()+interval '10 seconds' END,'upstream_io_pending',true,'upstream_io_uncertain',COALESCE((resource->>'upstream_io_uncertain')::boolean,false) OR (COALESCE((resource->>'upstream_io_pending')::boolean,false) AND COALESCE(resource->>'upstream_io_kind','progress')<>'stop'))||CASE WHEN $3::text='stop' THEN jsonb_build_object('upstream_cleanup_attempts',COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)+1,'upstream_cleanup_deadline',COALESCE((resource->>'upstream_cleanup_deadline')::timestamptz,clock_timestamp()+interval '60 seconds'),'upstream_cleanup_after',clock_timestamp()+make_interval(secs=>LEAST(16,power(2,COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)+1)::integer))) ELSE jsonb_build_object('upstream_last_report_at',clock_timestamp()) END WHERE id=$1 AND NOT(resource ? 'upstream_closed') AND p.static_hls_capture_id IS NULL AND NOT static_hls_is_child_session(p.id) AND NOT (p.resource ? 'native_platform_context') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id) AND (NOT(resource ? 'upstream_io_claim') OR (resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp()) AND CASE WHEN $3::text='stop' THEN COALESCE((resource->>'upstream_cleanup_attempts')::integer,0)<5 AND (NOT(resource ? 'upstream_cleanup_deadline') OR (resource->>'upstream_cleanup_deadline')::timestamptz>clock_timestamp()) AND (NOT(resource ? 'upstream_cleanup_after') OR (resource->>'upstream_cleanup_after')::timestamptz<=clock_timestamp()) AND (stopped OR expires_at<=clock_timestamp() OR EXISTS(SELECT 1 FROM room_snapshots s WHERE s.room_id=p.room_id AND (s.state->>'media_generation')::bigint<>p.generation)) ELSE NOT stopped AND playback_source_allowed(p.media_id,p.resource,p.id) AND expires_at>clock_timestamp() AND NOT COALESCE((resource->>'upstream_io_pending')::boolean,false) AND NOT COALESCE((resource->>'upstream_io_uncertain')::boolean,false) AND ($3::text='start' OR NOT(resource ? 'upstream_last_report_at') OR (resource->>'upstream_last_report_at')::timestamptz<=clock_timestamp()-interval '10 seconds') AND EXISTS(SELECT 1 FROM room_snapshots s WHERE s.room_id=p.room_id AND (s.state->>'media_generation')::bigint=p.generation) END RETURNING jsonb_build_object('resource',resource,'cleanup_remaining_ms',CASE WHEN $3::text='stop' THEN EXTRACT(epoch FROM ((resource->>'upstream_cleanup_deadline')::timestamptz-clock_timestamp()))*1000 ELSE 3000 END)")
         .bind(id).bind(&token).bind(event).fetch_optional(&mut *admission).await?;
     admission.commit().await?;
     let Some(claimed) = claimed else {
@@ -507,7 +653,7 @@ async fn legacy_report(app: &App, id: Uuid, event: &str) -> anyhow::Result<()> {
     let cleanup_remaining = Duration::from_secs_f64(remaining_ms / 1000.0);
     let mut can_close = false;
     let result = async {
-    let row = sqlx::query("SELECT p.resource,s.state FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$1 AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id)")
+    let row = sqlx::query("SELECT p.resource,s.state FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id=$1 AND p.static_hls_capture_id IS NULL AND NOT static_hls_is_child_session(p.id) AND NOT (p.resource ? 'native_platform_context') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id)")
         .bind(id).fetch_one(&app.db).await?;
     let resource = app.decrypt(encrypted["encrypted"].as_str().unwrap_or(""))?;
     let Some(base) = resource["upstream_base"].as_str() else {
@@ -530,9 +676,7 @@ async fn legacy_report(app: &App, id: Uuid, event: &str) -> anyhow::Result<()> {
         "stop" => "Sessions/Playing/Stopped",
         _ => "Sessions/Playing/Progress",
     };
-    let mut request = providers::client()
-        .post(format!("{}/{endpoint}", base.trim_end_matches('/')))
-        .json(&body);
+    let mut scoped_headers=std::collections::BTreeMap::new();
     if let Some(headers) = resource["headers"].as_object() {
         for (name, value) in headers {
             if let Some(value) = value.as_str() {
@@ -545,10 +689,12 @@ async fn legacy_report(app: &App, id: Uuid, event: &str) -> anyhow::Result<()> {
                 } else {
                     value.into()
                 };
-                request = request.header(name, value);
+                scoped_headers.insert(name.to_owned(), value);
             }
         }
     }
+    let config=providers::resource_config(&resource)?;
+    let request=providers::source_request(&config,&format!("{}/{endpoint}",base.trim_end_matches('/')),reqwest::Method::POST,&scoped_headers).await?.json(&body);
     let timeout = if event == "stop" {
         // The SQL clock supplies remaining total budget. Subtracting elapsed
         // time since before the claim also conservatively covers DB latency.
@@ -582,17 +728,17 @@ async fn legacy_report(app: &App, id: Uuid, event: &str) -> anyhow::Result<()> {
 async fn legacy_maintenance(app: App) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let _=sqlx::query("UPDATE playback_sessions SET resource=resource||jsonb_build_object('upstream_cleanup_failed',true,'upstream_cleanup_error','upstream_cleanup_deadline') WHERE NOT(resource ? 'upstream_closed') AND (resource->>'upstream_cleanup_deadline')::timestamptz<=clock_timestamp() AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=playback_sessions.id)").execute(&app.db).await;
+        let _=sqlx::query("UPDATE playback_sessions SET resource=resource||jsonb_build_object('upstream_cleanup_failed',true,'upstream_cleanup_error','upstream_cleanup_deadline') WHERE NOT(resource ? 'upstream_closed') AND (resource->>'upstream_cleanup_deadline')::timestamptz<=clock_timestamp() AND static_hls_capture_id IS NULL AND NOT static_hls_is_child_session(playback_sessions.id) AND NOT (resource ? 'native_platform_context') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=playback_sessions.id)").execute(&app.db).await;
         // An expired local reporter may still execute remotely. Retire its
         // lease before another report is considered; Stop may compensate but
         // cannot turn this uncertain remote ordering into a confirmed closure.
-        let _ = sqlx::query("UPDATE playback_sessions p SET resource=(resource-'upstream_io_pending'-'upstream_io_claim'-'upstream_io_kind'-'upstream_io_lease_until')||jsonb_build_object('upstream_io_uncertain',COALESCE((resource->>'upstream_io_uncertain')::boolean,false) OR COALESCE(resource->>'upstream_io_kind','progress')<>'stop') WHERE resource ? 'upstream_io_claim' AND (resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp() AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id)")
+        let _ = sqlx::query("UPDATE playback_sessions p SET resource=(resource-'upstream_io_pending'-'upstream_io_claim'-'upstream_io_kind'-'upstream_io_lease_until')||jsonb_build_object('upstream_io_uncertain',COALESCE((resource->>'upstream_io_uncertain')::boolean,false) OR COALESCE(resource->>'upstream_io_kind','progress')<>'stop') WHERE resource ? 'upstream_io_claim' AND (resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp() AND p.static_hls_capture_id IS NULL AND NOT static_hls_is_child_session(p.id) AND NOT (p.resource ? 'native_platform_context') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id)")
             .execute(&app.db).await;
         for stop in [true, false] {
             let query = if stop {
-                "SELECT p.id,p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE NOT(p.resource ? 'upstream_closed') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id) AND (p.stopped OR p.expires_at<=clock_timestamp() OR (s.state->>'media_generation')::bigint<>p.generation) AND COALESCE((p.resource->>'upstream_cleanup_attempts')::integer,0)<5 AND (NOT(p.resource ? 'upstream_cleanup_deadline') OR (p.resource->>'upstream_cleanup_deadline')::timestamptz>clock_timestamp()) AND (NOT(p.resource ? 'upstream_cleanup_after') OR (p.resource->>'upstream_cleanup_after')::timestamptz<=clock_timestamp()) AND (NOT(p.resource ? 'upstream_io_claim') OR (p.resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp()) ORDER BY (p.resource->>'upstream_cleanup_after')::timestamptz NULLS FIRST,p.id LIMIT 32"
+                "SELECT p.id,p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE NOT(p.resource ? 'upstream_closed') AND p.static_hls_capture_id IS NULL AND NOT static_hls_is_child_session(p.id) AND NOT (p.resource ? 'native_platform_context') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id) AND (p.stopped OR p.expires_at<=clock_timestamp() OR (s.state->>'media_generation')::bigint<>p.generation) AND COALESCE((p.resource->>'upstream_cleanup_attempts')::integer,0)<5 AND (NOT(p.resource ? 'upstream_cleanup_deadline') OR (p.resource->>'upstream_cleanup_deadline')::timestamptz>clock_timestamp()) AND (NOT(p.resource ? 'upstream_cleanup_after') OR (p.resource->>'upstream_cleanup_after')::timestamptz<=clock_timestamp()) AND (NOT(p.resource ? 'upstream_io_claim') OR (p.resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp()) ORDER BY (p.resource->>'upstream_cleanup_after')::timestamptz NULLS FIRST,p.id LIMIT 32"
             } else {
-                "SELECT p.id,p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE NOT(p.resource ? 'upstream_closed') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id) AND NOT p.stopped AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation AND NOT COALESCE((p.resource->>'upstream_io_uncertain')::boolean,false) AND (NOT(p.resource ? 'upstream_last_report_at') OR (p.resource->>'upstream_last_report_at')::timestamptz<=clock_timestamp()-interval '10 seconds') AND (NOT(p.resource ? 'upstream_io_claim') OR (p.resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp()) ORDER BY (p.resource->>'upstream_last_report_at')::timestamptz NULLS FIRST,p.id LIMIT 32"
+                "SELECT p.id,p.resource FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id WHERE NOT(p.resource ? 'upstream_closed') AND p.static_hls_capture_id IS NULL AND NOT static_hls_is_child_session(p.id) AND NOT (p.resource ? 'native_platform_context') AND NOT EXISTS(SELECT 1 FROM upstream_reservations WHERE id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations WHERE session_id=p.id) AND NOT p.stopped AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation AND NOT COALESCE((p.resource->>'upstream_io_uncertain')::boolean,false) AND (NOT(p.resource ? 'upstream_last_report_at') OR (p.resource->>'upstream_last_report_at')::timestamptz<=clock_timestamp()-interval '10 seconds') AND (NOT(p.resource ? 'upstream_io_claim') OR (p.resource->>'upstream_io_lease_until')::timestamptz<=clock_timestamp()) ORDER BY (p.resource->>'upstream_last_report_at')::timestamptz NULLS FIRST,p.id LIMIT 32"
             };
             let rows = sqlx::query(query)
                 .fetch_all(&app.db)

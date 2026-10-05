@@ -60,9 +60,12 @@ function end() {
       <AppIcon
         :name="r.state?.playback_status === 'playing' ? 'pause' : 'play'"
       /></button
-    ><span class="playback-time"
+    ><span v-if="r.live" class="playback-time" role="status"
+      >直播边缘 · 控制同步</span
+    ><span v-else class="playback-time"
       >{{ formatTime(r.position) }} / {{ formatTime(r.duration) }}</span
     ><input
+      v-if="!r.live"
       class="seek-control"
       aria-label="播放进度"
       type="range"
@@ -108,7 +111,7 @@ function end() {
         @blur="emit('dragging', false)"
         @input="setVolume" /></span
     ><AppSelect
-      v-if="!mini"
+      v-if="!mini && !r.live"
       class="rate-control"
       label="房间倍速"
       @open-change="emit('menuOpen', $event)"

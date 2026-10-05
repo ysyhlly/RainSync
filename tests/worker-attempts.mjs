@@ -56,7 +56,7 @@ export async function workerAttempts({
       await writeFile(resolve(dir, "index0.m4s"), segmentBytes(attempt));
     }
     sql(
-      `INSERT INTO media_jobs(id,session_id,status,spec,attempt) VALUES('${id}','${id}','succeeded','{}',1); UPDATE playback_sessions SET resource=jsonb_build_object('encrypted','${encrypted}') WHERE id='${id}'`,
+      `INSERT INTO media_jobs(id,session_id,status,spec,attempt) VALUES('${id}','${id}','succeeded','{}',1); UPDATE playback_sessions SET resource=resource||jsonb_build_object('encrypted','${encrypted}') WHERE id='${id}'`,
     );
     const saved = await readFile(resolve(cache, id, "1", "index.m3u8"));
     const digest = createHash("sha256").update(saved).digest("hex");
@@ -372,6 +372,10 @@ export async function workerAttempts({
       ["cache_capacity_exceeded", "CACHE_CAPACITY_EXCEEDED", 503],
       ["cache_read_only", "CACHE_READ_ONLY", 503],
       ["cache_permission_denied", "CACHE_PERMISSION_DENIED", 503],
+      ["media_input_invalid", "MEDIA_INPUT_INVALID", 422],
+      ["media_input_denied", "MEDIA_INPUT_DENIED", 502],
+      ["media_decoder_unavailable", "MEDIA_DECODER_UNAVAILABLE", 422],
+      ["media_encoder_unavailable", "MEDIA_ENCODER_UNAVAILABLE", 503],
       ["media_job_retry_exhausted", "MEDIA_JOB_RETRY_EXHAUSTED", 502],
       ["upstream_transport_retry_exhausted", "MEDIA_JOB_RETRY_EXHAUSTED", 502],
       ["private_path_and_credentials", "MEDIA_JOB_FAILED", 502],
