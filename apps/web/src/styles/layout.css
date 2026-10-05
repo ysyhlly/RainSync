@@ -1149,6 +1149,11 @@
   .mini-player.mini-collapsed .player-caption h2 {
     margin: 0;
   }
+  .mini-player.mini-collapsed:not(:fullscreen) .player-caption {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
 }
 @media (max-width: 1279px) {
   .full-player,

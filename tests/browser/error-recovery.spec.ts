@@ -260,6 +260,13 @@ test("short zoomed viewport keeps the source title above the empty room mini pla
   const heading = (await title.boundingBox())!;
   const player = (await mini.boundingBox())!;
   expect(heading.y + heading.height).toBeLessThanOrEqual(player.y);
+  const returnRoom = (await mini
+    .getByRole("link", { name: "返回房间" })
+    .boundingBox())!;
+  expect(returnRoom.y).toBeGreaterThanOrEqual(player.y);
+  expect(returnRoom.y + returnRoom.height).toBeLessThanOrEqual(
+    player.y + player.height,
+  );
   expect(
     await title.evaluate((element) => {
       const r = element.getBoundingClientRect();
