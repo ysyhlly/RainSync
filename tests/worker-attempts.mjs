@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createCipheriv, randomBytes, createHash } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes, createHash } from "node:crypto";
 import { mkdir, writeFile, readFile, open, rename, rm } from "node:fs/promises";
 import http from "node:http";
 import { outputCleanup } from "./output-cleanup.mjs";
@@ -30,6 +30,16 @@ export async function workerAttempts({
   const original = sql(
     `SELECT resource FROM playback_sessions WHERE id='${id}'`,
   );
+  const originalCiphertext = Buffer.from(JSON.parse(original).encrypted, "base64");
+  const decipher = createDecipheriv("aes-256-gcm", Buffer.from(key, "base64"), originalCiphertext.subarray(0, 12));
+  decipher.setAuthTag(originalCiphertext.subarray(-16));
+  const originalResource = JSON.parse(Buffer.concat([
+    decipher.update(originalCiphertext.subarray(12, -16)), decipher.final(),
+  ]).toString("utf8"));
+  const cachedResource = { ...originalResource, job_id: id };
+  // These controlled v1/v2 outputs predate recorded plan facts. Retain actual
+  // source authority without claiming the original direct plan's output facts.
+  delete cachedResource.plan_facts_version;
   const nonce = randomBytes(12);
   const cipher = createCipheriv(
     "aes-256-gcm",
@@ -38,7 +48,9 @@ export async function workerAttempts({
   );
   const encrypted = Buffer.concat([
     nonce,
-    cipher.update(JSON.stringify({ job_id: id })),
+    // Keep the authenticated source kind and identity when selecting the
+    // fixture's controlled cached output route.
+    cipher.update(JSON.stringify(cachedResource)),
     cipher.final(),
     cipher.getAuthTag(),
   ]).toString("base64");
