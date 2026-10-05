@@ -219,7 +219,7 @@ impl PendingResolved {
             codecs: self.audio.codecs,
             mime_type: self.audio.mime_type,
             bandwidth: self.audio.bandwidth,
-            sampling_rate,
+            sampling_rate: Some(sampling_rate),
             start_with_sap: self.audio.start_with_sap,
             segment_base: self.audio.segment_base,
             primary: self.audio.primary,

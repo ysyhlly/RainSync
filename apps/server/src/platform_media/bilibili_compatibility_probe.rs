@@ -1,4 +1,4 @@
-//! Private clear HEVC UGC source selection, only after explicit HLS intent.
+//! Private clear UGC source proof, only after explicit HLS intent.
 //! Provider metadata never substitutes for an exact configuration/range proof.
 use super::*;
 use providers::platform::{http::PlatformHttp, youtube::mp4};
@@ -11,7 +11,7 @@ pub(super) async fn prepare(
 ) -> Result<(Descriptor, Option<i64>, Vec<u32>)> {
     let (mut descriptor, heights) =
         Descriptor::bilibili_compatibility_candidate(resolved, max_height)?;
-    if descriptor.compatibility_source.is_some() {
+    if descriptor.compatibility_source.is_some() || descriptor.tracks[1].sampling_rate.is_none() {
         // The original extraction deadline also bounds both byte observations.
         let (video, audio) = tokio::try_join!(
             youtube_probe::probe_bilibili_compatibility(
@@ -54,7 +54,7 @@ fn duration(probe: &mp4::Probe) -> Result<f64> {
 fn apply_proofs(descriptor: &mut Descriptor, video: &mp4::Probe, audio: &mp4::Probe) -> Result<()> {
     if !matches!(
         descriptor.compatibility_source,
-        Some(
+        None | Some(
             descriptor::CompatibilitySource::ClearHevcMainV1
                 | descriptor::CompatibilitySource::ClearExtendedV1
         )
@@ -66,6 +66,14 @@ fn apply_proofs(descriptor: &mut Descriptor, video: &mp4::Probe, audio: &mp4::Pr
     let v = &descriptor.tracks[0];
     let a = &descriptor.tracks[1];
     match &video.codec {
+        mp4::Codec::Avc {
+            rfc6381,
+            width,
+            height,
+        } if descriptor.compatibility_source.is_none()
+            && rfc6381.eq_ignore_ascii_case(&v.codecs)
+            && Some(*width) == v.width
+            && Some(*height) == v.height => {}
         mp4::Codec::Hevc {
             rfc6381,
             width,
@@ -86,20 +94,26 @@ fn apply_proofs(descriptor: &mut Descriptor, video: &mp4::Probe, audio: &mp4::Pr
             rfc6381,
             width,
             height,
-        } if mp4::clear_extended_codec_equivalent(rfc6381, &v.codecs)
+        } if descriptor.compatibility_source.is_some()
+            && mp4::clear_extended_codec_equivalent(rfc6381, &v.codecs)
             && Some(*width) == v.width
             && Some(*height) == v.height => {}
         _ => return Err(unsupported()),
     }
-    match audio.codec {
+    let sample_rate = match audio.codec {
         mp4::Codec::AacLc {
             sample_rate,
             channels,
         } if a.codecs == "mp4a.40.2"
-            && Some(sample_rate) == a.sampling_rate
-            && matches!(channels, 1 | 2) => {}
+            && (8000..=96000).contains(&sample_rate)
+            && a.sampling_rate
+                .is_none_or(|declared| declared == sample_rate)
+            && matches!(channels, 1 | 2) =>
+        {
+            sample_rate
+        }
         _ => return Err(unsupported()),
-    }
+    };
     if descriptor.compatibility_source == Some(descriptor::CompatibilitySource::ClearExtendedV1) {
         descriptor.tracks[0].source_video =
             Some(video.codec.source_expectation().ok_or_else(unsupported)?);
@@ -134,6 +148,9 @@ fn apply_proofs(descriptor: &mut Descriptor, video: &mp4::Probe, audio: &mp4::Pr
         track.observed_content_length = Some(proof.total_bytes);
         track.strong_etag = proof.strong_etag.clone();
     }
+    // Missing declarations become measured facts only after all configuration,
+    // representation identity, range, and timeline checks succeed.
+    descriptor.tracks[1].sampling_rate = Some(sample_rate);
     descriptor.duration_seconds = video_duration.max(audio_duration);
     descriptor
         .validate_for("bilibili")
@@ -200,6 +217,48 @@ mod tests {
         relabel.tracks[0].codecs = "avc1.640028".into();
         assert!(relabel.validate_for("bilibili").is_err());
     }
+    #[test]
+    fn missing_audio_rate_is_derived_from_exact_compatibility_byte_proof() {
+        for avc in [false, true] {
+            let (mut d, mut v, a) = selected();
+            d.tracks[1].sampling_rate = None;
+            if avc {
+                d.compatibility_source = None;
+                d.tracks[0].codecs = "avc1.640028".into();
+                v.codec = mp4::Codec::Avc {
+                    rfc6381: "avc1.640028".into(),
+                    width: 1920,
+                    height: 1080,
+                };
+            }
+            apply_proofs(&mut d, &v, &a).unwrap();
+            assert_eq!(d.tracks[1].sampling_rate, Some(48000));
+            assert!(d.validate_for("bilibili").is_ok());
+            let mut invalid = d.clone();
+            invalid.tracks[1].sampling_rate = None;
+            let mut mismatched = a.clone();
+            mismatched.index.start += 1;
+            assert!(apply_proofs(&mut invalid, &v, &mismatched).is_err());
+            assert!(invalid.tracks[1].sampling_rate.is_none());
+        }
+    }
+
+    #[test]
+    fn missing_audio_rate_avc_proof_accepts_equivalent_hex_case() {
+        let (mut d, mut v, a) = selected();
+        d.compatibility_source = None;
+        d.tracks[0].codecs = "avc1.4D401F".into();
+        d.tracks[1].sampling_rate = None;
+        v.codec = mp4::Codec::Avc {
+            rfc6381: "avc1.4d401f".into(),
+            width: 1920,
+            height: 1080,
+        };
+        apply_proofs(&mut d, &v, &a).unwrap();
+        assert_eq!(d.tracks[1].sampling_rate, Some(48000));
+        assert_eq!(d.tracks[0].codecs, "avc1.4D401F");
+    }
+
     #[test]
     fn clear_hevc_sealed_source_cannot_be_restored_as_pgc_course_or_foreign_provider() {
         let (mut d, v, a) = selected();

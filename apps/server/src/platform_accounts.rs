@@ -705,7 +705,35 @@ async fn terminalize(tx: &mut Transaction<'_, Postgres>, id: Uuid, status: &str)
     Ok(())
 }
 
-fn upstream_error(_: providers::platform::bilibili::Error) -> Error {
+fn upstream_failure_class(error: &providers::platform::bilibili::Error) -> &'static str {
+    use providers::platform::bilibili::Error as Upstream;
+    // A closed, low-cardinality vocabulary, not upstream text or a secret URL.
+    match error {
+        Upstream::InvalidResponse("qr_url") => "qr_url_invalid",
+        Upstream::InvalidResponse("qr_key") => "qr_key_invalid",
+        Upstream::InvalidResponse("qr_binding") => "qr_binding_invalid",
+        Upstream::InvalidResponse("qr_state") => "qr_state_invalid",
+        Upstream::InvalidResponse(
+            "set_cookie" | "cookie_origin" | "cookie_path" | "cookie" | "cookie_identity",
+        ) => "qr_cookie_invalid",
+        Upstream::InvalidResponse(_) | Upstream::InvalidResource => "response_schema_invalid",
+        Upstream::InvalidJson => "response_json_invalid",
+        Upstream::Restricted(_) => "transport_policy_rejected",
+        Upstream::Api(_) => "provider_api_rejected",
+        Upstream::Status(_) => "provider_http_rejected",
+        Upstream::Deadline => "deadline_exceeded",
+        Upstream::Transport => "transport_failed",
+        Upstream::TooLarge => "response_limit_exceeded",
+    }
+}
+
+fn upstream_error(operation: &'static str, error: providers::platform::bilibili::Error) -> Error {
+    tracing::warn!(
+        event = "platform_login_upstream_failed",
+        provider = PROVIDER,
+        operation,
+        failure_class = upstream_failure_class(&error),
+    );
     // Never format provider errors, body, URL, Cookie or key into public errors.
     err(StatusCode::BAD_GATEWAY, "platform_login_upstream_failed")
 }
@@ -830,7 +858,7 @@ pub async fn start_login(
             Err(error) => {
                 terminalize(&mut tx, current.scope.request_id, "failed").await?;
                 tx.commit().await?;
-                return Err(upstream_error(error));
+                return Err(upstream_error("qr_generate", error));
             }
         }
     }
@@ -965,7 +993,7 @@ pub async fn poll_login(
                 sqlx::query("UPDATE platform_login_requests SET operation_nonce=NULL,operation_expires_at=NULL,next_poll_at=GREATEST(next_poll_at,clock_timestamp()+$2*interval '1 second'),updated_at=clock_timestamp() WHERE id=$1")
                     .bind(id).bind(POLL_INTERVAL_SECONDS).execute(&mut *tx).await?;
                 tx.commit().await?;
-                return Err(upstream_error(error));
+                return Err(upstream_error("qr_poll", error));
             }
         }
     }
@@ -1342,6 +1370,44 @@ mod tests {
             operation_nonce: Some(nonce),
             ready_to_poll: false,
             consent_to_renew: false,
+        }
+    }
+
+    #[test]
+    fn qr_upstream_diagnostics_are_closed_and_never_include_provider_values() {
+        use providers::platform::bilibili::Error as Upstream;
+        for (error, expected) in [
+            (Upstream::InvalidResponse("qr_url"), "qr_url_invalid"),
+            (
+                Upstream::InvalidResponse("qr_binding"),
+                "qr_binding_invalid",
+            ),
+            (Upstream::InvalidResponse("qr_key"), "qr_key_invalid"),
+            (Upstream::InvalidResponse("qr_state"), "qr_state_invalid"),
+            (
+                Upstream::InvalidResponse("cookie_origin"),
+                "qr_cookie_invalid",
+            ),
+            (
+                Upstream::InvalidResponse("synthetic-private-value"),
+                "response_schema_invalid",
+            ),
+            (
+                Upstream::Restricted("synthetic-private-value"),
+                "transport_policy_rejected",
+            ),
+            (Upstream::Api(-352), "provider_api_rejected"),
+            (Upstream::Status(403), "provider_http_rejected"),
+            (Upstream::InvalidJson, "response_json_invalid"),
+            (Upstream::Deadline, "deadline_exceeded"),
+            (Upstream::Transport, "transport_failed"),
+            (Upstream::TooLarge, "response_limit_exceeded"),
+        ] {
+            let class = upstream_failure_class(&error);
+            assert_eq!(class, expected);
+            assert!(!class.contains("synthetic"));
+            assert!(!class.contains("-352"));
+            assert!(!class.contains("403"));
         }
     }
 

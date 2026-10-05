@@ -276,7 +276,9 @@ impl Descriptor {
                 a.codec == AudioCodec::Aac
                     && a.codecs == "mp4a.40.2"
                     && a.mime_type == "audio/mp4"
-                    && audio_shape(a.sampling_rate, a.bandwidth)
+                    && (1..=MAX_AUDIO_BANDWIDTH).contains(&a.bandwidth)
+                    && a.sampling_rate
+                        .is_none_or(|rate| audio_shape(rate, a.bandwidth))
                     && valid_segments(
                         a.segment_base.index_range.start,
                         a.segment_base.index_range.end,
@@ -346,7 +348,7 @@ impl Descriptor {
                     height: None,
                     frame_rate: None,
                     sar: None,
-                    sampling_rate: Some(audio.sampling_rate),
+                    sampling_rate: audio.sampling_rate,
                     observed_content_length: None,
                     strong_etag: None,
                 },
@@ -545,9 +547,13 @@ impl Descriptor {
                 "audio"
                     if track.mime_type == "audio/mp4"
                         && track.codecs == "mp4a.40.2"
-                        && track
-                            .sampling_rate
-                            .is_some_and(|rate| audio_shape(rate, track.bandwidth))
+                        && (1..=MAX_AUDIO_BANDWIDTH).contains(&track.bandwidth)
+                        && match track.sampling_rate {
+                            Some(rate) => audio_shape(rate, track.bandwidth),
+                            // Bilibili may omit this declaration. Its MP4
+                            // initialization supplies the decoder configuration.
+                            None => provider == "bilibili" && self.compatibility_source.is_none(),
+                        }
                         && track.width.is_none()
                         && track.height.is_none()
                         && track.frame_rate.is_none()
@@ -1003,7 +1009,7 @@ mod tests {
                     codecs: "mp4a.40.2".into(),
                     mime_type: "audio/mp4".into(),
                     bandwidth: 192000,
-                    sampling_rate: 48000,
+                    sampling_rate: Some(48000),
                     start_with_sap: 1,
                     segment_base: segments,
                     primary: url,
@@ -1209,6 +1215,28 @@ mod tests {
         assert!(xml.len() < MAX_MANIFEST_BYTES);
         assert_eq!(xml_escape("<&\"'>"), "&lt;&amp;&quot;&apos;&gt;");
     }
+    #[test]
+    fn bilibili_unknown_audio_rate_is_omitted_from_mpd_without_fabrication() {
+        let mut d = fixture();
+        d.tracks[1].sampling_rate = None;
+        assert!(d.validate_for("bilibili").is_ok());
+        let mpd = d
+            .render_for("bilibili", Uuid::from_u128(42), &"a".repeat(64))
+            .unwrap();
+        assert!(!mpd.contains("audioSamplingRate"));
+        assert!(mpd.contains("codecs=\"mp4a.40.2\""));
+        let mut youtube = youtube_fixture();
+        youtube.tracks[1].sampling_rate = None;
+        assert!(youtube.validate_for("youtube").is_err());
+        for rate in [0, 7999, 96001] {
+            d.tracks[1].sampling_rate = Some(rate);
+            assert!(d.validate_for("bilibili").is_err());
+        }
+        d.tracks[1].sampling_rate = None;
+        d.tracks[1].bandwidth = 0;
+        assert!(d.validate_for("bilibili").is_err());
+    }
+
     #[test]
     fn descriptors_refuse_foreign_routes_codecs_and_invalid_ranges() {
         let mut d = fixture();

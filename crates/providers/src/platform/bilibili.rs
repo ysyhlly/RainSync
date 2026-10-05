@@ -470,7 +470,9 @@ pub struct AudioTrack {
     pub codecs: String,
     pub mime_type: String,
     pub bandwidth: u64,
-    pub sampling_rate: u32,
+    /// Provider-declared rate, when present. Missing metadata is not a measured
+    /// value and must not be replaced by a guessed default.
+    pub sampling_rate: Option<u32>,
     pub start_with_sap: u32,
     pub segment_base: SegmentBase,
     pub primary: MediaUrl,
@@ -1074,13 +1076,17 @@ fn parse_dash(value: &Value, expected_duration_seconds: u64, now: u64) -> Result
         if mime_type != "audio/mp4" {
             return Err(Error::InvalidResponse("audio_mime"));
         }
-        let sampling_rate =
-            numeric_string(alias(track, &["audioSamplingRate", "audio_sampling_rate"])?)?
-                .parse::<u32>()
-                .map_err(|_| Error::InvalidResponse("sampling_rate"))?;
-        if !(8000..=384000).contains(&sampling_rate) {
-            return Err(Error::InvalidResponse("sampling_rate"));
-        }
+        let sampling_rate = optional_alias(track, &["audioSamplingRate", "audio_sampling_rate"])?
+            .map(|value| {
+                let rate = numeric_string(value)?
+                    .parse::<u32>()
+                    .map_err(|_| Error::InvalidResponse("sampling_rate"))?;
+                if !(8000..=384000).contains(&rate) {
+                    return Err(Error::InvalidResponse("sampling_rate"));
+                }
+                Ok(rate)
+            })
+            .transpose()?;
         let (primary, backups) = media_addresses(track, &["baseUrl", "base_url"], now)?;
         audio.push(AudioTrack {
             key,
@@ -1467,18 +1473,24 @@ pub fn parse_qr_generate_response(bytes: &[u8]) -> Result<QrChallenge> {
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
-        || url.path() != "/h5-app/passport/login"
+        || !matches!(
+            url.path(),
+            "/h5-app/passport/login" | "/h5-app/passport/login/scan"
+        )
     {
         return Err(Error::InvalidResponse("qr_url"));
     }
     let key = QrKey::from_secret(text(field(data, "qrcode_key")?, 128)?)?;
-    let pairs = url.query_pairs().collect::<Vec<_>>();
-    if pairs.iter().filter(|(name, _)| name == "oauthKey").count() != 1
-        || pairs
-            .iter()
-            .find(|(name, _)| name == "oauthKey")
-            .map(|(_, value)| value.as_ref())
-            != Some(key.0.as_str())
+    // The current web endpoint returns /login/scan?qrcode_key=.... Preserve
+    // the previously supported /login?oauthKey=... payload only when exactly
+    // one recognized binding matches this response's poll key.
+    let bindings = url
+        .query_pairs()
+        .filter(|(name, _)| matches!(name.as_ref(), "qrcode_key" | "oauthKey"))
+        .collect::<Vec<_>>();
+    if bindings.len() != 1
+        || (url.path().ends_with("/scan") && bindings[0].0 != "qrcode_key")
+        || bindings[0].1 != key.0
     {
         return Err(Error::InvalidResponse("qr_binding"));
     }

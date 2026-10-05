@@ -211,7 +211,7 @@ fn course_access_and_full_view_are_distinct_required_gates() {
     // Known whole free/introduction episodes remain legal even has_paid=false.
     let actual = parse(&play_json()).unwrap();
     assert!(actual.whole_entitlement().is_whole());
-    assert_eq!(actual.dash.audio[0].sampling_rate, 48000);
+    assert_eq!(actual.dash.audio[0].sampling_rate, Some(48000));
     assert!(actual.audio_probe.is_none());
     assert_eq!(actual.dash.video.len(), 3);
     assert!(
@@ -520,7 +520,7 @@ async fn course_missing_audio_rate_uses_one_bounded_authorized_init_probe() {
         .resolve(&reference().canonical(), None, deadline)
         .await
         .unwrap();
-    assert_eq!(resolved.dash.audio[0].sampling_rate, 44100); // Derived from esds, not a guessed default.
+    assert_eq!(resolved.dash.audio[0].sampling_rate, Some(44100)); // Derived from esds, not a guessed default.
     assert!(resolved.whole_entitlement().is_whole());
     assert_eq!(
         resolved.audio_probe.unwrap(),

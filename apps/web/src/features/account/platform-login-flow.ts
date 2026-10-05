@@ -25,7 +25,8 @@ export function createPlatformLoginFlow(options: {
 }) {
   let serial = 0,
     key: string | undefined,
-    loginId: string | undefined;
+    loginId: string | undefined,
+    qrPayload: string | undefined;
   let controller = new AbortController(),
     timer: ReturnType<typeof setTimeout> | undefined;
   let closed = false,
@@ -39,7 +40,7 @@ export function createPlatformLoginFlow(options: {
     generation === serial &&
     options.current() &&
     !controller.signal.aborted;
-  function validate(value: PlatformLogin) {
+  function validate(value: PlatformLogin, fromPoll: boolean) {
     if ((key && value.id !== key) || (loginId && value.id !== loginId))
       throw Error("Invalid login binding");
     if (
@@ -52,7 +53,19 @@ export function createPlatformLoginFlow(options: {
     )
       throw Error("Invalid login response");
     if (value.status === "pending") {
-      if (!value.qr_payload || value.qr_payload.length > 4096)
+      // Poll responses deliberately omit the capability. Only this exact
+      // login's validated start response can supply its immutable local QR.
+      if (value.qr_payload === null) {
+        if (!fromPoll || loginId !== value.id || !qrPayload)
+          throw Error("Invalid QR response");
+        return value;
+      }
+      if (
+        typeof value.qr_payload !== "string" ||
+        !value.qr_payload ||
+        value.qr_payload.length > 4096 ||
+        (qrPayload && value.qr_payload !== qrPayload)
+      )
         throw Error("Invalid QR response");
       const url = new URL(value.qr_payload);
       if (
@@ -60,19 +73,31 @@ export function createPlatformLoginFlow(options: {
         url.username ||
         url.password ||
         url.hash ||
-        url.pathname !== "/h5-app/passport/login"
+        !["/h5-app/passport/login", "/h5-app/passport/login/scan"].includes(
+          url.pathname,
+        )
       )
         throw Error("Invalid QR origin");
+      const bindings = [...url.searchParams].filter(([name]) =>
+        ["qrcode_key", "oauthKey"].includes(name),
+      );
+      if (
+        bindings.length !== 1 ||
+        (url.pathname.endsWith("/scan") && bindings[0]![0] !== "qrcode_key") ||
+        !/^[a-z0-9_-]{16,128}$/i.test(bindings[0]![1])
+      )
+        throw Error("Invalid QR binding");
     }
     return value;
   }
-  function apply(value: PlatformLogin, generation: number) {
+  function apply(value: PlatformLogin, generation: number, fromPoll = false) {
     if (!current(generation)) return;
-    validate(value);
+    validate(value, fromPoll);
     loginId = value.id;
     if (value.status !== "pending") {
       key = undefined;
       loginId = undefined;
+      qrPayload = undefined;
       publish({
         phase: value.status,
         message:
@@ -85,6 +110,7 @@ export function createPlatformLoginFlow(options: {
       if (value.status === "confirmed") options.confirmed();
       return;
     }
+    qrPayload = value.qr_payload ?? qrPayload;
     loginDeadline = Math.min(
       loginDeadline ?? Infinity,
       now() +
@@ -98,7 +124,7 @@ export function createPlatformLoginFlow(options: {
     publish({
       phase: "pending",
       stage: value.stage ?? "waiting",
-      payload: value.qr_payload!,
+      payload: qrPayload!,
     });
     const deadline = now() + remaining;
     const delay = Math.max(
@@ -113,7 +139,11 @@ export function createPlatformLoginFlow(options: {
         return;
       }
       try {
-        apply(await options.poll(value.id, controller.signal), generation);
+        apply(
+          await options.poll(value.id, controller.signal),
+          generation,
+          true,
+        );
       } catch {
         if (current(generation))
           publish({
@@ -152,6 +182,7 @@ export function createPlatformLoginFlow(options: {
     const pending = loginId ?? key;
     key = undefined;
     loginId = undefined;
+    qrPayload = undefined;
     if (pending) await options.cancel(pending);
   }
   return { start, close };

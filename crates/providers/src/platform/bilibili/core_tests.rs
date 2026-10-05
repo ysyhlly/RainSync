@@ -180,7 +180,7 @@ fn bilibili_core_dash_typed_ranges_codecs_qualities_and_expiry() {
         dash.video[0].segment_base.index_range.to_string(),
         "1000-1999"
     );
-    assert_eq!(dash.audio[0].sampling_rate, 48000);
+    assert_eq!(dash.audio[0].sampling_rate, Some(48000));
     assert!(!format!("{resolved:?}").contains("bilivideo.com"));
     let mut unknown = play_json();
     unknown["data"]["dash"]["audio"][0]["baseUrl"] =
@@ -191,6 +191,73 @@ fn bilibili_core_dash_typed_ranges_codecs_qualities_and_expiry() {
             .earliest_expires_at,
         None
     );
+}
+
+#[test]
+fn bilibili_core_anonymous_dash_can_omit_unmeasured_audio_sampling_rate() {
+    // Same six-video/three-AAC response shape as the failing anonymous playurl.
+    // URLs and names are fixture-only; no signed production media grants persist.
+    let mut response = play_json();
+    let mut videos = Vec::new();
+    for (quality, height) in [(80, 1080), (64, 720)] {
+        for (codec, codecid) in [
+            ("avc1.640028", 7),
+            ("hev1.1.6.L120.90", 12),
+            ("av01.0.08M.08", 13),
+        ] {
+            let mut video = video_json();
+            video["id"] = json!(quality);
+            video["height"] = json!(height);
+            video["codecs"] = json!(codec);
+            video["codecid"] = json!(codecid);
+            videos.push(video);
+        }
+    }
+    let mut audios = Vec::new();
+    for (id, bandwidth) in [(30232, 132000), (30216, 67000), (30280, 192000)] {
+        let mut audio = audio_json();
+        audio.as_object_mut().unwrap().remove("audioSamplingRate");
+        audio["id"] = json!(id);
+        audio["bandwidth"] = json!(bandwidth);
+        audios.push(audio);
+    }
+    response["data"]["dash"]["video"] = json!(videos);
+    response["data"]["dash"]["audio"] = json!(audios);
+    let resolved = parse_playurl_response(&bytes(response), &metadata(), NOW).unwrap();
+    let Playback::Dash(dash) = resolved.playback else {
+        panic!("expected DASH")
+    };
+    assert_eq!(dash.video.len(), 6);
+    assert_eq!(dash.audio.len(), 3);
+    assert!(dash.audio.iter().all(|audio| audio.sampling_rate.is_none()));
+}
+
+#[test]
+fn bilibili_core_optional_audio_sampling_rate_keeps_present_values_strict() {
+    for invalid in [
+        Value::Null,
+        json!(""),
+        json!("NaN"),
+        json!(0),
+        json!(7999),
+        json!(384001),
+        json!("48000.0"),
+        json!(-48000),
+        json!(true),
+    ] {
+        let mut response = play_json();
+        response["data"]["dash"]["audio"][0]["audioSamplingRate"] = invalid;
+        assert!(parse_playurl_response(&bytes(response), &metadata(), NOW).is_err());
+    }
+    let mut response = play_json();
+    response["data"]["dash"]["audio"][0]["audio_sampling_rate"] = json!("44100");
+    assert_eq!(
+        parse_playurl_response(&bytes(response), &metadata(), NOW).unwrap_err(),
+        Error::InvalidResponse("conflicting_alias")
+    );
+    let mut response = play_json();
+    response["data"]["dash"]["audio"][0]["audio_sampling_rate"] = json!("48000");
+    assert!(parse_playurl_response(&bytes(response), &metadata(), NOW).is_ok());
 }
 
 #[test]
@@ -387,6 +454,46 @@ fn bilibili_core_qr_parser_binds_state_and_captures_only_confirmed_cookie() {
         json!({"code":0,"data":{"url":"https://passport.bilibili.com/h5-app/passport/login?oauthKey=other","qrcode_key":key}}),
     );
     assert!(parse_qr_generate_response(&wrong).is_err());
+}
+
+#[test]
+fn bilibili_core_current_qr_scan_url_binds_exactly_one_poll_key() {
+    // Synthetic response in the current web QR endpoint's shape. No remote
+    // QR session or credential is created by this regression test.
+    let key = "synthetic-qr-capability-0123456789";
+    let payload = format!(
+        "https://passport.bilibili.com/h5-app/passport/login/scan?navhide=1&qrcode_key={key}&from=main_web"
+    );
+    for url in [
+        payload.clone(),
+        format!("https://passport.bilibili.com/h5-app/passport/login?qrcode_key={key}"),
+        format!("https://passport.bilibili.com/h5-app/passport/login?oauthKey={key}"),
+    ] {
+        let body = bytes(json!({"code":0,"data":{"url":url,"qrcode_key":key}}));
+        let challenge = parse_qr_generate_response(&body).unwrap();
+        assert_eq!(challenge.login_url, url);
+        assert_eq!(challenge.key.expose_for_storage(), key);
+        assert!(!format!("{challenge:?}").contains(key));
+    }
+    for url in [
+        format!("{payload}&qrcode_key={key}"),
+        format!("{payload}&qrcode_key=different-synthetic-capability"),
+        format!("{payload}&oauthKey={key}"),
+        format!("{payload}&oauthKey=different-synthetic-capability"),
+        "https://passport.bilibili.com/h5-app/passport/login/scan?navhide=1".to_owned(),
+        format!("https://passport.bilibili.com/h5-app/passport/login/scan?oauthKey={key}"),
+        "https://passport.bilibili.com/h5-app/passport/login/scan?qrcode_key=different-synthetic-capability".to_owned(),
+        format!("https://passport.bilibili.com/h5-app/passport/login?oauthKey={key}&oauthKey={key}"),
+        format!("https://passport.bilibili.com/h5-app/passport/login?oauthKey={key}&qrcode_key={key}"),
+        format!("https://passport.bilibili.com/h5-app/passport/login/scan/other?qrcode_key={key}"),
+        format!("https://passport.bilibili.com.evil.invalid/h5-app/passport/login/scan?qrcode_key={key}"),
+        format!("https://user@passport.bilibili.com/h5-app/passport/login/scan?qrcode_key={key}"),
+        format!("https://passport.bilibili.com:444/h5-app/passport/login/scan?qrcode_key={key}"),
+        format!("{payload}#fragment"),
+    ] {
+        let body = bytes(json!({"code":0,"data":{"url":url,"qrcode_key":key}}));
+        assert!(parse_qr_generate_response(&body).is_err());
+    }
 }
 
 #[derive(Clone)]
