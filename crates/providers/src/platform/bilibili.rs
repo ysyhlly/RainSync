@@ -1008,8 +1008,8 @@ fn parse_dash(value: &Value, expected_duration_seconds: u64, now: u64) -> Result
         if mime_type != "video/mp4" {
             return Err(Error::InvalidResponse("video_mime"));
         }
-        let frame_rate = text(alias(track, &["frameRate", "frame_rate"])?, 32)?.to_owned();
-        ratio(&frame_rate, '/', 240.0)?;
+        let frame_rate =
+            canonical_frame_rate(text(alias(track, &["frameRate", "frame_rate"])?, 32)?)?;
         let sar = track
             .get("sar")
             .map(|value| text(value, 32).map(str::to_owned))
@@ -1131,6 +1131,59 @@ fn codec_text(value: &Value) -> Result<String> {
     }
     Ok(value.to_owned())
 }
+fn canonical_frame_rate(value: &str) -> Result<String> {
+    let invalid = || Error::InvalidResponse("frame_rate");
+    ratio(value, '/', 240.0)?;
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit());
+    if let Some((whole, fraction)) = value.split_once('.') {
+        if !digits(whole) || !digits(fraction) {
+            return Err(invalid());
+        }
+        // Bilibili reports ordinary rates such as "25.000". The closed DASH
+        // renderer and browser contract require integer or integer-ratio rates.
+        // Convert exactly, without rounding a fractional cadence to an integer.
+        let fraction = fraction.trim_end_matches('0');
+        if fraction.len() > 9 {
+            return Err(invalid());
+        }
+        let denominator = 10_u64.pow(fraction.len() as u32);
+        let numerator = whole
+            .parse::<u64>()
+            .ok()
+            .and_then(|whole| whole.checked_mul(denominator))
+            .and_then(|whole| {
+                if fraction.is_empty() {
+                    Some(whole)
+                } else {
+                    whole.checked_add(fraction.parse::<u64>().ok()?)
+                }
+            })
+            .ok_or_else(invalid)?;
+        let (mut a, mut b) = (numerator, denominator);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        let numerator = u32::try_from(numerator / a).map_err(|_| invalid())?;
+        let denominator = u32::try_from(denominator / a).map_err(|_| invalid())?;
+        return Ok(if denominator == 1 {
+            numerator.to_string()
+        } else {
+            format!("{numerator}/{denominator}")
+        });
+    }
+    // Existing integer/rational rates remain byte-for-byte unchanged. Reject
+    // exponent/sign syntax and components the browser contract cannot represent.
+    let mut parts = value.split('/');
+    let number = |part: &str| digits(part) && part.parse::<u32>().is_ok_and(|number| number > 0);
+    if !parts.next().is_some_and(number)
+        || !parts.next().is_none_or(number)
+        || parts.next().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(value.to_owned())
+}
+
 fn ratio(value: &str, separator: char, max: f64) -> Result<()> {
     let result = if let Some((a, b)) = value.split_once(separator) {
         let a = a

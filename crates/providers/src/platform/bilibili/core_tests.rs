@@ -194,6 +194,55 @@ fn bilibili_core_dash_typed_ranges_codecs_qualities_and_expiry() {
 }
 
 #[test]
+fn bilibili_core_dash_decimal_frame_rates_are_canonical_browser_ratios() {
+    for (input, expected) in [
+        ("25.000", "25"),
+        ("23.976", "2997/125"),
+        ("29.970", "2997/100"),
+        ("59.940", "2997/50"),
+        ("120.000", "120"),
+        ("240.000", "240"),
+        ("0.125", "1/8"),
+        ("25", "25"),
+        ("30000/1001", "30000/1001"),
+    ] {
+        let mut response = play_json();
+        response["data"]["dash"]["video"][0]["frameRate"] = json!(input);
+        let resolved = parse_playurl_response(&bytes(response), &metadata(), NOW).unwrap();
+        let Playback::Dash(dash) = resolved.playback else {
+            panic!("expected DASH")
+        };
+        assert_eq!(dash.video[0].frame_rate, expected, "input {input}");
+    }
+}
+
+#[test]
+fn bilibili_core_dash_frame_rate_normalization_keeps_invalid_values_closed() {
+    for input in [
+        "0.000",
+        "240.001",
+        "NaN",
+        "inf",
+        "-25.000",
+        "25/0",
+        "25.000/1",
+        ".25",
+        "25.",
+        "25.0000000001",
+        "4294967296/4294967295",
+        "25.000\n",
+        " 25.000",
+    ] {
+        let mut response = play_json();
+        response["data"]["dash"]["video"][0]["frameRate"] = json!(input);
+        assert!(
+            parse_playurl_response(&bytes(response), &metadata(), NOW).is_err(),
+            "accepted {input:?}"
+        );
+    }
+}
+
+#[test]
 fn bilibili_core_anonymous_dash_can_omit_unmeasured_audio_sampling_rate() {
     // Same six-video/three-AAC response shape as the failing anonymous playurl.
     // URLs and names are fixture-only; no signed production media grants persist.
