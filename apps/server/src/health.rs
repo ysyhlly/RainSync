@@ -173,6 +173,7 @@ pub async fn endpoint(
     (
         axum::http::StatusCode::from_u16(snapshot.http_status()).expect("fixed readiness status"),
         [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::Extension(http_api::PreserveReadinessBody),
         axum::Json(serde_json::json!({"ready":snapshot.ready,"checks":checks})),
     )
 }

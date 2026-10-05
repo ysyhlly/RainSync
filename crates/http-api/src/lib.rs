@@ -9,6 +9,11 @@ use axum::{
 use protocol::{ApiError, ErrorCode, ErrorResponse};
 use uuid::Uuid;
 
+/// Trusted readiness handlers return a fixed, low-cardinality diagnostic body
+/// even when readiness fails. Request data cannot create this response marker.
+#[derive(Clone, Copy, Debug)]
+pub struct PreserveReadinessBody;
+
 /// Normalize application, extractor and router failures without returning raw
 /// upstream/framework bodies. Preserve protocol headers such as Content-Range.
 pub async fn errors(request: Request, next: Next) -> Response {
@@ -19,7 +24,9 @@ pub async fn errors(request: Request, next: Next) -> Response {
     parts
         .headers
         .insert("x-request-id", request_id.to_string().parse().unwrap());
-    if !parts.status.is_client_error() && !parts.status.is_server_error() {
+    if (!parts.status.is_client_error() && !parts.status.is_server_error())
+        || parts.extensions.get::<PreserveReadinessBody>().is_some()
+    {
         return Response::from_parts(parts, body);
     }
     // An Agent can return a streamed error. Do not wait indefinitely for its
@@ -111,6 +118,61 @@ mod tests {
     use super::*;
     use axum::{Router, routing::get};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn trusted_readiness_failure_keeps_checks_without_bypassing_unmarked_errors() {
+        let readiness = serde_json::json!({
+            "ready": false,
+            "checks": {
+                "accepting_work": "ready",
+                "database": "failed",
+                "instance_ownership": "ready"
+            }
+        });
+        for marked in [false, true] {
+            let value = readiness.clone();
+            let router = Router::new()
+                .route(
+                    "/ready",
+                    get(move || async move {
+                        let mut response = (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            [(header::CACHE_CONTROL, "no-store")],
+                            Json(value),
+                        )
+                            .into_response();
+                        if marked {
+                            response.extensions_mut().insert(PreserveReadinessBody);
+                        }
+                        response
+                    }),
+                )
+                .layer(axum::middleware::from_fn(errors));
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/ready")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert!(response.headers().contains_key("x-request-id"));
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            if marked {
+                let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(actual, readiness);
+            } else {
+                let actual: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(actual.error.code, ErrorCode::ServiceUnavailable);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn chat_and_reaction_limits_preserve_explicit_bounded_backoff() {
