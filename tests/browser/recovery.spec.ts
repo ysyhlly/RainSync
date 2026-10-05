@@ -748,7 +748,24 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
     await page.clock.runFor(1000);
     resumes++;
     await expect.poll(async () => (await stats()).starts.length).toBe(resumes);
+    // startLoad requests the refreshed EVENT manifest asynchronously. A paused
+    // browser clock must not advance playback against the previous short range
+    // before the real fetch has completed and the fixture has exposed its end.
+    await expect
+      .poll(async () => (await stats()).manifests.at(-1)?.end)
+      .toBe(publishedUntil / 1000);
     await page.clock.runFor(300);
+    await expect
+      .poll(async () => {
+        const value = await stats();
+        if (value.paused || value.current <= waitingRead.position / 1000)
+          await page.clock.runFor(100);
+        const progressed = await stats();
+        return (
+          !progressed.paused && progressed.current > waitingRead.position / 1000
+        );
+      })
+      .toBe(true);
     const after = await stats();
     expect(after.current).toBeGreaterThan(waitingRead.position / 1000);
     expect(after.paused).toBe(false);
