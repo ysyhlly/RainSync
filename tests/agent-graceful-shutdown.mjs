@@ -12,6 +12,7 @@ import { spawn } from "node:child_process";
 import { open, readFile, readdir, readlink, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 import { delay } from "./fixtures/server.mjs";
 
 if (process.platform !== "linux") {
@@ -85,7 +86,9 @@ await isolatedMediaStack("agent-graceful-shutdown", async (f) => {
       resource: "long.mp4",
       source_version: sourceVersion,
     };
-    f.sql(
+    withPlaybackAdmission(
+      f,
+      { client: admin, user: user.id, room: room.id, session },
       `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f,resource)}','${session}','${user.id}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}","upstream_closed":true}',now()+interval '1 hour')`,
     );
     let response,

@@ -4,6 +4,7 @@ import { randomUUID, randomBytes, createCipheriv, createHash } from "node:crypto
 import { createServer } from "node:http";
 import { readFile, readdir } from "node:fs/promises";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 import { delay } from "./fixtures/server.mjs";
 
 const quote = value => `'${String(value).replaceAll("'", "''")}'`;
@@ -55,19 +56,18 @@ await isolatedMediaStack("room-cleanup", async f => {
   const lifecycle=id=>client.request(`/rooms/${id}/lifecycle`);
   const close=async id=>{ const current=await lifecycle(id); return client.request(`/rooms/${id}/close`,"POST",{expected_revision:current.state.revision}); };
   const waitClosed=async id=>until(async()=> (await lifecycle(id)).lifecycle==="closed","room cleanup completed");
-  const seed=(id,room,resource)=>{
+  const seed=(id,room,resource,{key=randomUUID(),reservation=""}={})=>{
     const token=randomBytes(24).toString("hex");
     const media=resource.kind==="agent"?"NULL":quote(sourceMedia(f,resource));
-    f.sql(`INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES(${media},'${id}','${user.id}','${room}',0,'${createHash("sha256").update(token).digest("hex")}',${quote(JSON.stringify({encrypted:encrypt(resource)}))},now()+interval '1 hour')`);
+    withPlaybackAdmission(f, { client, user: user.id, room, session: id, key }, `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES(${media},'${id}','${user.id}','${room}',0,'${createHash("sha256").update(token).digest("hex")}',${quote(JSON.stringify({encrypted:encrypt(resource)}))},now()+interval '1 hour'); ${reservation}`);
     return token;
   };
   let paused=false;
   try {
     await f.startWorker();
-    const external=await room("upstream retry across restart"), session=randomUUID();
+    const external=await room("upstream retry across restart"), session=randomUUID(), key=randomUUID();
     const resource={kind:"jellyfin",upstream_base:remote,upstream_item:"fixture",upstream_session:randomUUID(),headers:{},transport:"progressive"};
-    seed(session,external.id,resource);
-    f.sql(`INSERT INTO upstream_reservations(id,user_id,request_key,owner_epoch,room_id,media_id,source_id,generation,kind,device_id,origin_key,scope_encrypted,play_session_id,state,negotiation,lifecycle_epoch,play_method,start_reported) VALUES('${session}','${user.id}','${randomUUID()}','${randomUUID()}','${external.id}','${randomUUID()}','${randomUUID()}',0,'jellyfin','fixture-${session}','fixture-origin',${quote(encrypt({config:{url:remote,token:"fixture",user_id:"fixture"},item:"fixture"}))},'${resource.upstream_session}','active','received',0,'DirectPlay',true)`);
+    seed(session,external.id,resource,{key,reservation:`INSERT INTO upstream_reservations(id,user_id,request_key,owner_epoch,room_id,media_id,source_id,generation,kind,device_id,origin_key,scope_encrypted,play_session_id,state,negotiation,lifecycle_epoch,play_method,start_reported) VALUES('${session}','${user.id}','${key}','${randomUUID()}','${external.id}','${randomUUID()}','${randomUUID()}',0,'jellyfin','fixture-${session}','fixture-origin',${quote(encrypt({config:{url:remote,token:"fixture",user_id:"fixture"},item:"fixture"}))},'${resource.upstream_session}','active','received',0,'DirectPlay',true)`});
     assert.equal((await close(external.id)).lifecycle,"closing");
     await until(()=>stops>0,"first upstream stop failure");
     await until(async()=>Boolean((await lifecycle(external.id)).cleanup?.last_error),"observable cleanup failure");

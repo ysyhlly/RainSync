@@ -14,6 +14,8 @@ import re
 import subprocess
 import sys
 import tarfile
+import tempfile
+from uuid import uuid4
 
 MAX_IMAGE_BYTES = 1536 * 1024 * 1024
 TAR_OVERHEAD_BYTES = 32 * 1024 * 1024
@@ -196,6 +198,62 @@ def verify_daemon(manifest):
         require(labels.get("org.opencontainers.image.revision") == expected["source_revision"], "daemon source revision mismatch")
 
 
+def validate_web_image(web, restrictions):
+    # Official Caddy's file capability cannot execute with an empty bounding
+    # set. Docker tmpfs is noexec by default. Keep both restrictions: prepare
+    # only a byte-identical, capability-free validation copy in a runner-only
+    # derived image layer. The production image and save list stay unchanged.
+    base = inspect(web)
+    require(base["Id"] == web and web.startswith("sha256:"), "validation base must be the exact production image ID")
+    nonce = uuid4().hex
+    base_tag, validation_tag = "rainsync-web-validation-base:" + nonce, "rainsync-web-validation-only:" + nonce
+    probe_name = "rainsync-web-validation-probe-" + nonce
+    owned_tags = []
+    probe_attempted = False
+    try:
+        builder = docker(["buildx", "inspect", "default"])
+        require(re.search(r"^Driver:\s+docker\s*$", builder, re.MULTILINE), "validation requires the default docker driver and local daemon image store; no registry fallback")
+        docker(["image", "tag", web, base_tag])
+        owned_tags.append(base_tag)
+        require(inspect(base_tag)["Id"] == web, "validation base alias changed")
+        with tempfile.TemporaryDirectory(prefix="rainsync-web-validation-") as context:
+            recipe = Path(context) / "Dockerfile"
+            recipe.write_text(f"FROM {base_tag}\nRUN --network=none cp /usr/bin/caddy /usr/bin/rainsync-caddy-validate && cmp /usr/bin/caddy /usr/bin/rainsync-caddy-validate && test -z \"$(getcap /usr/bin/rainsync-caddy-validate)\"\n")
+            docker(["build", "--builder", "default", "--platform", "linux/amd64", "--network", "none", "--pull=false", "--file", str(recipe), "--tag", validation_tag, context], timeout=120)
+        owned_tags.append(validation_tag)
+        derived = inspect(validation_tag)
+        require(inspect(base_tag)["Id"] == web and inspect(web)["Id"] == web, "production image identity changed")
+        require(derived["Os"] == "linux" and derived["Architecture"] == "amd64", "validation image architecture mismatch")
+        require(derived["RootFS"]["Layers"][:-1] == base["RootFS"]["Layers"], "validation image is not exactly the production layers plus one copy layer")
+        caddy = """getcap /usr/bin/caddy >&2
+cmp /usr/bin/caddy /usr/bin/rainsync-caddy-validate
+test -z "$(getcap /usr/bin/rainsync-caddy-validate)"
+awk '$2 == "/tmp" { print }' /proc/mounts >&2
+exec /usr/bin/rainsync-caddy-validate validate --config /etc/caddy/Caddyfile --adapter caddyfile"""
+        probe_attempted = True
+        docker([*restrictions, "--name", probe_name, "--tmpfs", "/tmp:rw,nosuid,nodev,size=128m", "--env", "SITE_ADDRESS=:80", "--entrypoint", "sh", derived["Id"], "-eu", "-c", caddy], timeout=30)
+    finally:
+        if probe_attempted:
+            listing = ["container", "ls", "--all", "--filter", "name=^/" + probe_name + "$", "--format", "{{.Names}}"]
+            present = docker(listing).strip().splitlines()
+            require(present in ([], [probe_name]), "ambiguous validation probe ownership; preserve validation images")
+            if present:
+                try:
+                    # A killed/timed-out CLI does not stop its daemon container.
+                    # Only this fresh nonce-owned disposable probe may be killed.
+                    docker(["container", "rm", "--force", probe_name], timeout=15)
+                except subprocess.CalledProcessError:
+                    # --rm can complete between listing and removal. Accept that
+                    # race only after the following positive absence query.
+                    pass
+                require(not docker(listing).strip(), "validation probe is not confirmed absent; preserve validation images")
+        # Remove only fresh nonce-named validation aliases/images, never a
+        # runtime image or another builder's cache. The daemon confirms the
+        # attempted probe is absent before any image cleanup, even on timeout.
+        if owned_tags:
+            docker(["image", "rm", "--no-prune", *reversed(owned_tags)])
+
+
 def runtime_checks(backend, web):
     common = ["run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges"]
     def probe(binary, flag):
@@ -209,15 +267,7 @@ ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,heigh
     result = read_json(docker([*common, "--tmpfs", "/tmp:rw,nosuid,nodev,size=16m", "--entrypoint", "sh", backend, "-eu", "-c", ffmpeg], timeout=60))
     require(result.get("streams") == [{"codec_name": "h264", "width": 64, "height": 64}], "actual FFmpeg encode/probe/decode failed")
     checks["ffmpeg"] = {"encode": "passed", "probe": "passed", "decode": "passed", "codec": "h264", "width": 64, "height": 64}
-    # Official Caddy carries cap_net_bind_service=ep. Linux refuses its direct
-    # exec when ALL is dropped from the capability bounding set. Validation
-    # needs no listener/capability: copy bytes only into the bounded nosuid tmpfs
-    # and compare them before exec, retaining every isolation flag above.
-    caddy = """getcap /usr/bin/caddy >&2
-cp /usr/bin/caddy /tmp/rainsync-caddy-validate
-cmp /usr/bin/caddy /tmp/rainsync-caddy-validate
-exec /tmp/rainsync-caddy-validate validate --config /etc/caddy/Caddyfile --adapter caddyfile"""
-    docker([*common, "--tmpfs", "/tmp:rw,nosuid,nodev,size=128m", "--env", "SITE_ADDRESS=:80", "--entrypoint", "sh", web, "-eu", "-c", caddy], timeout=30)
+    validate_web_image(web, common)
     checks["web_config"] = "passed"
     return checks
 

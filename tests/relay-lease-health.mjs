@@ -8,6 +8,7 @@ import { open, readFile, readdir, readlink, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 import { delay } from "./fixtures/server.mjs";
 import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
 
@@ -41,7 +42,7 @@ try {
     const room = await admin.request("/rooms", "POST", { name: "isolated relay unknown renewal" });
     const session = randomUUID(), token = randomBytes(32).toString("hex");
     const encrypted = encrypt({ kind: "agent", agent_id: agentId, resource: "long.mp4", source_version: sourceVersion });
-    f.sql(`INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES((SELECT id FROM media_items WHERE source_id='${agentId}' AND resource='long.mp4'),'${session}','${identity.id}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypted}"}',now()+interval '1 hour')`);
+    withPlaybackAdmission(f, { client: admin, user: identity.id, room: room.id, session }, `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES((SELECT id FROM media_items WHERE source_id='${agentId}' AND resource='long.mp4'),'${session}','${identity.id}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypted}"}',now()+interval '1 hour')`);
     const stream = { response: null, aborted: false, ended: false };
     const req = request(`${f.workerOrigin}/media-delivery/${session}/source?token=${token}`, res => {
       stream.response = res;

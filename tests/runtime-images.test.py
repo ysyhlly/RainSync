@@ -123,37 +123,115 @@ class RuntimeArtifactTests(unittest.TestCase):
         self.reject(lambda m: m["runtime_checks"].update(ffmpeg={}), "FFmpeg")
 
     def test_caddy_validation_preserves_hardening_and_compares_image_binary(self):
-        calls = []
+        calls, recipes = [], []
+        web_id, derived_id = "sha256:" + "e" * 64, "sha256:" + "f" * 64
+        base = {"Id": web_id, "Os": "linux", "Architecture": "amd64", "RootFS": {"Layers": ["base-layer"]}}
+        derived = {"Id": derived_id, "Os": "linux", "Architecture": "amd64", "RootFS": {"Layers": ["base-layer", "validation-copy-layer"]}}
+        def inspect(reference):
+            return copy.deepcopy(derived if reference.startswith("rainsync-web-validation-only:") else base)
         def run(args, timeout=60):
             calls.append(args)
-            if "--media-authorization-contract" in args:
-                return json.dumps(runtime.LOGIN_CONTRACT)
-            if "--source-access-contract" in args:
-                role = "worker" if "rainsync-media-worker" in args else "server"
-                return json.dumps(runtime.source_contract(role))
-            if "backend-image" in args:
-                return json.dumps({"streams": [{"codec_name": "h264", "width": 64, "height": 64}]})
+            if args[0] == "buildx":
+                return "Name: default\nDriver: docker\n"
+            if args[:2] == ["container", "ls"]:
+                return ""
+            if args[0] == "build":
+                recipes.append(Path(args[args.index("--file") + 1]).read_text())
             return "Valid configuration\n"
-        with patch.object(runtime, "docker", side_effect=run):
-            self.assertEqual(runtime.runtime_checks("backend-image", "web-image")["web_config"], "passed")
-        self.assertEqual(len(calls), 5)
-        web = calls[-1]
+        restrictions = ["run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges"]
+        with patch.object(runtime, "docker", side_effect=run), patch.object(runtime, "inspect", side_effect=inspect):
+            runtime.validate_web_image(web_id, restrictions)
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(calls[0], ["buildx", "inspect", "default"])
+        self.assertEqual(calls[1][:3], ["image", "tag", web_id])
+        base_tag = calls[1][-1]
+        build = calls[2]
+        self.assertEqual(build[0], "build")
+        self.assertEqual(build[build.index("--builder") + 1], "default")
+        self.assertEqual(build[build.index("--network") + 1], "none")
+        self.assertIn("--pull=false", build)
+        self.assertTrue(recipes[0].startswith("FROM " + base_tag + "\n"))
+        self.assertIn("RUN --network=none cp /usr/bin/caddy /usr/bin/rainsync-caddy-validate && cmp /usr/bin/caddy /usr/bin/rainsync-caddy-validate", recipes[0])
+        self.assertIn('test -z "$(getcap /usr/bin/rainsync-caddy-validate)"', recipes[0])
+        web = calls[3]
         for option, value in (("--network", "none"), ("--cap-drop", "ALL"), ("--security-opt", "no-new-privileges"),
                               ("--tmpfs", "/tmp:rw,nosuid,nodev,size=128m"), ("--entrypoint", "sh")):
             self.assertEqual(web[web.index(option) + 1], value)
         self.assertIn("--read-only", web)
         self.assertNotIn("--cap-add", web)
         self.assertNotIn("--privileged", web)
+        self.assertIn(derived_id, web)
+        self.assertNotIn("exec", web[web.index("--tmpfs") + 1].split(","))
         self.assertIn("getcap /usr/bin/caddy", web[-1])
-        self.assertIn("cp /usr/bin/caddy /tmp/rainsync-caddy-validate", web[-1])
-        self.assertIn("cmp /usr/bin/caddy /tmp/rainsync-caddy-validate", web[-1])
-        self.assertIn("exec /tmp/rainsync-caddy-validate validate --config /etc/caddy/Caddyfile --adapter caddyfile", web[-1])
+        self.assertIn("cmp /usr/bin/caddy /usr/bin/rainsync-caddy-validate", web[-1])
+        self.assertIn('test -z "$(getcap /usr/bin/rainsync-caddy-validate)"', web[-1])
+        self.assertIn("exec /usr/bin/rainsync-caddy-validate validate --config /etc/caddy/Caddyfile --adapter caddyfile", web[-1])
+        probe_name = web[web.index("--name") + 1]
+        self.assertTrue(probe_name.startswith("rainsync-web-validation-probe-"))
+        self.assertEqual(calls[4], ["container", "ls", "--all", "--filter", "name=^/" + probe_name + "$", "--format", "{{.Names}}"])
+        self.assertEqual(calls[5], ["image", "rm", "--no-prune", build[build.index("--tag") + 1], base_tag])
         def fail_web(args, timeout=60):
-            if "web-image" in args:
-                raise subprocess.CalledProcessError(255, args)
+            if args[0] == "run":
+                raise subprocess.CalledProcessError(126, args)
             return run(args, timeout)
-        with patch.object(runtime, "docker", side_effect=fail_web), self.assertRaises(subprocess.CalledProcessError):
-            runtime.runtime_checks("backend-image", "web-image")
+        with patch.object(runtime, "docker", side_effect=fail_web), patch.object(runtime, "inspect", side_effect=inspect), self.assertRaises(subprocess.CalledProcessError):
+            runtime.validate_web_image(web_id, restrictions)
+        self.assertEqual(calls[-1][:3], ["image", "rm", "--no-prune"])
+
+    def test_web_validation_refuses_unbound_base_or_derived_filesystem(self):
+        web_id = "sha256:" + "e" * 64
+        with patch.object(runtime, "inspect", return_value={"Id": "sha256:" + "f" * 64}), self.assertRaisesRegex(ValueError, "exact production image ID"):
+            runtime.validate_web_image(web_id, [])
+        base = {"Id": web_id, "Os": "linux", "Architecture": "amd64", "RootFS": {"Layers": ["base-layer"]}}
+        derived = {**base, "Id": "sha256:" + "f" * 64, "RootFS": {"Layers": ["unrelated-base", "copy"]}}
+        def inspect(reference):
+            return derived if reference.startswith("rainsync-web-validation-only:") else base
+        def run(args, timeout=60):
+            return "Driver: docker\n" if args[0] == "buildx" else ""
+        with patch.object(runtime, "docker", side_effect=run) as docker, patch.object(runtime, "inspect", side_effect=inspect), self.assertRaisesRegex(ValueError, "production layers"):
+            runtime.validate_web_image(web_id, [])
+        self.assertFalse(any(call.args[0][0] == "run" for call in docker.call_args_list))
+        self.assertEqual(docker.call_args_list[-1].args[0][:3], ["image", "rm", "--no-prune"])
+
+    def test_web_probe_timeout_removes_only_owned_container_before_images(self):
+        web_id = "sha256:" + "e" * 64
+        base = {"Id": web_id, "Os": "linux", "Architecture": "amd64", "RootFS": {"Layers": ["base-layer"]}}
+        derived = {**base, "Id": "sha256:" + "f" * 64, "RootFS": {"Layers": ["base-layer", "copy-layer"]}}
+        def inspect(reference):
+            return derived if reference.startswith("rainsync-web-validation-only:") else base
+        for removable in (True, False):
+            calls, state = [], {"probe": None, "present": False}
+            def run(args, timeout=60):
+                calls.append(args)
+                if args[0] == "buildx":
+                    return "Driver: docker\n"
+                if args[0] == "run":
+                    state["probe"] = args[args.index("--name") + 1]
+                    state["present"] = True
+                    raise subprocess.TimeoutExpired(args, timeout)
+                if args[:2] == ["container", "ls"]:
+                    return state["probe"] + "\n" if state["present"] else ""
+                if args[:2] == ["container", "rm"]:
+                    self.assertEqual(args, ["container", "rm", "--force", state["probe"]])
+                    if not removable:
+                        raise subprocess.CalledProcessError(1, args)
+                    state["present"] = False
+                return ""
+            with patch.object(runtime, "docker", side_effect=run), patch.object(runtime, "inspect", side_effect=inspect):
+                with self.assertRaises(subprocess.TimeoutExpired if removable else ValueError):
+                    runtime.validate_web_image(web_id, ["run", "--rm"])
+            image_cleanup = [args for args in calls if args[:2] == ["image", "rm"]]
+            self.assertEqual(len(image_cleanup), 1 if removable else 0)
+            if removable:
+                self.assertFalse(state["present"])
+                self.assertEqual(calls[-2][:2], ["container", "ls"])
+
+    def test_validation_refuses_nonlocal_builder_without_registry_fallback(self):
+        with patch.object(runtime, "inspect", return_value={"Id": "sha256:" + "e" * 64}), patch.object(runtime, "docker", return_value="Driver: docker-container\n") as docker:
+            with self.assertRaisesRegex(ValueError, "no registry fallback"):
+                runtime.validate_web_image("sha256:" + "e" * 64, [])
+        self.assertEqual(docker.call_args_list[0].args[0], ["buildx", "inspect", "default"])
+        self.assertEqual(len(docker.call_args_list), 1)
 
     def test_daemon_checks_ids_architecture_size_and_source(self):
         def observed(reference):

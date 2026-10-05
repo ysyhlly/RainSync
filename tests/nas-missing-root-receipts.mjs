@@ -22,6 +22,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 import { sourceMedia } from "./fixtures/source-grant.mjs";
 import { delay } from "./fixtures/server.mjs";
 import { verifyPidAbsent } from "./fixtures/postgres.mjs";
@@ -219,7 +220,9 @@ await isolatedMediaStack("nas-missing-root-receipts", async (f) => {
       resource: "long.mp4",
       source_version: sourceVersion,
     };
-    f.sql(
+    withPlaybackAdmission(
+      f,
+      { client: admin, user: identity.id, room: room.id, session },
       `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${session}','${identity.id}','${room.id}',0,'${hash(token)}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
     );
     return { room, session, token };

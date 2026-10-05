@@ -11,6 +11,7 @@ import { open, readdir, readlink, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import WebSocket from "ws";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 import { delay } from "./fixtures/server.mjs";
 
 const LIMIT_MS = 10000;
@@ -184,7 +185,9 @@ await isolatedMediaStack("stream-revocation", async (f) => {
           kind === "local"
             ? { kind, root: f.root, resource: "long.mp4" }
             : { kind, url: `${upstreamOrigin}/${id}.mp4`, headers: {} };
-        f.sql(
+        withPlaybackAdmission(
+          f,
+          { client: admin, user: userId, room: room.id, session: id },
           `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
         );
         const url = `${f.workerOrigin}/media-delivery/${id}/source?token=${token}`;
@@ -315,7 +318,9 @@ await isolatedMediaStack("stream-revocation", async (f) => {
             }
           : {}),
       };
-      f.sql(
+      withPlaybackAdmission(
+        f,
+        { client: admin, user: userId, room: room.id, session: id },
         `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
       );
       const path = mode === "subtitle" ? "subtitle-0.vtt" : "source";
@@ -389,7 +394,9 @@ await isolatedMediaStack("stream-revocation", async (f) => {
         const id = randomUUID(),
           token = randomBytes(32).toString("hex");
         const resource = { kind: "local", root: f.root, resource: "long.mp4" };
-        f.sql(
+        withPlaybackAdmission(
+          f,
+          { client: admin, user: userId, room: room.id, session: id },
           `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
         );
         streams.push(
@@ -418,7 +425,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
       );
       const blockedChecks = Number(
         f.sql(
-          `SELECT count(*) FROM pg_stat_activity WHERE application_name='${workerApplication}' AND wait_event_type='Lock' AND query LIKE 'SELECT src.id AS source_id,%' AND query LIKE '%p.delivery_token_hash=$2%' AND query LIKE '%playback_source_allowed(p.media_id,p.resource)%'`,
+          `SELECT count(*) FROM pg_stat_activity WHERE application_name='${workerApplication}' AND wait_event_type='Lock' AND query LIKE 'SELECT src.id AS source_id,%' AND query LIKE '%p.delivery_token_hash=$2%' AND query LIKE '%playback_source_allowed(p.media_id,p.resource,p.id)%'`,
         ),
       );
       assert.ok(

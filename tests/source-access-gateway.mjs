@@ -540,10 +540,7 @@ try {
         source_policy_revision: revision,
       };
       const insert = `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch) SELECT ${quote(id)},${quote(user.id)},r.id,${quote(src.media)},(s.state->>'media_generation')::bigint,${quote(digest(token))},${json(envelope)},now()+interval '1 hour',r.lifecycle_epoch FROM rooms r JOIN room_snapshots s ON s.room_id=r.id WHERE r.id=${quote(room.id)}`;
-      // The Agent fixture is outside this login-binding repair lane; its existing
-      // setup is deliberately unchanged and the mixed full suite is not rerun.
-      if (src.kind === "agent") f.sql(insert);
-      else withPlaybackAdmission(f, { client: admin, user: user.id, room: room.id, session: id }, insert);
+      withPlaybackAdmission(f, { client: admin, user: user.id, room: room.id, session: id }, insert);
       assert.equal(
         f.sql(
           `SELECT resource->>'source_policy_revision' FROM playback_sessions WHERE id=${quote(id)}`,
@@ -742,7 +739,7 @@ try {
       async () => {
         for (const [path, status] of [
           ["/foreign.mp4", 502],
-          ["/redirect.mp4", 302],
+          ["/redirect.mp4", 502],
           ["/dash.mp4", 502],
           ["/latin1-dash.mp4", 502],
           ["/padded-dash.mp4", 502],
