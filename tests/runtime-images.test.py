@@ -26,7 +26,20 @@ def fixture(directory, config_path_style="classic"):
     images, saved, contents = {}, [], {}
     for role, tag in runtime.tags(SOURCE).items():
         labels = {"org.opencontainers.image.revision": SOURCE} if role != "postgres" else {}
-        config = json.dumps({"os": "linux", "architecture": "amd64", "config": {"Labels": labels}, "rootfs": {"type": "layers", "diff_ids": []}}).encode()
+        layers, diff_ids = [], []
+        for number in range(2):
+            layer = io.BytesIO()
+            with tarfile.open(fileobj=layer, mode="w") as archive:
+                data = (role + "-owned-layer-" + str(number)).encode()
+                entry = tarfile.TarInfo("fixture.txt")
+                entry.size = len(data)
+                archive.addfile(entry, io.BytesIO(data))
+            digest = hashlib.sha256(layer.getvalue()).hexdigest()
+            path = "blobs/sha256/" + digest
+            contents[path] = layer.getvalue()
+            layers.append(path)
+            diff_ids.append("sha256:" + digest)
+        config = json.dumps({"os": "linux", "architecture": "amd64", "config": {"Labels": labels}, "rootfs": {"type": "layers", "diff_ids": diff_ids}}).encode()
         digest = hashlib.sha256(config).hexdigest()
         name = digest + ".json" if config_path_style == "classic" else "blobs/sha256/" + digest
         contents[name] = config
@@ -34,14 +47,7 @@ def fixture(directory, config_path_style="classic"):
                         "repo_digests": ["postgres@sha256:" + "b" * 64] if role == "postgres" else [],
                         "os": "linux", "architecture": "amd64", "size_bytes": 1024 * 1024,
                         "source_revision": SOURCE if role != "postgres" else None}
-        # Give backend and web distinct measured content IDs.
-        if role == "web":
-            config = json.dumps({"os": "linux", "architecture": "amd64", "config": {"Labels": labels}, "role": "web"}).encode()
-            digest = hashlib.sha256(config).hexdigest()
-            name = digest + ".json" if config_path_style == "classic" else "blobs/sha256/" + digest
-            contents[name] = config
-            images[role]["image_id"] = "sha256:" + digest
-        saved.append({"Config": name, "RepoTags": [tag], "Layers": []})
+        saved.append({"Config": name, "RepoTags": [tag], "Layers": layers})
     contents["manifest.json"] = json.dumps(saved).encode()
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w") as archive:
@@ -59,6 +65,46 @@ def fixture(directory, config_path_style="classic"):
                 "archive": {"file": runtime.ARCHIVE_NAME, "sha256": runtime.sha_file(path), "size_bytes": path.stat().st_size,
                             "uncompressed_size_bytes": len(raw.getvalue())}}
     return manifest
+
+
+def oci_fixture(manifest, original, *, compressed=False, index=False, wrong_config=False, wrong_layer=False, reverse_layers=False):
+    blobs, observed = {}, {}
+    def blob(data, media_type):
+        digest = hashlib.sha256(data).hexdigest()
+        blobs["blobs/sha256/" + digest] = data
+        return {"mediaType": media_type, "digest": "sha256:" + digest, "size": len(data)}
+    for role in runtime.ROLES:
+        expected = manifest["images"][role]
+        raw_config = next(data for data in original.values() if hashlib.sha256(data).hexdigest() == expected["image_id"][7:])
+        config = json.loads(raw_config)
+        raw = raw_config + b" " if wrong_config else raw_config
+        config_descriptor = blob(raw, "application/vnd.oci.image.config.v1+json")
+        layers = []
+        for diff_id in config["rootfs"]["diff_ids"]:
+            data = original["blobs/sha256/" + diff_id[7:]]
+            if wrong_layer:
+                data += b"wrong-owned-content"
+            if compressed:
+                data = gzip.compress(data, mtime=0)
+            layers.append(blob(data, "application/vnd.oci.image.layer.v1.tar" + ("+gzip" if compressed else "")))
+        if reverse_layers:
+            layers.reverse()
+        node = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json", "config": config_descriptor, "layers": layers}
+        descriptor = blob(json.dumps(node).encode(), node["mediaType"])
+        packed_size = descriptor["size"] + config_descriptor["size"] + sum(d["size"] for d in layers)
+        if index:
+            node = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": [{**descriptor, "platform": {"os": "linux", "architecture": "amd64"}}]}
+            descriptor = blob(json.dumps(node).encode(), node["mediaType"])
+            packed_size += descriptor["size"]
+        observed[expected["tag"]] = {"Id": descriptor["digest"], "Descriptor": descriptor, "Os": "linux", "Architecture": "amd64",
+                                     "Size": packed_size, "RootFS": {"Type": "layers", "Layers": config["rootfs"]["diff_ids"]}, "Config": config["config"]}
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w") as saved:
+        for path, data in blobs.items():
+            entry = tarfile.TarInfo(path)
+            entry.size = len(data)
+            saved.addfile(entry, io.BytesIO(data))
+    return observed, runtime.scan_tar(runtime.BoundedReader(io.BytesIO(output.getvalue()), runtime.MAX_IMAGE_BYTES))
 
 
 class RuntimeArtifactTests(unittest.TestCase):
@@ -235,8 +281,8 @@ class RuntimeArtifactTests(unittest.TestCase):
 
     def test_daemon_checks_ids_architecture_size_and_source(self):
         def observed(reference):
-            expected = next(i for i in self.manifest["images"].values() if i["image_id"] == reference)
-            return {"Id": reference, "Os": expected["os"], "Architecture": expected["architecture"], "Size": expected["size_bytes"],
+            expected = next(i for i in self.manifest["images"].values() if i["tag"] == reference)
+            return {"Id": expected["image_id"], "Os": expected["os"], "Architecture": expected["architecture"], "Size": expected["size_bytes"],
                     "Config": {"Labels": {"org.opencontainers.image.revision": expected["source_revision"]}}}
         with patch.object(runtime, "inspect", side_effect=observed):
             runtime.verify_daemon(self.manifest)
@@ -247,6 +293,31 @@ class RuntimeArtifactTests(unittest.TestCase):
                 return value
             with patch.object(runtime, "inspect", side_effect=mismatch), self.assertRaisesRegex(ValueError, message):
                 runtime.verify_daemon(self.manifest)
+
+    def test_containerd_descriptor_identity_requires_exact_config_and_physical_layers(self):
+        proofs = {}
+        runtime.verify_archive(self.directory / runtime.ARCHIVE_NAME, self.manifest, content=proofs)
+        with gzip.open(self.directory / runtime.ARCHIVE_NAME, "rb") as stream:
+            _, original = runtime.scan_tar(runtime.BoundedReader(stream, self.manifest["archive"]["uncompressed_size_bytes"]))
+        for compressed in (False, True):
+            for index in (False, True):
+                observed, exported = oci_fixture(self.manifest, original, compressed=compressed, index=index)
+                with patch.object(runtime, "inspect", side_effect=lambda tag: copy.deepcopy(observed[tag])), patch.object(runtime, "read_daemon_tar", return_value=exported):
+                    result = runtime.verify_daemon(self.manifest, content=proofs)
+                self.assertEqual(result, {r: observed[self.manifest["images"][r]["tag"]]["Id"] for r in runtime.ROLES})
+        for option, message in (("wrong_config", "config digest"), ("wrong_layer", "physical layer"), ("reverse_layers", "physical layer")):
+            observed, exported = oci_fixture(self.manifest, original, **{option: True})
+            with patch.object(runtime, "inspect", side_effect=lambda tag: copy.deepcopy(observed[tag])), patch.object(runtime, "read_daemon_tar", return_value=exported), self.assertRaisesRegex(ValueError, message):
+                runtime.verify_daemon(self.manifest, content=proofs)
+        observed, exported = oci_fixture(self.manifest, original)
+        with patch.object(runtime, "inspect", side_effect=lambda tag: copy.deepcopy(observed[tag])), self.assertRaisesRegex(ValueError, "verified archive content"):
+            runtime.verify_daemon(self.manifest)
+        first = self.manifest["images"]["backend"]["tag"]
+        for field, value, message in (("Size", observed[first]["Size"] + 1, "packed descriptor size"), ("RootFS", {"Layers": []}, "rootfs digest"), ("Id", "sha256:" + "d" * 64, "OCI descriptor digest")):
+            modified = copy.deepcopy(observed)
+            modified[first][field] = value
+            with patch.object(runtime, "inspect", side_effect=lambda tag: copy.deepcopy(modified[tag])), patch.object(runtime, "read_daemon_tar", return_value=exported), self.assertRaisesRegex(ValueError, message):
+                runtime.verify_daemon(self.manifest, content=proofs)
 
     def test_cli_verify_is_read_only_and_requires_exact_checksums(self):
         path = self.directory / "manifest.json"

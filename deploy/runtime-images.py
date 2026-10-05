@@ -15,7 +15,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 from uuid import uuid4
+import zlib
 
 MAX_IMAGE_BYTES = 1536 * 1024 * 1024
 TAR_OVERHEAD_BYTES = 32 * 1024 * 1024
@@ -117,40 +119,65 @@ class BoundedReader:
         return data
 
 
-def verify_archive(path, manifest):
+def scan_tar(stream):
+    """Read bounded save output; hash raw and uncompressed layer content."""
+    records, small, buffered = {}, {}, 0
+    expanded_layers = 0
+    with tarfile.open(fileobj=stream, mode="r|") as saved:
+        for member in saved:
+            name = member.name
+            parts = PurePosixPath(name).parts
+            require(name and not name.startswith("/") and ".." not in parts and "\\" not in name, "unsafe archive path")
+            require(not member.issym() and not member.islnk(), "archive links are forbidden")
+            if member.isdir():
+                continue
+            require(member.isfile(), "unsupported archive entry")
+            require(name not in records and len(records) < 10000, "duplicate or excessive archive entries")
+            require(member.size <= stream.limit, "oversized archive entry")
+            digest, diff_digest, chunks = hashlib.sha256(), hashlib.sha256(), []
+            compression, decoder = None, None
+            retain = member.size <= 1024 * 1024
+            if retain:
+                buffered += member.size
+                require(buffered <= 8 * 1024 * 1024, "excessive archive metadata")
+            with saved.extractfile(member) as handle:
+                for block in iter(lambda: handle.read(64 * 1024), b""):
+                    if compression is None:
+                        compression = "gzip" if block.startswith(b"\x1f\x8b") else ("unsupported" if block.startswith(b"\x28\xb5\x2f\xfd") else "none")
+                        if compression == "gzip":
+                            decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    digest.update(block)
+                    if retain:
+                        chunks.append(block)
+                    if decoder:
+                        pending = block
+                        while pending:
+                            output = decoder.decompress(pending, 64 * 1024)
+                            pending = decoder.unconsumed_tail
+                            diff_digest.update(output)
+                            expanded_layers += len(output)
+                            require(expanded_layers <= MAX_IMAGE_BYTES + TAR_OVERHEAD_BYTES, "layer expansion exceeds runtime budget")
+                        require(not decoder.unused_data, "unexpected trailing compressed layer content")
+                    else:
+                        diff_digest.update(block)
+            if decoder:
+                require(decoder.eof, "truncated gzip layer")
+            records[name] = {"sha256": digest.hexdigest(), "diff_sha256": diff_digest.hexdigest(), "compression": compression or "none", "size": member.size}
+            if retain:
+                small[name] = b"".join(chunks)
+    while stream.read(64 * 1024):
+        pass
+    return records, small
+
+
+def verify_archive(path, manifest, *, content=None):
     archive = manifest["archive"]
     require(path.stat().st_size == archive["size_bytes"], "archive byte size mismatch")
     require(sha_file(path) == archive["sha256"], "archive SHA256 mismatch")
-    records, small, buffered = {}, {}, 0
     with gzip.open(path, "rb") as compressed:
         stream = BoundedReader(compressed, archive["uncompressed_size_bytes"])
-        with tarfile.open(fileobj=stream, mode="r|") as saved:
-            for member in saved:
-                name = member.name
-                parts = PurePosixPath(name).parts
-                require(name and not name.startswith("/") and ".." not in parts and "\\" not in name, "unsafe archive path")
-                require(not member.issym() and not member.islnk(), "archive links are forbidden")
-                if member.isdir():
-                    continue
-                require(member.isfile(), "unsupported archive entry")
-                require(name not in records and len(records) < 10000, "duplicate or excessive archive entries")
-                require(member.size <= stream.limit, "oversized archive entry")
-                digest, chunks = hashlib.sha256(), []
-                retain = member.size <= 1024 * 1024
-                if retain:
-                    buffered += member.size
-                    require(buffered <= 8 * 1024 * 1024, "excessive archive metadata")
-                with saved.extractfile(member) as handle:
-                    for block in iter(lambda: handle.read(64 * 1024), b""):
-                        digest.update(block)
-                        if retain:
-                            chunks.append(block)
-                records[name] = {"sha256": digest.hexdigest(), "size": member.size}
-                if retain:
-                    small[name] = b"".join(chunks)
+        records, small = scan_tar(stream)
         # Consume padding/trailers too; gzip CRC and the full expansion bound matter.
-        while stream.read(64 * 1024):
-            pass
         require(stream.count == archive["uncompressed_size_bytes"], "uncompressed archive byte size mismatch")
     require("manifest.json" in small, "missing Docker-save manifest")
     entries = read_json(small["manifest.json"])
@@ -169,6 +196,13 @@ def verify_archive(path, manifest):
         require(config.get("os") == "linux" and config.get("architecture") == "amd64", "archive architecture mismatch")
         revision = (config.get("config") or {}).get("Labels", {}) or {}
         require(revision.get("org.opencontainers.image.revision") == expected["source_revision"], "archive source revision mismatch")
+        diff_ids = config.get("rootfs", {}).get("diff_ids")
+        layers = entry.get("Layers")
+        require(config.get("rootfs", {}).get("type") == "layers" and isinstance(diff_ids, list) and isinstance(layers, list) and len(diff_ids) == len(layers), "archive layer/config count mismatch")
+        for layer, diff_id in zip(layers, diff_ids):
+            require(layer in records and records[layer]["compression"] != "unsupported" and diff_id == "sha256:" + records[layer]["diff_sha256"], "archive ordered layer content mismatch")
+        if content is not None:
+            content[role] = {"config_id": expected["image_id"], "diff_ids": diff_ids}
     require(selected == set(ROLES), "missing runtime image")
     # SHA256 binds every byte to the exact Actions artifact. Do not implement an
     # alternate OCI/layer importer here; Docker owns loading its own save format.
@@ -187,15 +221,114 @@ def inspect(reference):
     return values[0]
 
 
-def verify_daemon(manifest):
+def read_daemon_tar(image_ids, limit):
+    """Stream a read-only local export; never write an additional image tar."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("DOCKER_")}
+    command = ["docker", "--host", "unix:///var/run/docker.sock", "image", "save", *image_ids]
+    with subprocess.Popen(command, stdout=subprocess.PIPE, env=env) as process:
+        expired = threading.Event()
+        def expire():
+            expired.set()
+            if process.poll() is None:
+                process.kill()
+        timer = threading.Timer(180, expire)
+        timer.start()
+        try:
+            records, small = scan_tar(BoundedReader(process.stdout, limit))
+            status = process.wait(timeout=5)
+            require(not expired.is_set(), "bounded target image export timed out")
+            require(status == 0, "read-only target image export failed")
+            return records, small
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            raise
+        finally:
+            timer.cancel()
+
+
+def verify_oci_image(observed, expected, proof, records, small):
+    """Bind native descriptor ID -> exact config -> ordered physical layers."""
+    index_types = {"application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"}
+    manifest_types = {"application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"}
+    config_types = {"application/vnd.oci.image.config.v1+json", "application/vnd.docker.container.image.v1+json"}
+    raw_types = {"application/vnd.oci.image.layer.v1.tar", "application/vnd.docker.image.rootfs.diff.tar"}
+    gzip_types = {"application/vnd.oci.image.layer.v1.tar+gzip", "application/vnd.docker.image.rootfs.diff.tar.gzip"}
+    def blob(descriptor):
+        require(isinstance(descriptor, dict), "invalid OCI descriptor object")
+        digest = descriptor.get("digest", "")
+        require(digest.startswith("sha256:") and SHA.fullmatch(digest[7:]), "invalid OCI content digest")
+        path = "blobs/sha256/" + digest[7:]
+        require(path in records and records[path]["sha256"] == digest[7:] and integer(descriptor.get("size")) and records[path]["size"] == descriptor["size"], "OCI descriptor content/size mismatch")
+        return path
+    descriptor = observed.get("Descriptor") or {}
+    require(descriptor.get("digest") == observed["Id"], "daemon native ID is not its OCI descriptor digest")
+    packed_size = descriptor.get("size", 0)
+    path = blob(descriptor)
+    require(path in small, "oversized OCI identity metadata")
+    node = read_json(small[path])
+    require(isinstance(node, dict) and node.get("schemaVersion") == 2, "unsupported OCI identity schema")
+    require(node.get("mediaType", descriptor.get("mediaType")) == descriptor.get("mediaType"), "OCI identity media type mismatch")
+    if descriptor.get("mediaType") in index_types:
+        children = node.get("manifests")
+        require(isinstance(children, list) and len(children) == 1, "only the shipped single-platform OCI wrapper is supported")
+        descriptor = children[0]
+        platform = descriptor.get("platform")
+        require(platform is None or platform.get("os") == "linux" and platform.get("architecture") == "amd64", "OCI wrapper architecture mismatch")
+        path = blob(descriptor)
+        packed_size += descriptor["size"]
+        require(path in small, "oversized OCI manifest")
+        node = read_json(small[path])
+        require(isinstance(node, dict) and node.get("schemaVersion") == 2, "unsupported OCI manifest schema")
+        require(node.get("mediaType", descriptor.get("mediaType")) == descriptor.get("mediaType"), "OCI manifest media type mismatch")
+    require(descriptor.get("mediaType") in manifest_types, "unsupported native OCI descriptor format")
+    config = node.get("config", {})
+    require(config.get("mediaType") in config_types and config.get("digest") == expected["image_id"] == proof["config_id"], "daemon OCI config digest differs from the exact packaged config")
+    config_path = blob(config)
+    require(config_path in small and read_json(small[config_path]).get("rootfs", {}).get("diff_ids") == proof["diff_ids"], "daemon OCI config rootfs mismatch")
+    packed_size += config["size"]
+    layers = node.get("layers")
+    require(isinstance(layers, list) and len(layers) == len(proof["diff_ids"]), "daemon OCI layer count mismatch")
+    for descriptor, diff_id in zip(layers, proof["diff_ids"]):
+        path = blob(descriptor)
+        compression = records[path]["compression"]
+        require(descriptor.get("mediaType") in (gzip_types if compression == "gzip" else raw_types) and compression != "unsupported", "unsupported OCI layer compression; content qualification required")
+        require("sha256:" + records[path]["diff_sha256"] == diff_id, "daemon ordered physical layer content mismatch")
+        packed_size += descriptor["size"]
+    require(observed["Size"] == packed_size, "daemon packed descriptor size mismatch")
+
+
+def verify_daemon(manifest, *, content=None):
+    observed_images, native_ids, translated = {}, {}, []
     for role in ROLES:
         expected = manifest["images"][role]
-        observed = inspect(expected["image_id"])
-        require(observed["Id"] == expected["image_id"], "daemon image ID mismatch")
+        # Tags select candidates only. The classic ID or full OCI content graph
+        # must prove identity; labels or a mutable tag alone never suffice.
+        observed = inspect(expected["tag"])
+        native_id = observed.get("Id", "")
+        require(native_id.startswith("sha256:") and SHA.fullmatch(native_id[7:]), "invalid daemon image ID")
         require(observed["Os"] == expected["os"] and observed["Architecture"] == expected["architecture"], "daemon architecture mismatch")
-        require(observed["Size"] == expected["size_bytes"], "daemon image size mismatch")
+        require(integer(observed.get("Size")), "invalid daemon image size")
         labels = observed.get("Config", {}).get("Labels", {}) or {}
         require(labels.get("org.opencontainers.image.revision") == expected["source_revision"], "daemon source revision mismatch")
+        if content is not None:
+            require(observed.get("RootFS", {}).get("Type") == "layers" and observed.get("RootFS", {}).get("Layers") == content[role]["diff_ids"], "daemon ordered rootfs digest mismatch")
+        if native_id == expected["image_id"]:
+            require(observed["Size"] == expected["size_bytes"], "daemon image size mismatch")
+        else:
+            require(content is not None and role in content, "daemon image ID mismatch: exact verified archive content is required for containerd")
+            translated.append(role)
+        observed_images[role], native_ids[role] = observed, native_id
+    require(len(set(native_ids.values())) == 3, "daemon runtime images must remain distinct")
+    require(sum(value["Size"] for value in observed_images.values()) <= MAX_IMAGE_BYTES, "loaded runtime sizes exceed 1.5 GiB budget")
+    if translated:
+        records, small = read_daemon_tar([native_ids[r] for r in translated], manifest["total_image_size_bytes"] + TAR_OVERHEAD_BYTES)
+        for role in translated:
+            verify_oci_image(observed_images[role], manifest["images"][role], content[role], records, small)
+    for role in ROLES:
+        require(inspect(manifest["images"][role]["tag"])["Id"] == native_ids[role], "daemon image tag changed during content verification")
+    return native_ids
 
 
 def validate_web_image(web, restrictions):
@@ -365,9 +498,10 @@ def main():
     manifest = validate_manifest(read_json(manifest_path.read_bytes()), args.source)
     checksums = (args.directory / "SHA256SUMS").read_text()
     require(checksums == f"{manifest['archive']['sha256']}  {ARCHIVE_NAME}\n{sha_file(manifest_path)}  manifest.json\n", "SHA256SUMS mismatch")
-    result = verify_archive(args.directory / ARCHIVE_NAME, manifest)
+    content = {}
+    result = verify_archive(args.directory / ARCHIVE_NAME, manifest, content=content)
     if args.daemon:
-        verify_daemon(manifest)
+        result["daemon_image_ids"] = verify_daemon(manifest, content=content)
         result["loaded_local_images"] = "passed"
     print(json.dumps(result, indent=2))
 
@@ -375,6 +509,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, KeyError, TypeError, OSError, EOFError, tarfile.TarError, subprocess.SubprocessError) as error:
+    except (ValueError, KeyError, TypeError, OSError, EOFError, zlib.error, tarfile.TarError, subprocess.SubprocessError) as error:
         print("Runtime artifact verification failed: " + str(error), file=sys.stderr)
         sys.exit(1)

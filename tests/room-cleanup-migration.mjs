@@ -64,7 +64,12 @@ await isolatedServer("room-cleanup-migration",async f=>{
   const retention=await readFile("crates/persistence/src/room_cleanup.rs","utf8");
   const prune=[...retention.matchAll(/"(DELETE FROM (?:media_executions|playback_preparations)[^"\n]*)"/g)].map(match=>match[1]);
   assert.equal(prune.length,2);
-  for(const query of prune) f.sql(query);
+  const lockRooms=retention.match(/pub const LOCK_PRUNE_ROOMS_SQL: &str = r#"([\s\S]+?)"#;/)[1];
+  for(const query of prune) {
+    // Match the production room-lock snapshot and bind its captured room set.
+    if(query.includes("$1")) f.sql(`BEGIN ISOLATION LEVEL READ COMMITTED;CREATE TEMP TABLE owned_prune_rooms ON COMMIT DROP AS ${lockRooms};${query.replaceAll("$1","ARRAY(SELECT id FROM owned_prune_rooms)")};COMMIT;`);
+    else f.sql(query);
+  }
   assert.equal(f.sql(`SELECT count(*) FROM media_executions WHERE id='${oldReceipt}'`),"0");
   assert.equal(f.sql(`SELECT count(*) FROM media_executions WHERE id IN('${unknownReceipt}','${newReceipt}','${heldReceipt}')`),"3");
   assert.equal(f.sql(`SELECT count(*) FROM playback_preparations WHERE session_id='${oldPrep}'`),"0");
