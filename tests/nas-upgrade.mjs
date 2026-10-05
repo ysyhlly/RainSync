@@ -287,7 +287,33 @@ await isolatedMediaStack(
         });
       };
       const plan = await makePlan();
+      // A real maintenance tick must not rewrite a non-upstream grant between
+      // the outer statement snapshot and the volatile source authorization.
+      assert.equal(
+        f.sql(`WITH frozen AS MATERIALIZED (
+          SELECT id,media_id,resource FROM playback_sessions WHERE id='${plan.session_id}'
+        ), maintenance_tick AS MATERIALIZED (SELECT pg_sleep(2) FROM frozen)
+        SELECT playback_source_allowed(f.media_id,f.resource,f.id)
+        FROM frozen f CROSS JOIN maintenance_tick`),
+        "t",
+        "a background reporter cannot invalidate the exact NAS grant binding",
+      );
       let response = await delivery(plan);
+      if (response.status !== 200) {
+        console.error("NAS upgrade delivery admission", {
+          status: response.status,
+          admission: f.sql(`SELECT jsonb_build_object(
+            'not_stopped', NOT p.stopped,
+            'not_expired', p.expires_at>now(),
+            'active_room', r.lifecycle='active',
+            'lifecycle_matches', r.lifecycle_epoch=p.lifecycle_epoch,
+            'generation_matches', (s.state->>'media_generation')::bigint=p.generation,
+            'member_exists', EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id),
+            'source_allowed', playback_source_allowed(p.media_id,p.resource,p.id)
+          ) FROM playback_sessions p JOIN rooms r ON r.id=p.room_id
+          JOIN room_snapshots s ON s.room_id=p.room_id WHERE p.id='${plan.session_id}'`),
+        });
+      }
       assert.equal(response.status, 200);
       assert.deepEqual(
         Buffer.from(await response.arrayBuffer()),

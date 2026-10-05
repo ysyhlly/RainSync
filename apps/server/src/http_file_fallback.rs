@@ -589,6 +589,14 @@ pub fn wrap_resource(
     generation: Option<i64>,
 ) -> Result<Value> {
     let mut outer = json!({"encrypted":app.encrypt(resource)?,"source_policy_revision":revision,"account_policy_generation":generation});
+    // These sources have no upstream playback check-in to close. Mark that
+    // before publication so the legacy reporter never rewrites an active grant
+    // while a delivery checks its exact resource binding.
+    if matches!(resource["kind"].as_str(), Some("local" | "agent" | "http"))
+        && resource.get("upstream_base").is_none()
+    {
+        outer["upstream_closed"] = json!(true);
+    }
     if resource["http_owned_response_version"] == 1 {
         outer["http_owned_response_version"] = json!(1);
         outer["owned_http_session_id"] = resource["owned_http_session_id"].clone();
