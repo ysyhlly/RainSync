@@ -297,12 +297,27 @@ struct Acquisition {
     until: tokio::time::Instant,
     retired: watch::Receiver<bool>,
 }
+fn require_complete_response(
+    status: StatusCode,
+    has_content_range: bool,
+    input_failure: &input_failure::Observation,
+) -> anyhow::Result<()> {
+    // Capture bypasses the generic source proxy, so preserve its original
+    // execution's status classification before rejecting a non-complete body.
+    input_failure.status(status);
+    ensure!(
+        status == StatusCode::OK && !has_content_range,
+        "owned_http_complete_response_required"
+    );
+    Ok(())
+}
 async fn capture(
     app: &App,
     id: Uuid,
     resource: &Value,
     slot: FilesSlot,
     acquisition: Acquisition,
+    input_failure: input_failure::Observation,
 ) -> anyhow::Result<Snapshot> {
     if resource.get("http_finite_hls_version").is_some() {
         return finite_hls::capture(app, id, resource, slot, acquisition).await;
@@ -327,11 +342,11 @@ async fn capture(
     })
     .await
     .map_err(|_| anyhow::anyhow!("owned_http_capture_deadline"))??;
-    ensure!(
-        response.status() == StatusCode::OK
-            && !response.headers().contains_key(header::CONTENT_RANGE),
-        "owned_http_complete_response_required"
-    );
+    require_complete_response(
+        response.status(),
+        response.headers().contains_key(header::CONTENT_RANGE),
+        &input_failure,
+    )?;
     let metadata = http_identity::Metadata::read(response.status(), response.headers())?;
     let class = capture_class(
         &metadata,
@@ -494,7 +509,13 @@ async fn capture(
         retired,
     })
 }
-async fn owner(app: App, id: Uuid, resource: Value, sender: watch::Sender<State>) {
+async fn owner(
+    app: App,
+    id: Uuid,
+    resource: Value,
+    sender: watch::Sender<State>,
+    input_failure: input_failure::Observation,
+) {
     let owner = Uuid::new_v4();
     let root_until = tokio::time::Instant::now() + Duration::from_secs(1800);
     let mut reserved = false;
@@ -511,7 +532,7 @@ async fn owner(app: App, id: Uuid, resource: Value, sender: watch::Sender<State>
         let work=async {
             let create=slot.clone();let root=app.cache.clone();
             tokio::time::timeout_at(began+CAPTURE_TIME,child_process::blocking(move||->anyhow::Result<()>{*create.lock().unwrap()=Some(Files::create(root,owner)?);Ok(())})).await.map_err(|_|anyhow::anyhow!("owned_http_capture_deadline"))???;
-            capture(&app,id,&resource,slot.clone(),Acquisition{owner,began,until:root_until,retired:retirement.clone()}).await
+            capture(&app,id,&resource,slot.clone(),Acquisition{owner,began,until:root_until,retired:retirement.clone()},input_failure.clone()).await
         };
         let captured=scope.run(async{tokio::select!{biased;_=global_stop.changed()=>Err(anyhow::anyhow!("owned_http_shutdown")),v=tokio::time::timeout_at(io_until,work)=>v.map_err(|_|anyhow::anyhow!("owned_http_capture_deadline"))?}}).await;
         if captured.is_err(){retired.send_replace(true);sender.send_replace(State::Closed);}
@@ -599,7 +620,12 @@ fn finished(id: Uuid) {
     entries.remove(&id);
     registry().active.send_replace(entries.len());
 }
-async fn acquire(app: &App, id: Uuid, resource: &Value) -> anyhow::Result<Arc<Snapshot>> {
+async fn acquire(
+    app: &App,
+    id: Uuid,
+    resource: &Value,
+    input_failure: input_failure::Observation,
+) -> anyhow::Result<Arc<Snapshot>> {
     ensure!(!*registry().stop.borrow(), "owned_http_shutdown");
     let mut receiver = {
         let mut entries = registry().entries.lock().unwrap();
@@ -609,7 +635,13 @@ async fn acquire(app: &App, id: Uuid, resource: &Value) -> anyhow::Result<Arc<Sn
             let (sender, receiver) = watch::channel(State::Capturing);
             entries.insert(id, receiver.clone());
             registry().active.send_replace(entries.len());
-            tokio::spawn(owner(app.clone(), id, resource.clone(), sender));
+            tokio::spawn(owner(
+                app.clone(),
+                id,
+                resource.clone(),
+                sender,
+                input_failure,
+            ));
             receiver
         }
     };
@@ -653,7 +685,12 @@ pub(crate) async fn shutdown() {
 
 /// Capture finishes before the short-lived decoder starts. Its input is the
 /// same retained read-only descriptor used by all later delivery/job reads.
-pub(crate) async fn probe_owned(app: &App, id: Uuid, resource: &Value) -> anyhow::Result<Value> {
+pub(crate) async fn probe_owned(
+    app: &App,
+    id: Uuid,
+    resource: &Value,
+    input_failure: input_failure::Observation,
+) -> anyhow::Result<Value> {
     ensure!(
         resource["kind"] == "http"
             && resource["http_owned_response_version"] == 1
@@ -663,7 +700,7 @@ pub(crate) async fn probe_owned(app: &App, id: Uuid, resource: &Value) -> anyhow
     );
     let snapshot = tokio::time::timeout(
         PINNED_CAPTURE_TIME + Duration::from_secs(5),
-        acquire(app, id, resource),
+        acquire(app, id, resource, input_failure),
     )
     .await
     .map_err(|_| anyhow::anyhow!("owned_http_deadline"))??;
@@ -738,7 +775,12 @@ pub(crate) async fn response(
         } else {
             Duration::from_secs(30)
         },
-        acquire(app, id, resource),
+        acquire(
+            app,
+            id,
+            resource,
+            app.input_failures.observe(id, q.execution),
+        ),
     )
     .await
     .map_err(|_| failure("owned_http_deadline"))?
@@ -900,6 +942,38 @@ pub(crate) async fn constrain_finite_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capture_keeps_execution_scoped_denial_but_requires_complete_200() {
+        use persistence::media_jobs::JobFailure;
+        let registry = input_failure::Registry::default();
+        let id = Uuid::new_v4();
+        for (status, expected) in [
+            (StatusCode::OK, None),
+            (StatusCode::UNAUTHORIZED, Some(JobFailure::InputDenied)),
+            (StatusCode::FORBIDDEN, Some(JobFailure::InputDenied)),
+            (StatusCode::NOT_FOUND, Some(JobFailure::ExecutionFailed)),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(JobFailure::UpstreamTransient),
+            ),
+            (StatusCode::PARTIAL_CONTENT, None),
+        ] {
+            let guard = registry.register(id);
+            let next = registry.register(id);
+            let observation = registry.observe(id, Some(guard.token()));
+            let result = require_complete_response(status, false, &observation);
+            assert_eq!(result.is_ok(), status == StatusCode::OK);
+            assert_eq!(
+                guard.failure().map(JobFailure::reason),
+                expected.map(JobFailure::reason)
+            );
+            assert!(
+                next.failure().is_none(),
+                "another execution is never poisoned"
+            );
+            assert!(require_complete_response(StatusCode::OK, true, &observation).is_err());
+        }
+    }
     #[test]
     fn weak_metadata_never_is_promoted_to_an_external_identity() {
         let mut headers = HeaderMap::new();

@@ -244,7 +244,13 @@ async fn delivery_response(
         let metadata = if resource["http_owned_large_response_version"] == 1
             || resource["http_finite_hls_version"] == 1
         {
-            owned_http::probe_owned(&app, id, &resource).await
+            owned_http::probe_owned(
+                &app,
+                id,
+                &resource,
+                app.input_failures.observe(id, Some(observed.token())),
+            )
+            .await
         } else {
             advanced_media::probe_advertised(&source, &resource).await
         };
