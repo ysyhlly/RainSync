@@ -1,5 +1,5 @@
 import type { PlaybackReadiness } from "../../../../../packages/protocol";
-import { RequestFailure } from "../../errors";
+import { RequestFailure, playbackFailureMessage } from "../../errors";
 import { PlaybackTimeout } from "../../playback-request";
 
 export type PlaybackPreparationPhase =
@@ -15,6 +15,8 @@ export type PlaybackPreparationPhase =
 export type PlaybackPreparationFailure = {
   message: string;
   retryable: boolean;
+  /** Compares the originating notice without rendering or serializing its text. */
+  ownsNotice?: (notice: string) => boolean;
   code?: string;
   requestId?: string;
   retryAfterMs?: number;
@@ -115,15 +117,19 @@ const failureMessages: Record<string, string> = {
 
 /** Keep raw server/native messages, URLs and paths out of the status surface. */
 export function preparationFailure(error: unknown): PlaybackPreparationFailure {
+  const notice = error instanceof Error ? error.message : String(error);
+  const ownsNotice = (message: string) => message === notice;
   if (error instanceof RequestFailure) {
     const safeCode = /^[A-Z][A-Z0-9_]{0,79}$/.test(error.code)
       ? error.code
       : undefined;
     return {
       message:
-        (safeCode && failureMessages[safeCode]) ||
+        (safeCode &&
+          (playbackFailureMessage(safeCode) ?? failureMessages[safeCode])) ||
         "播放准备失败，请检查片源或稍后重试。",
       retryable: error.retryable,
+      ownsNotice,
       code: safeCode,
       requestId: error.requestId,
       retryAfterMs: error.retryAfterMs,
@@ -137,7 +143,21 @@ export function preparationFailure(error: unknown): PlaybackPreparationFailure {
           ? "无法连接播放服务，请检查网络后重试。"
           : "播放准备失败，请检查连接后重试。",
     retryable: true,
+    ownsNotice,
   };
+}
+
+export function playbackFailureOwnsNotice(
+  failure: PlaybackPreparationFailure | undefined,
+  notice: string,
+): boolean {
+  return !!(
+    failure &&
+    notice &&
+    (failure.ownsNotice?.(notice) ||
+      notice === failure.message ||
+      (failure.requestId && notice.includes(failure.requestId)))
+  );
 }
 
 export function describePlaybackPreparation(state: PlaybackPreparationState) {
@@ -162,5 +182,14 @@ export function describePlaybackPreparation(state: PlaybackPreparationState) {
     retry:
       state.phase === "cancelled" ||
       (state.phase === "failed" && state.failure?.retryable === true),
+    account:
+      state.phase === "failed" &&
+      [
+        "NATIVE_PLATFORM_ACCESS_DENIED",
+        "NATIVE_PLATFORM_ANONYMOUS_UNSUPPORTED",
+        "PLATFORM_ACCOUNT_CHANGED",
+        "PLATFORM_ACCOUNT_EXPIRED",
+      ].includes(state.failure?.code ?? ""),
+    chooseMedia: state.phase === "failed" && state.failure?.retryable === false,
   };
 }

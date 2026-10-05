@@ -128,9 +128,18 @@ export async function appFixture(
         item.personal_title ?? item.shared_title ?? item.original_title,
       );
       value = item;
-    } else if (path.startsWith("/media/")) {
+    } else if (
+      path.startsWith("/media/") ||
+      /^\/rooms\/[^/]+\/media\/[^/]+$/.test(path)
+    ) {
       const item = media.find(
-        (m) => m.id === decodeURIComponent(path.split("/")[2]),
+        (m) =>
+          m.id ===
+          decodeURIComponent(
+            path.startsWith("/media/")
+              ? path.split("/")[2]
+              : path.split("/").at(-1)!,
+          ),
       );
       if (!item)
         return route.fulfill({
@@ -138,6 +147,66 @@ export async function appFixture(
           json: { error: { code: "MEDIA_NOT_FOUND", message: "未找到影片" } },
         });
       value = item;
+    } else if (/^\/rooms\/[^/]+\/compute$/.test(path))
+      value = {
+        enabled: false,
+        p2p_enabled: false,
+        jobs: [],
+        source_probe_ready: false,
+        source_audio_tracks: [],
+      };
+    else if (path.startsWith("/platform-accounts/")) {
+      const provider = path.split("/")[2];
+      const account = { id: null, provider, revision: null, state: "revoked" };
+      value = path.endsWith("/oauth")
+        ? {
+            ...account,
+            available: false,
+            missing_prerequisites: [
+              "approved_developer_application",
+              "server_client_key",
+              "server_client_secret_file",
+              "registered_https_callback",
+              "approved_identity_scope",
+            ],
+            authorization_kind: "official_oauth",
+            playback_session: false,
+            authorization_mode: "web",
+            scopes: [],
+            access_expires_at: null,
+            refresh_expires_at: null,
+            auto_renew: false,
+            renewal_state: "disabled",
+            next_refresh_at: null,
+          }
+        : path.endsWith("/renewal")
+          ? {
+              account,
+              method: "web_cookie_refresh",
+              supported: true,
+              enabled: false,
+              state: "disabled",
+              next_refresh_at: null,
+              enable_requires: "new_consented_qr_login",
+            }
+          : provider === "bilibili"
+            ? account
+            : {
+                ...account,
+                login_method:
+                  provider === "youtube"
+                    ? "netscape_cookie_import"
+                    : "cookie_import",
+                qr_available: false,
+                verification: "none",
+                credential_expires_at: null,
+                ...(provider === "youtube"
+                  ? {
+                      account_import_available: false,
+                      availability_reason: "server_opt_in_required",
+                    }
+                  : {}),
+              };
     } else if (path.endsWith("/playlist")) value = [];
     else if (path.endsWith("/messages")) value = [];
     else if (path.endsWith("/invites"))

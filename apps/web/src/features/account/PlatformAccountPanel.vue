@@ -247,7 +247,7 @@ onBeforeUnmount(() => {
 });
 </script>
 <template>
-  <section class="panel platform-account-panel">
+  <section id="bilibili-account" class="panel platform-account-panel">
     <h2>Bilibili 账号</h2>
     <p>
       每位观众使用自己的账号权限。未连接时可尝试匿名播放，会员和地区限制仍由平台决定。
@@ -331,7 +331,12 @@ onBeforeUnmount(() => {
         默认不启用自动续期。平台必须在这次登录中返回刷新令牌才能启用；旧会话无法补造令牌。停止或解除连接会删除刷新材料并阻止后续请求，已发送的请求可能已经完成。续期更换会话后，旧播放授权会失效，需要重新播放
       </p>
       <p v-if="login.phase === 'starting'" role="status">正在准备二维码…</p>
-      <template v-if="login.phase === 'pending'">
+      <template
+        v-if="
+          login.phase === 'pending' ||
+          (login.phase === 'uncertain' && login.payload)
+        "
+      >
         <img
           v-if="image"
           :src="image"
@@ -348,6 +353,10 @@ onBeforeUnmount(() => {
         </p>
       </template>
       <p v-if="login.message" role="status">{{ login.message }}</p>
+      <p v-if="login.code" class="helper">错误码：{{ login.code }}</p>
+      <p v-if="login.requestId" class="helper">
+        诊断编号：{{ login.requestId }}
+      </p>
       <button
         v-if="login.phase === 'idle' || login.phase === 'uncertain'"
         class="primary"

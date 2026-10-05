@@ -463,7 +463,9 @@ test("playback retries a lost HTTP response with the same operation key", async 
     .toEqual([abandoned]);
   await showOptions(page);
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("清理暂不可用");
+  await expect(page.getByRole("alert")).toContainText("播放服务暂不可用");
+  await expect(page.getByRole("alert")).not.toContainText("清理暂不可用");
+  await expect(page.locator(".global-notice")).toHaveCount(0);
   expect(requests.length).toBe(7);
   loseResponses = false;
   cleanupOffline = false;

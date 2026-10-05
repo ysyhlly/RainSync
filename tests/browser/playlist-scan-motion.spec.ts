@@ -58,12 +58,18 @@ test("drawer stays modal during closing then restores focus", async ({
   await trigger.click();
   const dialog = page.getByRole("dialog", { name: "添加片源" });
   await expect(dialog).toBeVisible();
-  await page.evaluate(() => {
+  const closing = await page.evaluate(async () => {
     const dialog = document.querySelector<HTMLDialogElement>("dialog[open]")!;
     (dialog.querySelector("button") as HTMLButtonElement).click();
+    // Sample both facts after Vue's update, in one browser turn. Separate
+    // protocol round trips can outlive the short closing animation.
+    await Promise.resolve();
+    return {
+      closing: dialog.classList.contains("closing"),
+      modal: dialog.open,
+    };
   });
-  await expect(dialog).toHaveClass(/closing/);
-  expect(await dialog.evaluate((el: HTMLDialogElement) => el.open)).toBe(true);
+  expect(closing).toEqual({ closing: true, modal: true });
   await expect(dialog).toBeHidden();
   await expect(trigger).toBeFocused();
   await trigger.click();

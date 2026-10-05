@@ -175,6 +175,49 @@ it("partial results retain success and distinguish retryable unattempted items",
   ])
     expect(() => validatePlatformImportBatch(bad, items)).toThrow();
 });
+it("per-item errors preserve safe correlation and explain access or extractor failures", () => {
+  const items = selectedPlatformImportItems(
+    preview([bili]),
+    [bili.key],
+    "anonymous",
+  );
+  for (const code of [
+    "native_platform_access_denied",
+    "native_platform_extractor_unavailable",
+  ]) {
+    const error = {
+      code,
+      retryable: false,
+      attempted: true,
+      status: 422,
+      request_id: id,
+    };
+    const decode = (value: unknown) =>
+      validatePlatformImportBatch(
+        { outcomes: [{ key: bili.key, error: value }], stopped: null },
+        items,
+      );
+    expect(
+      decode({
+        ...error,
+        message: "private upstream body",
+        url: "https://secret.example",
+      }).outcomes[0].error,
+    ).toEqual(error);
+    expect(platformImportFailureMessage(error)).toContain(
+      code.endsWith("access_denied") ? "平台拒绝访问" : "提取器未启用",
+    );
+    for (const invalid of [
+      { ...error, request_id: "secret" },
+      { ...error, status: 200 },
+      { ...error, status: 502.5 },
+    ])
+      expect(() => decode(invalid)).toThrow();
+  }
+  expect(
+    platformImportFailureMessage({ code: "constructor", retryable: false }),
+  ).toBe("此条目导入失败，可重新预览或重试");
+});
 it("batch API sends only reviewed selected identities and scoped account intent, never preview titles or arbitrary fields", async () => {
   const items: any[] = selectedPlatformImportItems(
     preview([bili]),

@@ -703,7 +703,7 @@ async fn persist_chat(
     user_id: Uuid,
     body: &str,
     client_message_id: Option<Uuid>,
-) -> std::result::Result<(Uuid, bool, bool), &'static str> {
+) -> std::result::Result<(Uuid, i64, bool, bool), &'static str> {
     let mut tx = db.begin().await.map_err(|_| "database_error")?;
     persistence::room_lifecycle::lock_active(&mut tx, room_id)
         .await
@@ -728,8 +728,8 @@ async fn persist_chat(
         return Err("not_a_member");
     }
     crate::timeline_chat::check_mute(&mut tx, room_id, user_id).await?;
-    let inserted = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO chat_messages(id,room_id,user_id,body,client_message_id,body_digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (room_id,user_id,client_message_id) DO NOTHING RETURNING id",
+    let inserted = sqlx::query(
+        "INSERT INTO chat_messages(id,room_id,user_id,body,client_message_id,body_digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (room_id,user_id,client_message_id) DO NOTHING RETURNING id,floor(extract(epoch FROM created_at)*1000)::bigint AS created_at_ms",
     )
     .bind(Uuid::new_v4())
     .bind(room_id)
@@ -740,14 +740,14 @@ async fn persist_chat(
     .fetch_optional(&mut *tx)
     .await
     .map_err(|_| "database_error")?;
-    if let Some(id) = inserted {
+    if let Some(row) = inserted {
         tx.commit().await.map_err(|_| "database_error")?;
-        return Ok((id, false, false));
+        return Ok((row.get("id"), row.get("created_at_ms"), false, false));
     }
     // The unique-index conflict waits for the concurrent insertion to commit.
     // Read in a new statement so its committed row is visible at READ COMMITTED.
     let existing = sqlx::query(
-        "SELECT id,body,body_digest,deleted_at IS NOT NULL AS deleted FROM chat_messages WHERE room_id=$1 AND user_id=$2 AND client_message_id=$3",
+        "SELECT id,body,body_digest,deleted_at IS NOT NULL AS deleted,floor(extract(epoch FROM created_at)*1000)::bigint AS created_at_ms FROM chat_messages WHERE room_id=$1 AND user_id=$2 AND client_message_id=$3",
     )
     .bind(room_id)
     .bind(user_id)
@@ -765,7 +765,12 @@ async fn persist_chat(
         return Err("invalid_request");
     }
     tx.commit().await.map_err(|_| "database_error")?;
-    Ok((existing.get("id"), true, existing.get("deleted")))
+    Ok((
+        existing.get("id"),
+        existing.get("created_at_ms"),
+        true,
+        existing.get("deleted"),
+    ))
 }
 
 pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: String) {
@@ -1013,12 +1018,12 @@ async fn socket_inner(
                                 None => {reject_with_presence(&mut out, "invalid_request", presence_lease.as_ref()).await;continue},
                             },
                         };
-                        let (cid,replayed,deleted)=match persist_chat(&app.db,id,user.id,body,client_message_id).await {
+                        let (cid,created_at,replayed,deleted)=match persist_chat(&app.db,id,user.id,body,client_message_id).await {
                             Ok(result)=>result,
                             Err(reason)=>{reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;if reason=="not_a_member" {break};continue},
                         };
                         let identity=match profile::value(&app,user.id).await{Ok(value)=>value,Err(_)=>{reject_with_presence(&mut out, "database_error", presence_lease.as_ref()).await;break}};
-                        let reply=json!({"type":"CHAT","id":cid,"user_id":user.id,"username":identity["username"],"display_name":identity["display_name"],"avatar_url":identity["avatar_url"],"avatar_version":identity["avatar_version"],"body":if deleted{""}else{body},"deleted":deleted,"client_message_id":client_message_id});
+                        let reply=json!({"type":"CHAT","id":cid,"created_at":created_at,"user_id":user.id,"username":identity["username"],"display_name":identity["display_name"],"avatar_url":identity["avatar_url"],"avatar_version":identity["avatar_version"],"body":if deleted{""}else{body},"deleted":deleted,"client_message_id":client_message_id});
                         if replayed {
                             if let Err(reason)=socket_access(&app,id,user.id,&session_hash).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
                             if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Text(reply.to_string().into()))).await,Ok(Ok(()))) {break}

@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
-import { createCipheriv, createDecipheriv, randomBytes, createHash } from "node:crypto";
+import {
+  createCipheriv,
+  createDecipheriv,
+  randomBytes,
+  createHash,
+} from "node:crypto";
 import { mkdir, writeFile, readFile, open, rename, rm } from "node:fs/promises";
 import http from "node:http";
 import { outputCleanup } from "./output-cleanup.mjs";
@@ -30,12 +35,22 @@ export async function workerAttempts({
   const original = sql(
     `SELECT resource FROM playback_sessions WHERE id='${id}'`,
   );
-  const originalCiphertext = Buffer.from(JSON.parse(original).encrypted, "base64");
-  const decipher = createDecipheriv("aes-256-gcm", Buffer.from(key, "base64"), originalCiphertext.subarray(0, 12));
+  const originalCiphertext = Buffer.from(
+    JSON.parse(original).encrypted,
+    "base64",
+  );
+  const decipher = createDecipheriv(
+    "aes-256-gcm",
+    Buffer.from(key, "base64"),
+    originalCiphertext.subarray(0, 12),
+  );
   decipher.setAuthTag(originalCiphertext.subarray(-16));
-  const originalResource = JSON.parse(Buffer.concat([
-    decipher.update(originalCiphertext.subarray(12, -16)), decipher.final(),
-  ]).toString("utf8"));
+  const originalResource = JSON.parse(
+    Buffer.concat([
+      decipher.update(originalCiphertext.subarray(12, -16)),
+      decipher.final(),
+    ]).toString("utf8"),
+  );
   const cachedResource = { ...originalResource, job_id: id };
   // These controlled v1/v2 outputs predate recorded plan facts. Retain actual
   // source authority without claiming the original direct plan's output facts.
@@ -56,6 +71,41 @@ export async function workerAttempts({
   ]).toString("base64");
   const playlist = new URL(worker + plan.playback_url);
   playlist.pathname = `/media-delivery/${id}/index.m3u8`;
+  async function assertStatus(response, expected) {
+    if (response.status === 401 && expected !== 401) {
+      const diagnostic = {
+        expected_status: expected,
+        actual_status: response.status,
+      };
+      try {
+        const value = await response.clone().json();
+        diagnostic.error_code = /^[A-Z_]{1,80}$/.test(value?.error?.code ?? "")
+          ? value.error.code
+          : "UNPARSEABLE";
+      } catch {
+        diagnostic.response_evidence_unavailable = true;
+      }
+      try {
+        const token = playlist.searchParams.get("token");
+        const tokenHash = createHash("sha256")
+          .update(token ?? "")
+          .digest("hex");
+        diagnostic.grant_predicates = JSON.parse(
+          sql(
+            `SET statement_timeout='500ms'; SELECT json_build_object('token_matches',p.delivery_token_hash='${tokenHash}','unexpired',p.expires_at>clock_timestamp(),'stopped',p.stopped,'source_allowed',COALESCE(playback_source_allowed(p.media_id,p.resource,p.id),false),'room_active',r.lifecycle='active','epoch_matches',r.lifecycle_epoch=p.lifecycle_epoch,'generation_matches',(s.state->>'media_generation')::bigint=p.generation,'member_present',EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id),'origin_allowed',COALESCE(playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch),false),'library_allowed',COALESCE(playback_library_session_allowed(p.id),false),'job_present',j.id IS NOT NULL,'job_session_matches',j.session_id=p.id,'output_present',EXISTS(SELECT 1 FROM media_outputs o WHERE o.job_id=j.id AND o.attempt=j.attempt),'resource_matches_fixture',p.resource->>'encrypted'='${encrypted}') FROM playback_sessions p JOIN rooms r ON r.id=p.room_id JOIN room_snapshots s ON s.room_id=p.room_id LEFT JOIN media_jobs j ON j.id=p.id WHERE p.id='${id}'`,
+          )
+            .split("\n")
+            .at(-1) || "null",
+        );
+      } catch {
+        diagnostic.grant_evidence_unavailable = true;
+      }
+      console.error(
+        "Worker attempts authorization failure: " + JSON.stringify(diagnostic),
+      );
+    }
+    assert.equal(response.status, expected);
+  }
   try {
     for (const attempt of [1, 2]) {
       const dir = resolve(cache, id, String(attempt));
@@ -86,14 +136,10 @@ export async function workerAttempts({
       "ready",
       "legacy output retains on-demand Worker validation",
     );
-    assert.equal(
-      (await fetch(playlist)).status,
-      502,
-      "published manifest digest must be enforced",
-    );
+    await assertStatus(await fetch(playlist), 502);
     await writeFile(resolve(cache, id, "1", "index.m3u8"), saved);
     let response = await fetch(playlist);
-    assert.equal(response.status, 200);
+    await assertStatus(response, 200);
     const manifest = await response.text();
     assert.ok(manifest.includes("#EXT-X-ENDLIST"));
     sql(
@@ -121,7 +167,7 @@ export async function workerAttempts({
       );
       await writeFile(resolve(cache, id, "1", "index.m3u8"), saved);
       const recovered = await pending;
-      assert.equal(recovered.status, 200);
+      await assertStatus(recovered, 200);
       assert.ok((await recovered.text()).includes("index0.m4s"));
     }
     const growing = resolve(cache, id, "1");
@@ -146,7 +192,7 @@ export async function workerAttempts({
       resolve(growing, "index1.m4s"),
     );
     const ready = await waiting;
-    assert.equal(ready.status, 200);
+    await assertStatus(ready, 200);
     assert.ok((await ready.text()).includes("index1.m4s"));
     await writeFile(resolve(growing, "index.m3u8"), saved);
     await rm(resolve(growing, "index1.m4s"));

@@ -379,6 +379,25 @@ function selectAll() {
               {{
                 platformImportFailureMessage(outcomeByKey.get(item.key)!.error!)
               }}
+              <span
+                v-if="outcomeByKey.get(item.key)!.error!.attempted === false"
+              >
+                此条目尚未执行导入。
+              </span>
+              <br />
+              <small>
+                错误码：{{
+                  outcomeByKey.get(item.key)!.error!.code.toUpperCase()
+                }}
+                <template v-if="outcomeByKey.get(item.key)!.error!.status">
+                  · HTTP {{ outcomeByKey.get(item.key)!.error!.status }}
+                </template>
+                <template v-if="outcomeByKey.get(item.key)!.error!.request_id">
+                  · 诊断编号：{{
+                    outcomeByKey.get(item.key)!.error!.request_id
+                  }}
+                </template>
+              </small>
             </p>
           </li>
         </ul>

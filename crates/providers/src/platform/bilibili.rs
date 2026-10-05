@@ -1420,6 +1420,7 @@ pub enum QrUrlScheme {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QrUrlHost {
     Passport,
+    Account,
     OtherBilibili,
     Other,
     Missing,
@@ -1429,6 +1430,7 @@ pub enum QrUrlHost {
 pub enum QrUrlPath {
     Login,
     LoginScan,
+    AccountScanWeb,
     LegacyQrLogin,
     OtherPassport,
     Other,
@@ -1463,6 +1465,7 @@ impl QrUrlRejection {
             },
             host: match url.host_str() {
                 Some("passport.bilibili.com") => QrUrlHost::Passport,
+                Some("account.bilibili.com") => QrUrlHost::Account,
                 Some(host) if host == "bilibili.com" || host.ends_with(".bilibili.com") => {
                     QrUrlHost::OtherBilibili
                 }
@@ -1472,6 +1475,7 @@ impl QrUrlRejection {
             path: match url.path() {
                 "/h5-app/passport/login" => QrUrlPath::Login,
                 "/h5-app/passport/login/scan" => QrUrlPath::LoginScan,
+                "/h5/account-h5/auth/scan-web" => QrUrlPath::AccountScanWeb,
                 "/qrcode/h5/login" => QrUrlPath::LegacyQrLogin,
                 path if path.starts_with("/h5-app/passport/") => QrUrlPath::OtherPassport,
                 _ => QrUrlPath::Other,
@@ -1545,32 +1549,50 @@ pub fn parse_qr_generate_response(bytes: &[u8]) -> Result<QrChallenge> {
     let login_url = text(field(data, "url")?, 4096)?.to_owned();
     let url =
         Url::parse(&login_url).map_err(|_| Error::InvalidQrUrl(QrUrlRejection::unparsed()))?;
+    // Observed from the fixed official web QR generation endpoint. Keep the
+    // host/path pairs exact; an arbitrary Bilibili URL is not a login capability.
+    let account_scan = url.host_str() == Some("account.bilibili.com")
+        && url.path() == "/h5/account-h5/auth/scan-web";
+    let passport_scan = url.host_str() == Some("passport.bilibili.com")
+        && matches!(
+            url.path(),
+            "/h5-app/passport/login" | "/h5-app/passport/login/scan"
+        );
     if url.scheme() != "https"
-        || url.host_str() != Some("passport.bilibili.com")
+        || !(account_scan || passport_scan)
         || url.port().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
-        || !matches!(
-            url.path(),
-            "/h5-app/passport/login" | "/h5-app/passport/login/scan"
-        )
     {
         return Err(Error::InvalidQrUrl(QrUrlRejection::from_url(&url)));
     }
     let key = QrKey::from_secret(text(field(data, "qrcode_key")?, 128)?)?;
-    // The current web endpoint returns /login/scan?qrcode_key=.... Preserve
-    // the previously supported /login?oauthKey=... payload only when exactly
-    // one recognized binding matches this response's poll key.
+    // Every supported shape must carry exactly one binding to the poll key.
     let bindings = url
         .query_pairs()
         .filter(|(name, _)| matches!(name.as_ref(), "qrcode_key" | "oauthKey"))
         .collect::<Vec<_>>();
     if bindings.len() != 1
-        || (url.path().ends_with("/scan") && bindings[0].0 != "qrcode_key")
+        || ((account_scan || url.path().ends_with("/scan")) && bindings[0].0 != "qrcode_key")
         || bindings[0].1 != key.0
     {
         return Err(Error::InvalidResponse("qr_binding"));
+    }
+    if account_scan {
+        let query = url.query_pairs().collect::<Vec<_>>();
+        if query.iter().any(|(name, value)| match name.as_ref() {
+            "qrcode_key" => false,
+            "navhide" => value != "1",
+            "callback" => value != "close",
+            "from" => !value.is_empty(),
+            _ => true,
+        }) || query.iter().filter(|(name, _)| name == "callback").count() != 1
+            || query.iter().filter(|(name, _)| name == "navhide").count() > 1
+            || query.iter().filter(|(name, _)| name == "from").count() > 1
+        {
+            return Err(Error::InvalidResponse("qr_binding"));
+        }
     }
     Ok(QrChallenge { login_url, key })
 }

@@ -1,4 +1,5 @@
 import { validNativeLiveBinding } from "../playback/native-live";
+import { playbackFailureMessage } from "../../errors";
 import type { NativePlatformProvider } from "../../shared/api/types";
 import type { Media } from "../../shared/api/types";
 import type { NativePlatformCredentialMode } from "../../../../../packages/protocol";
@@ -576,6 +577,8 @@ export interface PlatformImportFailure {
   code: string;
   retryable: boolean;
   attempted?: boolean;
+  request_id?: string;
+  status?: number;
 }
 export interface PlatformImportPreviewItem {
   key: string;
@@ -644,7 +647,13 @@ const importMessages: Record<string, string> = {
 export function platformImportFailureMessage(
   failure: PlatformImportFailure,
 ): string {
-  return importMessages[failure.code] ?? "此条目导入失败，可重新预览或重试";
+  return (
+    (Object.hasOwn(importMessages, failure.code)
+      ? importMessages[failure.code]
+      : undefined) ??
+    playbackFailureMessage(failure.code.toUpperCase()) ??
+    "此条目导入失败，可重新预览或重试"
+  );
 }
 function object(value: unknown): Record<string, any> {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -657,13 +666,20 @@ function failure(value: unknown): PlatformImportFailure {
     typeof v.code !== "string" ||
     !/^[a-z_]{1,100}$/.test(v.code) ||
     typeof v.retryable !== "boolean" ||
-    (v.attempted !== undefined && typeof v.attempted !== "boolean")
+    (v.attempted !== undefined && typeof v.attempted !== "boolean") ||
+    (v.request_id !== undefined &&
+      (typeof v.request_id !== "string" ||
+        !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(v.request_id))) ||
+    (v.status !== undefined &&
+      (!Number.isInteger(v.status) || v.status < 400 || v.status > 599))
   )
     throw Error("导入响应不完整，请重新预览");
   return {
     code: v.code,
     retryable: v.retryable,
     ...(v.attempted === undefined ? {} : { attempted: v.attempted }),
+    ...(v.request_id === undefined ? {} : { request_id: v.request_id }),
+    ...(v.status === undefined ? {} : { status: v.status }),
   };
 }
 /** Local bounds only. All discovery still uses the server's closed transport. */

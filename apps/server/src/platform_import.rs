@@ -408,6 +408,24 @@ fn retryable(error: &Error) -> bool {
         || error.0 == StatusCode::TOO_MANY_REQUESTS
         || error.1 == "platform_account_changed"
 }
+// A batch can succeed at HTTP level while individual entries fail. Give each
+// failure its own correlation ID and log only the closed protocol category.
+fn outcome_failure(
+    code: &str,
+    retryable: bool,
+    attempted: bool,
+    status: Option<StatusCode>,
+) -> Value {
+    let request_id = Uuid::new_v4();
+    let category = protocol::ErrorCode::from_reason(code, status.map_or(409, |s| s.as_u16()));
+    tracing::warn!(%request_id, code = ?category, status = status.map(|s| s.as_u16()), attempted, "platform import item failed");
+    let mut value =
+        json!({"code":code,"retryable":retryable,"attempted":attempted,"request_id":request_id});
+    if let Some(status) = status {
+        value["status"] = json!(status.as_u16());
+    }
+    value
+}
 async fn collect_outcomes<F, Fut>(
     items: Vec<BatchItem>,
     deadline: Instant,
@@ -424,9 +442,7 @@ where
             stop = Some("platform_import_deadline".into());
         }
         if let Some(code) = &stop {
-            outcomes.push(
-                json!({"key":item.key,"error":{"code":code,"retryable":true,"attempted":false}}),
-            );
+            outcomes.push(json!({"key":item.key,"error":outcome_failure(code,true,false,None)}));
             continue;
         }
         let key = item.key.clone();
@@ -438,12 +454,12 @@ where
                     stop = Some(error.1.clone());
                 }
                 outcomes.push(
-                    json!({"key":key,"error":{"code":error.1,"retryable":retry,"attempted":true}}),
+                    json!({"key":key,"error":outcome_failure(&error.1,retry,true,Some(error.0))}),
                 );
             }
             Err(_) => {
                 stop = Some("platform_import_deadline".into());
-                outcomes.push(json!({"key":key,"error":{"code":"platform_import_deadline","retryable":true,"attempted":true}}));
+                outcomes.push(json!({"key":key,"error":outcome_failure("platform_import_deadline",true,true,Some(StatusCode::GATEWAY_TIMEOUT))}));
             }
         }
     }
@@ -710,6 +726,12 @@ mod tests {
         assert!(stop.is_none());
         assert_eq!(outcomes[0]["media"]["id"], "first");
         assert_eq!(outcomes[1]["error"]["retryable"], true);
+        assert_eq!(
+            outcomes[1]["error"]["code"],
+            "native_platform_resolve_failed"
+        );
+        assert_eq!(outcomes[1]["error"]["status"], 502);
+        assert!(Uuid::parse_str(outcomes[1]["error"]["request_id"].as_str().unwrap()).is_ok());
         assert_eq!(outcomes[2]["media"]["id"], "third");
     }
     #[tokio::test]
@@ -727,6 +749,11 @@ mod tests {
         assert_eq!(calls, 1);
         assert_eq!(stop.as_deref(), Some("platform_account_changed"));
         assert_eq!(outcomes[1]["error"]["attempted"], false);
+        assert!(outcomes[1]["error"].get("status").is_none());
+        assert_ne!(
+            outcomes[0]["error"]["request_id"],
+            outcomes[1]["error"]["request_id"]
+        );
         let (outcomes, stop) =
             collect_outcomes(batch_items(2), Instant::now(), |_| std::future::pending()).await;
         assert_eq!(stop.as_deref(), Some("platform_import_deadline"));

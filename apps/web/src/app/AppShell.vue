@@ -10,6 +10,7 @@ import AppIcon from "../shared/ui/AppIcon.vue";
 import UserAvatar from "../shared/ui/UserAvatar.vue";
 import Notice from "../shared/ui/Notice.vue";
 import PlaybackHost from "../features/playback/PlaybackHost.vue";
+import { playbackFailureOwnsNotice } from "../features/playback/playback-preparation";
 const session = useSession(),
   runtime = useRoomRuntime(),
   route = useRoute(),
@@ -29,6 +30,17 @@ const inRoom = computed(
     () => !!route.meta.room && String(route.params.id) === runtime.room?.id,
   ),
   keyboard = ref(false);
+const miniHeight = ref(112);
+const runtimeNotice = computed(() => {
+  const failure =
+    runtime.preparation?.phase === "failed"
+      ? runtime.preparation.failure
+      : undefined;
+  // The player owns this diagnostic across pages. Keep unrelated room and
+  // connection errors visible, even while the local player has failed.
+  if (playbackFailureOwnsNotice(failure, runtime.error)) return "";
+  return runtime.error;
+});
 function viewport() {
   document.documentElement.style.setProperty(
     "--viewport-height",
@@ -64,6 +76,7 @@ async function retry() {
 <template>
   <div
     class="app-layout"
+    :style="{ '--mini-height': miniHeight + 'px' }"
     :class="{
       authenticated: !!session.user,
       'has-mini': !!runtime.room && !inRoom,
@@ -125,8 +138,8 @@ async function retry() {
           重试连接
         </button>
       </div>
-      <div v-if="error || runtime.error" class="global-notice">
-        <Notice :message="error || runtime.error" error
+      <div v-if="error || runtimeNotice" class="global-notice">
+        <Notice :message="error || runtimeNotice" error
           ><button
             class="text-button"
             @click="
@@ -138,8 +151,10 @@ async function retry() {
           </button></Notice
         >
       </div>
-      <PlaybackHost :full="inRoom" /><template
-        v-if="session.loaded && !session.startupError"
+      <PlaybackHost
+        :full="inRoom"
+        @mini-resize="miniHeight = $event"
+      /><template v-if="session.loaded && !session.startupError"
         ><nav
           v-if="session.user?.admin && route.path.startsWith('/admin')"
           class="mobile-admin-nav"

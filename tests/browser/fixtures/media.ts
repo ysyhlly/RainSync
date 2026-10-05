@@ -44,12 +44,25 @@ export function mediaExtraResponse(route: import("@playwright/test").Route) {
       },
     });
   }
-  if (/^\/api\/v1\/media\/[^/]+$/.test(path))
+  if (/^\/api\/v1\/(?:rooms\/[^/]+\/)?media\/[^/]+$/.test(path))
     return route.fulfill({
       json: mediaRecord({
         id: decodeURIComponent(path.split("/").at(-1)!),
         title: "movie",
       }),
+    });
+  if (
+    /^\/api\/v1\/rooms\/[^/]+\/compute$/.test(path) &&
+    route.request().method() === "GET"
+  )
+    return route.fulfill({
+      json: {
+        enabled: false,
+        p2p_enabled: false,
+        jobs: [],
+        source_probe_ready: false,
+        source_audio_tracks: [],
+      },
     });
   return undefined;
 }

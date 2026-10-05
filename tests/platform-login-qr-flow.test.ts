@@ -1,10 +1,11 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { PlatformLogin } from "../apps/web/src/features/account/platform-account.api";
 import { createPlatformLoginFlow } from "../apps/web/src/features/account/platform-login-flow";
+import { RequestFailure } from "../apps/web/src/errors";
 
 const id = "00000000-0000-0000-0000-000000000001";
 const key = "synthetic-qr-capability-0123456789";
-const payload = `https://passport.bilibili.com/h5-app/passport/login/scan?navhide=1&qrcode_key=${key}&from=main_web`;
+const payload = `https://account.bilibili.com/h5/account-h5/auth/scan-web?navhide=1&callback=close&qrcode_key=${key}&from=`;
 function response(extra: Partial<PlatformLogin> = {}): PlatformLogin {
   return {
     id,
@@ -140,6 +141,7 @@ it("never accepts a missing start QR, even when an earlier response populated th
 });
 
 it.each([
+  `https://passport.bilibili.com/h5-app/passport/login/scan?navhide=1&qrcode_key=${key}&from=main_web`,
   `https://passport.bilibili.com/h5-app/passport/login?oauthKey=${key}`,
   `https://passport.bilibili.com/h5-app/passport/login?qrcode_key=${key}`,
 ])(
@@ -161,6 +163,20 @@ it.each([
 );
 
 it.each([
+  payload.replace("https://", "http://"),
+  payload.replace("account.bilibili.com", "account.bilibili.com.evil.invalid"),
+  payload.replace("account.bilibili.com", "passport.bilibili.com"),
+  payload.replace("account.bilibili.com", "user@account.bilibili.com"),
+  payload.replace("account.bilibili.com", "account.bilibili.com:444"),
+  payload.replace("scan-web", "scan-web/other"),
+  payload.replace("callback=close", "callback=https%3A%2F%2Fevil.invalid"),
+  payload.replace("callback=close&", ""),
+  payload.replace("qrcode_key=", "oauthKey="),
+  `${payload}&callback=close`,
+  `${payload}&navhide=1`,
+  `${payload}&redirect=other`,
+  payload.replace("from=", "from=unknown"),
+  `${payload}&from=`,
   `${payload}&qrcode_key=${key}`,
   `${payload}&qrcode_key=different-synthetic-capability`,
   `${payload}&oauthKey=${key}`,
@@ -192,6 +208,63 @@ it.each([
     await login.close();
   },
 );
+
+it("shows definitive generation failure with safe diagnostics and requires a fresh consent flow", async () => {
+  const requestId = "00000000-0000-4000-8000-000000000002";
+  const poll = vi.fn(async () => response());
+  const { login, change, cancel } = flow(async () => {
+    throw new RequestFailure({
+      error: {
+        code: "PLATFORM_LOGIN_UPSTREAM_FAILED",
+        message: "private URL or QR key",
+        request_id: requestId,
+        retryable: true,
+      },
+    });
+  }, poll);
+  await login.start();
+  expect(change.mock.calls.at(-1)?.[0]).toMatchObject({
+    phase: "failed",
+    code: "PLATFORM_LOGIN_UPSTREAM_FAILED",
+    requestId,
+  });
+  expect(change.mock.calls.at(-1)?.[0].message).not.toMatch(/private|QR key/);
+  expect(poll).not.toHaveBeenCalled();
+  await login.close();
+  expect(cancel).toHaveBeenCalledWith(id);
+});
+
+it("retains the validated QR through an upstream poll failure and retries the same login", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  const requestId = "00000000-0000-4000-8000-000000000002";
+  const start = vi.fn(async () => response());
+  const poll = vi.fn(async () => {
+    throw new RequestFailure({
+      error: {
+        code: "PLATFORM_LOGIN_UPSTREAM_FAILED",
+        request_id: requestId,
+        retryable: true,
+      },
+    });
+  });
+  const { login, change } = flow(start, poll);
+  await login.start();
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(change.mock.calls.at(-1)?.[0]).toMatchObject({
+    phase: "uncertain",
+    payload,
+    code: "PLATFORM_LOGIN_UPSTREAM_FAILED",
+    requestId,
+  });
+  await login.start();
+  expect(start).toHaveBeenLastCalledWith(id, expect.any(AbortSignal));
+  expect(change.mock.calls.at(-1)?.[0]).toMatchObject({
+    phase: "pending",
+    payload,
+  });
+  await login.close();
+});
 
 it("rejects a poll that attempts to replace the QR capability of the same login", async () => {
   vi.useFakeTimers();

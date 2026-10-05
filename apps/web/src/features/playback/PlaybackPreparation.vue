@@ -42,7 +42,16 @@ const view = computed(() => describePlaybackPreparation(props.state));
         {{ Math.ceil(state.failure.retryAfterMs / 1000) }} 秒后重试。
       </p>
     </div>
-    <div v-if="view.cancel || view.retry" class="preparation-actions">
+    <div
+      v-if="view.cancel || view.retry || view.account || view.chooseMedia"
+      class="preparation-actions"
+    >
+      <RouterLink v-if="view.account" class="button" to="/account/profile"
+        >检查平台账号</RouterLink
+      >
+      <RouterLink v-if="view.chooseMedia" class="button" to="/library"
+        >选择其他影片</RouterLink
+      >
       <button v-if="view.cancel" type="button" @click="emit('cancel')">
         取消准备
       </button>

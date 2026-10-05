@@ -7,6 +7,7 @@ import {
   describePlaybackPreparation,
   preparationFailure,
   preparationReadinessSnapshot,
+  playbackFailureOwnsNotice,
   type PlaybackPreparationState,
 } from "../apps/web/src/features/playback/playback-preparation";
 
@@ -43,6 +44,14 @@ it("maps observed readiness without inventing processing from the requested mode
   expect(
     preparationReadinessSnapshot({ ...ready, status: "unknown" as any }),
   ).toBeUndefined();
+});
+
+it("owns only its original playback notice and keeps raw text out of serialization", () => {
+  const failure = preparationFailure(new TypeError("Failed to fetch"));
+  expect(playbackFailureOwnsNotice(failure, "Failed to fetch")).toBe(true);
+  expect(playbackFailureOwnsNotice(failure, "房间连接中断")).toBe(false);
+  expect(playbackFailureOwnsNotice(undefined, "Failed to fetch")).toBe(false);
+  expect(JSON.stringify(failure)).not.toContain("Failed to fetch");
 });
 
 it("rejects obsolete generations, another session and updates after cancellation/failure", () => {
@@ -126,6 +135,29 @@ it("distinguishes network/timeout failures and exposes bounded user actions", ()
   expect(describePlaybackPreparation({ phase: "ready" })).toMatchObject({
     label: "可播放",
     cancel: false,
+    retry: false,
+  });
+});
+
+it("uses one typed platform error in notices and the player, with account recovery", () => {
+  const error = new RequestFailure({
+    error: {
+      code: "NATIVE_PLATFORM_ACCESS_DENIED",
+      message: "https://private.invalid/?token=secret",
+      retryable: false,
+      request_id: "00000000-0000-4000-8000-000000000000",
+    },
+  });
+  const failure = preparationFailure(error);
+  expect(failure.message).toContain("平台拒绝访问此视频");
+  expect(error.message).toBe(
+    failure.message + `（诊断编号：${failure.requestId}）`,
+  );
+  expect(
+    describePlaybackPreparation({ phase: "failed", failure }),
+  ).toMatchObject({
+    account: true,
+    chooseMedia: true,
     retry: false,
   });
 });

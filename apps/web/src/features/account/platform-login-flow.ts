@@ -1,4 +1,5 @@
 import type { PlatformLogin } from "./platform-account.api";
+import { RequestFailure } from "../../errors";
 export interface PlatformLoginFlowState {
   phase:
     | "idle"
@@ -11,6 +12,8 @@ export interface PlatformLoginFlowState {
   stage?: "waiting" | "scanned";
   payload?: string;
   message?: string;
+  code?: string;
+  requestId?: string;
 }
 /** Login capability is held in this exact origin/session closure, never persisted. */
 export function createPlatformLoginFlow(options: {
@@ -68,14 +71,19 @@ export function createPlatformLoginFlow(options: {
       )
         throw Error("Invalid QR response");
       const url = new URL(value.qr_payload);
+      const accountScan =
+        url.origin === "https://account.bilibili.com" &&
+        url.pathname === "/h5/account-h5/auth/scan-web";
+      const passportScan =
+        url.origin === "https://passport.bilibili.com" &&
+        ["/h5-app/passport/login", "/h5-app/passport/login/scan"].includes(
+          url.pathname,
+        );
       if (
-        url.origin !== "https://passport.bilibili.com" ||
+        !(accountScan || passportScan) ||
         url.username ||
         url.password ||
-        url.hash ||
-        !["/h5-app/passport/login", "/h5-app/passport/login/scan"].includes(
-          url.pathname,
-        )
+        url.hash
       )
         throw Error("Invalid QR origin");
       const bindings = [...url.searchParams].filter(([name]) =>
@@ -83,12 +91,69 @@ export function createPlatformLoginFlow(options: {
       );
       if (
         bindings.length !== 1 ||
-        (url.pathname.endsWith("/scan") && bindings[0]![0] !== "qrcode_key") ||
+        ((accountScan || url.pathname.endsWith("/scan")) &&
+          bindings[0]![0] !== "qrcode_key") ||
         !/^[a-z0-9_-]{16,128}$/i.test(bindings[0]![1])
       )
         throw Error("Invalid QR binding");
+      if (accountScan) {
+        const query = [...url.searchParams];
+        if (
+          query.some(([name, value]) =>
+            name === "qrcode_key"
+              ? false
+              : name === "navhide"
+                ? value !== "1"
+                : name === "callback"
+                  ? value !== "close"
+                  : name === "from"
+                    ? value !== ""
+                    : true,
+          ) ||
+          url.searchParams.getAll("callback").length !== 1 ||
+          url.searchParams.getAll("navhide").length > 1 ||
+          url.searchParams.getAll("from").length > 1
+        )
+          throw Error("Invalid QR callback");
+      }
     }
     return value;
+  }
+  function failed(error: unknown, fromPoll: boolean) {
+    const failure = error instanceof RequestFailure ? error : undefined;
+    const code =
+      failure && /^[A-Z][A-Z0-9_]{0,79}$/.test(failure.code)
+        ? failure.code
+        : undefined;
+    const expired = code === "PLATFORM_LOGIN_EXPIRED";
+    // Generation failure is terminal on the server. Poll failures release the
+    // claim while retaining the same QR, so their outcome stays uncertain.
+    const terminal =
+      expired ||
+      (!fromPoll && code === "PLATFORM_LOGIN_UPSTREAM_FAILED") ||
+      [
+        "PLATFORM_LOGIN_CHANGED",
+        "PLATFORM_LOGIN_REQUEST_NOT_FOUND",
+        "PLATFORM_LOGIN_REQUEST_CONFLICT",
+        "PLATFORM_LOGIN_REQUEST_INVALID",
+        "LOGIN_REQUIRED",
+        "SESSION_EXPIRED",
+      ].includes(code ?? "");
+    if (terminal) {
+      qrPayload = undefined;
+      loginDeadline = undefined;
+    }
+    publish({
+      phase: expired ? "expired" : terminal ? "failed" : "uncertain",
+      payload: terminal ? undefined : qrPayload,
+      code,
+      requestId: failure?.requestId,
+      message: expired
+        ? "二维码已过期，请关闭后重新确认登录。"
+        : terminal
+          ? "本次平台登录已失败，请关闭后重新确认登录。"
+          : "登录结果尚未确认，点击重试同一登录。不会自动生成新的二维码。",
+    });
   }
   function apply(value: PlatformLogin, generation: number, fromPoll = false) {
     if (!current(generation)) return;
@@ -144,13 +209,8 @@ export function createPlatformLoginFlow(options: {
           generation,
           true,
         );
-      } catch {
-        if (current(generation))
-          publish({
-            phase: "uncertain",
-            message:
-              "登录结果尚未确认，点击重试同一登录。不会自动生成新的二维码。",
-          });
+      } catch (error) {
+        if (current(generation)) failed(error, true);
       }
     }, delay);
   }
@@ -164,13 +224,8 @@ export function createPlatformLoginFlow(options: {
     publish({ phase: "starting" });
     try {
       apply(await options.start(key, controller.signal), generation);
-    } catch {
-      if (current(generation))
-        publish({
-          phase: "uncertain",
-          message:
-            "登录结果尚未确认，点击重试同一登录。不会自动生成新的二维码。",
-        });
+    } catch (error) {
+      if (current(generation)) failed(error, false);
     }
   }
   async function close() {

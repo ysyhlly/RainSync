@@ -20,6 +20,12 @@ const progress = computed(() =>
     ? Math.max(0, Math.min(100, (r.position / r.duration) * 100))
     : 0,
 );
+const durationKnown = computed(
+  () => Number.isFinite(r.duration) && r.duration > 0,
+);
+const localUnavailable = computed(() =>
+  ["failed", "cancelled"].includes(r.preparation?.phase ?? ""),
+);
 function setVolume(event: Event) {
   volume.value = Number((event.target as HTMLInputElement).value);
   if (r.video) r.video.volume = volume.value;
@@ -53,7 +59,18 @@ function end() {
   >
     <button
       class="icon-button control-play"
-      :aria-label="r.state?.playback_status === 'playing' ? '暂停' : '播放'"
+      :aria-label="
+        r.state?.playback_status === 'playing'
+          ? localUnavailable
+            ? '暂停房间播放'
+            : '暂停'
+          : localUnavailable
+            ? '开始房间播放'
+            : '播放'
+      "
+      :title="
+        localUnavailable ? '控制房间共同播放，本机播放尚未就绪' : undefined
+      "
       :disabled="!r.owner || !r.connected || !r.state?.media_id"
       @click="r.send(r.state?.playback_status === 'playing' ? 'PAUSE' : 'PLAY')"
     >
@@ -63,7 +80,11 @@ function end() {
     ><span v-if="r.live" class="playback-time" role="status"
       >直播边缘 · 控制同步</span
     ><span v-else class="playback-time"
-      >{{ formatTime(r.position) }} / {{ formatTime(r.duration) }}</span
+      >{{
+        durationKnown
+          ? formatTime(r.position) + " / " + formatTime(r.duration)
+          : "时长未知"
+      }}<template v-if="localUnavailable"> · 房间控制</template></span
     ><input
       v-if="!r.live"
       class="seek-control"
@@ -74,7 +95,9 @@ function end() {
       step="0.1"
       :value="r.position"
       :style="{ '--range-progress': progress + '%' }"
-      :disabled="!r.owner || !r.connected || !r.state?.media_id"
+      :disabled="
+        !r.owner || !r.connected || !r.state?.media_id || !durationKnown
+      "
       @pointerdown="drag"
       @input="
         r.dragging = true;

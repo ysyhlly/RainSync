@@ -393,11 +393,16 @@ export function createPlaybackRuntime(ctx: {
     sessionId = ref<string | null>(null);
   const recoveryState = ref<PlaybackRecoveryState>("idle");
   const preparation = ref<PlaybackPreparationState>({ phase: "idle" });
-  function failLocalPlayback(message: string, code?: string) {
+  function failLocalPlayback(message: string, code?: string, notice = message) {
     preparation.value = {
       ...preparation.value,
       phase: "failed",
-      failure: { message, code, retryable: true },
+      failure: {
+        message,
+        code,
+        retryable: true,
+        ownsNotice: (value) => value === notice,
+      },
     };
   }
   function failNativeCompatibility(p: PlaybackPlan, message: string) {
@@ -3134,7 +3139,11 @@ export function createPlaybackRuntime(ctx: {
             if (data.type === "mediaError" && retryDecode()) return;
             recoveringHls = false;
             error.value = "媒体加载失败：" + data.details;
-            failLocalPlayback("媒体加载失败，请检查连接或重新发起播放。");
+            failLocalPlayback(
+              "媒体加载失败，请检查连接或重新发起播放。",
+              undefined,
+              error.value,
+            );
             waiting.value = false;
           }
         });

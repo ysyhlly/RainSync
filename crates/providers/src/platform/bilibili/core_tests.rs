@@ -466,6 +466,9 @@ fn bilibili_core_current_qr_scan_url_binds_exactly_one_poll_key() {
     );
     for url in [
         payload.clone(),
+        format!(
+            "https://account.bilibili.com/h5/account-h5/auth/scan-web?navhide=1&callback=close&qrcode_key={key}&from="
+        ),
         format!("https://passport.bilibili.com/h5-app/passport/login?qrcode_key={key}"),
         format!("https://passport.bilibili.com/h5-app/passport/login?oauthKey={key}"),
     ] {
@@ -492,6 +495,37 @@ fn bilibili_core_current_qr_scan_url_binds_exactly_one_poll_key() {
         format!("{payload}#fragment"),
     ] {
         let body = bytes(json!({"code":0,"data":{"url":url,"qrcode_key":key}}));
+        assert!(parse_qr_generate_response(&body).is_err());
+    }
+}
+
+#[test]
+fn bilibili_core_account_qr_rejects_foreign_callbacks_and_ambiguous_bindings() {
+    let key = "synthetic-qr-capability-0123456789";
+    let url = format!(
+        "https://account.bilibili.com/h5/account-h5/auth/scan-web?navhide=1&callback=close&qrcode_key={key}&from="
+    );
+    for invalid in [
+        url.replace("https://", "http://"),
+        url.replace("account.bilibili.com", "account.bilibili.com.evil.invalid"),
+        url.replace("account.bilibili.com", "passport.bilibili.com"),
+        url.replace("scan-web", "scan-web/other"),
+        url.replace("account.bilibili.com", "user@account.bilibili.com"),
+        url.replace("account.bilibili.com", "account.bilibili.com:444"),
+        url.replace("callback=close", "callback=https%3A%2F%2Fevil.invalid"),
+        url.replace("callback=close&", ""),
+        url.replace("qrcode_key=", "oauthKey="),
+        url.replace(key, "different-synthetic-capability"),
+        format!("{url}&callback=close"),
+        format!("{url}&navhide=1"),
+        format!("{url}&qrcode_key={key}"),
+        format!("{url}&oauthKey={key}"),
+        format!("{url}&redirect=other"),
+        url.replace("from=", "from=unknown"),
+        format!("{url}&from="),
+        format!("{url}#fragment"),
+    ] {
+        let body = bytes(json!({"code":0,"data":{"url":invalid,"qrcode_key":key}}));
         assert!(parse_qr_generate_response(&body).is_err());
     }
 }

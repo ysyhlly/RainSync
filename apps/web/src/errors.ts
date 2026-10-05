@@ -35,7 +35,7 @@ const playbackMessages: Record<string, string> = {
     "平台播放请求不受支持，请重新加载或更新客户端",
   NATIVE_PLATFORM_DEVICE_UNSUPPORTED: "浏览器不支持此平台视频所需的播放格式",
   NATIVE_PLATFORM_ACCESS_DENIED:
-    "平台拒绝访问此视频；登录、会员、年龄或地区限制可能适用",
+    "平台拒绝访问此视频，请检查自己的平台登录状态和视频权限。",
   NATIVE_PLATFORM_ANONYMOUS_UNSUPPORTED:
     "此视频需要平台登录或额外权限，当前请求使用匿名观看；可尝试使用自己的对应平台会话（平台支持时）",
   NATIVE_PLATFORM_PROVIDER_UNAVAILABLE:
@@ -60,6 +60,12 @@ const playbackMessages: Record<string, string> = {
   PLAYBACK_VIEWER_LIMIT_EXCEEDED:
     "此账号在该房间的播放器身份已达上限，现有播放器可继续使用；新播放器需使用新房间",
 };
+
+export function playbackFailureMessage(code: string): string | undefined {
+  return Object.hasOwn(playbackMessages, code)
+    ? playbackMessages[code]
+    : undefined;
+}
 
 /** Hls' default XHR loader exposes the already-read body in networkDetails.
  * Match only our stable code/status; never display a raw media-origin body. */
@@ -103,10 +109,12 @@ export class RequestFailure extends Error {
         ? detail.request_id
         : undefined;
     const message =
-      typeof detail?.message === "string"
+      playbackFailureMessage(code) ??
+      (typeof detail?.message === "string"
         ? detail.message
-        : (playbackMessages[code] ??
-          (typeof error === "string" ? error : "请求失败，请稍后重试"));
+        : typeof error === "string"
+          ? error
+          : "请求失败，请稍后重试");
     super(message + (requestId ? `（诊断编号：${requestId}）` : ""));
     this.name = "RequestFailure";
     this.code = code;

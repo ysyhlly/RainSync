@@ -1,4 +1,4 @@
-import { isolatedPostgres } from "./fixtures/postgres.mjs";
+import { isolatedPostgres, verifyClosedPort } from "./fixtures/postgres.mjs";
 import { reviewRegressions } from "./review-regressions.mjs";
 import { libraryScans } from "./library-scans.mjs";
 import { queueCapacity } from "./queue-capacity.mjs";
@@ -50,8 +50,6 @@ const env = {
   PUBLIC_ORIGIN: origin,
   BIND: "127.0.0.1:18080",
   WORKER_BIND: "127.0.0.1:18081",
-  // Controlled probe response below; delivery tests still use the real worker.
-  WORKER_URL: "http://127.0.0.1:18082",
   MEDIA_ROOT: root,
   CACHE_ROOT: resolve(root, "cache"),
   RUST_LOG: "warn",
@@ -206,8 +204,18 @@ async function connect(client, room) {
   };
 }
 let mock;
+let mockOrigin;
 const mockRequests = [];
 try {
+  for (const port of [18080, 18081, 18084])
+    assert.ok(await verifyClosedPort(port), `fixture port ${port} is already in use`);
+  // Own the fixture listener before launching any client. A fixed port can
+  // collide with a developer's running service or send probes to that service.
+  mock = http.createServer((_request, response) => response.writeHead(503).end());
+  await new Promise((resolve, reject) =>
+    mock.once("error", reject).listen(0, "127.0.0.1", resolve));
+  mockOrigin = `http://127.0.0.1:${mock.address().port}`;
+  env.WORKER_URL = mockOrigin;
   await database.start();
   env.DATABASE_URL = database.url;
   let server = launch("rainsync-server");
@@ -542,8 +550,8 @@ try {
   );
   const rotatedPath = resolve(root, "rotation-fixture.tmp");
   execFileSync("ffmpeg", [
-    "-v", "error", "-nostdin", "-y", "-display_rotation:v:0", "90", "-i", fixturePath,
-    "-map", "0", "-c", "copy",
+    "-v", "error", "-nostdin", "-y", "-i", fixturePath,
+    "-map", "0", "-c", "copy", "-metadata:s:v:0", "rotate=90",
     "-f", "mp4", rotatedPath,
   ], { timeout: 30000, stdio: "inherit" });
   const rotatedMetadata = JSON.parse(execFileSync("ffprobe", [
@@ -755,8 +763,8 @@ try {
   let probeResponse;
   let probeMetadata;
   let probeCalls = 0;
-  mock = http
-    .createServer((req, res) => {
+  mock.removeAllListeners("request");
+  mock.on("request", (req, res) => {
       mockRequests.push({ method: req.method, path: new URL(req.url, "http://fixture").pathname, headers: { ...req.headers } });
       if (
         req.url.startsWith("/media-delivery/") &&
@@ -870,12 +878,11 @@ try {
       } else {
         res.end(bytes);
       }
-    })
-    .listen(18082, "127.0.0.1");
+    });
   const httpSource = await admin.request("/sources", "POST", {
     name: "HTTP",
     kind: "http",
-    config: { url: "http://127.0.0.1:18082/index.m3u8" },
+    config: { url: mockOrigin + "/index.m3u8" },
   });
   await admin.request(`/sources/${httpSource.id}/test`, "POST");
   const httpMedia = (await admin.request("/media")).find(
@@ -909,7 +916,7 @@ try {
   const forged = new URL(worker + segment);
   forged.searchParams.set(
     "url",
-    Buffer.from("http://127.0.0.1:18082/private").toString("base64url"),
+    Buffer.from(mockOrigin + "/private").toString("base64url"),
   );
   assert.equal((await fetch(forged)).status, 403);
   const probeRequest = {
@@ -961,7 +968,7 @@ try {
   );
   const binarySource = await admin.request("/sources", "POST", {
     name: "Owned HTTP Binary", kind: "http",
-    config: { url: "http://127.0.0.1:18082/fixture.mp4" },
+    config: { url: mockOrigin + "/fixture.mp4" },
   });
   await admin.request(`/sources/${binarySource.id}/test`, "POST");
   const binaryMedia = sql(`SELECT id FROM media_items WHERE source_id='${binarySource.id}'`);
@@ -1004,7 +1011,7 @@ try {
       name: kind,
       kind,
       config: {
-        url: "http://127.0.0.1:18082",
+        url: mockOrigin,
         token: "mock-token",
         user_id: "test-user",
       },

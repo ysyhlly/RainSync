@@ -21,12 +21,51 @@ import {
   type SubtitleResource,
 } from "./subtitle-load-state";
 const props = defineProps<{ full: boolean }>();
+const emit = defineEmits<{ miniResize: [height: number] }>();
 const r = useRoomRuntime(),
   element = ref<HTMLVideoElement>(),
   host = ref<HTMLElement>(),
   fullscreenError = ref("");
+const miniCollapsed = ref(false);
+const shortViewport = matchMedia("(max-height: 500px)");
+function adaptMini() {
+  if (
+    !props.full &&
+    r.room &&
+    r.state &&
+    (shortViewport.matches || !r.state.media_id)
+  )
+    miniCollapsed.value = true;
+}
+let miniObserver: ResizeObserver | undefined;
+function measureMini() {
+  emit(
+    "miniResize",
+    !props.full && !fullscreen.value && r.room
+      ? Math.ceil(host.value?.getBoundingClientRect().height ?? 0)
+      : 0,
+  );
+}
 const chrome = createPlayerChrome(matchMedia("(pointer: coarse)").matches);
 const { visible, fullscreen, hideCursor } = chrome;
+watch(
+  () => r.preparation?.phase,
+  (phase) => {
+    if (phase === "failed") miniCollapsed.value = true;
+  },
+  { immediate: true },
+);
+watch(
+  () => [props.full, fullscreen.value, r.room?.id, r.state?.media_id],
+  adaptMini,
+  { immediate: true },
+);
+watch(
+  () => [props.full, fullscreen.value, miniCollapsed.value, r.room?.id],
+  () => {
+    void nextTick().then(measureMini);
+  },
+);
 const subtitleLoads = new SubtitleLoadState(),
   subtitleResources = shallowRef<readonly SubtitleResource[]>([]),
   subtitleFailure = shallowRef<SubtitleResource>();
@@ -71,6 +110,9 @@ const preparationVisible = computed(
   () =>
     !!r.preparation &&
     r.preparation.phase !== "idle" &&
+    !(
+      r.preparation.phase === "preparing" && r.recoveryState === "calibrating"
+    ) &&
     (r.preparation.phase !== "ready" || r.waiting),
 );
 let keyboard = false,
@@ -136,6 +178,12 @@ watch(
   },
 );
 onMounted(() => {
+  shortViewport.addEventListener("change", adaptMini);
+  if (host.value) {
+    miniObserver = new ResizeObserver(measureMini);
+    miniObserver.observe(host.value);
+    measureMini();
+  }
   if (element.value) r.attach(element.value);
   document.addEventListener("fullscreenchange", changed);
   document.addEventListener("visibilitychange", visibility);
@@ -143,6 +191,9 @@ onMounted(() => {
   document.addEventListener("pointerdown", pointer, true);
 });
 onBeforeUnmount(() => {
+  shortViewport.removeEventListener("change", adaptMini);
+  miniObserver?.disconnect();
+  emit("miniResize", 0);
   chrome.dispose();
   document.removeEventListener("fullscreenchange", changed);
   document.removeEventListener("visibilitychange", visibility);
@@ -157,7 +208,11 @@ onBeforeUnmount(() => {
     class="playback-host"
     :class="[
       full ? 'full-player' : 'mini-player',
-      { 'chrome-visible': visible, 'cursor-hidden': hideCursor },
+      {
+        'chrome-visible': visible,
+        'cursor-hidden': hideCursor,
+        'mini-collapsed': !full && !fullscreen && miniCollapsed,
+      },
     ]"
     aria-label="房间播放器"
     @focusin="focus"
@@ -284,9 +339,44 @@ onBeforeUnmount(() => {
     <div v-show="!full && !fullscreen" class="player-caption">
       <div>
         <h2>{{ r.currentTitle }}</h2>
-        <p>{{ r.room?.name }}</p>
+        <p v-if="!miniCollapsed">{{ r.room?.name }}</p>
+        <template v-if="!full && !fullscreen && miniCollapsed">
+          <span class="mini-status" role="status">{{
+            r.preparation?.phase === "failed"
+              ? "本机播放失败"
+              : r.recoveryLabel || r.room?.name
+          }}</span>
+          <small
+            v-if="r.preparation?.failure?.requestId"
+            class="mini-diagnostic"
+            >诊断编号：{{ r.preparation.failure.requestId }}</small
+          >
+          <button
+            v-if="
+              r.preparation?.phase === 'failed' &&
+              r.preparation.failure?.retryable
+            "
+            :disabled="!r.connected || !r.roomActive"
+            @click="r.run(r.loadMedia)"
+          >
+            重新发起播放
+          </button>
+          <RouterLink
+            v-if="
+              r.preparation?.phase === 'failed' &&
+              [
+                'NATIVE_PLATFORM_ACCESS_DENIED',
+                'NATIVE_PLATFORM_ANONYMOUS_UNSUPPORTED',
+                'PLATFORM_ACCOUNT_CHANGED',
+                'PLATFORM_ACCOUNT_EXPIRED',
+              ].includes(r.preparation.failure?.code ?? '')
+            "
+            to="/account/profile"
+            >检查平台账号</RouterLink
+          >
+        </template>
         <PlaybackPreparation
-          v-if="!full && !fullscreen && preparationVisible"
+          v-if="!full && !fullscreen && !miniCollapsed && preparationVisible"
           compact
           :state="r.preparation"
           :can-retry="r.connected && r.roomActive"
@@ -294,7 +384,7 @@ onBeforeUnmount(() => {
           @retry="r.run(r.loadMedia)"
         />
         <span
-          v-else-if="!full && !fullscreen && r.recoveryLabel"
+          v-else-if="!full && !fullscreen && !miniCollapsed && r.recoveryLabel"
           role="status"
           >{{ r.recoveryLabel }}</span
         >
@@ -303,6 +393,15 @@ onBeforeUnmount(() => {
         >返回房间<AppIcon name="next"
       /></RouterLink>
     </div>
+    <button
+      v-if="!full && !fullscreen"
+      class="icon-button mini-toggle"
+      :aria-label="miniCollapsed ? '展开播放器' : '折叠播放器'"
+      :aria-expanded="!miniCollapsed"
+      @click="miniCollapsed = !miniCollapsed"
+    >
+      <AppIcon :name="miniCollapsed ? 'maximize' : 'minimize'" />
+    </button>
   </section>
 </template>
 

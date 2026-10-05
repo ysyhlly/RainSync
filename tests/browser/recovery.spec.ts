@@ -48,6 +48,7 @@ async function setup(
   page: Page,
   opts: {
     holdClock?: boolean;
+    deterministicClock?: boolean;
     holdRoom?: boolean;
     validMedia?: boolean;
     nativeHls?: boolean;
@@ -57,17 +58,77 @@ async function setup(
     playbackStatus?: "playing" | "paused";
   } = {},
 ) {
-  await page.clock.install();
-  await page.addInitScript(() => {
-    Object.defineProperty(HTMLMediaElement.prototype, "readyState", {
-      get: () => 4,
-    });
-    Object.defineProperty(HTMLMediaElement.prototype, "duration", {
-      get: () => 3600,
-    });
-    HTMLMediaElement.prototype.play = async function () {};
-    HTMLMediaElement.prototype.pause = function () {};
-  });
+  if (opts.deterministicClock) {
+    const start = new Date("2026-10-05T12:00:00Z");
+    await page.clock.install({ time: start });
+    await page.clock.pauseAt(new Date(start.getTime() + 1000));
+  } else await page.clock.install();
+  await page.addInitScript(
+    ({ validMedia }) => {
+      const playing = new WeakSet<HTMLMediaElement>();
+      // These component fixtures already simulate readiness, duration and play.
+      // Keep their time ranges and frame callbacks consistent with that model;
+      // real decode and presentation are verified by the separate NAS/browser soak.
+      Object.defineProperty(HTMLMediaElement.prototype, "readyState", {
+        get: () => 4,
+      });
+      Object.defineProperty(HTMLMediaElement.prototype, "duration", {
+        get: () => 3600,
+      });
+      HTMLMediaElement.prototype.play = async function () {
+        playing.add(this);
+      };
+      HTMLMediaElement.prototype.pause = function () {
+        playing.delete(this);
+      };
+      HTMLVideoElement.prototype.requestVideoFrameCallback = function (
+        callback,
+      ) {
+        const element = this;
+        const frame = () => {
+          if (playing.has(element) || !element.paused) {
+            timers.delete(id);
+            callback(performance.now(), {
+              presentationTime: performance.now(),
+              mediaTime: element.currentTime,
+            } as VideoFrameCallbackMetadata);
+          } else timers.set(id, setTimeout(frame, 100));
+        };
+        const id = ++serial;
+        timers.set(id, setTimeout(frame, 100));
+        return id;
+      };
+      let serial = 0;
+      const timers = new Map<number, ReturnType<typeof setTimeout>>();
+      HTMLVideoElement.prototype.cancelVideoFrameCallback = (id) => {
+        clearTimeout(timers.get(id));
+        timers.delete(id);
+      };
+      if (validMedia) {
+        const positions = new WeakMap<HTMLMediaElement, number>();
+        Object.defineProperties(HTMLMediaElement.prototype, {
+          currentTime: {
+            configurable: true,
+            get() {
+              return positions.get(this) ?? 0;
+            },
+            set(value) {
+              positions.set(this, value);
+            },
+          },
+          seekable: {
+            configurable: true,
+            get: () => ({ length: 1, start: () => 0, end: () => 3600 }),
+          },
+          buffered: {
+            configurable: true,
+            get: () => ({ length: 1, start: () => 0, end: () => 3600 }),
+          },
+        });
+      }
+    },
+    { validMedia: opts.validMedia === true },
+  );
   const frames: any[] = [],
     preparations: any[] = [],
     planGenerations = new Map<string, number>(),
@@ -594,6 +655,9 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
   const h = await setup(page, {
     holdClock: true,
     nativeHls: true,
+    // A four-second headroom window must advance only through runFor; real
+    // elapsed time during network assertions can otherwise cause extra resumes.
+    deterministicClock: true,
     playbackUrl: "/media-delivery/session-1/attempt-1/index.m3u8?token=test",
   });
   let publishedUntil = 1802000;
@@ -721,7 +785,12 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
   // observing every transient count as if fetch completion were synchronous.
   await page.clock.runFor(750);
   await expect
-    .poll(async () => (await stats()).errors)
+    .poll(async () => {
+      // HTTP completion can occur after runFor returns. Advance the paused
+      // clock until the next refresh runs, while retaining the exact retry budget.
+      if ((await stats()).errors.length < 4) await page.clock.runFor(250);
+      return (await stats()).errors;
+    })
     .toEqual([409, 409, 409, 409]);
   const failed = await stats();
   expect(failed.errors).toEqual([409, 409, 409, 409]);

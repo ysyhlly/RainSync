@@ -19,7 +19,68 @@ pub(crate) use resolver::resolve_progressive;
 pub(crate) use resolver::resolve_public_progressive;
 pub(crate) use resolver::resolve_youtube_with_account;
 
+#[derive(serde::Deserialize)]
+struct UpstreamCode {
+    code: i64,
+}
+fn upstream_api_code(body: &[u8]) -> Option<i64> {
+    // A typed envelope rejects duplicate, missing and non-integer codes. No
+    // provider message, URL, account material or QR payload is retained.
+    // Serde also accepts structs as arrays; the API envelope must be an object.
+    if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return None;
+    }
+    serde_json::from_slice::<UpstreamCode>(body)
+        .ok()
+        .map(|value| value.code)
+}
+struct DiagnosticTransport(providers::platform::http::PlatformHttp);
+impl bilibili::Transport for DiagnosticTransport {
+    fn get<'a>(
+        &'a self,
+        request: bilibili::ApiRequest,
+        deadline: Deadline,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<bilibili::ApiResponse, bilibili::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let endpoint = request.endpoint();
+            let authenticated = request.headers().contains_key("Cookie");
+            let response = bilibili::Transport::get(&self.0, request, deadline).await?;
+            if matches!(
+                endpoint,
+                bilibili::Endpoint::View | bilibili::Endpoint::PlayUrl
+            ) && let Some(code) = upstream_api_code(&response.body)
+                && code != 0
+            {
+                tracing::warn!(event = "native_platform_api_rejected", provider = "bilibili",
+                    endpoint = ?endpoint, authenticated, upstream_api_code = code);
+            }
+            Ok(response)
+        })
+    }
+}
+
 pub(crate) fn provider_error(error: bilibili::Error) -> Error {
+    provider_error_scoped(error, None)
+}
+fn provider_error_scoped(error: bilibili::Error, authenticated: Option<bool>) -> Error {
+    let (failure_class, upstream_api_code, upstream_http_status, restriction_reason) =
+        provider_failure_fields(&error);
+    tracing::warn!(
+        event = "native_platform_upstream_failed",
+        provider = "bilibili",
+        authenticated,
+        failure_class,
+        upstream_api_code,
+        upstream_http_status,
+        restriction_reason,
+    );
     match error {
         bilibili::Error::InvalidResource => err(StatusCode::BAD_REQUEST, "native_platform_invalid"),
         bilibili::Error::Deadline => err(
@@ -32,6 +93,34 @@ pub(crate) fn provider_error(error: bilibili::Error) -> Error {
             "native_platform_access_denied",
         ),
         _ => err(StatusCode::BAD_GATEWAY, "native_platform_resolve_failed"),
+    }
+}
+fn provider_failure_fields(
+    error: &bilibili::Error,
+) -> (&'static str, Option<i64>, Option<u16>, &'static str) {
+    use bilibili::Error as E;
+    match error {
+        E::Api(code) => ("provider_api_rejected", Some(*code), None, "none"),
+        E::Status(status) => ("provider_http_rejected", None, Some(*status), "none"),
+        E::Restricted(reason) => (
+            "provider_policy_rejected",
+            None,
+            None,
+            match *reason {
+                "authentication_required" => "authentication_required",
+                "unavailable_or_permission" => "unavailable_or_permission",
+                "upstream_access_or_drm" => "upstream_access_or_drm",
+                "preview_or_duration_mismatch" => "preview_or_duration_mismatch",
+                "unavailable" => "unavailable",
+                "redirected_resource" => "redirected_resource",
+                _ => "other_policy_restriction",
+            },
+        ),
+        E::Deadline => ("deadline_exceeded", None, None, "none"),
+        E::Transport => ("transport_failed", None, None, "none"),
+        E::TooLarge => ("response_limit_exceeded", None, None, "none"),
+        E::InvalidJson => ("response_json_invalid", None, None, "none"),
+        _ => ("response_schema_invalid", None, None, "none"),
     }
 }
 fn validate_request(body: &protocol::PlaybackRequest) -> Result<()> {
@@ -366,17 +455,20 @@ async fn resolve_and_publish(
         available_heights = heights;
         (descriptor, expiry)
     } else if entry.provider == "bilibili" {
-        let resolved = Client::new(app.platform_http, account.cookie().cloned())
-            .resolve(
-                &entry.resource(),
-                // Discover only renditions this exact viewer's provider response
-                // admits. Auto keeps the existing 1080p ceiling; labels come
-                // from real compatible tracks rather than Bili quality names.
-                127,
-                deadline,
-            )
-            .await
-            .map_err(provider_error)?;
+        let resolved = Client::new(
+            DiagnosticTransport(app.platform_http),
+            account.cookie().cloned(),
+        )
+        .resolve(
+            &entry.resource(),
+            // Discover only renditions this exact viewer's provider response
+            // admits. Auto keeps the existing 1080p ceiling; labels come
+            // from real compatible tracks rather than Bili quality names.
+            127,
+            deadline,
+        )
+        .await
+        .map_err(|error| provider_error_scoped(error, Some(account.cookie().is_some())))?;
         if resolved.metadata.bvid != entry.content_id
             || resolved.metadata.part != entry.part
             || entry
@@ -892,6 +984,48 @@ fn unix_ms() -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn upstream_code_diagnostics_require_one_integer_and_discard_provider_payload() {
+        assert_eq!(
+            upstream_api_code(br#"{"code":-404,"data":{"url":"private"}}"#),
+            Some(-404)
+        );
+        for body in [
+            br#"{"code":0,"code":-404}"#.as_slice(),
+            br#"{"code":"-404"}"#,
+            br#"{"code":true}"#,
+            br#"{"data":{"code":-404}}"#,
+            br#"[0]"#,
+        ] {
+            assert_eq!(upstream_api_code(body), None);
+        }
+    }
+    #[test]
+    fn bilibili_failure_diagnostics_are_typed_and_never_retain_provider_text() {
+        assert_eq!(
+            provider_failure_fields(&bilibili::Error::Api(-10403)),
+            ("provider_api_rejected", Some(-10403), None, "none")
+        );
+        assert_eq!(
+            provider_failure_fields(&bilibili::Error::Status(403)),
+            ("provider_http_rejected", None, Some(403), "none")
+        );
+        assert_eq!(
+            provider_failure_fields(&bilibili::Error::Restricted("authentication_required")),
+            (
+                "provider_policy_rejected",
+                None,
+                None,
+                "authentication_required"
+            )
+        );
+        for error in [
+            bilibili::Error::Restricted("https://private.invalid/?token=secret"),
+            bilibili::Error::InvalidResponse("private QR payload"),
+        ] {
+            assert!(!format!("{:?}", provider_failure_fields(&error)).contains("private"));
+        }
+    }
     fn request() -> protocol::PlaybackRequest {
         serde_json::from_value(json!({"room_id":Uuid::from_u128(1),"media_generation":1,"viewer_id":Uuid::from_u128(2),"plan_generation":1,"native_platform":{"version":1,"credential_mode":"own_or_anonymous"}})).unwrap()
     }
