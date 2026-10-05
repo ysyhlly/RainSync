@@ -206,6 +206,7 @@ async function connect(client, room) {
   };
 }
 let mock;
+const mockRequests = [];
 try {
   await database.start();
   env.DATABASE_URL = database.url;
@@ -735,14 +736,25 @@ try {
   let probeCalls = 0;
   mock = http
     .createServer((req, res) => {
+      mockRequests.push({ method: req.method, path: new URL(req.url, "http://fixture").pathname, headers: { ...req.headers } });
       if (
         req.url.startsWith("/media-delivery/") &&
         req.url.includes("/probe?")
       ) {
         probeCalls++;
         if (probeMetadata) {
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify(probeMetadata));
+          // Pin the same actual Binary grant through the real Worker before
+          // returning this fixture's controlled API-decision metadata.
+          void (async () => {
+            const pinned = await fetch(worker + req.url.replace("/probe?", "/source?"));
+            if (!pinned.ok) {
+              res.writeHead(pinned.status).end(await pinned.text());
+              return;
+            }
+            await pinned.arrayBuffer();
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify(probeMetadata));
+          })().catch(() => res.writeHead(502).end());
         } else probeResponse = res;
       } else if (req.url === "/Users/test-user") {
         res.setHeader("Content-Type", "application/json");
@@ -809,6 +821,26 @@ try {
         upstreamReports.push(req.url);
         res.setHeader("Content-Type", "application/json");
         res.end("{}");
+      } else if (req.url === "/fixture.mp4") {
+        const etag = `"${createHash("sha256").update(bytes).digest("hex")}"`;
+        res.setHeader("ETag", etag);
+        res.setHeader("Content-Type", "video/mp4");
+        res.setHeader("Accept-Ranges", "bytes");
+        if (req.headers["if-match"] && req.headers["if-match"] !== etag) {
+          res.writeHead(412).end();
+          return;
+        }
+        const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? "");
+        const start = range ? Number(range[1]) : 0;
+        const end = range && range[2] ? Math.min(Number(range[2]), bytes.length - 1) : bytes.length - 1;
+        if (start >= bytes.length || end < start) {
+          res.setHeader("Content-Range", `bytes */${bytes.length}`);
+          res.writeHead(416).end();
+          return;
+        }
+        if (range) res.setHeader("Content-Range", `bytes ${start}-${end}/${bytes.length}`);
+        res.setHeader("Content-Length", String(end - start + 1));
+        res.writeHead(range ? 206 : 200).end(req.method === "HEAD" ? undefined : bytes.subarray(start, end + 1));
       } else if (req.url === "/index.m3u8") {
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
         res.end(
@@ -906,6 +938,17 @@ try {
   console.log(
     "PASS: disconnected probe records failure and releases committed grant before lease expiry",
   );
+  const binarySource = await admin.request("/sources", "POST", {
+    name: "Owned HTTP Binary", kind: "http",
+    config: { url: "http://127.0.0.1:18082/fixture.mp4" },
+  });
+  await admin.request(`/sources/${binarySource.id}/test`, "POST");
+  const binaryMedia = sql(`SELECT id FROM media_items WHERE source_id='${binarySource.id}'`);
+  a.ws.send(JSON.stringify({
+    ...command, command_id: randomUUID(), expected_revision: state.revision,
+    media_generation: state.media_generation, type: "CHANGE_MEDIA", payload: { media_id: binaryMedia },
+  }));
+  state = (await a.wait((v) => v.type === "ACK")).state;
   // Controlled probe metadata exercises the real API decision and grant cleanup.
   for (const [format, codec, expected] of [
     ["mov,mp4", "h264", "direct"],
@@ -920,6 +963,7 @@ try {
       ],
     };
     const before = probeCalls;
+    const beforeRequests = mockRequests.length;
     const automatic = await admin.request("/playback-sessions", "POST", {
       room_id: room.id,
       media_generation: state.media_generation,
@@ -927,9 +971,12 @@ try {
     });
     assert.equal(probeCalls, before + 1);
     assert.equal(automatic.delivery_mode, expected);
+    assert.ok(mockRequests.slice(beforeRequests).some((request) => request.path === "/fixture.mp4" && request.method === "GET"), "controlled probe consumes the actual owned Binary source");
+    assert.equal(sql(`SELECT count(*) FROM playback_http_representations WHERE session_id='${automatic.session_id}' AND identity->>'class'='binary' AND identity->'metadata'->>'etag'='"${createHash("sha256").update(bytes).digest("hex")}"'`), "1", "exact grant has one actual strong-validator Binary pin");
     await admin.request(`/playback-sessions/${automatic.session_id}`, "DELETE");
   }
   probeMetadata = undefined;
+  await writeFile(resolve(root, "mock-http-requests.json"), JSON.stringify(mockRequests, null, 2));
   console.log("PASS: remote auto probes and selects direct/remux/transcode");
   for (const kind of ["jellyfin", "emby"]) {
     const source = await admin.request("/sources", "POST", {
@@ -1367,4 +1414,5 @@ try {
   for (const child of children) child.kill();
   await delay(400);
   await database.stop();
+  await writeFile(resolve(root, "mock-http-requests.json"), JSON.stringify(mockRequests, null, 2));
 }
