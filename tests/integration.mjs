@@ -4,7 +4,7 @@ import { libraryScans } from "./library-scans.mjs";
 import { queueCapacity } from "./queue-capacity.mjs";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile, rename } from "node:fs/promises";
 import { resolve } from "node:path";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -27,8 +27,20 @@ const database = isolatedPostgres({ root, name: "integration", password });
 const children = [];
 const origin = "http://127.0.0.1:18080";
 const worker = "http://127.0.0.1:18081";
-const bytes = Buffer.from(Array.from({ length: 2048 }, (_, i) => i % 256));
-await writeFile(resolve(root, "fixture.mp4"), bytes);
+const fixturePath = resolve(root, "fixture.mp4");
+// New local plans probe current owned bytes, including both selectable tracks.
+execFileSync("ffmpeg", [
+  "-v", "error", "-nostdin", "-y",
+  "-f", "lavfi", "-i", "color=c=blue:s=128x72:r=25:d=20",
+  "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=20",
+  "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=20",
+  "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0",
+  "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-threads", "1",
+  "-c:a", "aac", "-b:a", "32k",
+  "-metadata:s:a:0", "language=eng", "-metadata:s:a:1", "language=jpn",
+  "-movflags", "+faststart", fixturePath,
+], { timeout: 30000, stdio: "inherit" });
+const bytes = await readFile(fixturePath);
 const env = {
   ...process.env,
   PLAYBACK_SESSION_LIMIT: "8",
@@ -527,21 +539,18 @@ try {
   const originalMetadata = sql(
     `SELECT metadata FROM media_items WHERE id='${state.media_id}'`,
   );
-  const rotatedMetadata = {
-    format: { format_name: "mov,mp4" },
-    streams: [
-      {
-        index: 0,
-        codec_type: "video",
-        codec_name: "h264",
-        pix_fmt: "yuv420p",
-        side_data_list: [{ side_data_type: "Display Matrix", rotation: 90 }],
-      },
-    ],
-  };
-  sql(
-    `UPDATE media_items SET metadata='${JSON.stringify(rotatedMetadata)}'::jsonb WHERE id='${state.media_id}'`,
-  );
+  const rotatedPath = resolve(root, "rotation-fixture.tmp");
+  execFileSync("ffmpeg", [
+    "-v", "error", "-nostdin", "-y", "-display_rotation:v:0", "90", "-i", fixturePath,
+    "-map", "0", "-c", "copy",
+    "-f", "mp4", rotatedPath,
+  ], { timeout: 30000, stdio: "inherit" });
+  const rotatedMetadata = JSON.parse(execFileSync("ffprobe", [
+    "-v", "error", "-select_streams", "v:0", "-show_streams", "-of", "json", rotatedPath,
+  ], { timeout: 10000, encoding: "utf8" }));
+  assert.ok(rotatedMetadata.streams[0].side_data_list.some((entry) =>
+    entry.side_data_type === "Display Matrix" && entry.rotation === 90));
+  await rename(rotatedPath, fixturePath);
   try {
     for (const [mode, capabilities, expected] of [
       ["auto", null, "direct"],
@@ -572,6 +581,7 @@ try {
       );
     }
   } finally {
+    await writeFile(fixturePath, bytes);
     sql(
       `UPDATE media_items SET metadata='${originalMetadata.replaceAll("'", "''")}'::jsonb WHERE id='${state.media_id}'`,
     );
@@ -613,24 +623,24 @@ try {
     headers: { Range: "bytes=-0" },
   });
   assert.equal(r.status, 416);
-  assert.equal(r.headers.get("content-range"), "bytes */2048");
+  assert.equal(r.headers.get("content-range"), `bytes */${bytes.length}`);
   r = await fetch(worker + plan.playback_url, {
-    headers: { Range: "bytes=9999-" },
+    headers: { Range: `bytes=${bytes.length + 1}-` },
   });
   assert.equal(r.status, 416);
-  assert.equal(r.headers.get("content-range"), "bytes */2048");
+  assert.equal(r.headers.get("content-range"), `bytes */${bytes.length}`);
   assertError(await r.json(), "RANGE_NOT_SATISFIABLE", r);
   r = await fetch(worker + plan.playback_url, {
     method: "HEAD",
-    headers: { Range: "bytes=9999-" },
+    headers: { Range: `bytes=${bytes.length + 1}-` },
   });
   // RFC 9110 Range semantics apply to GET only; HEAD describes the full entity.
   assert.equal(r.status, 200);
   assert.equal(r.headers.get("content-range"), null);
-  assert.equal(r.headers.get("content-length"), "2048");
+  assert.equal(r.headers.get("content-length"), String(bytes.length));
   assert.equal(await r.text(), "");
   r = await fetch(worker + plan.playback_url, { method: "HEAD" });
-  assert.equal(r.headers.get("content-length"), "2048");
+  assert.equal(r.headers.get("content-length"), String(bytes.length));
   await workerAttempts({
     readiness: (status = 200, position) =>
       friend.request(
@@ -905,8 +915,8 @@ try {
     probeMetadata = {
       format: { format_name: format, duration: "20" },
       streams: [
-        { codec_type: "video", codec_name: codec, pix_fmt: "yuv420p" },
-        { codec_type: "audio", codec_name: "aac" },
+        { index: 0, codec_type: "video", codec_name: codec, pix_fmt: "yuv420p", disposition: { attached_pic: 0 } },
+        { index: 1, codec_type: "audio", codec_name: "aac" },
       ],
     };
     const before = probeCalls;

@@ -269,19 +269,37 @@ class RuntimeArtifactTests(unittest.TestCase):
         services = {s: {"image": ids[r], "pull_policy": "never", "volumes": []} for s, r in (("db", "postgres"), ("server", "backend"), ("worker", "backend"), ("web", "web"))}
         services["db"]["volumes"] = [mount("/opt/rainsync/database", "/var/lib/postgresql/data")]
         for s in ("server", "worker"):
-            services[s]["volumes"] = [mount("/opt/rainsync/cache", "/cache")]
+            media = {**mount("/opt/rainsync/media", "/media"), "read_only": True}
+            services[s]["volumes"] = [mount("/opt/rainsync/cache", "/cache"), media]
         services["web"]["ports"] = [{"host_ip": "127.0.0.1", "published": "3080", "target": 80}]
         runtime.validate_compose({"services": services}, ids)
         for edit, message in ((lambda c: c["server"].update(build={"context": "."}), "not build"),
                               (lambda c: c["db"].update(ports=[{"published": "5432"}]), "published"),
                               (lambda c: c["worker"].update(ports=[{"published": "8081"}]), "published"),
                               (lambda c: c["web"]["ports"][0].update(host_ip="0.0.0.0"), "127.0.0.1"),
-                              (lambda c: c["db"]["volumes"][0].update(source="/var/lib/docker/database"), "bind mounts")):
+                              (lambda c: c["db"]["volumes"][0].update(source="/var/lib/docker/database"), "bind mounts"),
+                              (lambda c: c["server"]["volumes"][1].update(read_only=False), "read-only"),
+                              (lambda c: c["worker"]["volumes"][1]["bind"].update(create_host_path=True), "without host creation"),
+                              (lambda c: c["db"]["volumes"][0].update(read_only=True), "writable")):
             changed = copy.deepcopy(services)
             edit(changed)
             with self.assertRaisesRegex(ValueError, message):
                 runtime.validate_compose({"services": changed}, ids)
+        normalized = copy.deepcopy(services)
+        for service in ("db", "server", "worker"):
+            for volume in normalized[service]["volumes"]:
+                volume["bind"].pop("create_host_path")
+        runtime.validate_compose({"services": normalized}, ids, compose_version="2.38.2")
+        for version in (None, "2.38.3", "2.99.0"):
+            with self.assertRaisesRegex(ValueError, "without host creation"):
+                runtime.validate_compose({"services": normalized}, ids, compose_version=version)
+        for forbidden in (True, None, "false", 0):
+            changed = copy.deepcopy(normalized)
+            changed["db"]["volumes"][0]["bind"]["create_host_path"] = forbidden
+            with self.assertRaisesRegex(ValueError, "without host creation"):
+                runtime.validate_compose({"services": changed}, ids, compose_version="2.38.2")
         override = (ROOT / "deploy/imported-images.override.yaml").read_text()
+        self.assertEqual(override.count("create_host_path: false"), 5)
         self.assertEqual(override.count("build: !reset null"), 3)
         self.assertEqual(override.count("pull_policy: never"), 4)
         self.assertNotIn("ports:", override)

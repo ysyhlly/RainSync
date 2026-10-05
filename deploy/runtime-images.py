@@ -272,7 +272,7 @@ ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,heigh
     return checks
 
 
-def validate_compose(config, image_ids):
+def validate_compose(config, image_ids, *, compose_version=None):
     services = config["services"]
     require(set(services) == {"db", "server", "worker", "web"}, "unexpected Compose services")
     for service, role in (("db", "postgres"), ("server", "backend"), ("worker", "backend"), ("web", "web")):
@@ -282,9 +282,20 @@ def validate_compose(config, image_ids):
         require(not value.get("ports") if service != "web" else len(value["ports"]) == 1, "unexpected published service port")
     port = services["web"]["ports"][0]
     require(port.get("host_ip") == "127.0.0.1" and str(port["published"]) == "3080" and port["target"] == 80 and port.get("protocol", "tcp") == "tcp", "web must publish only 127.0.0.1:3080:80")
+    # Compose 2.38.2 uses compose-go 2.7.1's bool/json:omitempty model:
+    # explicit create_host_path:false serializes as bind:{}. Its runtime
+    # CreateMountpoint remains false. New OptOut models omit true instead,
+    # so unknown versions must retain the explicit-false requirement.
+    legacy_false_omitted = compose_version in ("2.38.2", "v2.38.2")
+    def no_host_creation(mount):
+        bind = mount.get("bind")
+        return isinstance(bind, dict) and bind.get("create_host_path", False if legacy_false_omitted else None) is False
     for service, target in (("db", "/var/lib/postgresql/data"), ("server", "/cache"), ("worker", "/cache")):
         mounts = [v for v in services[service]["volumes"] if v["target"] == target]
-        require(len(mounts) == 1 and mounts[0]["type"] == "bind" and mounts[0]["source"].startswith("/opt/rainsync/") and ".." not in PurePosixPath(mounts[0]["source"]).parts and mounts[0].get("bind", {}).get("create_host_path") is False, "database/cache must use prepared /opt/rainsync bind mounts")
+        require(len(mounts) == 1 and mounts[0]["type"] == "bind" and mounts[0]["source"].startswith("/opt/rainsync/") and ".." not in PurePosixPath(mounts[0]["source"]).parts and mounts[0].get("read_only", False) is False and no_host_creation(mounts[0]), "database/cache must use prepared writable /opt/rainsync bind mounts without host creation: " + service)
+    for service in ("server", "worker"):
+        mounts = [v for v in services[service]["volumes"] if v["target"] == "/media"]
+        require(len(mounts) == 1 and mounts[0]["type"] == "bind" and PurePosixPath(mounts[0]["source"]).is_absolute() and ".." not in PurePosixPath(mounts[0]["source"]).parts and mounts[0].get("read_only") is True and no_host_creation(mounts[0]), "media must use prepared read-only bind mounts without host creation: " + service)
     require(next(v["source"] for v in services["server"]["volumes"] if v["target"] == "/cache") == next(v["source"] for v in services["worker"]["volumes"] if v["target"] == "/cache"), "Server/Worker cache must match")
 
 
@@ -310,7 +321,9 @@ def package(directory, source):
     # config is read-only, with no real environment file or credentials.
     env = {k: v for k, v in env.items() if not k.startswith("DOCKER_")}
     config = subprocess.check_output(["docker", "--host", "unix:///var/run/docker.sock", "compose", "-p", "rainsync-artifact-validation", "-f", "compose.yaml", "-f", "deploy/imported-images.override.yaml", "-f", "deploy/loopback.override.yaml", "config", "--format", "json"], env=env, text=True, timeout=30)
-    validate_compose(read_json(config), ids)
+    compose_version = docker(["compose", "version", "--short"]).strip()
+    print("Qualifying Compose bind normalization for version " + compose_version, file=sys.stderr)
+    validate_compose(read_json(config), ids, compose_version=compose_version)
     directory.mkdir(parents=True)
     path, count = directory / ARCHIVE_NAME, 0
     command = ["docker", "--host", "unix:///var/run/docker.sock", "image", "save", *tags(source).values()]
