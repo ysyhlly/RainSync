@@ -116,12 +116,19 @@ pub async fn acknowledge_with_reader(
     owner: Uuid,
     reader: DeliveryReader,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut connection = pool.acquire().await?;
+    // A cancelled receipt query must not monopolize a shared pool slot while
+    // its trigger waits for revoked authority. The original owner retries.
+    connection.close_on_drop();
+    let mut tx = connection.begin().await?;
+    sqlx::query("SELECT set_config('lock_timeout','750ms',true),set_config('statement_timeout','1500ms',true)")
+        .execute(&mut *tx).await?;
     reader.configure(&mut tx).await?;
     let changed = sqlx::query("UPDATE media_executions SET reaped_at=COALESCE(reaped_at,clock_timestamp()) WHERE id=$1 AND owner_id=$2")
         .bind(id).bind(owner).execute(&mut *tx).await?.rows_affected();
     anyhow::ensure!(changed == 1, "delivery_disposal_ack_unconfirmed");
     tx.commit().await?;
+    connection.return_to_pool().await;
     Ok(())
 }
 

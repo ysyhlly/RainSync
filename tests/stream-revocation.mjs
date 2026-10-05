@@ -390,9 +390,11 @@ await isolatedMediaStack("stream-revocation", async (f) => {
     if (!selected || selected === poolLabel) {
       const room = await admin.request("/rooms", "POST", { name: poolLabel });
       const streams = [];
+      const sessions = [];
       for (let i = 0; i < 12; i++) {
         const id = randomUUID(),
           token = randomBytes(32).toString("hex");
+        sessions.push(id);
         const resource = { kind: "local", root: f.root, resource: "long.mp4" };
         withPlaybackAdmission(
           f,
@@ -411,6 +413,9 @@ await isolatedMediaStack("stream-revocation", async (f) => {
         `${poolLabel}: all headers`,
       );
       for (const state of streams) assert.equal(state.response.statusCode, 200);
+      const sessionList = sessions.map((id) => `'${id}'`).join(",");
+      const receiptOwners = () => f.sql(`SELECT COALESCE(jsonb_agg(jsonb_build_array(id,owner_id) ORDER BY id),'[]'::jsonb) FROM media_executions WHERE kind='delivery' AND session_id IN (${sessionList})`);
+      const originalOwners = receiptOwners();
       await delay(250);
       const began = Date.now();
       const lock = f.sqlProcess(
@@ -486,14 +491,25 @@ await isolatedMediaStack("stream-revocation", async (f) => {
         "1",
         "unrelated pool request completes before the playback lock releases",
       );
+      assert.equal(
+        f.sql(`SELECT count(*) FROM media_executions WHERE kind='delivery' AND session_id IN (${sessionList}) AND reaped_at IS NULL`),
+        String(streams.length),
+        "blocked receipts retain unresolved ownership while pool slots recover",
+      );
       for (const state of streams) state.request.destroy();
       await lock.done;
+      await until(
+        () => f.sql(`SELECT count(*) FROM media_executions WHERE kind='delivery' AND session_id IN (${sessionList}) AND reaped_at>=created_at AND reaped_at<=clock_timestamp()`) === String(streams.length),
+        `${poolLabel}: original owners retry and positively acknowledge`,
+      );
+      assert.equal(receiptOwners(), originalOwners, "receipt retries retain the same original owners");
       cases.push({
         scenario: poolLabel,
         stream_count: streams.length,
         blocked_authorization_checks: blockedChecks,
         response_aborted_ms: abortedMs,
         unrelated_pool_request_ms: recoveryMs,
+        positively_acknowledged_original_receipts: streams.length,
       });
       console.log(
         `PASS ${poolLabel}: aborted=${abortedMs}ms; pool request=${recoveryMs}ms`,
