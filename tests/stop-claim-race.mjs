@@ -119,6 +119,13 @@ try {
         INSERT INTO playback_observations(session_id,user_id,room_id,media_id,generation,timeline_origin_ms,duration_ms)
         VALUES('${id}','${identity.id}','${room.id}','${media}',1,1000,10000);
         INSERT INTO media_jobs(id,session_id,status,spec) VALUES('${id}','${id}','queued','{}')`);
+        const executionGateKey = 73564921;
+        // A table lock also blocks output guards and prior-output cleanup.
+        // Hold only this claim's actual receipt insert after it owns the job.
+        f.sql(`CREATE FUNCTION hold_test_claim_execution() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+          IF NEW.job_id='${id}' THEN PERFORM pg_advisory_xact_lock(${executionGateKey}); END IF;
+          RETURN NEW; END $$;
+          CREATE TRIGGER hold_test_claim_execution BEFORE INSERT ON media_executions FOR EACH ROW EXECUTE FUNCTION hold_test_claim_execution()`);
         const gateName = `stop-claim-gate-${id}`;
         const gate = f.sqlProcess(undefined, { interactive: true });
         let child, childDone, stopDone, observationDone;
@@ -126,14 +133,14 @@ try {
           stderr = [];
         try {
           gate.stdin.write(
-            `SET application_name='${gateName}'; BEGIN; LOCK TABLE media_executions IN ACCESS EXCLUSIVE MODE;\n`,
+            `SET application_name='${gateName}'; BEGIN; SELECT pg_advisory_xact_lock(${executionGateKey});\n`,
           );
           await until(
             () =>
               f.sql(
                 `SELECT count(*) FROM pg_stat_activity WHERE application_name='${gateName}' AND state='idle in transaction'`,
               ) === "1",
-            "execution gate owns table",
+            "execution insert gate is held",
           );
           child = spawn(driver, [], {
             env: { ...f.env, RAINSYNC_ISOLATED_TEST: "1" },
@@ -278,6 +285,7 @@ try {
           await Promise.allSettled(
             [gate.done, childDone, stopDone, observationDone].filter(Boolean),
           );
+          f.sql("DROP TRIGGER hold_test_claim_execution ON media_executions; DROP FUNCTION hold_test_claim_execution()");
           if (missingMembership)
             f.sql(
               `INSERT INTO room_members(room_id,user_id) VALUES('${room.id}','${identity.id}') ON CONFLICT DO NOTHING`,
