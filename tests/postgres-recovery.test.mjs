@@ -263,7 +263,7 @@ test(
 );
 
 test(
-  "frozen RainSync 1-43 schema checksums survive an isolated empty-database recovery",
+  "frozen RainSync 1-78 schema checksums survive an isolated empty-database recovery",
   {
     skip: !process.env.RAINSYNC_NATIVE_POSTGRES_BIN
       ? "set RAINSYNC_NATIVE_POSTGRES_BIN for isolated PostgreSQL"
@@ -280,7 +280,7 @@ test(
       schema_version: 1,
       result: "failed",
       scope:
-        "fresh empty RainSync schema from frozen 1-43 files; not a real old production database or app acceptance",
+        "fresh empty RainSync schema from frozen 1-78 files (77 migrations, version 63 absent); not a real old production database or app acceptance",
       started_at: new Date().toISOString(),
     };
     try {
@@ -294,8 +294,15 @@ test(
         .sort();
       assert.equal(
         migrations.length,
-        43,
+        77,
         "test must explicitly track controller migration baseline",
+      );
+      assert.deepEqual(
+        migrations.map((name) => Number(name.split("_")[0])),
+        Array.from({ length: 78 }, (_, index) => index + 1).filter(
+          (version) => version !== 63,
+        ),
+        "test must explicitly track the frozen migration version set",
       );
       for (const name of migrations) {
         const sql = await readFile(resolve(directory, name), "utf8");
@@ -308,7 +315,7 @@ test(
       const baseline = await preflight(fixture.url, {
         migrationsDirectory: directory,
       });
-      assert.equal(baseline.migrations.at(-1).version, 43);
+      assert.equal(baseline.migrations.at(-1).version, 78);
       assert.deepEqual(baseline.candidate_migrations.pending_versions, []);
       await writeFile(keyFile, randomBytes(32), { mode: 0o600, flag: "wx" });
       const backupDirectory = resolve(root, "backup");
