@@ -709,7 +709,7 @@ fn upstream_failure_class(error: &providers::platform::bilibili::Error) -> &'sta
     use providers::platform::bilibili::Error as Upstream;
     // A closed, low-cardinality vocabulary, not upstream text or a secret URL.
     match error {
-        Upstream::InvalidResponse("qr_url") => "qr_url_invalid",
+        Upstream::InvalidResponse("qr_url") | Upstream::InvalidQrUrl(_) => "qr_url_invalid",
         Upstream::InvalidResponse("qr_key") => "qr_key_invalid",
         Upstream::InvalidResponse("qr_binding") => "qr_binding_invalid",
         Upstream::InvalidResponse("qr_state") => "qr_state_invalid",
@@ -728,12 +728,27 @@ fn upstream_failure_class(error: &providers::platform::bilibili::Error) -> &'sta
 }
 
 fn upstream_error(operation: &'static str, error: providers::platform::bilibili::Error) -> Error {
-    tracing::warn!(
-        event = "platform_login_upstream_failed",
-        provider = PROVIDER,
-        operation,
-        failure_class = upstream_failure_class(&error),
-    );
+    if let providers::platform::bilibili::Error::InvalidQrUrl(shape) = &error {
+        tracing::warn!(
+            event = "platform_login_upstream_failed",
+            provider = PROVIDER,
+            operation,
+            failure_class = upstream_failure_class(&error),
+            qr_url_scheme = ?shape.scheme,
+            qr_url_host = ?shape.host,
+            qr_url_path = ?shape.path,
+            qr_url_has_port = shape.has_port,
+            qr_url_has_credentials = shape.has_credentials,
+            qr_url_has_fragment = shape.has_fragment,
+        );
+    } else {
+        tracing::warn!(
+            event = "platform_login_upstream_failed",
+            provider = PROVIDER,
+            operation,
+            failure_class = upstream_failure_class(&error),
+        );
+    }
     // Never format provider errors, body, URL, Cookie or key into public errors.
     err(StatusCode::BAD_GATEWAY, "platform_login_upstream_failed")
 }
@@ -1376,8 +1391,20 @@ mod tests {
     #[test]
     fn qr_upstream_diagnostics_are_closed_and_never_include_provider_values() {
         use providers::platform::bilibili::Error as Upstream;
+        use providers::platform::bilibili::{QrUrlHost, QrUrlPath, QrUrlRejection, QrUrlScheme};
         for (error, expected) in [
             (Upstream::InvalidResponse("qr_url"), "qr_url_invalid"),
+            (
+                Upstream::InvalidQrUrl(QrUrlRejection {
+                    scheme: QrUrlScheme::Https,
+                    host: QrUrlHost::Passport,
+                    path: QrUrlPath::Other,
+                    has_port: false,
+                    has_credentials: false,
+                    has_fragment: false,
+                }),
+                "qr_url_invalid",
+            ),
             (
                 Upstream::InvalidResponse("qr_binding"),
                 "qr_binding_invalid",

@@ -56,6 +56,7 @@ const USER_AGENT: &str = "RainSync/0.1 (+server-side authorized media adapter)";
 pub enum Error {
     InvalidResource,
     InvalidResponse(&'static str),
+    InvalidQrUrl(QrUrlRejection),
     InvalidJson,
     Restricted(&'static str),
     Api(i64),
@@ -70,6 +71,7 @@ impl fmt::Display for Error {
         match self {
             Self::InvalidResource => f.write_str("bilibili_invalid_resource"),
             Self::InvalidResponse(reason) => write!(f, "bilibili_invalid_response:{reason}"),
+            Self::InvalidQrUrl(_) => f.write_str("bilibili_invalid_response:qr_url"),
             Self::InvalidJson => f.write_str("bilibili_invalid_json"),
             Self::Restricted(reason) => write!(f, "bilibili_restricted:{reason}"),
             Self::Api(code) => write!(f, "bilibili_api:{code}"),
@@ -1406,6 +1408,81 @@ fn deny_restrictions(value: &Value) -> Result<()> {
     walk(value)
 }
 
+/// Closed diagnostic categories only. These must never retain the rejected
+/// URL, its query, QR key, user information or arbitrary provider strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QrUrlScheme {
+    Https,
+    Http,
+    Other,
+    Unparsed,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QrUrlHost {
+    Passport,
+    OtherBilibili,
+    Other,
+    Missing,
+    Unparsed,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QrUrlPath {
+    Login,
+    LoginScan,
+    LegacyQrLogin,
+    OtherPassport,
+    Other,
+    Unparsed,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QrUrlRejection {
+    pub scheme: QrUrlScheme,
+    pub host: QrUrlHost,
+    pub path: QrUrlPath,
+    pub has_port: bool,
+    pub has_credentials: bool,
+    pub has_fragment: bool,
+}
+impl QrUrlRejection {
+    fn unparsed() -> Self {
+        Self {
+            scheme: QrUrlScheme::Unparsed,
+            host: QrUrlHost::Unparsed,
+            path: QrUrlPath::Unparsed,
+            has_port: false,
+            has_credentials: false,
+            has_fragment: false,
+        }
+    }
+    fn from_url(url: &Url) -> Self {
+        Self {
+            scheme: match url.scheme() {
+                "https" => QrUrlScheme::Https,
+                "http" => QrUrlScheme::Http,
+                _ => QrUrlScheme::Other,
+            },
+            host: match url.host_str() {
+                Some("passport.bilibili.com") => QrUrlHost::Passport,
+                Some(host) if host == "bilibili.com" || host.ends_with(".bilibili.com") => {
+                    QrUrlHost::OtherBilibili
+                }
+                Some(_) => QrUrlHost::Other,
+                None => QrUrlHost::Missing,
+            },
+            path: match url.path() {
+                "/h5-app/passport/login" => QrUrlPath::Login,
+                "/h5-app/passport/login/scan" => QrUrlPath::LoginScan,
+                "/qrcode/h5/login" => QrUrlPath::LegacyQrLogin,
+                path if path.starts_with("/h5-app/passport/") => QrUrlPath::OtherPassport,
+                _ => QrUrlPath::Other,
+            },
+            has_port: url.port().is_some(),
+            has_credentials: !url.username().is_empty() || url.password().is_some(),
+            has_fragment: url.fragment().is_some(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct QrKey(String);
 impl fmt::Debug for QrKey {
@@ -1466,7 +1543,8 @@ pub fn parse_qr_generate_response(bytes: &[u8]) -> Result<QrChallenge> {
     check_code(&value)?;
     let data = object(field(&value, "data")?)?;
     let login_url = text(field(data, "url")?, 4096)?.to_owned();
-    let url = Url::parse(&login_url).map_err(|_| Error::InvalidResponse("qr_url"))?;
+    let url =
+        Url::parse(&login_url).map_err(|_| Error::InvalidQrUrl(QrUrlRejection::unparsed()))?;
     if url.scheme() != "https"
         || url.host_str() != Some("passport.bilibili.com")
         || url.port().is_some()
@@ -1478,7 +1556,7 @@ pub fn parse_qr_generate_response(bytes: &[u8]) -> Result<QrChallenge> {
             "/h5-app/passport/login" | "/h5-app/passport/login/scan"
         )
     {
-        return Err(Error::InvalidResponse("qr_url"));
+        return Err(Error::InvalidQrUrl(QrUrlRejection::from_url(&url)));
     }
     let key = QrKey::from_secret(text(field(data, "qrcode_key")?, 128)?)?;
     // The current web endpoint returns /login/scan?qrcode_key=.... Preserve

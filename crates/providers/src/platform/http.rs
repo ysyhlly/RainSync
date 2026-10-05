@@ -292,6 +292,7 @@ fn short_video_error(error: bilibili::Error) -> short_video::Error {
     match error {
         bilibili::Error::InvalidResource => short_video::Error::InvalidResource,
         bilibili::Error::InvalidResponse(reason) => short_video::Error::InvalidResponse(reason),
+        bilibili::Error::InvalidQrUrl(_) => short_video::Error::InvalidResponse("qr_url"),
         bilibili::Error::InvalidJson => short_video::Error::InvalidJson,
         bilibili::Error::Restricted(reason) => short_video::Error::Restricted(reason),
         bilibili::Error::Api(code) => short_video::Error::Api(code),

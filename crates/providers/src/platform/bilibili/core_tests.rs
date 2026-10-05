@@ -496,6 +496,125 @@ fn bilibili_core_current_qr_scan_url_binds_exactly_one_poll_key() {
     }
 }
 
+#[test]
+fn bilibili_core_qr_url_rejections_retain_only_closed_non_secret_shape() {
+    let key = "synthetic-qr-private-capability-0123456789";
+    let safe = QrUrlRejection {
+        scheme: QrUrlScheme::Https,
+        host: QrUrlHost::Passport,
+        path: QrUrlPath::LoginScan,
+        has_port: false,
+        has_credentials: false,
+        has_fragment: false,
+    };
+    let cases = [
+        (
+            format!("http://passport.bilibili.com/h5-app/passport/login/scan?qrcode_key={key}"),
+            QrUrlRejection {
+                scheme: QrUrlScheme::Http,
+                ..safe
+            },
+        ),
+        (
+            format!("https://www.bilibili.com/h5-app/passport/login/scan?qrcode_key={key}"),
+            QrUrlRejection {
+                host: QrUrlHost::OtherBilibili,
+                ..safe
+            },
+        ),
+        (
+            format!(
+                "https://synthetic-private-host.invalid/h5-app/passport/login/scan?qrcode_key={key}"
+            ),
+            QrUrlRejection {
+                host: QrUrlHost::Other,
+                ..safe
+            },
+        ),
+        (
+            format!("https://passport.bilibili.com/qrcode/h5/login?oauthKey={key}"),
+            QrUrlRejection {
+                path: QrUrlPath::LegacyQrLogin,
+                ..safe
+            },
+        ),
+        (
+            format!(
+                "https://passport.bilibili.com/h5-app/passport/synthetic-private-path?qrcode_key={key}"
+            ),
+            QrUrlRejection {
+                path: QrUrlPath::OtherPassport,
+                ..safe
+            },
+        ),
+        (
+            format!("https://passport.bilibili.com/synthetic-private-path?qrcode_key={key}"),
+            QrUrlRejection {
+                path: QrUrlPath::Other,
+                ..safe
+            },
+        ),
+        (
+            format!(
+                "https://passport.bilibili.com:444/h5-app/passport/login/scan?qrcode_key={key}"
+            ),
+            QrUrlRejection {
+                has_port: true,
+                ..safe
+            },
+        ),
+        (
+            format!(
+                "https://synthetic-user:synthetic-password@passport.bilibili.com/h5-app/passport/login/scan?qrcode_key={key}#synthetic-fragment"
+            ),
+            QrUrlRejection {
+                has_credentials: true,
+                has_fragment: true,
+                ..safe
+            },
+        ),
+        (
+            "https://[synthetic-private-malformed".to_owned(),
+            QrUrlRejection::unparsed(),
+        ),
+    ];
+    for (url, expected) in cases {
+        let body = bytes(json!({"code":0,"data":{"url":url,"qrcode_key":key}}));
+        let error = parse_qr_generate_response(&body).unwrap_err();
+        assert_eq!(error, Error::InvalidQrUrl(expected));
+        assert_eq!(error.to_string(), "bilibili_invalid_response:qr_url");
+        let diagnostic = format!("{error:?}");
+        for secret in [
+            key,
+            "synthetic-user",
+            "synthetic-password",
+            "synthetic-fragment",
+            "synthetic-private",
+            "https://",
+            "qrcode_key",
+            "oauthKey",
+        ] {
+            assert!(!diagnostic.contains(secret));
+        }
+    }
+    // Existing acceptance and binding checks are unchanged by diagnostics.
+    let url = format!("https://passport.bilibili.com/h5-app/passport/login/scan?qrcode_key={key}");
+    assert!(
+        parse_qr_generate_response(&bytes(
+            json!({"code":0,"data":{"url":url,"qrcode_key":key}})
+        ))
+        .is_ok()
+    );
+    let conflicting = format!("{url}&oauthKey={key}");
+    assert_eq!(
+        parse_qr_generate_response(&bytes(
+            json!({"code":0,"data":{"url":conflicting,"qrcode_key":key}})
+        ))
+        .unwrap_err(),
+        Error::InvalidResponse("qr_binding"),
+    );
+}
+
 #[derive(Clone)]
 struct FixtureTransport {
     responses: Arc<StdMutex<FixtureResponses>>,
