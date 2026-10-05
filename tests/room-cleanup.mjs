@@ -13,14 +13,22 @@ async function until(check, description, timeout = 30000) {
   while (Date.now() < end) { if (await check()) return; await delay(50); }
   throw Error(`deadline: ${description}`);
 }
-async function childrenOf(parent) {
+async function childrenOf(parent, job) {
   const children=[];
   for (const pid of await readdir("/proc")) {
     if (!/^\d+$/.test(pid)) continue;
     try {
       const stat=await readFile(`/proc/${pid}/stat`,"utf8");
       const fields=stat.slice(stat.lastIndexOf(")")+2).split(" ");
-      if (Number(fields[1])===parent) children.push(Number(pid));
+      if (Number(fields[1])!==parent) continue;
+      const args=(await readFile(`/proc/${pid}/cmdline`,"utf8")).split("\0");
+      const owned=args.some(argument=>{
+        let path=argument;
+        try { path=new URL(argument).pathname; } catch {}
+        return path.split(/[\\/]/).includes(job);
+      });
+      // Readiness tool children are unrelated to this job's resource custody.
+      if (owned) children.push(Number(pid));
     } catch {}
   }
   return children;
@@ -148,7 +156,7 @@ await isolatedMediaStack("room-cleanup", async f => {
     const token=seed(job,local.id,{kind:"http",url:`${remote}/source`,headers:{},transport:"progressive"});
     f.sql(`INSERT INTO media_jobs(id,session_id,status,spec) VALUES('${job}','${job}','queued',${quote(JSON.stringify({input_ticket:encrypt({token}),transcode:true,start_seconds:0,estimated_output_bytes:65536}))})`);
     await until(()=>sourceRequests>0,"actual FFmpeg waiting on HTTP source");
-    const processes=await childrenOf(f.workerPid);
+    const processes=await childrenOf(f.workerPid,job);
     assert.ok(processes.length>0,"real FFmpeg child must exist");
     assert.equal(f.sql(`SELECT count(*) FROM media_executions WHERE job_id='${job}' AND reaped_at IS NULL`),"1");
     process.kill(f.workerPid,"SIGSTOP"); paused=true;
