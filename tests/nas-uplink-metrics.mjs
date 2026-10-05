@@ -559,11 +559,27 @@ async function lock(f, statement) {
   child.stdout.on("data", (bytes) => {
     output += bytes;
   });
-  child.stdin.write(
-    `BEGIN; SET application_name=${quote(marker)}; ${statement}; SELECT ${quote(marker)};\n`,
+  const query = async (statement, timeout = 250) => {
+    const complete = `nas_metrics_step_${randomUUID().replaceAll("-", "")}`;
+    const start = output.length;
+    child.stdin.write(
+      `SELECT pg_stat_clear_snapshot(); ${statement}; SELECT ${quote(complete)};\n`,
+    );
+    await until(
+      () => output.slice(start).includes(complete),
+      "Owned lock session statement",
+      timeout,
+      5,
+    );
+    return output.slice(start).split(complete)[0].trim().split("\n").at(-1);
+  };
+  await query(
+    `BEGIN; SET application_name=${quote(marker)}; ${statement}`,
+    10000,
   );
-  await until(() => output.includes(marker), "Owned Agent row lock");
   return {
+    marker,
+    query,
     async finish(commit = true) {
       if (child.exitCode !== null) return child.done;
       child.stdin.end(`${commit ? "COMMIT" : "ROLLBACK"};\n`);
@@ -1508,33 +1524,72 @@ try {
             before = await scrape();
           await delay(1050);
           const replacement = randomBytes(32).toString("hex");
-          // Hold the row just after the ordinary 250ms liveness update. Otherwise
-          // that ordinary branch could block before it ever reads our heartbeat.
-          const seen = f.sql(
-            `SELECT last_seen::text FROM agents WHERE id=${quote(identity.id)}`,
-          );
-          await until(
-            () =>
-              f.sql(
-                `SELECT last_seen::text FROM agents WHERE id=${quote(identity.id)}`,
-              ) !== seen,
-            "Ordinary Agent tick leaves room for receiver dispatch",
-            2000,
-            5,
-          );
-          const held = await lock(
-            f,
-            mode === "token"
-              ? `UPDATE agents SET token_hash=${quote(digest(replacement))} WHERE id=${quote(identity.id)}`
-              : `SELECT id FROM agents WHERE id=${quote(identity.id)} FOR UPDATE`,
-          );
-          let newer, invalidation;
+          // Start owned SQL sessions before the ordinary liveness window.
+          const held = await lock(f, "SELECT 1");
+          let handoff, handoffReady, newer, invalidation;
           try {
-            peer.send(packet(peer.connection, 1, completedTotals(77)));
+            if (mode === "connection")
+              handoff = await lock(
+                f,
+                "LOCK TABLE agent_transfer_runs IN SHARE MODE; SAVEPOINT connection_handoff",
+              );
+            const seen = await held.query(
+              `SELECT last_seen::text FROM agents WHERE id=${quote(identity.id)}`,
+            );
             await until(
-              () =>
+              async () =>
+                (await held.query(
+                  `SELECT last_seen::text FROM agents WHERE id=${quote(identity.id)}`,
+                )) !== seen,
+              "Ordinary Agent tick leaves room for receiver dispatch",
+              2000,
+              5,
+            );
+            await held.query(
+              mode === "token"
+                ? `UPDATE agents SET token_hash=${quote(digest(replacement))} WHERE id=${quote(identity.id)}`
+                : `SELECT id FROM agents WHERE id=${quote(identity.id)} FOR UPDATE`,
+            );
+            if (mode === "connection") {
+              newer = await connect(
+                f.origin.replace("http:", "ws:") + "/api/v1/agents/ws",
+                { Authorization: `Bearer ${identity.token}` },
+              );
+              await until(
+                async () =>
+                  Number(
+                    await held.query(
+                      "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='UPDATE agents SET advanced_assets_version=0,advanced_assets_connection=$2 WHERE id=$1 AND NOT revoked'",
+                    ),
+                  ) === 1,
+                "Replacement initialization queued first",
+                250,
+                5,
+              );
+              handoffReady = handoff.query(
+                `SELECT id FROM agents WHERE id=${quote(identity.id)} FOR UPDATE`,
+                10000,
+              );
+              handoffReady.catch(() => {});
+              await until(
+                async () =>
+                  Number(
+                    await held.query(
+                      `SELECT count(*) FROM pg_stat_activity WHERE application_name=${quote(handoff.marker)} AND wait_event_type='Lock'`,
+                    ),
+                  ) === 1,
+                "Owned row handoff queued second",
+                250,
+                5,
+              );
+            }
+            peer.send(packet(peer.connection, 1, completedTotals(77)));
+            if (mode === "connection")
+              peer.send({ type: "TRANSFER_DRAINED", id: randomUUID() });
+            await until(
+              async () =>
                 Number(
-                  f.sql(
+                  await held.query(
                     "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='SELECT id FROM agents WHERE id=$1 AND token_hash=$2 AND NOT revoked FOR SHARE'",
                   ),
                 ) > 0,
@@ -1542,15 +1597,39 @@ try {
               250,
               5,
             );
-            if (mode === "connection") {
-              newer = await connect(
-                f.origin.replace("http:", "ws:") + "/api/v1/agents/ws",
-                { Authorization: `Bearer ${identity.token}` },
+            if (mode === "connection")
+              await until(
+                async () =>
+                  Number(
+                    await held.query(
+                      "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='UPDATE agent_transfer_runs SET agent_drained_at=COALESCE(agent_drained_at,clock_timestamp()) WHERE id=$1 AND agent_id=$2 AND dispatched_at IS NOT NULL'",
+                    ),
+                  ) === 1,
+                "Old socket task owns its queued receiver",
+                250,
+                5,
               );
-              // Registry replacement happens on ordinary upgrade, before HELLO.
-              await delay(20);
-            }
             await held.finish();
+            if (mode === "connection") {
+              await handoffReady;
+              await until(
+                async () => {
+                  const row = (await admin.request("/agents")).find(
+                    (row) => row.id === identity.id,
+                  );
+                  return row?.connected === true && row.drain_receipts === null;
+                },
+                "Replacement registry positively installed",
+                250,
+                5,
+              );
+              assert.equal(
+                peer.record.closed,
+                false,
+                "Old receiver remains owned through post-wait identity check",
+              );
+              await handoff.query("ROLLBACK TO SAVEPOINT connection_handoff");
+            }
             await until(async () => {
               const rows = await scrape();
               assert.equal(
@@ -1573,14 +1652,15 @@ try {
               ) {
                 invalidation = "post_wait_connection_rejected";
                 return true;
-              } else if (peer.record.closed) {
-                // Replacing Control also drops the old scan sender: the old
-                // socket can abort its owned task before its final row check.
-                invalidation = "old_socket_closed_owned_task_cancelled";
-                return true;
               }
               return false;
             }, "Explicit queued-report invalidation rather than timeout");
+            if (mode === "connection")
+              assert.equal(
+                peer.record.closed,
+                false,
+                "Stale identity rejected before old socket cancellation",
+              );
             await stable(before, 1200);
             assert.equal(
               metric(await scrape(), "dropped_total", {
@@ -1589,7 +1669,7 @@ try {
               metric(before, "dropped_total", { reason: "unavailable" }),
             );
           } finally {
-            await held.finish(false);
+            await Promise.all([held.finish(false), handoff?.finish(false)]);
           }
           if (newer) await newer.close();
           if (!peer.record.closed) await peer.close();
