@@ -394,6 +394,13 @@ export function createPlaybackRuntime(ctx: {
   const recoveryState = ref<PlaybackRecoveryState>("idle");
   const preparation = ref<PlaybackPreparationState>({ phase: "idle" });
   function failLocalPlayback(message: string, code?: string, notice = message) {
+    // A terminal transport/decoder failure owns its error. Loading deadlines
+    // must not replace it after the SDK has already detached the source.
+    // Deadline failures retain their existing late-data/gesture recovery.
+    if (code !== "MEDIA_DATA_TIMEOUT" && code !== "FIRST_FRAME_TIMEOUT") {
+      firstFrameDeadline?.stop();
+      mediaDataLoad?.stop();
+    }
     preparation.value = {
       ...preparation.value,
       phase: "failed",

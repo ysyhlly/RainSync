@@ -35,6 +35,13 @@ python3 deploy/runtime-images.py verify --source "$EXPECTED_SOURCE_SHA" --direct
 `compose.yaml`、`deploy/imported-images.override.yaml`、`deploy/loopback.override.yaml`。
 导入配置禁止自动构建和拉取镜像。`RAINSYNC_LOOPBACK_PORT` 控制本机回环端口；公网代理与 TLS 需单独配置。
 
+使用 Nginx 作为公网代理时，在转发 RainSync 的 `location` 中包含
+`deploy/nginx-playback.inc.conf`（使用发布目录的绝对路径）。该配置关闭继承的代理缓存，
+并保留 `Range`、`If-Range` 请求头。Nginx 启用代理缓存时默认移除这些请求头，
+即使上游返回 `Cache-Control: no-store`，DASH 索引请求也可能收到整个视频并导致黑屏。
+上线时应通过公网入口验证非零字节范围返回 `206`、正确的 `Content-Range` 和对应长度的响应体。
+参见 [Nginx 请求头转发说明](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header)。
+
 启动该项目的数据库后，在安装负责人自己的交互式终端中运行同一组 Compose 选择器的
 `run --rm --no-deps server rainsync-server init-admin --username NAME`，再启动 Server、Worker、Web。
 负责人亲自输入并提交两次密码；不要把密码放入环境变量、命令、管道或日志。

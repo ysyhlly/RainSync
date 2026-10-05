@@ -1016,6 +1016,29 @@ it("YouTube DASH decode failure stays on the dedicated session without generic f
     f.cleanup();
   }
 });
+it.each(["bilibili", "youtube"] as const)(
+  "%s DASH failure is not replaced by a later media or first-frame deadline",
+  async (provider) => {
+    const f = setup({ provider });
+    try {
+      f.state.value.playback_status = "playing";
+      await f.runtime.loadMedia();
+      dashboards[0].options.onError({
+        message: "DASH 媒体加载或解码失败，请重新加载",
+        code: "DASH_PLAYBACK_ERROR",
+      });
+      await vi.advanceTimersByTimeAsync(21000);
+      expect(f.runtime.preparation.value.failure?.code).toBe(
+        "DASH_PLAYBACK_ERROR",
+      );
+      expect(f.error.value).toBe("DASH 媒体加载或解码失败，请重新加载");
+      expect(f.runtime.waiting.value).toBe(false);
+      expect(f.bodies).toHaveLength(1);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 it.each(["douyin", "tiktok"] as const)(
   "%s own-session replacement retires progressive callbacks immediately and ignores the other platform",
   async (provider) => {
