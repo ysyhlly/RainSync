@@ -122,6 +122,39 @@ class RuntimeArtifactTests(unittest.TestCase):
         self.reject(lambda m: m["runtime_checks"].pop("worker_source"), "Worker")
         self.reject(lambda m: m["runtime_checks"].update(ffmpeg={}), "FFmpeg")
 
+    def test_caddy_validation_preserves_hardening_and_compares_image_binary(self):
+        calls = []
+        def run(args, timeout=60):
+            calls.append(args)
+            if "--media-authorization-contract" in args:
+                return json.dumps(runtime.LOGIN_CONTRACT)
+            if "--source-access-contract" in args:
+                role = "worker" if "rainsync-media-worker" in args else "server"
+                return json.dumps(runtime.source_contract(role))
+            if "backend-image" in args:
+                return json.dumps({"streams": [{"codec_name": "h264", "width": 64, "height": 64}]})
+            return "Valid configuration\n"
+        with patch.object(runtime, "docker", side_effect=run):
+            self.assertEqual(runtime.runtime_checks("backend-image", "web-image")["web_config"], "passed")
+        self.assertEqual(len(calls), 5)
+        web = calls[-1]
+        for option, value in (("--network", "none"), ("--cap-drop", "ALL"), ("--security-opt", "no-new-privileges"),
+                              ("--tmpfs", "/tmp:rw,nosuid,nodev,size=128m"), ("--entrypoint", "sh")):
+            self.assertEqual(web[web.index(option) + 1], value)
+        self.assertIn("--read-only", web)
+        self.assertNotIn("--cap-add", web)
+        self.assertNotIn("--privileged", web)
+        self.assertIn("getcap /usr/bin/caddy", web[-1])
+        self.assertIn("cp /usr/bin/caddy /tmp/rainsync-caddy-validate", web[-1])
+        self.assertIn("cmp /usr/bin/caddy /tmp/rainsync-caddy-validate", web[-1])
+        self.assertIn("exec /tmp/rainsync-caddy-validate validate --config /etc/caddy/Caddyfile --adapter caddyfile", web[-1])
+        def fail_web(args, timeout=60):
+            if "web-image" in args:
+                raise subprocess.CalledProcessError(255, args)
+            return run(args, timeout)
+        with patch.object(runtime, "docker", side_effect=fail_web), self.assertRaises(subprocess.CalledProcessError):
+            runtime.runtime_checks("backend-image", "web-image")
+
     def test_daemon_checks_ids_architecture_size_and_source(self):
         def observed(reference):
             expected = next(i for i in self.manifest["images"].values() if i["image_id"] == reference)

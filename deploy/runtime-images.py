@@ -209,7 +209,15 @@ ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,heigh
     result = read_json(docker([*common, "--tmpfs", "/tmp:rw,nosuid,nodev,size=16m", "--entrypoint", "sh", backend, "-eu", "-c", ffmpeg], timeout=60))
     require(result.get("streams") == [{"codec_name": "h264", "width": 64, "height": 64}], "actual FFmpeg encode/probe/decode failed")
     checks["ffmpeg"] = {"encode": "passed", "probe": "passed", "decode": "passed", "codec": "h264", "width": 64, "height": 64}
-    docker([*common, "--tmpfs", "/tmp:rw,nosuid,nodev,size=16m", "--env", "SITE_ADDRESS=:80", "--entrypoint", "caddy", web, "validate", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"], timeout=30)
+    # Official Caddy carries cap_net_bind_service=ep. Linux refuses its direct
+    # exec when ALL is dropped from the capability bounding set. Validation
+    # needs no listener/capability: copy bytes only into the bounded nosuid tmpfs
+    # and compare them before exec, retaining every isolation flag above.
+    caddy = """getcap /usr/bin/caddy >&2
+cp /usr/bin/caddy /tmp/rainsync-caddy-validate
+cmp /usr/bin/caddy /tmp/rainsync-caddy-validate
+exec /tmp/rainsync-caddy-validate validate --config /etc/caddy/Caddyfile --adapter caddyfile"""
+    docker([*common, "--tmpfs", "/tmp:rw,nosuid,nodev,size=128m", "--env", "SITE_ADDRESS=:80", "--entrypoint", "sh", web, "-eu", "-c", caddy], timeout=30)
     checks["web_config"] = "passed"
     return checks
 

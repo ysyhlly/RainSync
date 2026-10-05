@@ -1129,8 +1129,25 @@ async fn cleanup_failure_keeps_unresolved_ownership_and_never_deletes_an_unknown
     cdn.close().await;
 }
 
+#[test]
+fn actual_active_ffprobe_epoch_revocation_reaps_before_positive_disposal() {
+    // The owner registry is process-global. Keep this lifecycle observation
+    // isolated from the other captures running concurrently in this binary.
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "active_ffprobe_epoch_revocation_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
 #[tokio::test]
-async fn actual_active_ffprobe_epoch_revocation_reaps_before_positive_disposal() {
+#[ignore = "owned subprocess helper for process-global owner observation"]
+async fn active_ffprobe_epoch_revocation_child() {
     let root = root();
     let (primary, cdn) = origins(fixture_shape(&root, false, 25, "1920x1080", 5).await).await;
     assert_eq!(
