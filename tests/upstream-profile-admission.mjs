@@ -1627,7 +1627,7 @@ try {
               await client.request("/auth/logout", "POST");
               fault.hold.release();
               const response = await pending;
-              error(response, 409, "STALE_CAPABILITY_REPORT");
+              error(response, 410, "INVALID_PLAYBACK_SESSION");
               assert.equal(count(subject), 0);
               record.terminal = await stopped(row.session_id, true);
               await drained(body.idempotency_key);
@@ -1659,10 +1659,19 @@ try {
             assert.equal(same.status, 200);
             assert.equal(same.body.session_id, original.body.session_id);
             assert.equal(count(subject), 1);
-            await client.request("/auth/logout", "POST");
-            await client.login();
-            const changed = await prepare(subject, body);
-            error(changed, 409, "STALE_CAPABILITY_REPORT");
+            const otherLogin = f.client();
+            await otherLogin.login();
+            subject.client = otherLogin;
+            let changed;
+            try {
+              changed = await prepare(subject, body);
+              error(changed, 409, "STALE_PLAYBACK_PLAN");
+            } finally {
+              subject.client = client;
+            }
+            const retained = await prepare(subject, body);
+            assert.equal(retained.status, 200);
+            assert.equal(retained.body.session_id, original.body.session_id);
             assert.equal(count(subject), 1);
             assert.equal(requestRow(body.idempotency_key).attempt, 1);
             assert.equal(
@@ -2155,7 +2164,9 @@ try {
                 );
               }
               assert.equal(count(subject), 0);
-              assert.equal(ledger(row.session_id).state, "closing");
+              record.invalidated_before_metadata_return = await stopped(
+                row.session_id, true,
+              );
               fault.hold.release();
               const response = await pending;
               noPlan(response);
@@ -2173,52 +2184,61 @@ try {
       await scenario(
         "preflight media table contention is bounded and leaves independent API/pool capacity",
         async (record) => {
-          const subject = await setup(
-              "jellyfin",
-              "preflight bounded database fixture",
-            ),
-            fault = { hold: gate() };
-          subject.metadataQueue.push(fault);
-          const pending = candidates(subject),
-            tag = "profile-preflight-table-lock-" + randomUUID();
-          let lock;
-          try {
-            await until(
-              () => fault.received,
-              "preflight metadata proves auth and durable admission finished",
+          const subject = await setup("jellyfin", "preflight bounded database fixture");
+          const results = [];
+          for (let attempt = 0; attempt < 4; attempt++) {
+            const fault = { hold: gate() };
+            subject.metadataQueue.push(fault);
+            const requested = performance.now();
+            let settled = false;
+            const pending = candidates(subject).then(
+              (response) => {
+                settled = true;
+                return response;
+              },
+              (cause) => {
+                settled = true;
+                throw cause;
+              },
             );
-            // Own a real table barrier after initial auth/admission. It neither
-            // rewrites authorization nor manufactures owner/cleanup receipts.
-            lock = f.sqlProcess(undefined, { interactive: true });
-            locks.add(lock);
-            let output = "";
-            lock.stdout.on("data", (chunk) => {
-              output += chunk;
-            });
-            lock.stdin.write(
-              `BEGIN; LOCK TABLE media_items IN ACCESS EXCLUSIVE MODE; SELECT '${tag}';\n`,
-            );
-            await until(
-              () => output.includes(tag),
-              "owned media table lock acquired",
-            );
-            fault.hold.release();
-            const started = performance.now(),
-              first = await pending;
-            noPlan(first);
-            assert.ok(
-              performance.now() - started < 3500,
-              "held preflight read fails within its database budget",
-            );
-            const results = [safeResponse(first)];
-            for (let attempt = 0; attempt < 3; attempt++) {
-              const began = performance.now(),
-                response = await candidates(subject);
-              noPlan(response);
+            pending.catch(() => {});
+            const tag = "profile-preflight-table-lock-" + randomUUID();
+            let lock;
+            try {
+              await until(
+                () => fault.received,
+                "preflight metadata proves auth and durable admission finished",
+              );
+              // Each admission finishes before its own external table barrier.
+              // A single origin has two metadata permits, not four held slots.
+              lock = f.sqlProcess(undefined, { interactive: true });
+              locks.add(lock);
+              let output = "";
+              lock.stdout.on("data", (chunk) => {
+                output += chunk;
+              });
+              lock.stdin.write(
+                `BEGIN; LOCK TABLE media_items IN ACCESS EXCLUSIVE MODE; SELECT '${tag}';\n`,
+              );
+              await until(
+                () => output.includes(tag),
+                "owned media table lock acquired",
+              );
+              assert.equal(settled, false, "Held metadata has not already failed");
+              assert.ok(
+                performance.now() - requested < 6000,
+                "Held metadata retains its provider timeout budget for the database phase",
+              );
+              const began = performance.now();
+              fault.hold.release();
+              const response = await pending;
               const elapsed = performance.now() - began;
+              error(response, 500, "DATABASE_ERROR");
               assert.ok(
                 elapsed < 3500,
-                "repeated bounded preflight does not wait for the external table owner",
+                attempt === 0
+                  ? "held preflight read fails within its database budget"
+                  : "repeated bounded preflight does not wait for the external table owner",
               );
               results.push({
                 ...safeResponse(response),
@@ -2236,21 +2256,21 @@ try {
                 "0",
                 "cancelled preflight does not strand its metadata DB query in the pool",
               );
+              assert.equal(count(subject), 0);
+              lock.stdin.end("COMMIT;\n");
+              await lock.done;
+              await unaffected();
+            } finally {
+              fault.hold.release();
+              if (lock && lock.exitCode === null) {
+                lock.stdin.end("ROLLBACK;\n");
+                await lock.done.catch(() => {});
+              }
+              await pending.catch(() => {});
             }
-            assert.equal(count(subject), 0);
-            record.rejections_while_lock_held = results;
-            record.independent_authenticated_api_usable = true;
-            lock.stdin.end("COMMIT;\n");
-            await lock.done;
-            await unaffected();
-          } finally {
-            fault.hold.release();
-            if (lock && lock.exitCode === null) {
-              lock.stdin.end("ROLLBACK;\n");
-              await lock.done.catch(() => {});
-            }
-            await pending.catch(() => {});
           }
+          record.rejections_while_lock_held = results;
+          record.independent_authenticated_api_usable = true;
         },
       );
       await scenario(
