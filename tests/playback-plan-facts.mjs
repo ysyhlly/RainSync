@@ -746,18 +746,39 @@ try {
       /^http_automatic_direct_authorized_probe$/,
     );
     assert.equal(http.plan.selected_audio_track, 1);
-    assert.deepEqual(http.plan.decoder_fallback_modes, ["remux", "transcode"]);
+    assert.deepEqual(http.plan.decoder_fallback_modes, []);
+    absent(http.plan, "http_file_fallback_version");
     absent(http.plan, "seekable_media_ranges_ms");
     absent(http.plan, "pending_job_id");
     assert.equal(http.plan.subtitle_mode, "none");
     await stop(http);
+    // Current probe facts alone do not grant HTTP continuation authority.
+    const httpFallback = await prepare({
+      http_file_fallback_version: 1,
+      viewer_id: randomUUID(),
+      plan_generation: 1,
+    });
+    assert.match(
+      httpFallback.plan.decision_reason,
+      /^http_automatic_direct_authorized_probe$/,
+    );
+    assert.equal(httpFallback.plan.selected_audio_track, 1);
+    assert.equal(httpFallback.plan.http_file_fallback_version, 1);
+    assert.deepEqual(httpFallback.plan.decoder_fallback_modes, [
+      "remux",
+      "transcode",
+    ]);
+    absent(httpFallback.plan, "seekable_media_ranges_ms");
+    absent(httpFallback.plan, "pending_job_id");
+    assert.equal(httpFallback.plan.subtitle_mode, "none");
+    await stop(httpFallback);
     const unprobed = await prepare({ mode: "direct" });
     absent(unprobed.plan, "selected_audio_track");
     assert.deepEqual(unprobed.plan.decoder_fallback_modes, []);
     absent(unprobed.plan, "seekable_media_ranges_ms");
     await stop(unprobed);
     check(
-      "HTTP authorized probe supports bounded hints/audio; duration and an unprobed direct request never invent seek ranges or decoder evidence",
+      "HTTP authorized probe verifies audio; only an opted-in reliable Binary root supplies bounded fallback hints, and duration or unprobed direct never invents ranges or decoder evidence",
     );
 
     for (const kind of ["jellyfin", "emby"]) {

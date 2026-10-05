@@ -618,6 +618,27 @@ try {
   let r = await fetch(worker + plan.playback_url, {
     headers: { Range: "bytes=7-18" },
   });
+  if (r.status !== 206) {
+    // Failure-only evidence contains booleans and a normalized code, no tokens.
+    const diagnostic = { status: r.status, error_code: "UNPARSEABLE" };
+    try {
+      const value = await r.clone().json();
+      diagnostic.error_code = /^[A-Z_]{1,80}$/.test(value?.error?.code ?? "")
+        ? value.error.code : "UNPARSEABLE";
+    } catch {
+      diagnostic.response_evidence_unavailable = true;
+    }
+    try {
+      const deliveryToken = new URL(plan.playback_url, worker).searchParams.get("token");
+      const deliveryHash = createHash("sha256").update(deliveryToken ?? "").digest("hex");
+      diagnostic.grant_predicates = JSON.parse(sql(
+        `SET statement_timeout='500ms'; SELECT json_build_object('token_matches',p.delivery_token_hash='${deliveryHash}','unexpired',p.expires_at>clock_timestamp(),'stopped',p.stopped,'source_allowed',COALESCE(playback_source_allowed(p.media_id,p.resource,p.id),false),'room_active',r.lifecycle='active','epoch_matches',r.lifecycle_epoch=p.lifecycle_epoch,'generation_matches',(snap.state->>'media_generation')::bigint=p.generation,'member_present',EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id),'origin_allowed',COALESCE(playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch),false),'media_present',mi.id IS NOT NULL,'media_available',COALESCE(mi.available,false),'source_present',src.id IS NOT NULL,'source_kind_local',src.kind='local','source_revision_matches',COALESCE((p.resource->>'source_policy_revision')::bigint,0)=src.access_policy_revision,'library_allowed',COALESCE(playback_library_session_allowed(p.id),false),'delivery_registered',EXISTS(SELECT 1 FROM media_executions e WHERE e.session_id=p.id AND e.kind='delivery'),'delivery_unreaped',EXISTS(SELECT 1 FROM media_executions e WHERE e.session_id=p.id AND e.kind='delivery' AND e.reaped_at IS NULL)) FROM playback_sessions p JOIN room_snapshots snap ON snap.room_id=p.room_id JOIN rooms r ON r.id=p.room_id LEFT JOIN media_items mi ON mi.id=p.media_id LEFT JOIN sources src ON src.id=mi.source_id WHERE p.id='${plan.session_id}'`,
+      ).split("\n").at(-1) || "null");
+    } catch {
+      diagnostic.grant_evidence_unavailable = true;
+    }
+    console.error("Direct Range authorization failure: " + JSON.stringify(diagnostic));
+  }
   assert.equal(r.status, 206);
   assert.deepEqual(Buffer.from(await r.arrayBuffer()), bytes.subarray(7, 19));
   r = await fetch(worker + plan.playback_url, {

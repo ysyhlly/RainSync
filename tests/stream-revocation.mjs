@@ -194,6 +194,38 @@ await isolatedMediaStack("stream-revocation", async (f) => {
         const ranged = revoke === "membership" || revoke === "expiry";
         const state = start(url, ranged);
         await until(() => state.response, `${label}: initial headers`);
+        if (state.response.statusCode !== (ranged ? 206 : 200)) {
+          // Failure-only authorization evidence never prints credentials/resources.
+          const diagnostic = { case: label, status: state.response.statusCode, error_code: "UNPARSEABLE" };
+          try {
+            let body = "";
+            await new Promise(done => {
+              const response = state.response;
+              const finish = () => { clearTimeout(timer); done(); };
+              const timer = setTimeout(() => { response.destroy(); finish(); }, 1000);
+              response.on("data", chunk => {
+                if (body.length < 8192) body += chunk.toString();
+              });
+              response.once("end", finish);
+              response.once("close", finish);
+              response.resume();
+            });
+            const value = JSON.parse(body);
+            diagnostic.error_code = /^[A-Z_]{1,80}$/.test(value?.error?.code ?? "")
+              ? value.error.code : "UNPARSEABLE";
+          } catch {
+            diagnostic.response_evidence_unavailable = true;
+          }
+          try {
+            const deliveryHash = createHash("sha256").update(token).digest("hex");
+            diagnostic.grant_predicates = JSON.parse(f.sql(
+              `SET statement_timeout='500ms'; SELECT json_build_object('token_matches',p.delivery_token_hash='${deliveryHash}','unexpired',p.expires_at>clock_timestamp(),'stopped',p.stopped,'source_allowed',COALESCE(playback_source_allowed(p.media_id,p.resource,p.id),false),'room_active',r.lifecycle='active','epoch_matches',r.lifecycle_epoch=p.lifecycle_epoch,'generation_matches',(snap.state->>'media_generation')::bigint=p.generation,'member_present',EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id),'origin_allowed',COALESCE(playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch),false),'media_present',mi.id IS NOT NULL,'media_available',COALESCE(mi.available,false),'source_present',src.id IS NOT NULL,'source_kind_matches',src.kind='${kind}','source_revision_matches',COALESCE((p.resource->>'source_policy_revision')::bigint,0)=src.access_policy_revision,'library_allowed',COALESCE(playback_library_session_allowed(p.id),false),'delivery_registered',EXISTS(SELECT 1 FROM media_executions e WHERE e.session_id=p.id AND e.kind='delivery'),'delivery_unreaped',EXISTS(SELECT 1 FROM media_executions e WHERE e.session_id=p.id AND e.kind='delivery' AND e.reaped_at IS NULL)) FROM playback_sessions p JOIN room_snapshots snap ON snap.room_id=p.room_id JOIN rooms r ON r.id=p.room_id LEFT JOIN media_items mi ON mi.id=p.media_id LEFT JOIN sources src ON src.id=mi.source_id WHERE p.id='${id}'`,
+            ).split("\n").at(-1) || "null");
+          } catch {
+            diagnostic.grant_evidence_unavailable = true;
+          }
+          console.error("Initial delivery authorization failure: " + JSON.stringify(diagnostic));
+        }
         assert.equal(state.response.statusCode, ranged ? 206 : 200);
         if (ranged)
           assert.equal(
