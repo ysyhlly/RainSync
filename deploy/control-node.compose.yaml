@@ -1,0 +1,26 @@
+# A control-only node shares the database, not the media/cache authority.
+name: rainsync-control-node
+services:
+  control:
+    image: ${RAINSYNC_IMAGE:?Set the exact matching backend image ID or digest}
+    command: ["rainsync-server"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set the same cluster database privately}
+      SOURCE_ENCRYPTION_KEY: ${SOURCE_ENCRYPTION_KEY:?Set the matching source key privately}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set the public browser origin}
+      MEDIA_ORIGIN: ${MEDIA_ORIGIN:?Set the media authority origin}
+      WORKER_URL: ${WORKER_URL:?Set the media authority Worker origin}
+      MEDIA_ROOT: /media
+      CACHE_ROOT: /cache
+      RAINSYNC_CONTROL_CLUSTER: "1"
+      RAINSYNC_CONTROL_ROLE: control
+      RAINSYNC_CONTROL_NODE_ID: ${RAINSYNC_CONTROL_NODE_ID:?Set this node UUID}
+      RAINSYNC_CONTROL_NODES: ${RAINSYNC_CONTROL_NODES:?Set the identical node UUID/origin JSON allowlist}
+      RAINSYNC_CONTROL_PEER_TOKEN: ${RAINSYNC_CONTROL_PEER_TOKEN:?Set the same private peer token}
+    tmpfs: ["/cache:uid=10001,gid=10001,mode=0700", "/media:uid=10001,gid=10001,mode=0500"]
+    ports:
+      - target: 8080
+        published: "${RAINSYNC_CONTROL_PORT:-3081}"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    restart: unless-stopped

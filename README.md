@@ -31,6 +31,11 @@ NAS 片源通过 NAS 设备页面撤销；所属媒体库中的片源继续受�
 python3 deploy/runtime-images.py verify --source "$EXPECTED_SOURCE_SHA" --directory "$ARTIFACT_DIRECTORY"
 ```
 
+自动工作流分别构建 amd64/arm64 包；上面的校验默认 amd64，arm64 必须追加
+`--platform linux/arm64`。新 schema 2 记录源码/锁文件/构建配方和实际 FFmpeg 证明，
+旧 amd64 schema 1 继续可校验。日常镜像仍是开发制品，固定发布构建与真机验收
+要求见 [运行制品](docs/RUNTIME_ARTIFACTS.md)。
+
 校验成功后再由安装负责人加载镜像；追加 `--daemon` 可只读核对已加载的本地镜像和离线程序契约。校验命令不会拉取、加载或启动服务。
 将经核对的本地镜像 `sha256:` ID 设置为 `RAINSYNC_BACKEND_IMAGE`、`RAINSYNC_WEB_IMAGE`、`RAINSYNC_POSTGRES_IMAGE`。
 设置 `RAINSYNC_DATABASE_PATH`、`RAINSYNC_CACHE_PATH`、`MEDIA_PATH` 为预先准备、符合辅助工具约束的绑定目录；自动创建宿主目录已禁用，Server 和 Worker 必须共享同一缓存目录。
@@ -81,6 +86,9 @@ python3 tests/runtime-images.test.py
 - [媒体库扫描](docs/LIBRARY_SCANNING.md)
 - [平台合集导入](docs/PLATFORM_COLLECTION_IMPORT.md)
 - [传输指标契约](docs/TRANSPORT_METRICS_CONTRACT.md)
+- [安装与运维](docs/OPERATIONS.md)、[每日备份与恢复](docs/BACKUP_OPERATIONS.md)
+- [兼容矩阵](docs/COMPATIBILITY.md) 与 [高级功能启用/回退](docs/ADVANCED_FEATURES.md)
+- [交付决策](docs/DECISIONS.md)、[变更记录](CHANGELOG.md)、[安全报告](SECURITY.md)
 
-本源码分发保留产品使用与契约文档。部分契约引用的独立验证或审计材料未包含在此分发中。
+本源码分发提供产品契约与安装步骤。验证入口说明不替代当前候选的独立实机和长时验收报告。
 源码使用 [GNU AGPL-3.0-only](LICENSE)；第三方依赖遵循各自许可证。

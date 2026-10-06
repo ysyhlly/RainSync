@@ -1,0 +1,112 @@
+<script setup lang="ts">
+import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { usePendingMedia } from "./pending-media.store";
+import { useMediaCatalog } from "./media-catalog.store";
+import { useRoomRuntime } from "../rooms/room-runtime";
+import { useSession } from "../auth/session.store";
+import Notice from "../../shared/ui/Notice.vue";
+import { RequestFailure } from "../../errors";
+const pending = usePendingMedia(),
+  catalog = useMediaCatalog(),
+  runtime = useRoomRuntime(),
+  session = useSession();
+const busy = ref(false),
+  error = ref("");
+let active = true,
+  serial = 0;
+const canContinue = computed(
+  () =>
+    !!runtime.room &&
+    !!runtime.state &&
+    runtime.connected &&
+    runtime.can("change_media"),
+);
+watch(
+  () => pending.selection,
+  () => {
+    ++serial;
+    busy.value = false;
+    error.value = "";
+  },
+  { flush: "sync" },
+);
+watch(
+  () => [runtime.room?.id, runtime.connected],
+  () => {
+    // Returning to the same room after an intervening switch still requires
+    // a fresh confirmation; an old detail response cannot resume the action.
+    ++serial;
+    busy.value = false;
+    error.value = "";
+  },
+  { flush: "sync" },
+);
+onBeforeUnmount(() => {
+  active = false;
+  ++serial;
+});
+async function confirm() {
+  const selection = pending.selection,
+    room = runtime.room?.id;
+  if (!selection || !room || busy.value || !canContinue.value) return;
+  const mine = ++serial;
+  busy.value = true;
+  error.value = "";
+  try {
+    // Recheck visibility before using a selection from another page. The
+    // server still owns the final room and playback authorization.
+    await catalog.ensure(selection.mediaId, true);
+    if (
+      !active ||
+      mine !== serial ||
+      pending.selection !== selection ||
+      selection.epoch !== session.epoch ||
+      runtime.room?.id !== room ||
+      !canContinue.value
+    )
+      return;
+    const sent = await runtime.choose(selection.mediaId);
+    if (!active || mine !== serial || pending.selection !== selection) return;
+    if (!sent) {
+      error.value = "房间状态尚未就绪，影片选择已保留。连接恢复后请再次确认。";
+      return;
+    }
+    if (pending.selection === selection) pending.clear();
+  } catch (e) {
+    if (active && mine === serial && pending.selection === selection) {
+      if (e instanceof RequestFailure && e.code === "MEDIA_NOT_FOUND")
+        pending.clear();
+      error.value = e instanceof Error ? e.message : String(e);
+    }
+  } finally {
+    if (active && mine === serial) busy.value = false;
+  }
+}
+</script>
+<template>
+  <Notice v-if="!pending.selection" :message="error" error />
+  <section
+    v-if="pending.selection"
+    class="panel pending-media-selection"
+    aria-label="已选择的影片"
+  >
+    <h2>已选择：{{ pending.selection.title }}</h2>
+    <p v-if="!runtime.room">选择一个放映室，进入后确认播放这部影片。</p>
+    <p v-else-if="canContinue">
+      在“{{ runtime.room.name }}”中播放，确认后会更换房间当前影片。
+    </p>
+    <p v-else>影片选择已保留。连接恢复且获得选片权限后，可确认继续。</p>
+    <Notice :message="error" error />
+    <div class="form-actions">
+      <button
+        v-if="runtime.room"
+        class="primary"
+        :disabled="busy || !canContinue"
+        @click="confirm"
+      >
+        {{ busy ? "正在检查影片…" : "确认播放所选影片" }}
+      </button>
+      <button @click="pending.clear()">取消选片</button>
+    </div>
+  </section>
+</template>

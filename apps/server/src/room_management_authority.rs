@@ -7,6 +7,7 @@ pub(crate) struct Authority {
     user_id: Uuid,
     login_hash: String,
     actor_is_admin: bool,
+    delegated: Option<(Uuid, protocol::RoomPermission)>,
 }
 
 impl Authority {
@@ -17,6 +18,29 @@ impl Authority {
         owner_id: Uuid,
         actor_is_member: bool,
     ) -> Result<Self> {
+        Self::admit_action(tx, headers, user_id, owner_id, actor_is_member, None).await
+    }
+
+    pub(crate) async fn admit_action(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        headers: &HeaderMap,
+        user_id: Uuid,
+        owner_id: Uuid,
+        actor_is_member: bool,
+        delegated_action: Option<(Uuid, protocol::RoomPermission)>,
+    ) -> Result<Self> {
+        let delegated = if let Some((room, permission)) = delegated_action {
+            if actor_is_member
+                && user_id != owner_id
+                && persistence::room_permissions::allowed(tx, room, user_id, permission).await?
+            {
+                Some((room, permission))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // Match controller/command ordering: memberships -> user -> login.
         // SHARE also blocks non-key role and expiry changes, unlike KEY SHARE.
         let current_admin: Option<bool> =
@@ -42,7 +66,11 @@ impl Authority {
         .await?;
         let actor_is_admin = authorize(
             user_id,
-            owner_id,
+            if delegated.is_some() {
+                user_id
+            } else {
+                owner_id
+            },
             actor_is_member,
             current_admin,
             csrf.as_deref(),
@@ -55,11 +83,16 @@ impl Authority {
             user_id,
             login_hash,
             actor_is_admin,
+            delegated: if actor_is_admin { None } else { delegated },
         })
     }
 
     pub(crate) fn actor_is_admin(&self) -> bool {
         self.actor_is_admin
+    }
+
+    pub(crate) fn actor_permission(&self) -> Option<protocol::RoomPermission> {
+        self.delegated.map(|(_, permission)| permission)
     }
 
     pub(crate) async fn commit(self, mut tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<()> {
@@ -73,6 +106,11 @@ impl Authority {
         .fetch_one(&mut *tx)
         .await?;
         require_live_login(valid)?;
+        if let Some((room, permission)) = self.delegated {
+            persistence::room_permissions::require(&mut tx, room, self.user_id, permission)
+                .await
+                .map_err(|_| err(StatusCode::FORBIDDEN, "forbidden"))?;
+        }
         tx.commit().await?;
         Ok(())
     }

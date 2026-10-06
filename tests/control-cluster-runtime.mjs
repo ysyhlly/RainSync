@@ -46,12 +46,95 @@ try {
   assert.equal(f.sql(`SELECT owner_node FROM room_leases WHERE room_id=${quote(controlClosing)}`),nodes[1]);
   await admin.request(`/rooms/${controlClosing}/reopen`,'POST',{expected_revision:controlClosed.state.revision});
   report.checks.push('live control-only owner independently reconciles positive database receipts to closed and can reopen through the public gateway');
+  const createKey=randomUUID(),createBody={name:'same creation key across control gateways'};
+  const createHeaders={'Idempotency-Key':createKey};
+  const firstCreated=await admin.request('/rooms','POST',createBody,200,createHeaders);
+  const secondaryReplay=await viaSecondary.request('/rooms','POST',createBody,200,createHeaders);
+  const primaryReplay=await admin.request('/rooms','POST',createBody,200,createHeaders);
+  assert.equal(secondaryReplay.id,firstCreated.id,'secondary gateway preserves the original per-account creation key');
+  assert.equal(primaryReplay.id,firstCreated.id,'round-robin forwarding preserves the same key when primary selects a remote owner');
+  assert.equal(f.sql(`SELECT count(*) FROM rooms WHERE owner_id=${quote(adminUser.id)} AND name=${quote(createBody.name)}`),'1');
+  assert.equal(f.sql(`SELECT count(*) FROM room_creation_requests WHERE user_id=${quote(adminUser.id)} AND request_key=${quote(createKey)}`),'1');
+  for(const gateway of [admin,viaSecondary,admin]){
+   const conflict=await gateway.request('/rooms','POST',{name:createBody.name+' changed'},409,createHeaders);
+   assert.equal(conflict.error.code,'INVALID_REQUEST','payload conflict retains the public error code across local and forwarded handlers');
+  }
+  assert.equal(f.sql(`SELECT count(*) FROM rooms WHERE owner_id=${quote(adminUser.id)} AND name=${quote(createBody.name+' changed')}`),'0');
+  report.checks.push('the same account creation key replays one durable room through both gateways and alternating room routes; conflicting payloads return 409 without a second room');
   const media=sourceMedia(f,{kind:'local',root:f.root,resource:'cluster-control-fixture.mp4'});
   f.sql(`UPDATE media_items SET duration_ms=900000 WHERE id=${quote(media)}`);
   await admin.request('/users','POST',{username:'cluster-member',password:f.password});const viewer=f.client();const viewerUser=await viewer.login('cluster-member',f.password);
   const invite=await admin.request(`/rooms/${room}/invites`,'POST');await viewer.request(`/rooms/${room}/join`,'POST',{token:invite.token});
   assert.equal(f.sql(`SELECT count(*) FROM room_members WHERE room_id=${quote(room)}`),'2');
   report.checks.push('room created on control owner; primary gateway forwards invite and member join preserving ordinary login/Origin/CSRF gates');
+  const viewerCreated=await viewer.request('/rooms','POST',createBody,200,createHeaders);
+  assert.notEqual(viewerCreated.id,firstCreated.id,'another authenticated account has a separate creation result for the same request key');
+  const viewerReplay=await secondaryClient(viewer).request('/rooms','POST',createBody,200,createHeaders);
+  assert.equal(viewerReplay.id,viewerCreated.id);
+  assert.equal(f.sql(`SELECT count(*) FROM room_creation_requests WHERE request_key=${quote(createKey)} AND user_id IN (${quote(adminUser.id)},${quote(viewerUser.id)})`),'2');
+  report.checks.push('creation-key isolation remains per account across the control gateways');
+  // A global account tombstone spans rooms with two different physical owners.
+  // Keep the ordinary viewer alive to prove cleanup is scoped to the exited user.
+  await admin.request('/users','POST',{username:'cluster-exit',password:f.password});
+  const exitClient=f.client(),exitUser=await exitClient.login('cluster-exit',f.password);
+  const exitOtherLogin=f.client();await exitOtherLogin.login('cluster-exit',f.password);
+  const exitViaSecondary=secondaryClient(exitClient),exitInvites=[];
+  const exitRoomOwners=balanced.map(id=>f.sql(`SELECT owner_node FROM room_leases WHERE room_id=${quote(id)}`));
+  assert.equal(new Set(exitRoomOwners).size,2);
+  for(const id of balanced){
+   const ownedInvite=await admin.request(`/rooms/${id}/invites`,'POST');
+   for(const member of [exitClient,viewer])await member.request(`/rooms/${id}/join`,'POST',{token:ownedInvite.token});
+   await viaSecondary.request(`/rooms/${id}/permissions/${exitUser.id}`,'PUT',{role:'moderator',permissions:['invite']});
+   assert.equal(f.sql(`SELECT room_permission_allowed(${quote(id)},${quote(exitUser.id)},'invite')`),'t');
+   const policy=await exitViaSecondary.request(`/rooms/${id}/permissions`);
+   assert.deepEqual(policy.self_permissions,['invite'],'new permission routes forward through either gateway to the room owner');
+   exitInvites.push(await exitViaSecondary.request(`/rooms/${id}/invites`,'POST',{expires_in_seconds:3600,max_uses:2}));
+   assert.equal(f.sql(`SELECT count(*) FROM room_members WHERE room_id=${quote(id)}`),'3');
+  }
+  const exited=await exitClient.request('/users/me/deletion','POST',{password:f.password,confirmation:'DELETE'});
+  assert.equal(exited.ok,true,'account exit is global and does not require one transaction to own both rooms');
+  assert.equal(f.sql(`SELECT account_active(${quote(exitUser.id)})`),'f');
+  assert.equal(f.sql(`SELECT count(*) FROM sessions WHERE user_id=${quote(exitUser.id)}`),'0');
+  await exitOtherLogin.request('/auth/me','GET',undefined,401);
+  await exitViaSecondary.request('/auth/me','GET',undefined,401);
+  for(let index=0;index<balanced.length;index++){
+   const id=balanced[index];
+   assert.equal(f.sql(`SELECT room_permission_allowed(${quote(id)},${quote(exitUser.id)},'invite')`),'f','logical delegation is revoked before owner cleanup is required');
+   const rejected=await viewer.request(`/rooms/${id}/join`,'POST',{token:exitInvites[index].token},403);
+   assert.equal(rejected.error.code,'INVALID_INVITE','a tombstoned creator cannot authorize a fresh or repeated join under the current generated public error contract');
+  }
+  await until(()=>f.sql(`SELECT count(*) FROM account_exit_room_cleanup WHERE user_id=${quote(exitUser.id)}`)==='0','both room owners drain durable account-exit cleanup');
+  for(let index=0;index<balanced.length;index++){
+   const id=balanced[index];
+   assert.equal(f.sql(`SELECT owner_node FROM room_leases WHERE room_id=${quote(id)}`),exitRoomOwners[index],'cleanup respects the existing live room owner');
+   assert.equal(f.sql(`SELECT count(*) FROM room_members WHERE room_id=${quote(id)} AND user_id=${quote(exitUser.id)}`),'0');
+   assert.equal(f.sql(`SELECT count(*) FROM room_member_permissions WHERE room_id=${quote(id)} AND (user_id=${quote(exitUser.id)} OR granted_by=${quote(exitUser.id)})`),'0');
+   assert.equal(f.sql(`SELECT revoked FROM invites WHERE room_id=${quote(id)} AND id=${quote(exitInvites[index].id)}`),'t');
+   assert.equal(f.sql(`SELECT count(*) FROM room_members WHERE room_id=${quote(id)} AND user_id IN (${quote(adminUser.id)},${quote(viewerUser.id)})`),'2','other members survive account cleanup');
+  }
+  report.checks.push('global account exit immediately revokes all logins, delegation and creator invitations across two live room owners; durable owner-fenced cleanup removes only the exited memberships and grants without taking over either lease');
+  // Requeue only already-revoked cleanup receipts. Hold one queue row while
+  // proving the other owner can finish before the lock is released.
+  const queueLockTag='account_queue_lock_'+randomUUID().replaceAll('-','');
+  const heldRoom=balanced[0],freeRoom=balanced[1];
+  const queueLock=f.sqlProcess(`SET application_name=${quote(queueLockTag)}; BEGIN;
+   INSERT INTO account_exit_room_cleanup(room_id,user_id) VALUES(${quote(heldRoom)},${quote(exitUser.id)}),(${quote(freeRoom)},${quote(exitUser.id)});
+   COMMIT; BEGIN; SELECT user_id FROM account_exit_room_cleanup WHERE room_id=${quote(heldRoom)} AND user_id=${quote(exitUser.id)} FOR UPDATE;
+   SELECT pg_sleep(12); COMMIT;`);
+  try {
+   await f.waitForSql(`SELECT count(*) FROM pg_stat_activity WHERE application_name=${quote(queueLockTag)} AND wait_event='PgSleep'`,'1');
+   assert.equal(f.sql(`SELECT count(*) FROM account_exit_room_cleanup WHERE room_id=${quote(heldRoom)} AND user_id=${quote(exitUser.id)}`),'1');
+   await until(()=>f.sql(`SELECT count(*) FROM account_exit_room_cleanup WHERE room_id=${quote(freeRoom)} AND user_id=${quote(exitUser.id)}`)==='0','unlocked account-exit receipt drains while another queue row is locked',10000);
+   assert.equal(f.sql(`SELECT count(*) FROM pg_stat_activity WHERE application_name=${quote(queueLockTag)} AND wait_event='PgSleep'`),'1','the second cleanup finishes before the first queue lock is released');
+   assert.equal(f.sql(`SELECT count(*) FROM account_exit_room_cleanup WHERE room_id=${quote(heldRoom)} AND user_id=${quote(exitUser.id)}`),'1');
+  } finally {
+   f.sql(`SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE application_name=${quote(queueLockTag)}`);
+   await queueLock.done.catch(()=>{});
+   await f.waitForSql(`SELECT count(*) FROM pg_stat_activity WHERE application_name=${quote(queueLockTag)}`,'0');
+  }
+  await until(()=>f.sql(`SELECT count(*) FROM account_exit_room_cleanup WHERE user_id=${quote(exitUser.id)}`)==='0','previously locked account-exit receipt drains after release');
+  for(const id of balanced)assert.equal(f.sql(`SELECT count(*) FROM room_members WHERE room_id=${quote(id)} AND user_id IN (${quote(adminUser.id)},${quote(viewerUser.id)})`),'2','queue contention cannot revoke unrelated members');
+  report.checks.push('atomic queue rotation skips a row held by an owned PostgreSQL transaction; the other live room owner completes independently, and the held receipt retries after lock release');
   let a=await socket(f.origin,admin,room),b=await socket(secondaryOrigin,viaSecondary,room);
   const make=(state,type,payload)=>({protocol_version:1,command_id:randomUUID(),control_epoch:a.snapshot.control_epoch.id,room_id:room,expected_revision:state.revision,media_generation:state.media_generation,type,...payload});
   let command=make(a.snapshot.state,'CHANGE_MEDIA',{payload:{media_id:media}});a.ws.send(JSON.stringify(command));let ack=await a.wait(m=>m.type==='ACK'&&m.command_id===command.command_id);
@@ -116,7 +199,7 @@ try {
    for(const record of children)if(record.wasStopped){record.child.kill('SIGCONT');record.wasStopped=false;}
    await reapOwnedChildren([...children]);
   }
- },{beforeStart:async f=>{report.server_binary_sha256=createHash('sha256').update(await readFile(resolve(f.target,'rainsync-server'))).digest('hex');secondaryPort=await port();secondaryOrigin=`http://127.0.0.1:${secondaryPort}`;Object.assign(f.env,{RAINSYNC_CONTROL_CLUSTER:'1',RAINSYNC_CONTROL_NODE_ID:nodes[0],RAINSYNC_CONTROL_ROLE:'media',RAINSYNC_CONTROL_NODES:JSON.stringify({[nodes[0]]:f.origin,[nodes[1]]:secondaryOrigin}),RAINSYNC_CONTROL_PEER_TOKEN:randomBytes(32).toString('hex')})},signal:AbortSignal.timeout(120000)});
+ },{beforeStart:async f=>{report.server_binary_sha256=createHash('sha256').update(await readFile(resolve(f.target,'rainsync-server'))).digest('hex');secondaryPort=await port();secondaryOrigin=`http://127.0.0.1:${secondaryPort}`;Object.assign(f.env,{RAINSYNC_CONTROL_CLUSTER:'1',RAINSYNC_CONTROL_NODE_ID:nodes[0],RAINSYNC_CONTROL_ROLE:'media',RAINSYNC_CONTROL_NODES:JSON.stringify({[nodes[0]]:f.origin,[nodes[1]]:secondaryOrigin}),RAINSYNC_CONTROL_PEER_TOKEN:randomBytes(32).toString('hex')})},signal:AbortSignal.timeout(150000)});
  report.cleanup=await fixture.verifyStopped();
 }catch(error){report.result='failed';report.error=String(error);throw error}
 finally {

@@ -1,3 +1,5 @@
+mod room_permissions;
+pub use room_permissions::RoomPermission;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;

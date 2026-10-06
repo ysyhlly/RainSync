@@ -244,7 +244,9 @@ test("sources validate dynamic fields and keep scans scoped to each row", async 
   await first.getByRole("button", { name: "检测并扫描" }).click();
   await second.getByRole("button", { name: "检测并扫描" }).click();
   await expect(second.getByText("本次扫描发现 7 部影片")).toBeVisible();
-  await expect(first.getByRole("button")).toBeDisabled();
+  await expect(
+    first.getByRole("button", { name: "正在检测扫描…", exact: true }),
+  ).toBeDisabled();
   finishFirst();
   await expect(first.getByText("本次扫描发现 7 部影片")).toBeVisible();
   await expect(
@@ -262,6 +264,7 @@ test("sources validate dynamic fields and keep scans scoped to each row", async 
   await page
     .getByLabel("媒体或服务 URL")
     .fill("https://example.test/video.mp4");
+  await page.getByText("高级选项：请求头与外部字幕", { exact: true }).click();
   await page.getByLabel("请求头 JSON（可选）").fill('{"Authorization":3}');
   await page.getByRole("button", { name: "保存片源" }).click();
   await expect(page.getByRole("alert")).toContainText("请求头须为JSON对象");
@@ -309,7 +312,9 @@ test("NAS history is not claimed online; pairing and revoke preserve actual cont
   });
   await page.goto(appBase + "/admin/agents");
   await expect(page.locator(".admin-row")).toContainText("已配对记录");
-  await expect(page.locator(".admin-row")).toContainText("文件版本索引状态未知");
+  await expect(page.locator(".admin-row")).toContainText(
+    "文件版本索引状态未知",
+  );
   await page.getByRole("button", { name: "添加设备", exact: true }).click();
   await page.getByLabel("设备名称").fill("第二设备");
   await page.getByRole("button", { name: "生成配对码" }).click();

@@ -369,6 +369,7 @@ fn control_error(error: anyhow::Error, fallback: &str) -> String {
         | "wrong_room"
         | "stale_media"
         | "no_media"
+        | "media_not_found"
         | "invalid_position"
         | "invalid_rate"
         | "native_live_client_unsupported"
@@ -388,9 +389,31 @@ pub async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"owner_id":r.get::<Uuid,_>("owner_id"),"lifecycle":r.get::<String,_>("lifecycle"),"lifecycle_epoch":r.get::<i64,_>("lifecycle_epoch")})).collect())))
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Name {
     pub name: String,
 }
+
+async fn creation_session_valid(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: Uuid,
+    session_hash: &str,
+) -> Result<()> {
+    // now() is fixed at transaction start and would accept a session that
+    // expires while a concurrent creation holds the request-key lock.
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>clock_timestamp())",
+    )
+    .bind(session_hash)
+    .bind(user)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !valid {
+        return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
+    }
+    Ok(())
+}
+
 pub async fn create(
     State(app): State<App>,
     h: HeaderMap,
@@ -400,7 +423,74 @@ pub async fn create(
     if body.name.trim().is_empty() || body.name.chars().count() > 120 {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_name"));
     }
+    let mut keys = h.get_all("idempotency-key").iter();
+    let request_key = keys
+        .next()
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .filter(|key| {
+                    !key.is_empty()
+                        && key.len() <= 128
+                        && key.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-')
+                        })
+                })
+                .ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid_idempotency_key"))
+        })
+        .transpose()?;
+    if keys.next().is_some() {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid_idempotency_key"));
+    }
     let id = Uuid::new_v4();
+    let mut tx = app.db.begin().await?;
+    // Coordinate with account exit and hold the exact authenticated session
+    // until commit; a prior auth check alone cannot authorize queued work.
+    sqlx::query("SELECT id FROM users WHERE id=$1 FOR SHARE")
+        .bind(u.id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "session_expired"))?;
+    let session_hash =
+        hash(&cookie(&h).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "login_required"))?);
+    sqlx::query("SELECT token_hash FROM sessions WHERE token_hash=$1 AND user_id=$2 AND csrf=$3 AND expires_at>clock_timestamp() FOR SHARE")
+        .bind(&session_hash)
+        .bind(u.id)
+        .bind(h.get("x-csrf-token").and_then(|v| v.to_str().ok()).unwrap_or_default())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "session_expired"))?;
+    if let Some(key) = request_key {
+        // PostgreSQL's unique-key conflict wait coordinates all Server nodes.
+        // A losing INSERT sees the committed row in the following statement
+        // (READ COMMITTED), rather than in the INSERT's earlier snapshot.
+        let claimed = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO room_creation_requests(user_id,request_key,name,room_id) VALUES($1,$2,$3,$4) ON CONFLICT (user_id,request_key) DO NOTHING RETURNING room_id",
+        )
+        .bind(u.id)
+        .bind(key)
+        .bind(&body.name)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if claimed.is_none() {
+            let result = sqlx::query(
+                "SELECT name,room_id FROM room_creation_requests WHERE user_id=$1 AND request_key=$2",
+            )
+            .bind(u.id)
+            .bind(key)
+            .fetch_one(&mut *tx)
+            .await?;
+            if result.get::<String, _>("name") != body.name {
+                return Err(err(StatusCode::CONFLICT, "idempotency_key_conflict"));
+            }
+            let original = result.get::<Uuid, _>("room_id");
+            creation_session_valid(&mut tx, u.id, &session_hash).await?;
+            tx.commit().await?;
+            return Ok(Json(json!({"id":original})));
+        }
+    }
     let state = RoomState {
         room_id: id,
         revision: 0,
@@ -415,7 +505,6 @@ pub async fn create(
         live: None,
         clock_epoch: app.epoch,
     };
-    let mut tx = app.db.begin().await?;
     sqlx::query("INSERT INTO rooms(id,name,owner_id) VALUES($1,$2,$3)")
         .bind(id)
         .bind(body.name)
@@ -432,15 +521,32 @@ pub async fn create(
         .bind(serde_json::to_value(state).unwrap())
         .execute(&mut *tx)
         .await?;
+    creation_session_valid(&mut tx, u.id, &session_hash).await?;
     tx.commit().await?;
     Ok(Json(json!({"id":id})))
 }
+
 pub(crate) async fn controller<'a>(
     app: &'a App,
     h: &HeaderMap,
     id: Uuid,
 ) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
-    let u = auth(app, h, true).await?;
+    controller_for_permission(app, h, id, protocol::RoomPermission::Queue).await
+}
+pub(crate) async fn controller_for_permission<'a>(
+    app: &'a App, h: &HeaderMap, id: Uuid, permission: protocol::RoomPermission,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
+    controller_admission(app, h, id, permission, true).await
+}
+pub(crate) async fn controller_read_for_permission<'a>(
+    app: &'a App, h: &HeaderMap, id: Uuid, permission: protocol::RoomPermission,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
+    controller_admission(app, h, id, permission, false).await
+}
+async fn controller_admission<'a>(
+    app: &'a App, h: &HeaderMap, id: Uuid, permission: protocol::RoomPermission, write: bool,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
+    let u = auth(app, h, write).await?;
     member(app, &u, id).await?;
     let mut tx = app.db.begin().await?;
     // Same order as joining: room first, then snapshot/invitation.
@@ -488,11 +594,17 @@ pub(crate) async fn controller<'a>(
     if !valid || csrf.is_none() || current_admin.is_none() {
         return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
     }
-    if h.get("x-csrf-token").and_then(|value| value.to_str().ok()) != csrf.as_deref() {
+    // Browser same-origin GET requests do not need an Origin/CSRF header.
+    // Writes retain both the original origin gate and the locked login's CSRF.
+    if write && h.get("x-csrf-token").and_then(|value| value.to_str().ok()) != csrf.as_deref() {
         return Err(err(StatusCode::FORBIDDEN, "csrf_rejected"));
     }
-    if current_admin != Some(true) && s.controller_user_id != u.id {
-        return Err(err(StatusCode::FORBIDDEN, "controller_required"));
+    let owner: Uuid = sqlx::query_scalar("SELECT owner_id FROM rooms WHERE id=$1").bind(id).fetch_one(&mut *tx).await?;
+    if current_admin != Some(true) && s.controller_user_id != u.id && owner != u.id {
+        persistence::room_permissions::require(&mut tx, id, u.id, permission).await
+            .map_err(|_| err(StatusCode::FORBIDDEN, "controller_required"))?;
+        sqlx::query("SELECT set_config('rainsync.delegated_room',$1,true),set_config('rainsync.delegated_user',$2,true),set_config('rainsync.delegated_permission',$3,true)")
+            .bind(id.to_string()).bind(u.id.to_string()).bind(permission.as_str()).execute(&mut *tx).await?;
     };
     Ok(tx)
 }
@@ -510,75 +622,19 @@ pub(crate) async fn commit_controller(
     if !valid {
         return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
     }
+    let delegated: bool = sqlx::query_scalar("SELECT CASE WHEN NULLIF(current_setting('rainsync.delegated_room',true),'') IS NULL THEN true ELSE room_permission_allowed(current_setting('rainsync.delegated_room')::uuid,current_setting('rainsync.delegated_user')::uuid,current_setting('rainsync.delegated_permission')) END")
+        .fetch_one(&mut *tx).await?;
+    if !delegated { return Err(err(StatusCode::FORBIDDEN, "controller_required")); }
     tx.commit().await?;
     Ok(())
 }
 
-pub async fn invite(
-    State(app): State<App>,
-    h: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Value>> {
-    let mut tx = controller(&app, &h, id).await?;
-    let t = token();
-    sqlx::query("INSERT INTO invites VALUES($1,$2,now()+interval '24 hours',false)")
-        .bind(hash(&t))
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    commit_controller(tx, &h).await?;
-    Ok(Json(json!({"token":t,"room_id":id})))
-}
-pub async fn revoke_invite(
-    State(app): State<App>,
-    h: HeaderMap,
-    Path((id, t)): Path<(Uuid, String)>,
-) -> Result<Json<Value>> {
-    let mut tx = controller(&app, &h, id).await?;
-    sqlx::query("UPDATE invites SET revoked=true WHERE room_id=$1 AND token_hash=$2")
-        .bind(id)
-        .bind(hash(&t))
-        .execute(&mut *tx)
-        .await?;
-    commit_controller(tx, &h).await?;
-    Ok(Json(json!({"ok":true})))
-}
-#[derive(Deserialize)]
-pub struct Join {
-    token: String,
-}
-pub async fn join(
-    State(app): State<App>,
-    h: HeaderMap,
-    Path(id): Path<Uuid>,
-    Json(body): Json<Join>,
-) -> Result<Json<Value>> {
-    let u = auth(&app, &h, true).await?;
-    let mut tx = app.db.begin().await?;
-    persistence::room_lifecycle::lock_active(&mut tx, id)
-        .await
-        .map_err(room_lifecycle::gate_error)?;
-    let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM invites WHERE room_id=$1 AND token_hash=$2 AND expires_at>now() AND NOT revoked)").bind(id).bind(hash(&body.token)).fetch_one(&mut *tx).await?;
-    if !valid {
-        return Err(err(StatusCode::FORBIDDEN, "invalid_invite"));
-    }
-    let count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM room_members WHERE room_id=$1 AND user_id<>$2")
-            .bind(id)
-            .bind(u.id)
-            .fetch_one(&mut *tx)
-            .await?;
-    if count >= 10 {
-        return Err(err(StatusCode::CONFLICT, "room_full"));
-    }
-    sqlx::query("INSERT INTO room_members(room_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
-        .bind(id)
-        .bind(u.id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(Json(json!({"ok":true})))
-}
+#[path = "room_invites.rs"]
+mod invites_runtime;
+#[path = "room_permissions.rs"]
+mod permissions_runtime;
+pub use permissions_runtime::{permissions, set_permissions, revoke_permissions, kick};
+pub use invites_runtime::{invite, revoke_invite, join, list_invites};
 pub async fn playlist(
     State(app): State<App>,
     h: HeaderMap,

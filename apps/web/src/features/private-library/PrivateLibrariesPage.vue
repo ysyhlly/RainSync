@@ -18,6 +18,7 @@ const session = useSession(),
 const libraries = ref<Library[]>([]),
   selected = ref<LibraryDetail | null>(null),
   enabled = ref(false),
+  configurationLoaded = ref(false),
   busy = ref(false),
   error = ref(""),
   notice = ref("");
@@ -37,6 +38,9 @@ const sourceName = ref(""),
   attachId = ref("");
 const media = ref<Media[]>([]),
   search = ref(""),
+  appliedQuery = ref(""),
+  mediaBusy = ref(false),
+  mediaError = ref(""),
   cursor = ref<string>(),
   hasMore = ref(false),
   scans = ref<Record<string, ScanStatus>>({});
@@ -44,7 +48,9 @@ const shareMedia = ref(""),
   shareMode = ref<"room_members" | "library_members">("library_members"),
   minutes = ref(120);
 let serial = 0,
-  controller: AbortController | undefined;
+  controller: AbortController | undefined,
+  mediaSerial = 0,
+  mediaController: AbortController | undefined;
 function fail(e: unknown) {
   error.value = e instanceof Error ? e.message : String(e);
 }
@@ -52,10 +58,17 @@ async function loadList(signal?: AbortSignal) {
   const value = await api.list(signal);
   libraries.value = value.items;
   enabled.value = value.enabled;
+  configurationLoaded.value = true;
 }
 async function select(id: string) {
   const mine = ++serial;
   controller?.abort();
+  ++mediaSerial;
+  mediaController?.abort();
+  mediaBusy.value = false;
+  mediaError.value = "";
+  appliedQuery.value = "";
+  hasMore.value = false;
   controller = new AbortController();
   error.value = "";
   selected.value = null;
@@ -81,19 +94,42 @@ async function refresh() {
 }
 async function loadMedia(next = false) {
   const lib = selected.value;
-  if (!lib) return;
+  if (!lib || (next && (mediaBusy.value || !hasMore.value))) return;
   const id = lib.id,
-    mine = serial;
-  const values = await api.media(
-    id,
-    search.value,
-    next ? cursor.value : undefined,
-    controller?.signal,
-  );
-  if (mine !== serial || selected.value?.id !== id) return;
-  media.value = next ? [...media.value, ...values] : values;
-  cursor.value = values.at(-1)?.id;
-  hasMore.value = values.length === 50;
+    selection = serial,
+    mine = ++mediaSerial,
+    query = next ? appliedQuery.value : search.value;
+  mediaController?.abort();
+  mediaController = new AbortController();
+  const signal = controller
+    ? AbortSignal.any([controller.signal, mediaController.signal])
+    : mediaController.signal;
+  mediaBusy.value = true;
+  mediaError.value = "";
+  try {
+    const values = await api.media(
+      id,
+      query,
+      next ? cursor.value : undefined,
+      signal,
+    );
+    if (
+      mine !== mediaSerial ||
+      selection !== serial ||
+      signal.aborted ||
+      selected.value?.id !== id
+    )
+      return;
+    media.value = next ? [...media.value, ...values] : values;
+    appliedQuery.value = query;
+    cursor.value = values.at(-1)?.id;
+    hasMore.value = values.length === 50;
+  } catch (e) {
+    if (mine === mediaSerial && selection === serial && !signal.aborted)
+      mediaError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    if (mine === mediaSerial) mediaBusy.value = false;
+  }
 }
 async function run(
   action: () => Promise<unknown>,
@@ -215,14 +251,23 @@ watch(
   () => {
     ++serial;
     controller?.abort();
+    ++mediaSerial;
+    mediaController?.abort();
+    configurationLoaded.value = false;
+    enabled.value = false;
+    mediaBusy.value = false;
+    mediaError.value = "";
     libraries.value = [];
     selected.value = null;
     media.value = [];
   },
+  { flush: "sync" },
 );
 onBeforeUnmount(() => {
   ++serial;
   controller?.abort();
+  ++mediaSerial;
+  mediaController?.abort();
 });
 </script>
 <template>
@@ -236,7 +281,7 @@ onBeforeUnmount(() => {
       <RouterLink to="/library" class="button">浏览影片</RouterLink>
     </div>
     <Notice :message="error" error /><Notice :message="notice" />
-    <p v-if="!enabled" class="notice">
+    <p v-if="configurationLoaded && !enabled" class="notice">
       私人库创建与分享未开启。管理员可在部署配置中开启
       PRIVATE_LIBRARIES_ENABLED。
     </p>
@@ -432,13 +477,21 @@ onBeforeUnmount(() => {
         </form>
       </template>
       <template v-if="selected.permissions.browse">
-        <form
-          role="search"
-          @submit.prevent="run(() => loadMedia(false), '影片已更新', false)"
-        >
+        <form role="search" @submit.prevent="loadMedia(false)">
           <label>搜索当前库<input v-model="search" type="search" /></label
-          ><button :disabled="busy">搜索</button>
+          ><button :disabled="mediaBusy">搜索</button>
         </form>
+        <Notice :message="mediaError" error />
+        <p v-if="mediaBusy" role="status">正在加载当前库的影片…</p>
+        <p
+          v-if="media.length && (search !== appliedQuery || mediaError)"
+          class="helper"
+          role="status"
+        >
+          仍显示{{
+            appliedQuery ? `“${appliedQuery}”搜索` : "全部影片"
+          }}的已加载结果。 输入新关键词后点击搜索；加载更多沿用当前结果的查询。
+        </p>
         <ul class="private-media-list">
           <li v-for="item in media" :key="item.id">
             <span>{{ item.title }}</span
@@ -456,12 +509,8 @@ onBeforeUnmount(() => {
             </button>
           </li>
         </ul>
-        <button
-          v-if="hasMore"
-          :disabled="busy"
-          @click="run(() => loadMedia(true), '下一页已加载', false)"
-        >
-          下一页
+        <button v-if="hasMore" :disabled="mediaBusy" @click="loadMedia(true)">
+          加载更多
         </button>
       </template>
       <form

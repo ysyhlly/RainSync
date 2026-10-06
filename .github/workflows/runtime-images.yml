@@ -11,7 +11,17 @@ concurrency:
 jobs:
   runtime-images:
     if: startsWith(github.ref, 'refs/heads/codex/rainsync-deploy-')
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            tag_suffix: ''
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            tag_suffix: '-arm64'
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -23,24 +33,31 @@ jobs:
       - name: Build, probe and package only the three runtime images
         env:
           SOURCE_COMMIT: ${{ github.sha }}
+          PLATFORM: linux/${{ matrix.architecture }}
+          TAG_SUFFIX: ${{ matrix.tag_suffix }}
+          SOURCE_BINDING_FILE: ${{ runner.temp }}/rainsync-source-binding.json
           OUTPUT_DIRECTORY: ${{ runner.temp }}/rainsync-runtime-artifact
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
-          docker build --platform linux/amd64 --pull \
+          python3 deploy/runtime-images.py source --source "$SOURCE_COMMIT" > "$SOURCE_BINDING_FILE"
+          SOURCE_BINDING_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["label_sha256"])' "$SOURCE_BINDING_FILE")
+          docker build --platform "$PLATFORM" --pull \
             --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \
-            -f deploy/Dockerfile -t "rainsync-backend:$SOURCE_COMMIT" .
-          docker build --platform linux/amd64 --pull \
+            --label "org.rainsync.runtime-source-binding=$SOURCE_BINDING_SHA" \
+            -f deploy/Dockerfile -t "rainsync-backend:$SOURCE_COMMIT$TAG_SUFFIX" .
+          docker build --platform "$PLATFORM" --pull \
             --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \
-            -f deploy/Dockerfile.web -t "rainsync-web:$SOURCE_COMMIT" .
-          docker pull --platform linux/amd64 postgres:17
-          docker tag postgres:17 "rainsync-postgres:17-$SOURCE_COMMIT"
+            --label "org.rainsync.runtime-source-binding=$SOURCE_BINDING_SHA" \
+            -f deploy/Dockerfile.web -t "rainsync-web:$SOURCE_COMMIT$TAG_SUFFIX" .
+          docker pull --platform "$PLATFORM" postgres:17
+          docker tag postgres:17 "rainsync-postgres:17-$SOURCE_COMMIT$TAG_SUFFIX"
           python3 deploy/runtime-images.py package \
-            --source "$SOURCE_COMMIT" --directory "$OUTPUT_DIRECTORY"
+            --source "$SOURCE_COMMIT" --platform "$PLATFORM" --directory "$OUTPUT_DIRECTORY"
       - name: Upload verified offline runtime bundle
         uses: actions/upload-artifact@v4
         with:
-          name: rainsync-runtime-linux-amd64-${{ github.sha }}
+          name: rainsync-runtime-linux-${{ matrix.architecture }}-${{ github.sha }}
           path: ${{ runner.temp }}/rainsync-runtime-artifact/*
           if-no-files-found: error
           retention-days: 7

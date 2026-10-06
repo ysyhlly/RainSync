@@ -42,12 +42,26 @@ function measureMini() {
   emit(
     "miniResize",
     !props.full && !fullscreen.value && r.room
+      && !emptyRoom.value
       ? Math.ceil(host.value?.getBoundingClientRect().height ?? 0)
       : 0,
   );
 }
 const chrome = createPlayerChrome(matchMedia("(pointer: coarse)").matches);
 const { visible, fullscreen, hideCursor } = chrome;
+const emptyRoom = computed(() =>
+  !!r.state && !r.state.media_id && r.connected &&
+  !preparationVisible.value && !r.waiting && !r.blocked && !r.error && !r.recoveryLabel,
+);
+const preparationVisible = computed(
+  () =>
+    !!r.preparation &&
+    r.preparation.phase !== "idle" &&
+    !(
+      r.preparation.phase === "preparing" && r.recoveryState === "calibrating"
+    ) &&
+    (r.preparation.phase !== "ready" || r.waiting),
+);
 watch(
   () => r.preparation?.phase,
   (phase) => {
@@ -61,7 +75,7 @@ watch(
   { immediate: true },
 );
 watch(
-  () => [props.full, fullscreen.value, miniCollapsed.value, r.room?.id],
+  () => [props.full, fullscreen.value, miniCollapsed.value, r.room?.id, emptyRoom.value],
   () => {
     void nextTick().then(measureMini);
   },
@@ -106,15 +120,6 @@ function closeSubtitles() {
   r.subtitleIndex = undefined;
   r.applySubtitles();
 }
-const preparationVisible = computed(
-  () =>
-    !!r.preparation &&
-    r.preparation.phase !== "idle" &&
-    !(
-      r.preparation.phase === "preparing" && r.recoveryState === "calibrating"
-    ) &&
-    (r.preparation.phase !== "ready" || r.waiting),
-);
 let keyboard = false,
   settingsOpen = false,
   selectOpen = false;
@@ -212,6 +217,8 @@ onBeforeUnmount(() => {
         'chrome-visible': visible,
         'cursor-hidden': hideCursor,
         'mini-collapsed': !full && !fullscreen && miniCollapsed,
+        'empty-room': emptyRoom,
+        'has-room-media': !!r.state?.media_id,
       },
     ]"
     aria-label="房间播放器"
@@ -250,11 +257,11 @@ onBeforeUnmount(() => {
         :cues="r.platformDanmakuCues"
         :enabled="r.platformDanmakuEnabled"
         :video="element"
-        :can-seek="r.owner && r.connected && !r.live && !!r.state?.media_id"
+        :can-seek="r.can('seek') && r.connected && !r.live && !!r.state?.media_id"
         @seek="
           (at) => {
             if (
-              r.owner &&
+              r.can('seek') &&
               r.connected &&
               !r.live &&
               r.state?.media_id &&
@@ -266,8 +273,11 @@ onBeforeUnmount(() => {
       />
       <div v-if="!r.state?.media_id" class="player-empty">
         <AppIcon name="movie" :size="40" />
-        <p>尚未选择影片</p>
-        <RouterLink v-if="full" to="/library">前往媒体库</RouterLink>
+        <p>{{ !r.state ? '正在读取房间内容…' : !r.roomActive ? '房间当前为只读状态' : '尚未选择影片' }}</p>
+        <p v-if="full && r.state && r.roomActive" class="helper">
+          {{ r.can('change_media') ? '选择一部影片，开始一起观看。' : '等待有控制权限的成员选择影片。' }}
+        </p>
+        <RouterLink v-if="full && r.can('change_media')" class="button primary" to="/library">从媒体库选片</RouterLink>
       </div>
       <button
         v-if="r.blocked"
@@ -303,7 +313,7 @@ onBeforeUnmount(() => {
         :room="r.room?.name ?? ''"
         :connected="r.connected"
         :stopped="r.connectionStopped"
-        :owner="r.owner"
+        :owner="r.can('play') || r.can('pause') || r.can('seek') || r.can('set_rate') || r.can('change_media')"
       />
       <div
         class="player-chrome"
@@ -313,6 +323,7 @@ onBeforeUnmount(() => {
       >
         <PlaybackControls
           :mini="!full && !fullscreen"
+          :fullscreen="fullscreen"
           @menu-open="menu('select', $event)"
           @dragging="chrome.setDragging"
           @fullscreen="toggleFullscreen"
@@ -351,45 +362,10 @@ onBeforeUnmount(() => {
     </p>
     <div v-show="!full && !fullscreen" class="player-caption">
       <div>
-        <h2>{{ r.currentTitle }}</h2>
-        <p v-if="!miniCollapsed">{{ r.room?.name }}</p>
-        <template v-if="!full && !fullscreen && miniCollapsed">
-          <span class="mini-status" role="status">{{
-            r.preparation?.phase === "failed"
-              ? "本机播放失败"
-              : r.recoveryLabel || r.room?.name
-          }}</span>
-          <small
-            v-if="r.preparation?.failure?.requestId"
-            class="mini-diagnostic"
-            >诊断编号：{{ r.preparation.failure.requestId }}</small
-          >
-          <button
-            v-if="
-              r.preparation?.phase === 'failed' &&
-              r.preparation.failure?.retryable
-            "
-            :disabled="!r.connected || !r.roomActive"
-            @click="r.run(r.loadMedia)"
-          >
-            重新发起播放
-          </button>
-          <RouterLink
-            v-if="
-              r.preparation?.phase === 'failed' &&
-              [
-                'NATIVE_PLATFORM_ACCESS_DENIED',
-                'NATIVE_PLATFORM_ANONYMOUS_UNSUPPORTED',
-                'PLATFORM_ACCOUNT_CHANGED',
-                'PLATFORM_ACCOUNT_EXPIRED',
-              ].includes(r.preparation.failure?.code ?? '')
-            "
-            to="/account/profile"
-            >检查平台账号</RouterLink
-          >
-        </template>
+        <h2>{{ emptyRoom ? r.room?.name : r.currentTitle }}</h2>
+        <p v-if="!miniCollapsed && !emptyRoom">{{ r.room?.name }}</p>
         <PlaybackPreparation
-          v-if="!full && !fullscreen && !miniCollapsed && preparationVisible"
+          v-if="!full && !fullscreen && preparationVisible"
           compact
           :state="r.preparation"
           :can-retry="r.connected && r.roomActive"
@@ -397,17 +373,17 @@ onBeforeUnmount(() => {
           @retry="r.run(r.loadMedia)"
         />
         <span
-          v-else-if="!full && !fullscreen && !miniCollapsed && r.recoveryLabel"
+          v-else-if="!full && !fullscreen && (r.recoveryLabel || miniCollapsed || emptyRoom)"
+          class="mini-status"
           role="status"
-          >{{ r.recoveryLabel }}</span
-        >
+        >{{ emptyRoom ? '尚未选择影片' : r.recoveryLabel || r.room?.name }}</span>
       </div>
       <RouterLink class="button return-room" :to="'/rooms/' + r.room?.id"
         >返回房间<AppIcon name="next"
       /></RouterLink>
     </div>
     <button
-      v-if="!full && !fullscreen"
+      v-if="!full && !fullscreen && !emptyRoom"
       class="icon-button mini-toggle"
       :aria-label="miniCollapsed ? '展开播放器' : '折叠播放器'"
       :aria-expanded="!miniCollapsed"

@@ -237,14 +237,14 @@ onBeforeUnmount(() => {
           @subtitle-change="subtitleChanged"
         />
         <PlatformTextSettings
-          v-if="r.nativePlatform && !r.live"
+          v-if="r.nativePlatform"
           :tracks="r.platformSubtitleTracks"
           :subtitle-id="r.platformSubtitleId"
           :subtitle-status="r.platformSubtitleStatus"
           :danmaku-status="r.platformDanmakuStatus"
           :danmaku-enabled="r.platformDanmakuEnabled"
           :error="r.platformTextError"
-          :live="r.platformTextLive"
+          :live="r.live || r.platformTextLive"
           :live-mode="r.platformLiveDanmakuMode"
           @live-danmaku-change="r.setPlatformLiveDanmaku"
           @subtitle-change="r.selectPlatformSubtitle"

@@ -37,7 +37,7 @@ const url = ref(""),
   selected = ref<string[]>([]),
   outcomes = ref<PlatformImportOutcome[]>([]);
 const canControl = computed(
-    () => r.roomActive && r.owner && r.connected && !!r.room,
+    () => r.roomActive && r.can("queue") && r.connected && !!r.room,
   ),
   outcomeByKey = computed(() => new Map(outcomes.value.map((o) => [o.key, o]))),
   retryKeys = computed(() =>
@@ -287,7 +287,7 @@ function selectAll() {
       Bilibili 番剧与课程仅支持平台明确允许的完整、无 DRM 播放；
       合集元数据不能替代每位观众独立的完整观看权限。
     </p>
-    <p v-if="!r.owner" class="helper">由房主导入并选择播放。</p>
+    <p v-if="!r.can('queue')" class="helper">由房主导入并选择播放。</p>
     <button v-if="busy" @click="cancelWork">停止等待</button>
     <Notice :message="error" error />
     <div v-if="preview" class="confirm-panel">

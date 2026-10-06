@@ -1,0 +1,19 @@
+# Opt-in overlay. Validate with the same project/env selectors as the base stack.
+# Server output storage is required when this overlay is selected.
+services:
+  server:
+    environment:
+      RAINSYNC_COMPUTE_OUTPUT_ROOT: /compute-artifacts
+      RAINSYNC_COMPUTE_TOTAL_BYTES: ${RAINSYNC_COMPUTE_TOTAL_BYTES:-1073741824}
+      RAINSYNC_P2P_ENABLED: ${RAINSYNC_P2P_ENABLED:-0}
+      RAINSYNC_CONTROL_CLUSTER: ${RAINSYNC_CONTROL_CLUSTER:-0}
+      RAINSYNC_CONTROL_NODE_ID: ${RAINSYNC_CONTROL_NODE_ID:-}
+      RAINSYNC_CONTROL_ROLE: ${RAINSYNC_CONTROL_ROLE:-media}
+      RAINSYNC_CONTROL_NODES: ${RAINSYNC_CONTROL_NODES:-}
+      RAINSYNC_CONTROL_PEER_TOKEN: ${RAINSYNC_CONTROL_PEER_TOKEN:-}
+    volumes:
+      - type: bind
+        source: ${RAINSYNC_COMPUTE_STORAGE_PATH:?Set a prepared separate compute output directory}
+        target: /compute-artifacts
+        bind:
+          create_host_path: false

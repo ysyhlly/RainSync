@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { ref, onBeforeUnmount, nextTick } from "vue";
-import { useRouter } from "vue-router";
+import { computed, ref, watch, onBeforeUnmount, nextTick } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { useSession } from "./session.store";
 import { RequestFailure } from "../../errors";
 import { validateAccount } from "./account-rules";
 import Notice from "../../shared/ui/Notice.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
+import { authenticationLocation, safeRedirect } from "../../app/navigation";
 const session = useSession(),
   router = useRouter(),
+  route = useRoute(),
   step = ref(1),
   code = ref(""),
   username = ref(""),
@@ -20,6 +22,29 @@ const session = useSession(),
   uncertain = ref(false),
   expires = ref<number>(),
   retrySeconds = ref(0);
+const fieldError = ref<{ field: string; message: string } | null>(null);
+watch([code, username, nickname, password, confirm], (values, previous) => {
+  if (!fieldError.value) return;
+  const index = [
+    "code",
+    "username",
+    "display_name",
+    "password",
+    "confirm",
+  ].indexOf(fieldError.value.field);
+  if (values[index] !== previous[index]) {
+    if (error.value === fieldError.value.message) error.value = "";
+    fieldError.value = null;
+  }
+});
+const returnTo = computed(() => safeRedirect(route.query.redirect));
+const loginLocation = computed(() =>
+  authenticationLocation(
+    "/login",
+    returnTo.value,
+    route.query.notice === "session-expired" || session.expired,
+  ),
+);
 let retryAt = 0,
   alive = true;
 const authentication = new AbortController();
@@ -76,7 +101,7 @@ async function complete() {
   password.value = "";
   confirm.value = "";
   code.value = "";
-  await router.replace("/rooms");
+  await router.replace(returnTo.value);
 }
 async function confirmSession() {
   try {
@@ -96,6 +121,7 @@ async function confirmSession() {
 async function register() {
   if (busy.value || retrySeconds.value || uncertain.value) return;
   error.value = "";
+  fieldError.value = null;
   const invalid = validateAccount(
     username.value,
     password.value,
@@ -103,11 +129,13 @@ async function register() {
   );
   if (invalid) {
     error.value = invalid.message;
+    fieldError.value = invalid;
     await focus("register-" + invalid.field);
     return;
   }
   if (password.value !== confirm.value) {
     error.value = "两次输入的密码不一致";
+    fieldError.value = { field: "confirm", message: error.value };
     await focus("register-confirm");
     return;
   }
@@ -128,11 +156,14 @@ async function register() {
     if (!alive) return;
     if (e instanceof RequestFailure) {
       failure(e);
-      if (e.code === "USERNAME_TAKEN") await focus("register-username");
-      else if (e.code === "REGISTRATION_INVITE_INVALID") {
+      if (e.code === "USERNAME_TAKEN") {
+        fieldError.value = { field: "username", message: error.value };
+        await focus("register-username");
+      } else if (e.code === "REGISTRATION_INVITE_INVALID") {
         step.value = 1;
         password.value = "";
         confirm.value = "";
+        fieldError.value = { field: "code", message: error.value };
         await focus("register-code");
       } else if (e.code === "ALREADY_AUTHENTICATED") {
         uncertain.value = true;
@@ -171,7 +202,7 @@ async function recover() {
   <section class="auth-page registration-page">
     <div class="auth-top">
       <RouterLink class="brand" to="/">RainSync</RouterLink
-      ><RouterLink to="/login">返回登录</RouterLink>
+      ><RouterLink :to="loginLocation">返回登录</RouterLink>
     </div>
     <div class="registration-panel">
       <aside class="registration-steps">
@@ -187,6 +218,9 @@ async function recover() {
           </li>
         </ol>
         <p>注册邀请码与房间邀请相互独立。</p>
+        <p v-if="returnTo.startsWith('/rooms/')">
+          注册后返回房间页面，请确认后再加入房间。
+        </p>
       </aside>
       <div class="registration-form">
         <form v-if="step === 1" @submit.prevent="validate">
@@ -200,7 +234,11 @@ async function recover() {
             placeholder="RS-…"
             required
             :disabled="busy"
-          /><Notice :message="error" error /><button
+            :aria-invalid="fieldError?.field === 'code'"
+            :aria-describedby="
+              fieldError?.field === 'code' ? 'register-error' : undefined
+            "
+          /><Notice id="register-error" :message="error" error /><button
             class="primary"
             :disabled="busy || retrySeconds > 0"
           >
@@ -231,7 +269,12 @@ async function recover() {
             required
             maxlength="80"
             :disabled="busy || uncertain"
-            aria-describedby="account-help"
+            :aria-invalid="fieldError?.field === 'username'"
+            :aria-describedby="
+              fieldError?.field === 'username'
+                ? 'account-help register-error'
+                : 'account-help'
+            "
           />
           <p id="account-help" class="helper">
             唯一且注册后不可修改。支持字母、数字、_、- 和 .。
@@ -242,7 +285,12 @@ async function recover() {
             v-model="nickname"
             autocomplete="nickname"
             :disabled="busy || uncertain"
-            aria-describedby="nickname-help"
+            :aria-invalid="fieldError?.field === 'display_name'"
+            :aria-describedby="
+              fieldError?.field === 'display_name'
+                ? 'nickname-help register-error'
+                : 'nickname-help'
+            "
           />
           <p id="nickname-help" class="helper">
             最多50个字符，支持中文与Emoji，可以重复或稍后修改。留空显示登录账号。
@@ -256,7 +304,12 @@ async function recover() {
               autocomplete="new-password"
               required
               :disabled="busy || uncertain"
-              aria-describedby="password-help"
+              :aria-invalid="fieldError?.field === 'password'"
+              :aria-describedby="
+                fieldError?.field === 'password'
+                  ? 'password-help register-error'
+                  : 'password-help'
+              "
             /><button type="button" :aria-pressed="show" @click="show = !show">
               {{ show ? "隐藏" : "显示" }}
             </button>
@@ -272,7 +325,11 @@ async function recover() {
             autocomplete="new-password"
             required
             :disabled="busy || uncertain"
-          /><Notice :message="error" error /><button
+            :aria-invalid="fieldError?.field === 'confirm'"
+            :aria-describedby="
+              fieldError?.field === 'confirm' ? 'register-error' : undefined
+            "
+          /><Notice id="register-error" :message="error" error /><button
             v-if="!uncertain"
             class="primary"
             :disabled="busy || retrySeconds > 0"

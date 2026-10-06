@@ -10,6 +10,7 @@ import Notice from "../../shared/ui/Notice.vue";
 import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import PlatformAccountPanel from "./PlatformAccountPanel.vue";
+import AccountExitPanel from "./AccountExitPanel.vue";
 import ShortPlatformAccountPanel from "./ShortPlatformAccountPanel.vue";
 import YoutubePlatformAccountPanel from "./YoutubePlatformAccountPanel.vue";
 import AvatarCropDialog from "./avatar/AvatarCropDialog.vue";
@@ -298,6 +299,7 @@ onBeforeUnmount(() => {
     <ShortPlatformAccountPanel provider="douyin" />
     <ShortPlatformAccountPanel provider="tiktok" />
     <YoutubePlatformAccountPanel />
+    <AccountExitPanel />
     <AvatarCropDialog
       v-if="selected"
       :image="selected"

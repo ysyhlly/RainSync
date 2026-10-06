@@ -1,10 +1,13 @@
 use protocol::{Action, Command, PlaybackStatus, RoomState};
 use room_core::diagnostics::{
-    Envelope, Event, FORMAT_VERSION, LEGACY_FORMAT_VERSION, LEGACY_REDUCER_VERSION, Lifecycle,
-    LifecycleState, LifecycleTransition, Operation, REDUCER_VERSION, ResolvedMedia, SafeCommand,
-    Window, decode_envelope, decode_window, verify,
+    Envelope, Event, LEGACY_FORMAT_VERSION, LEGACY_REDUCER_VERSION, Lifecycle, LifecycleState,
+    LifecycleTransition, Operation, ResolvedMedia, SafeCommand, Window, decode_envelope,
+    decode_window, verify,
 };
 use uuid::Uuid;
+
+const FORMAT_VERSION: u8 = 2;
+const REDUCER_VERSION: &str = "room-diagnostics/2";
 
 fn state() -> RoomState {
     RoomState {
@@ -55,6 +58,7 @@ fn event(
             event_id: Uuid::from_u128(100 + u128::from(before.revision)),
             actor_id: actor,
             actor_is_admin: false,
+            actor_permission: None,
             before: before.clone(),
             lifecycle_before: from,
             lifecycle_after: to,
@@ -268,8 +272,8 @@ fn new_operations_cannot_be_smuggled_under_legacy_or_future_versions() {
     bundle.format_version = LEGACY_FORMAT_VERSION;
     bundle.reducer_version = LEGACY_REDUCER_VERSION.into();
     assert!(!verify(&bundle).all_transitions_verified);
-    bundle.format_version = 3;
-    bundle.reducer_version = "room-diagnostics/3".into();
+    bundle.format_version = room_core::diagnostics::FORMAT_VERSION + 1;
+    bundle.reducer_version = format!("room-diagnostics/{}", bundle.format_version);
     assert!(decode_window(&serde_json::to_vec(&bundle).unwrap()).is_err());
 }
 

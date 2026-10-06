@@ -1,12 +1,34 @@
 export function safeRedirect(value: unknown) {
-  return typeof value === "string" &&
-    value.startsWith("/") &&
-    !value.startsWith("//") &&
-    !value.includes("\\") &&
-    !value.startsWith("/login") &&
-    !value.startsWith("/register")
-    ? value
-    : "/rooms";
+  if (typeof value !== "string" || !value.startsWith("/")) return "/rooms";
+  try {
+    const path = decodeURIComponent(value.split(/[?#]/, 1)[0]!);
+    if (
+      path.startsWith("//") ||
+      value.includes("\\") ||
+      path.includes("\\") ||
+      /[\u0000-\u0020\u007f]/.test(value) ||
+      /[\u0000-\u0020\u007f]/.test(path) ||
+      path.startsWith("/login") ||
+      path.startsWith("/register")
+    )
+      return "/rooms";
+    return value;
+  } catch {
+    return "/rooms";
+  }
+}
+export function authenticationLocation(
+  path: "/login" | "/register",
+  target: unknown,
+  expired = false,
+) {
+  return {
+    path,
+    query: {
+      redirect: safeRedirect(target),
+      ...(expired ? { notice: "session-expired" } : {}),
+    },
+  };
 }
 export const watchNavigation = [
   { to: "/rooms", label: "放映室", icon: "rooms" },

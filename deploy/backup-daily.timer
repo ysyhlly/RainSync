@@ -1,0 +1,11 @@
+[Unit]
+Description=RainSync daily backup at 02:00 UTC
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 UTC
+RandomizedDelaySec=0
+Persistent=true
+Unit=backup-daily.service
+
+[Install]
+WantedBy=timers.target

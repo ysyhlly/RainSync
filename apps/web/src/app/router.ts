@@ -13,6 +13,7 @@ import SourcesPage from "../features/admin/SourcesPage.vue";
 import AgentsPage from "../features/admin/AgentsPage.vue";
 import RegistrationInvitesPage from "../features/admin/RegistrationInvitesPage.vue";
 import CreateUserPage from "../features/admin/CreateUserPage.vue";
+import { authenticationLocation, safeRedirect } from "./navigation";
 export function createApplicationRouter(base = "/") {
   const router = createRouter({
     history: createWebHistory(base),
@@ -78,8 +79,8 @@ export function createApplicationRouter(base = "/") {
     await session.restore();
     if (session.startupError) return true;
     if (!session.user && !to.meta.public)
-      return { path: "/login", query: { redirect: to.fullPath } };
-    if (session.user && to.meta.public) return "/rooms";
+      return authenticationLocation("/login", to.fullPath, session.expired);
+    if (session.user && to.meta.public) return safeRedirect(to.query.redirect);
     if (to.path.startsWith("/admin") && !session.user?.admin)
       return { path: "/rooms", query: { notice: "admin-required" } };
     return true;

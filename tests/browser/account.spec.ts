@@ -52,8 +52,17 @@ test("two-step registration preserves password spaces and auto logs in without j
   await page.getByLabel("确认密码", { exact: true }).fill("中文password");
   await page.getByRole("button", { name: "注册并登录" }).click();
   await expect(page.getByRole("alert")).toContainText("不支持中文");
+  await expect(page.getByLabel("密码", { exact: true })).toBeFocused();
+  await expect(page.getByLabel("密码", { exact: true })).toHaveAttribute(
+    "aria-invalid",
+    "true",
+  );
   expect(submitted).toBeUndefined();
   await page.getByLabel("密码", { exact: true }).fill(" pass 12");
+  await expect(page.getByLabel("密码", { exact: true })).toHaveAttribute(
+    "aria-invalid",
+    "false",
+  );
   await page.getByLabel("确认密码", { exact: true }).fill(" pass 12");
   await page.getByRole("button", { name: "注册并登录" }).click();
   await expect(

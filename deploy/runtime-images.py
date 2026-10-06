@@ -23,6 +23,8 @@ MAX_IMAGE_BYTES = 1536 * 1024 * 1024
 TAR_OVERHEAD_BYTES = 32 * 1024 * 1024
 ARCHIVE_NAME = "runtime-images.tar.gz"
 ROLES = ("backend", "web", "postgres")
+PLATFORMS = ("linux/amd64", "linux/arm64")
+SOURCE_LABEL = "org.rainsync.runtime-source-binding"
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 LOGIN_CONTRACT = {"schema_version": 1, "contract": "media-login-binding-v1",
@@ -40,30 +42,71 @@ def source_contract(role):
             "methods": ["GET", "HEAD"], "default": "no-follow", "role": role}
 
 
-def tags(source):
-    return {"backend": "rainsync-backend:" + source, "web": "rainsync-web:" + source,
-            "postgres": "rainsync-postgres:17-" + source}
+def architecture(platform):
+    require(platform in PLATFORMS, "unsupported platform/architecture")
+    return platform.split("/")[1]
+
+
+def tags(source, platform="linux/amd64"):
+    suffix = "" if architecture(platform) == "amd64" else "-arm64"
+    return {"backend": "rainsync-backend:" + source + suffix, "web": "rainsync-web:" + source + suffix,
+            "postgres": "rainsync-postgres:17-" + source + suffix}
+
+
+def binding_digest(binding):
+    return hashlib.sha256(json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def source_binding(source):
+    """Bind a clean exact checkout, lockfiles and the recipes actually used."""
+    require(COMMIT.fullmatch(source or ""), "invalid source commit")
+    def git(*args):
+        return subprocess.check_output(["git", *args], text=True, timeout=30).strip()
+    require(git("rev-parse", "HEAD") == source, "checkout differs from exact source commit")
+    require(not git("status", "--porcelain", "--untracked-files=normal"), "source changes cannot produce a source-bound bundle")
+    paths = ("Cargo.lock", "package-lock.json", "deploy/Dockerfile", "deploy/Dockerfile.web", ".dockerignore")
+    files = {}
+    for name in paths:
+        require(not Path(name).is_symlink() and Path(name).is_file(), "missing/linked build input")
+        files[name] = sha_file(Path(name))
+    return {"source_commit": source, "git_tree": git("rev-parse", "HEAD^{tree}"), "files_sha256": files,
+            "build_kind": "development-measured", "runtime_acceptance": False}
+
+
+def validate_binding(binding, source):
+    require(isinstance(binding, dict) and binding.get("source_commit") == source, "source binding mismatch")
+    require(COMMIT.fullmatch(binding.get("git_tree", "")), "invalid source tree identity")
+    files = binding.get("files_sha256", {})
+    require(set(files) == {"Cargo.lock", "package-lock.json", "deploy/Dockerfile", "deploy/Dockerfile.web", ".dockerignore"}
+            and all(SHA.fullmatch(value or "") for value in files.values()), "missing build/lockfile hashes")
+    require(binding.get("build_kind") == "development-measured" and binding.get("runtime_acceptance") is False,
+            "bounded runtime bundle cannot claim pinned release or real-device acceptance")
 
 
 def integer(value):
     return type(value) is int and value > 0
 
 
-def validate_manifest(manifest, source):
+def validate_manifest(manifest, source, platform="linux/amd64"):
     require(COMMIT.fullmatch(source or ""), "expected source must be an exact 40-character Git SHA")
-    require(manifest.get("schema_version") == 1, "unsupported manifest schema")
+    arch = architecture(platform)
+    schema = manifest.get("schema_version")
+    require(type(schema) is int and schema in (1, 2), "unsupported manifest schema")
     require(manifest.get("source_commit") == source, "source commit mismatch")
-    require(manifest.get("platform") == "linux/amd64", "wrong platform/architecture")
+    require(manifest.get("platform") == platform and (schema == 2 or platform == "linux/amd64"), "wrong platform/architecture")
+    if schema == 2:
+        binding = manifest.get("build_binding")
+        validate_binding(binding, source)
     images = manifest.get("images", {})
     require(set(images) == set(ROLES), "exactly backend, web and postgres runtime images required")
     identities = []
     for role in ROLES:
         image = images[role]
-        require(image.get("tag") == tags(source)[role], "source-bound image tag mismatch: " + role)
+        require(image.get("tag") == tags(source, platform)[role], "source-bound image tag mismatch: " + role)
         image_id = image.get("image_id", "")
         require(image_id.startswith("sha256:") and SHA.fullmatch(image_id[7:]), "invalid image ID: " + role)
         identities.append(image_id)
-        require(image.get("os") == "linux" and image.get("architecture") == "amd64", "wrong image architecture: " + role)
+        require(image.get("os") == "linux" and image.get("architecture") == arch, "wrong image architecture: " + role)
         require(integer(image.get("size_bytes")), "invalid image size: " + role)
         require(isinstance(image.get("repo_tags"), list) and image["tag"] in image["repo_tags"], "missing measured image tag")
         digests = image.get("repo_digests")
@@ -71,6 +114,8 @@ def validate_manifest(manifest, source):
         if role == "postgres":
             require(any(d.startswith("postgres@sha256:") or d.startswith("docker.io/library/postgres@sha256:") for d in digests), "PostgreSQL requires measured official pull RepoDigest")
         require(image.get("source_revision") == (source if role != "postgres" else None), "wrong image source revision: " + role)
+        if schema == 2 and role != "postgres":
+            require(image.get("source_binding_sha256") == binding_digest(binding), "image/build input binding mismatch: " + role)
     require(len(set(identities)) == 3, "runtime image IDs must be distinct")
     total = sum(images[r]["size_bytes"] for r in ROLES)
     require(manifest.get("total_image_size_bytes") == total, "image size sum mismatch")
@@ -86,6 +131,13 @@ def validate_manifest(manifest, source):
     require(evidence.get("worker_source") == source_contract("worker"), "missing offline Worker source contract")
     require(evidence.get("ffmpeg") == {"encode": "passed", "probe": "passed", "decode": "passed", "codec": "h264", "width": 64, "height": 64}, "missing actual FFmpeg runtime evidence")
     require(evidence.get("web_config") == "passed", "missing web configuration check")
+    if schema == 2:
+        ffmpeg = evidence.get("ffmpeg_build", {})
+        require(isinstance(ffmpeg.get("package_version"), str) and re.fullmatch(r"[0-9][A-Za-z0-9.+:~_-]{0,100}", ffmpeg["package_version"]), "missing measured FFmpeg package version")
+        proof = ffmpeg.get("proof", "")
+        require(isinstance(proof, str) and len(proof) <= 65536 and "ffmpeg version " in proof and "ffprobe version " in proof
+                and proof.splitlines()[0] == ffmpeg["package_version"]
+                and hashlib.sha256(proof.encode()).hexdigest() == ffmpeg.get("proof_sha256"), "missing measured FFmpeg build proof")
     return manifest
 
 
@@ -193,9 +245,11 @@ def verify_archive(path, manifest, *, content=None):
         require(config_path in small, "unsupported Docker-save layout: missing/big image config; qualify actual CI output")
         require(records[config_path]["sha256"] == expected["image_id"][7:], "archive image ID mismatch: " + role)
         config = read_json(small[config_path])
-        require(config.get("os") == "linux" and config.get("architecture") == "amd64", "archive architecture mismatch")
+        require(config.get("os") == "linux" and config.get("architecture") == architecture(manifest["platform"]), "archive architecture mismatch")
         revision = (config.get("config") or {}).get("Labels", {}) or {}
         require(revision.get("org.opencontainers.image.revision") == expected["source_revision"], "archive source revision mismatch")
+        if manifest["schema_version"] == 2 and role != "postgres":
+            require(revision.get(SOURCE_LABEL) == expected["source_binding_sha256"], "archive build input binding mismatch")
         diff_ids = config.get("rootfs", {}).get("diff_ids")
         layers = entry.get("Layers")
         require(config.get("rootfs", {}).get("type") == "layers" and isinstance(diff_ids, list) and isinstance(layers, list) and len(diff_ids) == len(layers), "archive layer/config count mismatch")
@@ -206,7 +260,7 @@ def verify_archive(path, manifest, *, content=None):
     require(selected == set(ROLES), "missing runtime image")
     # SHA256 binds every byte to the exact Actions artifact. Do not implement an
     # alternate OCI/layer importer here; Docker owns loading its own save format.
-    return {"result": "passed", "archive_sha256": archive["sha256"], "source_commit": manifest["source_commit"], "platform": "linux/amd64", "images": {r: manifest["images"][r]["image_id"] for r in ROLES}}
+    return {"result": "passed", "archive_sha256": archive["sha256"], "source_commit": manifest["source_commit"], "platform": manifest["platform"], "images": {r: manifest["images"][r]["image_id"] for r in ROLES}}
 
 
 def docker(args, timeout=60):
@@ -275,7 +329,7 @@ def verify_oci_image(observed, expected, proof, records, small):
         require(isinstance(children, list) and len(children) == 1, "only the shipped single-platform OCI wrapper is supported")
         descriptor = children[0]
         platform = descriptor.get("platform")
-        require(platform is None or platform.get("os") == "linux" and platform.get("architecture") == "amd64", "OCI wrapper architecture mismatch")
+        require(platform is None or platform.get("os") == expected["os"] and platform.get("architecture") == expected["architecture"], "OCI wrapper architecture mismatch")
         path = blob(descriptor)
         packed_size += descriptor["size"]
         require(path in small, "oversized OCI manifest")
@@ -312,6 +366,8 @@ def verify_daemon(manifest, *, content=None):
         require(integer(observed.get("Size")), "invalid daemon image size")
         labels = observed.get("Config", {}).get("Labels", {}) or {}
         require(labels.get("org.opencontainers.image.revision") == expected["source_revision"], "daemon source revision mismatch")
+        if manifest["schema_version"] == 2 and role != "postgres":
+            require(labels.get(SOURCE_LABEL) == expected["source_binding_sha256"], "daemon build input binding mismatch")
         if content is not None:
             require(observed.get("RootFS", {}).get("Type") == "layers" and observed.get("RootFS", {}).get("Layers") == content[role]["diff_ids"], "daemon ordered rootfs digest mismatch")
         if native_id == expected["image_id"]:
@@ -331,7 +387,7 @@ def verify_daemon(manifest, *, content=None):
     return native_ids
 
 
-def validate_web_image(web, restrictions):
+def validate_web_image(web, restrictions, platform="linux/amd64"):
     # Official Caddy's file capability cannot execute with an empty bounding
     # set. Docker tmpfs is noexec by default. Keep both restrictions: prepare
     # only a byte-identical, capability-free validation copy in a runner-only
@@ -352,11 +408,11 @@ def validate_web_image(web, restrictions):
         with tempfile.TemporaryDirectory(prefix="rainsync-web-validation-") as context:
             recipe = Path(context) / "Dockerfile"
             recipe.write_text(f"FROM {base_tag}\nRUN --network=none cp /usr/bin/caddy /usr/bin/rainsync-caddy-validate && cmp /usr/bin/caddy /usr/bin/rainsync-caddy-validate && test -z \"$(getcap /usr/bin/rainsync-caddy-validate)\"\n")
-            docker(["build", "--builder", "default", "--platform", "linux/amd64", "--network", "none", "--pull=false", "--file", str(recipe), "--tag", validation_tag, context], timeout=120)
+            docker(["build", "--builder", "default", "--platform", platform, "--network", "none", "--pull=false", "--file", str(recipe), "--tag", validation_tag, context], timeout=120)
         owned_tags.append(validation_tag)
         derived = inspect(validation_tag)
         require(inspect(base_tag)["Id"] == web and inspect(web)["Id"] == web, "production image identity changed")
-        require(derived["Os"] == "linux" and derived["Architecture"] == "amd64", "validation image architecture mismatch")
+        require(derived["Os"] == "linux" and derived["Architecture"] == architecture(platform), "validation image architecture mismatch")
         require(derived["RootFS"]["Layers"][:-1] == base["RootFS"]["Layers"], "validation image is not exactly the production layers plus one copy layer")
         caddy = """getcap /usr/bin/caddy >&2
 cmp /usr/bin/caddy /usr/bin/rainsync-caddy-validate
@@ -387,7 +443,7 @@ exec /usr/bin/rainsync-caddy-validate validate --config /etc/caddy/Caddyfile --a
             docker(["image", "rm", "--no-prune", *reversed(owned_tags)])
 
 
-def runtime_checks(backend, web):
+def runtime_checks(backend, web, platform="linux/amd64"):
     common = ["run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges"]
     def probe(binary, flag):
         return read_json(docker([*common, "--entrypoint", binary, backend, flag], timeout=30))
@@ -400,7 +456,10 @@ ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,heigh
     result = read_json(docker([*common, "--tmpfs", "/tmp:rw,nosuid,nodev,size=16m", "--entrypoint", "sh", backend, "-eu", "-c", ffmpeg], timeout=60))
     require(result.get("streams") == [{"codec_name": "h264", "width": 64, "height": 64}], "actual FFmpeg encode/probe/decode failed")
     checks["ffmpeg"] = {"encode": "passed", "probe": "passed", "decode": "passed", "codec": "h264", "width": 64, "height": 64}
-    validate_web_image(web, common)
+    proof = docker([*common, "--entrypoint", "sh", backend, "-eu", "-c", "dpkg-query -W -f='${Version}\\n' ffmpeg; ffmpeg -version; ffprobe -version"], timeout=30)
+    checks["ffmpeg_build"] = {"package_version": proof.splitlines()[0], "proof": proof,
+                              "proof_sha256": hashlib.sha256(proof.encode()).hexdigest()}
+    validate_web_image(web, common, platform)
     checks["web_config"] = "passed"
     return checks
 
@@ -432,21 +491,26 @@ def validate_compose(config, image_ids, *, compose_version=None):
     require(next(v["source"] for v in services["server"]["volumes"] if v["target"] == "/cache") == next(v["source"] for v in services["worker"]["volumes"] if v["target"] == "/cache"), "Server/Worker cache must match")
 
 
-def package(directory, source):
+def package(directory, source, platform="linux/amd64"):
     require(COMMIT.fullmatch(source or ""), "invalid source commit")
     require(not directory.exists(), "output directory already exists")
+    binding = source_binding(source)
     images = {}
-    for role, tag in tags(source).items():
+    for role, tag in tags(source, platform).items():
         value = inspect(tag)
         images[role] = {"tag": tag, "image_id": value["Id"], "repo_tags": value.get("RepoTags") or [],
                         "repo_digests": value.get("RepoDigests") or [], "os": value["Os"], "architecture": value["Architecture"],
                         "size_bytes": value["Size"], "source_revision": (value.get("Config", {}).get("Labels", {}) or {}).get("org.opencontainers.image.revision")}
+        if role != "postgres":
+            images[role]["source_binding_sha256"] = (value.get("Config", {}).get("Labels", {}) or {}).get(SOURCE_LABEL)
+            require(images[role]["source_binding_sha256"] == binding_digest(binding), "built image lacks exact checkout/lockfile binding")
     total = sum(i["size_bytes"] for i in images.values())
     require(total <= MAX_IMAGE_BYTES, "runtime image sizes exceed 1.5 GiB budget; no artifact exported")
     for role in ROLES:
-        require(images[role]["os"] == "linux" and images[role]["architecture"] == "amd64", "wrong runtime image architecture")
+        require(images[role]["os"] == "linux" and images[role]["architecture"] == architecture(platform), "wrong runtime image architecture")
         require(images[role]["source_revision"] == (source if role != "postgres" else None), "wrong runtime image source revision")
-    checks = runtime_checks(images["backend"]["image_id"], images["web"]["image_id"])
+    checks = runtime_checks(images["backend"]["image_id"], images["web"]["image_id"], platform)
+    require(source_binding(source) == binding, "source inputs changed while measuring images")
     ids = {r: images[r]["image_id"] for r in ROLES}
     env = dict(os.environ, RAINSYNC_BACKEND_IMAGE=ids["backend"], RAINSYNC_WEB_IMAGE=ids["web"], RAINSYNC_POSTGRES_IMAGE=ids["postgres"],
                RAINSYNC_DATABASE_PATH="/opt/rainsync/database", RAINSYNC_CACHE_PATH="/opt/rainsync/cache", MEDIA_PATH="/opt/rainsync/media",
@@ -459,7 +523,7 @@ def package(directory, source):
     validate_compose(read_json(config), ids, compose_version=compose_version)
     directory.mkdir(parents=True)
     path, count = directory / ARCHIVE_NAME, 0
-    command = ["docker", "--host", "unix:///var/run/docker.sock", "image", "save", *tags(source).values()]
+    command = ["docker", "--host", "unix:///var/run/docker.sock", "image", "save", *tags(source, platform).values()]
     with subprocess.Popen(command, stdout=subprocess.PIPE, env=env) as process:
         try:
             with open(path, "xb") as output, gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0, compresslevel=1) as compressed:
@@ -472,10 +536,10 @@ def package(directory, source):
             process.kill()
             process.wait()
             raise
-    manifest = {"schema_version": 1, "source_commit": source, "platform": "linux/amd64", "images": images,
+    manifest = {"schema_version": 2, "source_commit": source, "platform": platform, "images": images, "build_binding": binding,
                 "total_image_size_bytes": total, "runtime_checks": checks,
                 "archive": {"file": ARCHIVE_NAME, "sha256": sha_file(path), "size_bytes": path.stat().st_size, "uncompressed_size_bytes": count}}
-    validate_manifest(manifest, source)
+    validate_manifest(manifest, source, platform)
     verify_archive(path, manifest)
     (directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     (directory / "SHA256SUMS").write_text(f"{sha_file(path)}  {ARCHIVE_NAME}\n{sha_file(directory / 'manifest.json')}  manifest.json\n")
@@ -484,18 +548,25 @@ def package(directory, source):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["verify", "package"])
-    parser.add_argument("--directory", required=True, type=Path)
+    parser.add_argument("mode", choices=["verify", "package", "source"])
+    parser.add_argument("--directory", type=Path)
     parser.add_argument("--source", required=True)
+    parser.add_argument("--platform", choices=PLATFORMS, default="linux/amd64", help="expected architecture; defaults to legacy amd64")
     parser.add_argument("--daemon", action="store_true", help="also inspect already-loaded local images, read-only")
     args = parser.parse_args()
+    if args.mode == "source":
+        require(not args.daemon and args.directory is None, "source mode does not inspect Docker or use an output directory")
+        binding = source_binding(args.source)
+        print(json.dumps({"binding": binding, "label_sha256": binding_digest(binding)}, sort_keys=True))
+        return
+    require(args.directory is not None, "--directory is required for package/verify")
     if args.mode == "package":
         require(not args.daemon, "--daemon applies only to verify")
-        package(args.directory, args.source)
+        package(args.directory, args.source, args.platform)
         return
     manifest_path = args.directory / "manifest.json"
     require(manifest_path.stat().st_size <= 1024 * 1024, "oversized artifact manifest")
-    manifest = validate_manifest(read_json(manifest_path.read_bytes()), args.source)
+    manifest = validate_manifest(read_json(manifest_path.read_bytes()), args.source, args.platform)
     checksums = (args.directory / "SHA256SUMS").read_text()
     require(checksums == f"{manifest['archive']['sha256']}  {ARCHIVE_NAME}\n{sha_file(manifest_path)}  manifest.json\n", "SHA256SUMS mismatch")
     content = {}

@@ -43,7 +43,7 @@ test("real fullscreen has exactly two idle seconds, locked menus and persistent 
     (window as any).__video = document.querySelector("video");
   });
   await page.locator("video").hover();
-  await page.getByRole("button", { name: "全屏", exact: true }).click();
+  await page.getByRole("button", { name: "进入全屏", exact: true }).click();
   await expect
     .poll(() =>
       page.evaluate(() =>
@@ -102,7 +102,7 @@ test("unsupported fullscreen reports the limitation without replacing the video"
   );
   if (isMobile) await page.locator("video").tap({ position: { x: 20, y: 20 } });
   else await page.locator("video").hover();
-  await page.getByRole("button", { name: "全屏", exact: true }).click();
+  await page.getByRole("button", { name: "进入全屏", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText(
     "此设备不支持标准播放器全屏",
   );

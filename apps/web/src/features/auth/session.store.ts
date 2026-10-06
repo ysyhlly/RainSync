@@ -13,6 +13,7 @@ export const useSession = defineStore("session", () => {
   let loadSerial = 0,
     profileRevision = 0;
   const startupError = ref("");
+  const expired = ref(false);
   let restoring: Promise<void> | undefined;
   let authentication: Promise<unknown> | undefined;
   let authenticationController: AbortController | undefined;
@@ -75,9 +76,14 @@ export const useSession = defineStore("session", () => {
     ++loadSerial;
     user.value = null;
     loaded.value = true;
+    expired.value = false;
   }
   function invalidate(failure: RequestFailure) {
-    if (["LOGIN_REQUIRED", "SESSION_EXPIRED"].includes(failure.code)) clear();
+    if (["LOGIN_REQUIRED", "SESSION_EXPIRED"].includes(failure.code)) {
+      const hadIdentity = !!user.value;
+      clear();
+      expired.value = hadIdentity || failure.code === "SESSION_EXPIRED";
+    }
   }
   function accept(value: ServerIdentity) {
     if (!value?.id || !value.username || typeof value.csrf !== "string")
@@ -94,6 +100,7 @@ export const useSession = defineStore("session", () => {
       avatar_version: value.avatar_version ?? null,
     };
     loaded.value = true;
+    expired.value = false;
   }
   async function readIdentity(
     signal?: AbortSignal,
@@ -185,6 +192,7 @@ export const useSession = defineStore("session", () => {
   }
   return {
     startupError,
+    expired,
     restore,
     user,
     epoch,

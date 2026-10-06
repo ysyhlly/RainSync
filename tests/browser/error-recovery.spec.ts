@@ -32,7 +32,7 @@ test("playback denial has one diagnostic and preserves room controls with unknow
     .locator(".video-frame")
     .dispatchEvent("pointermove", { pointerType: "mouse" });
   await expect(page.locator(".playback-time")).toContainText("时长未知");
-  await expect(page.getByRole("slider", { name: "播放进度" })).toBeDisabled();
+  await expect(page.getByRole("slider", { name: "房间播放进度" })).toBeDisabled();
   await page
     .locator(".video-frame")
     .dispatchEvent("pointermove", { pointerType: "mouse" });

@@ -37,6 +37,7 @@ pub fn envelope(
         event_id,
         actor_id: actor.map(|value| value.0),
         actor_is_admin: actor.is_some_and(|value| value.1),
+        actor_permission: None,
         before,
         lifecycle_before,
         lifecycle_after,

@@ -141,7 +141,10 @@ export const roomsApi = (api: ApiClient) => ({
       },
       signal,
     ),
-  create: (name: string) => api<{ id: string }>("/rooms", "POST", { name }),
+  create: (name: string, requestKey: string) =>
+    api<{ id: string }>("/rooms", "POST", { name }, undefined, {
+      "Idempotency-Key": requestKey,
+    }),
   join: (id: string, token: string) =>
     api("/rooms/" + encodeURIComponent(id) + "/join", "POST", { token }),
 });

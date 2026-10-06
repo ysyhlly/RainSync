@@ -22,10 +22,15 @@ SPEC.loader.exec_module(runtime)
 SOURCE = "a" * 40
 
 
-def fixture(directory, config_path_style="classic"):
+def fixture(directory, config_path_style="classic", *, platform="linux/amd64", schema=1):
+    binding = {"source_commit": SOURCE, "git_tree": "c" * 40,
+               "files_sha256": {name: "d" * 64 for name in ("Cargo.lock", "package-lock.json", "deploy/Dockerfile", "deploy/Dockerfile.web", ".dockerignore")},
+               "build_kind": "development-measured", "runtime_acceptance": False}
     images, saved, contents = {}, [], {}
-    for role, tag in runtime.tags(SOURCE).items():
+    for role, tag in runtime.tags(SOURCE, platform).items():
         labels = {"org.opencontainers.image.revision": SOURCE} if role != "postgres" else {}
+        if schema == 2 and role != "postgres":
+            labels[runtime.SOURCE_LABEL] = runtime.binding_digest(binding)
         layers, diff_ids = [], []
         for number in range(2):
             layer = io.BytesIO()
@@ -39,14 +44,16 @@ def fixture(directory, config_path_style="classic"):
             contents[path] = layer.getvalue()
             layers.append(path)
             diff_ids.append("sha256:" + digest)
-        config = json.dumps({"os": "linux", "architecture": "amd64", "config": {"Labels": labels}, "rootfs": {"type": "layers", "diff_ids": diff_ids}}).encode()
+        config = json.dumps({"os": "linux", "architecture": runtime.architecture(platform), "config": {"Labels": labels}, "rootfs": {"type": "layers", "diff_ids": diff_ids}}).encode()
         digest = hashlib.sha256(config).hexdigest()
         name = digest + ".json" if config_path_style == "classic" else "blobs/sha256/" + digest
         contents[name] = config
         images[role] = {"tag": tag, "image_id": "sha256:" + digest, "repo_tags": [tag],
                         "repo_digests": ["postgres@sha256:" + "b" * 64] if role == "postgres" else [],
-                        "os": "linux", "architecture": "amd64", "size_bytes": 1024 * 1024,
+                        "os": "linux", "architecture": runtime.architecture(platform), "size_bytes": 1024 * 1024,
                         "source_revision": SOURCE if role != "postgres" else None}
+        if schema == 2 and role != "postgres":
+            images[role]["source_binding_sha256"] = runtime.binding_digest(binding)
         saved.append({"Config": name, "RepoTags": [tag], "Layers": layers})
     contents["manifest.json"] = json.dumps(saved).encode()
     raw = io.BytesIO()
@@ -57,13 +64,18 @@ def fixture(directory, config_path_style="classic"):
             archive.addfile(entry, io.BytesIO(value))
     path = directory / runtime.ARCHIVE_NAME
     path.write_bytes(gzip.compress(raw.getvalue(), mtime=0))
-    manifest = {"schema_version": 1, "source_commit": SOURCE, "platform": "linux/amd64", "images": images,
+    manifest = {"schema_version": schema, "source_commit": SOURCE, "platform": platform, "images": images,
                 "total_image_size_bytes": 3 * 1024 * 1024,
                 "runtime_checks": {"server_login": runtime.LOGIN_CONTRACT, "server_source": runtime.source_contract("server"),
                                    "worker_source": runtime.source_contract("worker"), "web_config": "passed",
                                    "ffmpeg": {"encode": "passed", "probe": "passed", "decode": "passed", "codec": "h264", "width": 64, "height": 64}},
                 "archive": {"file": runtime.ARCHIVE_NAME, "sha256": runtime.sha_file(path), "size_bytes": path.stat().st_size,
                             "uncompressed_size_bytes": len(raw.getvalue())}}
+    if schema == 2:
+        proof = "7:fixture-1\nffmpeg version fixture\nffprobe version fixture\n"
+        manifest["build_binding"] = binding
+        manifest["runtime_checks"]["ffmpeg_build"] = {"package_version": "7:fixture-1", "proof": proof,
+                                                    "proof_sha256": hashlib.sha256(proof.encode()).hexdigest()}
     return manifest
 
 
@@ -93,10 +105,10 @@ def oci_fixture(manifest, original, *, compressed=False, index=False, wrong_conf
         descriptor = blob(json.dumps(node).encode(), node["mediaType"])
         packed_size = descriptor["size"] + config_descriptor["size"] + sum(d["size"] for d in layers)
         if index:
-            node = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": [{**descriptor, "platform": {"os": "linux", "architecture": "amd64"}}]}
+            node = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": [{**descriptor, "platform": {"os": expected["os"], "architecture": expected["architecture"]}}]}
             descriptor = blob(json.dumps(node).encode(), node["mediaType"])
             packed_size += descriptor["size"]
-        observed[expected["tag"]] = {"Id": descriptor["digest"], "Descriptor": descriptor, "Os": "linux", "Architecture": "amd64",
+        observed[expected["tag"]] = {"Id": descriptor["digest"], "Descriptor": descriptor, "Os": expected["os"], "Architecture": expected["architecture"],
                                      "Size": packed_size, "RootFS": {"Type": "layers", "Layers": config["rootfs"]["diff_ids"]}, "Config": config["config"]}
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w") as saved:
@@ -138,6 +150,59 @@ class RuntimeArtifactTests(unittest.TestCase):
     def test_wrong_architecture_fails_closed(self):
         self.reject(lambda m: m.update(platform="linux/arm64"), "architecture")
         self.reject(lambda m: m["images"]["postgres"].update(architecture="arm64"), "architecture")
+
+    def test_arm64_requires_explicit_platform_and_bound_schema(self):
+        value = fixture(self.directory, platform="linux/arm64", schema=2)
+        runtime.validate_manifest(value, SOURCE, "linux/arm64")
+        result = runtime.verify_archive(self.directory / runtime.ARCHIVE_NAME, value)
+        self.assertEqual(result["platform"], "linux/arm64")
+        self.assertEqual(value["images"]["backend"]["tag"], "rainsync-backend:" + SOURCE + "-arm64")
+        with self.assertRaisesRegex(ValueError, "architecture"):
+            runtime.validate_manifest(value, SOURCE)
+        value["images"]["postgres"]["architecture"] = "amd64"
+        with self.assertRaisesRegex(ValueError, "architecture"):
+            runtime.validate_manifest(value, SOURCE, "linux/arm64")
+        value = fixture(self.directory, platform="linux/arm64", schema=1)
+        with self.assertRaisesRegex(ValueError, "architecture"):
+            runtime.validate_manifest(value, SOURCE, "linux/arm64")
+
+    def test_new_manifest_binds_lockfiles_recipes_and_measured_ffmpeg(self):
+        self.manifest = fixture(self.directory, schema=2)
+        runtime.validate_manifest(self.manifest, SOURCE)
+        self.reject(lambda m: m["build_binding"]["files_sha256"].pop("Cargo.lock"), "lockfile")
+        self.reject(lambda m: m["build_binding"].update(runtime_acceptance=True), "acceptance")
+        self.reject(lambda m: m["build_binding"]["files_sha256"].update({"package-lock.json": "e" * 64}), "binding")
+        self.reject(lambda m: m["runtime_checks"]["ffmpeg_build"].update(proof="ffmpeg version tampered"), "FFmpeg")
+        self.reject(lambda m: m["runtime_checks"]["ffmpeg_build"].update(package_version="9:changed-1"), "FFmpeg")
+        value = copy.deepcopy(self.manifest)
+        value["build_binding"]["files_sha256"]["Cargo.lock"] = "e" * 64
+        for role in ("backend", "web"):
+            value["images"][role]["source_binding_sha256"] = runtime.binding_digest(value["build_binding"])
+        runtime.validate_manifest(value, SOURCE)
+        with self.assertRaisesRegex(ValueError, "build input binding"):
+            runtime.verify_archive(self.directory / runtime.ARCHIVE_NAME, value)
+
+    def test_arm64_daemon_oci_translation_checks_physical_layers_and_binding(self):
+        value = fixture(self.directory, platform="linux/arm64", schema=2)
+        content = {}
+        runtime.verify_archive(self.directory / runtime.ARCHIVE_NAME, value, content=content)
+        with gzip.open(self.directory / runtime.ARCHIVE_NAME, "rb") as stream:
+            original = runtime.scan_tar(runtime.BoundedReader(stream, value["archive"]["uncompressed_size_bytes"]))[1]
+        observed, (records, small) = oci_fixture(value, original, compressed=True, index=True)
+        with patch.object(runtime, "inspect", side_effect=lambda ref: observed[ref]), patch.object(runtime, "read_daemon_tar", return_value=(records, small)):
+            ids = runtime.verify_daemon(value, content=content)
+            self.assertEqual(set(ids), set(runtime.ROLES))
+            observed[value["images"]["backend"]["tag"]]["Config"]["Labels"][runtime.SOURCE_LABEL] = "e" * 64
+            with self.assertRaisesRegex(ValueError, "build input binding"):
+                runtime.verify_daemon(value, content=content)
+
+    def test_source_binding_rejects_changed_or_wrong_checkout_without_docker(self):
+        with patch.object(runtime.subprocess, "check_output", side_effect=[SOURCE, " M Cargo.lock"]):
+            with self.assertRaisesRegex(ValueError, "source changes"):
+                runtime.source_binding(SOURCE)
+        with patch.object(runtime.subprocess, "check_output", return_value="f" * 40):
+            with self.assertRaisesRegex(ValueError, "checkout differs"):
+                runtime.source_binding(SOURCE)
 
     def test_wrong_image_identity_fails_closed(self):
         self.reject(lambda m: m["images"]["backend"].update(image_id="rainsync:dev"), "image ID")

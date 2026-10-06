@@ -16,7 +16,7 @@ pub async fn members(
     if !user.admin {
         member(&app, &user, id).await?;
     }
-    let rows = sqlx::query("SELECT u.id,u.username,COALESCE(p.display_name,u.username) AS display_name FROM room_members m JOIN users u ON u.id=m.user_id LEFT JOIN user_profiles p ON p.user_id=u.id WHERE m.room_id=$1 ORDER BY u.username,u.id")
+    let rows = sqlx::query("SELECT u.id,u.username,COALESCE(p.display_name,u.username) AS display_name FROM room_members m JOIN users u ON u.id=m.user_id LEFT JOIN user_profiles p ON p.user_id=u.id WHERE m.room_id=$1 AND account_active(u.id) ORDER BY u.username,u.id")
         .bind(id).fetch_all(&app.db).await?;
     Ok(media_titles::private_json(Value::Array(
         rows.iter()
@@ -48,9 +48,12 @@ pub async fn transfer(
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
-    let lifecycle_epoch = persistence::room_lifecycle::lock_active(&mut tx, id)
-        .await
-        .map_err(room_lifecycle::gate_error)?;
+    let lifecycle_row = sqlx::query("SELECT lifecycle,lifecycle_epoch FROM rooms WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let lifecycle_epoch: i64 = lifecycle_row.get("lifecycle_epoch");
+    let lifecycle_state: String = lifecycle_row.get("lifecycle");
     let value: Value =
         sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
             .bind(id)
@@ -66,7 +69,7 @@ pub async fn transfer(
     // Lock the selected membership so a concurrent removal cannot commit
     // between target validation and the ownership update.
     let target: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
+        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 AND account_active(user_id) FOR KEY SHARE",
     )
     .bind(id)
     .bind(body.owner_id)
@@ -103,7 +106,7 @@ pub async fn transfer(
         .execute(&mut *tx)
         .await?;
     let event_id = Uuid::new_v4();
-    let lifecycle = persistence::room_diagnostics::lifecycle("active", lifecycle_epoch)?;
+    let lifecycle = persistence::room_diagnostics::lifecycle(&lifecycle_state, lifecycle_epoch)?;
     let diagnostic = persistence::room_diagnostics::envelope(
         event_id,
         state,
@@ -121,6 +124,14 @@ pub async fn transfer(
     // All devices must use a fresh command identity and credential after transfer.
     // Existing media grants and source ownership are deliberately unchanged.
     sqlx::query("DELETE FROM control_epochs WHERE room_id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    // The new owner decides future delegation. A former owner's outstanding
+    // moderator invitations cannot restore authority after the transfer.
+    sqlx::query("UPDATE room_member_permissions SET revoked=true,updated_at=clock_timestamp() WHERE room_id=$1")
+        .bind(id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE invites SET revoked=true WHERE room_id=$1 AND granted_role='moderator'")
         .bind(id)
         .execute(&mut *tx)
         .await?;

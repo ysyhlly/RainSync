@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount } from "vue";
+import { ref, computed, watch, onMounted, onBeforeUnmount } from "vue";
 import { useRouter } from "vue-router";
 import { useSession } from "../auth/session.store";
 import { useRoomRuntime } from "./room-runtime";
 import { roomsApi } from "./rooms.api";
+import { createRoomSubmission } from "./room-creation";
 import type { Room } from "../../shared/api/types";
 import { useAction } from "../../shared/use-action";
 import AppDialog from "../../shared/ui/AppDialog.vue";
@@ -15,11 +16,13 @@ import {
   type RoomFilter,
 } from "./room-lifecycle";
 import Notice from "../../shared/ui/Notice.vue";
+import PendingMediaSelection from "../library/PendingMediaSelection.vue";
 const session = useSession(),
   runtime = useRoomRuntime(),
   api = roomsApi(session.api),
   router = useRouter();
 const { busy, error, run } = useAction();
+const submitRoom = createRoomSubmission(api.create, () => session.user?.id);
 const rooms = ref<Room[]>([]),
   loaded = ref(false),
   createOpen = ref(false),
@@ -28,6 +31,13 @@ const rooms = ref<Room[]>([]),
   roomId = ref(""),
   token = ref(""),
   pasted = ref("");
+const inviteParsed = ref(false);
+watch(pasted, () => {
+  roomId.value = "";
+  token.value = "";
+  inviteParsed.value = false;
+  error.value = "";
+}, { flush: "sync" });
 const lifecycleFilter = ref<RoomFilter>("all");
 const visibleRooms = computed(() =>
   filterRooms(rooms.value, lifecycleFilter.value),
@@ -59,7 +69,7 @@ async function enter(room: Room) {
 async function create() {
   if (!name.value.trim() || [...name.value].length > 120)
     throw Error("房间名称须为1–120个字符");
-  const result = await api.create(name.value);
+  const result = await submitRoom(name.value);
   if (!alive) return;
   createOpen.value = false;
   name.value = "";
@@ -71,24 +81,34 @@ async function create() {
 function parse() {
   try {
     const value = JSON.parse(pasted.value);
-    if (typeof value.room_id !== "string" || typeof value.token !== "string")
+    if (!value || typeof value !== "object" ||
+      typeof value.room_id !== "string" || !value.room_id.trim() ||
+      typeof value.token !== "string" || !value.token.trim())
       throw Error();
-    roomId.value = value.room_id;
-    token.value = value.token;
+    roomId.value = value.room_id.trim();
+    token.value = value.token.trim();
+    inviteParsed.value = true;
     error.value = "";
+    return true;
   } catch {
-    error.value = "请粘贴完整房间邀请JSON，或分别填写房间ID与邀请token。";
+    roomId.value = "";
+    token.value = "";
+    inviteParsed.value = false;
+    error.value = "请粘贴完整房间邀请JSON，或清空粘贴内容后分别填写房间ID与邀请token。";
+    return false;
   }
 }
 async function join() {
-  await api.join(roomId.value, token.value);
+  if (pasted.value.trim() && !parse()) return;
+  const joinedRoomId = roomId.value.trim();
+  await api.join(joinedRoomId, token.value.trim());
   if (!alive) return;
   joinOpen.value = false;
   token.value = "";
   pasted.value = "";
   await load();
   if (!alive) return;
-  const room = rooms.value.find((r) => r.id === roomId.value);
+  const room = rooms.value.find((r) => r.id === joinedRoomId);
   if (room) await enter(room);
 }
 onMounted(() => run(load));
@@ -108,6 +128,7 @@ onMounted(() => run(load));
         </button>
       </div>
     </div>
+    <PendingMediaSelection />
     <Notice v-if="!createOpen && !joinOpen" :message="error" error /><button
       v-if="error && !createOpen && !joinOpen"
       @click="run(load)"
@@ -190,10 +211,10 @@ onMounted(() => run(load));
         ><label
           >邀请 token<input v-model="token" required autocomplete="off"
         /></label>
-        <p class="helper">请使用房间邀请，注册邀请码不能加入房间。</p>
+        <p class="helper">请使用房间邀请，注册邀请码不能加入房间。修改粘贴内容后，需重新解析邀请。</p>
         <Notice :message="error" error /><button
           class="primary"
-          :disabled="busy"
+          :disabled="busy || (!!pasted.trim() && !inviteParsed)"
         >
           {{ busy ? "正在加入…" : "加入房间" }}
         </button>

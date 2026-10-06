@@ -4,13 +4,14 @@ import { useRoute, useRouter } from "vue-router";
 import { useSession } from "../features/auth/session.store";
 import { useRoomRuntime } from "../features/rooms/room-runtime";
 import { useAction } from "../shared/use-action";
-import { adminNavigation } from "./navigation";
+import { adminNavigation, authenticationLocation, safeRedirect } from "./navigation";
 import AnimatedNavigation from "./AnimatedNavigation.vue";
 import AppIcon from "../shared/ui/AppIcon.vue";
 import UserAvatar from "../shared/ui/UserAvatar.vue";
 import Notice from "../shared/ui/Notice.vue";
 import PlaybackHost from "../features/playback/PlaybackHost.vue";
 import { playbackFailureOwnsNotice } from "../features/playback/playback-preparation";
+import { keyboardViewportOpen, hasEditableFocus } from "../shared/keyboard-viewport";
 const session = useSession(),
   runtime = useRoomRuntime(),
   route = useRoute(),
@@ -20,10 +21,7 @@ watch(
   () => session.user,
   (user) => {
     if (!user && session.loaded && !route.meta.public && !session.startupError)
-      void router.replace({
-        path: "/login",
-        query: { redirect: route.fullPath },
-      });
+      void router.replace(authenticationLocation("/login", route.fullPath, session.expired));
   },
 );
 const inRoom = computed(
@@ -46,16 +44,26 @@ function viewport() {
     "--viewport-height",
     (window.visualViewport?.height ?? window.innerHeight) + "px",
   );
-  keyboard.value =
-    !!window.visualViewport &&
-    window.innerHeight - window.visualViewport.height > 160;
+  const visual = window.visualViewport;
+  keyboard.value = !!visual && keyboardViewportOpen({
+    layoutHeight: window.innerHeight,
+    viewportHeight: visual.height,
+    scale: visual.scale,
+    editable: hasEditableFocus(document.activeElement),
+  });
 }
 onMounted(() => {
   viewport();
   window.visualViewport?.addEventListener("resize", viewport);
+  window.addEventListener("resize", viewport);
+  document.addEventListener("focusin", viewport);
+  document.addEventListener("focusout", viewport);
 });
 onBeforeUnmount(() => {
   window.visualViewport?.removeEventListener("resize", viewport);
+  window.removeEventListener("resize", viewport);
+  document.removeEventListener("focusin", viewport);
+  document.removeEventListener("focusout", viewport);
   document.documentElement.style.removeProperty("--viewport-height");
   runtime.$dispose();
 });
@@ -67,10 +75,11 @@ async function logout() {
   await router.replace("/login");
 }
 async function retry() {
+  const target = route.meta.public ? route.query.redirect : route.fullPath;
   session.loaded = false;
   await session.restore();
   if (!session.startupError)
-    await router.replace(session.user ? "/rooms" : "/login");
+    await router.replace(session.user ? safeRedirect(target) : authenticationLocation("/login", target, session.expired));
 }
 </script>
 <template>
@@ -154,7 +163,7 @@ async function retry() {
       <PlaybackHost
         :full="inRoom"
         @mini-resize="miniHeight = $event"
-      /><template v-if="session.loaded && !session.startupError"
+      /><template v-if="session.loaded && !session.startupError && (session.user || route.meta.public)"
         ><nav
           v-if="session.user?.admin && route.path.startsWith('/admin')"
           class="mobile-admin-nav"

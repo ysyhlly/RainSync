@@ -1,0 +1,27 @@
+[Unit]
+Description=RainSync encrypted daily recovery set
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=rainsync-backup
+Group=rainsync-backup
+EnvironmentFile=/etc/rainsync/backup.env
+WorkingDirectory=/opt/rainsync/source
+ExecStart=/usr/bin/python3 /opt/rainsync/source/deploy/backup-schedule.py run
+UMask=0077
+StateDirectory=rainsync-backup
+StateDirectoryMode=0700
+TimeoutStartSec=70min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/rainsync-backup/database /srv/rainsync-backup/materials /var/lib/rainsync-backup
+
+# Retention is a separate explicit preview/apply step after offsite copy.
+# No service restart, restore, or automatic retention is performed here.

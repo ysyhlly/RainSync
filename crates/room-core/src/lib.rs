@@ -40,10 +40,26 @@ pub fn reduce(
     admin: bool,
     now: f64,
 ) -> Result<RoomState, &'static str> {
+    reduce_with_permission(state, command, actor, admin, None, now)
+}
+
+/// `permission` is an exact action admitted by the caller's durable authority gate.
+/// It is also retained in diagnostics so offline replay never labels a moderator admin.
+pub fn reduce_with_permission(
+    state: &RoomState,
+    command: &Command,
+    actor: Uuid,
+    admin: bool,
+    permission: Option<protocol::RoomPermission>,
+    now: f64,
+) -> Result<RoomState, &'static str> {
     if command.protocol_version != VERSION {
         return Err("protocol_version");
     }
-    if actor != state.controller_user_id && !admin {
+    if actor != state.controller_user_id
+        && !admin
+        && permission != Some(protocol::RoomPermission::for_action(&command.action))
+    {
         return Err("controller_required");
     }
     if command.room_id != state.room_id {
@@ -193,6 +209,59 @@ mod tests {
             Err("revision_conflict")
         );
     }
+    #[test]
+    fn a_delegated_action_never_authorizes_another_action() {
+        let (state, mut command) = fixture();
+        let moderator = Uuid::new_v4();
+        assert!(
+            reduce_with_permission(
+                &state,
+                &command,
+                moderator,
+                false,
+                Some(protocol::RoomPermission::Pause),
+                600.0
+            )
+            .is_ok()
+        );
+        for permission in [
+            protocol::RoomPermission::Play,
+            protocol::RoomPermission::Seek,
+            protocol::RoomPermission::Queue,
+            protocol::RoomPermission::Invite,
+        ] {
+            assert_eq!(
+                reduce_with_permission(&state, &command, moderator, false, Some(permission), 600.0),
+                Err("controller_required")
+            );
+        }
+        command.action = Action::ChangeMedia {
+            media_id: Uuid::new_v4(),
+        };
+        assert_eq!(
+            reduce_with_permission(
+                &state,
+                &command,
+                moderator,
+                false,
+                Some(protocol::RoomPermission::Pause),
+                600.0
+            ),
+            Err("controller_required")
+        );
+        assert!(
+            reduce_with_permission(
+                &state,
+                &command,
+                moderator,
+                false,
+                Some(protocol::RoomPermission::ChangeMedia),
+                600.0
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn stale_generation_rejected() {
         let (s, mut c) = fixture();

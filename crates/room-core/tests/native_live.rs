@@ -162,6 +162,7 @@ fn live_selection_and_control_diagnostics_replay_with_explicit_immutable_fact() 
         event_id: Uuid::from_u128(10),
         actor_id: Some(before.controller_user_id),
         actor_is_admin: false,
+        actor_permission: None,
         before: before.clone(),
         lifecycle_before: lifecycle,
         lifecycle_after: lifecycle,

@@ -23,6 +23,8 @@ pub mod room_cleanup;
 pub mod room_diagnostics;
 pub mod room_lifecycle;
 pub mod room_node_leases;
+pub mod room_permissions;
+pub mod room_invites;
 pub mod source_account_policy;
 pub mod static_hls;
 pub mod static_hls_activation;
@@ -383,7 +385,12 @@ async fn commit_inner(
         }
         check_control_login(&mut tx, user, session_hash).await?;
     }
-    let mut state = room_core::reduce(&current, command, user, actor_is_admin, server_time_ms)
+    let actor_permission = if !actor_is_admin && current.controller_user_id != user {
+        let permission = protocol::RoomPermission::for_action(&command.action);
+        room_permissions::require(&mut tx, command.room_id, user, permission).await?;
+        Some(permission)
+    } else { None };
+    let mut state = room_core::reduce_with_permission(&current, command, user, actor_is_admin, actor_permission, server_time_ms)
         .map_err(anyhow::Error::msg)?;
     if let Some(resolved) = &resolved_media {
         state.media_id = Some(resolved.media_id);
@@ -433,7 +440,7 @@ async fn commit_inner(
         }
     };
     let lifecycle = room_diagnostics::lifecycle("active", lifecycle_epoch)?;
-    let diagnostic = room_diagnostics::envelope(
+    let mut diagnostic = room_diagnostics::envelope(
         Uuid::new_v4(),
         current,
         Some((user, actor_is_admin)),
@@ -441,6 +448,7 @@ async fn commit_inner(
         lifecycle,
         operation,
     );
+    diagnostic.actor_permission = actor_permission;
     room_diagnostics::append(&mut tx, &state, diagnostic).await?;
     sqlx::query(
         "INSERT INTO command_results(room_id,command_id,user_id,state,request_payload) VALUES($1,$2,$3,$4,$5)",
@@ -469,6 +477,9 @@ async fn commit_inner(
     if let Some(lease) = lease {
         room_node_leases::checkpoint_locked(&mut tx, lease, &state, server_time_ms).await?;
         room_node_leases::guard(&mut tx, lease).await?;
+    }
+    if let Some(permission) = actor_permission {
+        room_permissions::require(&mut tx, command.room_id, user, permission).await?;
     }
     tx.commit().await?;
     job_health.confirmed();

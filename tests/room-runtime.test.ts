@@ -866,3 +866,47 @@ it("a control event from another server clock requires a snapshot and does not r
     runtime.$dispose();
   }
 });
+
+it("delegated room actions stay separate and a stale grant response cannot undo revocation", async () => {
+  const replies: ((value: Response) => void)[] = [];
+  const fetcher = vi.fn((url: string) =>
+    url.endsWith("/permissions")
+      ? new Promise<Response>((resolve) => replies.push(resolve))
+      : Promise.resolve(Response.json([])),
+  );
+  const { runtime } = lifecycleFixture(fetcher);
+  const snapshot = (permissions: string[]) =>
+    Response.json({
+      owner_id: "owner",
+      self_permissions: permissions,
+      members: [
+        {
+          user_id: "user",
+          role: "moderator",
+          permissions,
+          expires_at: null,
+          revoked: !permissions.length,
+          active: !!permissions.length,
+        },
+      ],
+    });
+  try {
+    await runtime.enter({ id: "a", name: "A", owner_id: "owner" });
+    const latest = runtime.refreshPermissions();
+    replies[1](snapshot(["pause"]));
+    await latest;
+    expect(runtime.can("pause")).toBe(true);
+    expect(runtime.can("play")).toBe(false);
+    expect(runtime.canManageRoom).toBe(false);
+    const revoked = runtime.refreshPermissions();
+    replies[2](snapshot([]));
+    await revoked;
+    replies[0](snapshot(["play", "pause"]));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(runtime.can("pause")).toBe(false);
+    expect(runtime.can("play")).toBe(false);
+    expect(runtime.can("invite")).toBe(false);
+  } finally {
+    runtime.$dispose();
+  }
+});

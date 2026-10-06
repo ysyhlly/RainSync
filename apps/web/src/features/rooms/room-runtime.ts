@@ -13,6 +13,9 @@ import type {
   Message,
   QueueItem,
   RoomInvitation,
+  RoomPermission,
+  RoomPermissionSnapshot,
+  RoomInvitePolicy,
   Media,
 } from "../../shared/api/types";
 import { RequestFailure, stopsReconnect } from "../../errors";
@@ -253,13 +256,34 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       (state.value.controller_user_id === session.user?.id ||
         !!session.user?.admin),
   );
+  const delegatedPermissions = ref<RoomPermission[]>([]);
+  const grantExpiresAt = ref<number | null>(null);
+  function can(permission: RoomPermission) {
+    return roomActive.value && (owner.value ||
+      ((grantExpiresAt.value === null || grantExpiresAt.value > Date.now()) && delegatedPermissions.value.includes(permission)));
+  }
+  let permissionsRequest = 0;
+  async function refreshPermissions() {
+    const selected = room.value?.id, identity = session.epoch, request = ++permissionsRequest;
+    if (!selected) return;
+    try {
+      const snapshot = await session.api<RoomPermissionSnapshot>(`/rooms/${selected}/permissions`);
+      if (request !== permissionsRequest || room.value?.id !== selected || session.epoch !== identity) return;
+      delegatedPermissions.value = snapshot.self_permissions;
+      grantExpiresAt.value = snapshot.members.find((member) => member.user_id === session.user?.id)?.expires_at ?? null;
+    } catch {
+      if (request === permissionsRequest && room.value?.id === selected && session.epoch === identity) delegatedPermissions.value = [];
+    }
+  }
+  const permissionRefresh = setInterval(() => { if (room.value) void refreshPermissions(); }, 30_000);
+  onScopeDispose(() => clearInterval(permissionRefresh));
   const canManageRoom = computed(
     () =>
       !!room.value &&
       (room.value.owner_id === session.user?.id || !!session.user?.admin),
   );
   let actionSerial = 0;
-  async function run(action: () => Promise<void>, preserveError = false) {
+  async function run(action: () => Promise<unknown>, preserveError = false) {
     const serial = ++actionSerial;
     if (!preserveError) error.value = "";
     busy.value = true;
@@ -295,6 +319,9 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     connectionStopped.value = false;
     controlEpoch = undefined;
     room.value = null;
+    ++permissionsRequest;
+    delegatedPermissions.value = [];
+    grantExpiresAt.value = null;
     cleanupError.value = "";
     state.value = null;
     playlist.value = [];
@@ -323,6 +350,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     await cleanup;
     if (serial !== roomSerial) return;
     room.value = r;
+    void refreshPermissions();
     recoveryIdentity = {};
     recoveryAuthEpoch = session.epoch;
     connect();
@@ -487,6 +515,14 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       }
       if (!v.state && typeof v.control_epoch?.id === "string")
         controlEpoch = v.control_epoch.id;
+      if (v.type === "ROOM_PERMISSIONS_CHANGED") {
+        if (v.user_id === session.user?.id) {
+          delegatedPermissions.value = [];
+          void refreshPermissions().then(() => { if (serial === connectionSerial) connect(); });
+        }
+        return;
+      }
+      if (v.type === "SNAPSHOT") void refreshPermissions();
       if (v.type === "CLOCK_SYNC_REPLY") {
         checkClockContinuity();
         if (
@@ -666,16 +702,18 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     }
   }
   function send(type: string, payload?: unknown) {
-    if (!connected.value || !owner.value || !state.value || !controlEpoch)
-      return;
+    const permission: RoomPermission = ({ PLAY: "play", PAUSE: "pause", SEEK: "seek", SET_RATE: "set_rate", CHANGE_MEDIA: "change_media", END_MEDIA: "change_media" } as const)[type as "PLAY" | "PAUSE" | "SEEK" | "SET_RATE" | "CHANGE_MEDIA" | "END_MEDIA"];
+    if (!connected.value || !can(permission) || !state.value || !controlEpoch)
+      return false;
     if (
       state.value.live &&
       (type === "SEEK" ||
         type === "END_MEDIA" ||
         (type === "SET_RATE" && (payload as { rate?: number })?.rate !== 1))
     )
-      return;
-    socket?.send(
+      return false;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(
       JSON.stringify({
         ...(state.value.live || type === "CHANGE_MEDIA" || type === "END_MEDIA"
           ? { live_version: 1 }
@@ -690,14 +728,15 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         media_generation: state.value.media_generation,
       }),
     );
+    return true;
   }
   async function choose(id: string) {
-    send("CHANGE_MEDIA", { media_id: id });
+    return send("CHANGE_MEDIA", { media_id: id });
   }
   async function transferOwnership(ownerId: string) {
     const current = state.value,
       serial = roomSerial;
-    if (!current || !canManageRoom.value || !roomActive.value)
+    if (!current || !canManageRoom.value)
       throw Error("当前无法转让房间");
     const result = await session.api<{ owner_id: string; state: RoomState }>(
       `/rooms/${current.room_id}/owner`,
@@ -715,11 +754,12 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     room.value.owner_id = result.owner_id;
     acceptHttpState(result.state);
   }
-  async function makeInvite() {
+  async function makeInvite(policy?: RoomInvitePolicy) {
     if (!room.value || !roomActive.value) throw Error("房间当前未开放");
     return session.api<RoomInvitation>(
       "/rooms/" + room.value.id + "/invites",
       "POST",
+      policy,
     );
   }
   async function revokeInvite(invite: RoomInvitation) {
@@ -936,6 +976,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     busy,
     owner,
     canManageRoom,
+    can,
+    refreshPermissions,
     roomActive,
     lifecycleLabel,
     cleanupError,

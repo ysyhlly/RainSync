@@ -86,7 +86,7 @@ function subtitleChanged(value: SelectValue) {
     </label>
     <p v-else class="helper">当前方案未提供可选字幕。</p>
     <p class="helper playback-quality">
-      画质：{{ quality ?? "由服务端确定" }}。当前方案不提供画质切换。
+      画质：{{ quality ?? "由当前播放方案确定" }}。清晰度切换仅在当前方案提供可选档位时显示。
     </p>
   </div>
 </template>

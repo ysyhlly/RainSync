@@ -597,6 +597,20 @@
   .watch-layout {
     grid-template-columns: minmax(0, 1fr);
   }
+  .app-segmented.mobile-room-tabs {
+    display: flex;
+    gap: 8px;
+    grid-column: 1;
+  }
+  .mobile-room-tabs > button {
+    flex: 1;
+  }
+  .mobile-room-tabs [aria-selected="true"] {
+    background: var(--accent-soft);
+  }
+  .room-content .mobile-hidden {
+    display: none;
+  }
   .room-chat {
     grid-column: 1;
     grid-row: auto;
@@ -814,20 +828,6 @@
   .room-secondary,
   .room-chat {
     grid-column: 1;
-  }
-  .app-segmented.mobile-room-tabs {
-    display: flex;
-    gap: 8px;
-    grid-column: 1;
-  }
-  .mobile-room-tabs > button {
-    flex: 1;
-  }
-  .mobile-room-tabs [aria-selected="true"] {
-    background: var(--accent-soft);
-  }
-  .mobile-hidden {
-    display: none;
   }
   .panel {
     padding: 18px;
@@ -1197,4 +1197,106 @@
 
 .autoplay {
   z-index: 6;
+}
+
+/* Keep room preparation and everyday actions outside the switchable panels. */
+.room-opening {
+  display: grid;
+  grid-column: 1;
+  gap: 16px;
+  min-width: 0;
+}
+.room-preparation,
+.room-tools {
+  grid-column: 1;
+  min-width: 0;
+}
+.room-preparation h2 {
+  font-size: 18px;
+  margin-bottom: 8px;
+}
+.room-tools {
+  flex-wrap: wrap;
+}
+.queue-add-actions {
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+.platform-import-disclosure {
+  margin-block: 16px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  background: var(--surface-panel);
+}
+.platform-import-disclosure > summary {
+  cursor: pointer;
+  padding: 12px 16px;
+  min-height: 44px;
+}
+.platform-import-disclosure .panel {
+  margin: 0;
+  border: 0;
+}
+/* The video remains mounted while an empty room uses a compact opening card. */
+.full-player.empty-room:not(:fullscreen) {
+  grid-row: 1;
+}
+.full-player.empty-room:not(:fullscreen) .video-frame {
+  aspect-ratio: auto;
+  padding: 20px;
+}
+.full-player.empty-room:not(:fullscreen) video,
+.full-player.empty-room:not(:fullscreen) .player-chrome {
+  display: none;
+}
+.full-player.empty-room:not(:fullscreen) .player-empty {
+  position: static;
+  text-align: center;
+}
+/* Empty rooms return to normal document flow on pages with another task. */
+.mini-player.empty-room:not(:fullscreen) {
+  position: static;
+  display: block;
+  width: auto;
+  min-height: 0;
+  max-height: none;
+  margin-bottom: 16px;
+  padding: 8px 12px;
+  box-shadow: none;
+}
+.mini-player.empty-room:not(:fullscreen) .player-caption {
+  display: flex;
+  flex-wrap: wrap;
+}
+/* Retain room playback and local mute without duplicating their state. */
+.mini-player.mini-collapsed.has-room-media:not(:fullscreen) {
+  grid-template-columns: minmax(0, 1fr) auto 40px;
+}
+.mini-player.mini-collapsed.has-room-media:not(:fullscreen) .video-frame {
+  display: contents;
+}
+.mini-player.mini-collapsed.has-room-media:not(:fullscreen) .player-chrome {
+  display: block;
+  grid-column: 2;
+}
+.mini-player.mini-collapsed.has-room-media:not(:fullscreen) .playback-controls {
+  flex-direction: row;
+  flex-wrap: nowrap;
+  padding: 0;
+}
+.mini-player.mini-collapsed.has-room-media:not(:fullscreen) .mini-toggle {
+  grid-column: 3;
+}
+.mini-player.mini-collapsed.has-room-media:not(:fullscreen) .playback-time,
+.mini-player.mini-collapsed.has-room-media:not(:fullscreen) .seek-control,
+.mini-player.mini-collapsed.has-room-media:not(:fullscreen) .playback-options {
+  display: none;
+}
+@media (max-width: 767px) {
+  .mini-player.mini-collapsed.has-room-media:not(:fullscreen) {
+    gap: 6px;
+  }
+  .mini-player.mini-collapsed.has-room-media:not(:fullscreen) .player-caption {
+    flex-wrap: wrap;
+  }
 }

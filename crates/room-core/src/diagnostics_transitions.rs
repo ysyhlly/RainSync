@@ -63,11 +63,12 @@ pub(super) fn apply(envelope: &Envelope) -> Result<(RoomState, Lifecycle), Issue
                 SafeAction::EndMedia { .. } => {}
                 _ => return Err(IssueCode::InvalidCommand),
             }
-            next = crate::reduce(
+            next = crate::reduce_with_permission(
                 before,
                 &command.to_command(before.room_id),
                 actor,
                 envelope.actor_is_admin,
+                envelope.actor_permission,
                 *server_time_ms,
             )
             .map_err(|_| IssueCode::ReducerRejected)?;
@@ -121,7 +122,11 @@ pub(super) fn apply(envelope: &Envelope) -> Result<(RoomState, Lifecycle), Issue
                 }
             } else {
                 let actor = envelope.actor_id.ok_or(IssueCode::ActorRequired)?;
-                if actor != before.controller_user_id && !envelope.actor_is_admin {
+                if actor != before.controller_user_id
+                    && !envelope.actor_is_admin
+                    && !(matches!(transition, LifecycleTransition::Closing)
+                        && envelope.actor_permission == Some(protocol::RoomPermission::Close))
+                {
                     return Err(IssueCode::ControllerRequired);
                 }
                 let time = server_time_ms.ok_or(IssueCode::InvalidEventTime)?;

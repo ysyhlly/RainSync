@@ -1,4 +1,6 @@
 mod account_rules;
+mod account_exit;
+mod account_exit_cleanup;
 mod account_security;
 mod admin_bootstrap;
 mod advanced_playback;
@@ -179,7 +181,15 @@ impl From<anyhow::Error> for Error {
     }
 }
 impl From<sqlx::Error> for Error {
-    fn from(_: sqlx::Error) -> Self {
+    fn from(error: sqlx::Error) -> Self {
+        if let sqlx::Error::Database(ref db) = error {
+            if db.message() == "account_inactive" {
+                return err(StatusCode::FORBIDDEN, "account_inactive");
+            }
+            if matches!(db.code().as_deref(), Some("40P01" | "55P03")) {
+                return err(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
+            }
+        }
         Self(
             StatusCode::INTERNAL_SERVER_ERROR,
             "database_error".into(),
@@ -220,7 +230,7 @@ fn origin(app: &App, h: &HeaderMap) -> Result<()> {
 }
 async fn auth(app: &App, h: &HeaderMap, write: bool) -> Result<User> {
     let token = cookie(h).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "login_required"))?;
-    let row=sqlx::query("SELECT u.id,u.admin,s.csrf FROM sessions s JOIN users u ON u.id=s.user_id WHERE token_hash=$1 AND expires_at>now()").bind(hash(&token)).fetch_optional(&app.db).await?.ok_or_else(||err(StatusCode::UNAUTHORIZED,"session_expired"))?;
+    let row=sqlx::query("SELECT u.id,u.admin,s.csrf FROM sessions s JOIN users u ON u.id=s.user_id WHERE token_hash=$1 AND expires_at>clock_timestamp() AND NOT EXISTS(SELECT 1 FROM account_exits e WHERE e.user_id=u.id)").bind(hash(&token)).fetch_optional(&app.db).await?.ok_or_else(||err(StatusCode::UNAUTHORIZED,"session_expired"))?;
     if write {
         origin(app, h)?;
         if h.get("x-csrf-token").and_then(|v| v.to_str().ok())
@@ -265,7 +275,7 @@ async fn login(State(app): State<App>, h: HeaderMap, Json(body): Json<Login>) ->
         return Err(err(StatusCode::BAD_REQUEST, "invalid_credentials"));
     }
     login_attempt(&app.db, &body.username).await?;
-    let row = sqlx::query("SELECT id,password_hash FROM users WHERE username=$1")
+    let row = sqlx::query("SELECT id,password_hash FROM users WHERE username=$1 AND NOT EXISTS(SELECT 1 FROM account_exits e WHERE e.user_id=users.id)")
         .bind(&body.username)
         .fetch_optional(&app.db)
         .await?
@@ -681,6 +691,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         tokio::spawn(upstream_policy::maintenance(app.clone()));
     }
     tokio::spawn(room_cleanup::run(app.clone()));
+    let _account_exit_cleanup = account_exit_cleanup::Maintenance::start(app.clone());
     let mut platform_renewal =
         media_authority.then(|| platform_accounts::maintenance::Maintenance::start(app.clone()));
     let preparations = app.preparations.clone();
@@ -793,6 +804,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/users", post(users))
+        .route("/api/v1/users/me/deletion", get(account_exit::preview).post(account_exit::delete))
         .route(
             "/api/v1/users/me/profile",
             get(profile::get_profile).patch(profile::update),
@@ -811,6 +823,9 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
             delete(registration::revoke),
         )
         .route("/api/v1/rooms", get(rooms::list).post(rooms::create))
+        .route("/api/v1/rooms/{id}/permissions", get(rooms::permissions))
+        .route("/api/v1/rooms/{id}/permissions/{user}", axum::routing::put(rooms::set_permissions).delete(rooms::revoke_permissions))
+        .route("/api/v1/rooms/{id}/members/{user}", delete(rooms::kick))
         .route(
             "/api/v1/rooms/{id}/platform-media",
             post(native_platform::create),
@@ -984,7 +999,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route("/api/v1/rooms/{id}/reopen", post(room_lifecycle::reopen))
         .route("/api/v1/rooms/{id}/archive", post(room_lifecycle::archive))
         .route("/api/v1/rooms/{id}/join", post(rooms::join))
-        .route("/api/v1/rooms/{id}/invites", post(rooms::invite))
+        .route("/api/v1/rooms/{id}/invites", get(rooms::list_invites).post(rooms::invite))
         .route(
             "/api/v1/rooms/{id}/invites/{token}",
             delete(rooms::revoke_invite),

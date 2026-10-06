@@ -98,9 +98,19 @@ async fn change(
     .bind(user.id)
     .fetch_optional(&mut *tx)
     .await?;
-    let authority =
-        management_authority::Authority::admit(&mut tx, h, user.id, owner, membership.is_some())
-            .await?;
+    let authority = management_authority::Authority::admit_action(
+        &mut tx,
+        h,
+        user.id,
+        owner,
+        membership.is_some(),
+        if target == "closing" {
+            Some((id, protocol::RoomPermission::Close))
+        } else {
+            None
+        },
+    )
+    .await?;
     let mut state: RoomState = serde_json::from_value(value).map_err(anyhow::Error::from)?;
     let before = state.clone();
     if state.revision != body.expected_revision {
@@ -151,7 +161,7 @@ async fn change(
         "archived" => LifecycleTransition::Archived,
         _ => return Err(err(StatusCode::CONFLICT, "room_lifecycle_conflict")),
     };
-    let diagnostic = persistence::room_diagnostics::envelope(
+    let mut diagnostic = persistence::room_diagnostics::envelope(
         event_id,
         before,
         Some((user.id, authority.actor_is_admin())),
@@ -163,6 +173,7 @@ async fn change(
             server_time_ms: Some(server_time_ms),
         },
     );
+    diagnostic.actor_permission = authority.actor_permission();
     persistence::room_diagnostics::append(&mut tx, &state, diagnostic).await?;
     sqlx::query("INSERT INTO room_lifecycle_events(id,room_id,actor_id,previous_lifecycle,lifecycle,lifecycle_epoch,revision) VALUES($1,$2,$3,$4,$5,$6,$7)")
         .bind(event_id).bind(id).bind(user.id).bind(expected).bind(target).bind(epoch).bind(i64::from(state.revision)).execute(&mut *tx).await?;

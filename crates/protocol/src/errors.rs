@@ -8,6 +8,9 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
+    AccountInactive,
+    AccountOwnershipRequired,
+    AccountLastAdmin,
     DistributedPlaybackIntentRequired,
     InvalidDistributedPlaybackIntent,
     DedicatedDistributedEndpointRequired,
@@ -335,6 +338,7 @@ impl ErrorCode {
 
     pub fn from_reason(reason: &str, status: u16) -> Self {
         match reason {
+            "idempotency_key_conflict" => Self::InvalidRequest,
             "wrong_room" => Self::RoomMismatch,
             "try_later" => Self::RateLimited,
             "legacy_stream_mapping_unsupported" => Self::UnsupportedVideoOrHdr,
@@ -654,6 +658,9 @@ impl ErrorCode {
                 "会话已失效，请重新登录或重新加载播放"
             }
             Self::InvalidName => "房间名不能为空，且不能超过 120 个字符",
+            Self::AccountInactive => "该账号已注销，无法再接收授权或更新资源",
+            Self::AccountOwnershipRequired => "请先转移全部房间与私人媒体库的所有权，再注销账号",
+            Self::AccountLastAdmin => "请先设置另一名管理员，再注销当前管理员账号",
             Self::InvalidCredentials => "用户名或密码不正确",
             Self::UsernameTaken => "登录账号已被使用，请选择其他账号",
             Self::AlreadyAuthenticated => "当前已有登录账号，请先确认当前身份",

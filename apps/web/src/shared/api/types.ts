@@ -144,9 +144,29 @@ export interface QueueItem {
   title: string;
   cover: MediaCover;
 }
+export type RoomPermission = "invite" | "kick" | "close" | "play" | "pause" | "seek" | "set_rate" | "change_media" | "queue";
+export interface RoomGrant {
+  user_id: string;
+  role: "viewer" | "moderator";
+  permissions: RoomPermission[];
+  expires_at: number | null;
+  revoked: boolean;
+  active: boolean;
+}
+export interface RoomPermissionSnapshot { owner_id: string; self_permissions: RoomPermission[]; members: RoomGrant[] }
+export interface RoomInvitePolicy {
+  expires_in_seconds: number;
+  max_uses: number | null;
+  invited_user_id: string | null;
+  role: "viewer" | "moderator";
+  permissions: RoomPermission[];
+  grant_expires_in_seconds: number | null;
+}
+export interface RoomInviteRecord extends Omit<RoomInvitation, "token"> { id: string; revoked: boolean; revoked_at?: number | null; expired: boolean; use_count: number }
 export interface RoomInvitation {
-  room_id: string;
-  token: string;
+  room_id: string; token: string;
+  id?: string; expires_at?: number; max_uses?: number | null; use_count?: number;
+  invited_user_id?: string | null; role?: "viewer" | "moderator"; permissions?: RoomPermission[];
 }
 export type InviteStatus = "unused" | "used" | "expired" | "revoked";
 export interface RegistrationInvite {

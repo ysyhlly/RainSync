@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onBeforeUnmount } from "vue";
+import { computed, ref, watch, onMounted, onBeforeUnmount } from "vue";
 import QRCode from "qrcode";
 import { useSession } from "../auth/session.store";
 import { usePlatformAccount } from "./platform-account.store";
@@ -23,6 +23,7 @@ const open = ref(false),
   consent = ref(false),
   renew = ref(false),
   renewal = ref<BilibiliRenewalStatus | null>(null),
+  renewalPhase = ref<"loading" | "ready" | "error">("loading"),
   unlinkOpen = ref(false),
   busy = ref(false),
   error = ref(""),
@@ -31,33 +32,91 @@ const login = ref<PlatformLoginFlowState>({ phase: "idle" });
 let flow: ReturnType<typeof createPlatformLoginFlow> | undefined,
   alive = true,
   qrSerial = 0,
-  actionSerial = 0;
+  actionSerial = 0,
+  renewalSerial = 0;
+let renewalPending: { key: string; work: Promise<void> } | undefined;
 const checkController = new AbortController();
+const accountKey = computed(() =>
+  JSON.stringify([
+    session.epoch,
+    session.user?.id,
+    session.user?.csrf,
+    account.status?.id,
+    account.status?.revision,
+    account.status?.state,
+  ]),
+);
+function matchingRenewal(value: BilibiliRenewalStatus) {
+  return (
+    value.account.id === account.status?.id &&
+    value.account.revision === account.status?.revision &&
+    value.account.state === account.status?.state &&
+    (!value.enabled || value.account.state === "connected")
+  );
+}
+const currentRenewal = computed(() =>
+  renewalPhase.value === "ready" &&
+  renewal.value &&
+  matchingRenewal(renewal.value)
+    ? renewal.value
+    : null,
+);
+async function readRenewal() {
+  if (!session.user || !account.status) return;
+  if (currentRenewal.value) return;
+  const key = accountKey.value;
+  if (renewalPending?.key === key) return renewalPending.work;
+  const serial = ++renewalSerial;
+  renewal.value = null;
+  renewalPhase.value = "loading";
+  const current = () =>
+    alive && serial === renewalSerial && key === accountKey.value;
+  const work = (async () => {
+    try {
+      const value = validateBilibiliRenewal(
+        await bilibiliRenewalApi(session.api).status(checkController.signal),
+      );
+      if (!current()) return;
+      if (!matchingRenewal(value)) throw Error("续期状态与当前账号版本不一致");
+      renewal.value = value;
+      renewalPhase.value = "ready";
+    } catch {
+      if (current()) renewalPhase.value = "error";
+    }
+  })();
+  renewalPending = { key, work };
+  await work;
+  if (renewalPending?.work === work) renewalPending = undefined;
+}
 async function refresh() {
   const epoch = session.epoch,
     user = session.user?.id,
     csrf = session.user?.csrf;
   error.value = "";
+  ++renewalSerial;
+  renewalPending = undefined;
+  renewal.value = null;
+  renewalPhase.value = "loading";
   try {
     await account.refresh(true);
-    const value = validateBilibiliRenewal(
-      await bilibiliRenewalApi(session.api).status(checkController.signal),
-    );
     if (
       alive &&
       epoch === session.epoch &&
       user === session.user?.id &&
       csrf === session.user?.csrf
     )
-      renewal.value = value;
+      await readRenewal();
   } catch {
     if (
       alive &&
       epoch === session.epoch &&
       user === session.user?.id &&
       csrf === session.user?.csrf
-    )
+    ) {
       error.value = "无法读取平台账号状态，请重试";
+      renewal.value = null;
+      renewalPhase.value = "error";
+    }
   }
 }
 function createFlow() {
@@ -126,34 +185,48 @@ async function close() {
   }
 }
 async function disableRenewal() {
-  if (busy.value || !renewal.value) return;
+  if (busy.value || !currentRenewal.value?.enabled) return;
+  const observed = currentRenewal.value,
+    key = accountKey.value,
+    serial = ++renewalSerial;
   const epoch = session.epoch,
     user = session.user?.id,
     csrf = session.user?.csrf;
   busy.value = true;
   error.value = "";
+  renewal.value = null;
+  renewalPhase.value = "loading";
   try {
     const value = validateBilibiliRenewal(
       await bilibiliRenewalApi(session.api).disable(
-        renewal.value.account.revision,
+        observed.account.revision,
         checkController.signal,
       ),
     );
     if (
       alive &&
+      serial === renewalSerial &&
+      key === accountKey.value &&
       epoch === session.epoch &&
       user === session.user?.id &&
       csrf === session.user?.csrf
-    )
+    ) {
+      if (!matchingRenewal(value)) throw Error("续期状态与当前账号版本不一致");
       renewal.value = value;
+      renewalPhase.value = "ready";
+    }
   } catch {
     if (
       alive &&
+      serial === renewalSerial &&
+      key === accountKey.value &&
       epoch === session.epoch &&
       user === session.user?.id &&
       csrf === session.user?.csrf
-    )
+    ) {
       error.value = "停止自动续期结果尚未确认，请刷新状态";
+      renewalPhase.value = "error";
+    }
   } finally {
     if (
       alive &&
@@ -180,7 +253,10 @@ async function unlink() {
   error.value = "";
   try {
     await account.unlink();
-    if (current()) unlinkOpen.value = false;
+    if (current()) {
+      unlinkOpen.value = false;
+      await readRenewal();
+    }
   } catch {
     if (current()) error.value = "解除连接结果尚未确认，请刷新账号状态检查";
   } finally {
@@ -203,6 +279,7 @@ async function checkLogin() {
   error.value = "";
   try {
     await account.checkLogin(checkController.signal);
+    if (current()) await readRenewal();
   } catch {
     if (current()) error.value = "登录检查结果尚未确认，请刷新保存状态后重试";
   } finally {
@@ -230,11 +307,23 @@ watch(
   },
 );
 watch(
+  accountKey,
+  () => {
+    ++renewalSerial;
+    renewal.value = null;
+    renewalPhase.value = "loading";
+    renewalPending = undefined;
+    if (session.user && account.status) void readRenewal();
+  },
+  { flush: "sync" },
+);
+watch(
   [() => session.epoch, () => session.user?.id, () => session.user?.csrf],
   () => {
     void close();
     unlinkOpen.value = false;
     renewal.value = null;
+    renewalPhase.value = "loading";
     error.value = "";
   },
   { flush: "sync" },
@@ -268,14 +357,24 @@ onBeforeUnmount(() => {
     </p>
     <p class="helper" role="status">
       {{
-        renewal?.enabled
-          ? "已同意后台自动续期，仅在本次 RainSync 登录有效时运行"
-          : renewal?.state === "uncertain"
-            ? "续期结果不确定，已停止继续刷新，请重新扫码确认"
-            : "自动续期未启用；须在新的扫码登录时另外同意保留刷新令牌"
+        renewalPhase === "loading"
+          ? "正在确认自动续期状态…"
+          : !currentRenewal
+            ? "续期状态暂未确认，请刷新状态重试"
+            : account.status?.state === "revoked"
+              ? "此服务器已解除连接，自动续期已停止"
+              : currentRenewal.enabled
+                ? "已同意后台自动续期，仅在本次 RainSync 登录有效时运行"
+                : currentRenewal.state === "uncertain"
+                  ? "续期结果不确定，已停止继续刷新，请重新扫码确认"
+                  : "自动续期未启用；须在新的扫码登录时另外同意保留刷新令牌"
       }}
     </p>
-    <button v-if="renewal?.enabled" :disabled="busy" @click="disableRenewal">
+    <button
+      v-if="currentRenewal?.enabled"
+      :disabled="busy"
+      @click="disableRenewal"
+    >
       停止自动续期
     </button>
     <div class="button-row">

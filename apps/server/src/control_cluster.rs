@@ -419,6 +419,7 @@ fn room_path(path: &str) -> Option<Uuid> {
                 | "playlist"
                 | "messages"
                 | "members"
+                | "permissions"
                 | "ownership"
                 | "owner"
                 | "lifecycle"
@@ -426,6 +427,8 @@ fn room_path(path: &str) -> Option<Uuid> {
                 | "reopen"
                 | "archive"
         )
+        || tail.starts_with("permissions/")
+        || tail.starts_with("members/")
         || tail.starts_with("invites/")
         || tail.starts_with("playlist/")
         || tail.starts_with("timeline/");
@@ -525,6 +528,9 @@ pub async fn middleware(State(app): State<App>, request: Request, next: Next) ->
     }
     if let Some(value) = parts.headers.get("x-csrf-token") {
         outgoing = outgoing.header("x-csrf-token", value)
+    }
+    for value in parts.headers.get_all("idempotency-key").iter() {
+        outgoing = outgoing.header("idempotency-key", value.clone())
     }
     let result = tokio::time::timeout(DEADLINE, async {
         let response = outgoing.send().await?;
@@ -654,6 +660,9 @@ mod tests {
             room_path(&format!("/api/v1/rooms/{room}/timeline/current")),
             Some(room)
         );
+        for tail in ["permissions", "permissions/user", "members/user"] {
+            assert_eq!(room_path(&format!("/api/v1/rooms/{room}/{tail}")), Some(room));
+        }
         for tail in [
             "playback-plan",
             "compute/jobs",

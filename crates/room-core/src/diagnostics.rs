@@ -10,15 +10,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const FORMAT_VERSION: u8 = 2;
-pub const REDUCER_VERSION: &str = "room-diagnostics/2";
+pub const FORMAT_VERSION: u8 = 3;
+pub const REDUCER_VERSION: &str = "room-diagnostics/3";
 pub const LEGACY_FORMAT_VERSION: u8 = 1;
 pub const LEGACY_REDUCER_VERSION: &str = "room-diagnostics/1";
 
 fn supported_version(version: u8, reducer: &str) -> bool {
     matches!(
         (version, reducer),
-        (1, LEGACY_REDUCER_VERSION) | (2, REDUCER_VERSION)
+        (1, LEGACY_REDUCER_VERSION) | (2, "room-diagnostics/2") | (3, REDUCER_VERSION)
     )
 }
 
@@ -124,6 +124,8 @@ pub struct Envelope {
     pub event_id: Uuid,
     pub actor_id: Option<Uuid>,
     pub actor_is_admin: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_permission: Option<protocol::RoomPermission>,
     pub before: RoomState,
     pub lifecycle_before: Lifecycle,
     pub lifecycle_after: Lifecycle,
@@ -456,6 +458,27 @@ fn validate_envelope(envelope: &Envelope) -> Result<(), &'static str> {
     {
         return Err("unsupported_envelope_version");
     }
+    if envelope.actor_permission.is_some() && envelope.schema_version < 3 {
+        return Err("unsupported_envelope_version");
+    }
+    if let Some(permission) = envelope.actor_permission {
+        let exact = match &envelope.operation {
+            Operation::Control { command, .. } | Operation::MediaControl { command, .. } => {
+                permission
+                    == protocol::RoomPermission::for_action(
+                        &command.to_command(envelope.before.room_id).action,
+                    )
+            }
+            Operation::Lifecycle {
+                transition: LifecycleTransition::Closing,
+                ..
+            } => permission == protocol::RoomPermission::Close,
+            _ => false,
+        };
+        if !exact || envelope.actor_id.is_none() || envelope.actor_is_admin {
+            return Err("invalid_command");
+        }
+    }
     validate_state(&envelope.before)?;
     validate_lifecycle(envelope.lifecycle_before)?;
     validate_lifecycle(envelope.lifecycle_after)?;
@@ -653,11 +676,12 @@ fn verify_event(window: &Window, event: &Event) -> Result<StepKind, IssueCode> {
             if *server_time_ms < envelope.before.anchor_server_time_ms {
                 return Err(IssueCode::InvalidEventTime);
             }
-            let next = crate::reduce(
+            let next = crate::reduce_with_permission(
                 &envelope.before,
                 &command.to_command(window.room_id),
                 actor,
                 envelope.actor_is_admin,
+                envelope.actor_permission,
                 *server_time_ms,
             )
             .map_err(|_| IssueCode::ReducerRejected)?;
@@ -675,7 +699,8 @@ fn verify_event(window: &Window, event: &Event) -> Result<StepKind, IssueCode> {
                 return Err(IssueCode::ControllerRequired);
             }
             if envelope.lifecycle_before != envelope.lifecycle_after
-                || envelope.lifecycle_before.state != LifecycleState::Active
+                || (envelope.schema_version < 3
+                    && envelope.lifecycle_before.state != LifecycleState::Active)
             {
                 return Err(IssueCode::LifecycleMismatch);
             }
@@ -909,6 +934,7 @@ mod tests {
                 event_id: command.command_id,
                 actor_id: Some(before.controller_user_id),
                 actor_is_admin: false,
+                actor_permission: None,
                 before: before.clone(),
                 lifecycle_before: lifecycle(),
                 lifecycle_after: lifecycle(),
@@ -960,6 +986,7 @@ mod tests {
                 ))
                 .then_some(before.controller_user_id),
                 actor_is_admin: false,
+                actor_permission: None,
                 before: before.clone(),
                 lifecycle_before: before_lifecycle,
                 lifecycle_after: after_lifecycle,
@@ -992,6 +1019,7 @@ mod tests {
                 event_id: Uuid::from_u128(16),
                 actor_id: Some(before.controller_user_id),
                 actor_is_admin: false,
+                actor_permission: None,
                 before: before.clone(),
                 lifecycle_before: lifecycle(),
                 lifecycle_after: lifecycle(),

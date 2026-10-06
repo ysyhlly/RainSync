@@ -1,5 +1,13 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, watch } from "vue";
+import {
+  computed,
+  nextTick,
+  ref,
+  onMounted,
+  onBeforeUnmount,
+  watch,
+} from "vue";
+import { onBeforeRouteLeave } from "vue-router";
 import { useSession } from "../auth/session.store";
 import type { Source } from "../../shared/api/types";
 import { useAction } from "../../shared/use-action";
@@ -25,8 +33,97 @@ const rows = ref<Source[]>([]),
   userId = ref(""),
   token = ref(""),
   headers = ref("{}"),
-  advancedAssets = ref("");
+  advancedAssets = ref(""),
+  advancedOpen = ref(false),
+  discardOpen = ref(false),
+  headersError = ref(""),
+  assetsError = ref("");
+const dirty = computed(
+  () =>
+    name.value !== "" ||
+    kind.value !== "local" ||
+    root.value !== "/media" ||
+    url.value !== "" ||
+    userId.value !== "" ||
+    token.value !== "" ||
+    headers.value !== "{}" ||
+    advancedAssets.value !== "",
+);
+const advancedConfigured = computed(
+  () =>
+    (headers.value.trim() !== "{}" && headers.value.trim() !== "") ||
+    advancedAssets.value.trim() !== "",
+);
 let alive = true;
+let pendingLeave: ((discard: boolean) => void) | undefined;
+let editingField: HTMLElement | null = null;
+function resetDraft() {
+  name.value = "";
+  kind.value = "local";
+  root.value = "/media";
+  url.value = "";
+  userId.value = "";
+  token.value = "";
+  headers.value = "{}";
+  advancedAssets.value = "";
+  advancedOpen.value = false;
+  discardOpen.value = false;
+  headersError.value = "";
+  assetsError.value = "";
+}
+function beginCreate() {
+  error.value = "";
+  open.value = true;
+}
+function canClose() {
+  if (busy.value) return false;
+  if (!dirty.value) return true;
+  if (!discardOpen.value) editingField = document.activeElement as HTMLElement;
+  discardOpen.value = true;
+  void nextTick(() =>
+    document.getElementById("source-continue-editing")?.focus(),
+  );
+  return false;
+}
+function closeDraft() {
+  if (canClose()) open.value = false;
+}
+function continueEditing() {
+  discardOpen.value = false;
+  pendingLeave?.(false);
+  pendingLeave = undefined;
+  void nextTick(() => editingField?.focus());
+}
+function discardDraft() {
+  resetDraft();
+  open.value = false;
+  pendingLeave?.(true);
+  pendingLeave = undefined;
+}
+onBeforeRouteLeave(() => {
+  if (!open.value) return true;
+  if (busy.value) return false;
+  if (canClose()) return true;
+  pendingLeave?.(false);
+  return new Promise<boolean>((resolve) => {
+    pendingLeave = resolve;
+  });
+});
+function beforeUnload(event: BeforeUnloadEvent) {
+  if (!open.value || !dirty.value) return;
+  event.preventDefault();
+  event.returnValue = "";
+}
+async function fieldFailure(field: "headers" | "assets", message: string) {
+  if (field === "headers") headersError.value = message;
+  else assetsError.value = message;
+  advancedOpen.value = true;
+  await nextTick();
+  document
+    .getElementById(field === "headers" ? "source-headers" : "source-assets")
+    ?.focus();
+  throw Error(message);
+}
 async function load() {
   const value = await session.api<Source[]>("/sources");
   if (alive) {
@@ -60,6 +157,8 @@ async function remove() {
   message.value = "片源已删除，关联影片已从媒体库移除";
 }
 async function create() {
+  headersError.value = "";
+  assetsError.value = "";
   let parsed: Record<string, string> = {};
   if (kind.value === "http") {
     try {
@@ -73,13 +172,22 @@ async function create() {
         throw Error();
       parsed = value;
     } catch {
-      throw Error("请求头须为JSON对象，名称和值都须为字符串");
+      await fieldFailure("headers", "请求头须为JSON对象，名称和值都须为字符串");
     }
   }
-  const association =
-    kind.value === "http"
-      ? parseHttpAssetAssociation(advancedAssets.value)
-      : undefined;
+  let association: ReturnType<typeof parseHttpAssetAssociation>;
+  try {
+    association =
+      kind.value === "http"
+        ? parseHttpAssetAssociation(advancedAssets.value)
+        : undefined;
+  } catch (e) {
+    await fieldFailure(
+      "assets",
+      e instanceof Error ? e.message : "外部字幕/字体声明格式不正确",
+    );
+    return;
+  }
   const config =
     kind.value === "local"
       ? { root: root.value }
@@ -96,27 +204,53 @@ async function create() {
     config,
   });
   if (!alive) return;
-  token.value = "";
-  headers.value = "{}";
-  advancedAssets.value = "";
+  resetDraft();
   open.value = false;
-  name.value = "";
-  await load();
   message.value = "片源已添加，可检测并扫描影片";
+  try {
+    await load();
+  } catch {
+    if (alive)
+      error.value =
+        "片源已添加，但列表暂未更新。请重新加载列表，避免重复添加。";
+  }
 }
 watch(open, (value) => {
-  if (!value) {
-    token.value = "";
-    headers.value = "{}";
-    advancedAssets.value = "";
+  if (!value) resetDraft();
+});
+watch(
+  [() => session.epoch, () => session.user?.id, () => session.user?.csrf],
+  () => {
+    resetDraft();
+    open.value = false;
+    removeOpen.value = false;
+    removing.value = undefined;
+    pendingLeave?.(true);
+    pendingLeave = undefined;
+  },
+  { flush: "sync" },
+);
+watch(headers, () => {
+  if (headersError.value) {
+    headersError.value = "";
+    error.value = "";
   }
 });
-onMounted(() => run(load));
+watch(advancedAssets, () => {
+  if (assetsError.value) {
+    assetsError.value = "";
+    error.value = "";
+  }
+});
+onMounted(() => {
+  window.addEventListener("beforeunload", beforeUnload);
+  void run(load);
+});
 onBeforeUnmount(() => {
   alive = false;
-  token.value = "";
-  headers.value = "{}";
-  advancedAssets.value = "";
+  window.removeEventListener("beforeunload", beforeUnload);
+  pendingLeave?.(false);
+  resetDraft();
 });
 </script>
 <template>
@@ -127,7 +261,7 @@ onBeforeUnmount(() => {
         <h1>片源管理</h1>
         <p>连接媒体目录或服务，检测并扫描可用影片。</p>
       </div>
-      <button class="primary" :disabled="busy" @click="open = true">
+      <button class="primary" :disabled="busy" @click="beginCreate">
         <AppIcon name="plus" />添加片源
       </button>
     </div>
@@ -141,13 +275,13 @@ onBeforeUnmount(() => {
       :disabled="busy"
       @click="run(load)"
     >
-      重新加载
+      重新加载列表
     </button>
     <div v-if="loaded && !rows.length" class="empty-state">
       <AppIcon name="movie" :size="40" />
       <h2>暂无片源</h2>
       <p>添加本地目录、HTTP视频链接或Jellyfin/Emby服务。</p>
-      <button @click="open = true">添加第一个片源</button>
+      <button @click="beginCreate">添加第一个片源</button>
     </div>
     <div class="admin-list">
       <article v-for="row in rows" :key="row.id" class="admin-row">
@@ -185,8 +319,13 @@ onBeforeUnmount(() => {
         />
       </article>
     </div>
-    <AppDialog v-model="open" title="添加片源" drawer :busy="busy"
-      ><form @submit.prevent="run(create)">
+    <AppDialog
+      v-model="open"
+      title="添加片源"
+      drawer
+      :busy="busy"
+      :can-close="canClose"
+      ><form class="source-form" @submit.prevent="run(create)">
         <label
           >名称<input
             v-model="name"
@@ -218,27 +357,79 @@ onBeforeUnmount(() => {
               v-model="token"
               type="password"
               autocomplete="off"
-              required /></label></template
-        ><label v-if="kind === 'http'"
-          >请求头 JSON（可选）<textarea
-            v-model="headers"
-            spellcheck="false"
-          /></label
-        ><label v-if="kind === 'http'"
-          >外部字幕/字体关联 JSON（可选）<textarea
-            v-model="advancedAssets"
-            spellcheck="false"
-            maxlength="32768"
-            placeholder='{"schema_version":1,"subtitles":["ass"],"fonts":["body.ttf"]}'
-          /><span class="helper"
-            >关联同名 ASS、SSA、SUP 和同名 .fonts 目录内的指定字体文件</span
-          ></label
-        ><Notice :message="error" error /><button
-          class="primary"
-          :disabled="busy"
+              required /></label
+        ></template>
+        <details
+          v-if="kind === 'http'"
+          :open="advancedOpen"
+          @toggle="advancedOpen = ($event.target as HTMLDetailsElement).open"
         >
-          {{ busy ? "正在添加…" : "保存片源" }}
-        </button>
+          <summary>
+            高级选项：请求头与外部字幕{{
+              advancedConfigured ? "（已配置）" : ""
+            }}
+          </summary>
+          <div class="source-advanced-fields">
+            <label for="source-headers">请求头 JSON（可选）</label
+            ><textarea
+              id="source-headers"
+              v-model="headers"
+              spellcheck="false"
+              :aria-invalid="!!headersError"
+              :aria-describedby="
+                headersError ? 'source-headers-error' : undefined
+              "
+            /><Notice id="source-headers-error" :message="headersError" error />
+            <label for="source-assets">外部字幕/字体关联 JSON（可选）</label
+            ><textarea
+              id="source-assets"
+              v-model="advancedAssets"
+              spellcheck="false"
+              maxlength="32768"
+              placeholder='{"schema_version":1,"subtitles":["ass"],"fonts":["body.ttf"]}'
+              :aria-invalid="!!assetsError"
+              :aria-describedby="
+                assetsError
+                  ? 'source-assets-help source-assets-error'
+                  : 'source-assets-help'
+              "
+            />
+            <p id="source-assets-help" class="helper">
+              占位内容是示例，不会自动应用。关联同名 ASS、SSA、PGS（.sup）和同名
+              .fonts 目录内的指定字体文件。
+            </p>
+            <Notice id="source-assets-error" :message="assetsError" error />
+          </div>
+        </details>
+        <div
+          v-if="discardOpen"
+          class="confirm-panel"
+          role="group"
+          aria-label="放弃未保存内容"
+        >
+          <p>片源尚未保存。放弃后会清除全部输入，包括请求头和访问令牌。</p>
+          <button
+            id="source-continue-editing"
+            type="button"
+            @click="continueEditing"
+          >
+            继续编辑
+          </button>
+          <button class="danger" type="button" @click="discardDraft">
+            放弃未保存内容
+          </button>
+        </div>
+        <div class="source-form-actions">
+          <Notice :message="headersError || assetsError ? '' : error" error />
+          <div class="dialog-actions">
+            <button type="button" :disabled="busy" @click="closeDraft">
+              取消
+            </button>
+            <button class="primary" :disabled="busy || discardOpen">
+              {{ busy ? "正在添加…" : "保存片源" }}
+            </button>
+          </div>
+        </div>
       </form></AppDialog
     >
     <AppDialog v-model="removeOpen" title="删除片源" :busy="busy">
@@ -260,3 +451,22 @@ onBeforeUnmount(() => {
     </AppDialog>
   </section>
 </template>
+<style scoped>
+.source-advanced-fields {
+  display: grid;
+  gap: 10px;
+  padding-top: 16px;
+}
+.source-form summary {
+  cursor: pointer;
+  padding-block: 10px;
+}
+.source-form-actions {
+  position: sticky;
+  bottom: -24px;
+  padding-block: 16px;
+  background: var(--surface-panel);
+  border-top: 1px solid var(--border-subtle);
+  z-index: 1;
+}
+</style>
