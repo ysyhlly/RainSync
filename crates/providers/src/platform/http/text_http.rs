@@ -66,7 +66,12 @@ async fn fetch_text(request: TextRequest, deadline: Instant) -> Result<TextRespo
         header::ACCEPT,
         HeaderValue::from_static(if request.endpoint() == TextEndpoint::BilibiliDanmaku {
             "application/xml,text/xml"
-        } else if request.endpoint() == TextEndpoint::BilibiliSegment {
+        } else if matches!(
+            request.endpoint(),
+            TextEndpoint::BilibiliSegment
+                | TextEndpoint::BilibiliDanmakuView
+                | TextEndpoint::BilibiliDanmakuSpecial
+        ) {
             "application/octet-stream"
         } else if matches!(
             request.endpoint(),

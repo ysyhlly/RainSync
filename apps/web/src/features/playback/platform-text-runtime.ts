@@ -1,3 +1,4 @@
+import { compileDanmakuCues } from "./advanced-danmaku-loader";
 import { ref, watch, onScopeDispose, type Ref } from "vue";
 import type { PlaybackPlan } from "../../../../../packages/protocol";
 import type { useSession } from "../auth/session.store";
@@ -471,14 +472,30 @@ export function createPlatformTextRuntime(ctx: {
           wanted = Math.floor(at / 360000);
         if (wanted !== segment) {
           const value = await ctx.session.api(
-            requestUrl("/danmaku") + `&at_ms=${at}&rendering_version=2`,
+            requestUrl("/danmaku") + `&at_ms=${at}&rendering_version=3`,
             "GET",
             undefined,
             AbortSignal.any([controller.signal, AbortSignal.timeout(35000)]),
           );
           if (!current()) return;
-          platformDanmakuCues.value = parsePlatformDanmaku(value)
-            .filter((cue) => cue.at_ms >= timelineOriginSeconds * 1000)
+          const compiled = await compileDanmakuCues(
+            parsePlatformDanmaku(value),
+            controller.signal,
+          );
+          if (!current()) return;
+          platformTextError.value =
+            (value as { warnings?: string[] }).warnings?.join("；") ?? "";
+          platformDanmakuCues.value = compiled
+            .filter(
+              (cue) =>
+                cue.at_ms >= timelineOriginSeconds * 1000 ||
+                ((cue.scene || cue.interaction) &&
+                  cue.at_ms +
+                    (cue.scene?.duration_ms ??
+                      cue.interaction?.duration_ms ??
+                      0) >
+                    timelineOriginSeconds * 1000),
+            )
             .map((cue) => ({
               ...cue,
               at_ms: cue.at_ms - timelineOriginSeconds * 1000,

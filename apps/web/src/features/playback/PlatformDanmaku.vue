@@ -4,14 +4,24 @@ import {
   visiblePlatformDanmaku,
   type PlatformDanmakuCue,
 } from "./platform-text";
+import AdvancedDanmakuScene from "./AdvancedDanmakuScene.vue";
+import { danmakuActionUrl } from "./advanced-danmaku";
+const emit = defineEmits<{ seek: [atMs: number] }>();
 const props = defineProps<{
   cues: readonly PlatformDanmakuCue[];
   enabled: boolean;
   video?: HTMLVideoElement;
+  canSeek?: boolean;
 }>();
 const current = ref(0);
 const drawBox = ref<Record<string, string>>({});
+const width = ref(672),
+  height = ref(438);
 let resize: ResizeObserver | undefined;
+function setSize(w: number, h: number) {
+  width.value = w;
+  height.value = h;
+}
 function measure() {
   const video = props.video;
   if (
@@ -30,6 +40,8 @@ function measure() {
     ),
     width = video.videoWidth * scale,
     height = video.videoHeight * scale;
+  // Match the video content rectangle, including letterboxing.
+  setSize(width, height);
   drawBox.value = {
     left: `${video.offsetLeft + (video.clientWidth - width) / 2}px`,
     top: `${video.offsetTop + (video.clientHeight - height) / 2}px`,
@@ -164,15 +176,62 @@ function position(item: ReturnType<typeof visiblePlatformDanmaku>[number]) {
 }
 </script>
 <template>
-  <div
-    v-if="enabled"
-    class="platform-danmaku"
-    :style="drawBox"
-    aria-hidden="true"
-  >
-    <span v-for="item in visible" :key="item.key" :style="position(item)">{{
-      item.cue.text
-    }}</span>
+  <div v-if="enabled" class="platform-danmaku" :style="drawBox">
+    <template v-for="item in visible" :key="item.key">
+      <AdvancedDanmakuScene
+        v-if="item.cue.scene"
+        :scene="item.cue.scene"
+        :elapsed="current - item.cue.at_ms"
+        :width="width"
+        :height="height"
+        :reduced="reducedMotion"
+        :can-seek="!!canSeek"
+        @seek="emit('seek', $event)"
+      />
+      <div
+        v-else-if="item.cue.interaction"
+        class="interactive-danmaku"
+        :style="{ top: 12 + item.lane * 64 + 'px' }"
+      >
+        <strong>{{ item.cue.text }}</strong>
+        <span v-if="item.cue.interaction.options.length" class="vote-options">{{
+          item.cue.interaction.options.join(" · ")
+        }}</span>
+        <a
+          :href="
+            danmakuActionUrl({
+              kind: 'video',
+              video: item.cue.interaction.video,
+              page: 1,
+              at_ms: 0,
+            })
+          "
+          target="_blank"
+          rel="noopener noreferrer"
+          @click.stop
+          @pointerdown.stop
+          >{{
+            item.cue.interaction.kind === "vote"
+              ? "到原站投票"
+              : item.cue.interaction.kind === "follow"
+                ? "到原站关注"
+                : "打开原站视频"
+          }}</a
+        >
+      </div>
+      <span
+        v-else-if="!item.cue.program"
+        :style="position(item)"
+        aria-hidden="true"
+        >{{ item.cue.text }}</span
+      >
+    </template>
+    <small
+      v-if="visible.some((item) => item.cue.program_error)"
+      class="unsupported-style"
+      role="status"
+      >部分高级弹幕包含暂不支持的语法或超出运行上限</small
+    >
     <small
       v-if="visible.some((item) => item.cue.advanced_unsupported)"
       class="unsupported-style"
@@ -198,7 +257,7 @@ function position(item: ReturnType<typeof visiblePlatformDanmaku>[number]) {
   font-size: 11px;
   max-width: 90%;
 }
-.platform-danmaku span {
+.platform-danmaku > span {
   position: absolute;
   color: white;
   font: 500 clamp(14px, 2vw, 20px)/1.2 sans-serif;
@@ -210,8 +269,30 @@ function position(item: ReturnType<typeof visiblePlatformDanmaku>[number]) {
     -1px -1px 1px #000,
     1px 1px 1px #000;
 }
+.interactive-danmaku {
+  position: absolute;
+  right: 12px;
+  max-width: min(420px, 85%);
+  padding: 8px;
+  color: white;
+  background: rgba(0, 0, 0, 0.75);
+  border: 1px solid #aaa;
+  border-radius: 6px;
+  font-size: 14px;
+}
+.interactive-danmaku .vote-options {
+  display: block;
+  margin: 4px 0;
+  white-space: normal;
+}
+.interactive-danmaku a {
+  display: inline-block;
+  pointer-events: auto;
+  color: #aee8ff;
+  margin-left: 8px;
+}
 @media (prefers-reduced-motion: reduce) {
-  .platform-danmaku span {
+  .platform-danmaku > span {
     font-size: 16px;
   }
 }

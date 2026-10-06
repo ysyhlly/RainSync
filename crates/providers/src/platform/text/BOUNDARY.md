@@ -1,8 +1,9 @@
-# Native platform text boundary (2026-10-05)
+# Native platform text boundary (updated 2026-10-06)
 
-Implemented code and synthetic fixtures only. No live site, login, cookie,
-provider request, WS connection, PostgreSQL acceptance or deployment was run.
-A successful offline parser/type check is not provider acceptance.
+The original adapter acceptance notes below describe the initial controlled fixtures.
+Advanced danmaku validation and support boundaries are documented in
+[ADVANCED_DANMAKU.md](../../../../../docs/ADVANCED_DANMAKU.md).
+A successful offline parser/type check is not live provider acceptance.
 
 ## Source-grounded adapters
 
@@ -23,9 +24,12 @@ A successful offline parser/type check is not provider acceptance.
   [Maintained extractor](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/tiktok.py)
 - Bili protobuf seg.so uses cid and a six-minute package index. At most current
   and previous packages are fetched per request; actual sealed duration bounds
-  requested playback time. Mode7 positioned JSON keeps only its text value;
-  mode6 is plain scroll. Script/BAS/action/URLs/styles/identities never execute
-  or leave the server. XML remains a legacy parser, no silent format fallback.
+  requested playback time. Mode7 supports the normalized position, opacity and
+  linear-move subset; mode6 is plain scroll. Renderer version 3 receives bounded
+  Script/BAS source and typed command data. Metadata-owned special packs supply
+  BAS, and command metadata supplies interactive labels and original-site links.
+  Upstream action URLs, remote styles and identities are discarded. XML remains
+  a legacy plain parser, with no silent format fallback.
   [Protobuf schema](https://github.com/bilibili-plugins/bilibili-api-collect/blob/master/grpc_api/bilibili/community/service/dm/v1/dm.proto)
 - Bili live recent history is a separate explicit five-second polling mode,
   bounded to recent messages and the exact current broadcast. It is not the
@@ -73,6 +77,7 @@ Real platform availability, provider anti-bot/login/entitlement behavior,
 long-lived socket behavior, actual CEA broadcast presence, Safari native track
 behavior, provider CDN caption shapes outside the narrow current path policy,
 PGC/course caption availability and runtime stop/revoke/shutdown integration.
-Script/BAS rendering, interactive actions and undocumented live ASR schemas are
-intentionally not executable adapters. Their absence is not reported as an
-empty, successful subtitle/chat result.
+BAS and the bounded Script display interpreter are implemented. Native Flash
+classes, bitmap/network APIs, arbitrary player control, original-site account
+actions inside RainSync and undocumented live ASR schemas remain unsupported.
+These boundaries are explicit; normal comments continue when a program fails.

@@ -2,14 +2,19 @@
 //! cues and labels may be serialized. Provenance (extractor implementations):
 //! https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/bilibili.py
 //! https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/youtube/_video.py
-//! A bounded normalized mode-7 position/style subset is data-only. Scripts/BAS, entities,
-//! remote styles and markup execution remain unsupported. No comments are submitted.
+//! Programs are bounded source data for the isolated, finite client interpreter.
+//! Remote styles, markup execution and comment publication remain unavailable.
+mod advanced;
 pub mod live;
 mod positioned;
 mod protobuf;
 mod timed_text;
 use super::bilibili::{self, Cookie};
-pub use protobuf::{bounded_danmaku, legacy_danmaku, parse_bilibili_segment};
+pub use advanced::{DanmakuInteraction, DanmakuProgram};
+pub use protobuf::{
+    bounded_danmaku, legacy_danmaku, parse_bilibili_segment, parse_bilibili_special,
+    parse_bilibili_view,
+};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::{fmt, future::Future, pin::Pin};
@@ -32,6 +37,8 @@ pub enum Endpoint {
     BilibiliSubtitle,
     BilibiliDanmaku,
     BilibiliSegment,
+    BilibiliDanmakuView,
+    BilibiliDanmakuSpecial,
     BilibiliLiveHistory,
     BilibiliLiveInfo,
     BilibiliClientId,
@@ -54,6 +61,32 @@ impl fmt::Debug for TextRequest {
     }
 }
 impl TextRequest {
+    pub fn bilibili_danmaku_view(cid: u64) -> Result<Self> {
+        if cid == 0 {
+            return Err(invalid());
+        }
+        let mut url = Url::parse("https://api.bilibili.com/x/v2/dm/web/view").unwrap();
+        url.query_pairs_mut()
+            .append_pair("type", "1")
+            .append_pair("oid", &cid.to_string());
+        Ok(Self {
+            endpoint: Endpoint::BilibiliDanmakuView,
+            url,
+            cookie: None,
+            content_id: None,
+            client_id: None,
+        })
+    }
+    pub fn bilibili_danmaku_special(raw: &str) -> Result<Self> {
+        let url = validate_text_url(Endpoint::BilibiliDanmakuSpecial, raw, None)?;
+        Ok(Self {
+            endpoint: Endpoint::BilibiliDanmakuSpecial,
+            url,
+            cookie: None,
+            content_id: None,
+            client_id: None,
+        })
+    }
     pub fn bilibili_player(bvid: &str, cid: u64, cookie: Option<&Cookie>) -> Result<Self> {
         if cid == 0
             || !matches!(bilibili::parse_resource(bvid)?.id, bilibili::VideoId::Bv(ref id) if id == bvid)
@@ -260,6 +293,29 @@ pub fn validate_text_url(endpoint: Endpoint, raw: &str, content: Option<&str>) -
     }
     let host = url.host_str().ok_or_else(invalid)?;
     let valid = match endpoint {
+        Endpoint::BilibiliDanmakuView => {
+            let pairs: Vec<_> = url.query_pairs().collect();
+            host == "api.bilibili.com"
+                && url.path() == "/x/v2/dm/web/view"
+                && pairs.len() == 2
+                && pairs[0] == ("type".into(), "1".into())
+                && pairs[1].0 == "oid"
+                && decimal(&pairs[1].1)
+        }
+        Endpoint::BilibiliDanmakuSpecial => {
+            matches!(host, "i0.hdslb.com" | "i1.hdslb.com" | "i2.hdslb.com")
+                && url.query().is_none()
+                && url
+                    .path()
+                    .strip_prefix("/bfs/dm/")
+                    .and_then(|s| s.strip_suffix(".bin"))
+                    .is_some_and(|s| {
+                        !s.is_empty()
+                            && s.len() <= 128
+                            && s.bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                    })
+        }
         Endpoint::BilibiliPlayer => {
             let pairs: Vec<_> = url.query_pairs().collect();
             host == "api.bilibili.com" && matches!(url.path(), "/x/player/wbi/v2" | "/x/player/v2")
@@ -779,6 +835,10 @@ pub struct DanmakuCue {
     pub position: Option<DanmakuPosition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advanced_unsupported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<DanmakuProgram>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction: Option<DanmakuInteraction>,
 }
 /// An intentionally small XML subset. Never resolve entities, process a DTD,
 /// retain user/style IDs, evaluate advanced/script content or render markup.
@@ -911,6 +971,8 @@ pub fn parse_bilibili_danmaku(bytes: &[u8], expected_cid: u64) -> Result<Vec<Dan
                 style,
                 position,
                 advanced_unsupported: unsupported.then_some(true),
+                program: None,
+                interaction: None,
             })
         }
     }

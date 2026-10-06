@@ -1,3 +1,4 @@
+import { validVideo, record, type DanmakuScene } from "./advanced-danmaku";
 import {
   validNativeLiveBinding,
   validNativeLiveDeliveryUrl,
@@ -35,6 +36,15 @@ export type PlatformDanmakuCue = {
     rotation_z_deg: number;
   };
   advanced_unsupported?: true;
+  program?: { language: "bas" | "script"; source: string };
+  interaction?: {
+    kind: "video" | "follow" | "vote" | "up";
+    duration_ms: number;
+    video: string;
+    options: string[];
+  };
+  scene?: DanmakuScene;
+  program_error?: string;
 };
 export const MAX_PLATFORM_TEXT_BYTES = 2 * 1024 * 1024;
 const plain = (value: unknown, max: number): value is string =>
@@ -206,7 +216,13 @@ export function parsePlatformTextCatalog(value: unknown) {
 export function parsePlatformDanmaku(value: unknown): PlatformDanmakuCue[] {
   if (
     !object(value) ||
-    Object.keys(value).length !== 2 ||
+    Object.keys(value).some(
+      (k) => !["snapshot", "cues", "warnings"].includes(k),
+    ) ||
+    (value.warnings !== undefined &&
+      (!Array.isArray(value.warnings) ||
+        value.warnings.length > 4 ||
+        !value.warnings.every((w) => plain(w, 80)))) ||
     value.snapshot !== true ||
     !Array.isArray(value.cues) ||
     value.cues.length > 20_000
@@ -214,7 +230,9 @@ export function parsePlatformDanmaku(value: unknown): PlatformDanmakuCue[] {
     throw new TypeError("原站弹幕数据无效");
   let last = -1,
     second = -1,
-    density = 0;
+    density = 0,
+    advanced = 0,
+    programBytes = 0;
   return value.cues.map((cue): PlatformDanmakuCue => {
     if (
       !object(cue) ||
@@ -227,6 +245,8 @@ export function parsePlatformDanmaku(value: unknown): PlatformDanmakuCue[] {
             "style",
             "position",
             "advanced_unsupported",
+            "program",
+            "interaction",
           ].includes(key),
       ) ||
       typeof cue.at_ms !== "number" ||
@@ -238,6 +258,48 @@ export function parsePlatformDanmaku(value: unknown): PlatformDanmakuCue[] {
       !["scroll", "top", "bottom", "positioned"].includes(cue.mode as string)
     )
       throw new TypeError("原站弹幕数据无效");
+    if (cue.program !== undefined) {
+      const p = cue.program;
+      if (
+        !record(p) ||
+        Object.keys(p).length !== 2 ||
+        !["bas", "script"].includes(p.language as string) ||
+        typeof p.source !== "string" ||
+        !p.source.trim() ||
+        p.source.includes("\0") ||
+        new TextEncoder().encode(p.source).length > 32768
+      )
+        throw new TypeError("高级弹幕程序无效");
+      programBytes += new TextEncoder().encode(p.source).length;
+    }
+    if (cue.interaction !== undefined) {
+      const p = cue.interaction;
+      if (
+        !record(p) ||
+        Object.keys(p).length !== 4 ||
+        !["video", "follow", "vote", "up"].includes(p.kind as string) ||
+        !Number.isSafeInteger(p.duration_ms) ||
+        (p.duration_ms as number) < 1000 ||
+        (p.duration_ms as number) > 30000 ||
+        !validVideo(p.video) ||
+        !Array.isArray(p.options) ||
+        p.options.length > 8 ||
+        !p.options.every((x) => plain(x, 80))
+      )
+        throw new TypeError("交互弹幕无效");
+    }
+    if (cue.program !== undefined || cue.interaction !== undefined) {
+      if (
+        ++advanced > 32 ||
+        programBytes > 256 * 1024 ||
+        (cue.program && cue.interaction) ||
+        cue.mode !== "top" ||
+        cue.style ||
+        cue.position ||
+        cue.advanced_unsupported
+      )
+        throw new TypeError("高级弹幕数据无效");
+    }
     const integer = (v: unknown, min: number, max: number): v is number =>
       typeof v === "number" && Number.isSafeInteger(v) && v >= min && v <= max;
     if (
@@ -280,13 +342,25 @@ export function parsePlatformDanmaku(value: unknown): PlatformDanmakuCue[] {
       throw new TypeError("原站弹幕降级数据无效");
     last = cue.at_ms;
     const bucket = Math.floor(last / 1000);
-    density = second === bucket ? density + 1 : 1;
+    if (second !== bucket) density = 0;
+    if (cue.program === undefined && cue.interaction === undefined) density++;
     second = bucket;
-    if (density > 6) throw new TypeError("原站弹幕过于密集");
+    if (
+      cue.program === undefined &&
+      cue.interaction === undefined &&
+      density > 6
+    )
+      throw new TypeError("原站弹幕过于密集");
     return {
       at_ms: last,
       text: cue.text,
       mode: cue.mode as PlatformDanmakuCue["mode"],
+      ...(cue.program
+        ? { program: cue.program as PlatformDanmakuCue["program"] }
+        : {}),
+      ...(cue.interaction
+        ? { interaction: cue.interaction as PlatformDanmakuCue["interaction"] }
+        : {}),
       ...(cue.style !== undefined
         ? { style: cue.style as PlatformDanmakuCue["style"] }
         : {}),
@@ -379,17 +453,32 @@ export function visiblePlatformDanmaku(
   }
   const lanes = new Set<string>(),
     visible = [];
+  let advancedVisible = 0,
+    renderedNodes = 0;
   for (
     let index = lo - 1;
-    index >= 0 && cues[index].at_ms > timeMs - 12000;
+    index >= 0 && cues[index].at_ms > timeMs - 120000;
     index--
   ) {
     const cue = cues[index],
-      lifetime = cue.position?.duration_ms ?? 6000,
+      lifetime =
+        cue.scene?.duration_ms ??
+        cue.interaction?.duration_ms ??
+        cue.position?.duration_ms ??
+        6000,
       lane =
         index % (cue.mode === "scroll" ? 6 : cue.mode === "positioned" ? 4 : 2),
-      key = `${cue.mode}:${lane}`;
+      key =
+        cue.program || cue.interaction
+          ? `advanced:${index}`
+          : `${cue.mode}:${lane}`;
     if (timeMs - cue.at_ms >= lifetime || lanes.has(key)) continue;
+    if (cue.program || cue.interaction) {
+      const nodes = cue.scene?.nodes.length ?? 1;
+      if (advancedVisible >= 4 || renderedNodes + nodes > 256) continue;
+      advancedVisible++;
+      renderedNodes += nodes;
+    }
     lanes.add(key);
     visible.push({
       cue,
@@ -397,7 +486,7 @@ export function visiblePlatformDanmaku(
       key: index,
       progress: (timeMs - cue.at_ms) / lifetime,
     });
-    if (visible.length >= 10) break;
+    if (visible.length >= 14) break;
   }
   return visible;
 }

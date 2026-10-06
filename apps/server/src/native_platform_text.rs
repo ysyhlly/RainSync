@@ -2,7 +2,7 @@
 //! Every request reuses the immutable media grant gate; IDs never become URLs.
 //! No global catalog/cache, borrowed credentials, raw upstream body or comment
 //! publication exists. Bounded protobuf windows retain original source time;
-//! positioned text is flattened and scripts/BAS never execute.
+//! advanced programs remain bounded data for the isolated client interpreter.
 use crate::*;
 use axum::extract::Query;
 use providers::platform::{
@@ -60,7 +60,7 @@ pub async fn danmaku(
     Path(session): Path<Uuid>,
     Query(query): Query<DanmakuQuery>,
 ) -> Result<Response> {
-    if query.at_ms > 604_800_000 || !matches!(query.rendering_version, 1 | 2) {
+    if query.at_ms > 604_800_000 || !matches!(query.rendering_version, 1..=3) {
         return Err(err(StatusCode::BAD_REQUEST, "native_platform_text_invalid"));
     }
     execute(
@@ -185,16 +185,60 @@ async fn resolve(
                 .map_err(text_error)?;
                 cues.extend(text::parse_bilibili_segment(&bytes, index).map_err(text_error)?);
             }
+            let mut warnings = Vec::new();
+            if rendering_version == 3 {
+                // BAS lives in metadata-owned special packs, not seg.so. No
+                // account credentials or upstream URLs reach the browser.
+                let from = u64::from(segment - 1)
+                    .saturating_mul(360_000)
+                    .saturating_sub(120_000);
+                let to = (u64::from(segment) * 360_000).min(scope.duration_ms);
+                platform_media::check_text(app, &scope).await?;
+                match text::fetch(
+                    &app.platform_http,
+                    TextRequest::bilibili_danmaku_view(cid).map_err(text_error)?,
+                    deadline,
+                )
+                .await
+                .and_then(|bytes| {
+                    text::parse_bilibili_view(&bytes, cid, &scope.entry.content_id, from, to)
+                }) {
+                    Ok(view) => {
+                        cues.extend(view.cues);
+                        for request in view.special_requests {
+                            platform_media::check_text(app, &scope).await?;
+                            match text::fetch(&app.platform_http, request, deadline)
+                                .await
+                                .and_then(|bytes| text::parse_bilibili_special(&bytes, from, to))
+                            {
+                                Ok(special) => cues.extend(special),
+                                Err(_) => {
+                                    warnings.push("部分高级弹幕数据包加载失败".to_owned());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => warnings.push("高级及交互弹幕元数据暂不可用".to_owned()),
+                }
+            }
             let cues = text::bounded_danmaku(cues)
                 .into_iter()
                 .filter(|cue| cue.at_ms <= scope.duration_ms)
                 .collect::<Vec<_>>();
-            let cues = if rendering_version == 1 {
+            let mut cues = if rendering_version == 1 {
                 text::legacy_danmaku(cues)
             } else {
                 cues
             };
-            media_titles::private_json(json!({"cues":cues,"snapshot":true}))
+            if rendering_version == 2 {
+                cues.retain(|c| c.program.is_none() && c.interaction.is_none());
+            }
+            if rendering_version == 3 {
+                media_titles::private_json(json!({"cues":cues,"snapshot":true,"warnings":warnings}))
+            } else {
+                media_titles::private_json(json!({"cues":cues,"snapshot":true}))
+            }
         }
     };
     platform_media::check_text(app, &scope).await?;

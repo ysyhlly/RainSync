@@ -420,6 +420,8 @@ pub fn parse_history(bytes: &[u8], started_at: u64, now_ms: u64) -> Result<Vec<D
                 style: None,
                 position: None,
                 advanced_unsupported: None,
+                program: None,
+                interaction: None,
             });
         }
     }

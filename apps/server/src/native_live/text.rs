@@ -193,6 +193,8 @@ impl Relay {
                         style: None,
                         position: None,
                         advanced_unsupported: None,
+                        program: None,
+                        interaction: None,
                     });
                 }
             }

@@ -250,6 +250,19 @@ onBeforeUnmount(() => {
         :cues="r.platformDanmakuCues"
         :enabled="r.platformDanmakuEnabled"
         :video="element"
+        :can-seek="r.owner && r.connected && !r.live && !!r.state?.media_id"
+        @seek="
+          (at) => {
+            if (
+              r.owner &&
+              r.connected &&
+              !r.live &&
+              r.state?.media_id &&
+              at < r.duration * 1000
+            )
+              r.send('SEEK', { position_ms: at });
+          }
+        "
       />
       <div v-if="!r.state?.media_id" class="player-empty">
         <AppIcon name="movie" :size="40" />

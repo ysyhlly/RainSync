@@ -64,7 +64,8 @@ const statuses: Partial<Record<PlatformTextStatus, string>> = {
     />原站弹幕</label
   >
   <p v-if="!live && danmakuStatus === 'available'" class="helper">
-    原站弹幕按播放进度获取有限分段；支持受限颜色、字号与归一化定位/透明度/二维移动。复杂路径或透视降为纯文字，不执行脚本或 BAS
+    原站弹幕按播放进度获取有限分段；支持定位弹幕、Script／BAS
+    文本与图形动画、点击跳转和交互提示。部分旧版接口及超出运行上限的弹幕会提示不支持；关注与投票在原站完成
   </p>
   <div v-if="live && danmakuStatus === 'available'">
     <label
