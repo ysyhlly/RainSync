@@ -4,10 +4,10 @@
   display: block;
 }
 .room-modular-page {
-  --room-panel: color-mix(in srgb, var(--surface-panel) 82%, white);
-  --room-line: color-mix(in srgb, var(--border-subtle) 75%, transparent);
+  --room-panel: var(--surface-panel);
+  --room-line: var(--border-subtle);
   --room-muted: color-mix(in srgb, var(--accent-soft) 30%, transparent);
-  --room-radius: 12px;
+  --room-radius: var(--radius-widget);
   display: block;
   min-width: 0;
   padding-bottom: 24px;
@@ -1035,16 +1035,8 @@
   }
 }
 
-/* Neutral cream belongs only to the room; other routes retain their palette. */
+/* Every route consumes the shared cream palette. Keep room geometry local. */
 .room-layout-active {
-  --surface-canvas: #f5f0e6;
-  --surface-panel: #fcf9f2;
-  --surface-muted: #eee4d4;
-  --text-primary: #443127;
-  --text-secondary: #756355;
-  --accent-soft: #efe1cf;
-  --border-subtle: #e4dacb;
-  --border-control: #ad927c;
   background: var(--surface-canvas);
 }
 

@@ -65,7 +65,7 @@ watch(
 );
 </script>
 <template>
-  <section class="panel">
+  <section class="panel account-exit-panel">
     <h2>注销账号</h2>
     <p>
       注销会退出所有设备、停止自己的播放并撤销平台登录。共享聊天和审计记录会以“已注销用户”保留。
@@ -135,3 +135,13 @@ watch(
     </AppDialog>
   </section>
 </template>
+
+<style scoped>
+.account-exit-panel {
+  display: grid;
+  gap: var(--space-3);
+}
+.account-exit-panel > button {
+  justify-self: start;
+}
+</style>

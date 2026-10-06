@@ -121,7 +121,7 @@ test("beige tokens, media ratio, dialogs and required widths remain usable", asy
         .trim()
         .toUpperCase(),
     ),
-  ).toBe("#FFF4D5");
+  ).toBe("#F5F0E6");
   expect(
     await page.evaluate(() =>
       getComputedStyle(document.documentElement)
@@ -129,7 +129,7 @@ test("beige tokens, media ratio, dialogs and required widths remain usable", asy
         .trim()
         .toUpperCase(),
     ),
-  ).toBe("#D2B49C");
+  ).toBe("#D7BDA5");
   await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
   expect(
     await page.evaluate(

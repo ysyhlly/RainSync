@@ -1347,8 +1347,18 @@ try {
       );
       try {
         const started = Date.now();
-        await post(timeoutGrant, sample(timeoutGrant), 500, "DATABASE_ERROR");
-        assert.ok(Date.now() - started < 3500, "whole request remains bounded");
+        // The receiver's 500 ms lock_timeout raises SQLSTATE 55P03, which
+        // the Server classifies as transient contention. The CHECK-constraint
+        // rollback fixture above remains a distinct 500 DATABASE_ERROR.
+        const rejection = await post(timeoutGrant, sample(timeoutGrant), 503, "SERVICE_UNAVAILABLE");
+        report.lock_timeout_response = {
+          status: 503,
+          error_code: rejection.error.code,
+          retryable: rejection.error.retryable,
+          elapsed_ms: Date.now() - started,
+        };
+        assert.equal(rejection.error.retryable, true);
+        assert.ok(report.lock_timeout_response.elapsed_ms < 3500, "whole request remains bounded");
         await unchanged(timeoutGrant, timeoutSlot, timeoutMetrics);
         const aborted = admin
           .raw(`/playback-sessions/${timeoutGrant.plan.session_id}/metrics`, {
@@ -1554,7 +1564,7 @@ try {
             { method: "POST", body: sample(grant) },
           );
           const body = await response.json();
-          return { status: response.status, code: body.error?.code };
+          return { status: response.status, code: body.error?.code, retryable: body.error?.retryable };
         });
         const responses = await Promise.all(requests);
         assert.ok(
@@ -1564,7 +1574,7 @@ try {
           "36 concurrent requests exceed 32 in-flight permits",
         );
         assert.ok(
-          responses.every((r) => [500, 503].includes(r.status)),
+          responses.every((r) => r.status === 503 && r.code === "SERVICE_UNAVAILABLE" && r.retryable === true),
           JSON.stringify(responses),
         );
         for (const grant of capacityGrants) assert.equal(slot(grant).seq, 0);

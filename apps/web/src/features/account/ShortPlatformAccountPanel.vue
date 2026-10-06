@@ -192,7 +192,7 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="panel platform-account-panel">
-    <h2>{{ label }} 账号会话</h2>
+    <h3>{{ label }} 账号会话</h3>
     <p>
       抖音与 TikTok
       是独立平台，账号会话不能混用。每位观众只能使用自己导入的会话，会员、年龄和地区限制仍由平台决定。
@@ -210,12 +210,6 @@ onBeforeUnmount(() => {
     </p>
     <p class="helper">
       网页播放会话不提供直接扫码登录；下方的官方开放平台授权需要单独配置。导入成功只表示会话已加密保存，不能保证仍已登录或具有视频访问权限。
-    </p>
-    <p class="helper">
-      开放平台 OAuth
-      扫码授权需要服务器运营者拥有审核通过的应用，并配置应用密钥和 HTTPS
-      回调地址。安装普通抖音或 TikTok App 不满足此条件；官方 OAuth
-      授权也不会生成用于网页播放的登录 Cookie。
     </p>
     <OfficialPlatformAccountPanel :provider="props.provider" />
     <div class="button-row">

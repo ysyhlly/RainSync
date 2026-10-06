@@ -1,7 +1,10 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount } from "vue";
+import { ref, onMounted, onBeforeUnmount, watch } from "vue";
 import { useSession } from "../auth/session.store";
 import type { Media } from "../../shared/api/types";
+import AppIcon from "../../shared/ui/AppIcon.vue";
+import AppSelect from "../../shared/ui/AppSelect.vue";
+import Notice from "../../shared/ui/Notice.vue";
 interface Manifest {
   id: string;
   name: string;
@@ -26,13 +29,17 @@ interface Draft {
 }
 const session = useSession(),
   catalog = ref<Manifest[]>([]),
+  catalogLoaded = ref(false),
   installed = ref<Record<string, Installed>>({}),
   draft = ref<Record<string, Draft>>({}),
   busy = ref(""),
   error = ref(""),
   message = ref(""),
   media = ref<Media[]>([]),
+  mediaLoaded = ref(false),
   selectedMedia = ref(""),
+  previewLoaded = ref(false),
+  auditLoaded = ref(false),
   extensions = ref<
     {
       plugin_id: string;
@@ -77,6 +84,7 @@ async function load() {
       ];
     }),
   );
+  catalogLoaded.value = true;
 }
 async function run(id: string, operation: () => Promise<void>) {
   if (busy.value) return;
@@ -114,6 +122,7 @@ async function save(id: string) {
   installed.value[id] = result;
   message.value = "插件设置已保存，新请求使用此配置版本";
   extensions.value = [];
+  previewLoaded.value = false;
 }
 async function rollback(id: string) {
   const p = installed.value[id];
@@ -128,6 +137,7 @@ async function rollback(id: string) {
   await load();
   message.value = "已恢复上一次配置，修订号继续递增";
   extensions.value = [];
+  previewLoaded.value = false;
 }
 async function preview() {
   if (!selectedMedia.value) return;
@@ -149,19 +159,33 @@ async function preview() {
   )
     throw new TypeError("插件输出无效");
   extensions.value = result.extensions;
+  previewLoaded.value = true;
 }
 async function audit() {
   const result = await session.api<{ items: typeof audits.value }>(
     "/admin/plugins/audit",
   );
-  if (alive) audits.value = result.items;
+  if (alive) {
+    audits.value = result.items;
+    auditLoaded.value = true;
+  }
 }
+async function loadMedia() {
+  const result = await session.api<Media[]>("/media");
+  if (alive) {
+    media.value = result.slice(0, 100);
+    mediaLoaded.value = true;
+  }
+}
+watch(selectedMedia, () => {
+  extensions.value = [];
+  previewLoaded.value = false;
+});
 onMounted(
   () =>
     void run("load", async () => {
       await load();
-      const result = await session.api<Media[]>("/media");
-      if (alive) media.value = result.slice(0, 100);
+      await loadMedia();
     }),
 );
 onBeforeUnmount(() => {
@@ -172,172 +196,284 @@ onBeforeUnmount(() => {
 <template>
   <section class="page plugin-page">
     <div class="page-title">
-      <div>
-        <p class="section-label">管理区</p>
+      <div class="page-intro">
+        <p class="section-label">管理</p>
         <h1>插件管理</h1>
-        <p>从受控目录安装声明式元数据扩展，显式授予权限并保留版本回退记录</p>
+        <p>从受控目录安装声明式元数据扩展，显式授予权限并保留版本回退记录。</p>
       </div>
+      <button :disabled="!!busy" @click="run('load', load)">
+        <AppIcon name="refresh" />{{
+          busy === "load" ? "正在刷新…" : "刷新目录与状态"
+        }}
+      </button>
     </div>
     <p class="notice">
       当前只支持应用内封闭插件目录。扩展不加载远程脚本，不访问网络、文件、凭据或数据库，不改写影片或播放授权。第三方进程宿主尚未开放。
     </p>
-    <p v-if="error" class="error" role="alert">{{ error }}</p>
-    <p v-if="message" role="status">{{ message }}</p>
-    <button :disabled="!!busy" @click="run('load', load)">
-      刷新目录与状态
-    </button>
-    <article
-      v-for="plugin in catalog"
-      :key="plugin.id"
-      class="panel plugin-card"
+    <Notice :message="error" error />
+    <Notice :message="message" />
+    <p
+      v-if="busy === 'load' && !catalogLoaded"
+      class="loading-state loading-state--inline"
+      role="status"
     >
-      <h2>{{ plugin.name }}</h2>
-      <p>{{ plugin.description }}</p>
-      <p class="helper">
-        {{ plugin.id }} · API 1.0 ·
-        {{ installed[plugin.id] ? "已安装" : "未安装" }} · 封闭声明式
-      </p>
-      <form
-        v-if="draft[plugin.id]"
-        @submit.prevent="run(plugin.id, () => save(plugin.id))"
+      正在加载插件目录…
+    </p>
+    <div class="content-grid plugin-catalog" :aria-busy="busy === 'load'">
+      <article
+        v-for="plugin in catalog"
+        :key="plugin.id"
+        class="panel surface-card plugin-card"
       >
-        <label
-          >目录版本<select
-            v-model="draft[plugin.id].version"
-            :disabled="!!busy"
+        <header class="section-heading">
+          <h2>{{ plugin.name }}</h2>
+          <span
+            class="status-badge"
+            :class="{ 'status-badge--success': installed[plugin.id]?.enabled }"
           >
-            <option
-              v-for="version in plugin.versions"
-              :key="version.version"
-              :value="version.version"
-            >
-              {{ version.version }}
-            </option>
-          </select></label
-        >
-        <label v-if="plugin.id === 'metadata.duration-badge'"
-          >时长格式<select v-model="draft[plugin.id].format" :disabled="!!busy">
-            <option value="minutes">分钟</option>
-            <option value="clock">时:分:秒</option>
-          </select></label
-        >
-        <label v-else
-          >纯文字说明<input
-            v-model="draft[plugin.id].label"
-            maxlength="40"
-            :disabled="!!busy"
-            placeholder="例如：优先观看完整版"
-        /></label>
-        <label
-          ><input
-            v-model="draft[plugin.id].grant"
-            type="checkbox"
-            :disabled="!!busy"
-          />授予 metadata:read，只读取当前用户有权查看的影片元信息</label
-        >
-        <label
-          ><input
-            v-model="draft[plugin.id].enabled"
-            type="checkbox"
-            :disabled="!!busy"
-          />启用此插件</label
-        >
-        <p class="helper">
-          制品摘要
-          {{
-            plugin.versions.find((v) => v.version === draft[plugin.id].version)
-              ?.artifact_digest
-          }}
-        </p>
-        <p v-if="installed[plugin.id]" class="helper">
-          当前修订 {{ installed[plugin.id].revision }} ·
-          {{ installed[plugin.id].enabled ? "运行中" : "已停用" }}
-        </p>
-        <div class="button-row">
-          <button class="primary" :disabled="!!busy || !draft[plugin.id].grant">
             {{
-              busy === plugin.id
-                ? "保存中…"
-                : installed[plugin.id]
-                  ? "保存配置与版本"
-                  : "安装插件"
-            }}</button
-          ><button
-            v-if="installed[plugin.id]?.can_rollback"
-            type="button"
-            :disabled="!!busy"
-            @click="run(plugin.id, () => rollback(plugin.id))"
+              !installed[plugin.id]
+                ? "未安装"
+                : installed[plugin.id].enabled
+                  ? "已启用"
+                  : "已停用"
+            }}
+          </span>
+        </header>
+        <p>{{ plugin.description }}</p>
+        <p class="helper">{{ plugin.id }} · API 1.0 · 封闭声明式</p>
+        <form
+          v-if="draft[plugin.id]"
+          :aria-busy="busy === plugin.id"
+          @submit.prevent="run(plugin.id, () => save(plugin.id))"
+        >
+          <label>
+            目录版本
+            <AppSelect
+              v-model="draft[plugin.id].version"
+              label="目录版本"
+              :disabled="!!busy"
+              :options="
+                plugin.versions.map((version) => ({
+                  value: version.version,
+                  label: version.version,
+                }))
+              "
+            />
+          </label>
+          <label v-if="plugin.id === 'metadata.duration-badge'">
+            时长格式
+            <AppSelect
+              v-model="draft[plugin.id].format"
+              label="时长格式"
+              :disabled="!!busy"
+              :options="[
+                { value: 'minutes', label: '分钟' },
+                { value: 'clock', label: '时:分:秒' },
+              ]"
+            />
+          </label>
+          <label v-else>
+            纯文字说明
+            <input
+              v-model="draft[plugin.id].label"
+              maxlength="40"
+              :disabled="!!busy"
+              placeholder="例如：优先观看完整版"
+            />
+          </label>
+          <fieldset class="plugin-permissions">
+            <legend>运行与权限</legend>
+            <label class="plugin-check">
+              <input
+                v-model="draft[plugin.id].grant"
+                type="checkbox"
+                :disabled="!!busy"
+              />
+              <span
+                >授予 metadata:read，只读取当前用户有权查看的影片元信息</span
+              >
+            </label>
+            <label class="plugin-check">
+              <input
+                v-model="draft[plugin.id].enabled"
+                type="checkbox"
+                :disabled="!!busy"
+              />
+              <span>启用此插件</span>
+            </label>
+          </fieldset>
+          <details class="plugin-version">
+            <summary>版本与制品信息</summary>
+            <p class="helper">
+              制品摘要
+              {{
+                plugin.versions.find(
+                  (v) => v.version === draft[plugin.id].version,
+                )?.artifact_digest
+              }}
+            </p>
+            <p v-if="installed[plugin.id]" class="helper">
+              当前修订 {{ installed[plugin.id].revision }} ·
+              {{ installed[plugin.id].enabled ? "运行中" : "已停用" }}
+            </p>
+          </details>
+          <div class="button-row">
+            <button
+              class="primary"
+              :disabled="!!busy || !draft[plugin.id].grant"
+            >
+              {{
+                busy === plugin.id
+                  ? "保存中…"
+                  : installed[plugin.id]
+                    ? "保存配置与版本"
+                    : "安装插件"
+              }}
+            </button>
+            <button
+              v-if="installed[plugin.id]?.can_rollback"
+              type="button"
+              :disabled="!!busy"
+              @click="run(plugin.id, () => rollback(plugin.id))"
+            >
+              恢复上一次配置
+            </button>
+          </div>
+        </form>
+      </article>
+    </div>
+    <div class="content-grid plugin-tools">
+      <section
+        class="panel surface-card plugin-preview"
+        :aria-busy="busy === 'preview'"
+      >
+        <div class="section-heading__copy">
+          <h2>验证实际插件输出</h2>
+          <p class="helper">选取你有权查看的影片，读取当前配置的实际结果。</p>
+        </div>
+        <label>
+          可访问的影片
+          <AppSelect
+            v-model="selectedMedia"
+            label="可访问的影片"
+            :disabled="!!busy || !media.length"
+            :options="[
+              { value: '', label: '选择影片' },
+              ...media.map((m) => ({ value: m.id, label: m.title })),
+            ]"
+          />
+        </label>
+        <div class="button-row">
+          <button
+            :disabled="!!busy || !selectedMedia"
+            @click="run('preview', preview)"
           >
-            恢复上一次配置
+            {{ busy === "preview" ? "正在读取扩展…" : "读取元数据扩展" }}
+          </button>
+          <button
+            v-if="catalogLoaded && !mediaLoaded"
+            :disabled="!!busy"
+            @click="run('media', loadMedia)"
+          >
+            {{ busy === "media" ? "正在加载影片…" : "重新加载影片" }}
           </button>
         </div>
-      </form>
-    </article>
-    <section class="panel plugin-preview">
-      <h2>验证实际插件输出</h2>
-      <label
-        >可访问的影片<select v-model="selectedMedia">
-          <option value="">选择影片</option>
-          <option v-for="m in media" :key="m.id" :value="m.id">
-            {{ m.title }}
-          </option>
-        </select></label
-      ><button
-        :disabled="!!busy || !selectedMedia"
-        @click="run('preview', preview)"
-      >
-        读取元数据扩展
-      </button>
-      <p v-if="!extensions.length" class="helper">
-        没有可显示的扩展。请启用插件并选择有对应元信息的影片。
-      </p>
-      <ul v-else>
-        <li v-for="e in extensions" :key="e.plugin_id">
-          {{ e.label }} · {{ e.plugin_id }} {{ e.extension_version }} / 修订{{
-            e.revision
+        <p v-if="!previewLoaded" class="helper">
+          {{
+            !catalogLoaded
+              ? "加载插件目录后可验证输出。"
+              : !mediaLoaded
+                ? "影片列表尚未加载，请重新加载影片后再试。"
+                : !media.length
+                  ? "暂无可访问的影片，请先在媒体库添加影片。"
+                  : "选择影片后，读取元数据扩展以查看结果。"
           }}
-        </li>
-      </ul>
-    </section>
-    <section class="panel">
-      <button :disabled="!!busy" @click="run('audit', audit)">
-        查看安装、升级与回退记录
-      </button>
-      <ul v-if="audits.length">
-        <li v-for="a in audits" :key="a.id">
-          {{ a.plugin_id }} · {{ a.action }} · 修订{{ a.revision }}
-        </li>
-      </ul>
-    </section>
+        </p>
+        <p v-else-if="!extensions.length" class="helper" role="status">
+          没有可显示的扩展。请启用插件并选择有对应元信息的影片。
+        </p>
+        <ul v-else class="plugin-results" aria-live="polite">
+          <li v-for="extension in extensions" :key="extension.plugin_id">
+            <strong>{{ extension.label }}</strong>
+            <p class="helper">
+              {{ extension.plugin_id }} {{ extension.extension_version }} /
+              修订{{ extension.revision }}
+            </p>
+          </li>
+        </ul>
+      </section>
+      <section
+        class="panel surface-card plugin-audit"
+        :aria-busy="busy === 'audit'"
+      >
+        <div class="section-heading__copy">
+          <h2>变更记录</h2>
+          <p class="helper">查看插件安装、版本升级与配置回退记录。</p>
+        </div>
+        <div class="button-row">
+          <button :disabled="!!busy" @click="run('audit', audit)">
+            {{
+              busy === "audit" ? "正在读取记录…" : "查看安装、升级与回退记录"
+            }}
+          </button>
+        </div>
+        <p v-if="!auditLoaded" class="helper">
+          按需读取记录，核对插件与配置修订。
+        </p>
+        <p v-else-if="!audits.length" class="helper" role="status">
+          暂无安装、升级或回退记录。
+        </p>
+        <ul v-else class="plugin-results">
+          <li v-for="entry in audits" :key="entry.id">
+            <strong>{{ entry.plugin_id }}</strong>
+            <p class="helper">{{ entry.action }} · 修订{{ entry.revision }}</p>
+          </li>
+        </ul>
+      </section>
+    </div>
   </section>
 </template>
 <style scoped>
+.plugin-catalog,
+.plugin-tools {
+  margin-top: var(--space-6);
+  align-items: start;
+}
 .plugin-card,
-.plugin-preview {
-  padding: 20px;
-  margin-top: 16px;
+.plugin-preview,
+.plugin-audit {
+  display: grid;
+  gap: var(--space-4);
   min-width: 0;
 }
-.plugin-page label {
-  display: flex;
+.plugin-permissions {
+  display: grid;
+  gap: var(--space-3);
+}
+.plugin-permissions legend {
+  margin-bottom: var(--space-3);
+  font-weight: 700;
+}
+.plugin-check {
+  flex-direction: row;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin: 12px 0;
+  gap: var(--space-3);
+  min-height: var(--control-height);
+  font-weight: 400;
 }
-.plugin-page select,
-.plugin-page input:not([type="checkbox"]) {
-  min-width: 0;
-  max-width: 100%;
-  flex: 1;
+.plugin-check input {
+  flex-shrink: 0;
+  margin-block: var(--space-1);
 }
-.plugin-card .helper {
+.plugin-card .helper,
+.plugin-results {
   overflow-wrap: anywhere;
 }
-.error {
-  color: #973b32;
-}
-.plugin-page .panel:last-child {
-  margin-top: 16px;
+.plugin-results {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding-left: var(--space-5);
 }
 </style>

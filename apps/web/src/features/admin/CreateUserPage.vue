@@ -31,42 +31,53 @@ async function create() {
 <template>
   <section class="page">
     <div class="page-title">
-      <div>
+      <div class="page-intro">
         <p class="section-label">管理</p>
         <h1>账号与注册</h1>
         <p>管理注册邀请，或手动创建普通观看账号。</p>
       </div>
     </div>
     <AccountTabs />
-    <section class="panel narrow-panel">
+    <section class="panel narrow-panel surface-card">
       <h2>手动创建账号</h2>
-      <form @submit.prevent="run(create)">
-        <label
-          >登录账号<input
-            v-model="username"
-            required
-            maxlength="80"
-            autocomplete="off"
-            aria-describedby="new-account-help"
-        /></label>
-        <p id="new-account-help" class="helper">
-          唯一且不可修改，支持英文字母、数字、_、- 和 .。
-        </p>
-        <label
-          >昵称（可选）<input v-model="nickname" autocomplete="off"
-        /></label>
-        <p class="helper">最多50个字符，支持中文、Emoji和重名。</p>
-        <label
-          >密码<input
-            v-model="password"
-            type="password"
-            autocomplete="new-password"
-            required
-            aria-describedby="new-password-help"
-        /></label>
-        <p id="new-password-help" class="helper">
-          至少8个英文字符、数字、英文符号或空格，不支持中文，空格保留。
-        </p>
+      <form :aria-busy="busy" @submit.prevent="run(create)">
+        <div class="form-field">
+          <label
+            >登录账号<input
+              v-model="username"
+              required
+              maxlength="80"
+              autocomplete="off"
+              aria-describedby="new-account-help"
+          /></label>
+          <p id="new-account-help" class="helper">
+            唯一且不可修改，支持英文字母、数字、_、- 和 .。
+          </p>
+        </div>
+        <div class="form-field">
+          <label
+            >昵称（可选）<input
+              v-model="nickname"
+              autocomplete="off"
+              aria-describedby="new-nickname-help"
+          /></label>
+          <p id="new-nickname-help" class="helper">
+            最多50个字符，支持中文、Emoji和重名。
+          </p>
+        </div>
+        <div class="form-field">
+          <label
+            >密码<input
+              v-model="password"
+              type="password"
+              autocomplete="new-password"
+              required
+              aria-describedby="new-password-help"
+          /></label>
+          <p id="new-password-help" class="helper">
+            至少8个英文字符、数字、英文符号或空格，不支持中文，空格保留。
+          </p>
+        </div>
         <Notice :message="error" error /><Notice :message="message" /><button
           class="primary"
           :disabled="busy"

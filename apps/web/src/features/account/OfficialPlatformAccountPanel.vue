@@ -225,11 +225,17 @@ onBeforeUnmount(() => {
     <p v-if="status && !status.available" role="status">
       服务器尚未配置可用的开放平台应用。仅安装手机 App 无法完成这项授权
     </p>
-    <ul v-if="status && !status.available">
-      <li v-for="item in status.missing_prerequisites" :key="item">
-        {{ oauthPrerequisiteLabels[item] ?? item }}
-      </li>
-    </ul>
+    <details v-if="status && !status.available" class="oauth-setup-details">
+      <summary>查看 {{ label }} 开放平台配置要求</summary>
+      <p class="helper">
+        需要服务器运营者拥有审核通过的应用，并配置应用密钥和 HTTPS 回调地址。
+      </p>
+      <ul>
+        <li v-for="item in status.missing_prerequisites" :key="item">
+          {{ oauthPrerequisiteLabels[item] ?? item }}
+        </li>
+      </ul>
+    </details>
     <p v-else-if="status" role="status">
       {{
         status.state === "connected"
@@ -360,3 +366,17 @@ onBeforeUnmount(() => {
     </AppDialog>
   </section>
 </template>
+
+<style scoped>
+.platform-oauth-panel {
+  display: grid;
+  gap: var(--space-3);
+  padding-top: var(--space-4);
+  margin-top: var(--space-1);
+  border-top: 1px solid var(--border-subtle);
+}
+.oauth-setup-details ul {
+  margin: var(--space-2) 0 0;
+  padding-left: var(--space-5);
+}
+</style>

@@ -66,43 +66,62 @@ onBeforeUnmount(() => {
 <template>
   <section class="page">
     <div class="page-title">
-      <div>
+      <div class="page-intro">
         <p class="section-label">管理</p>
         <h1>NAS 设备</h1>
         <p>设备主动连接服务器，无需开放NAS入站端口。</p>
       </div>
-      <button
-        class="primary"
-        @click="
-          code = '';
-          name = '';
-          open = true;
-        "
-      >
-        <AppIcon name="plus" />添加设备
-      </button>
+      <div class="button-row">
+        <button v-if="!open && !revokeOpen" :disabled="busy" @click="run(load)">
+          <AppIcon name="refresh" />{{ busy ? "正在刷新…" : "刷新设备状态" }}
+        </button>
+        <button
+          class="primary"
+          @click="
+            code = '';
+            name = '';
+            open = true;
+          "
+        >
+          <AppIcon name="plus" />添加设备
+        </button>
+      </div>
     </div>
     <Notice v-if="!open && !revokeOpen" :message="error" error /><Notice
       :message="message"
     />
-    <p v-if="busy && !loaded" role="status">正在加载设备…</p>
-    <button v-if="!open && !revokeOpen" :disabled="busy" @click="run(load)">
-      {{ busy ? "正在刷新…" : "刷新设备状态" }}
-    </button>
-    <ComputePolicyPanel />
-    <div v-if="loaded && !rows.length" class="empty-state">
-      <AppIcon name="server" :size="40" />
+    <p
+      v-if="busy && !loaded"
+      class="loading-state loading-state--inline"
+      role="status"
+    >
+      正在加载设备…
+    </p>
+    <div
+      v-if="loaded && !busy && !error && !rows.length"
+      class="empty-state surface-card"
+    >
+      <span class="empty-state__icon"
+        ><AppIcon name="server" :size="28"
+      /></span>
       <h2>暂无NAS设备</h2>
       <p>生成配对码后，在NAS Agent中完成连接。</p>
     </div>
-    <div class="admin-list">
+    <div class="admin-list" :aria-busy="busy">
       <article v-for="row in rows" :key="row.id" class="admin-row">
         <div class="row-main">
-          <h2>{{ row.name }}</h2>
-          <p class="helper">
-            {{ agentConnectionLabel(row) }}
-            · 最后联系：{{ formatDate(row.last_seen) }}
-          </p>
+          <div class="section-heading">
+            <h2>{{ row.name }}</h2>
+            <span
+              class="status-badge"
+              :class="{
+                'status-badge--success': !row.revoked && row.connected === true,
+                'status-badge--danger': row.revoked,
+              }"
+              >{{ agentConnectionLabel(row) }}</span
+            >
+          </div>
+          <p class="helper">最后联系：{{ formatDate(row.last_seen) }}</p>
           <p class="helper">{{ agentReadinessLabel(row) }}</p>
           <p v-if="agentDrainLabel(row)" class="helper">
             {{ agentDrainLabel(row) }}
@@ -123,6 +142,7 @@ onBeforeUnmount(() => {
     <p v-if="rows.length" class="helper">
       连接状态以最近一次刷新为准；文件版本索引就绪不代表设备当前在线或所有影片均可播放。
     </p>
+    <ComputePolicyPanel class="agent-compute" />
     <AppDialog v-model="open" title="添加NAS设备" drawer :busy="busy"
       ><template v-if="code"
         ><CopyField label="配对码" :value="code" />
@@ -172,3 +192,8 @@ onBeforeUnmount(() => {
     >
   </section>
 </template>
+<style scoped>
+.agent-compute {
+  margin-top: var(--space-6);
+}
+</style>

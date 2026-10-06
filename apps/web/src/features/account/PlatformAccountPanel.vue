@@ -337,7 +337,7 @@ onBeforeUnmount(() => {
 </script>
 <template>
   <section id="bilibili-account" class="panel platform-account-panel">
-    <h2>Bilibili 账号</h2>
+    <h3>Bilibili 账号</h3>
     <p>
       每位观众使用自己的账号权限。未连接时可尝试匿名播放，会员和地区限制仍由平台决定。
     </p>

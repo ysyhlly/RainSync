@@ -168,7 +168,7 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="panel platform-account-panel">
-    <h2>YouTube 账号会话</h2>
+    <h3>YouTube 账号会话</h3>
     <p>
       每位观众只能使用自己导入的 YouTube
       会话。会话不会共享给房主或其他观众，视频权限仍由平台决定。

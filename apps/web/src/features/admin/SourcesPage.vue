@@ -19,6 +19,14 @@ import ScanAllSources from "./ScanAllSources.vue";
 import { useSourceScans } from "./source-scans.store";
 import { parseHttpAssetAssociation } from "./http-asset-association";
 const scans = useSourceScans();
+const kindLabels: Record<string, string> = {
+  local: "本地目录",
+  http: "HTTP 媒体",
+  jellyfin: "Jellyfin",
+  emby: "Emby",
+  agent: "NAS 设备",
+  s3: "对象存储",
+};
 const session = useSession(),
   { busy, error, message, run } = useAction();
 const rows = ref<Source[]>([]),
@@ -256,7 +264,7 @@ onBeforeUnmount(() => {
 <template>
   <section class="page">
     <div class="page-title">
-      <div>
+      <div class="page-intro">
         <p class="section-label">管理</p>
         <h1>片源管理</h1>
         <p>连接媒体目录或服务，检测并扫描可用影片。</p>
@@ -268,8 +276,22 @@ onBeforeUnmount(() => {
     <Notice v-if="!open && !removeOpen" :message="error" error /><Notice
       :message="message"
     />
-    <ScanAllSources />
-    <p v-if="busy && !loaded" role="status">正在加载片源…</p>
+    <div class="toolbar source-toolbar">
+      <div class="section-heading__copy">
+        <h2>已连接片源</h2>
+        <p class="helper">
+          {{ loaded ? `共 ${rows.length} 个片源` : "连接后可检测并扫描影片" }}
+        </p>
+      </div>
+      <ScanAllSources />
+    </div>
+    <p
+      v-if="busy && !loaded"
+      class="loading-state loading-state--inline"
+      role="status"
+    >
+      正在加载片源…
+    </p>
     <button
       v-if="error && !open && !removeOpen"
       :disabled="busy"
@@ -277,17 +299,22 @@ onBeforeUnmount(() => {
     >
       重新加载列表
     </button>
-    <div v-if="loaded && !rows.length" class="empty-state">
-      <AppIcon name="movie" :size="40" />
+    <div
+      v-if="loaded && !busy && !error && !rows.length"
+      class="empty-state surface-card"
+    >
+      <span class="empty-state__icon"><AppIcon name="movie" :size="28" /></span>
       <h2>暂无片源</h2>
       <p>添加本地目录、HTTP视频链接或Jellyfin/Emby服务。</p>
       <button @click="beginCreate">添加第一个片源</button>
     </div>
-    <div class="admin-list">
+    <div class="admin-list" :aria-busy="busy">
       <article v-for="row in rows" :key="row.id" class="admin-row">
         <div class="row-main">
           <h2>{{ row.name }}</h2>
-          <span class="helper">{{ row.kind }}</span>
+          <span class="status-badge">{{
+            kindLabels[row.kind] ?? row.kind
+          }}</span>
         </div>
         <button
           :disabled="busy || scans.running || scans.results[row.id]?.busy"
@@ -326,39 +353,46 @@ onBeforeUnmount(() => {
       :busy="busy"
       :can-close="canClose"
       ><form class="source-form" @submit.prevent="run(create)">
-        <label
-          >名称<input
-            v-model="name"
-            required
-            maxlength="120"
-            autofocus /></label
-        ><label
-          >类型<AppSelect
-            v-model="kind"
-            label="类型"
-            :options="[
-              { value: 'local', label: '本地挂载目录' },
-              { value: 'http', label: 'HTTP MP4 / HLS' },
-              { value: 'jellyfin', label: 'Jellyfin' },
-              { value: 'emby', label: 'Emby' },
-            ]" /></label
-        ><label v-if="kind === 'local'"
-          >容器内路径<input v-model="root" required /></label
-        ><label v-else
-          >媒体或服务 URL<input v-model="url" type="url" required /></label
-        ><template v-if="kind === 'jellyfin' || kind === 'emby'"
-          ><label
-            >专用账户 User ID<input
-              v-model="userId"
+        <fieldset class="source-field-group">
+          <legend>片源信息</legend>
+          <label
+            >名称<input
+              v-model="name"
               required
-              autocomplete="off" /></label
+              maxlength="120"
+              autofocus /></label
           ><label
-            >访问令牌<input
-              v-model="token"
-              type="password"
-              autocomplete="off"
-              required /></label
-        ></template>
+            >类型<AppSelect
+              v-model="kind"
+              label="类型"
+              :options="[
+                { value: 'local', label: '本地挂载目录' },
+                { value: 'http', label: 'HTTP MP4 / HLS' },
+                { value: 'jellyfin', label: 'Jellyfin' },
+                { value: 'emby', label: 'Emby' },
+              ]"
+          /></label>
+        </fieldset>
+        <fieldset class="source-field-group">
+          <legend>连接信息</legend>
+          <label v-if="kind === 'local'"
+            >容器内路径<input v-model="root" required /></label
+          ><label v-else
+            >媒体或服务 URL<input v-model="url" type="url" required /></label
+          ><template v-if="kind === 'jellyfin' || kind === 'emby'"
+            ><label
+              >专用账户 User ID<input
+                v-model="userId"
+                required
+                autocomplete="off" /></label
+            ><label
+              >访问令牌<input
+                v-model="token"
+                type="password"
+                autocomplete="off"
+                required /></label
+          ></template>
+        </fieldset>
         <details
           v-if="kind === 'http'"
           :open="advancedOpen"
@@ -454,17 +488,32 @@ onBeforeUnmount(() => {
 <style scoped>
 .source-advanced-fields {
   display: grid;
-  gap: 10px;
-  padding-top: 16px;
+  gap: var(--space-3);
+  padding-top: var(--space-4);
+}
+.source-field-group {
+  display: grid;
+  gap: var(--space-4);
+}
+.source-field-group legend {
+  margin-bottom: var(--space-3);
+  font-weight: 700;
+}
+.source-toolbar {
+  margin-bottom: var(--space-6);
+}
+.source-toolbar :deep(.scan-all-sources) {
+  margin-bottom: 0;
+  min-width: 0;
 }
 .source-form summary {
   cursor: pointer;
-  padding-block: 10px;
+  padding-block: var(--space-3);
 }
 .source-form-actions {
   position: sticky;
-  bottom: -24px;
-  padding-block: 16px;
+  bottom: calc(-1 * var(--space-6));
+  padding-block: var(--space-4);
   background: var(--surface-panel);
   border-top: 1px solid var(--border-subtle);
   z-index: 1;

@@ -80,6 +80,7 @@ async function validate() {
   if (busy.value || retrySeconds.value) return;
   busy.value = true;
   error.value = "";
+  fieldError.value = null;
   try {
     const value = await session.api<{ expires_at: number }>(
       "/auth/registration-invites/validate",
@@ -92,10 +93,27 @@ async function validate() {
     step.value = 2;
     await focus("register-username");
   } catch (e) {
-    if (alive) failure(e);
+    if (!alive) return;
+    failure(e);
+    if (
+      e instanceof RequestFailure &&
+      e.code === "REGISTRATION_INVITE_INVALID"
+    ) {
+      fieldError.value = { field: "code", message: error.value };
+      await focus("register-code");
+    }
   } finally {
     busy.value = false;
   }
+}
+async function changeInvite() {
+  if (busy.value || uncertain.value) return;
+  step.value = 1;
+  password.value = "";
+  confirm.value = "";
+  error.value = "";
+  fieldError.value = null;
+  await focus("register-code");
 }
 async function complete() {
   password.value = "";
@@ -199,137 +217,176 @@ async function recover() {
 }
 </script>
 <template>
-  <section class="auth-page registration-page">
+  <section
+    class="auth-page registration-page"
+    aria-labelledby="registration-title"
+  >
     <div class="auth-top">
-      <RouterLink class="brand" to="/">RainSync</RouterLink
-      ><RouterLink :to="loginLocation">返回登录</RouterLink>
+      <RouterLink class="brand" to="/">RainSync</RouterLink>
+      <RouterLink :to="loginLocation">返回登录</RouterLink>
     </div>
     <div class="registration-panel">
       <aside class="registration-steps">
-        <h1>邀请码注册</h1>
-        <ol>
-          <li :class="{ current: step === 1 }">
-            <span>1</span>
+        <h1 id="registration-title">邀请码注册</h1>
+        <ol aria-label="注册步骤">
+          <li
+            :class="{ current: step === 1 }"
+            :aria-current="step === 1 ? 'step' : undefined"
+          >
+            <span
+              ><AppIcon v-if="step === 2" name="check" :size="16" /><template
+                v-else
+                >1</template
+              ></span
+            >
             <div>验证邀请码<small>由管理员提供</small></div>
           </li>
-          <li :class="{ current: step === 2 }">
+          <li
+            :class="{ current: step === 2 }"
+            :aria-current="step === 2 ? 'step' : undefined"
+          >
             <span>2</span>
             <div>设置账号<small>注册普通观看账号</small></div>
           </li>
         </ol>
-        <p>注册邀请码与房间邀请相互独立。</p>
-        <p v-if="returnTo.startsWith('/rooms/')">
-          注册后返回房间页面，请确认后再加入房间。
-        </p>
       </aside>
       <div class="registration-form">
-        <form v-if="step === 1" @submit.prevent="validate">
-          <h2>验证邀请码</h2>
-          <p>验证不会消耗或预留名额，注册成功后才使用。</p>
-          <label for="register-code">注册邀请码</label
-          ><input
-            id="register-code"
-            v-model="code"
-            autocomplete="off"
-            placeholder="RS-…"
-            required
-            :disabled="busy"
-            :aria-invalid="fieldError?.field === 'code'"
-            :aria-describedby="
-              fieldError?.field === 'code' ? 'register-error' : undefined
-            "
-          /><Notice id="register-error" :message="error" error /><button
-            class="primary"
-            :disabled="busy || retrySeconds > 0"
-          >
+        <form v-if="step === 1" :aria-busy="busy" @submit.prevent="validate">
+          <header class="auth-step-heading">
+            <p class="page-eyebrow">第 1 步，共 2 步</p>
+            <h2>验证邀请码</h2>
+            <p class="helper">验证不会消耗或预留名额，注册成功后才使用。</p>
+          </header>
+          <div class="form-field">
+            <label for="register-code">注册邀请码</label>
+            <input
+              id="register-code"
+              v-model="code"
+              autocomplete="off"
+              autocapitalize="none"
+              :spellcheck="false"
+              placeholder="RS-…"
+              required
+              :disabled="busy"
+              :aria-invalid="fieldError?.field === 'code'"
+              :aria-describedby="
+                fieldError?.field === 'code' ? 'register-error' : undefined
+              "
+            />
+          </div>
+          <Notice id="register-error" :message="error" error />
+          <button class="primary" :disabled="busy || retrySeconds > 0">
             {{
               busy
                 ? "正在验证…"
                 : retrySeconds
                   ? retrySeconds + "秒后重试"
                   : "验证并继续"
-            }}<AppIcon name="next" />
+            }}
+            <AppIcon name="next" />
           </button>
         </form>
-        <form v-else @submit.prevent="register">
-          <h2>设置账号</h2>
-          <p class="helper">
-            邀请码已验证，有效期至
-            {{
-              expires
-                ? new Date(expires).toLocaleString("zh-CN")
-                : "服务端指定时间"
-            }}；最终以提交时状态为准。
-          </p>
-          <label for="register-username">登录账号</label
-          ><input
-            id="register-username"
-            v-model="username"
-            autocomplete="username"
-            required
-            maxlength="80"
-            :disabled="busy || uncertain"
-            :aria-invalid="fieldError?.field === 'username'"
-            :aria-describedby="
-              fieldError?.field === 'username'
-                ? 'account-help register-error'
-                : 'account-help'
-            "
-          />
-          <p id="account-help" class="helper">
-            唯一且注册后不可修改。支持字母、数字、_、- 和 .。
-          </p>
-          <label for="register-display_name">昵称（可选）</label
-          ><input
-            id="register-display_name"
-            v-model="nickname"
-            autocomplete="nickname"
-            :disabled="busy || uncertain"
-            :aria-invalid="fieldError?.field === 'display_name'"
-            :aria-describedby="
-              fieldError?.field === 'display_name'
-                ? 'nickname-help register-error'
-                : 'nickname-help'
-            "
-          />
-          <p id="nickname-help" class="helper">
-            最多50个字符，支持中文与Emoji，可以重复或稍后修改。留空显示登录账号。
-          </p>
-          <label for="register-password">密码</label>
-          <div class="password-field">
+        <form v-else :aria-busy="busy" @submit.prevent="register">
+          <header class="auth-step-heading">
+            <p class="page-eyebrow">第 2 步，共 2 步</p>
+            <h2>设置账号</h2>
+            <p class="helper">
+              邀请码已验证，有效期至
+              {{
+                expires
+                  ? new Date(expires).toLocaleString("zh-CN")
+                  : "服务端指定时间"
+              }}；最终以提交时状态为准。
+            </p>
+          </header>
+          <div class="form-field">
+            <label for="register-username">登录账号</label>
             <input
-              id="register-password"
-              v-model="password"
+              id="register-username"
+              v-model="username"
+              autocomplete="username"
+              autocapitalize="none"
+              :spellcheck="false"
+              required
+              maxlength="80"
+              :disabled="busy || uncertain"
+              :aria-invalid="fieldError?.field === 'username'"
+              :aria-describedby="
+                fieldError?.field === 'username'
+                  ? 'account-help register-error'
+                  : 'account-help'
+              "
+            />
+            <p id="account-help" class="helper field-hint">
+              唯一且注册后不可修改。支持字母、数字、_、- 和 .。
+            </p>
+          </div>
+          <div class="form-field">
+            <label for="register-display_name">昵称（可选）</label>
+            <input
+              id="register-display_name"
+              v-model="nickname"
+              autocomplete="nickname"
+              :disabled="busy || uncertain"
+              :aria-invalid="fieldError?.field === 'display_name'"
+              :aria-describedby="
+                fieldError?.field === 'display_name'
+                  ? 'nickname-help register-error'
+                  : 'nickname-help'
+              "
+            />
+            <p id="nickname-help" class="helper field-hint">
+              最多50个字符，支持中文与Emoji，可以重复或稍后修改。留空显示登录账号。
+            </p>
+          </div>
+          <div class="form-field">
+            <label for="register-password">密码</label>
+            <div class="password-field">
+              <input
+                id="register-password"
+                v-model="password"
+                :type="show ? 'text' : 'password'"
+                autocomplete="new-password"
+                required
+                :disabled="busy || uncertain"
+                :aria-invalid="fieldError?.field === 'password'"
+                :aria-describedby="
+                  fieldError?.field === 'password'
+                    ? 'password-help register-error'
+                    : 'password-help'
+                "
+              />
+              <button
+                type="button"
+                :aria-pressed="show"
+                aria-controls="register-password register-confirm"
+                :disabled="busy"
+                @click="show = !show"
+              >
+                {{ show ? "隐藏" : "显示" }}
+              </button>
+            </div>
+            <p id="password-help" class="helper field-hint">
+              至少8个英文字符、数字、英文符号或空格，不支持中文。空格将保留。
+            </p>
+          </div>
+          <div class="form-field">
+            <label for="register-confirm">确认密码</label>
+            <input
+              id="register-confirm"
+              v-model="confirm"
               :type="show ? 'text' : 'password'"
               autocomplete="new-password"
               required
               :disabled="busy || uncertain"
-              :aria-invalid="fieldError?.field === 'password'"
+              :aria-invalid="fieldError?.field === 'confirm'"
               :aria-describedby="
-                fieldError?.field === 'password'
-                  ? 'password-help register-error'
-                  : 'password-help'
+                fieldError?.field === 'confirm' ? 'register-error' : undefined
               "
-            /><button type="button" :aria-pressed="show" @click="show = !show">
-              {{ show ? "隐藏" : "显示" }}
-            </button>
+            />
           </div>
-          <p id="password-help" class="helper">
-            至少8个英文字符、数字、英文符号或空格，不支持中文。空格将保留。
-          </p>
-          <label for="register-confirm">确认密码</label
-          ><input
-            id="register-confirm"
-            v-model="confirm"
-            :type="show ? 'text' : 'password'"
-            autocomplete="new-password"
-            required
-            :disabled="busy || uncertain"
-            :aria-invalid="fieldError?.field === 'confirm'"
-            :aria-describedby="
-              fieldError?.field === 'confirm' ? 'register-error' : undefined
-            "
-          /><Notice id="register-error" :message="error" error /><button
+          <Notice id="register-error" :message="error" error />
+          <button
             v-if="!uncertain"
             class="primary"
             :disabled="busy || retrySeconds > 0"
@@ -340,30 +397,52 @@ async function recover() {
                 : retrySeconds
                   ? retrySeconds + "秒后重试"
                   : "注册并登录"
-            }}</button
-          ><button
+            }}
+          </button>
+          <button
             v-else
             type="button"
             class="primary"
             :disabled="busy"
             @click="recover"
           >
-            {{ busy ? "正在确认…" : "使用刚设置的账号登录确认" }}</button
-          ><button
+            {{ busy ? "正在确认…" : "使用刚设置的账号登录确认" }}
+          </button>
+          <button
             v-if="!uncertain"
             type="button"
             class="text-button"
             :disabled="busy"
-            @click="
-              step = 1;
-              password = '';
-              confirm = '';
-            "
+            @click="changeInvite"
           >
             返回修改邀请码
           </button>
         </form>
+        <div class="registration-context">
+          <p class="helper">注册邀请码与房间邀请相互独立。</p>
+          <p v-if="returnTo.startsWith('/rooms/')" class="helper">
+            注册后返回房间页面，请确认后再加入房间。
+          </p>
+        </div>
       </div>
     </div>
   </section>
 </template>
+<style scoped>
+.auth-step-heading {
+  display: grid;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+.registration-form form {
+  gap: var(--space-5);
+}
+.registration-form .form-field label {
+  margin-top: 0;
+}
+.registration-context {
+  display: grid;
+  gap: var(--space-2);
+  margin-top: var(--space-6);
+}
+</style>

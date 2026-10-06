@@ -28,7 +28,7 @@
   margin: 0;
   padding: 5px;
   border: 1px solid var(--border-control);
-  border-radius: 11px;
+  border-radius: var(--radius-control);
   background: var(--surface-panel);
   color: var(--text-primary);
   box-shadow: var(--shadow-floating);
@@ -37,13 +37,13 @@
   z-index: 1000;
 }
 .select-option {
-  min-height: 44px;
+  min-height: var(--control-height);
   padding: 10px 12px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  border-radius: 7px;
+  border-radius: var(--radius-small);
   cursor: pointer;
   line-height: 1.4;
 }
@@ -61,7 +61,7 @@
 }
 input[type="checkbox"],
 input[type="radio"] {
-  accent-color: var(--accent);
+  accent-color: var(--focus-ring);
   width: 20px;
   height: 20px;
   border: 1px solid var(--border-control);

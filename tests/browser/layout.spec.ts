@@ -13,15 +13,18 @@ async function setup(page: Page, loggedIn = true) {
   );
   return app;
 }
-async function fits(page: Page) {
-  expect(
-    await page.evaluate(() => ({
-      content: document.documentElement.scrollWidth,
-      viewport: innerWidth,
-    })),
-  ).toEqual(
-    expect.objectContaining({ content: await page.evaluate(() => innerWidth) }),
-  );
+async function fits(page: Page, expectedWidth: number) {
+  // Mobile visual/layout viewports can settle on different frames after resize.
+  // Read both values atomically and require the actual requested CSS width,
+  // rather than accidentally accepting a zoom-expanded viewport.
+  await expect
+    .poll(() =>
+      page.evaluate(() => ({
+        content: document.documentElement.scrollWidth,
+        viewport: innerWidth,
+      })),
+    )
+    .toEqual({ content: expectedWidth, viewport: expectedWidth });
   const overflow = await page
     .locator(
       "main button:visible, main input:visible, main select:visible, main textarea:visible",
@@ -72,7 +75,7 @@ test("all authenticated pages fit six required widths with accessible primary co
     ).toBeVisible();
     for (const width of widths) {
       await page.setViewportSize({ width, height: 800 });
-      await fits(page);
+      await fits(page, width);
     }
   }
   await page.setViewportSize({ width: 360, height: 720 });
@@ -97,7 +100,7 @@ test("anonymous forms and admin drawers keep actions reachable at mobile and des
     await expect(page.locator(".auth-page")).toBeVisible();
     for (const width of widths) {
       await page.setViewportSize({ width, height: 740 });
-      await fits(page);
+      await fits(page, width);
     }
   }
   await page.getByLabel("注册邀请码", { exact: true }).fill("RS-SYNTHETIC");
@@ -105,7 +108,7 @@ test("anonymous forms and admin drawers keep actions reachable at mobile and des
   await expect(page.getByLabel("登录账号", { exact: true })).toBeFocused();
   for (const width of widths) {
     await page.setViewportSize({ width, height: 740 });
-    await fits(page);
+    await fits(page, width);
     await reachable(page.getByRole("button", { name: "注册并登录" }));
   }
   await setup(page, true);
@@ -118,7 +121,7 @@ test("anonymous forms and admin drawers keep actions reachable at mobile and des
     await page.getByRole("button", { name: action, exact: true }).click();
     for (const width of widths) {
       await page.setViewportSize({ width, height: 740 });
-      await fits(page);
+      await fits(page, width);
       await reachable(page.getByRole("button", { name: submit, exact: true }));
     }
     await page.keyboard.press("Escape");
@@ -240,9 +243,19 @@ test("soft keyboard viewport hides overlays without removing video or reconnecti
   expect(app.preparations()).toBe(1);
   expect(app.errors).toEqual([]);
 });
-test("empty player uses the cream panel while video letterboxing is neutral",async({page})=>{
-  const app=await appFixture(page);app.state.media_id=null as any;
-  await page.goto("/rooms/room");await expect(page.getByText("尚未选择影片").first()).toBeVisible();
-  await expect(page.locator(".video-frame")).toHaveCSS("background-color","rgb(252, 249, 242)");
-  await expect(page.locator("video")).toHaveCSS("background-color","rgb(252, 249, 242)");
+test("empty player uses the cream panel while video letterboxing is neutral", async ({
+  page,
+}) => {
+  const app = await appFixture(page);
+  app.state.media_id = null as any;
+  await page.goto("/rooms/room");
+  await expect(page.getByText("尚未选择影片").first()).toBeVisible();
+  await expect(page.locator(".video-frame")).toHaveCSS(
+    "background-color",
+    "rgb(252, 249, 242)",
+  );
+  await expect(page.locator("video")).toHaveCSS(
+    "background-color",
+    "rgb(252, 249, 242)",
+  );
 });

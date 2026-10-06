@@ -2185,7 +2185,7 @@ try {
         "preflight media table contention is bounded and leaves independent API/pool capacity",
         async (record) => {
           const subject = await setup("jellyfin", "preflight bounded database fixture");
-          const results = [];
+          const results = (record.rejections_while_lock_held = []);
           for (let attempt = 0; attempt < 4; attempt++) {
             const fault = { hold: gate() };
             subject.metadataQueue.push(fault);
@@ -2233,25 +2233,42 @@ try {
               fault.hold.release();
               const response = await pending;
               const elapsed = performance.now() - began;
-              error(response, 500, "DATABASE_ERROR");
+              const result = {
+                ...safeResponse(response),
+                retryable: response.body.error?.retryable,
+                elapsed_ms: Math.round(elapsed),
+              };
+              results.push(result);
+              // Preflight's 250 ms lock_timeout raises SQLSTATE 55P03.
+              // The Server deliberately exposes lock contention as retryable
+              // SERVICE_UNAVAILABLE, rather than an unclassified database fault.
+              error(response, 503, "SERVICE_UNAVAILABLE");
+              assert.equal(response.body.error.retryable, true);
+              assert.equal(response.body.binding, undefined);
+              assert.equal(response.body.profile, undefined);
               assert.ok(
                 elapsed < 3500,
                 attempt === 0
                   ? "held preflight read fails within its database budget"
                   : "repeated bounded preflight does not wait for the external table owner",
               );
-              results.push({
-                ...safeResponse(response),
-                elapsed_ms: Math.round(elapsed),
-              });
+              const apiBegan = performance.now();
               const rooms = await admin.request("/rooms");
+              result.independent_api_elapsed_ms = Math.round(performance.now() - apiBegan);
               assert.ok(
                 Array.isArray(rooms),
                 "independent authenticated API remains usable while media lock is held",
               );
+              assert.ok(
+                result.independent_api_elapsed_ms < 3500,
+                "independent authenticated API retains its own bounded pool capacity",
+              );
+              // The barrier is installed while upstream metadata is held,
+              // after the first read. It blocks guard's final SELECT EXISTS, so inspect
+              // both preflight media queries rather than only the initial read.
               assert.equal(
                 f.sql(
-                  "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT m.source_id,m.resource,s.kind,s.config_encrypted,s.access_policy_revision%'",
+                  "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND (query LIKE 'SELECT m.source_id,m.resource,s.kind,s.config_encrypted,s.access_policy_revision%' OR query LIKE 'SELECT EXISTS(SELECT 1 FROM media_items m JOIN sources s ON s.id=m.source_id JOIN room_snapshots r ON r.room_id=$1%')",
                 ),
                 "0",
                 "cancelled preflight does not strand its metadata DB query in the pool",
@@ -2269,7 +2286,9 @@ try {
               await pending.catch(() => {});
             }
           }
-          record.rejections_while_lock_held = results;
+          await minted(subject);
+          assert.equal(count(subject), 0);
+          record.preflight_recovers_after_lock_release = true;
           record.independent_authenticated_api_usable = true;
         },
       );

@@ -21,7 +21,7 @@ test("custom source menu keeps the drawer open and Escape closes only the menu",
   ).toBeVisible();
   await expect(page.getByRole("listbox")).toHaveCSS(
     "background-color",
-    "rgb(255, 248, 229)",
+    "rgb(252, 249, 242)",
   );
   await page.keyboard.press("Escape");
   await expect(page.getByRole("listbox")).toBeHidden();
