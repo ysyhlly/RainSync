@@ -23,6 +23,32 @@ import {
 } from "../deploy/postgres-recovery.mjs";
 import { isolatedPostgres } from "./fixtures/postgres.mjs";
 
+async function frozenControllerMigrations(directory) {
+  const migrations = (await readdir(directory))
+    .filter((name) => /^\d+_[^.]+\.sql$/.test(name))
+    .sort();
+  // Keep this contract explicit when appending migrations. Versions 79-81 add
+  // room creation idempotency, delegated permissions, and account exit.
+  assert.equal(
+    migrations.length,
+    80,
+    "test must explicitly track controller migration baseline",
+  );
+  assert.deepEqual(
+    migrations.map((name) => Number(name.split("_")[0])),
+    Array.from({ length: 81 }, (_, index) => index + 1).filter(
+      (version) => version !== 63,
+    ),
+    "test must explicitly track the frozen migration version set",
+  );
+  return migrations;
+}
+
+test("frozen controller migration inventory is 1-81 with version 63 absent", async () => {
+  // Validate the pinned baseline even when the native PostgreSQL drill is skipped.
+  await frozenControllerMigrations(resolve("migrations"));
+});
+
 test("connection policy rejects remote and libpq host overrides", () => {
   assert.equal(
     localConnection("postgres://user:pass@127.0.0.1:1234/test?sslmode=disable")
@@ -263,7 +289,7 @@ test(
 );
 
 test(
-  "frozen RainSync 1-78 schema checksums survive an isolated empty-database recovery",
+  "frozen RainSync 1-81 schema checksums survive an isolated empty-database recovery",
   {
     skip: !process.env.RAINSYNC_NATIVE_POSTGRES_BIN
       ? "set RAINSYNC_NATIVE_POSTGRES_BIN for isolated PostgreSQL"
@@ -280,7 +306,7 @@ test(
       schema_version: 1,
       result: "failed",
       scope:
-        "fresh empty RainSync schema from frozen 1-78 files (77 migrations, version 63 absent); not a real old production database or app acceptance",
+        "fresh empty RainSync schema from frozen 1-81 files (80 migrations, version 63 absent); not a real old production database or app acceptance",
       started_at: new Date().toISOString(),
     };
     try {
@@ -289,21 +315,7 @@ test(
         "CREATE TABLE _sqlx_migrations(version bigint PRIMARY KEY, success boolean NOT NULL, checksum bytea NOT NULL);",
       );
       const directory = resolve("migrations");
-      const migrations = (await readdir(directory))
-        .filter((name) => /^\d+_[^.]+\.sql$/.test(name))
-        .sort();
-      assert.equal(
-        migrations.length,
-        77,
-        "test must explicitly track controller migration baseline",
-      );
-      assert.deepEqual(
-        migrations.map((name) => Number(name.split("_")[0])),
-        Array.from({ length: 78 }, (_, index) => index + 1).filter(
-          (version) => version !== 63,
-        ),
-        "test must explicitly track the frozen migration version set",
-      );
+      const migrations = await frozenControllerMigrations(directory);
       for (const name of migrations) {
         const sql = await readFile(resolve(directory, name), "utf8");
         const version = Number(name.split("_")[0]);
@@ -315,7 +327,7 @@ test(
       const baseline = await preflight(fixture.url, {
         migrationsDirectory: directory,
       });
-      assert.equal(baseline.migrations.at(-1).version, 78);
+      assert.equal(baseline.migrations.at(-1).version, 81);
       assert.deepEqual(baseline.candidate_migrations.pending_versions, []);
       await writeFile(keyFile, randomBytes(32), { mode: 0o600, flag: "wx" });
       const backupDirectory = resolve(root, "backup");

@@ -449,7 +449,7 @@ await isolatedServer(
       await expect(admin.locator(".queue-row")).toHaveCount(2);
       await admin.locator("video").hover();
       await expect(
-        admin.getByRole("button", { name: "暂停", exact: true }),
+        admin.getByRole("button", { name: "暂停房间播放", exact: true }),
       ).toBeEnabled();
       await expect
         .poll(() => admin.locator("video").evaluate((el) => el.currentTime), {
@@ -479,7 +479,7 @@ await isolatedServer(
           (m) => m.status === 200 && m.sample.first_frame,
         );
         const { sample, receipt, session } = measurement;
-        assert.equal(sample.version, 1);
+        assert.equal(sample.version, 2);
         assert.equal(Object.keys(sample.totals).length, 8);
         assert.ok(
           Object.values(sample.totals).every(
@@ -500,6 +500,25 @@ await isolatedServer(
             sample.first_frame.evidence,
           ),
         );
+        assert.deepEqual(Object.keys(sample.startup_phases).sort(), [
+          "loading_ms",
+          "preparation_ms",
+          "unobserved_ms",
+        ]);
+        assert.ok(
+          Object.values(sample.startup_phases).every(
+            (v) => Number.isInteger(v) && v >= 0 && v <= 604800000,
+          ),
+        );
+        assert.equal(
+          Object.values(sample.startup_phases).reduce((sum, v) => sum + v, 0),
+          sample.first_frame.confirmed_elapsed_ms,
+        );
+        assert.ok(Number.isInteger(sample.first_frame_plan_generation));
+        assert.ok(
+          sample.first_frame_plan_generation >= sample.meter_start_generation &&
+            sample.first_frame_plan_generation <= sample.plan_generation,
+        );
         assert.deepEqual(receipt, {
           session_id: session,
           meter_start_generation: sample.meter_start_generation,
@@ -512,14 +531,20 @@ await isolatedServer(
           ),
         );
         assert.ok(persisted.seq >= sample.seq);
+        assert.equal(persisted.version, 2);
         assert.deepEqual(persisted.first_frame, sample.first_frame);
+        assert.deepEqual(persisted.startup_phases, sample.startup_phases);
+        assert.equal(
+          persisted.first_frame_plan_generation,
+          sample.first_frame_plan_generation,
+        );
         evidence.clientReportedMetrics.push({ user: label, sample, receipt });
       }
       stage(
-        "actual browser presentation callbacks produce conserved client-reported metrics accepted and persisted by the real receiver for both users",
+        "actual browser presentation callbacks produce conserved v2 metrics, startup phases, and originating grants accepted and persisted by the real receiver for both users",
       );
       await expect(
-        viewer.getByRole("button", { name: "暂停", exact: true }),
+        viewer.getByRole("button", { name: "暂停房间播放", exact: true }),
       ).toBeDisabled();
       await viewer.getByLabel("聊天消息").fill("真实用户昵称聊天");
       await viewer.getByRole("button", { name: "发送消息" }).click();
@@ -529,7 +554,7 @@ await isolatedServer(
       await expect(admin.locator(".chat-message b")).toHaveText(
         "独立昵称草稿🙂",
       );
-      await admin.getByRole("button", { name: "暂停", exact: true }).click();
+      await admin.getByRole("button", { name: "暂停房间播放", exact: true }).click();
       await expect
         .poll(() => viewer.locator("video").evaluate((el) => el.paused))
         .toBe(true);
@@ -540,7 +565,7 @@ await isolatedServer(
           timeout: 15000,
         })
         .toBeGreaterThan(19);
-      await admin.getByRole("button", { name: "播放", exact: true }).click();
+      await admin.getByRole("button", { name: "播放房间", exact: true }).click();
       await expect
         .poll(() => viewer.locator("video").evaluate((el) => el.paused))
         .toBe(false);
@@ -629,6 +654,7 @@ await isolatedServer(
         ).status(),
         403,
       );
+      await nav(admin, "管理");
       await nav(admin, "账号与注册");
       await admin
         .getByRole("link", { name: "手动创建账号", exact: true })
