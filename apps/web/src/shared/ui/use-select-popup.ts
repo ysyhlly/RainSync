@@ -4,8 +4,11 @@ export function useSelectPopup(
   trigger: Ref<HTMLElement | undefined>,
   menu: Ref<HTMLElement | undefined>,
   changed: (open: boolean) => void,
+  disabled: () => boolean = () => false,
 ) {
   const open = ref(false);
+  let generation = 0,
+    disposed = false;
   function position() {
     const button = trigger.value,
       popup = menu.value;
@@ -25,7 +28,9 @@ export function useSelectPopup(
     popup.style.top = `${below >= Math.min(220, height) ? rect.bottom + 4 : Math.max(top + 8, rect.top - Math.min(popup.scrollHeight, height) - 4)}px`;
   }
   function close() {
-    if (!open.value) return;
+    // Invalidate pending nextTick work even when the popup is already closed.
+    generation++;
+    const wasOpen = open.value;
     open.value = false;
     if (menu.value?.matches(":popover-open")) menu.value.hidePopover();
     if (activeClose === close) activeClose = undefined;
@@ -34,7 +39,7 @@ export function useSelectPopup(
     document.removeEventListener("scroll", position, true);
     window.visualViewport?.removeEventListener("resize", position);
     window.visualViewport?.removeEventListener("scroll", position);
-    changed(false);
+    if (wasOpen) changed(false);
   }
   function outside(event: PointerEvent) {
     const target = event.target as Node;
@@ -42,11 +47,25 @@ export function useSelectPopup(
       close();
   }
   async function show() {
+    if (disposed || disabled()) return;
+    if (open.value) return;
     activeClose?.();
+    const current = ++generation;
     activeClose = close;
     open.value = true;
     changed(true);
     await nextTick();
+    if (
+      disposed ||
+      current !== generation ||
+      !open.value ||
+      activeClose !== close
+    )
+      return;
+    if (disabled() || !trigger.value || !menu.value) {
+      close();
+      return;
+    }
     if (menu.value?.showPopover) menu.value.showPopover();
     position();
     document.addEventListener("pointerdown", outside, true);
@@ -55,6 +74,9 @@ export function useSelectPopup(
     window.visualViewport?.addEventListener("resize", position);
     window.visualViewport?.addEventListener("scroll", position);
   }
-  onBeforeUnmount(close);
+  onBeforeUnmount(() => {
+    disposed = true;
+    close();
+  });
   return { open, show, close, position };
 }

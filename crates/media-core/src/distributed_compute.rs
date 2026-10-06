@@ -16,6 +16,240 @@ pub const QUALIFICATION_VERSION: u32 = 1;
 /// SAR after -2 width rounding (720p -> 854x480 yields SAR 1280:1281).
 /// The existing measured aspect-ratio gate still bounds rounding distortion.
 pub const H264_480P_VIDEO_FILTER: &str = "scale=w=-2:h='min(480,trunc(ih/2)*2)',setsar=1";
+/// An exact, immutable recipe allowlist shared by admission, execution and
+/// qualification. Nothing in a job can supply an encoder flag or filter.
+#[derive(Debug, Clone, Copy)]
+pub struct ComputeRecipe {
+    pub id: &'static str,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub max_h264_level: i64,
+    pub transcode: Option<H264Recipe>,
+    pub segment_seconds: u32,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct H264Recipe {
+    pub video_filter: &'static str,
+    pub video_kbps: u32,
+    pub max_video_kbps: u32,
+    pub buffer_kbits: u32,
+    pub audio_kbps: u32,
+}
+pub static COMPUTE_RECIPES: &[ComputeRecipe] = &[
+    ComputeRecipe {
+        id: "remux_hls_v1",
+        max_width: 1920,
+        max_height: 1080,
+        max_h264_level: 42,
+        transcode: None,
+        segment_seconds: 4,
+    },
+    // Keep the legacy height-only fit and its bitrate settings unchanged.
+    ComputeRecipe {
+        id: "h264_480p_hls_v1",
+        max_width: 1920,
+        max_height: 480,
+        max_h264_level: 42,
+        transcode: Some(H264Recipe {
+            video_filter: H264_480P_VIDEO_FILTER,
+            video_kbps: 1000,
+            max_video_kbps: 1200,
+            buffer_kbits: 2400,
+            audio_kbps: 96,
+        }),
+        segment_seconds: 4,
+    },
+    ComputeRecipe {
+        id: "h264_720p_hls_v1",
+        max_width: 1280,
+        max_height: 720,
+        max_h264_level: 42,
+        transcode: Some(H264Recipe {
+            video_filter: "scale=w='trunc(iw*min(1,min(1280/iw,720/ih))/2)*2':h='trunc(ih*min(1,min(1280/iw,720/ih))/2)*2',setsar=1",
+            video_kbps: 2500,
+            max_video_kbps: 3000,
+            buffer_kbits: 6000,
+            audio_kbps: 128,
+        }),
+        segment_seconds: 2,
+    },
+    ComputeRecipe {
+        id: "h264_1080p_hls_v1",
+        max_width: 1920,
+        max_height: 1080,
+        max_h264_level: 42,
+        transcode: Some(H264Recipe {
+            video_filter: "scale=w='trunc(iw*min(1,min(1920/iw,1080/ih))/2)*2':h='trunc(ih*min(1,min(1920/iw,1080/ih))/2)*2',setsar=1",
+            video_kbps: 5000,
+            max_video_kbps: 6000,
+            buffer_kbits: 12000,
+            audio_kbps: 128,
+        }),
+        segment_seconds: 2,
+    },
+    // Two-second keyframe-aligned segments and a one-second VBV buffer keep
+    // UHD uploads inside the existing 8 MiB per-file bound, including TS overhead.
+    ComputeRecipe {
+        id: "h264_2160p_hls_v1",
+        max_width: 3840,
+        max_height: 2160,
+        max_h264_level: 52,
+        transcode: Some(H264Recipe {
+            video_filter: "scale=w='trunc(iw*min(1,min(3840/iw,2160/ih))/2)*2':h='trunc(ih*min(1,min(3840/iw,2160/ih))/2)*2',setsar=1",
+            video_kbps: 14000,
+            max_video_kbps: 16000,
+            buffer_kbits: 16000,
+            audio_kbps: 192,
+        }),
+        segment_seconds: 2,
+    },
+];
+pub fn compute_recipe(id: &str) -> Result<&'static ComputeRecipe> {
+    COMPUTE_RECIPES
+        .iter()
+        .find(|r| r.id == id)
+        .context("unsupported_structured_recipe")
+}
+impl ComputeRecipe {
+    /// Conservative reservation, not a prediction or minimum actual file size:
+    /// max video/audio rate, one VBV buffer, 20% mux margin and 64 KiB metadata.
+    /// Remux has no fixed bitrate; non-finite/out-of-range durations fail closed.
+    pub fn estimated_output_bytes(&self, duration_seconds: f64, with_audio: bool) -> Option<u64> {
+        if !duration_seconds.is_finite()
+            || duration_seconds <= 0.0
+            || duration_seconds > MAX_SOURCE_DURATION_SECONDS
+        {
+            return None;
+        }
+        let h264 = self.transcode?;
+        let kbps = h264.max_video_kbps + if with_audio { h264.audio_kbps } else { 0 };
+        Some(
+            (((duration_seconds * f64::from(kbps) + f64::from(h264.buffer_kbits)) * 125.0 * 1.2)
+                .ceil() as u64)
+                + 65536,
+        )
+    }
+}
+pub const MAX_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Build only fixed allowlisted commands, with decoder, encoder and filters
+/// bounded to one thread. Source paths and stream indices remain caller-scoped.
+pub fn encode_command(
+    ffmpeg: &str,
+    source: &Path,
+    output: &Path,
+    video_index: u32,
+    audio_index: Option<u32>,
+    recipe: &str,
+) -> Result<Command> {
+    let recipe = compute_recipe(recipe)?;
+    let mut command = Command::new(ffmpeg);
+    crate::input_policy::clean_environment(&mut command);
+    command
+        .args([
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-xerror",
+            "-err_detect",
+            "explode",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-format_whitelist",
+            "mov,matroska,webm",
+            "-i",
+        ])
+        .arg(source)
+        .arg("-map")
+        .arg(format!("0:{video_index}"));
+    if let Some(index) = audio_index {
+        command.arg("-map").arg(format!("0:{index}"));
+    }
+    if let Some(h264) = recipe.transcode {
+        command
+            .args([
+                "-vf",
+                h264.video_filter,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-threads",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg("-b:v")
+            .arg(format!("{}k", h264.video_kbps))
+            .arg("-maxrate")
+            .arg(format!("{}k", h264.max_video_kbps))
+            .arg("-bufsize")
+            .arg(format!("{}k", h264.buffer_kbits));
+        if recipe.segment_seconds == 2 {
+            command.args([
+                "-g",
+                "120",
+                "-keyint_min",
+                "1",
+                "-sc_threshold",
+                "0",
+                "-force_key_frames",
+                "expr:gte(t,n_forced*2)",
+            ]);
+        } else {
+            command.args(["-g", "100", "-keyint_min", "100", "-sc_threshold", "0"]);
+        }
+        command
+            .args(["-c:a", "aac", "-b:a"])
+            .arg(format!("{}k", h264.audio_kbps));
+    } else {
+        command.args(["-c", "copy"]);
+    }
+    command
+        .args(["-f", "hls", "-hls_time"])
+        .arg(recipe.segment_seconds.to_string())
+        .args([
+            "-hls_list_size",
+            "0",
+            "-hls_playlist_type",
+            "vod",
+            "-hls_flags",
+            "temp_file",
+            "-hls_segment_filename",
+        ])
+        .arg(output.join("segment%05d.ts"))
+        .arg(output.join("index.m3u8"));
+    Ok(command)
+}
+
+/// Check physical bytes, not optional/unreliable stream bitrate metadata.
+/// Legacy recipes retain the existing global file cap. HD adds a recipe's
+/// conservative rate/buffer envelope as a second bound.
+pub fn validate_segment_size(
+    recipe: &str,
+    bytes: u64,
+    duration_seconds: f64,
+    with_audio: bool,
+) -> Result<()> {
+    let recipe = compute_recipe(recipe)?;
+    ensure!(
+        bytes > 0 && bytes <= MAX_SEGMENT_BYTES,
+        "compute_segment_bounds"
+    );
+    if recipe.segment_seconds == 2 {
+        let bound = recipe
+            .estimated_output_bytes(duration_seconds, with_audio)
+            .context("compute_segment_duration_mismatch")?;
+        ensure!(bytes <= bound, "compute_segment_bitrate_exceeded");
+    }
+    Ok(())
+}
+
 const TIME_TOLERANCE: f64 = 0.25;
 pub const MAX_SOURCE_DURATION_SECONDS: f64 = 1800.0;
 pub const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
@@ -122,10 +356,7 @@ pub fn validate_source_probe(
     audio_index: Option<u32>,
     recipe: &str,
 ) -> Result<()> {
-    ensure!(
-        matches!(recipe, "remux_hls_v1" | "h264_480p_hls_v1"),
-        "unsupported_structured_recipe"
-    );
+    let definition = compute_recipe(recipe)?;
     let selected_motion = crate::capabilities::validate_motion_source(meta)?;
     ensure!(
         selected_motion.stream["index"].as_u64() == Some(u64::from(video_index)),
@@ -159,7 +390,7 @@ pub fn validate_source_probe(
     let width = positive_u32(&video["width"])?;
     let height = positive_u32(&video["height"])?;
     ensure!(
-        width <= 7680 && height <= 4320,
+        width >= 2 && height >= 2 && width <= 7680 && height <= 4320,
         "compute_source_dimensions_unsupported"
     );
     if let Some(index) = audio_index {
@@ -185,7 +416,10 @@ pub fn validate_source_probe(
     }
     if recipe == "remux_hls_v1" {
         ensure!(
-            video["codec_name"] == "h264" && video["pix_fmt"] == "yuv420p",
+            video["codec_name"] == "h264"
+                && video["pix_fmt"] == "yuv420p"
+                && width <= definition.max_width
+                && height <= definition.max_height,
             "compute_remux_video_unsupported"
         );
     }
@@ -359,6 +593,14 @@ pub fn measured_media_facts(
 /// Obtain output absolute indices only from a complete actual probe. The output
 /// must contain exactly the encoded video and admitted optional audio.
 pub fn output_selection(meta: &Value, with_audio: bool) -> Result<(u32, Option<u32>)> {
+    output_selection_for_recipe(meta, with_audio, "remux_hls_v1")
+}
+pub fn output_selection_for_recipe(
+    meta: &Value,
+    with_audio: bool,
+    recipe: &str,
+) -> Result<(u32, Option<u32>)> {
+    let definition = compute_recipe(recipe)?;
     let rows = rows(meta)?;
     ensure!(
         rows.len() == if with_audio { 2 } else { 1 },
@@ -384,9 +626,9 @@ pub fn output_selection(meta: &Value, with_audio: bool) -> Result<(u32, Option<u
             )
             && video["level"]
                 .as_i64()
-                .is_some_and(|level| (1..=42).contains(&level))
-            && positive_u32(&video["width"])? <= 1920
-            && positive_u32(&video["height"])? <= 1080,
+                .is_some_and(|level| (1..=definition.max_h264_level).contains(&level))
+            && positive_u32(&video["width"])? <= definition.max_width
+            && positive_u32(&video["height"])? <= definition.max_height,
         "compute_output_video_profile_unsupported"
     );
     let rate = |value: &Value| -> Option<f64> {
@@ -485,10 +727,7 @@ pub fn validate_qualification(q: &Qualification) -> Result<()> {
                 .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
         "compute_qualification_source_identity"
     );
-    ensure!(
-        matches!(q.recipe.as_str(), "remux_hls_v1" | "h264_480p_hls_v1"),
-        "unsupported_structured_recipe"
-    );
+    compute_recipe(&q.recipe)?;
     ensure!(
         q.source.video.index == q.selected_video_index
             && q.source.audio.as_ref().map(|a| a.index) == q.selected_audio_index,
@@ -518,10 +757,7 @@ pub fn validate_output_relationship(
     output: &MediaFacts,
     recipe: &str,
 ) -> Result<()> {
-    ensure!(
-        matches!(recipe, "remux_hls_v1" | "h264_480p_hls_v1"),
-        "unsupported_structured_recipe"
-    );
+    let definition = compute_recipe(recipe)?;
     validate_media(source)?;
     ensure!(
         source.format_duration_seconds <= MAX_SOURCE_DURATION_SECONDS,
@@ -572,6 +808,10 @@ pub fn validate_output_relationship(
         }
         _ => anyhow::bail!("compute_audio_selection_not_preserved"),
     }
+    ensure!(
+        output.video.width <= definition.max_width && output.video.height <= definition.max_height,
+        "compute_output_dimensions_unsupported"
+    );
     if recipe == "remux_hls_v1" {
         ensure!(
             source.video.codec == output.video.codec
@@ -582,8 +822,9 @@ pub fn validate_output_relationship(
         );
     } else {
         ensure!(
-            output.video.height <= 480
+            output.video.height <= definition.max_height
                 && output.video.height <= source.video.height
+                && output.video.width <= source.video.width
                 && output.video.width.is_multiple_of(2)
                 && output.video.height.is_multiple_of(2),
             "compute_transcode_dimensions_invalid"
@@ -699,6 +940,14 @@ pub fn generated_segments(
     bytes: &[u8],
     filenames: &BTreeSet<String>,
 ) -> Result<Vec<PlaylistSegment>> {
+    generated_segments_for_recipe(bytes, filenames, "remux_hls_v1")
+}
+pub fn generated_segments_for_recipe(
+    bytes: &[u8],
+    filenames: &BTreeSet<String>,
+    recipe: &str,
+) -> Result<Vec<PlaylistSegment>> {
+    let definition = compute_recipe(recipe)?;
     let names = validate_generated_playlist(bytes, filenames)?;
     let durations = std::str::from_utf8(bytes)?
         .lines()
@@ -712,7 +961,9 @@ pub fn generated_segments(
         })
         .collect::<Result<Vec<_>>>()?;
     ensure!(
-        names.len() == durations.len() && names.len() <= 451,
+        names.len() == durations.len()
+            && names.len()
+                <= (MAX_SOURCE_DURATION_SECONDS as usize / definition.segment_seconds as usize) + 1,
         "compute_playlist_segment_count"
     );
     Ok(names
@@ -738,10 +989,12 @@ pub fn first_segment_frames_command(ffprobe: &str, segment: &Path, video_index: 
 /// Bind each independently probed MPEG-TS segment to both its EXTINF seek index
 /// and the complete decoded video timeline. Audio/video stream identities and
 /// configuration must remain invariant across every segment.
+#[allow(clippy::too_many_arguments)]
 pub fn check_segment_probe(
     meta: &Value,
     first_frames: &[u8],
     complete: &MediaFacts,
+    recipe: &str,
     declared_duration: f64,
     playlist_elapsed: f64,
     previous_end: Option<f64>,
@@ -750,7 +1003,8 @@ pub fn check_segment_probe(
         meta["format"]["format_name"] == "mpegts",
         "compute_segment_container_unsupported"
     );
-    let (video_index, audio_index) = output_selection(meta, complete.audio.is_some())?;
+    let (video_index, audio_index) =
+        output_selection_for_recipe(meta, complete.audio.is_some(), recipe)?;
     ensure!(
         video_index == complete.video.index
             && audio_index == complete.audio.as_ref().map(|a| a.index),
@@ -854,7 +1108,7 @@ pub async fn check_output(
         ensure!(names.insert(name), "duplicate_compute_filename");
     }
     let playlist = tokio::fs::read(manifest).await?;
-    let segments = generated_segments(&playlist, &names)?;
+    let segments = generated_segments_for_recipe(&playlist, &names, recipe)?;
     let (status, bytes) = crate::child_process::capture(
         metadata_command(ffprobe, manifest, true),
         Duration::from_secs(1800),
@@ -863,7 +1117,8 @@ pub async fn check_output(
     .await?;
     ensure!(status.success(), "compute_output_probe_failed");
     let meta: Value = serde_json::from_slice(&bytes)?;
-    let (video_index, audio_index) = output_selection(&meta, source.audio.is_some())?;
+    let (video_index, audio_index) =
+        output_selection_for_recipe(&meta, source.audio.is_some(), recipe)?;
     let (status, frames) = crate::child_process::capture(
         frames_command(ffprobe, manifest, true),
         Duration::from_secs(1800),
@@ -884,6 +1139,12 @@ pub async fn check_output(
     let mut previous_end = None;
     for segment in segments {
         let path = directory.join(&segment.filename);
+        validate_segment_size(
+            recipe,
+            tokio::fs::metadata(&path).await?.len(),
+            segment.duration_seconds,
+            source.audio.is_some(),
+        )?;
         let (status, bytes) = crate::child_process::capture(
             metadata_command(ffprobe, &path, true),
             Duration::from_secs(60),
@@ -903,6 +1164,7 @@ pub async fn check_output(
             &meta,
             &frames,
             &output,
+            recipe,
             segment.duration_seconds,
             elapsed,
             previous_end,
@@ -1375,6 +1637,250 @@ mod tests {
                     "compute_video_frame_configuration_changed"
                 );
             }
+        }
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+    #[test]
+    fn recipe_allowlist_dimensions_bitrate_and_commands_are_fixed() {
+        assert_eq!(COMPUTE_RECIPES.len(), 5);
+        assert!(compute_recipe("h264_4k_hls_v1").is_err());
+        assert!(compute_recipe("h264_2160p_hls_v1 -i https://example.org").is_err());
+        for definition in COMPUTE_RECIPES {
+            let command = encode_command(
+                "ffmpeg",
+                Path::new("source.mp4"),
+                Path::new("output"),
+                3,
+                Some(7),
+                definition.id,
+            )
+            .unwrap();
+            let args: Vec<_> = command
+                .as_std()
+                .get_args()
+                .map(|s| s.to_str().unwrap())
+                .collect();
+            assert!(args.windows(2).any(|w| w == ["-map", "0:3"]));
+            assert!(args.windows(2).any(|w| w == ["-map", "0:7"]));
+            assert!(args.windows(2).any(|w| w == ["-threads", "1"]));
+            if let Some(h264) = definition.transcode {
+                assert!(h264.video_kbps <= h264.max_video_kbps);
+                assert!(args.windows(2).any(|w| w == ["-vf", h264.video_filter]));
+                assert!(
+                    definition.estimated_output_bytes(10.0, true).unwrap()
+                        > definition.estimated_output_bytes(10.0, false).unwrap()
+                );
+                if definition.segment_seconds == 2 {
+                    assert!(
+                        definition.estimated_output_bytes(2.05, true).unwrap() < MAX_SEGMENT_BYTES
+                    );
+                    assert!(
+                        args.windows(2)
+                            .any(|w| w == ["-force_key_frames", "expr:gte(t,n_forced*2)"])
+                    );
+                }
+            } else {
+                assert!(definition.estimated_output_bytes(10.0, true).is_none());
+                assert!(args.windows(2).any(|w| w == ["-c", "copy"]));
+            }
+            for duration in [f64::NAN, f64::INFINITY, 0.0, -1.0, 1800.1] {
+                assert!(definition.estimated_output_bytes(duration, true).is_none());
+            }
+            assert!(
+                validate_segment_size(definition.id, MAX_SEGMENT_BYTES + 1, 2.0, true).is_err()
+            );
+        }
+        assert!(validate_segment_size("h264_720p_hls_v1", 7 * 1024 * 1024, 2.0, true).is_err());
+    }
+    #[test]
+    fn uhd_profile_is_recipe_specific_and_remux_does_not_expand() {
+        let mut output = json!({"streams":[{"index":0,"codec_type":"video","codec_name":"h264","profile":"High","level":51,"pix_fmt":"yuv420p","width":3840,"height":2160,"r_frame_rate":"25/1","avg_frame_rate":"25/1","disposition":{"attached_pic":0}}]});
+        output_selection_for_recipe(&output, false, "h264_2160p_hls_v1").unwrap();
+        for recipe in [
+            "remux_hls_v1",
+            "h264_480p_hls_v1",
+            "h264_720p_hls_v1",
+            "h264_1080p_hls_v1",
+        ] {
+            assert!(output_selection_for_recipe(&output, false, recipe).is_err());
+        }
+        assert!(output_selection(&output, false).is_err());
+        output["streams"][0]["level"] = json!(53);
+        assert!(output_selection_for_recipe(&output, false, "h264_2160p_hls_v1").is_err());
+        output["streams"][0]["level"] = json!(52);
+        output["streams"][0]["width"] = json!(4096);
+        assert!(output_selection_for_recipe(&output, false, "h264_2160p_hls_v1").is_err());
+    }
+    #[test]
+    fn all_transcodes_reject_upscaling_odd_pixels_aspect_changes_and_oversize() {
+        let source = measured_media_facts(&meta(), b"media_type=video|stream_index=4|key_frame=1|pts_time=0|best_effort_timestamp_time=0|pkt_duration_time=1|width=640|height=480|pix_fmt=yuv420p|sample_aspect_ratio=1:1\n", 4, None).unwrap();
+        for recipe in COMPUTE_RECIPES.iter().filter(|r| r.transcode.is_some()) {
+            validate_output_relationship(&source, &source, recipe.id).unwrap();
+            for (width, height) in [
+                (1280, 960),
+                (641, 480),
+                (640, 479),
+                (638, 400),
+                (7680, 4320),
+            ] {
+                let mut invalid = source.clone();
+                invalid.video.width = width;
+                invalid.video.height = height;
+                assert!(
+                    validate_output_relationship(&source, &invalid, recipe.id).is_err(),
+                    "{} accepted {width}x{height}",
+                    recipe.id
+                );
+            }
+        }
+        let mut uhd = source.clone();
+        uhd.video.width = 3840;
+        uhd.video.height = 2160;
+        assert!(validate_output_relationship(&uhd, &uhd, "remux_hls_v1").is_err());
+    }
+    #[test]
+    fn hd_playlist_supports_thirty_minutes_of_two_second_segments() {
+        let mut names = BTreeSet::from(["index.m3u8".into()]);
+        let mut playlist = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n".to_string();
+        for index in 0..900 {
+            let name = format!("segment{index:05}.ts");
+            playlist.push_str(&format!("#EXTINF:2.000000,\n{name}\n"));
+            names.insert(name);
+        }
+        playlist.push_str("#EXT-X-ENDLIST\n");
+        assert_eq!(
+            generated_segments_for_recipe(playlist.as_bytes(), &names, "h264_2160p_hls_v1")
+                .unwrap()
+                .len(),
+            900
+        );
+        assert!(generated_segments(playlist.as_bytes(), &names).is_err());
+    }
+    #[tokio::test]
+    #[ignore = "requires installed official FFmpeg and FFprobe"]
+    async fn actual_hd_recipes_produce_qualified_bounded_hls_without_upscaling() {
+        let ffmpeg = std::env::var("FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+        let ffprobe = std::env::var("FFPROBE").unwrap_or_else(|_| "ffprobe".into());
+        let root =
+            std::env::temp_dir().join(format!("rainsync-qualified-hd-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        async fn capture(command: Command, limit: usize) -> Vec<u8> {
+            let (status, bytes) =
+                crate::child_process::capture(command, Duration::from_secs(120), limit)
+                    .await
+                    .unwrap();
+            assert!(status.success());
+            bytes
+        }
+        for (case, width, height, recipe, with_audio, expected) in [
+            ("720p", 1280, 720, "h264_720p_hls_v1", true, (1280, 720)),
+            (
+                "1080p",
+                1920,
+                1080,
+                "h264_1080p_hls_v1",
+                false,
+                (1920, 1080),
+            ),
+            ("2160p", 3840, 2160, "h264_2160p_hls_v1", true, (3840, 2160)),
+            (
+                "no-upscale",
+                640,
+                360,
+                "h264_2160p_hls_v1",
+                false,
+                (640, 360),
+            ),
+            (
+                "portrait",
+                1080,
+                1920,
+                "h264_720p_hls_v1",
+                false,
+                (404, 720),
+            ),
+        ] {
+            let source = root.join(format!("{case}.mp4"));
+            let mut fixture = Command::new(&ffmpeg);
+            fixture
+                .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i"])
+                .arg(format!(
+                    "testsrc2=size={width}x{height}:rate=25:duration=2.4"
+                ));
+            if with_audio {
+                fixture.args([
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=48000:duration=2.4",
+                ]);
+            }
+            fixture
+                .args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-threads",
+                    "1",
+                    "-filter_threads",
+                    "1",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                ])
+                .arg(&source);
+            capture(fixture, 4096).await;
+            let meta: Value = serde_json::from_slice(
+                &capture(
+                    metadata_command(&ffprobe, &source, false),
+                    MAX_METADATA_BYTES,
+                )
+                .await,
+            )
+            .unwrap();
+            let frames = capture(frames_command(&ffprobe, &source, false), MAX_FRAME_BYTES).await;
+            let audio_index = with_audio.then_some(1);
+            let original = qualify_source(&meta, &frames, 0, audio_index, recipe).unwrap();
+            if case == "2160p" {
+                assert!(validate_source_probe(&meta, 0, audio_index, "remux_hls_v1").is_err());
+            }
+            let output = root.join(case);
+            tokio::fs::create_dir_all(&output).await.unwrap();
+            capture(
+                encode_command(&ffmpeg, &source, &output, 0, audio_index, recipe).unwrap(),
+                4096,
+            )
+            .await;
+            let measured = check_output(
+                &ffmpeg,
+                &ffprobe,
+                &output.join("index.m3u8"),
+                &original,
+                recipe,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (measured.video.width, measured.video.height),
+                expected,
+                "{case}"
+            );
+            assert_eq!(measured.audio.is_some(), with_audio);
+            assert!(
+                output.join("segment00001.ts").exists(),
+                "{case} requires a two-second keyframe boundary"
+            );
+            let bytes = tokio::fs::metadata(output.join("segment00000.ts"))
+                .await
+                .unwrap()
+                .len();
+            assert!(bytes < MAX_SEGMENT_BYTES);
+            eprintln!(
+                "{recipe}: {}x{}, selected_audio={with_audio}, first_segment_bytes={bytes}, full_decode=passed",
+                measured.video.width, measured.video.height
+            );
         }
         tokio::fs::remove_dir_all(root).await.unwrap();
     }

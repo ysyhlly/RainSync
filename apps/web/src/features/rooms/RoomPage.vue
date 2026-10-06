@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import QueueFeedback from "./QueueFeedback.vue";
 import {
   computed,
   ref,
@@ -218,6 +219,7 @@ watch(
         id = String(route.params.id);
       if (r.room?.id === id) {
         r.refreshMetadata();
+        await r.enter(r.room);
         return;
       }
       const rooms = await api.list();
@@ -469,7 +471,20 @@ async function transferOwnership() {
                 </button>
               </div>
             </div>
-            <p v-if="!r.playlist.length" class="helper">
+            <QueueFeedback />
+            <p
+              v-if="!r.playlistLoaded && r.playlistLoading"
+              class="helper"
+              role="status"
+            >
+              正在加载待播列表…
+            </p>
+            <p
+              v-else-if="
+                r.playlistLoaded && !r.playlist.length && !r.playlistError
+              "
+              class="helper"
+            >
               暂无待播影片。{{
                 r.can("queue")
                   ? "添加影片后，在这里选择下一部。"
@@ -515,7 +530,8 @@ async function transferOwnership() {
                   v-if="r.can('queue')"
                   class="icon-button"
                   :aria-label="'移除 ' + item.title"
-                  :disabled="!r.connected"
+                  :aria-busy="r.queuePending('remove', item.id)"
+                  :disabled="!r.connected || r.queuePending('remove', item.id)"
                   @click="r.run(() => r.removeQueue(item.id))"
                 >
                   <AppIcon name="trash" />

@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import ComputePolicyPanel from "./ComputePolicyPanel.vue";
-import { ref, onMounted, onBeforeUnmount } from "vue";
+import { ref, onMounted, onBeforeUnmount, watch } from "vue";
 import { useSession } from "../auth/session.store";
 import type { Agent } from "../../shared/api/types";
-import { useAction, formatDate } from "../../shared/use-action";
+import { StaleIdentity } from "../../shared/api/client";
+import { formatDate } from "../../shared/use-action";
 import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import Notice from "../../shared/ui/Notice.vue";
@@ -14,7 +15,11 @@ import {
   agentDrainLabel,
 } from "./agent-readiness";
 const session = useSession(),
-  { busy, error, message, run } = useAction(),
+  busy = ref(false),
+  refreshing = ref(false),
+  error = ref(""),
+  refreshError = ref(""),
+  message = ref(""),
   rows = ref<Agent[]>([]),
   loaded = ref(false),
   open = ref(false),
@@ -24,41 +29,143 @@ const session = useSession(),
   revoking = ref<Agent | null>(null),
   revokeOpen = ref(false);
 let expires = 0,
-  alive = true;
+  alive = true,
+  scope = 0,
+  loadSerial = 0,
+  dialogSerial = 0;
+const revokedIds = new Set<string>();
+function ignoredFailure(e: unknown) {
+  return (
+    e instanceof StaleIdentity ||
+    (e instanceof DOMException && e.name === "AbortError")
+  );
+}
 const timer = setInterval(
   () =>
     (remaining.value = Math.max(0, Math.ceil((expires - Date.now()) / 1000))),
   1000,
 );
 async function load() {
-  const value = await session.api<Agent[]>("/agents");
-  if (alive) {
-    rows.value = value;
+  const request = ++loadSerial,
+    context = scope;
+  refreshing.value = true;
+  refreshError.value = "";
+  try {
+    const value = await session.api<Agent[]>("/agents");
+    if (!alive || context !== scope || request !== loadSerial) return;
+    // A confirmed revocation cannot be undone by a stale list snapshot.
+    rows.value = value.map((row) =>
+      revokedIds.has(row.id)
+        ? { ...row, revoked: true, connected: false }
+        : row,
+    );
     loaded.value = true;
+  } catch (e) {
+    if (
+      alive &&
+      context === scope &&
+      request === loadSerial &&
+      !ignoredFailure(e)
+    )
+      refreshError.value = `设备状态刷新失败：${e instanceof Error ? e.message : String(e)}。请重试刷新，无需重复已完成的操作。`;
+  } finally {
+    if (alive && context === scope && request === loadSerial)
+      refreshing.value = false;
+  }
+}
+async function run(operation: () => Promise<void>) {
+  if (busy.value || refreshing.value) return;
+  const context = scope;
+  busy.value = true;
+  error.value = "";
+  try {
+    await operation();
+  } catch (e) {
+    if (alive && context === scope && !ignoredFailure(e))
+      error.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    if (alive && context === scope) busy.value = false;
   }
 }
 async function create() {
+  if (!open.value || code.value) return;
+  const context = scope,
+    dialog = dialogSerial;
+  message.value = "";
   const result = await session.api<{ id: string; pair_code: string }>(
     "/agents",
     "POST",
     { name: name.value },
   );
-  if (!alive) return;
-  code.value = result.pair_code;
-  expires = Date.now() + 600000;
-  remaining.value = 600;
+  if (!alive || context !== scope) return;
+  if (open.value && dialog === dialogSerial) {
+    code.value = result.pair_code;
+    expires = Date.now() + 600000;
+    remaining.value = 600;
+  }
+  message.value = "设备已添加，配对码已生成";
   await load();
 }
 async function revoke() {
-  if (!revoking.value) return;
-  await session.api("/agents/" + revoking.value.id, "DELETE");
+  const target = revoking.value,
+    context = scope;
+  if (
+    !revokeOpen.value ||
+    !target ||
+    target.revoked ||
+    revokedIds.has(target.id)
+  )
+    return;
+  message.value = "";
+  await session.api("/agents/" + target.id, "DELETE");
+  if (!alive || context !== scope) return;
+  revokedIds.add(target.id);
+  rows.value = rows.value.map((row) =>
+    row.id === target.id ? { ...row, revoked: true, connected: false } : row,
+  );
+  revoking.value = null;
   revokeOpen.value = false;
-  await load();
   message.value = "设备已撤销，后续连接将被拒绝";
+  await load();
 }
-onMounted(() => run(load));
+watch(
+  open,
+  (value) => {
+    ++dialogSerial;
+    if (!value) {
+      code.value = name.value = "";
+      expires = remaining.value = 0;
+    }
+  },
+  { flush: "sync" },
+);
+watch(
+  () => [
+    session.epoch,
+    session.user?.id,
+    session.user?.csrf,
+    session.user?.admin,
+  ],
+  (current, previous) => {
+    if (current.every((value, index) => value === previous[index])) return;
+    ++scope;
+    ++loadSerial;
+    busy.value = refreshing.value = loaded.value = false;
+    error.value = refreshError.value = message.value = "";
+    rows.value = [];
+    revokedIds.clear();
+    open.value = revokeOpen.value = false;
+    code.value = name.value = "";
+    expires = remaining.value = 0;
+    revoking.value = null;
+  },
+  { flush: "sync" },
+);
+onMounted(load);
 onBeforeUnmount(() => {
   alive = false;
+  ++scope;
+  ++loadSerial;
   clearInterval(timer);
   code.value = "";
 });
@@ -72,14 +179,23 @@ onBeforeUnmount(() => {
         <p>设备主动连接服务器，无需开放NAS入站端口。</p>
       </div>
       <div class="button-row">
-        <button v-if="!open && !revokeOpen" :disabled="busy" @click="run(load)">
-          <AppIcon name="refresh" />{{ busy ? "正在刷新…" : "刷新设备状态" }}
+        <button
+          v-if="!open && !revokeOpen"
+          :disabled="busy || refreshing"
+          @click="load"
+        >
+          <AppIcon name="refresh" />{{
+            refreshing ? "正在刷新…" : "刷新设备状态"
+          }}
         </button>
         <button
           class="primary"
+          :disabled="busy || refreshing || open || revokeOpen"
           @click="
             code = '';
             name = '';
+            error = '';
+            message = '';
             open = true;
           "
         >
@@ -87,18 +203,30 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </div>
-    <Notice v-if="!open && !revokeOpen" :message="error" error /><Notice
-      :message="message"
-    />
+    <template v-if="!open && !revokeOpen">
+      <Notice :message="message" />
+      <Notice :message="error" error />
+      <Notice :message="refreshError" error />
+      <button v-if="refreshError" :disabled="busy || refreshing" @click="load">
+        {{ refreshing ? "正在刷新…" : "重试刷新设备状态" }}
+      </button>
+    </template>
     <p
-      v-if="busy && !loaded"
+      v-if="refreshing && !loaded"
       class="loading-state loading-state--inline"
       role="status"
     >
       正在加载设备…
     </p>
     <div
-      v-if="loaded && !busy && !error && !rows.length"
+      v-if="
+        loaded &&
+        !busy &&
+        !refreshing &&
+        !error &&
+        !refreshError &&
+        !rows.length
+      "
       class="empty-state surface-card"
     >
       <span class="empty-state__icon"
@@ -107,7 +235,7 @@ onBeforeUnmount(() => {
       <h2>暂无NAS设备</h2>
       <p>生成配对码后，在NAS Agent中完成连接。</p>
     </div>
-    <div class="admin-list" :aria-busy="busy">
+    <div class="admin-list" :aria-busy="busy || refreshing">
       <article v-for="row in rows" :key="row.id" class="admin-row">
         <div class="row-main">
           <div class="section-heading">
@@ -129,7 +257,7 @@ onBeforeUnmount(() => {
         </div>
         <button
           class="danger"
-          :disabled="row.revoked || busy"
+          :disabled="row.revoked || busy || refreshing || open || revokeOpen"
           @click="
             revoking = row;
             revokeOpen = true;
@@ -144,7 +272,13 @@ onBeforeUnmount(() => {
     </p>
     <ComputePolicyPanel class="agent-compute" />
     <AppDialog v-model="open" title="添加NAS设备" drawer :busy="busy"
-      ><template v-if="code"
+      ><Notice :message="message" />
+      <Notice :message="error" error />
+      <Notice :message="refreshError" error />
+      <button v-if="refreshError" :disabled="busy || refreshing" @click="load">
+        {{ refreshing ? "正在刷新…" : "重试刷新设备状态" }}
+      </button>
+      <template v-if="code"
         ><CopyField label="配对码" :value="code" />
         <p role="status">
           {{
@@ -169,10 +303,7 @@ onBeforeUnmount(() => {
             required
             maxlength="120"
             autofocus /></label
-        ><Notice :message="error" error /><button
-          class="primary"
-          :disabled="busy"
-        >
+        ><button class="primary" :disabled="busy || refreshing">
           {{ busy ? "正在生成…" : "生成配对码" }}
         </button>
       </form></AppDialog

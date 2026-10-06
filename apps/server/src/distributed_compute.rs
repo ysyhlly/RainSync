@@ -1,7 +1,69 @@
 //! Policy-gated, fenced NAS-local jobs. The ordinary Agent token never grants compute by itself.
 use super::*;
 use axum::{body::Bytes, extract::DefaultBodyLimit};
+use futures_util::TryStreamExt;
+use media_core::distributed_compute::{
+    COMPUTE_RECIPES, MAX_SEGMENT_BYTES, MAX_SOURCE_DURATION_SECONDS, compute_recipe,
+};
 use std::path::{Path as FsPath, PathBuf};
+
+const MAX_SOURCE_BYTES: i64 = 16 * 1024 * 1024 * 1024;
+
+fn valid_capabilities(capabilities: &[String]) -> bool {
+    !capabilities.is_empty()
+        && capabilities.len() <= COMPUTE_RECIPES.len()
+        && capabilities
+            .iter()
+            .enumerate()
+            .all(|(i, id)| compute_recipe(id).is_ok() && !capabilities[..i].contains(id))
+}
+
+// Only version-bound probe metadata may influence admission. This is a
+// conservative capacity estimate, not a promise of actual encoded size. Unknown
+// metadata/remux still undergo the node and server runtime byte/probe checks.
+fn estimated_output_bytes(
+    recipe: &str,
+    metadata: &Value,
+    source_version: &str,
+    source_bytes: i64,
+    with_audio: bool,
+) -> Result<Option<u64>> {
+    let recipe = compute_recipe(recipe)
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_compute_recipe"))?;
+    if source_bytes <= 0 || source_bytes > MAX_SOURCE_BYTES {
+        return Err(err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "compute_source_too_large",
+        ));
+    }
+    if metadata["capability_source_version"].as_str() != Some(source_version)
+        || metadata["format"]["duration"].is_null()
+    {
+        return Ok(None);
+    }
+    let duration = metadata["format"]["duration"].as_f64().or_else(|| {
+        metadata["format"]["duration"]
+            .as_str()
+            .and_then(|v| v.parse::<f64>().ok())
+    });
+    let duration = duration
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= MAX_SOURCE_DURATION_SECONDS)
+        .ok_or_else(|| {
+            err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "compute_source_duration_unsupported",
+            )
+        })?;
+    // Preserve legacy 480p/remux admission; their actual runtime byte limits
+    // still apply. Only the new HD recipes reserve conservative capacity.
+    Ok((recipe.segment_seconds == 2)
+        .then(|| recipe.estimated_output_bytes(duration, with_audio))
+        .flatten())
+}
+
+fn budget_fits(estimate: Option<u64>, budget: i64) -> bool {
+    budget > 0 && estimate.is_none_or(|bytes| bytes <= budget as u64)
+}
 
 pub fn routes() -> Router<App> {
     Router::new()
@@ -28,7 +90,7 @@ pub fn routes() -> Router<App> {
             get(directory),
         )
         .route("/api/v1/rooms/{room}/compute/{id}/files/{name}", get(read))
-        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_SEGMENT_BYTES as usize))
 }
 pub(super) fn enabled() -> Result<PathBuf> {
     std::env::var_os("RAINSYNC_COMPUTE_OUTPUT_ROOT")
@@ -103,11 +165,7 @@ pub async fn heartbeat(
     Json(b): Json<Heartbeat>,
 ) -> Result<Json<Value>> {
     let id = agent(&app, &h).await?;
-    if b.capabilities.is_empty()
-        || b.capabilities.len() > 2
-        || b.capabilities
-            .iter()
-            .any(|c| !matches!(c.as_str(), "remux_hls_v1" | "h264_480p_hls_v1"))
+    if !valid_capabilities(&b.capabilities)
         || !b.self_test.is_object()
         || b.self_test.to_string().len() > 2048
     {
@@ -159,6 +217,12 @@ pub async fn register_source(
     {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_compute_source"));
     }
+    if b.size_bytes > MAX_SOURCE_BYTES {
+        return Err(err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "compute_source_too_large",
+        ));
+    }
     let n=sqlx::query("INSERT INTO distributed_compute_sources(media_id,agent_id,source_version,content_sha256,size_bytes) SELECT m.id,$1,$3,$4,$5 FROM media_items m JOIN distributed_compute_policy p ON p.agent_id=$1 AND p.enabled WHERE m.id=$2 AND m.source_id=$1 AND m.available AND m.source_version=$3 ON CONFLICT(media_id) DO UPDATE SET source_version=$3,content_sha256=$4,size_bytes=$5,verified_at=clock_timestamp()").bind(id).bind(b.media_id).bind(b.source_version).bind(b.content_sha256).bind(b.size_bytes).execute(&app.db).await?.rows_affected();
     if n != 1 {
         return Err(err(StatusCode::CONFLICT, "compute_source_changed"));
@@ -171,7 +235,7 @@ pub async fn list_jobs(
     Path(room): Path<Uuid>,
 ) -> Result<Json<Value>> {
     let user = auth(&app, &h, false).await?;
-    let rows=sqlx::query("SELECT j.id,j.status,j.recipe,j.attempt,j.output_generation,j.qualification_sha256,j.selected_audio_index FROM distributed_compute_jobs j JOIN room_members member ON member.room_id=j.room_id AND member.user_id=$2 WHERE j.room_id=$1 AND distributed_compute_authorized(j.id) AND library_media_allowed($2,j.media_id,'play',j.room_id) ORDER BY j.created_at DESC LIMIT 32").bind(room).bind(user.id).fetch_all(&app.db).await?;
+    let rows=sqlx::query("SELECT j.id,j.status,j.recipe,j.attempt,j.output_generation,j.qualification_sha256,j.selected_audio_index,j.error FROM distributed_compute_jobs j JOIN room_members member ON member.room_id=j.room_id AND member.user_id=$2 WHERE j.room_id=$1 AND distributed_compute_authorized(j.id) AND library_media_allowed($2,j.media_id,'play',j.room_id) ORDER BY j.created_at DESC LIMIT 32").bind(room).bind(user.id).fetch_all(&app.db).await?;
     let source=sqlx::query("SELECT m.metadata,m.source_version FROM room_snapshots snap JOIN media_items m ON m.id=(snap.state->>'media_id')::uuid JOIN room_members member ON member.room_id=snap.room_id AND member.user_id=$2 WHERE snap.room_id=$1 AND library_media_allowed($2,m.id,'play',snap.room_id) AND room_media_allowed(snap.room_id,m.id)")
         .bind(room).bind(user.id).fetch_optional(&app.db).await?;
     let metadata = source
@@ -193,7 +257,7 @@ pub async fn list_jobs(
         vec![]
     };
     Ok(Json(
-        json!({"enabled":enabled().is_ok(),"p2p_enabled":std::env::var("RAINSYNC_P2P_ENABLED").as_deref()==Ok("1"),"source_probe_ready":probe_ready,"source_audio_tracks":tracks,"jobs":rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"status":r.get::<String,_>("status"),"recipe":r.get::<String,_>("recipe"),"attempt":r.get::<i32,_>("attempt"),"output_generation":r.get::<Option<Uuid>,_>("output_generation"),"primary_qualified":r.get::<Option<String>,_>("qualification_sha256").is_some(),"selected_audio_index":r.get::<Option<i32>,_>("selected_audio_index")})).collect::<Vec<_>>()}),
+        json!({"enabled":enabled().is_ok(),"p2p_enabled":std::env::var("RAINSYNC_P2P_ENABLED").as_deref()==Ok("1"),"source_probe_ready":probe_ready,"source_audio_tracks":tracks,"jobs":rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"status":r.get::<String,_>("status"),"recipe":r.get::<String,_>("recipe"),"attempt":r.get::<i32,_>("attempt"),"output_generation":r.get::<Option<Uuid>,_>("output_generation"),"primary_qualified":r.get::<Option<String>,_>("qualification_sha256").is_some(),"selected_audio_index":r.get::<Option<i32>,_>("selected_audio_index"),"error":r.get::<Option<String>,_>("error")})).collect::<Vec<_>>()}),
     ))
 }
 #[derive(Deserialize)]
@@ -211,7 +275,7 @@ pub async fn prepare(
 ) -> Result<Json<Value>> {
     enabled()?;
     let user = auth(&app, &h, true).await?;
-    if !matches!(b.recipe.as_str(), "remux_hls_v1" | "h264_480p_hls_v1") {
+    if compute_recipe(&b.recipe).is_err() {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_compute_recipe"));
     }
     let login = crate::media_authorization::login_hash(&h)?;
@@ -268,9 +332,43 @@ pub async fn prepare(
             .and_then(|v| v.iter().find(|s| s["codec_type"] == "audio"))
             .and_then(index),
     };
-    let n=sqlx::query("INSERT INTO distributed_compute_jobs(id,room_id,user_id,login_hash,membership_epoch,media_id,media_generation,lifecycle_epoch,source_version,source_revision,content_sha256,source_bytes,recipe,selected_video_index,selected_audio_index) SELECT $1,r.id,$3,$5,member.membership_epoch,m.id,$4,r.lifecycle_epoch,m.source_version,src.access_policy_revision,c.content_sha256,c.size_bytes,$6,$7,$8 FROM rooms r JOIN room_snapshots snap ON snap.room_id=r.id JOIN room_members member ON member.room_id=r.id AND member.user_id=$3 JOIN media_items m ON m.id=(snap.state->>'media_id')::uuid JOIN sources src ON src.id=m.source_id JOIN agents a ON a.id=m.source_id AND NOT a.revoked JOIN distributed_compute_sources c ON c.media_id=m.id AND c.source_version=m.source_version WHERE r.id=$2 AND r.lifecycle='active' AND (snap.state->>'media_generation')::bigint=$4 AND m.available AND playback_origin_allowed($3,r.id,$5,member.membership_epoch) AND library_media_allowed($3,m.id,'play',r.id)").bind(id).bind(room).bind(user.id).bind(b.media_generation).bind(login).bind(b.recipe).bind(selected_video as i32).bind(selected_audio.map(|v|v as i32)).execute(&mut *tx).await?.rows_affected();
+    let n=sqlx::query("INSERT INTO distributed_compute_jobs(id,room_id,user_id,login_hash,membership_epoch,media_id,media_generation,lifecycle_epoch,source_version,source_revision,content_sha256,source_bytes,recipe,selected_video_index,selected_audio_index) SELECT $1,r.id,$3,$5,member.membership_epoch,m.id,$4,r.lifecycle_epoch,m.source_version,src.access_policy_revision,c.content_sha256,c.size_bytes,$6,$7,$8 FROM rooms r JOIN room_snapshots snap ON snap.room_id=r.id JOIN room_members member ON member.room_id=r.id AND member.user_id=$3 JOIN media_items m ON m.id=(snap.state->>'media_id')::uuid JOIN sources src ON src.id=m.source_id JOIN agents a ON a.id=m.source_id AND NOT a.revoked JOIN distributed_compute_sources c ON c.media_id=m.id AND c.source_version=m.source_version WHERE r.id=$2 AND r.lifecycle='active' AND (snap.state->>'media_generation')::bigint=$4 AND m.available AND playback_origin_allowed($3,r.id,$5,member.membership_epoch) AND library_media_allowed($3,m.id,'play',r.id)").bind(id).bind(room).bind(user.id).bind(b.media_generation).bind(login).bind(&b.recipe).bind(selected_video as i32).bind(selected_audio.map(|v|v as i32)).execute(&mut *tx).await?.rows_affected();
     if n != 1 {
         return Err(err(StatusCode::CONFLICT, "compute_source_not_ready"));
+    }
+    let source = sqlx::query("SELECT source_version,source_bytes FROM distributed_compute_jobs WHERE id=$1 AND distributed_compute_authorized(id)")
+        .bind(id).fetch_optional(&mut *tx).await?
+        .ok_or_else(|| err(StatusCode::CONFLICT, "compute_source_not_ready"))?;
+    let estimate = estimated_output_bytes(
+        &b.recipe,
+        &metadata,
+        &source.get::<String, _>("source_version"),
+        source.get("source_bytes"),
+        selected_audio.is_some(),
+    )?;
+    // A queued request may wait for a previously registered node to reconnect,
+    // but never upgrades an old node's advertised recipe set or grants compute
+    // through ordinary directory-read access. Replicas must match hash AND size.
+    let nodes = sqlx::query("SELECT p.output_budget_bytes,n.capabilities FROM distributed_compute_jobs j JOIN distributed_compute_sources c ON c.content_sha256=j.content_sha256 AND c.size_bytes=j.source_bytes JOIN media_items m ON m.id=c.media_id AND m.source_id=c.agent_id AND m.available AND m.source_version=c.source_version JOIN agents a ON a.id=c.agent_id AND NOT a.revoked JOIN distributed_compute_policy p ON p.agent_id=a.id AND p.enabled JOIN distributed_compute_nodes n ON n.agent_id=a.id WHERE j.id=$1")
+        .bind(id).fetch_all(&mut *tx).await?;
+    let capable: Vec<_> = nodes
+        .iter()
+        .filter(|node| {
+            node.get::<Vec<String>, _>("capabilities")
+                .contains(&b.recipe)
+        })
+        .collect();
+    if capable.is_empty() {
+        return Err(err(StatusCode::CONFLICT, "compute_recipe_unavailable"));
+    }
+    if !capable
+        .iter()
+        .any(|node| budget_fits(estimate, node.get("output_budget_bytes")))
+    {
+        return Err(err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "compute_output_budget_insufficient",
+        ));
     }
     tx.commit().await?;
     Ok(Json(json!({"id":id,"status":"queued"})))
@@ -295,10 +393,37 @@ pub async fn claim(
     let caps: Vec<String> = row.get("capabilities");
     let budget: i64 = row.get("output_budget_bytes");
     // Prefer the original source owner; equivalent replicas are scoped by authenticated content identity.
-    let job=sqlx::query("SELECT j.id,c.media_id,m.resource,c.source_version,j.recipe,j.selected_video_index,j.selected_audio_index,c.content_sha256,c.size_bytes,j.attempt FROM distributed_compute_jobs j JOIN distributed_compute_sources c ON c.agent_id=$1 AND c.content_sha256=j.content_sha256 AND c.size_bytes=j.source_bytes JOIN media_items m ON m.id=c.media_id AND m.available AND m.source_id=$1 AND m.source_version=c.source_version WHERE (j.status='queued' OR (j.status='running' AND j.lease_until<=clock_timestamp())) AND j.attempt<3 AND j.recipe=ANY($2) AND distributed_compute_authorized(j.id) ORDER BY (m.id=j.media_id) DESC,j.created_at LIMIT 1").bind(agent).bind(caps).fetch_optional(&mut *tx).await?;
-    let Some(j) = job else {
+    let mut candidates=sqlx::query("SELECT j.id,c.media_id,m.resource,c.source_version,j.recipe,j.selected_video_index,j.selected_audio_index,c.content_sha256,c.size_bytes,j.attempt,origin.metadata,origin.source_version AS origin_source_version FROM distributed_compute_jobs j JOIN media_items origin ON origin.id=j.media_id JOIN distributed_compute_sources c ON c.agent_id=$1 AND c.content_sha256=j.content_sha256 AND c.size_bytes=j.source_bytes JOIN media_items m ON m.id=c.media_id AND m.available AND m.source_id=$1 AND m.source_version=c.source_version WHERE (j.status='queued' OR (j.status='running' AND j.lease_until<=clock_timestamp())) AND j.attempt<3 AND j.recipe=ANY($2) AND distributed_compute_authorized(j.id) ORDER BY (m.id=j.media_id) DESC,j.created_at").bind(agent).bind(caps).fetch(&mut *tx);
+    let mut rejected = Vec::new();
+    let mut selected = None;
+    while let Some(candidate) = candidates.try_next().await? {
+        let estimate = estimated_output_bytes(
+            &candidate.get::<String, _>("recipe"),
+            &candidate.get::<Value, _>("metadata"),
+            &candidate.get::<String, _>("origin_source_version"),
+            candidate.get("size_bytes"),
+            candidate
+                .get::<Option<i32>, _>("selected_audio_index")
+                .is_some(),
+        );
+        let reason = match estimate {
+            Ok(estimate) if budget_fits(estimate, budget) => {
+                selected = Some(candidate);
+                break;
+            }
+            Ok(_) => "compute_output_budget_insufficient".to_owned(),
+            Err(error) => error.1,
+        };
+        rejected.push((candidate.get::<Uuid, _>("id"), reason));
+    }
+    drop(candidates);
+    let Some(j) = selected else {
         tx.commit().await?;
-        return Ok(Json(json!({"job":null})));
+        record_rejections(&app, &rejected).await;
+        return Ok(Json(match rejected.first() {
+            Some((_, reason)) => json!({"job":null,"reason":reason}),
+            None => json!({"job":null}),
+        }));
     };
     let id: Uuid = j.get("id");
     let room: Uuid = sqlx::query_scalar("SELECT room_id FROM distributed_compute_jobs WHERE id=$1")
@@ -324,9 +449,30 @@ pub async fn claim(
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "agent_token_required"))?;
     sqlx::query("INSERT INTO distributed_compute_attempts(job_id,room_id,attempt,output_generation,owner_agent,owner_connection,owner_token_hash) SELECT id,room_id,$2,$3,$4,$5,$6 FROM distributed_compute_jobs WHERE id=$1").bind(id).bind(attempt).bind(generation).bind(agent).bind(b.connection_id).bind(owner_token_hash).execute(&mut *tx).await?;
     tx.commit().await?;
+    record_rejections(&app, &rejected).await;
     Ok(Json(
         json!({"job":{"id":id,"attempt":attempt,"output_generation":generation,"lease_ms":20000,"resource":j.get::<String,_>("resource"),"source_version":j.get::<String,_>("source_version"),"content_sha256":j.get::<String,_>("content_sha256"),"source_bytes":j.get::<i64,_>("size_bytes"),"recipe":j.get::<String,_>("recipe"),"selected_video_index":j.get::<i32,_>("selected_video_index"),"selected_audio_index":j.get::<Option<i32>,_>("selected_audio_index"),"output_budget_bytes":budget}}),
     ))
+}
+// Advisory diagnostics are persisted only after releasing the claim's policy,
+// room and job locks. They cannot introduce a job-before-room lock inversion or
+// turn an already committed lease into a failed claim response.
+async fn record_rejections(app: &App, rejected: &[(Uuid, String)]) {
+    if rejected.is_empty() {
+        return;
+    }
+    let ids: Vec<Uuid> = rejected.iter().map(|(id, _)| *id).collect();
+    let reasons: Vec<&str> = rejected.iter().map(|(_, reason)| reason.as_str()).collect();
+    let update = sqlx::query("WITH diagnostic AS (SELECT j.id,d.reason FROM distributed_compute_jobs j JOIN unnest($1::uuid[],$2::text[]) AS d(id,reason) ON j.id=d.id WHERE j.error IS DISTINCT FROM d.reason AND (j.status='queued' OR (j.status='running' AND j.lease_until<=clock_timestamp())) FOR UPDATE OF j SKIP LOCKED) UPDATE distributed_compute_jobs j SET error=d.reason FROM diagnostic d WHERE j.id=d.id")
+        .bind(ids).bind(reasons).execute(&app.db);
+    // A locked rejected job or saturated pool must not hide an already-committed
+    // lease from the node (whose control HTTP timeout is three seconds).
+    if !matches!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), update).await,
+        Ok(Ok(_))
+    ) {
+        tracing::warn!("compute admission diagnostic was not recorded");
+    }
 }
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -360,7 +506,7 @@ async fn lock_job(
     if origin.is_none() {
         return Err(err(StatusCode::CONFLICT, "compute_lease_lost"));
     }
-    let row=sqlx::query("SELECT j.output_budget_bytes FROM distributed_compute_jobs j JOIN distributed_compute_policy p ON p.agent_id=j.owner_agent JOIN distributed_compute_nodes n ON n.agent_id=j.owner_agent JOIN agents a ON a.id=j.owner_agent JOIN media_items input ON input.id=j.input_media_id WHERE j.id=$1 AND j.owner_agent=$2 AND j.owner_connection=$3 AND j.attempt=$4 AND j.output_generation=$5 AND j.status='running' AND j.lease_until>clock_timestamp() AND p.enabled AND NOT a.revoked AND n.connection_id=$3 AND n.heartbeat_at>clock_timestamp()-interval '12 seconds' AND input.available AND input.source_version=j.input_version AND distributed_compute_authorized(j.id) FOR UPDATE OF j").bind(id).bind(agent).bind(f.connection_id).bind(f.attempt).bind(f.output_generation).fetch_optional(&mut **tx).await?.ok_or_else(||err(StatusCode::CONFLICT,"compute_lease_lost"))?;
+    let row=sqlx::query("SELECT j.output_budget_bytes FROM distributed_compute_jobs j JOIN distributed_compute_policy p ON p.agent_id=j.owner_agent JOIN distributed_compute_nodes n ON n.agent_id=j.owner_agent JOIN agents a ON a.id=j.owner_agent JOIN media_items input ON input.id=j.input_media_id WHERE j.id=$1 AND j.owner_agent=$2 AND j.owner_connection=$3 AND j.attempt=$4 AND j.output_generation=$5 AND j.status='running' AND j.lease_until>clock_timestamp() AND p.enabled AND NOT a.revoked AND j.recipe=ANY(n.capabilities) AND n.connection_id=$3 AND n.heartbeat_at>clock_timestamp()-interval '12 seconds' AND input.available AND input.source_version=j.input_version AND distributed_compute_authorized(j.id) FOR UPDATE OF j").bind(id).bind(agent).bind(f.connection_id).bind(f.attempt).bind(f.output_generation).fetch_optional(&mut **tx).await?.ok_or_else(||err(StatusCode::CONFLICT,"compute_lease_lost"))?;
     Ok(row.get("output_budget_bytes"))
 }
 pub async fn renew(
@@ -376,16 +522,64 @@ pub async fn renew(
     tx.commit().await?;
     Ok(Json(json!({"lease_ms":20000})))
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureReason {
+    #[serde(rename = "compute_output_budget_exceeded")]
+    OutputBudgetExceeded,
+    #[serde(rename = "compute_output_budget_insufficient")]
+    OutputBudgetInsufficient,
+    #[serde(rename = "compute_global_budget_exceeded")]
+    GlobalBudgetExceeded,
+    #[serde(rename = "compute_source_too_large")]
+    SourceTooLarge,
+    #[serde(rename = "compute_source_duration_unsupported")]
+    SourceDurationUnsupported,
+}
+impl FailureReason {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::OutputBudgetExceeded => "compute_output_budget_exceeded",
+            Self::OutputBudgetInsufficient => "compute_output_budget_insufficient",
+            Self::GlobalBudgetExceeded => "compute_global_budget_exceeded",
+            Self::SourceTooLarge => "compute_source_too_large",
+            Self::SourceDurationUnsupported => "compute_source_duration_unsupported",
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Failure {
+    connection_id: Uuid,
+    attempt: i32,
+    output_generation: Uuid,
+    failure_reason: Option<FailureReason>,
+}
 pub async fn fail(
     State(app): State<App>,
     h: HeaderMap,
     Path(id): Path<Uuid>,
-    Json(b): Json<Fence>,
+    Json(b): Json<Failure>,
 ) -> Result<Json<Value>> {
     let agent = agent(&app, &h).await?;
     let mut tx = app.db.begin().await?;
-    lock_job(&mut tx, id, agent, &b).await?;
-    sqlx::query("UPDATE distributed_compute_jobs SET status='failed',error='node_execution_failed' WHERE id=$1").bind(id).execute(&mut *tx).await?;
+    let fence = Fence {
+        connection_id: b.connection_id,
+        attempt: b.attempt,
+        output_generation: b.output_generation,
+    };
+    lock_job(&mut tx, id, agent, &fence).await?;
+    // Only bounded diagnostic codes cross the node boundary; failure never
+    // releases an attempt's independent process/files drain obligation.
+    let reason = b
+        .failure_reason
+        .as_ref()
+        .map_or("node_execution_failed", FailureReason::code);
+    sqlx::query("UPDATE distributed_compute_jobs SET status='failed',error=$2 WHERE id=$1")
+        .bind(id)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }
@@ -426,7 +620,7 @@ pub async fn upload(
     let root = enabled()?;
     let agent = agent(&app, &h).await?;
     let fence = header_fence(&h)?;
-    if !safe_name(&name) || body.is_empty() || body.len() > 8388608 {
+    if !safe_name(&name) || body.is_empty() || body.len() as u64 > MAX_SEGMENT_BYTES {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_compute_artifact"));
     }
     let sha = hex::encode(Sha256::digest(&body));
@@ -747,6 +941,102 @@ pub async fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_distinct_fixed_capabilities_are_admitted() {
+        let all: Vec<String> = COMPUTE_RECIPES.iter().map(|r| r.id.to_owned()).collect();
+        assert_eq!(all.len(), 5);
+        assert!(valid_capabilities(&all));
+        for recipe in &all {
+            assert!(valid_capabilities(std::slice::from_ref(recipe)));
+        }
+        assert!(valid_capabilities(&all[..2]));
+        assert!(!valid_capabilities(&[]));
+        assert!(!valid_capabilities(&["h264_8k_hls_v1".into()]));
+        assert!(!valid_capabilities(&[all[0].clone(), all[0].clone()]));
+        assert!(!valid_capabilities(&["-vf scale=1280:720".into()]));
+    }
+    #[test]
+    fn each_tier_respects_explicit_capacity_and_version_bound_metadata() {
+        let version = "stat-v1:fixture";
+        let metadata = json!({"capability_source_version":version,"format":{"duration":"10"}});
+        for recipe in COMPUTE_RECIPES {
+            let estimate = estimated_output_bytes(recipe.id, &metadata, version, 1, true).unwrap();
+            if let Some(bytes) = estimate {
+                assert!(budget_fits(Some(bytes), bytes as i64));
+                assert!(!budget_fits(Some(bytes), bytes as i64 - 1));
+                assert!(budget_fits(Some(bytes), 64 * 1024 * 1024));
+            } else {
+                assert!(matches!(recipe.id, "remux_hls_v1" | "h264_480p_hls_v1"));
+            }
+            assert_eq!(
+                estimated_output_bytes(recipe.id, &metadata, "stat-v1:changed", 1, true).unwrap(),
+                None
+            );
+            assert!(
+                estimated_output_bytes(recipe.id, &metadata, version, MAX_SOURCE_BYTES + 1, false)
+                    .is_err()
+            );
+            assert!(estimated_output_bytes(recipe.id, &metadata, version, 0, false).is_err());
+            for duration in [json!(0), json!(-1), json!(1801), json!("NaN"), json!("inf")] {
+                let mut invalid = metadata.clone();
+                invalid["format"]["duration"] = duration;
+                assert!(estimated_output_bytes(recipe.id, &invalid, version, 1, false).is_err());
+            }
+        }
+        assert!(estimated_output_bytes("unknown", &metadata, version, 1, false).is_err());
+        assert!(!budget_fits(None, 0));
+        assert!(!budget_fits(Some(1), -1));
+    }
+    #[test]
+    fn legacy_480p_keeps_runtime_quota_instead_of_new_hd_reservation() {
+        let metadata = json!({"capability_source_version":"v1","format":{"duration":"600"}});
+        let estimate =
+            estimated_output_bytes("h264_480p_hls_v1", &metadata, "v1", 1, true).unwrap();
+        assert_eq!(estimate, None);
+        assert!(budget_fits(estimate, 64 * 1024 * 1024));
+    }
+    #[test]
+    fn known_hd_sources_cannot_silently_raise_default_quota() {
+        let metadata = json!({"capability_source_version":"v1","format":{"duration":"300"}});
+        for recipe in ["h264_720p_hls_v1", "h264_1080p_hls_v1", "h264_2160p_hls_v1"] {
+            let estimate = estimated_output_bytes(recipe, &metadata, "v1", 1, true).unwrap();
+            assert!(!budget_fits(estimate, 64 * 1024 * 1024));
+        }
+    }
+    #[test]
+    fn failure_diagnostics_are_optional_bounded_and_not_process_receipts() {
+        let fence =
+            json!({"connection_id":Uuid::nil(), "attempt":1, "output_generation":Uuid::nil()});
+        assert!(
+            serde_json::from_value::<Failure>(fence.clone())
+                .unwrap()
+                .failure_reason
+                .is_none()
+        );
+        for reason in [
+            "compute_output_budget_exceeded",
+            "compute_output_budget_insufficient",
+            "compute_global_budget_exceeded",
+            "compute_source_too_large",
+            "compute_source_duration_unsupported",
+        ] {
+            let mut body = fence.clone();
+            body["failure_reason"] = json!(reason);
+            assert_eq!(
+                serde_json::from_value::<Failure>(body)
+                    .unwrap()
+                    .failure_reason
+                    .unwrap()
+                    .code(),
+                reason
+            );
+        }
+        for reason in ["process_reaped", "raw secret or exception", "ready"] {
+            let mut body = fence.clone();
+            body["failure_reason"] = json!(reason);
+            assert!(serde_json::from_value::<Failure>(body).is_err());
+        }
+    }
     #[test]
     fn strict_manifest() {
         assert!(

@@ -74,6 +74,7 @@ async function page() {
     useRoomRuntime: () => ({ room: null }),
     privateLibraryApi,
     Notice: {},
+    QueueFeedback: {},
     AppDialog: {},
     AppIcon: {},
   };

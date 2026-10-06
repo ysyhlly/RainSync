@@ -32,6 +32,8 @@ const session = useSession(),
   catalogLoaded = ref(false),
   installed = ref<Record<string, Installed>>({}),
   draft = ref<Record<string, Draft>>({}),
+  draftBase = ref<Record<string, Draft>>({}),
+  draftRevision = ref<Record<string, string>>({}),
   busy = ref(""),
   error = ref(""),
   message = ref(""),
@@ -52,14 +54,39 @@ const session = useSession(),
     { id: string; plugin_id: string; action: string; revision: string }[]
   >([]);
 let alive = true,
-  serial = 0;
+  serial = 0,
+  scope = 0;
+function pluginDraft(m: Manifest, p?: Installed): Draft {
+  return {
+    version: p?.version ?? m.versions[0].version,
+    enabled: p?.enabled ?? false,
+    grant: p?.granted_permissions.includes("metadata:read") ?? false,
+    format: p?.config.format ?? "minutes",
+    label: p?.config.label ?? "",
+  };
+}
+function dirty(id: string) {
+  return (
+    !!draft.value[id] &&
+    JSON.stringify(draft.value[id]) !== JSON.stringify(draftBase.value[id])
+  );
+}
+function resetDraft(id: string) {
+  const m = catalog.value.find((item) => item.id === id);
+  if (!m) return;
+  const value = pluginDraft(m, installed.value[id]);
+  draft.value[id] = value;
+  draftBase.value[id] = { ...value };
+  draftRevision.value[id] = installed.value[id]?.revision ?? "0";
+}
 async function load() {
-  const request = ++serial;
+  const request = ++serial,
+    context = scope;
   const result = await session.api<{
     catalog: Manifest[];
     installed: Installed[];
   }>("/admin/plugins", "GET", undefined, AbortSignal.timeout(15000));
-  if (!alive || request !== serial) return;
+  if (!alive || context !== scope || request !== serial) return;
   if (
     !Array.isArray(result.catalog) ||
     result.catalog.length !== 2 ||
@@ -69,39 +96,31 @@ async function load() {
     throw new TypeError("插件目录无效");
   catalog.value = result.catalog;
   installed.value = Object.fromEntries(result.installed.map((p) => [p.id, p]));
-  draft.value = Object.fromEntries(
-    result.catalog.map((m) => {
-      const p = installed.value[m.id];
-      return [
-        m.id,
-        {
-          version: p?.version ?? m.versions[0].version,
-          enabled: p?.enabled ?? false,
-          grant: p?.granted_permissions.includes("metadata:read") ?? false,
-          format: p?.config.format ?? "minutes",
-          label: p?.config.label ?? "",
-        },
-      ];
-    }),
-  );
+  // A dirty draft stays attached to the revision it was edited from. Merely
+  // reading a newer server revision must not authorize overwriting it.
+  for (const m of result.catalog) {
+    if (!dirty(m.id)) resetDraft(m.id);
+  }
   catalogLoaded.value = true;
 }
 async function run(id: string, operation: () => Promise<void>) {
   if (busy.value) return;
+  const context = scope;
   busy.value = id;
   error.value = "";
-  message.value = "";
+  if (id !== "load") message.value = "";
   try {
     await operation();
   } catch (e) {
-    if (alive) error.value = e instanceof Error ? e.message : String(e);
+    if (alive && context === scope)
+      error.value = e instanceof Error ? e.message : String(e);
   } finally {
-    if (alive) busy.value = "";
+    if (alive && context === scope) busy.value = "";
   }
 }
 async function save(id: string) {
   const d = draft.value[id],
-    p = installed.value[id];
+    context = scope;
   if (!d.grant) throw new Error("请明确授予 metadata:read 权限");
   const result = await session.api<Installed>(
     `/admin/plugins/${id}`,
@@ -114,34 +133,46 @@ async function save(id: string) {
           ? { format: d.format }
           : { label: d.label },
       granted_permissions: ["metadata:read"],
-      expected_revision: p?.revision ?? "0",
+      expected_revision: draftRevision.value[id],
     },
     AbortSignal.timeout(15000),
   );
-  if (!alive) return;
+  if (!alive || context !== scope) return;
+  ++serial;
   installed.value[id] = result;
+  resetDraft(id);
   message.value = "插件设置已保存，新请求使用此配置版本";
   extensions.value = [];
   previewLoaded.value = false;
 }
 async function rollback(id: string) {
-  const p = installed.value[id];
-  if (!p) return;
-  await session.api(
+  const p = installed.value[id],
+    context = scope;
+  if (!p?.can_rollback) return;
+  const result = await session.api<Installed>(
     `/admin/plugins/${id}/rollback`,
     "POST",
     { expected_revision: p.revision },
     AbortSignal.timeout(15000),
   );
-  if (!alive) return;
-  await load();
+  if (!alive || context !== scope) return;
+  ++serial;
+  installed.value[id] = result;
+  resetDraft(id);
   message.value = "已恢复上一次配置，修订号继续递增";
   extensions.value = [];
   previewLoaded.value = false;
+  try {
+    await load();
+  } catch (e) {
+    if (alive && context === scope)
+      error.value = `配置已恢复，但目录刷新失败：${e instanceof Error ? e.message : String(e)}。请刷新目录与状态，无需再次恢复。`;
+  }
 }
 async function preview() {
   if (!selectedMedia.value) return;
   const selected = selectedMedia.value,
+    context = scope,
     result = await session.api<{
       media_id: string;
       extensions: typeof extensions.value;
@@ -151,7 +182,7 @@ async function preview() {
       undefined,
       AbortSignal.timeout(15000),
     );
-  if (!alive || selectedMedia.value !== selected) return;
+  if (!alive || context !== scope || selectedMedia.value !== selected) return;
   if (
     result.media_id !== selected ||
     !Array.isArray(result.extensions) ||
@@ -162,17 +193,19 @@ async function preview() {
   previewLoaded.value = true;
 }
 async function audit() {
+  const context = scope;
   const result = await session.api<{ items: typeof audits.value }>(
     "/admin/plugins/audit",
   );
-  if (alive) {
+  if (alive && context === scope) {
     audits.value = result.items;
     auditLoaded.value = true;
   }
 }
 async function loadMedia() {
+  const context = scope;
   const result = await session.api<Media[]>("/media");
-  if (alive) {
+  if (alive && context === scope) {
     media.value = result.slice(0, 100);
     mediaLoaded.value = true;
   }
@@ -181,11 +214,38 @@ watch(selectedMedia, () => {
   extensions.value = [];
   previewLoaded.value = false;
 });
+watch(
+  () => [
+    session.epoch,
+    session.user?.id,
+    session.user?.csrf,
+    session.user?.admin,
+  ],
+  (current, previous) => {
+    if (current.every((value, index) => value === previous[index])) return;
+    ++scope;
+    ++serial;
+    catalog.value = [];
+    installed.value = {};
+    draft.value = {};
+    draftBase.value = {};
+    draftRevision.value = {};
+    catalogLoaded.value = false;
+    busy.value = error.value = message.value = "";
+    media.value = [];
+    mediaLoaded.value = previewLoaded.value = auditLoaded.value = false;
+    selectedMedia.value = "";
+    extensions.value = [];
+    audits.value = [];
+  },
+  { flush: "sync" },
+);
 onMounted(
   () =>
     void run("load", async () => {
+      const context = scope;
       await load();
-      await loadMedia();
+      if (alive && context === scope) await loadMedia();
     }),
 );
 onBeforeUnmount(() => {
@@ -318,6 +378,17 @@ onBeforeUnmount(() => {
               {{ installed[plugin.id].enabled ? "运行中" : "已停用" }}
             </p>
           </details>
+          <p
+            v-if="
+              draftRevision[plugin.id] !==
+              (installed[plugin.id]?.revision ?? '0')
+            "
+            class="helper"
+            role="status"
+          >
+            服务端配置已更新；未保存草稿仍基于修订
+            {{ draftRevision[plugin.id] }}，不会覆盖新的修订。
+          </p>
           <div class="button-row">
             <button
               class="primary"
@@ -338,6 +409,17 @@ onBeforeUnmount(() => {
               @click="run(plugin.id, () => rollback(plugin.id))"
             >
               恢复上一次配置
+            </button>
+            <button
+              v-if="
+                draftRevision[plugin.id] !==
+                (installed[plugin.id]?.revision ?? '0')
+              "
+              type="button"
+              :disabled="!!busy"
+              @click="resetDraft(plugin.id)"
+            >
+              放弃草稿并载入当前配置
             </button>
           </div>
         </form>

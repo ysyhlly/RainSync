@@ -10,22 +10,33 @@ const session = useSession(),
   username = ref(""),
   nickname = ref(""),
   password = ref("");
+function submit() {
+  if (busy.value) return;
+  return run(create);
+}
 async function create() {
-  const invalid = validateAccount(
-    username.value,
-    password.value,
-    nickname.value,
-  );
-  if (invalid) throw Error(invalid.message);
-  await session.api<{ id: string }>("/users", "POST", {
+  const account = {
     username: username.value,
     password: password.value,
     display_name: nickname.value,
-  });
-  message.value = "普通账号 " + username.value + " 已创建";
-  password.value = "";
-  username.value = "";
-  nickname.value = "";
+  };
+  const invalid = validateAccount(
+    account.username,
+    account.password,
+    account.display_name,
+  );
+  if (invalid) throw Error(invalid.message);
+  await session.api<{ id: string }>("/users", "POST", account);
+  message.value = "普通账号 " + account.username + " 已创建";
+  if (
+    username.value === account.username &&
+    password.value === account.password &&
+    nickname.value === account.display_name
+  ) {
+    password.value = "";
+    username.value = "";
+    nickname.value = "";
+  }
 }
 </script>
 <template>
@@ -40,11 +51,12 @@ async function create() {
     <AccountTabs />
     <section class="panel narrow-panel surface-card">
       <h2>手动创建账号</h2>
-      <form :aria-busy="busy" @submit.prevent="run(create)">
+      <form :aria-busy="busy" @submit.prevent="submit">
         <div class="form-field">
           <label
             >登录账号<input
               v-model="username"
+              :disabled="busy"
               required
               maxlength="80"
               autocomplete="off"
@@ -58,6 +70,7 @@ async function create() {
           <label
             >昵称（可选）<input
               v-model="nickname"
+              :disabled="busy"
               autocomplete="off"
               aria-describedby="new-nickname-help"
           /></label>
@@ -69,6 +82,7 @@ async function create() {
           <label
             >密码<input
               v-model="password"
+              :disabled="busy"
               type="password"
               autocomplete="new-password"
               required

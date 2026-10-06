@@ -43,6 +43,72 @@ struct Job {
     selected_audio_index: Option<u32>,
     output_budget_bytes: u64,
 }
+/// Known local or normalized Server failures are safe bounded codes. Never send
+/// arbitrary process, path, credential or HTTP exception text to the Server.
+fn public_failure_reason(error: &anyhow::Error) -> Option<&'static str> {
+    match error.to_string().as_str() {
+        "compute_output_budget_exceeded" => Some("compute_output_budget_exceeded"),
+        "compute_output_budget_insufficient" => Some("compute_output_budget_insufficient"),
+        "compute_global_budget_exceeded" => Some("compute_global_budget_exceeded"),
+        "compute_source_duration_unsupported" => Some("compute_source_duration_unsupported"),
+        "compute_source_too_large" => Some("compute_source_too_large"),
+        _ => None,
+    }
+}
+const MAX_UPLOAD_ERROR_BYTES: usize = 4096;
+fn upload_budget_reason(status: u16, body: &[u8]) -> Option<&'static str> {
+    if status != 413 || body.len() > MAX_UPLOAD_ERROR_BYTES {
+        return None;
+    }
+    let body: Value = serde_json::from_slice(body).ok()?;
+    match body["error"]["code"].as_str()? {
+        "COMPUTE_OUTPUT_BUDGET_EXCEEDED" => Some("compute_output_budget_exceeded"),
+        "COMPUTE_GLOBAL_BUDGET_EXCEEDED" => Some("compute_global_budget_exceeded"),
+        _ => None,
+    }
+}
+async fn require_upload_success(mut response: reqwest::Response) -> Result<()> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let generic = || anyhow::anyhow!("compute_upload_failed:{status}");
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_UPLOAD_ERROR_BYTES as u64)
+    {
+        return Err(generic());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| generic())? {
+        ensure!(
+            chunk.len() <= MAX_UPLOAD_ERROR_BYTES - bytes.len(),
+            "compute_upload_failed:{status}"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    match upload_budget_reason(status.as_u16(), &bytes) {
+        Some(reason) => Err(anyhow::anyhow!(reason)),
+        None => Err(generic()),
+    }
+}
+fn validate_measured_output_budget(
+    recipe: &str,
+    duration_seconds: f64,
+    with_audio: bool,
+    budget: u64,
+) -> Result<()> {
+    let recipe = media_core::distributed_compute::compute_recipe(recipe)?;
+    // Preserve legacy admission semantics. Fixed HD recipes reserve their
+    // conservative maximum only after actual source duration/audio are known.
+    if recipe.segment_seconds == 2 {
+        let required = recipe
+            .estimated_output_bytes(duration_seconds, with_audio)
+            .context("compute_source_duration_unsupported")?;
+        ensure!(required <= budget, "compute_output_budget_insufficient");
+    }
+    Ok(())
+}
 fn required_audio_selection<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<Option<u32>, D::Error> {
@@ -345,9 +411,10 @@ impl Node {
                 && j.output_budget_bytes <= 1024 * 1024 * 1024,
             "compute_job_bounds"
         );
+        qualification::compute_recipe(&j.recipe)?;
         ensure!(
-            matches!(j.recipe.as_str(), "remux_hls_v1" | "h264_480p_hls_v1"),
-            "unsupported_structured_recipe"
+            self.caps.contains(&j.recipe),
+            "compute_recipe_not_self_tested"
         );
         let began = tokio::time::Instant::now();
         let source = source_path(&self.root, &j.resource)?;
@@ -367,17 +434,8 @@ impl Node {
             let source_facts = qualification::qualify_source(&source_meta, &source_frames,
                 j.selected_video_index, j.selected_audio_index, &j.recipe)?;
             drop(source_frames);
-            let mut command = Command::new(&self.ffmpeg);
-            command.args(["-v", "error", "-nostdin", "-y", "-xerror", "-err_detect", "explode", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm", "-i"])
-                .arg(&source).arg("-map").arg(format!("0:{}", j.selected_video_index));
-            if let Some(index) = j.selected_audio_index { command.arg("-map").arg(format!("0:{index}")); }
-            match j.recipe.as_str() {
-                "remux_hls_v1" => { command.args(["-c", "copy"]); },
-                "h264_480p_hls_v1" => { command.args(["-vf", qualification::H264_480P_VIDEO_FILTER, "-c:v", "libx264", "-preset", "veryfast", "-threads", "1", "-pix_fmt", "yuv420p", "-b:v", "1000k", "-maxrate", "1200k", "-bufsize", "2400k", "-g", "100", "-keyint_min", "100", "-sc_threshold", "0", "-c:a", "aac", "-b:a", "96k"]); },
-                _ => anyhow::bail!("unsupported_structured_recipe"),
-            }
-            command.args(["-f", "hls", "-hls_time", "4", "-hls_list_size", "0", "-hls_playlist_type", "vod", "-hls_flags", "temp_file", "-hls_segment_filename"])
-                .arg(out.join("segment%05d.ts")).arg(out.join("index.m3u8"));
+            validate_measured_output_budget(&j.recipe, source_facts.format_duration_seconds, source_facts.audio.is_some(), j.output_budget_bytes)?;
+            let command = qualification::encode_command(&self.ffmpeg, &source, &out, j.selected_video_index, j.selected_audio_index, &j.recipe)?;
             self.owned_capture(&j, &mut stop, &started, command, 4096, &out, "compute_ffmpeg_failed").await?;
             let mut entries = tokio::fs::read_dir(&out).await?;
             let mut names = BTreeSet::new();
@@ -387,12 +445,12 @@ impl Node {
                 ensure!(names.insert(name), "duplicate_compute_filename");
             }
             let playlist = tokio::fs::read(out.join("index.m3u8")).await?;
-            let segments = qualification::generated_segments(&playlist, &names)?;
+            let segments = qualification::generated_segments_for_recipe(&playlist, &names, &j.recipe)?;
             let manifest = out.join("index.m3u8");
             let output_meta_bytes = self.owned_capture(&j, &mut stop, &started,
                 qualification::metadata_command(&self.ffprobe, &manifest, true), qualification::MAX_METADATA_BYTES, &out, "compute_output_probe_failed").await?;
             let output_meta: Value = serde_json::from_slice(&output_meta_bytes)?;
-            let (output_video, output_audio) = qualification::output_selection(&output_meta, j.selected_audio_index.is_some())?;
+            let (output_video, output_audio) = qualification::output_selection_for_recipe(&output_meta, j.selected_audio_index.is_some(), &j.recipe)?;
             let output_frames = self.owned_capture(&j, &mut stop, &started,
                 qualification::frames_command(&self.ffprobe, &manifest, true), qualification::MAX_FRAME_BYTES, &out, "compute_output_frame_probe_failed").await?;
             let output_facts = qualification::measured_media_facts(&output_meta, &output_frames, output_video, output_audio)?;
@@ -403,12 +461,13 @@ impl Node {
             let mut previous_end = None;
             for segment in segments {
                 let path = out.join(&segment.filename);
+                qualification::validate_segment_size(&j.recipe, tokio::fs::metadata(&path).await?.len(), segment.duration_seconds, j.selected_audio_index.is_some())?;
                 let bytes = self.owned_capture(&j, &mut stop, &started,
                     qualification::metadata_command(&self.ffprobe, &path, true), qualification::MAX_METADATA_BYTES, &out, "compute_segment_probe_failed").await?;
                 let meta: Value = serde_json::from_slice(&bytes)?;
                 let frames = self.owned_capture(&j, &mut stop, &started,
                     qualification::first_segment_frames_command(&self.ffprobe, &path, output_video), qualification::MAX_METADATA_BYTES, &out, "compute_segment_frame_probe_failed").await?;
-                let timing = qualification::check_segment_probe(&meta, &frames, &output_facts, segment.duration_seconds, elapsed, previous_end)?;
+                let timing = qualification::check_segment_probe(&meta, &frames, &output_facts, &j.recipe, segment.duration_seconds, elapsed, previous_end)?;
                 previous_end = Some(timing.end_seconds);
                 elapsed += segment.duration_seconds;
             }
@@ -429,12 +488,12 @@ impl Node {
                 ensure!(!*stop.borrow(), "compute_shutdown");
                 self.call(&format!("/agent-compute/jobs/{}/renew", j.id), Some(serde_json::to_value(self.fence(&j))?)).await?;
                 let bytes = tokio::fs::read(out.join(&name)).await?;
-                ensure!(!bytes.is_empty() && bytes.len() <= 8388608, "compute_segment_bounds");
+                ensure!(!bytes.is_empty() && bytes.len() as u64 <= qualification::MAX_SEGMENT_BYTES, "compute_segment_bounds");
                 let sha = hex::encode(Sha256::digest(&bytes));
                 let response = self.http.post(format!("{}/api/v1/agent-compute/jobs/{}/files/{name}", self.server, j.id)).bearer_auth(&self.token)
                     .header("x-compute-connection", self.connection.to_string()).header("x-compute-attempt", j.attempt.to_string())
                     .header("x-compute-generation", j.output_generation.to_string()).header("x-content-sha256", sha).body(bytes).send().await?;
-                ensure!(response.status().is_success(), "compute_upload_failed:{}", response.status());
+                require_upload_success(response).await?;
             }
             let mut finish = serde_json::to_value(self.fence(&j))?;
             finish["qualification"] = serde_json::to_value(&report)?;
@@ -485,9 +544,10 @@ fn verify_source_cancellable(
     let path = source_path(root, resource)?;
     let mut file = std::fs::File::open(&path)?;
     let before = media_core::file_version::snapshot_file(&file)?;
+    ensure!(before.len > 0, "compute_source_empty");
     ensure!(
-        before.len > 0 && before.len <= 16 * 1024 * 1024 * 1024,
-        "compute_source_size_limit"
+        before.len <= 16 * 1024 * 1024 * 1024,
+        "compute_source_too_large"
     );
     ensure!(before.version == version, "compute_source_changed");
     let mut digest = Sha256::new();
@@ -522,45 +582,115 @@ async fn directory_bytes(path: &Path) -> Result<u64> {
     }
     Ok(bytes)
 }
-async fn self_test(ffmpeg: &str, output: &Path) -> Result<Vec<String>> {
-    let dir = output.join(format!("self-test-{}", Uuid::new_v4()));
-    tokio::fs::create_dir_all(&dir).await?;
-    let mut c = Command::new(ffmpeg);
-    c.args([
-        "-v",
-        "error",
-        "-nostdin",
-        "-y",
-        "-f",
-        "lavfi",
-        "-i",
-        "color=c=black:s=32x32:r=25:d=0.2",
-        "-c:v",
-        "libx264",
-        "-threads",
-        "1",
-        "-pix_fmt",
-        "yuv420p",
-        "-f",
-        "mpegts",
-    ])
-    .arg(dir.join("sample.ts"))
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
-    let mut child = media_core::child_process::spawn(c)?;
-    let status = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
-    if status.is_err() {
-        child.kill().await?;
+/// Execute the actual recipe at its advertised size, including selected AAC,
+/// then independently probe/decode its HLS. A codec listing or a 32px encode
+/// cannot establish that a node can execute an advertised UHD recipe.
+async fn test_recipe(
+    ffmpeg: &str,
+    ffprobe: &str,
+    dir: &Path,
+    recipe: &media_core::distributed_compute::ComputeRecipe,
+) -> Result<()> {
+    use media_core::distributed_compute as q;
+    async fn capture(command: Command, limit: usize) -> Result<Vec<u8>> {
+        let (status, bytes) =
+            media_core::child_process::capture(command, Duration::from_secs(30), limit).await?;
+        ensure!(status.success(), "compute_self_test_process_failed");
+        Ok(bytes)
     }
-    let result = status.context("compute_self_test_timeout")??;
-    let good = result.success()
-        && tokio::fs::metadata(dir.join("sample.ts"))
-            .await
-            .is_ok_and(|m| m.len() > 0);
-    tokio::fs::remove_dir_all(&dir).await?;
-    ensure!(good, "compute_encoder_self_test_failed");
-    Ok(vec!["remux_hls_v1".into(), "h264_480p_hls_v1".into()])
+    let (width, height) = if recipe.segment_seconds == 2 {
+        (recipe.max_width, recipe.max_height)
+    } else {
+        (640, 480)
+    };
+    let source = dir.join("sample.mp4");
+    let mut fixture = Command::new(ffmpeg);
+    media_core::input_policy::clean_environment(&mut fixture);
+    fixture
+        .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i"])
+        .arg(format!("color=c=black:s={width}x{height}:r=25:d=1"))
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+        ])
+        .arg(&source);
+    capture(fixture, 4096).await?;
+    let meta: Value = serde_json::from_slice(
+        &capture(
+            q::metadata_command(ffprobe, &source, false),
+            q::MAX_METADATA_BYTES,
+        )
+        .await?,
+    )?;
+    let frames = capture(
+        q::frames_command(ffprobe, &source, false),
+        q::MAX_FRAME_BYTES,
+    )
+    .await?;
+    let original = q::qualify_source(&meta, &frames, 0, Some(1), recipe.id)?;
+    let output = dir.join("output");
+    tokio::fs::create_dir_all(&output).await?;
+    capture(
+        q::encode_command(ffmpeg, &source, &output, 0, Some(1), recipe.id)?,
+        4096,
+    )
+    .await?;
+    let measured = q::check_output(
+        ffmpeg,
+        ffprobe,
+        &output.join("index.m3u8"),
+        &original,
+        recipe.id,
+    )
+    .await?;
+    ensure!(
+        measured.video.width == width && measured.video.height == height,
+        "compute_self_test_dimensions"
+    );
+    Ok(())
+}
+async fn self_test(ffmpeg: &str, ffprobe: &str, output: &Path) -> Result<Vec<String>> {
+    let mut caps = Vec::new();
+    for recipe in media_core::distributed_compute::COMPUTE_RECIPES {
+        let dir = output.join(format!("self-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await?;
+        let scope = media_core::child_process::Scope::new();
+        let result = scope
+            .run(tokio::time::timeout(
+                Duration::from_secs(90),
+                test_recipe(ffmpeg, ffprobe, &dir, recipe),
+            ))
+            .await;
+        // A timeout/cancellation never leaves a test encoder or decoder running.
+        scope.shutdown().await?;
+        tokio::fs::remove_dir_all(&dir).await?;
+        match result {
+            Ok(Ok(())) => caps.push(recipe.id.into()),
+            Ok(Err(error)) => {
+                tracing::warn!(recipe=recipe.id, %error, "compute recipe self-test failed; capability withheld")
+            }
+            Err(_) => tracing::warn!(
+                recipe = recipe.id,
+                "compute recipe self-test timed out; capability withheld"
+            ),
+        }
+    }
+    ensure!(!caps.is_empty(), "compute_encoder_self_test_failed");
+    Ok(caps)
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Receipt {
@@ -740,7 +870,7 @@ async fn run() -> Result<()> {
             .any(|r| r.process_disposition.is_none()),
         "compute_previous_attempt_drain_unconfirmed"
     );
-    n.caps = self_test(&n.ffmpeg, &n.output).await?;
+    n.caps = self_test(&n.ffmpeg, &n.ffprobe, &n.output).await?;
     n.heartbeat().await?;
     let (stop, shutdown) = watch::channel(false);
     let heartbeat = n.clone();
@@ -816,11 +946,12 @@ async fn run() -> Result<()> {
                 }
                 if let Err(e) = execution {
                     tracing::warn!(job=%j.id,error=%e,"structured computation failed");
+                    let mut failure = serde_json::to_value(n.fence(&j))?;
+                    if let Some(reason) = public_failure_reason(&e) {
+                        failure["failure_reason"] = json!(reason);
+                    }
                     let _ = n
-                        .call(
-                            &format!("/agent-compute/jobs/{}/fail", j.id),
-                            Some(serde_json::to_value(n.fence(&j))?),
-                        )
+                        .call(&format!("/agent-compute/jobs/{}/fail", j.id), Some(failure))
                         .await;
                 }
             } else {
@@ -876,6 +1007,68 @@ mod tests {
         );
     }
     #[test]
+    fn upload_budget_codes_require_bounded_normalized_error_and_expected_status() {
+        for (code, expected) in [
+            (
+                "COMPUTE_OUTPUT_BUDGET_EXCEEDED",
+                "compute_output_budget_exceeded",
+            ),
+            (
+                "COMPUTE_GLOBAL_BUDGET_EXCEEDED",
+                "compute_global_budget_exceeded",
+            ),
+        ] {
+            let body = serde_json::to_vec(
+                &json!({"error":{"code":code,"message":"untrusted host path or token"}}),
+            )
+            .unwrap();
+            assert_eq!(upload_budget_reason(413, &body), Some(expected));
+            for status in [200, 400, 401, 403, 409, 500] {
+                assert_eq!(upload_budget_reason(status, &body), None);
+            }
+        }
+        for body in [
+            b"not JSON".as_slice(),
+            b"{}",
+            br#"{"error":"compute_global_budget_exceeded"}"#,
+            br#"{"error":{"code":"UNKNOWN","message":"COMPUTE_GLOBAL_BUDGET_EXCEEDED"}}"#,
+        ] {
+            assert_eq!(upload_budget_reason(413, body), None);
+        }
+        let oversized = serde_json::to_vec(&json!({"error":{"code":"COMPUTE_GLOBAL_BUDGET_EXCEEDED","message":"x".repeat(MAX_UPLOAD_ERROR_BYTES)}})).unwrap();
+        assert_eq!(upload_budget_reason(413, &oversized), None);
+    }
+    #[tokio::test]
+    async fn upload_failure_response_is_bounded_before_reporting() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (body, expected) in [
+            (json!({"error":{"code":"COMPUTE_GLOBAL_BUDGET_EXCEEDED","message":"not forwarded"}}).to_string(), Some("compute_global_budget_exceeded")),
+            (json!({"error":{"code":"COMPUTE_GLOBAL_BUDGET_EXCEEDED","message":"x".repeat(MAX_UPLOAD_ERROR_BYTES)}}).to_string(), None),
+            ("untrusted proxy error".to_owned(), None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let mut chunk = [0u8; 1024];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0 && request.len() + count <= 8192);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let reply = format!("HTTP/1.1 413 Payload Too Large\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n", body.len(), body);
+                stream.write_all(reply.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let response = reqwest::Client::builder().no_proxy().build().unwrap().get(format!("http://{address}/owned-fixture")).send().await.unwrap();
+            let error = require_upload_success(response).await.unwrap_err();
+            assert_eq!(public_failure_reason(&error), expected);
+            assert!(!error.to_string().contains("untrusted"));
+            server.await.unwrap();
+        }
+    }
+    #[test]
     fn path_scope() {
         let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(&dir).unwrap();
@@ -889,5 +1082,97 @@ mod tests {
         assert!(verify_source(&dir, "a.mp4", &v.version, Some((&hash, len))).is_ok());
         assert!(verify_source(&dir, "a.mp4", &v.version, Some((&"0".repeat(64), len))).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires installed official FFmpeg and FFprobe"]
+    async fn real_self_test_advertises_only_fully_executed_recipes() {
+        let root = std::env::temp_dir().join(format!("rainsync-self-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let ffmpeg = std::env::var("FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+        let ffprobe = std::env::var("FFPROBE").unwrap_or_else(|_| "ffprobe".into());
+        let caps = self_test(&ffmpeg, &ffprobe, &root).await.unwrap();
+        assert_eq!(
+            caps,
+            media_core::distributed_compute::COMPUTE_RECIPES
+                .iter()
+                .map(|r| r.id.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            self_test("/does-not-exist/ffmpeg", &ffprobe, &root)
+                .await
+                .is_err()
+        );
+        assert!(
+            self_test(&ffmpeg, "/does-not-exist/ffprobe", &root)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::fs::read_dir(&root)
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+    #[test]
+    fn public_failure_codes_are_exact_and_never_raw_exception_text() {
+        for (local, public) in [
+            (
+                "compute_output_budget_exceeded",
+                "compute_output_budget_exceeded",
+            ),
+            (
+                "compute_output_budget_insufficient",
+                "compute_output_budget_insufficient",
+            ),
+            (
+                "compute_source_duration_unsupported",
+                "compute_source_duration_unsupported",
+            ),
+            ("compute_source_too_large", "compute_source_too_large"),
+        ] {
+            assert_eq!(public_failure_reason(&anyhow::anyhow!(local)), Some(public));
+        }
+        for unknown in [
+            "compute_api_status:413 Payload Too Large",
+            "compute_upload_failed:507 Insufficient Storage",
+            "compute_output_budget_exceeded: /private/path",
+            "encoder failed with sensitive details",
+            "compute_source_empty",
+        ] {
+            assert_eq!(public_failure_reason(&anyhow::anyhow!(unknown)), None);
+        }
+    }
+    #[test]
+    fn measured_hd_budget_rejects_before_encode_without_changing_legacy() {
+        use media_core::distributed_compute::compute_recipe;
+        for recipe in ["h264_720p_hls_v1", "h264_1080p_hls_v1", "h264_2160p_hls_v1"] {
+            let required = compute_recipe(recipe)
+                .unwrap()
+                .estimated_output_bytes(30.0, true)
+                .unwrap();
+            validate_measured_output_budget(recipe, 30.0, true, required).unwrap();
+            assert_eq!(
+                validate_measured_output_budget(recipe, 30.0, true, required - 1)
+                    .unwrap_err()
+                    .to_string(),
+                "compute_output_budget_insufficient"
+            );
+            assert_eq!(
+                validate_measured_output_budget(recipe, f64::NAN, true, u64::MAX)
+                    .unwrap_err()
+                    .to_string(),
+                "compute_source_duration_unsupported"
+            );
+        }
+        for recipe in ["remux_hls_v1", "h264_480p_hls_v1"] {
+            validate_measured_output_budget(recipe, 1800.0, true, 1).unwrap();
+        }
+        assert!(validate_measured_output_budget("arbitrary", 30.0, true, u64::MAX).is_err());
     }
 }

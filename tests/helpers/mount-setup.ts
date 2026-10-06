@@ -4,7 +4,11 @@ import ts from "typescript";
 import * as Vue from "vue";
 
 /** Exercise the real SFC setup and Vue lifecycle with an in-memory renderer. */
-export function mountSetup(url: URL, imports: Record<string, unknown>) {
+export function mountSetup(
+  url: URL,
+  imports: Record<string, unknown>,
+  props: Record<string, unknown> = {},
+) {
   const descriptor = parse(readFileSync(url, "utf8")).descriptor;
   const script = compileScript(descriptor, {
     id: "first-round-regression",
@@ -51,7 +55,15 @@ export function mountSetup(url: URL, imports: Record<string, unknown>) {
     parentNode: (node) => node.parent,
     nextSibling: () => null,
   });
-  const app = renderer.createApp(component);
+  const currentProps = Vue.reactive(props);
+  const app = renderer.createApp({
+    render: () => Vue.h(component, currentProps),
+  });
   app.mount({});
-  return { controls, unmount: () => app.unmount() };
+  return {
+    controls,
+    setProps: (patch: Record<string, unknown>) =>
+      Object.assign(currentProps, patch),
+    unmount: () => app.unmount(),
+  };
 }

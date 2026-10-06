@@ -55,6 +55,13 @@ jobs:
           echo "W03_BACKEND_BINDING=$BINDING" >> "$GITHUB_ENV"
           export W03_BACKEND_BINDING="$BINDING"
           npm run test:parallel-integration
+          # The earlier workspace --bins build includes both NAS executables.
+          # These fixtures own fresh loopback databases and synthetic media only.
+          test -x "$CARGO_TARGET_DIR/debug/rainsync-server"
+          test -x "$CARGO_TARGET_DIR/debug/rainsync-nas-agent"
+          test -x "$CARGO_TARGET_DIR/debug/rainsync-compute-node"
+          timeout --signal=TERM --kill-after=15s 180s node tests/distributed-compute-admission.mjs
+          timeout --signal=TERM --kill-after=15s 600s node tests/distributed-compute-hd.mjs
       - run: npm run test:accounts
       - name: Verify avatars with the deployment image's FFmpeg
         run: |

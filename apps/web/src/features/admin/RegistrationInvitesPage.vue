@@ -304,7 +304,7 @@ onBeforeUnmount(() => {
 });
 </script>
 <template>
-  <section class="page">
+  <section class="page registration-invites-page">
     <div class="page-title">
       <div class="page-intro">
         <p class="section-label">管理</p>
@@ -504,3 +504,18 @@ onBeforeUnmount(() => {
     >
   </section>
 </template>
+
+<style scoped>
+.registration-invites-page > .admin-filters {
+  align-items: flex-end;
+}
+@media (min-width: 1100px) {
+  .registration-invites-page > .page-title {
+    margin-bottom: var(--space-5);
+  }
+  .registration-invites-page > :deep(.section-tabs),
+  .registration-invites-page > .admin-filters {
+    margin-bottom: var(--space-4);
+  }
+}
+</style>

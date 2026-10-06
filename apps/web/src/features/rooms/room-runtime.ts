@@ -283,8 +283,12 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       (room.value.owner_id === session.user?.id || !!session.user?.admin),
   );
   let actionSerial = 0;
+  const pendingActions = new Set<object>();
   async function run(action: () => Promise<unknown>, preserveError = false) {
-    const serial = ++actionSerial;
+    const serial = ++actionSerial,
+      identity = session.epoch,
+      token = {};
+    pendingActions.add(token);
     if (!preserveError) error.value = "";
     busy.value = true;
     try {
@@ -292,12 +296,14 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     } catch (e) {
       if (
         serial === actionSerial &&
+        identity === session.epoch &&
         !(e instanceof PlaybackCancelled) &&
         !(e instanceof StaleIdentity)
       )
         error.value = e instanceof Error ? e.message : String(e);
     } finally {
-      if (serial === actionSerial) busy.value = false;
+      pendingActions.delete(token);
+      busy.value = pendingActions.size > 0;
     }
   }
   async function leave() {
@@ -309,6 +315,18 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     ++namesRequest;
     namesPending = false;
     ++roomSerial;
+    ++actionSerial;
+    pendingActions.clear();
+    busy.value = false;
+    ++playlistRequest;
+    playlistPending = undefined;
+    playlistLoading.value = false;
+    playlistLoaded.value = false;
+    playlistError.value = "";
+    queueNotice.value = "";
+    queueReceipts.value = {};
+    queueOperations.clear();
+    queuePendingKeys.value = [];
     ++connectionSerial;
     clearTimeout(retry);
     snapshotReady = false;
@@ -344,7 +362,11 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     },
   );
   async function enter(r: Room) {
-    if (room.value?.id === r.id) return;
+    if (room.value?.id === r.id) {
+      if (playlistPending) return playlistPending;
+      if (!playlistLoaded.value || playlistError.value) await refreshPlaylist();
+      return;
+    }
     const cleanup = leave(),
       serial = roomSerial;
     await cleanup;
@@ -354,10 +376,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     recoveryIdentity = {};
     recoveryAuthEpoch = session.epoch;
     connect();
-    const items = await session.api<QueueItem[]>(
-      "/rooms/" + r.id + "/playlist",
-    );
-    if (serial === roomSerial) playlist.value = items;
+    await refreshPlaylist();
   }
   async function catchUpChat(id: string, serial: number) {
     const before = [...messages.value];
@@ -658,14 +677,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           old.live?.broadcast_id !== next.live?.broadcast_id
         ) {
           playback.mediaChanged();
-          const serial = roomSerial,
-            selected = next.room_id;
-          void session
-            .api<QueueItem[]>(`/rooms/${selected}/playlist`)
-            .then((items) => {
-              if (serial === roomSerial) playlist.value = items;
-            })
-            .catch(() => {});
+          void refreshPlaylist().catch(() => {});
         } else if (v.action?.type === "SEEK")
           void run(() => applyState(true, true), true);
         else {
@@ -771,15 +783,98 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       "DELETE",
     );
   }
-  async function addQueue(id: string) {
-    if (!roomActive.value) throw Error("房间当前未开放");
+  const playlistLoaded = ref(false),
+    playlistLoading = ref(false),
+    playlistError = ref(""),
+    queueNotice = ref(""),
+    queueReceipts = ref<Record<string, string>>({}),
+    queuePendingKeys = ref<string[]>([]);
+  let playlistRequest = 0,
+    playlistPending: Promise<void> | undefined;
+  const queueOperations = new Map<string, Promise<void>>();
+  function queueReceipt(kind: "add" | "remove", id: string) {
+    return queueReceipts.value[`${kind}:${id}`] ?? "";
+  }
+  function queuePending(kind: "add" | "remove", id: string) {
+    return queuePendingKeys.value.includes(`${kind}:${id}`);
+  }
+  function refreshPlaylist(): Promise<void> {
+    const selected = room.value?.id,
+      serial = roomSerial,
+      identity = session.epoch,
+      request = ++playlistRequest;
+    if (!selected) return Promise.resolve();
+    const current = () =>
+      serial === roomSerial &&
+      identity === session.epoch &&
+      selected === room.value?.id &&
+      request === playlistRequest;
+    playlistLoading.value = true;
+    const work = (async () => {
+      try {
+        const items = await session.api<QueueItem[]>(
+          `/rooms/${selected}/playlist`,
+        );
+        if (!current()) return;
+        playlist.value = items;
+        playlistLoaded.value = true;
+        playlistError.value = "";
+      } catch (failure) {
+        if (!current()) return;
+        playlistError.value =
+          failure instanceof Error ? failure.message : String(failure);
+        throw failure;
+      } finally {
+        if (current()) {
+          playlistLoading.value = false;
+          playlistPending = undefined;
+        }
+      }
+    })();
+    playlistPending = work;
+    return work;
+  }
+  function mutateQueue(kind: "add" | "remove", id: string): Promise<void> {
+    if (!roomActive.value) return Promise.reject(Error("房间当前未开放"));
+    const key = `${kind}:${id}`;
+    const pending = queueOperations.get(key);
+    if (pending) return pending;
     const selected = room.value!.id,
-      serial = roomSerial;
-    await session.api(`/rooms/${selected}/playlist`, "POST", {
-      media_id: id,
-    });
-    const items = await session.api<QueueItem[]>(`/rooms/${selected}/playlist`);
-    if (serial === roomSerial) playlist.value = items;
+      serial = roomSerial,
+      identity = session.epoch;
+    const current = () =>
+      serial === roomSerial &&
+      identity === session.epoch &&
+      selected === room.value?.id;
+    delete queueReceipts.value[key];
+    queuePendingKeys.value = [...queuePendingKeys.value, key];
+    const work = (async () => {
+      try {
+        if (kind === "add")
+          await session.api(`/rooms/${selected}/playlist`, "POST", {
+            media_id: id,
+          });
+        else await session.api(`/rooms/${selected}/playlist/${id}`, "DELETE");
+        if (!current()) return;
+        // The mutation is committed. A failed read must never invite repeating it.
+        queueNotice.value =
+          kind === "add" ? "已加入当前房间待播" : "已从当前房间待播移除";
+        queueReceipts.value[key] = queueNotice.value;
+        await refreshPlaylist().catch(() => {});
+      } finally {
+        if (current()) {
+          queueOperations.delete(key);
+          queuePendingKeys.value = queuePendingKeys.value.filter(
+            (value) => value !== key,
+          );
+        }
+      }
+    })();
+    queueOperations.set(key, work);
+    return work;
+  }
+  function addQueue(id: string) {
+    return mutateQueue("add", id);
   }
   function sendChat() {
     if (
@@ -813,16 +908,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       }),
     );
   }
-  async function removeQueue(id: string) {
-    if (!roomActive.value) throw Error("房间当前未开放");
-    const selected = room.value?.id,
-      serial = roomSerial;
-    if (!selected) return;
-    await session.api("/rooms/" + selected + "/playlist/" + id, "DELETE");
-    const rows = await session.api<QueueItem[]>(
-      "/rooms/" + selected + "/playlist",
-    );
-    if (serial === roomSerial) playlist.value = rows;
+  function removeQueue(id: string) {
+    return mutateQueue("remove", id);
   }
   type LifecycleView = {
     lifecycle: RoomLifecycle;
@@ -969,6 +1056,14 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     messages,
     lastChatDeletion,
     playlist,
+    playlistLoaded,
+    playlistLoading,
+    playlistError,
+    queueNotice,
+    queuePendingCount: computed(() => queuePendingKeys.value.length),
+    queuePending,
+    queueReceipt,
+    refreshPlaylist,
     chat,
     chatPending,
     chatFailed,

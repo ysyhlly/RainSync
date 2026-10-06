@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import QueueFeedback from "../rooms/QueueFeedback.vue";
 import { ref, computed, onMounted, onBeforeUnmount, watch } from "vue";
 import { useRoute } from "vue-router";
 import { useSession } from "../auth/session.store";
@@ -296,8 +297,9 @@ function share() {
     true,
   );
 }
+const canQueue = computed(() => !!runtime.room && runtime.can("queue"));
 async function choose(id: string) {
-  if (!runtime.room) return;
+  if (!canQueue.value) return;
   await runtime.run(() => runtime.addQueue(id));
 }
 function requestChange(kind: ChangeKind, target: string, targetLabel = target) {
@@ -431,566 +433,621 @@ onBeforeUnmount(() => {
           }}
         </p>
       </div>
-      <form
-        v-if="enabled"
-        class="surface-card surface-card--compact library-create"
-        @submit.prevent="create"
-      >
-        <div>
-          <h2>创建私人库</h2>
-          <p class="helper">片源与授权独立管理</p>
-        </div>
-        <label
-          >名称<input
-            v-model="createName"
-            maxlength="100"
-            required
-            placeholder="例如：家庭影院"
-        /></label>
-        <button class="primary" :disabled="busy || !createName.trim()">
-          <AppIcon name="plus" />创建
-        </button>
-      </form>
-      <section
-        v-if="libraries.length"
-        class="surface-card surface-card--compact"
-      >
-        <div class="section-heading">
-          <h2>选择媒体库</h2>
-          <span class="helper">{{ libraries.length }} 个可访问的媒体库</span>
-        </div>
-        <nav aria-label="媒体库选择" class="library-tabs segmented-nav">
-          <button
-            v-for="library in libraries"
-            :key="library.id"
-            :aria-pressed="selectedId === library.id"
-            :disabled="busy"
-            @click="select(library.id)"
-          >
-            <AppIcon name="movie" :size="18" />
-            {{ library.name }} ·
-            {{ library.visibility === "private" ? "私人" : "实例共享" }}
-          </button>
-        </nav>
-      </section>
-      <div v-if="detailBusy && !selected" class="loading-state" role="status">
-        正在打开媒体库…
-      </div>
-      <template v-if="selected">
-        <section class="surface-card">
-          <div class="section-heading">
-            <div class="section-heading__copy">
-              <p class="section-label">当前媒体库</p>
-              <h2>{{ selected.name }}</h2>
-              <p class="helper">权限版本 {{ selected.permission_epoch }}</p>
-            </div>
-            <div class="button-row">
-              <span class="status-badge">{{
-                selected.visibility === "private" ? "私人媒体库" : "实例共享"
-              }}</span>
-              <span
-                class="status-badge"
-                :class="{
-                  'status-badge--success': selected.permissions.browse,
-                }"
-                >{{ selected.permissions.browse ? "可浏览" : "不可浏览" }}</span
-              >
-              <span
-                class="status-badge"
-                :class="{ 'status-badge--success': selected.permissions.play }"
-                >{{ selected.permissions.play ? "可播放" : "不可播放" }}</span
-              >
-            </div>
-          </div>
+      <div class="library-workspace">
+        <div class="library-management page-stack">
           <form
-            v-if="selected.permissions.manage"
-            class="library-inline-form"
-            @submit.prevent="
-              run(
-                () => api.rename(selected!.id, editName, selected!.revision),
-                '名称已保存',
-              )
-            "
+            v-if="enabled"
+            class="surface-card surface-card--compact library-create"
+            @submit.prevent="create"
           >
-            <label
-              >媒体库名称<input v-model="editName" maxlength="100" required
-            /></label>
-            <button :disabled="busy">保存名称</button>
-          </form>
-        </section>
-
-        <section
-          v-if="selected.permissions.browse"
-          class="surface-card page-stack"
-        >
-          <div class="section-heading">
-            <div class="section-heading__copy">
-              <h2>库内影片</h2>
-              <p class="helper">
-                已加载 {{ media.length }} 部影片{{
-                  hasMore ? "，可继续加载" : ""
-                }}
-              </p>
+            <div>
+              <h2>创建私人库</h2>
+              <p class="helper">片源与授权独立管理</p>
             </div>
-            <span v-if="runtime.room" class="status-badge"
-              >当前房间 · {{ runtime.room.name }}</span
-            >
-          </div>
-          <form
-            class="library-inline-form"
-            role="search"
-            @submit.prevent="loadMedia(false)"
-          >
             <label
-              ><span class="sr-only">搜索当前库</span
-              ><input
-                v-model="search"
-                type="search"
-                placeholder="搜索当前库的影片标题"
+              >名称<input
+                v-model="createName"
+                maxlength="100"
+                required
+                placeholder="例如：家庭影院"
             /></label>
-            <button :disabled="mediaBusy"><AppIcon name="search" />搜索</button>
-          </form>
-          <div v-if="mediaError">
-            <Notice :message="mediaError" error />
-            <button :disabled="mediaBusy" @click="loadMedia(false)">
-              重新加载影片
+            <button class="primary" :disabled="busy || !createName.trim()">
+              <AppIcon name="plus" />创建
             </button>
-          </div>
-          <p
-            v-if="mediaBusy"
-            class="loading-state loading-state--inline"
-            role="status"
+          </form>
+          <section
+            v-if="libraries.length"
+            class="surface-card surface-card--compact library-picker"
           >
-            正在加载当前库的影片…
-          </p>
-          <p
-            v-if="media.length && (search !== appliedQuery || mediaError)"
-            class="helper"
-            role="status"
-          >
-            仍显示{{
-              appliedQuery ? `“${appliedQuery}”搜索` : "全部影片"
-            }}的已加载结果。
-            输入新关键词后点击搜索；加载更多沿用当前结果的查询。
-          </p>
-          <div
-            v-if="!mediaBusy && !mediaError && !media.length"
-            class="empty-state empty-state--compact"
-          >
-            <span class="empty-state__icon"
-              ><AppIcon :name="appliedQuery ? 'search' : 'movie'" :size="28"
-            /></span>
-            <h3>
-              {{ appliedQuery ? "没有找到匹配影片" : "这个媒体库还没有影片" }}
-            </h3>
-            <p>
-              {{
-                appliedQuery
-                  ? "换个标题关键词再试，或清除搜索查看全部影片。"
-                  : selected.permissions.manage
-                    ? "添加片源并完成扫描后，影片会出现在这里。"
-                    : "请库管理者确认片源和扫描结果。"
-              }}
-            </p>
-            <button
-              v-if="appliedQuery"
-              @click="
-                search = '';
-                loadMedia(false);
+            <div class="section-heading">
+              <h2>选择媒体库</h2>
+              <span class="helper"
+                >{{ libraries.length }} 个可访问的媒体库</span
+              >
+            </div>
+            <nav aria-label="媒体库选择" class="library-tabs segmented-nav">
+              <button
+                v-for="library in libraries"
+                :key="library.id"
+                :aria-pressed="selectedId === library.id"
+                :disabled="busy"
+                @click="select(library.id)"
+              >
+                <AppIcon name="movie" :size="18" />
+                {{ library.name }} ·
+                {{ library.visibility === "private" ? "私人" : "实例共享" }}
+              </button>
+            </nav>
+          </section>
+          <section v-if="selected" class="surface-card library-summary">
+            <div class="section-heading">
+              <div class="section-heading__copy">
+                <p class="section-label">当前媒体库</p>
+                <h2>{{ selected.name }}</h2>
+                <p class="helper">权限版本 {{ selected.permission_epoch }}</p>
+              </div>
+              <div class="button-row">
+                <span class="status-badge">{{
+                  selected.visibility === "private" ? "私人媒体库" : "实例共享"
+                }}</span>
+                <span
+                  class="status-badge"
+                  :class="{
+                    'status-badge--success': selected.permissions.browse,
+                  }"
+                  >{{
+                    selected.permissions.browse ? "可浏览" : "不可浏览"
+                  }}</span
+                >
+                <span
+                  class="status-badge"
+                  :class="{
+                    'status-badge--success': selected.permissions.play,
+                  }"
+                  >{{ selected.permissions.play ? "可播放" : "不可播放" }}</span
+                >
+              </div>
+            </div>
+            <form
+              v-if="selected.permissions.manage"
+              class="library-inline-form"
+              @submit.prevent="
+                run(
+                  () => api.rename(selected!.id, editName, selected!.revision),
+                  '名称已保存',
+                )
               "
             >
-              清除搜索
-            </button>
-          </div>
-          <p v-if="media.length && !runtime.room" class="helper">
-            先进入放映室，再将影片加入待播或分享到房间。<RouterLink to="/rooms"
-              >选择放映室</RouterLink
-            >
-          </p>
-          <ul class="private-media-list data-list" :aria-busy="mediaBusy">
-            <li v-for="item in media" :key="item.id" class="data-row">
-              <div class="data-row__body">
-                <strong>{{ item.title }}</strong>
-                <p class="helper">{{ item.kind }}</p>
-              </div>
-              <div class="data-row__actions">
-                <button
-                  v-if="selected.permissions.share_to_room"
-                  :aria-pressed="shareMedia === item.id"
-                  :disabled="busy"
-                  @click="shareMedia = item.id"
-                >
-                  {{ shareMedia === item.id ? "已选择分享" : "选择分享" }}
-                </button>
-                <button
-                  :disabled="busy || !runtime.room || !runtime.owner"
-                  @click="choose(item.id)"
-                >
-                  <AppIcon name="plus" />加入当前房间待播
-                </button>
-              </div>
-            </li>
-          </ul>
-          <button v-if="hasMore" :disabled="mediaBusy" @click="loadMedia(true)">
-            加载更多
-          </button>
-        </section>
-        <section v-else class="surface-card empty-state empty-state--compact">
-          <span class="empty-state__icon"
-            ><AppIcon name="key" :size="28"
-          /></span>
-          <h2>当前账号没有浏览权限</h2>
-          <p>
-            已有的播放授权与浏览权限独立。需要查看库内影片时，请联系库所有者。
-          </p>
-        </section>
-
-        <section
-          v-if="
-            (enabled && selected.permissions.share_to_room) ||
-            selected.room_shares?.length
-          "
-          class="surface-card page-stack"
-        >
-          <div class="section-heading">
-            <div class="section-heading__copy">
-              <h2>房间分享</h2>
-              <p class="helper">只分享一部影片，不开放整库浏览</p>
-            </div>
-            <span class="status-badge"
-              >{{
-                selected.room_shares?.filter((item) => item.active).length ?? 0
-              }}
-              个有效分享</span
-            >
-          </div>
-          <form
-            v-if="enabled && selected.permissions.share_to_room"
-            class="library-form-grid"
-            @submit.prevent="share"
+              <label
+                >媒体库名称<input v-model="editName" maxlength="100" required
+              /></label>
+              <button :disabled="busy">保存名称</button>
+            </form>
+          </section>
+        </div>
+        <div class="library-content page-stack">
+          <div
+            v-if="detailBusy && !selected"
+            class="loading-state"
+            role="status"
           >
-            <p v-if="!runtime.room" class="notice library-wide">
-              先进入一个房间，再返回这里。<RouterLink to="/rooms"
-                >选择放映室</RouterLink
-              >
-            </p>
-            <p v-else class="helper library-wide">
-              分享至：{{ runtime.room.name }}
-            </p>
-            <label
-              >影片<select v-model="shareMedia" required>
-                <option value="" disabled>选择影片</option>
-                <option v-for="item in media" :key="item.id" :value="item.id">
-                  {{ item.title }}
-                </option>
-              </select></label
-            >
-            <label
-              >观看范围<select v-model="shareMode">
-                <option value="library_members">
-                  仅已有库播放权限的房间成员
-                </option>
-                <option value="room_members">
-                  允许本房间有效成员观看此影片
-                </option>
-              </select></label
-            >
-            <label
-              >有效分钟<input
-                v-model.number="minutes"
-                type="number"
-                min="1"
-                max="1440"
-                required
-            /></label>
-            <p class="helper library-wide">
-              分享不开放整库浏览。撤销不能收回已经下载的数据。
-            </p>
-            <div class="button-row library-wide">
-              <button
-                class="primary"
-                :disabled="busy || !runtime.room || !shareMedia"
-              >
-                确认分享指定影片
-              </button>
-            </div>
-          </form>
-          <ul v-if="selected.room_shares?.length" class="data-list">
-            <li
-              v-for="shareItem in selected.room_shares"
-              :key="shareItem.id"
-              class="data-row"
-            >
-              <div class="data-row__body">
-                <strong>{{ shareItem.title }}</strong>
-                <p class="helper">
-                  {{
-                    shareItem.mode === "room_members"
-                      ? "房间成员"
-                      : "库授权成员"
-                  }}
-                  · {{ shareItem.active ? "未撤销" : "已失效" }} · 到期
-                  {{ new Date(shareItem.expires_at).toLocaleString() }}
-                </p>
-              </div>
-              <button
-                class="danger"
-                :disabled="busy || !shareItem.active"
-                @click="
-                  requestChange('revokeShare', shareItem.id, shareItem.title)
-                "
-              >
-                撤销分享
-              </button>
-            </li>
-          </ul>
-          <p v-else class="helper">
-            还没有房间分享。选择影片和观看范围后，即可建立限时授权。
-          </p>
-        </section>
-
-        <section
-          v-if="selected.permissions.manage"
-          class="surface-card page-stack"
-        >
-          <div class="section-heading">
-            <div class="section-heading__copy">
-              <h2>片源与索引</h2>
-              <p class="helper">扫描片源后，影片才会加入媒体库</p>
-            </div>
-            <span class="status-badge"
-              >{{ selected.sources?.length ?? 0 }} 个片源</span
-            >
+            正在打开媒体库…
           </div>
-          <ul v-if="selected.sources?.length" class="data-list">
-            <li
-              v-for="source in selected.sources"
-              :key="source.id"
-              class="data-row"
+          <template v-if="selected">
+            <section
+              v-if="selected.permissions.browse"
+              class="surface-card page-stack library-media"
             >
-              <div class="data-row__body">
-                <strong>{{ source.name }}</strong>
-                <p class="helper">{{ source.kind }}</p>
-                <p v-if="scans[source.id]" class="helper" role="status">
-                  {{
-                    {
-                      not_started: "尚未开始",
-                      running: "扫描中",
-                      failed: "扫描失败",
-                      completed: "扫描完成",
-                    }[scans[source.id].status]
-                  }}
-                  · {{ scans[source.id].item_count }} 部 ·
-                  {{ scans[source.id].page_count }} 页
-                </p>
-                <p
-                  v-if="scans[source.id]?.last_error"
-                  class="field-error"
-                  role="alert"
+              <div class="section-heading">
+                <div class="section-heading__copy">
+                  <h2>库内影片</h2>
+                  <p class="helper">
+                    已加载 {{ media.length }} 部影片{{
+                      hasMore ? "，可继续加载" : ""
+                    }}
+                  </p>
+                </div>
+                <span v-if="runtime.room" class="status-badge"
+                  >当前房间 · {{ runtime.room.name }}</span
                 >
-                  {{ scans[source.id].last_error }}
-                </p>
               </div>
-              <div
-                v-if="source.kind === 's3' || source.kind === 'http'"
-                class="data-row__actions"
+              <form
+                class="library-inline-form"
+                role="search"
+                @submit.prevent="loadMedia(false)"
               >
-                <button :disabled="busy" @click="scan(source.id, true)">
-                  重新扫描
+                <label
+                  ><span class="sr-only">搜索当前库</span
+                  ><input
+                    v-model="search"
+                    type="search"
+                    placeholder="搜索当前库的影片标题"
+                /></label>
+                <button :disabled="mediaBusy">
+                  <AppIcon name="search" />搜索
                 </button>
-                <button
-                  :disabled="busy || scans[source.id]?.status === 'completed'"
-                  @click="scan(source.id, false)"
-                >
-                  继续扫描
+              </form>
+              <div v-if="mediaError">
+                <Notice :message="mediaError" error />
+                <button :disabled="mediaBusy" @click="loadMedia(false)">
+                  重新加载影片
                 </button>
+              </div>
+              <p
+                v-if="mediaBusy"
+                class="loading-state loading-state--inline"
+                role="status"
+              >
+                正在加载当前库的影片…
+              </p>
+              <p
+                v-if="media.length && (search !== appliedQuery || mediaError)"
+                class="helper"
+                role="status"
+              >
+                仍显示{{
+                  appliedQuery ? `“${appliedQuery}”搜索` : "全部影片"
+                }}的已加载结果。
+                输入新关键词后点击搜索；加载更多沿用当前结果的查询。
+              </p>
+              <div
+                v-if="!mediaBusy && !mediaError && !media.length"
+                class="empty-state empty-state--compact"
+              >
+                <span class="empty-state__icon"
+                  ><AppIcon
+                    :name="appliedQuery ? 'search' : 'movie'"
+                    :size="28"
+                /></span>
+                <h3>
+                  {{
+                    appliedQuery ? "没有找到匹配影片" : "这个媒体库还没有影片"
+                  }}
+                </h3>
+                <p>
+                  {{
+                    appliedQuery
+                      ? "换个标题关键词再试，或清除搜索查看全部影片。"
+                      : selected.permissions.manage
+                        ? "添加片源并完成扫描后，影片会出现在这里。"
+                        : "请库管理者确认片源和扫描结果。"
+                  }}
+                </p>
                 <button
-                  :disabled="busy"
+                  v-if="appliedQuery"
                   @click="
-                    run(
-                      async () => {
-                        scans[source.id] = await api.scanStatus(
-                          selected!.id,
-                          source.id,
-                        );
-                      },
-                      '扫描状态已更新',
-                      false,
-                    )
+                    search = '';
+                    loadMedia(false);
                   "
                 >
-                  读取状态
+                  清除搜索
                 </button>
               </div>
-              <span v-else class="helper">由管理员在片源管理中扫描</span>
-            </li>
-          </ul>
-          <p v-else class="helper">
-            尚未添加片源。添加可读取的地址后，再扫描影片索引。
-          </p>
-          <details v-if="enabled" class="library-details">
-            <summary>添加读取片源</summary>
-            <form class="library-form-grid" @submit.prevent="addSource">
-              <label
-                >片源名称<input v-model="sourceName" required maxlength="100"
-              /></label>
-              <label
-                >类型<select v-model="sourceKind">
-                  <option value="http">HTTP</option>
-                  <option v-if="session.user?.admin" value="s3">
-                    S3（管理员绑定凭据引用）
-                  </option>
-                </select></label
-              >
-              <label class="library-wide"
-                >地址<input
-                  v-model="sourceUrl"
-                  type="url"
-                  required
-                  placeholder="https://media.example/"
-              /></label>
-              <label class="library-wide"
-                >配置 JSON<textarea
-                  v-model="sourceConfig"
-                  rows="5"
-                  spellcheck="false"
-                />
-              </label>
-              <p class="helper library-wide">
-                S3 使用 s3.region、bucket、prefix、credential_ref 中的
-                RAINSYNC_S3_* 环境变量名。不要在配置中填写密钥值。
-              </p>
-              <div class="button-row library-wide">
-                <button class="primary" :disabled="busy">添加片源</button>
-              </div>
-            </form>
-          </details>
-          <details
-            v-if="enabled && session.user?.admin"
-            class="library-details"
-          >
-            <summary>迁移已有片源（管理员）</summary>
-            <form
-              class="library-inline-form"
-              @submit.prevent="requestChange('attach', attachId)"
-            >
-              <p class="helper library-wide">
-                这是审计记录中的管理操作，将改变整份片源的可见范围。确认前请核对片源
-                ID。
-              </p>
-              <label>片源 ID<input v-model="attachId" required /></label>
-              <button :disabled="busy">迁入当前库</button>
-            </form>
-          </details>
-        </section>
-
-        <section
-          v-if="selected.owner_id === session.user?.id && enabled"
-          class="surface-card page-stack"
-        >
-          <div class="section-heading">
-            <div class="section-heading__copy">
-              <h2>账户授权</h2>
-              <p class="helper">按固定登录账号授予权限，并设置到期时间</p>
-            </div>
-            <span class="status-badge"
-              >{{ selected.grants?.length ?? 0 }} 个账户授权</span
-            >
-          </div>
-          <form class="library-form-grid" @submit.prevent="addGrant">
-            <label>固定登录账号<input v-model="grantName" required /></label>
-            <label
-              >有效小时<input
-                v-model.number="hours"
-                type="number"
-                min="1"
-                max="720"
-                required
-            /></label>
-            <fieldset class="library-wide">
-              <legend>允许的操作</legend>
-              <div class="permission-fields">
-                <label><input v-model="browse" type="checkbox" />浏览</label>
-                <label><input v-model="play" type="checkbox" />播放</label>
-                <label
-                  ><input
-                    v-model="shareRight"
-                    type="checkbox"
-                  />再分享到房间</label
+              <p v-if="media.length && !runtime.room" class="helper">
+                先进入放映室，再将影片加入待播或分享到房间。<RouterLink
+                  to="/rooms"
+                  >选择放映室</RouterLink
                 >
-                <label
-                  ><input v-model="manage" type="checkbox" />管理片源</label
-                >
-              </div>
-            </fieldset>
-            <p class="helper library-wide">
-              保存授权会使旧播放与分享失效，需要重新分享。
-            </p>
-            <div class="button-row library-wide">
-              <button class="primary" :disabled="busy">保存授权</button>
-            </div>
-          </form>
-          <ul v-if="selected.grants?.length" class="data-list">
-            <li
-              v-for="grant in selected.grants"
-              :key="grant.user_id"
-              class="data-row"
-            >
-              <div class="data-row__body">
-                <strong>{{ grant.username }}</strong>
-                <p class="helper">
-                  到期 {{ new Date(grant.expires_at).toLocaleString() }}
-                </p>
-              </div>
+              </p>
+              <ul class="private-media-list data-list" :aria-busy="mediaBusy">
+                <li v-for="item in media" :key="item.id" class="data-row">
+                  <div class="data-row__body">
+                    <strong>{{ item.title }}</strong>
+                    <p class="helper">{{ item.kind }}</p>
+                  <QueueFeedback :media-id="item.id" />
+                  </div>
+                  <div class="data-row__actions">
+                    <button
+                      v-if="selected.permissions.share_to_room"
+                      :aria-pressed="shareMedia === item.id"
+                      :disabled="busy"
+                      @click="shareMedia = item.id"
+                    >
+                      {{ shareMedia === item.id ? "已选择分享" : "选择分享" }}
+                    </button>
+                    <button
+                      :disabled="
+                        busy ||
+                        !canQueue ||
+                        runtime.queuePending('add', item.id)
+                      "
+                      :aria-busy="runtime.queuePending('add', item.id)"
+                      @click="choose(item.id)"
+                    >
+                      <AppIcon name="plus" />加入当前房间待播
+                    </button>
+                  </div>
+                </li>
+              </ul>
               <button
-                class="danger"
-                :disabled="busy"
-                @click="requestChange('revoke', grant.user_id, grant.username)"
+                v-if="hasMore"
+                :disabled="mediaBusy"
+                @click="loadMedia(true)"
               >
-                撤销
+                加载更多
               </button>
-            </li>
-          </ul>
-          <p v-else class="helper">
-            还没有向其他账号授权，私人库默认仅所有者可访问。
-          </p>
-        </section>
-
-        <details
-          v-if="selected.owner_id === session.user?.id && enabled"
-          class="surface-card library-details"
-        >
-          <summary>转移媒体库所有权</summary>
-          <form
-            class="library-inline-form"
-            @submit.prevent="requestChange('transfer', transferName)"
-          >
-            <p class="helper library-wide">
-              房间所有权保持独立。转移会终止旧库授权，且不会给你保留默认访问权。
-            </p>
-            <label
-              >新所有者的固定登录账号<input v-model="transferName" required
-            /></label>
-            <button class="danger" :disabled="busy">转移所有权</button>
-          </form>
-        </details>
-        <details v-if="selected.audit" class="surface-card library-details">
-          <summary>最近管理审计</summary>
-          <ul v-if="selected.audit.length" class="data-list">
-            <li
-              v-for="entry in selected.audit"
-              :key="entry.id"
-              class="data-row"
+            </section>
+            <section
+              v-else
+              class="surface-card empty-state empty-state--compact"
             >
-              <span class="helper">{{
-                new Date(entry.created_at).toLocaleString()
-              }}</span
-              ><span>{{ entry.action }}</span>
-            </li>
-          </ul>
-          <p v-else class="helper">暂无管理记录。</p>
-        </details>
-      </template>
+              <span class="empty-state__icon"
+                ><AppIcon name="key" :size="28"
+              /></span>
+              <h2>当前账号没有浏览权限</h2>
+              <p>
+                已有的播放授权与浏览权限独立。需要查看库内影片时，请联系库所有者。
+              </p>
+            </section>
+
+            <section
+              v-if="
+                (enabled && selected.permissions.share_to_room) ||
+                selected.room_shares?.length
+              "
+              class="surface-card page-stack"
+            >
+              <div class="section-heading">
+                <div class="section-heading__copy">
+                  <h2>房间分享</h2>
+                  <p class="helper">只分享一部影片，不开放整库浏览</p>
+                </div>
+                <span class="status-badge"
+                  >{{
+                    selected.room_shares?.filter((item) => item.active)
+                      .length ?? 0
+                  }}
+                  个有效分享</span
+                >
+              </div>
+              <form
+                v-if="enabled && selected.permissions.share_to_room"
+                class="library-form-grid"
+                @submit.prevent="share"
+              >
+                <p v-if="!runtime.room" class="notice library-wide">
+                  先进入一个房间，再返回这里。<RouterLink to="/rooms"
+                    >选择放映室</RouterLink
+                  >
+                </p>
+                <p v-else class="helper library-wide">
+                  分享至：{{ runtime.room.name }}
+                </p>
+                <label
+                  >影片<select v-model="shareMedia" required>
+                    <option value="" disabled>选择影片</option>
+                    <option
+                      v-for="item in media"
+                      :key="item.id"
+                      :value="item.id"
+                    >
+                      {{ item.title }}
+                    </option>
+                  </select></label
+                >
+                <label
+                  >观看范围<select v-model="shareMode">
+                    <option value="library_members">
+                      仅已有库播放权限的房间成员
+                    </option>
+                    <option value="room_members">
+                      允许本房间有效成员观看此影片
+                    </option>
+                  </select></label
+                >
+                <label
+                  >有效分钟<input
+                    v-model.number="minutes"
+                    type="number"
+                    min="1"
+                    max="1440"
+                    required
+                /></label>
+                <p class="helper library-wide">
+                  分享不开放整库浏览。撤销不能收回已经下载的数据。
+                </p>
+                <div class="button-row library-wide">
+                  <button
+                    class="primary"
+                    :disabled="busy || !runtime.room || !shareMedia"
+                  >
+                    确认分享指定影片
+                  </button>
+                </div>
+              </form>
+              <ul v-if="selected.room_shares?.length" class="data-list">
+                <li
+                  v-for="shareItem in selected.room_shares"
+                  :key="shareItem.id"
+                  class="data-row"
+                >
+                  <div class="data-row__body">
+                    <strong>{{ shareItem.title }}</strong>
+                    <p class="helper">
+                      {{
+                        shareItem.mode === "room_members"
+                          ? "房间成员"
+                          : "库授权成员"
+                      }}
+                      · {{ shareItem.active ? "未撤销" : "已失效" }} · 到期
+                      {{ new Date(shareItem.expires_at).toLocaleString() }}
+                    </p>
+                  </div>
+                  <button
+                    class="danger"
+                    :disabled="busy || !shareItem.active"
+                    @click="
+                      requestChange(
+                        'revokeShare',
+                        shareItem.id,
+                        shareItem.title,
+                      )
+                    "
+                  >
+                    撤销分享
+                  </button>
+                </li>
+              </ul>
+              <p v-else class="helper">
+                还没有房间分享。选择影片和观看范围后，即可建立限时授权。
+              </p>
+            </section>
+
+            <section
+              v-if="selected.permissions.manage"
+              class="surface-card page-stack"
+            >
+              <div class="section-heading">
+                <div class="section-heading__copy">
+                  <h2>片源与索引</h2>
+                  <p class="helper">扫描片源后，影片才会加入媒体库</p>
+                </div>
+                <span class="status-badge"
+                  >{{ selected.sources?.length ?? 0 }} 个片源</span
+                >
+              </div>
+              <ul v-if="selected.sources?.length" class="data-list">
+                <li
+                  v-for="source in selected.sources"
+                  :key="source.id"
+                  class="data-row"
+                >
+                  <div class="data-row__body">
+                    <strong>{{ source.name }}</strong>
+                    <p class="helper">{{ source.kind }}</p>
+                    <p v-if="scans[source.id]" class="helper" role="status">
+                      {{
+                        {
+                          not_started: "尚未开始",
+                          running: "扫描中",
+                          failed: "扫描失败",
+                          completed: "扫描完成",
+                        }[scans[source.id].status]
+                      }}
+                      · {{ scans[source.id].item_count }} 部 ·
+                      {{ scans[source.id].page_count }} 页
+                    </p>
+                    <p
+                      v-if="scans[source.id]?.last_error"
+                      class="field-error"
+                      role="alert"
+                    >
+                      {{ scans[source.id].last_error }}
+                    </p>
+                  </div>
+                  <div
+                    v-if="source.kind === 's3' || source.kind === 'http'"
+                    class="data-row__actions"
+                  >
+                    <button :disabled="busy" @click="scan(source.id, true)">
+                      重新扫描
+                    </button>
+                    <button
+                      :disabled="
+                        busy || scans[source.id]?.status === 'completed'
+                      "
+                      @click="scan(source.id, false)"
+                    >
+                      继续扫描
+                    </button>
+                    <button
+                      :disabled="busy"
+                      @click="
+                        run(
+                          async () => {
+                            scans[source.id] = await api.scanStatus(
+                              selected!.id,
+                              source.id,
+                            );
+                          },
+                          '扫描状态已更新',
+                          false,
+                        )
+                      "
+                    >
+                      读取状态
+                    </button>
+                  </div>
+                  <span v-else class="helper">由管理员在片源管理中扫描</span>
+                </li>
+              </ul>
+              <p v-else class="helper">
+                尚未添加片源。添加可读取的地址后，再扫描影片索引。
+              </p>
+              <details v-if="enabled" class="library-details">
+                <summary>添加读取片源</summary>
+                <form class="library-form-grid" @submit.prevent="addSource">
+                  <label
+                    >片源名称<input
+                      v-model="sourceName"
+                      required
+                      maxlength="100"
+                  /></label>
+                  <label
+                    >类型<select v-model="sourceKind">
+                      <option value="http">HTTP</option>
+                      <option v-if="session.user?.admin" value="s3">
+                        S3（管理员绑定凭据引用）
+                      </option>
+                    </select></label
+                  >
+                  <label class="library-wide"
+                    >地址<input
+                      v-model="sourceUrl"
+                      type="url"
+                      required
+                      placeholder="https://media.example/"
+                  /></label>
+                  <label class="library-wide"
+                    >配置 JSON<textarea
+                      v-model="sourceConfig"
+                      rows="5"
+                      spellcheck="false"
+                    />
+                  </label>
+                  <p class="helper library-wide">
+                    S3 使用 s3.region、bucket、prefix、credential_ref 中的
+                    RAINSYNC_S3_* 环境变量名。不要在配置中填写密钥值。
+                  </p>
+                  <div class="button-row library-wide">
+                    <button class="primary" :disabled="busy">添加片源</button>
+                  </div>
+                </form>
+              </details>
+              <details
+                v-if="enabled && session.user?.admin"
+                class="library-details"
+              >
+                <summary>迁移已有片源（管理员）</summary>
+                <form
+                  class="library-inline-form"
+                  @submit.prevent="requestChange('attach', attachId)"
+                >
+                  <p class="helper library-wide">
+                    这是审计记录中的管理操作，将改变整份片源的可见范围。确认前请核对片源
+                    ID。
+                  </p>
+                  <label>片源 ID<input v-model="attachId" required /></label>
+                  <button :disabled="busy">迁入当前库</button>
+                </form>
+              </details>
+            </section>
+
+            <section
+              v-if="selected.owner_id === session.user?.id && enabled"
+              class="surface-card page-stack"
+            >
+              <div class="section-heading">
+                <div class="section-heading__copy">
+                  <h2>账户授权</h2>
+                  <p class="helper">按固定登录账号授予权限，并设置到期时间</p>
+                </div>
+                <span class="status-badge"
+                  >{{ selected.grants?.length ?? 0 }} 个账户授权</span
+                >
+              </div>
+              <form class="library-form-grid" @submit.prevent="addGrant">
+                <label
+                  >固定登录账号<input v-model="grantName" required
+                /></label>
+                <label
+                  >有效小时<input
+                    v-model.number="hours"
+                    type="number"
+                    min="1"
+                    max="720"
+                    required
+                /></label>
+                <fieldset class="library-wide">
+                  <legend>允许的操作</legend>
+                  <div class="permission-fields">
+                    <label
+                      ><input v-model="browse" type="checkbox" />浏览</label
+                    >
+                    <label><input v-model="play" type="checkbox" />播放</label>
+                    <label
+                      ><input
+                        v-model="shareRight"
+                        type="checkbox"
+                      />再分享到房间</label
+                    >
+                    <label
+                      ><input v-model="manage" type="checkbox" />管理片源</label
+                    >
+                  </div>
+                </fieldset>
+                <p class="helper library-wide">
+                  保存授权会使旧播放与分享失效，需要重新分享。
+                </p>
+                <div class="button-row library-wide">
+                  <button class="primary" :disabled="busy">保存授权</button>
+                </div>
+              </form>
+              <ul v-if="selected.grants?.length" class="data-list">
+                <li
+                  v-for="grant in selected.grants"
+                  :key="grant.user_id"
+                  class="data-row"
+                >
+                  <div class="data-row__body">
+                    <strong>{{ grant.username }}</strong>
+                    <p class="helper">
+                      到期 {{ new Date(grant.expires_at).toLocaleString() }}
+                    </p>
+                  </div>
+                  <button
+                    class="danger"
+                    :disabled="busy"
+                    @click="
+                      requestChange('revoke', grant.user_id, grant.username)
+                    "
+                  >
+                    撤销
+                  </button>
+                </li>
+              </ul>
+              <p v-else class="helper">
+                还没有向其他账号授权，私人库默认仅所有者可访问。
+              </p>
+            </section>
+
+            <details
+              v-if="selected.owner_id === session.user?.id && enabled"
+              class="surface-card library-details"
+            >
+              <summary>转移媒体库所有权</summary>
+              <form
+                class="library-inline-form"
+                @submit.prevent="requestChange('transfer', transferName)"
+              >
+                <p class="helper library-wide">
+                  房间所有权保持独立。转移会终止旧库授权，且不会给你保留默认访问权。
+                </p>
+                <label
+                  >新所有者的固定登录账号<input v-model="transferName" required
+                /></label>
+                <button class="danger" :disabled="busy">转移所有权</button>
+              </form>
+            </details>
+            <details v-if="selected.audit" class="surface-card library-details">
+              <summary>最近管理审计</summary>
+              <ul v-if="selected.audit.length" class="data-list">
+                <li
+                  v-for="entry in selected.audit"
+                  :key="entry.id"
+                  class="data-row"
+                >
+                  <span class="helper">{{
+                    new Date(entry.created_at).toLocaleString()
+                  }}</span
+                  ><span>{{ entry.action }}</span>
+                </li>
+              </ul>
+              <p v-else class="helper">暂无管理记录。</p>
+            </details>
+          </template>
+        </div>
+      </div>
     </div>
     <AppDialog
       v-model="confirmationOpen"
@@ -1045,6 +1102,15 @@ onBeforeUnmount(() => {
   </section>
 </template>
 <style scoped>
+.library-workspace {
+  display: grid;
+  gap: var(--space-6);
+  min-width: 0;
+}
+.library-management,
+.library-content {
+  align-content: start;
+}
 .library-create {
   display: grid;
   grid-template-columns: minmax(10rem, auto) minmax(0, 1fr) auto;
@@ -1096,6 +1162,76 @@ onBeforeUnmount(() => {
 }
 .data-row__body strong {
   overflow-wrap: anywhere;
+}
+@media (min-width: 1100px) {
+  .private-library-page > .page-title {
+    margin-bottom: var(--space-5);
+  }
+  .library-workspace {
+    grid-template-columns: minmax(17rem, 20rem) minmax(0, 1fr);
+    align-items: start;
+  }
+  .library-management,
+  .library-content,
+  .library-content > .page-stack {
+    gap: var(--space-4);
+  }
+  .library-management .surface-card {
+    padding: var(--space-4);
+  }
+  .library-management .section-heading {
+    display: grid;
+    gap: var(--space-2);
+    margin: 0;
+  }
+  .library-management .section-heading__copy {
+    gap: var(--space-1);
+  }
+  .library-management .section-heading__copy h2 {
+    overflow-wrap: anywhere;
+  }
+  .library-management .button-row {
+    gap: var(--space-2);
+  }
+  .library-create,
+  .library-summary .library-inline-form {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-3);
+  }
+  .library-create > button,
+  .library-summary .library-inline-form > button {
+    justify-self: start;
+    margin: 0;
+  }
+  .library-tabs {
+    display: grid;
+    gap: var(--space-1);
+    margin-top: var(--space-3);
+  }
+  .library-tabs button {
+    justify-content: flex-start;
+    text-align: left;
+  }
+  .library-content .section-heading {
+    margin-bottom: 0;
+  }
+  .library-content .library-form-grid,
+  .library-content .library-inline-form {
+    width: 100%;
+    max-width: 52rem;
+  }
+  .library-content .section-heading + .library-inline-form {
+    margin-top: 0;
+  }
+  .library-media .private-media-list {
+    padding: 0;
+    list-style: none;
+  }
+}
+@media (max-width: 767px) {
+  .library-workspace {
+    gap: var(--space-5);
+  }
 }
 @media (max-width: 700px) {
   .library-create,

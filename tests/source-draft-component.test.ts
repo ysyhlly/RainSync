@@ -1,6 +1,8 @@
 import { createPinia, setActivePinia } from "pinia";
 import { afterEach, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
+import { readFileSync } from "node:fs";
+import { parse } from "@vue/compiler-sfc";
 import { mountSetup } from "./helpers/mount-setup";
 import { useSession } from "../apps/web/src/features/auth/session.store";
 import { useAction } from "../apps/web/src/shared/use-action";
@@ -154,3 +156,229 @@ it("a confirmed source POST followed by failed list GET still reports added and 
   });
   p.unmount();
 });
+
+it.each([
+  ["name", "New source draft"],
+  ["kind", "local"],
+  ["root", "/new-media"],
+  ["url", "https://fixture.test/second.mp4"],
+  ["userId", "new-user"],
+  ["token", "synthetic-new-token"],
+  ["headers", '{"X-Fixture":"new"}'],
+  ["advancedAssets", '{"schema_version":1}'],
+])(
+  "preserves a newer source %s after an older creation completes",
+  async (field, value) => {
+    let finish!: (value: { id: string }) => void;
+    const request = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const api = vi.fn(async (_path: string, method = "GET") =>
+      method === "POST" ? request : [],
+    );
+    const p = panel(api),
+      c = p.controls;
+    await vi.waitFor(() => expect(c.busy.value).toBe(false));
+    c.beginCreate();
+    c.name.value = "Submitted source";
+    c.kind.value = "http";
+    c.url.value = "https://fixture.test/first.mp4";
+    const pending = c.submitCreate();
+    c[field].value = value;
+    finish({ id: "created-source" });
+    await pending;
+    expect(api.mock.calls.find(([, method]) => method === "POST")?.[2]).toEqual(
+      {
+        name: "Submitted source",
+        kind: "http",
+        config: { url: "https://fixture.test/first.mp4", headers: {} },
+      },
+    );
+    expect(c[field].value).toBe(value);
+    expect(c.open.value).toBe(true);
+    p.unmount();
+  },
+);
+
+it.each([
+  ["local", { root: "/fixture-media" }],
+  [
+    "http",
+    { url: "https://fixture.test/media", headers: { "X-Fixture": "value" } },
+  ],
+  [
+    "jellyfin",
+    {
+      url: "https://fixture.test/media",
+      user_id: "fixture-user",
+      token: "synthetic-token",
+    },
+  ],
+  [
+    "emby",
+    {
+      url: "https://fixture.test/media",
+      user_id: "fixture-user",
+      token: "synthetic-token",
+    },
+  ],
+])(
+  "blocks repeated %s source submissions and resets only after success",
+  async (kind, config) => {
+    let finish!: (value: { id: string }) => void;
+    const request = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const api = vi.fn(async (_path: string, method = "GET") =>
+      method === "POST" ? request : [],
+    );
+    const p = panel(api),
+      c = p.controls;
+    await vi.waitFor(() => expect(c.busy.value).toBe(false));
+    c.beginCreate();
+    c.name.value = "Submitted source";
+    c.kind.value = kind;
+    c.root.value = "/fixture-media";
+    c.url.value = "https://fixture.test/media";
+    c.userId.value = "fixture-user";
+    c.token.value = "synthetic-token";
+    c.headers.value = '{"X-Fixture":"value"}';
+    const pending = c.submitCreate();
+    await c.submitCreate();
+    expect(api.mock.calls.filter(([, method]) => method === "POST")).toEqual([
+      ["/sources", "POST", { name: "Submitted source", kind, config }],
+    ]);
+    expect(c.busy.value).toBe(true);
+    expect(p.leave()).toBe(false);
+    expect(c.canClose()).toBe(false);
+    finish({ id: "created-source" });
+    await pending;
+    expect(c.open.value).toBe(false);
+    expect(c.dirty.value).toBe(false);
+    expect(c.token.value).toBe("");
+    expect(c.busy.value).toBe(false);
+    expect(c.message.value).toContain("片源已添加");
+    p.unmount();
+  },
+);
+
+it("preserves the complete failed source draft and the existing discard choice", async () => {
+  const api = vi.fn(async (_path: string, method = "GET") => {
+    if (method === "POST") throw Error("synthetic save failure");
+    return [];
+  });
+  const p = panel(api),
+    c = p.controls;
+  await vi.waitFor(() => expect(c.busy.value).toBe(false));
+  c.beginCreate();
+  const draft = {
+    name: "Fixture",
+    kind: "emby",
+    root: "/fixture-media",
+    url: "https://fixture.test",
+    userId: "fixture-user",
+    token: "synthetic-token",
+    headers: '{"X-Fixture":"value"}',
+    advancedAssets: '{"schema_version":1}',
+  };
+  for (const [key, value] of Object.entries(draft)) c[key].value = value;
+  await c.submitCreate();
+  for (const [key, value] of Object.entries(draft))
+    expect(c[key].value).toBe(value);
+  expect(c.open.value).toBe(true);
+  expect(c.busy.value).toBe(false);
+  expect(c.error.value).toBe("synthetic save failure");
+  expect(c.message.value).toBe("");
+  expect(c.canClose()).toBe(false);
+  expect(c.discardOpen.value).toBe(true);
+  await c.submitCreate();
+  expect(api.mock.calls.filter(([, method]) => method === "POST")).toHaveLength(
+    1,
+  );
+  c.continueEditing();
+  expect(c.token.value).toBe("synthetic-token");
+  c.closeDraft();
+  c.discardDraft();
+  expect(c.open.value).toBe(false);
+  expect(c.dirty.value).toBe(false);
+  p.unmount();
+});
+
+it("binds every source draft field to pending state and submits through the guard", () => {
+  const template = parse(
+    readFileSync(
+      new URL(
+        "../apps/web/src/features/admin/SourcesPage.vue",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  ).descriptor.template!;
+  const elements: any[] = [];
+  function visit(node: any) {
+    if (node.type === 1) elements.push(node);
+    node.children?.forEach(visit);
+  }
+  visit(template.ast);
+  const fields = elements.filter((node) =>
+    ["input", "textarea", "AppSelect"].includes(node.tag),
+  );
+  expect(fields).toHaveLength(8);
+  for (const field of fields) {
+    const model = field.props.find((prop: any) => prop.name === "model")?.exp
+      ?.content;
+    const expected =
+      model === "headers"
+        ? "busy && !headersError"
+        : model === "advancedAssets"
+          ? "busy && !assetsError"
+          : "busy";
+    expect(
+      field.props.find(
+        (prop: any) => prop.name === "bind" && prop.arg?.content === "disabled",
+      )?.exp?.content,
+    ).toBe(expected);
+  }
+  const form = elements.find((node) => node.tag === "form");
+  expect(
+    form.props.find(
+      (prop: any) => prop.name === "on" && prop.arg?.content === "submit",
+    )?.exp?.content,
+  ).toBe("submitCreate");
+});
+
+it.each([
+  ["headers", "headersError", '{"X-Fixture":3}'],
+  [
+    "advancedAssets",
+    "assetsError",
+    '{"schema_version":1,"fonts":["../unsafe.ttf"]}',
+  ],
+])(
+  "keeps invalid %s focusable for correction after guarded validation",
+  async (field, error, value) => {
+    const api = vi.fn(async () => []);
+    const p = panel(api),
+      c = p.controls;
+    await vi.waitFor(() => expect(c.busy.value).toBe(false));
+    c.beginCreate();
+    c.kind.value = "http";
+    c.name.value = "Fixture";
+    c.url.value = "https://fixture.test/media";
+    c[field].value = value;
+    await nextTick();
+    p.focus.mockImplementation(() => {
+      expect(c.busy.value && !c[error].value).toBe(false);
+    });
+    await c.submitCreate();
+    expect(c[error].value).not.toBe("");
+    expect(c[field].value).toBe(value);
+    expect(c.advancedOpen.value).toBe(true);
+    expect(p.focus).toHaveBeenCalled();
+    expect(c.busy.value).toBe(false);
+    expect(
+      api.mock.calls.filter(([, method]) => method === "POST"),
+    ).toHaveLength(0);
+    p.unmount();
+  },
+);

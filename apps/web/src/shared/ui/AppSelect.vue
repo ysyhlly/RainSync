@@ -22,11 +22,20 @@ const trigger = ref<HTMLElement>(),
   menu = ref<HTMLElement>(),
   id = useId(),
   active = ref(-1);
-const { open, show, close } = useSelectPopup(trigger, menu, (value) =>
-  emit("open-change", value),
+const { open, show, close } = useSelectPopup(
+  trigger,
+  menu,
+  (value) => emit("open-change", value),
+  () => !!props.disabled,
 );
 const selected = computed(() =>
   props.options.find((o) => o.value === props.modelValue),
+);
+const displayLabel = computed(
+  () =>
+    selected.value?.label ??
+    props.placeholder ??
+    (props.options.length ? "请选择" : "暂无可用选项"),
 );
 let typed = "",
   typedAt = 0;
@@ -37,6 +46,7 @@ function enabled() {
 }
 async function reveal() {
   await nextTick();
+  if (!open.value || props.disabled) return;
   menu.value
     ?.querySelector<HTMLElement>(`[id="${id}-${active.value}"]`)
     ?.scrollIntoView({ block: "nearest" });
@@ -51,6 +61,7 @@ async function expand() {
   void reveal();
 }
 function choose(index: number) {
+  if (props.disabled) return;
   const option = props.options[index];
   if (!option || option.disabled) return;
   if (option.value !== props.modelValue) {
@@ -61,6 +72,7 @@ function choose(index: number) {
   trigger.value?.focus({ preventScroll: true });
 }
 async function key(event: KeyboardEvent) {
+  if (props.disabled) return;
   if (event.key === "Tab") {
     close();
     return;
@@ -144,17 +156,14 @@ watch(
         open && active >= 0 ? `${id}-${active}` : undefined
       "
       :aria-invalid="invalid || undefined"
-      :aria-describedby="describedBy"
+      :aria-describedby="[describedBy, `${id}-value`].filter(Boolean).join(' ')"
+      :title="displayLabel"
       :disabled="disabled"
       class="select-trigger"
       @click="open ? close() : expand()"
       @keydown="key"
     >
-      <span>{{
-        selected?.label ??
-        placeholder ??
-        (options.length ? "请选择" : "暂无可用选项")
-      }}</span
+      <span :id="`${id}-value`" class="select-value">{{ displayLabel }}</span
       ><AppIcon name="down" :size="20" class="select-chevron" />
     </button>
     <div
@@ -175,12 +184,13 @@ watch(
         role="option"
         :aria-selected="option.value === modelValue"
         :aria-disabled="option.disabled || undefined"
+        :title="option.label"
         class="select-option"
         :class="{ active: index === active }"
         @pointermove="!option.disabled && (active = index)"
         @click.stop.prevent="choose(index)"
       >
-        <span>{{ option.label }}</span
+        <span class="select-option-label">{{ option.label }}</span
         ><AppIcon v-if="option.value === modelValue" name="check" :size="20" />
       </div>
       <div v-if="!options.length" class="select-option" aria-disabled="true">

@@ -32,6 +32,10 @@ pub enum ErrorCode {
     InvalidComputeSource,
     ComputeSourceChanged,
     InvalidComputeRecipe,
+    ComputeRecipeUnavailable,
+    ComputeOutputBudgetInsufficient,
+    ComputeSourceTooLarge,
+    ComputeSourceDurationUnsupported,
     ComputeRoomQueueFull,
     ComputeSourceNotReady,
     ComputeNodeUnhealthy,
@@ -408,6 +412,16 @@ impl ErrorCode {
             Self::InvalidComputeSource => "计算片源身份无效",
             Self::ComputeSourceChanged => "片源已变化，请重新索引",
             Self::InvalidComputeRecipe => "计算配方不受支持",
+            Self::ComputeRecipeUnavailable => {
+                "没有已授权的原片或等价副本节点声明支持此配方，请更新并启动计算节点后重试"
+            }
+            Self::ComputeOutputBudgetInsufficient => {
+                "当前节点配额不足以满足此配方的保守容量估算，请选择较低清晰度、较短片源，或由管理员显式调整配额；实际产物大小可能更小"
+            }
+            Self::ComputeSourceTooLarge => "NAS 计算片源不能超过 16 GiB，请选择较小的片源",
+            Self::ComputeSourceDurationUnsupported => {
+                "NAS 计算要求有效且不超过 30 分钟的片源，请选择较短片源"
+            }
             Self::ComputeRoomQueueFull => "房间计算队列已满，请稍后重试",
             Self::ComputeSourceNotReady => "NAS 片源尚未完成内容校验",
             Self::ComputeNodeUnhealthy => "节点计算心跳已失效",
@@ -825,6 +839,41 @@ mod tests {
             ("invalid_p2p_signal", 400, ErrorCode::InvalidP2pSignal),
         ] {
             assert_eq!(ErrorCode::from_reason(reason, status), expected);
+        }
+    }
+    #[test]
+    fn compute_admission_errors_are_specific_actionable_and_not_auto_retryable() {
+        for (reason, status, expected) in [
+            (
+                "compute_recipe_unavailable",
+                409,
+                ErrorCode::ComputeRecipeUnavailable,
+            ),
+            (
+                "compute_output_budget_insufficient",
+                413,
+                ErrorCode::ComputeOutputBudgetInsufficient,
+            ),
+            (
+                "compute_source_too_large",
+                413,
+                ErrorCode::ComputeSourceTooLarge,
+            ),
+            (
+                "compute_source_duration_unsupported",
+                422,
+                ErrorCode::ComputeSourceDurationUnsupported,
+            ),
+        ] {
+            assert_eq!(ErrorCode::from_reason(reason, status), expected);
+            let error = ApiError::new(expected, Uuid::nil());
+            assert!(!error.message.is_empty());
+            assert!(!expected.retryable());
+            assert_eq!(
+                serde_json::from_value::<ErrorCode>(serde_json::to_value(expected).unwrap())
+                    .unwrap(),
+                expected
+            );
         }
     }
     #[test]

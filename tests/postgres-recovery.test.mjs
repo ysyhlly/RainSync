@@ -27,16 +27,16 @@ async function frozenControllerMigrations(directory) {
   const migrations = (await readdir(directory))
     .filter((name) => /^\d+_[^.]+\.sql$/.test(name))
     .sort();
-  // Keep this contract explicit when appending migrations. Versions 79-81 add
-  // room creation idempotency, delegated permissions, and account exit.
+  // Keep this contract explicit when appending migrations. Versions 79-82 add
+  // room creation idempotency, delegated permissions, account exit, and fixed HD recipes.
   assert.equal(
     migrations.length,
-    80,
+    81,
     "test must explicitly track controller migration baseline",
   );
   assert.deepEqual(
     migrations.map((name) => Number(name.split("_")[0])),
-    Array.from({ length: 81 }, (_, index) => index + 1).filter(
+    Array.from({ length: 82 }, (_, index) => index + 1).filter(
       (version) => version !== 63,
     ),
     "test must explicitly track the frozen migration version set",
@@ -44,7 +44,7 @@ async function frozenControllerMigrations(directory) {
   return migrations;
 }
 
-test("frozen controller migration inventory is 1-81 with version 63 absent", async () => {
+test("frozen controller migration inventory is 1-82 with version 63 absent", async () => {
   // Validate the pinned baseline even when the native PostgreSQL drill is skipped.
   await frozenControllerMigrations(resolve("migrations"));
 });
@@ -289,7 +289,7 @@ test(
 );
 
 test(
-  "frozen RainSync 1-81 schema checksums survive an isolated empty-database recovery",
+  "frozen RainSync 1-82 schema checksums survive an isolated empty-database recovery",
   {
     skip: !process.env.RAINSYNC_NATIVE_POSTGRES_BIN
       ? "set RAINSYNC_NATIVE_POSTGRES_BIN for isolated PostgreSQL"
@@ -306,7 +306,7 @@ test(
       schema_version: 1,
       result: "failed",
       scope:
-        "fresh empty RainSync schema from frozen 1-81 files (80 migrations, version 63 absent); not a real old production database or app acceptance",
+        "fresh empty RainSync schema from frozen 1-82 files (81 migrations, version 63 absent); not a real old production database or app acceptance",
       started_at: new Date().toISOString(),
     };
     try {
@@ -327,7 +327,7 @@ test(
       const baseline = await preflight(fixture.url, {
         migrationsDirectory: directory,
       });
-      assert.equal(baseline.migrations.at(-1).version, 81);
+      assert.equal(baseline.migrations.at(-1).version, 82);
       assert.deepEqual(baseline.candidate_migrations.pending_versions, []);
       await writeFile(keyFile, randomBytes(32), { mode: 0o600, flag: "wx" });
       const backupDirectory = resolve(root, "backup");

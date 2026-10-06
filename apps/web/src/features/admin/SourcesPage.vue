@@ -164,13 +164,27 @@ async function remove() {
   removing.value = undefined;
   message.value = "片源已删除，关联影片已从媒体库移除";
 }
+function submitCreate() {
+  if (busy.value || discardOpen.value) return;
+  return run(create);
+}
 async function create() {
+  const draft = {
+    name: name.value,
+    kind: kind.value,
+    root: root.value,
+    url: url.value,
+    userId: userId.value,
+    token: token.value,
+    headers: headers.value,
+    advancedAssets: advancedAssets.value,
+  };
   headersError.value = "";
   assetsError.value = "";
   let parsed: Record<string, string> = {};
-  if (kind.value === "http") {
+  if (draft.kind === "http") {
     try {
-      const value = JSON.parse(headers.value || "{}");
+      const value = JSON.parse(draft.headers || "{}");
       if (
         !value ||
         Array.isArray(value) ||
@@ -186,8 +200,8 @@ async function create() {
   let association: ReturnType<typeof parseHttpAssetAssociation>;
   try {
     association =
-      kind.value === "http"
-        ? parseHttpAssetAssociation(advancedAssets.value)
+      draft.kind === "http"
+        ? parseHttpAssetAssociation(draft.advancedAssets)
         : undefined;
   } catch (e) {
     await fieldFailure(
@@ -197,23 +211,34 @@ async function create() {
     return;
   }
   const config =
-    kind.value === "local"
-      ? { root: root.value }
-      : kind.value === "http"
+    draft.kind === "local"
+      ? { root: draft.root }
+      : draft.kind === "http"
         ? {
-            url: url.value,
+            url: draft.url,
             headers: parsed,
             ...(association ? { advanced_assets: association } : {}),
           }
-        : { url: url.value, user_id: userId.value, token: token.value };
+        : { url: draft.url, user_id: draft.userId, token: draft.token };
   await session.api<{ id: string }>("/sources", "POST", {
-    name: name.value,
-    kind: kind.value,
+    name: draft.name,
+    kind: draft.kind,
     config,
   });
   if (!alive) return;
-  resetDraft();
-  open.value = false;
+  if (
+    name.value === draft.name &&
+    kind.value === draft.kind &&
+    root.value === draft.root &&
+    url.value === draft.url &&
+    userId.value === draft.userId &&
+    token.value === draft.token &&
+    headers.value === draft.headers &&
+    advancedAssets.value === draft.advancedAssets
+  ) {
+    resetDraft();
+    open.value = false;
+  }
   message.value = "片源已添加，可检测并扫描影片";
   try {
     await load();
@@ -311,34 +336,38 @@ onBeforeUnmount(() => {
     <div class="admin-list" :aria-busy="busy">
       <article v-for="row in rows" :key="row.id" class="admin-row">
         <div class="row-main">
-          <h2>{{ row.name }}</h2>
+          <h2 class="source-row-name" :title="row.name">{{ row.name }}</h2>
           <span class="status-badge">{{
             kindLabels[row.kind] ?? row.kind
           }}</span>
         </div>
-        <button
-          :disabled="busy || scans.running || scans.results[row.id]?.busy"
-          @click="scans.scan(row)"
-        >
-          <AppIcon name="refresh" />{{
-            scans.results[row.id]?.busy ? "正在检测扫描…" : "检测并扫描"
-          }}
-        </button>
-        <RouterLink v-if="row.kind === 'agent'" to="/admin/agents">
-          管理 NAS 设备
-        </RouterLink>
-        <span v-else-if="managedElsewhere(row)" class="helper">
-          请在所属媒体库中管理
-        </span>
-        <button
-          v-else
-          class="danger"
-          :aria-label="`删除片源 ${row.name}`"
-          :disabled="busy || scans.busy"
-          @click="beginRemove(row)"
-        >
-          删除
-        </button>
+        <div class="source-row-actions">
+          <button
+            :disabled="busy || scans.running || scans.results[row.id]?.busy"
+            @click="scans.scan(row)"
+          >
+            <AppIcon name="refresh" />{{
+              scans.results[row.id]?.busy ? "正在检测扫描…" : "检测并扫描"
+            }}
+          </button>
+          <div class="source-row-secondary">
+            <RouterLink v-if="row.kind === 'agent'" to="/admin/agents">
+              管理 NAS 设备
+            </RouterLink>
+            <span v-else-if="managedElsewhere(row)" class="helper">
+              请在所属媒体库中管理
+            </span>
+            <button
+              v-else
+              class="danger"
+              :aria-label="`删除片源 ${row.name}`"
+              :disabled="busy || scans.busy"
+              @click="beginRemove(row)"
+            >
+              删除
+            </button>
+          </div>
+        </div>
         <Notice
           class="row-result"
           :message="scans.results[row.id]?.message"
@@ -352,18 +381,24 @@ onBeforeUnmount(() => {
       drawer
       :busy="busy"
       :can-close="canClose"
-      ><form class="source-form" @submit.prevent="run(create)">
+      ><form
+        class="source-form"
+        :aria-busy="busy"
+        @submit.prevent="submitCreate"
+      >
         <fieldset class="source-field-group">
           <legend>片源信息</legend>
           <label
             >名称<input
               v-model="name"
+              :disabled="busy"
               required
               maxlength="120"
               autofocus /></label
           ><label
             >类型<AppSelect
               v-model="kind"
+              :disabled="busy"
               label="类型"
               :options="[
                 { value: 'local', label: '本地挂载目录' },
@@ -376,18 +411,24 @@ onBeforeUnmount(() => {
         <fieldset class="source-field-group">
           <legend>连接信息</legend>
           <label v-if="kind === 'local'"
-            >容器内路径<input v-model="root" required /></label
+            >容器内路径<input v-model="root" :disabled="busy" required /></label
           ><label v-else
-            >媒体或服务 URL<input v-model="url" type="url" required /></label
+            >媒体或服务 URL<input
+              v-model="url"
+              :disabled="busy"
+              type="url"
+              required /></label
           ><template v-if="kind === 'jellyfin' || kind === 'emby'"
             ><label
               >专用账户 User ID<input
                 v-model="userId"
+                :disabled="busy"
                 required
                 autocomplete="off" /></label
             ><label
               >访问令牌<input
                 v-model="token"
+                :disabled="busy"
                 type="password"
                 autocomplete="off"
                 required /></label
@@ -408,6 +449,7 @@ onBeforeUnmount(() => {
             ><textarea
               id="source-headers"
               v-model="headers"
+              :disabled="busy && !headersError"
               spellcheck="false"
               :aria-invalid="!!headersError"
               :aria-describedby="
@@ -418,6 +460,7 @@ onBeforeUnmount(() => {
             ><textarea
               id="source-assets"
               v-model="advancedAssets"
+              :disabled="busy && !assetsError"
               spellcheck="false"
               maxlength="32768"
               placeholder='{"schema_version":1,"subtitles":["ass"],"fonts":["body.ttf"]}'
@@ -486,6 +529,31 @@ onBeforeUnmount(() => {
   </section>
 </template>
 <style scoped>
+.source-row-actions,
+.source-row-secondary {
+  display: contents;
+}
+@media (min-width: 1100px) {
+  .source-row-actions {
+    display: grid;
+    grid-template-columns: 10.5rem 7rem;
+    align-items: center;
+    gap: var(--space-3);
+  }
+  .source-row-secondary {
+    display: flex;
+    justify-content: flex-start;
+    align-items: center;
+    min-width: 0;
+    text-align: left;
+    overflow-wrap: anywhere;
+  }
+  .source-row-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
 .source-advanced-fields {
   display: grid;
   gap: var(--space-3);

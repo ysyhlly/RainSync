@@ -33,6 +33,15 @@ const rooms = ref<Room[]>([]),
   token = ref(""),
   pasted = ref("");
 const inviteParsed = ref(false);
+let navigationIntent = 0;
+watch(
+  [createOpen, joinOpen],
+  ([create, join], [previousCreate, previousJoin]) => {
+    if ((create && !previousCreate) || (join && !previousJoin))
+      ++navigationIntent;
+  },
+  { flush: "sync" },
+);
 watch(
   pasted,
   () => {
@@ -97,22 +106,40 @@ function retryLoad() {
   error.value = "";
   void reload();
 }
-async function enter(room: Room) {
+async function enter(room: Room, intent = navigationIntent) {
+  if (!alive || intent !== navigationIntent) return;
   await runtime.enter(room);
-  if (!alive) return;
+  if (!alive || intent !== navigationIntent) return;
   await router.push("/rooms/" + room.id);
 }
+function submitCreate() {
+  if (busy.value) return;
+  return run(create);
+}
 async function create() {
-  if (!name.value.trim() || [...name.value].length > 120)
+  const submittedName = name.value,
+    intent = navigationIntent;
+  if (!submittedName.trim() || [...submittedName].length > 120)
     throw Error("房间名称须为1–120个字符");
-  const result = await submitRoom(name.value);
+  const result = await submitRoom(submittedName);
   if (!alive) return;
-  createOpen.value = false;
-  name.value = "";
+  const sameDraft = name.value === submittedName;
+  if (sameDraft) {
+    createOpen.value = false;
+    name.value = "";
+  }
   if (!(await reload())) return;
-  if (!alive) return;
+  if (
+    !alive ||
+    intent !== navigationIntent ||
+    !sameDraft ||
+    createOpen.value ||
+    joinOpen.value ||
+    name.value !== ""
+  )
+    return;
   const room = rooms.value.find((r) => r.id === result.id);
-  if (room) await enter(room);
+  if (room) await enter(room, intent);
 }
 function parse() {
   try {
@@ -277,11 +304,12 @@ onMounted(reload);
       </template>
     </div>
     <AppDialog v-model="createOpen" title="创建房间" drawer :busy="busy">
-      <form @submit.prevent="!busy && run(create)">
+      <form :aria-busy="busy" @submit.prevent="submitCreate">
         <p class="helper">取一个容易认出的名字，创建后即可邀请朋友加入。</p>
         <label
           >房间名称<input
             v-model="name"
+            :disabled="busy"
             required
             autofocus
             maxlength="240"

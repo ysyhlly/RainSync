@@ -16,6 +16,7 @@ let closeTimer: ReturnType<typeof setTimeout> | undefined;
 let emitClosed = false;
 let previous: HTMLElement | null = null;
 let backdropPointer: number | null = null;
+let focusVersion = 0;
 function outside(event: PointerEvent) {
   if (!dialog.value || event.target !== dialog.value) return false;
   const rect = dialog.value.getBoundingClientRect();
@@ -45,17 +46,49 @@ function finishClose() {
   if (!closing.value) return;
   clearTimeout(closeTimer);
   dialog.value?.close();
-  closing.value = false;
-  previous?.focus({ preventScroll: true });
+  setClosing(false);
   if (emitClosed) emit("update:modelValue", false);
   emitClosed = false;
+  restoreFocus();
 }
 function beginClose(notify: boolean) {
   if (!dialog.value?.open || closing.value) return;
   emitClosed = notify;
-  closing.value = true;
+  setClosing(true);
   if (matchMedia("(prefers-reduced-motion: reduce)").matches) finishClose();
   else closeTimer = setTimeout(finishClose, 300);
+}
+function setClosing(value: boolean) {
+  closing.value = value;
+  for (const type of ["keydown", "click", "submit"]) {
+    // Native capture avoids changing Vue's event timestamps for child handlers.
+    if (value)
+      dialog.value?.addEventListener(type, blockClosingInteraction, true);
+    else dialog.value?.removeEventListener(type, blockClosingInteraction, true);
+  }
+}
+function blockClosingInteraction(event: Event) {
+  // Guard before inert is rendered, including programmatic form submissions.
+  if (!closing.value) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}
+function restoreFocus() {
+  const target = previous;
+  const version = ++focusVersion;
+  if (!target) return;
+  void nextTick(() => {
+    // Let the parent re-enable its trigger, but don't interrupt a newer modal.
+    if (version !== focusVersion || dialog.value?.open || !target.isConnected)
+      return;
+    if (
+      Array.from(document.querySelectorAll("dialog:modal")).some(
+        (modal) => !modal.contains(target),
+      )
+    )
+      return;
+    target.focus({ preventScroll: true });
+  });
 }
 function animationEnded(event: AnimationEvent) {
   if (event.target === dialog.value && event.animationName.endsWith("-leave"))
@@ -65,7 +98,7 @@ function trapTab(event: KeyboardEvent) {
   if (event.key !== "Tab" || !dialog.value) return;
   const items = Array.from(
     dialog.value.querySelectorAll<HTMLElement>(
-      "button, a[href], input, textarea, select, [tabindex]",
+      "button, a[href], input, textarea, select, details > summary:first-of-type, [tabindex]",
     ),
   ).filter(
     (el) =>
@@ -91,10 +124,11 @@ function trapTab(event: KeyboardEvent) {
   }
 }
 async function sync() {
+  if (props.modelValue) ++focusVersion;
   await nextTick();
   if (props.modelValue) {
     clearTimeout(closeTimer);
-    closing.value = false;
+    setClosing(false);
     emitClosed = false;
     if (!dialog.value?.open) {
       previous = document.activeElement as HTMLElement;
@@ -108,8 +142,9 @@ watch(() => props.modelValue, sync);
 onMounted(sync);
 onBeforeUnmount(() => {
   clearTimeout(closeTimer);
+  setClosing(false);
   dialog.value?.close();
-  previous?.focus({ preventScroll: true });
+  restoreFocus();
 });
 </script>
 <template>
@@ -117,6 +152,7 @@ onBeforeUnmount(() => {
     ref="dialog"
     class="app-dialog"
     :class="{ drawer, closing }"
+    :inert="closing"
     @animationend="animationEnded"
     :aria-labelledby="titleId"
     @cancel.prevent="close"

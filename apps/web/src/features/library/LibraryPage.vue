@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import QueueFeedback from "../rooms/QueueFeedback.vue";
 import { ref, computed, onMounted, onBeforeUnmount } from "vue";
 import { useMediaCatalog } from "./media-catalog.store";
 import { useVisiblePreviews } from "./use-visible-previews";
@@ -162,27 +163,40 @@ onBeforeUnmount(() => {
           查看我的媒体库
         </RouterLink>
       </div>
-      <p v-if="library.items.length && !runtime.room" class="notice">
-        选择影片后可继续选择放映室，入房后确认播放。<RouterLink to="/rooms"
-          >选择放映室</RouterLink
-        >
-      </p>
-      <p
-        v-else-if="runtime.room && !runtime.can('change_media')"
-        class="helper"
+      <div
+        v-if="
+          library.items.length || (runtime.room && !runtime.can('change_media'))
+        "
+        class="library-results-summary"
       >
-        当前为观看者，选片与待播由控制者操作。
-      </p>
-      <div v-if="items.length" class="section-heading library-results-heading">
-        <div class="section-heading__copy">
-          <h2>
-            {{ library.query ? `“${library.query}”的搜索结果` : "全部影片" }}
-          </h2>
-          <p class="helper">已加载 {{ items.length }} 部影片</p>
-        </div>
-        <span v-if="runtime.room" class="status-badge"
-          >当前房间 · {{ runtime.room.name }}</span
+        <p
+          v-if="library.items.length && !runtime.room"
+          class="notice library-room-hint"
         >
+          选择影片后可继续选择放映室，入房后确认播放。<RouterLink to="/rooms"
+            >选择放映室</RouterLink
+          >
+        </p>
+        <p
+          v-else-if="runtime.room && !runtime.can('change_media')"
+          class="helper library-room-hint"
+        >
+          当前为观看者，选片与待播由控制者操作。
+        </p>
+        <div
+          v-if="items.length"
+          class="section-heading library-results-heading"
+        >
+          <div class="section-heading__copy">
+            <h2>
+              {{ library.query ? `“${library.query}”的搜索结果` : "全部影片" }}
+            </h2>
+            <p class="helper">已加载 {{ items.length }} 部影片</p>
+          </div>
+          <span v-if="runtime.room" class="status-badge"
+            >当前房间 · {{ runtime.room.name }}</span
+          >
+        </div>
       </div>
       <div ref="grid" class="media-grid" :aria-busy="library.busy">
         <article
@@ -210,6 +224,7 @@ onBeforeUnmount(() => {
             :media-id="item.id"
             :refresh-key="library.refreshKey"
           />
+          <QueueFeedback :media-id="item.id" class="media-queue-feedback" />
           <div class="media-actions">
             <button
               class="primary"
@@ -225,8 +240,12 @@ onBeforeUnmount(() => {
             <button
               class="icon-button"
               :aria-label="'加入待播 ' + item.title"
+              :aria-busy="runtime.queuePending('add', item.id)"
               :disabled="
-                !runtime.room || !runtime.can('queue') || !runtime.connected
+                !runtime.room ||
+                !runtime.can('queue') ||
+                !runtime.connected ||
+                runtime.queuePending('add', item.id)
               "
               @click="runtime.run(() => runtime.addQueue(item.id))"
             >
@@ -293,6 +312,11 @@ onBeforeUnmount(() => {
 .library-toolbar :deep(.scan-all-sources) {
   margin: 0;
 }
+.library-results-summary {
+  display: grid;
+  gap: var(--space-6);
+  min-width: 0;
+}
 .library-results-heading {
   margin-bottom: calc(-1 * var(--space-2));
 }
@@ -302,6 +326,16 @@ onBeforeUnmount(() => {
 }
 .media-card .media-thumbnail {
   flex-shrink: 0;
+}
+/* Keep the action-local receipt at the user's existing scroll position. */
+.media-grid:has(.media-queue-feedback) {
+  overflow-anchor: none;
+}
+.media-queue-feedback {
+  margin-top: auto;
+}
+.media-queue-feedback + .media-actions {
+  margin-top: 0;
 }
 .media-actions {
   margin-top: auto;
@@ -315,6 +349,50 @@ onBeforeUnmount(() => {
 }
 .media-secondary-actions .text-button {
   padding-inline: var(--space-2);
+}
+@media (min-width: 1100px) {
+  .library-page > .page-title {
+    margin-bottom: var(--space-5);
+  }
+  .library-page > .page-stack {
+    gap: var(--space-4);
+  }
+  .library-results-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-3) var(--space-6);
+  }
+  .library-results-heading {
+    order: -1;
+    flex: 1 1 240px;
+    margin: 0;
+  }
+  .library-results-heading .section-heading__copy {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-3);
+  }
+  .library-room-hint {
+    flex: 0 1 36rem;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+  }
+  .media-grid {
+    grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+    gap: var(--space-5);
+  }
+}
+@media (max-width: 767px) {
+  .library-results-summary {
+    gap: var(--space-5);
+  }
 }
 @media (max-width: 600px) {
   .media-grid {
