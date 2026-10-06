@@ -100,18 +100,9 @@ async fn real_rpu_native_candidates_and_sdr_output() {
                 EncoderSelection::software_recipe(),
             )
             .unwrap();
-            let mut args = recipe
+            let args = recipe
                 .ffmpeg_args(Input::OwnedLocal(&input), &output, &inventory, false)
                 .unwrap();
-            args.splice(
-                0..0,
-                [
-                    "-threads".into(),
-                    "1".into(),
-                    "-filter_complex_threads".into(),
-                    "1".into(),
-                ],
-            );
             let mut command = tokio::process::Command::new("ffmpeg");
             command.args(args).env("LP_NUM_THREADS", "2");
             input.install(&mut command).unwrap();

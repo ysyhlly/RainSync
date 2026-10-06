@@ -261,10 +261,29 @@ try {
     payload: { media_id: item.id },
   };
   control.socket.send(JSON.stringify(command));
-  const ack = await control.next(
+  let ack = await control.next(
     (frame) => frame.command_id === command.command_id,
   );
   assert.equal(ack.type, "ACK");
+  // The public fixture is only four seconds long. Keep the room at its first
+  // frame while qualifying independent viewers and their conversion routes.
+  for (const [type, payload] of [
+    ["PAUSE", {}],
+    ["SEEK", { position_ms: 0 }],
+  ]) {
+    const update = {
+      ...command,
+      command_id: randomUUID(),
+      expected_revision: ack.state.revision,
+      media_generation: ack.state.media_generation,
+      type,
+      payload,
+    };
+    if (type === "PAUSE") delete update.payload;
+    control.socket.send(JSON.stringify(update));
+    ack = await control.next((frame) => frame.command_id === update.command_id);
+    assert.equal(ack.type, "ACK", JSON.stringify(ack));
+  }
   const request = {
     room_id: room.id,
     media_generation: ack.state.media_generation,
@@ -413,6 +432,47 @@ try {
 } catch (error) {
   report.result = "failed";
   report.error = error.message;
+  if (browser) {
+    for (const [index, context] of browser.contexts().entries()) {
+      for (const page of context.pages()) {
+        await page.screenshot({ path: resolve(root, `failure-${index}.png`) });
+        await writeFile(
+          resolve(root, `failure-${index}.json`),
+          JSON.stringify(
+            await page.evaluate(() => ({
+              text: document.body.innerText,
+              video: [...document.querySelectorAll("video")].map((video) => ({
+                ready_state: video.readyState,
+                error: video.error?.code,
+                width: video.videoWidth,
+                decoded_frames:
+                  video.getVideoPlaybackQuality().totalVideoFrames,
+              })),
+            })),
+            null,
+            2,
+          ) + "\n",
+          { mode: 0o600 },
+        );
+      }
+    }
+  }
+  try {
+    const jobs = docker([
+      "exec",
+      names[0],
+      "psql",
+      "-U",
+      "rainsync",
+      "-d",
+      "rainsync",
+      "-Atc",
+      "SELECT jsonb_build_object('status',status,'error',error,'spec',spec) FROM media_jobs",
+    ]);
+    await writeFile(resolve(root, "failed-jobs.private.jsonl"), jobs + "\n", {
+      mode: 0o600,
+    });
+  } catch {}
   throw error;
 } finally {
   for (const socket of sockets) socket.terminate();

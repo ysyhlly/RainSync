@@ -28,4 +28,6 @@ RAINSYNC_DOLBY_FIXTURE_ROOT=/owned/fixtures \
 
 开发样本来自 [FFmpeg FATE](https://fate-suite.ffmpeg.org/hevc/dv84.mov) 和 [Apple 的 Dolby Vision 开发示例](https://developer.apple.com/streaming/examples/advanced-stream-dv-atmos.html)。FATE MOV 样本在夹具准备阶段仅重封装为 MP4、去除旋转标记；Apple 片段在夹具准备阶段仅重封装并恢复原有 `dvh1` 样本入口。媒体包和 RPU 不重新编码，准备过程应记录 URL、散列和包数据保持证据。样本不随仓库发布。
 
+`tests/dolby-vision-playback.mjs` 使用指定的后端和前端镜像、隔离 PostgreSQL 和两个独立 Chromium 上下文，检查原生文件 Range 传输的完整字节散列、实际 SDR 首帧和房间时间轴保持。设置 `RAINSYNC_DOLBY_TEST_IMAGE`、`RAINSYNC_DOLBY_TEST_WEB_IMAGE`、`RAINSYNC_DOLBY_FIXTURE_ROOT` 后执行该脚本。四秒开发夹具的房间先暂停并跳转到零，避免测试准备时间耗尽片长。转换单测直接使用发布配方参数，不额外覆盖线程设置。
+
 尚无用户设备做原生显示验收。数据保持、软件转换和浏览器 SDR 播放的证据应与原生显示、GPU/HDR、手机及长时间稳定性验收分开记录。
