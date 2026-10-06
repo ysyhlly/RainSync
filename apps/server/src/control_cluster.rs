@@ -661,7 +661,10 @@ mod tests {
             Some(room)
         );
         for tail in ["permissions", "permissions/user", "members/user"] {
-            assert_eq!(room_path(&format!("/api/v1/rooms/{room}/{tail}")), Some(room));
+            assert_eq!(
+                room_path(&format!("/api/v1/rooms/{room}/{tail}")),
+                Some(room)
+            );
         }
         for tail in [
             "playback-plan",

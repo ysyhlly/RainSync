@@ -1,6 +1,6 @@
-mod account_rules;
 mod account_exit;
 mod account_exit_cleanup;
+mod account_rules;
 mod account_security;
 mod admin_bootstrap;
 mod advanced_playback;
@@ -804,7 +804,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/users", post(users))
-        .route("/api/v1/users/me/deletion", get(account_exit::preview).post(account_exit::delete))
+        .route(
+            "/api/v1/users/me/deletion",
+            get(account_exit::preview).post(account_exit::delete),
+        )
         .route(
             "/api/v1/users/me/profile",
             get(profile::get_profile).patch(profile::update),
@@ -824,7 +827,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         )
         .route("/api/v1/rooms", get(rooms::list).post(rooms::create))
         .route("/api/v1/rooms/{id}/permissions", get(rooms::permissions))
-        .route("/api/v1/rooms/{id}/permissions/{user}", axum::routing::put(rooms::set_permissions).delete(rooms::revoke_permissions))
+        .route(
+            "/api/v1/rooms/{id}/permissions/{user}",
+            axum::routing::put(rooms::set_permissions).delete(rooms::revoke_permissions),
+        )
         .route("/api/v1/rooms/{id}/members/{user}", delete(rooms::kick))
         .route(
             "/api/v1/rooms/{id}/platform-media",
@@ -999,7 +1005,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route("/api/v1/rooms/{id}/reopen", post(room_lifecycle::reopen))
         .route("/api/v1/rooms/{id}/archive", post(room_lifecycle::archive))
         .route("/api/v1/rooms/{id}/join", post(rooms::join))
-        .route("/api/v1/rooms/{id}/invites", get(rooms::list_invites).post(rooms::invite))
+        .route(
+            "/api/v1/rooms/{id}/invites",
+            get(rooms::list_invites).post(rooms::invite),
+        )
         .route(
             "/api/v1/rooms/{id}/invites/{token}",
             delete(rooms::revoke_invite),

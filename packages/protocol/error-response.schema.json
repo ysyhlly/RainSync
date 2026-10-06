@@ -47,6 +47,9 @@
       "description": "Public codes are an allowlist. Raw framework, database and upstream errors\nmust never be copied into the wire response.",
       "type": "string",
       "enum": [
+        "ACCOUNT_INACTIVE",
+        "ACCOUNT_OWNERSHIP_REQUIRED",
+        "ACCOUNT_LAST_ADMIN",
         "DISTRIBUTED_PLAYBACK_INTENT_REQUIRED",
         "INVALID_DISTRIBUTED_PLAYBACK_INTENT",
         "DEDICATED_DISTRIBUTED_ENDPOINT_REQUIRED",

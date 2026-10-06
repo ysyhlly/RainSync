@@ -534,17 +534,27 @@ pub(crate) async fn controller<'a>(
     controller_for_permission(app, h, id, protocol::RoomPermission::Queue).await
 }
 pub(crate) async fn controller_for_permission<'a>(
-    app: &'a App, h: &HeaderMap, id: Uuid, permission: protocol::RoomPermission,
+    app: &'a App,
+    h: &HeaderMap,
+    id: Uuid,
+    permission: protocol::RoomPermission,
 ) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
     controller_admission(app, h, id, permission, true).await
 }
 pub(crate) async fn controller_read_for_permission<'a>(
-    app: &'a App, h: &HeaderMap, id: Uuid, permission: protocol::RoomPermission,
+    app: &'a App,
+    h: &HeaderMap,
+    id: Uuid,
+    permission: protocol::RoomPermission,
 ) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
     controller_admission(app, h, id, permission, false).await
 }
 async fn controller_admission<'a>(
-    app: &'a App, h: &HeaderMap, id: Uuid, permission: protocol::RoomPermission, write: bool,
+    app: &'a App,
+    h: &HeaderMap,
+    id: Uuid,
+    permission: protocol::RoomPermission,
+    write: bool,
 ) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
     let u = auth(app, h, write).await?;
     member(app, &u, id).await?;
@@ -599,9 +609,13 @@ async fn controller_admission<'a>(
     if write && h.get("x-csrf-token").and_then(|value| value.to_str().ok()) != csrf.as_deref() {
         return Err(err(StatusCode::FORBIDDEN, "csrf_rejected"));
     }
-    let owner: Uuid = sqlx::query_scalar("SELECT owner_id FROM rooms WHERE id=$1").bind(id).fetch_one(&mut *tx).await?;
+    let owner: Uuid = sqlx::query_scalar("SELECT owner_id FROM rooms WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
     if current_admin != Some(true) && s.controller_user_id != u.id && owner != u.id {
-        persistence::room_permissions::require(&mut tx, id, u.id, permission).await
+        persistence::room_permissions::require(&mut tx, id, u.id, permission)
+            .await
             .map_err(|_| err(StatusCode::FORBIDDEN, "controller_required"))?;
         sqlx::query("SELECT set_config('rainsync.delegated_room',$1,true),set_config('rainsync.delegated_user',$2,true),set_config('rainsync.delegated_permission',$3,true)")
             .bind(id.to_string()).bind(u.id.to_string()).bind(permission.as_str()).execute(&mut *tx).await?;
@@ -624,7 +638,9 @@ pub(crate) async fn commit_controller(
     }
     let delegated: bool = sqlx::query_scalar("SELECT CASE WHEN NULLIF(current_setting('rainsync.delegated_room',true),'') IS NULL THEN true ELSE room_permission_allowed(current_setting('rainsync.delegated_room')::uuid,current_setting('rainsync.delegated_user')::uuid,current_setting('rainsync.delegated_permission')) END")
         .fetch_one(&mut *tx).await?;
-    if !delegated { return Err(err(StatusCode::FORBIDDEN, "controller_required")); }
+    if !delegated {
+        return Err(err(StatusCode::FORBIDDEN, "controller_required"));
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -633,8 +649,8 @@ pub(crate) async fn commit_controller(
 mod invites_runtime;
 #[path = "room_permissions.rs"]
 mod permissions_runtime;
-pub use permissions_runtime::{permissions, set_permissions, revoke_permissions, kick};
-pub use invites_runtime::{invite, revoke_invite, join, list_invites};
+pub use invites_runtime::{invite, join, list_invites, revoke_invite};
+pub use permissions_runtime::{kick, permissions, revoke_permissions, set_permissions};
 pub async fn playlist(
     State(app): State<App>,
     h: HeaderMap,

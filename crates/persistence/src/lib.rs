@@ -21,10 +21,10 @@ pub mod owned_http;
 pub mod playback_observations;
 pub mod room_cleanup;
 pub mod room_diagnostics;
+pub mod room_invites;
 pub mod room_lifecycle;
 pub mod room_node_leases;
 pub mod room_permissions;
-pub mod room_invites;
 pub mod source_account_policy;
 pub mod static_hls;
 pub mod static_hls_activation;
@@ -389,9 +389,18 @@ async fn commit_inner(
         let permission = protocol::RoomPermission::for_action(&command.action);
         room_permissions::require(&mut tx, command.room_id, user, permission).await?;
         Some(permission)
-    } else { None };
-    let mut state = room_core::reduce_with_permission(&current, command, user, actor_is_admin, actor_permission, server_time_ms)
-        .map_err(anyhow::Error::msg)?;
+    } else {
+        None
+    };
+    let mut state = room_core::reduce_with_permission(
+        &current,
+        command,
+        user,
+        actor_is_admin,
+        actor_permission,
+        server_time_ms,
+    )
+    .map_err(anyhow::Error::msg)?;
     if let Some(resolved) = &resolved_media {
         state.media_id = Some(resolved.media_id);
         state.duration_ms = resolved.duration_ms;

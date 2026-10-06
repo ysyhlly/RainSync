@@ -77,10 +77,12 @@ pub async fn invite(
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
     if let Some(target) = body.invited_user_id {
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND account_active(id))")
-            .bind(target)
-            .fetch_one(&mut *tx)
-            .await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND account_active(id))",
+        )
+        .bind(target)
+        .fetch_one(&mut *tx)
+        .await?;
         if !exists {
             return Err(err(StatusCode::BAD_REQUEST, "invalid_request"));
         }
