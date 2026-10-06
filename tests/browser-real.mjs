@@ -690,8 +690,11 @@ await isolatedServer(
         }),
       });
       await expect(revokedAgent).toHaveCount(1);
+      const revokedStatus = revokedAgent.locator(".status-badge");
+      await expect(revokedStatus).toBeVisible();
+      await expect(revokedStatus).toHaveText("已撤销");
       await expect(
-        revokedAgent.getByText(/^已撤销\s*· 最后联系：/),
+        revokedAgent.getByText("最后联系：暂无", { exact: true }),
       ).toBeVisible();
       await expect(
         revokedAgent.getByText("设备凭据已失效，无法继续读取片源", {
