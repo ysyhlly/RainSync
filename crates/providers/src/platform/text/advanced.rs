@@ -50,6 +50,15 @@ pub(super) fn interaction(command: &str, raw: &str, video: &str) -> Option<Danma
     } else {
         video.to_owned()
     };
+    let canonical_video = (target.starts_with("BV")
+        && target.len() == 12
+        && target.bytes().all(|b| b.is_ascii_alphanumeric()))
+        || target
+            .strip_prefix("av")
+            .is_some_and(|id| id.len() <= 19 && decimal(id));
+    if !canonical_video {
+        return None;
+    }
     if !bilibili::parse_resource(&target)
         .is_ok_and(|r| matches!(r.id, bilibili::VideoId::Bv(_) | bilibili::VideoId::Av(_)))
     {

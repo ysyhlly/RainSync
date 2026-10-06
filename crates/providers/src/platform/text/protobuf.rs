@@ -454,6 +454,26 @@ mod tests {
         }
     }
     #[test]
+    fn malformed_interactive_targets_do_not_poison_normal_comments() {
+        for target in [
+            "https://www.bilibili.com/video/BV1dGhd68Epd/",
+            "javascript:evil",
+            "BV1dGhd68Epd?token=private",
+            "https://evil.test",
+        ] {
+            let extra = serde_json::json!({"bvid":target}).to_string();
+            let view = parse_bilibili_view(
+                &command_fixture(123, 1000, "#LINK#", &extra),
+                123,
+                "BV1dGhd68Epd",
+                0,
+                360000,
+            )
+            .unwrap();
+            assert!(view.cues.is_empty());
+        }
+    }
+    #[test]
     fn advanced_budget_does_not_consume_plain_density_and_old_renderers_drop_programs() {
         let body = [
             cue(0, 8, "$.createComment(\"x\");"),

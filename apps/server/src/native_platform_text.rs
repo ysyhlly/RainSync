@@ -193,11 +193,17 @@ async fn resolve(
                     .saturating_mul(360_000)
                     .saturating_sub(120_000);
                 let to = (u64::from(segment) * 360_000).min(scope.duration_ms);
+                // Optional artwork must leave time to return ordinary cues and
+                // recheck the grant, even when its metadata/CDN stalls.
+                let advanced_deadline = deadline
+                    .checked_sub(Duration::from_secs(2))
+                    .unwrap_or_else(Deadline::now)
+                    .min(Deadline::now() + Duration::from_secs(8));
                 platform_media::check_text(app, &scope).await?;
                 match text::fetch(
                     &app.platform_http,
                     TextRequest::bilibili_danmaku_view(cid).map_err(text_error)?,
-                    deadline,
+                    advanced_deadline,
                 )
                 .await
                 .and_then(|bytes| {
@@ -207,7 +213,7 @@ async fn resolve(
                         cues.extend(view.cues);
                         for request in view.special_requests {
                             platform_media::check_text(app, &scope).await?;
-                            match text::fetch(&app.platform_http, request, deadline)
+                            match text::fetch(&app.platform_http, request, advanced_deadline)
                                 .await
                                 .and_then(|bytes| text::parse_bilibili_special(&bytes, from, to))
                             {
