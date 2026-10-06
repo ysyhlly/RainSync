@@ -8,10 +8,67 @@ import { mkdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { chromium, expect } from "@playwright/test";
 import { createServer as viteServer } from "vite";
+import WebSocket from "ws";
 import { isolatedServer } from "./fixtures/server.mjs";
-import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 
 const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
+async function prepareLocal(f, client, room, media) {
+  const socket = new WebSocket(
+    f.origin.replace("http:", "ws:") + "/api/v1/ws",
+    {
+      headers: { Origin: f.env.PUBLIC_ORIGIN, Cookie: client.cookie },
+    },
+  );
+  const frames = [];
+  socket.on("message", (bytes) => frames.push(JSON.parse(bytes)));
+  socket.on("error", () => {});
+  try {
+    await new Promise((done, reject) => {
+      socket.once("open", done);
+      socket.once("error", reject);
+    });
+    async function next(predicate) {
+      const deadline = Date.now() + 10000;
+      while (Date.now() < deadline) {
+        const i = frames.findIndex(predicate);
+        if (i >= 0) return frames.splice(i, 1)[0];
+        await new Promise((done) => setTimeout(done, 20));
+      }
+      throw Error("owned room command timed out");
+    }
+    socket.send(JSON.stringify({ type: "JOIN", room_id: room.id }));
+    const snapshot = await next((frame) => frame.type === "SNAPSHOT");
+    const command = {
+      protocol_version: 1,
+      room_id: room.id,
+      command_id: randomUUID(),
+      control_epoch: snapshot.control_epoch.id,
+      expected_revision: snapshot.state.revision,
+      media_generation: snapshot.state.media_generation,
+      type: "CHANGE_MEDIA",
+      payload: { media_id: media },
+    };
+    socket.send(JSON.stringify(command));
+    const ack = await next((frame) => frame.command_id === command.command_id);
+    assert.equal(ack.type, "ACK");
+    const playback = await client.request("/playback-sessions", "POST", {
+      room_id: room.id,
+      media_generation: ack.state.media_generation,
+      position_ms: 0,
+      audio_index: null,
+      mode: "auto",
+      idempotency_key: randomUUID(),
+      capabilities: {
+        progressive_h264_aac: true,
+        native_hls: false,
+        mse_h264_aac: true,
+      },
+    });
+    return playback.session_id;
+  } finally {
+    socket.terminate();
+  }
+}
 const listener = netServer();
 await new Promise((done) => listener.listen(0, "127.0.0.1", done));
 const port = listener.address().port;
@@ -92,18 +149,10 @@ try {
         name: "deletion history",
       });
       const playlist = randomUUID();
-      const session = randomUUID();
       f.sql(
         `INSERT INTO playlist_items(id,room_id,media_id,sort_order) VALUES(${quote(playlist)},${quote(room.id)},${quote(media.id)},0)`,
       );
-      // The fixture skips media negotiation, retaining exact login and room
-      // admission so it exercises deletion against a durable current grant.
-      withPlaybackAdmission(
-        f,
-        { client: admin, user: me.id, room: room.id, session },
-        `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at)
-         VALUES(${quote(session)},${quote(me.id)},${quote(room.id)},${quote(media.id)},1,${quote(createHash("sha256").update(session).digest("hex"))},'{}',clock_timestamp()+interval '5 minutes')`,
-      );
+      const session = await prepareLocal(f, admin, room, media.id);
       const blocked = await admin.request(path, "DELETE", undefined, 409);
       assert.equal(blocked.error.code, "SOURCE_IN_USE");
       assert.match(blocked.error.message, /请先停止/);
@@ -326,18 +375,7 @@ try {
         const browserMedia = f.sql(
           `SELECT id FROM media_items WHERE source_id=${quote(browserSource.id)} AND available`,
         );
-        const browserSession = randomUUID();
-        withPlaybackAdmission(
-          f,
-          {
-            client: admin,
-            user: me.id,
-            room: room.id,
-            session: browserSession,
-          },
-          `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at)
-         VALUES(${quote(browserSession)},${quote(me.id)},${quote(room.id)},${quote(browserMedia)},1,${quote(createHash("sha256").update(browserSession).digest("hex"))},'{}',clock_timestamp()+interval '5 minutes')`,
-        );
+        const browserSession = await prepareLocal(f, admin, room, browserMedia);
         await button.click();
         await dialog
           .getByRole("button", { name: "确认删除片源", exact: true })
