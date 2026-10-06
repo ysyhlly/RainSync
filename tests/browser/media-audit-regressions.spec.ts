@@ -24,8 +24,7 @@ test("queue thumbnail image retry is reachable inside its compact bounds", async
     return route.abort("failed");
   });
   await page.goto("/rooms/room");
-  if (isMobile)
-    await page.getByRole("tab", { name: "待播", exact: true }).click();
+  await expect(page.locator("#room-queue")).toBeVisible();
   const thumbnail = page.locator(".queue-row .media-thumbnail");
   const retry = thumbnail.getByRole("button", {
     name: "重新加载封面",

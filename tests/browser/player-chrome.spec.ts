@@ -6,7 +6,7 @@ test("information is outside clean video and hover or touch reveals controls", a
 }) => {
   await appFixture(page);
   await page.goto("/rooms/room");
-  const info = page.locator(".room-information");
+  const info = page.locator(".room-media-widget");
   await expect(info).toContainText("真实合成测试视频");
   const chrome = page.locator(".player-chrome");
   await expect(chrome).toHaveCSS("opacity", "0");

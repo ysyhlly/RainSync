@@ -100,8 +100,7 @@ async function setup(
 
 async function leaveViewing(page: Page) {
   const leave = page.getByRole("button", { name: "离开观看", exact: true });
-  if (!(await leave.isVisible()))
-    await page.getByRole("tab", { name: "待播", exact: true }).click();
+  await expect(leave).toBeVisible();
   await leave.click();
 }
 

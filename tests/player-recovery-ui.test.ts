@@ -8,8 +8,10 @@ import ts from "typescript";
 import * as Vue from "vue";
 import type { MediaTrack } from "../packages/protocol";
 import { SubtitleLoadState } from "../apps/web/src/features/playback/subtitle-load-state";
+import { useRoomNotice } from "../apps/web/src/features/playback/room-notice";
 import {
   describePlaybackPreparation,
+  preparationFailure,
   type PlaybackPreparationState,
 } from "../apps/web/src/features/playback/playback-preparation";
 
@@ -140,6 +142,8 @@ async function renderPlayer(
           return { useRoomRuntime: () => runtime };
         case "./use-player-chrome":
           return { createPlayerChrome: () => chrome };
+        case "./room-notice":
+          return { useRoomNotice };
         case "./subtitle-load-state":
           return {
             SubtitleLoadState: class extends SubtitleLoadState {
@@ -483,12 +487,15 @@ it("only describes playable resources while the browser is still loading them", 
   ).toHaveLength(0);
 });
 
-it("fullscreen preparation failures replace the generic error banner with one safe alert", async () => {
+it("fullscreen preparation failures replace their own generic error banner with one safe alert", async () => {
   const runtime = fixture();
   runtime.error = "https://private.invalid/media?token=secret";
   runtime.preparation = {
     phase: "failed",
-    failure: { message: "媒体处理失败，请稍后重试。", retryable: true },
+    failure: {
+      ...preparationFailure(new Error(runtime.error)),
+      message: "媒体处理失败，请稍后重试。",
+    },
   };
   const html = await renderPlayer(runtime, { fullscreen: true });
   expect(
@@ -496,6 +503,22 @@ it("fullscreen preparation failures replace the generic error banner with one sa
   ).toHaveLength(1);
   expect(html).toContain("媒体处理失败");
   expect(html).not.toContain("token=secret");
+});
+
+it("fullscreen keeps an unrelated room error alongside a playback preparation failure", async () => {
+  const runtime = fixture();
+  runtime.error = "房间连接已停止，请重新加入";
+  runtime.preparation = {
+    phase: "failed",
+    failure: preparationFailure(new TypeError("Failed to fetch playback")),
+  };
+  const alerts = elements(
+    await renderPlayer(runtime, { fullscreen: true }),
+  ).filter((element) => element.attributes.role === "alert");
+  expect(alerts).toHaveLength(2);
+  expect(alerts[0].text).toContain(runtime.preparation.failure!.message);
+  expect(alerts[1].text).toContain(runtime.error);
+  expect(alerts[1].text).toContain("关闭提示");
 });
 
 it.each([

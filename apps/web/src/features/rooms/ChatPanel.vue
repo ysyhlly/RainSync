@@ -4,29 +4,57 @@ import { useRoomRuntime } from "./room-runtime";
 import UserAvatar from "../../shared/ui/UserAvatar.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import TimelineChatPanel from "./TimelineChatPanel.vue";
+const props = withDefaults(defineProps<{ visible?: boolean }>(), {
+  visible: true,
+});
 const r = useRoomRuntime(),
   log = ref<HTMLElement>(),
   atBottom = ref(true),
   unread = ref(false);
+let savedScrollTop = 0;
+let restoringScroll = false;
 function scroll() {
+  if (!props.visible || restoringScroll) return;
   const el = log.value;
   if (el)
     atBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
   if (atBottom.value) unread.value = false;
 }
 function bottom() {
+  if (!props.visible) return;
   log.value?.scrollTo({ top: log.value.scrollHeight });
   atBottom.value = true;
   unread.value = false;
 }
 watch(
-  () => r.messages.length,
-  async () => {
+  () => r.messages.at(-1)?.id,
+  async (latest, previous) => {
+    if (!latest || latest === previous) return;
+    if (!props.visible) {
+      unread.value = true;
+      return;
+    }
     const wasBottom = atBottom.value;
     await nextTick();
     if (wasBottom) bottom();
     else unread.value = true;
   },
+);
+// display:none can clamp a scroll container while messages keep arriving.
+// Retain its reading position explicitly and never auto-scroll a hidden widget.
+watch(
+  () => props.visible,
+  async (visible) => {
+    if (!visible) {
+      savedScrollTop = log.value?.scrollTop ?? 0;
+      return;
+    }
+    restoringScroll = true;
+    await nextTick();
+    if (log.value) log.value.scrollTop = savedScrollTop;
+    restoringScroll = false;
+  },
+  { flush: "sync" },
 );
 onMounted(bottom);
 </script>
@@ -96,6 +124,6 @@ onMounted(bottom);
         r.chatPending ? "正在等待发送确认…" : "消息未确认，保留原编号以供重试。"
       }}
     </p>
-    <TimelineChatPanel />
+    <TimelineChatPanel :visible="props.visible" />
   </aside>
 </template>

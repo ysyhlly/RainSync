@@ -1,21 +1,32 @@
 <script setup lang="ts">
+import UserAvatar from "../../shared/ui/UserAvatar.vue";
 import type { OnlineSnapshot } from "./presence-state";
 
 defineProps<{
   snapshot?: OnlineSnapshot;
   names?: Readonly<Record<string, string>>;
   selfId?: string;
+  compact?: boolean;
 }>();
 </script>
 
 <template>
-  <section class="presence-panel" aria-label="已上报在线状态的连接">
+  <section
+    class="presence-panel"
+    :class="{ 'presence-panel--compact': compact }"
+    aria-label="已上报在线状态的连接"
+  >
     <p v-if="!snapshot" role="status">在线状态不可用</p>
     <template v-else>
       <p role="status">{{ snapshot.members.length }} 位成员已上报在线状态</p>
-      <p>仅显示已上报在线状态的连接；其他成员的状态未知。</p>
+      <p v-if="!compact">仅显示已上报在线状态的连接；其他成员的状态未知。</p>
       <ul v-if="snapshot.members.length">
         <li v-for="member in snapshot.members" :key="member.userId">
+          <UserAvatar
+            v-if="compact"
+            :name="names?.[member.userId] || '房间成员'"
+            :size="40"
+          />
           <span
             >{{ names?.[member.userId] || "房间成员"
             }}{{ member.userId === selfId ? "（你）" : "" }}</span
@@ -29,6 +40,9 @@ defineProps<{
           <span v-else>1 个连接</span>
         </li>
       </ul>
+      <p v-if="compact" class="presence-caveat helper">
+        仅显示已上报状态的连接；其他成员状态未知
+      </p>
     </template>
   </section>
 </template>

@@ -8,12 +8,11 @@ export async function navigate(page: Page, name: string) {
     .click();
   await expect(page.locator(".page h1")).toHaveText(name);
 }
+/** Both widgets remain visible in the modular room, including narrow screens. */
 export async function roomPanel(page: Page, name: "聊天" | "待播") {
-  const tab = page.getByRole("tab", { name, exact: true });
-  if (await page.evaluate(() => innerWidth < 768)) {
-    await expect(tab).toBeVisible();
-    await tab.click();
-  }
+  const panel = page.locator(name === "聊天" ? "#room-chat" : "#room-queue");
+  await expect(panel).toBeVisible();
+  await panel.scrollIntoViewIfNeeded();
 }
 export async function chooseRoom(page: Page, id: string) {
   await navigate(page, "放映室");
@@ -21,7 +20,7 @@ export async function chooseRoom(page: Page, id: string) {
     .locator(".room-card")
     .filter({ has: page.getByRole("heading", { name: id, exact: true }) });
   await card.getByRole("button").click();
-  await expect(page.locator(".room-information h1")).toHaveText(id);
+  await expect(page.locator(".room-information-widget h1")).toHaveText(id);
 }
 export async function showOptions(page: Page) {
   await page

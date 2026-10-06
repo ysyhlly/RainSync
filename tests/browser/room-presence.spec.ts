@@ -69,7 +69,7 @@ test("reported connections have explicit coverage and sequence gaps leave playba
   const panel = page.getByRole("region", { name: "已上报在线状态的连接" });
   await expect(panel.getByText("2 个连接")).toBeVisible();
   await expect(panel.getByText("放映用户（你）")).toBeVisible();
-  await expect(panel).toContainText("其他成员的状态未知");
+  await expect(panel).toContainText("其他成员状态未知");
   await expect(panel).not.toContainText("未上报成员");
   expect(f.resumes[0].presence_version).toBe(1);
   await expect(page.locator("video")).toHaveAttribute(

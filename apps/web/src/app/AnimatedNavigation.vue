@@ -5,7 +5,10 @@ import { watchNavigation, adminNavigation } from "./navigation";
 import { useNavigationIndicator } from "./use-navigation-indicator";
 import AppIcon from "../shared/ui/AppIcon.vue";
 
-const props = defineProps<{ variant: "sidebar" | "bottom"; admin: boolean }>();
+const props = defineProps<{
+  variant: "sidebar" | "bottom" | "room";
+  admin: boolean;
+}>();
 const route = useRoute();
 const container = ref<HTMLElement | null>(null);
 // Sample the fade more finely than a screen pixel along the usual sidebar path.
@@ -30,7 +33,7 @@ const selected = computed(() => {
     path === "/admin/users" ? "/admin/registration-invites" : path;
   const item = adminNavigation.find((item) => item.to === adminPath);
   return item
-    ? props.variant === "bottom"
+    ? props.variant !== "sidebar"
       ? "/admin/sources"
       : item.to
     : null;
@@ -50,8 +53,8 @@ const indicatorStyle = computed(() =>
 <template>
   <nav
     ref="container"
-    :class="variant === 'sidebar' ? 'sidebar-navigation' : 'bottom-nav'"
-    :aria-label="variant === 'sidebar' ? '主导航' : '移动导航'"
+    :class="variant === 'bottom' ? 'bottom-nav' : 'sidebar-navigation'"
+    :aria-label="variant === 'bottom' ? '移动导航' : '主导航'"
   >
     <span
       v-if="rect"

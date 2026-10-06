@@ -79,7 +79,7 @@ test("rename updates library and playing metadata without another media session"
   await dialog.getByRole("button", { name: "关闭弹窗" }).click();
   await expect(page.locator(".media-card h2").first()).toHaveText("我的片名");
   await page.getByRole("link", { name: "返回房间" }).click();
-  await expect(page.locator(".room-information h2")).toBeVisible();
+  await expect(page.locator(".room-media-widget h2")).toBeVisible();
   expect(app.preparations()).toBe(1);
   expect(app.connections()).toBe(1);
   expect(

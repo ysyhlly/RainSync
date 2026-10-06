@@ -1,34 +1,27 @@
 import { test, expect } from "@playwright/test";
 import { appFixture } from "./fixtures/application";
 
-test("room tabs only switch panels on narrow screens and preserve selection across resize", async ({
+test("independent room widgets remain visible and preserve chat drafts across resize", async ({
   page,
 }) => {
   await appFixture(page);
   await page.setViewportSize({ width: 1366, height: 900 });
   await page.goto("/rooms/room");
-  const tabs = page.getByRole("tablist", { name: "房间面板" });
-  await expect(tabs).toBeHidden();
   await expect(page.locator("#room-chat")).toBeVisible();
   await page
     .getByRole("textbox", { name: "聊天消息", exact: true })
     .fill("保留的聊天草稿");
   await expect(page.locator("#room-queue")).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(tabs).toBeVisible();
   await expect(page.locator("#room-chat")).toBeVisible();
-  await page.getByRole("tab", { name: "待播", exact: true }).click();
-  await expect(page.locator("#room-chat")).toBeHidden();
+  await expect(page.locator("#room-chat")).toBeVisible();
   await expect(page.locator("#room-queue")).toBeVisible();
   await page.setViewportSize({ width: 1366, height: 900 });
-  await expect(tabs).toBeHidden();
   await expect(page.locator("#room-chat")).toBeVisible();
   await expect(page.locator("#room-queue")).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(
-    page.getByRole("tab", { name: "待播", exact: true }),
-  ).toHaveAttribute("aria-selected", "true");
-  await page.getByRole("tab", { name: "聊天", exact: true }).click();
+  await expect(page.locator("#room-chat")).toBeVisible();
+  await expect(page.locator("#room-queue")).toBeVisible();
   await expect(
     page.getByRole("textbox", { name: "聊天消息", exact: true }),
   ).toHaveValue("保留的聊天草稿");

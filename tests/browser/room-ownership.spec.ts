@@ -43,8 +43,7 @@ test("room owner reviews transfer, loses controls and retains the current player
   await page.evaluate(() => {
     (window as any).__ownershipVideo = document.querySelector("video");
   });
-  if (info.project.name === "mobile")
-    await page.getByRole("tab", { name: "待播" }).click();
+  await page.getByRole("button", { name: "房间管理", exact: true }).click();
   await page.getByRole("button", { name: "转让房间", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "转让房间" })).toBeVisible();
   await expect(page.getByRole("button", { name: "确认转让" })).toBeDisabled();
@@ -69,7 +68,7 @@ test("room owner reviews transfer, loses controls and retains the current player
     page.getByRole("button", { name: "转让房间", exact: true }),
   ).toHaveCount(0);
   await expect(
-    page.getByRole("button", { name: "房间邀请", exact: true }),
+    page.getByRole("button", { name: "邀请", exact: true }),
   ).toHaveCount(0);
   expect(transfers).toHaveLength(1);
   expect(app.preparations()).toBe(prepared);

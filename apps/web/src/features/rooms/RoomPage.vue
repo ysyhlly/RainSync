@@ -1,5 +1,12 @@
 <script setup lang="ts">
-import { computed, ref, watch, nextTick, onBeforeUnmount } from "vue";
+import {
+  computed,
+  ref,
+  watch,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+} from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useSession } from "../auth/session.store";
 import { useRoomRuntime } from "./room-runtime";
@@ -14,11 +21,21 @@ import RoomAccessPanel from "./RoomAccessPanel.vue";
 import { roomPermissionOptions } from "./room-permissions";
 import { useAction } from "../../shared/use-action";
 import DistributedComputePanel from "../playback/DistributedComputePanel.vue";
-import PlaybackInformation from "../playback/PlaybackInformation.vue";
+import RoomPlayerAnchor from "../playback/RoomPlayerAnchor.vue";
 import PlatformMediaImport from "./PlatformMediaImport.vue";
 import ChatPanel from "./ChatPanel.vue";
 import PresencePanel from "./PresencePanel.vue";
-import AppSegmented from "../../shared/ui/AppSegmented.vue";
+import UserAvatar from "../../shared/ui/UserAvatar.vue";
+import RoomLayoutCanvas from "../room-layout/RoomLayoutCanvas.vue";
+import RoomLayoutToolbar from "../room-layout/RoomLayoutToolbar.vue";
+import RoomWidgetCatalog from "../room-layout/RoomWidgetCatalog.vue";
+import { useRoomLayout } from "../room-layout/layout-controller";
+import {
+  NARROW_BREAKPOINT_PX,
+  type LayoutBreakpoint,
+  type WidgetType,
+} from "../room-layout/layout-model";
+import { formatTime } from "../../shared/use-action";
 import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import AppSelect from "../../shared/ui/AppSelect.vue";
@@ -36,18 +53,101 @@ const { busy, error, message, run } = useAction();
 const inviteOpen = ref(false),
   invite = ref<RoomInvitation | null>(null),
   revoking = ref(false),
-  mobilePanel = ref("chat");
-const platformImport = ref<HTMLDetailsElement>();
-async function showQueue() {
-  mobilePanel.value = "queue";
+  managementOpen = ref(false),
+  platformOpen = ref(false),
+  catalogOpen = ref(false);
+const platformImport = ref<HTMLElement>();
+const layoutCanvas = ref<InstanceType<typeof RoomLayoutCanvas>>();
+const roomPage = ref<HTMLElement>();
+const breakpoint = ref<LayoutBreakpoint>(
+  window.innerWidth < NARROW_BREAKPOINT_PX ? "narrow" : "wide",
+);
+let widthObserver: ResizeObserver | undefined;
+function updateBreakpoint(width: number) {
+  const next: LayoutBreakpoint =
+    width < NARROW_BREAKPOINT_PX ? "narrow" : "wide";
+  if (next === breakpoint.value) return;
+  layoutCanvas.value?.cancelGesture();
+  breakpoint.value = next;
+  catalogOpen.value = false;
+}
+onMounted(() => {
+  if (!roomPage.value) return;
+  // Profile selection follows usable canvas width, not browser chrome width.
+  updateBreakpoint(roomPage.value.clientWidth);
+  widthObserver = new ResizeObserver(([entry]) => {
+    if (entry && entry.contentRect.width > 0)
+      updateBreakpoint(entry.contentRect.width);
+  });
+  widthObserver.observe(roomPage.value);
+});
+onBeforeUnmount(() => widthObserver?.disconnect());
+const {
+  layout,
+  editing,
+  dirty,
+  canUndo,
+  canRedo,
+  error: layoutError,
+  begin,
+  cancel,
+  commit,
+  reset,
+  add,
+  remove,
+  move,
+  resize,
+  undo,
+  redo,
+} = useRoomLayout({ userId: computed(() => session.user?.id), breakpoint });
+async function focusWidget(id: string) {
   await nextTick();
-  document.getElementById("room-queue")?.scrollIntoView({ block: "nearest" });
+  await layoutCanvas.value?.focusWidget(id);
+}
+async function addWidget(type: WidgetType) {
+  if (add(type)) await focusWidget(type);
+}
+function finishLayout() {
+  layoutCanvas.value?.cancelGesture();
+  if (commit()) catalogOpen.value = false;
+}
+function cancelLayout() {
+  layoutCanvas.value?.cancelGesture();
+  cancel();
+  catalogOpen.value = false;
 }
 async function showPlatformImport() {
-  await showQueue();
-  if (platformImport.value) platformImport.value.open = true;
+  platformOpen.value = true;
+  await nextTick();
   await nextTick();
   platformImport.value?.querySelector<HTMLTextAreaElement>("textarea")?.focus();
+}
+const currentMedia = computed(() =>
+  catalog.roomRecord(r.room?.id, r.state?.media_id ?? undefined),
+);
+const currentDuration = computed(() =>
+  r.duration > 0 ? r.duration : (currentMedia.value?.duration_ms ?? 0) / 1000,
+);
+const playbackPermissions = computed(() =>
+  roomPermissionOptions.filter(
+    ({ value }) =>
+      ["play", "pause", "seek", "set_rate", "change_media"].includes(value) &&
+      r.can(value),
+  ),
+);
+const canControlPlayback = computed(() => playbackPermissions.value.length > 0);
+const playbackPermissionSummary = computed(() =>
+  playbackPermissions.value.length === 5
+    ? "你可以控制房间播放"
+    : playbackPermissions.value.length
+      ? `可${playbackPermissions.value.map(({ label }) => label).join("、")}`
+      : "播放由房间控制者同步",
+);
+const knownPresence = computed(() => r.presence?.members.slice(0, 3) ?? []);
+function presenceName(userId: string) {
+  return userId === session.user?.id
+    ? session.user.display_name
+    : r.presenceNames[userId] || "房间成员";
 }
 const emptyRoom = computed(() => !!r.state && !r.state.media_id);
 const preparationMessage = computed(() => {
@@ -112,7 +212,8 @@ watch(
       lifecycleAction.value = "";
       inviteOpen.value = false;
       invite.value = null;
-      if (platformImport.value) platformImport.value.open = false;
+      platformOpen.value = false;
+      managementOpen.value = false;
       const serial = ++entry,
         id = String(route.params.id);
       if (r.room?.id === id) {
@@ -187,226 +288,321 @@ async function transferOwnership() {
 }
 </script>
 <template>
-  <section class="room-content">
-    <Notice v-if="!inviteOpen" :message="error" error />
-    <Notice v-if="!ownershipOpen && !inviteOpen" :message="message" />
+  <section ref="roomPage" class="room-content room-modular-page">
+    <Notice v-if="!inviteOpen && !managementOpen" :message="error" error />
+    <Notice
+      v-if="!ownershipOpen && !inviteOpen && !managementOpen"
+      :message="message"
+    />
     <div v-if="r.room?.id !== String(route.params.id)" class="page empty-state">
       <h1>放映室</h1>
       <p v-if="busy" role="status">正在进入房间…</p>
       <RouterLink class="button" to="/rooms">返回放映室</RouterLink>
     </div>
-    <template v-else
-      ><PlaybackInformation
-        class="room-information"
-        :title="r.currentTitle"
-        :room="r.room?.name ?? ''"
-        :connected="r.connected"
-        :stopped="r.connectionStopped"
-        :owner="
-          r.can('play') ||
-          r.can('pause') ||
-          r.can('seek') ||
-          r.can('set_rate') ||
-          r.can('change_media')
-        " />
-      <div class="room-opening">
-        <PendingMediaSelection class="room-preparation" />
-        <section
-          v-if="!r.state || emptyRoom"
-          class="room-preparation panel"
-          aria-labelledby="room-preparation-title"
-        >
-          <h2 id="room-preparation-title">
-            {{
-              !r.state
-                ? "正在准备房间"
-                : r.roomActive
-                  ? "开始一起观看"
-                  : "房间历史"
-            }}
-          </h2>
-          <p class="helper">{{ preparationMessage }}</p>
-        </section>
-        <div class="room-tools button-row" aria-label="房间常用操作">
-          <RouterLink
-            v-if="r.can('change_media')"
-            class="button primary"
-            to="/library"
-          >
-            <AppIcon name="movie" />{{
-              emptyRoom ? "从媒体库选片" : "选择影片"
-            }}
-          </RouterLink>
-          <button
-            v-if="r.can('queue')"
-            :disabled="!r.connected"
-            @click="showPlatformImport"
-          >
-            粘贴平台链接
-          </button>
-          <button
-            v-if="r.can('invite')"
-            :disabled="busy || !r.connected"
-            @click="run(showInvites)"
-          >
-            <AppIcon name="key" />房间邀请
-          </button>
-          <button @click="showQueue">
-            待播列表（{{ r.playlist.length }}）
-          </button>
-        </div>
-      </div>
-      <AppSegmented
-        v-model="mobilePanel"
-        class="mobile-room-tabs"
-        label="房间面板"
-        :options="[
-          { value: 'chat', label: '聊天', panel: 'room-chat' },
-          { value: 'queue', label: '待播', panel: 'room-queue' },
-        ]" />
+    <template v-else>
       <div
-        id="room-chat"
-        role="tabpanel"
-        aria-labelledby="room-chat-tab"
-        class="room-chat"
-        :class="{ 'mobile-hidden': mobilePanel !== 'chat' }"
+        class="room-command-bar"
+        :class="{ 'room-command-bar--editing': editing }"
       >
-        <PresencePanel
-          class="panel"
-          :snapshot="r.presence"
-          :names="r.presenceNames"
-          :self-id="session.user?.id"
-        />
-        <ChatPanel />
-        <DistributedComputePanel
-          v-if="r.room && r.state && r.roomActive"
-          :room-id="r.room.id"
-          :media-generation="r.state.media_generation"
-          :audio-index="r.audioIndex"
-          :active-job="r.distributedFacts?.job_id"
-          :sharing="r.peerSharing"
-          :stats="r.peerStats"
-          :activate="r.useDistributedOutput"
-          :original="r.useOriginalSource"
-          :share="r.startPeerSharing"
-          :stop-sharing="r.stopPeerSharing"
+        <div class="room-permanent-actions" aria-label="房间常用操作">
+          <div class="room-permanent-status" role="status">
+            <span class="connection-status">{{
+              r.connected
+                ? "房间连接正常"
+                : r.connectionStopped
+                  ? "连接已停止"
+                  : "正在重连"
+            }}</span>
+            <span v-if="!r.roomActive">
+              · 房间{{ r.lifecycleLabel }} · 只读</span
+            >
+          </div>
+          <div class="button-row">
+            <RouterLink
+              v-if="r.can('change_media')"
+              class="button"
+              to="/library"
+              ><AppIcon name="movie" />选择影片</RouterLink
+            >
+            <button
+              v-if="r.can('queue') && r.roomActive"
+              :disabled="!r.connected"
+              @click="showPlatformImport"
+            >
+              粘贴平台链接
+            </button>
+            <button
+              v-if="r.can('invite')"
+              :disabled="busy || !r.connected"
+              @click="run(showInvites)"
+            >
+              <AppIcon name="key" />邀请
+            </button>
+            <button @click="managementOpen = true">
+              <AppIcon name="settings" />房间管理
+            </button>
+            <button :disabled="busy" @click="run(leave)">离开观看</button>
+          </div>
+        </div>
+        <RoomLayoutToolbar
+          :editing="editing"
+          :dirty="dirty"
+          :can-undo="canUndo"
+          :can-redo="canRedo"
+          :error="layoutError"
+          :breakpoint="breakpoint"
+          @begin="begin"
+          @cancel="cancelLayout"
+          @commit="finishLayout"
+          @reset="reset"
+          @undo="undo"
+          @redo="redo"
+          @catalog="catalogOpen = true"
         />
       </div>
-      <section
-        id="room-queue"
-        role="tabpanel"
-        aria-labelledby="room-queue-tab"
-        class="room-secondary"
-        :class="{ 'mobile-hidden': mobilePanel !== 'queue' }"
+      <Notice :message="r.cleanupError" error />
+      <p v-if="r.room?.lifecycle === 'closing'" class="notice" role="status">
+        正在停止播放和清理媒体任务，完成后才会关闭。历史记录仍可查看。
+      </p>
+      <PendingMediaSelection class="room-pending-selection" />
+      <RoomLayoutCanvas
+        ref="layoutCanvas"
+        :layout="layout"
+        :editing="editing"
+        @move="({ id, x, y }) => move(id, x, y)"
+        @resize="({ id, w, h }) => resize(id, w, h)"
+        @remove="remove"
       >
-        <div class="panel" role="status">
-          <strong>房间{{ r.lifecycleLabel }}</strong>
-          <p v-if="r.room?.lifecycle === 'closing'">
-            正在停止播放和清理媒体任务，完成后才会关闭。历史记录仍可查看。
-          </p>
-          <p v-else-if="!r.roomActive">
-            当前为只读状态，可以查看聊天记录和待播列表。
-          </p>
-          <Notice :message="r.cleanupError" error />
-        </div>
-        <div class="room-actions">
-          <button
-            v-if="r.canManageRoom"
-            :disabled="busy || !r.state"
-            @click="run(manageOwnership)"
-          >
-            转让房间</button
-          ><button
-            v-if="r.can('close') && r.roomActive"
-            class="danger"
-            :disabled="busy || !r.state"
-            @click="lifecycleAction = 'close'"
-          >
-            关闭房间
-          </button>
-          <button
-            v-if="r.canManageRoom && r.room?.lifecycle === 'closed'"
-            :disabled="busy || !r.state"
-            @click="lifecycleAction = 'reopen'"
-          >
-            重新开放
-          </button>
-          <button
-            v-if="r.canManageRoom && r.room?.lifecycle === 'closed'"
-            :disabled="busy || !r.state"
-            @click="lifecycleAction = 'archive'"
-          >
-            归档房间
-          </button>
-          <button @click="run(leave)">离开观看</button>
-        </div>
-        <div class="queue-panel panel">
-          <header>
-            <h2>待播列表</h2>
-            <span class="helper">{{ r.playlist.length }} 部</span>
-          </header>
-          <p v-if="!r.playlist.length" class="helper">
-            暂无待播影片。{{
-              r.can("queue")
-                ? "添加影片后，可在这里选择下一部。"
-                : "有待播管理权限的成员可以添加影片。"
-            }}
-          </p>
-          <div v-if="r.can('queue')" class="button-row queue-add-actions">
-            <RouterLink class="button" to="/library">从媒体库添加</RouterLink>
-            <button :disabled="!r.connected" @click="showPlatformImport">
-              添加平台链接
-            </button>
+        <template #widget="{ item, visible }">
+          <div v-if="item.type === 'room-info'" class="room-information-widget">
+            <h1>{{ r.room?.name }}</h1>
+            <div class="room-presence-summary">
+              <span class="room-avatar-stack" aria-hidden="true">
+                <UserAvatar
+                  v-for="member in knownPresence"
+                  :key="member.userId"
+                  :name="presenceName(member.userId)"
+                  :url="
+                    member.userId === session.user?.id
+                      ? session.user?.avatar_url
+                      : undefined
+                  "
+                  :size="36"
+                />
+              </span>
+              <span
+                :title="
+                  r.presence
+                    ? '仅统计已上报在线状态的连接，其他成员状态未知'
+                    : undefined
+                "
+                >{{
+                  r.presence
+                    ? `${r.presence.members.length} 人已上报在线`
+                    : "在线状态未知"
+                }}
+                ·
+                {{
+                  r.room?.owner_id === session.user?.id
+                    ? "房主"
+                    : canControlPlayback
+                      ? "可控制播放"
+                      : "观看者"
+                }}</span
+              >
+            </div>
           </div>
-          <article v-for="item in r.playlist" :key="item.id" class="queue-row">
-            <MediaThumbnail
-              small
-              :cover="
-                catalog.roomRecord(r.room?.id, item.media_id)?.cover ??
-                item.cover
-              "
-              :alt="
-                catalog.roomRecord(r.room?.id, item.media_id)?.title ??
-                item.title
-              "
-            />
-            <h3>
+          <RoomPlayerAnchor
+            v-else-if="item.type === 'player'"
+            :editing="editing"
+          />
+          <section
+            v-else-if="item.type === 'media-info'"
+            class="room-media-widget"
+            aria-label="当前影片详情"
+          >
+            <div class="room-media-title">
+              <h2>{{ r.state?.media_id ? r.currentTitle : "开始一起观看" }}</h2>
+              <span v-if="r.state?.media_id" class="room-media-status">{{
+                r.state.playback_status === "playing" ? "正在播放" : "已暂停"
+              }}</span>
+            </div>
+            <p v-if="r.state?.media_id" class="helper">
               {{
-                catalog.roomRecord(r.room?.id, item.media_id)?.title ??
-                item.title
+                r.live
+                  ? "直播"
+                  : currentDuration > 0
+                    ? formatTime(currentDuration)
+                    : "时长未知"
               }}
-            </h3>
-            <button
-              class="icon-button"
-              :aria-label="
-                '播放 ' +
-                (catalog.roomRecord(r.room?.id, item.media_id)?.title ??
-                  item.title)
-              "
-              :disabled="!r.can('change_media') || !r.connected"
-              @click="r.choose(item.media_id)"
-            >
-              <AppIcon name="play" /></button
-            ><button
-              v-if="r.can('queue')"
-              class="icon-button"
-              :aria-label="'移除 ' + item.title"
-              @click="r.run(() => r.removeQueue(item.id))"
-            >
-              <AppIcon name="trash" />
-            </button>
-          </article>
-        </div>
-        <details
-          v-if="r.roomActive"
-          ref="platformImport"
-          class="platform-import-disclosure"
+              ·
+              {{ playbackPermissionSummary
+              }}<template v-if="r.playbackSummary">
+                · {{ r.playbackSummary.mode }}</template
+              >
+              <template v-if="r.recoveryLabel">
+                · {{ r.recoveryLabel }}</template
+              >
+            </p>
+            <p v-else class="helper">{{ preparationMessage }}</p>
+          </section>
+          <div
+            v-else-if="item.type === 'chat'"
+            id="room-chat"
+            class="room-chat-widget"
+          >
+            <ChatPanel :visible="visible" />
+          </div>
+          <section
+            v-else-if="item.type === 'queue'"
+            id="room-queue"
+            class="room-queue-widget"
+            aria-label="待播列表"
+          >
+            <div class="queue-widget-heading">
+              <span class="helper">{{ r.playlist.length }} 部待播</span>
+              <div v-if="r.can('queue')" class="button-row">
+                <RouterLink class="button" to="/library"
+                  ><AppIcon name="plus" />添加影片</RouterLink
+                ><button :disabled="!r.connected" @click="showPlatformImport">
+                  平台链接
+                </button>
+              </div>
+            </div>
+            <p v-if="!r.playlist.length" class="helper">
+              暂无待播影片。{{
+                r.can("queue")
+                  ? "添加影片后，在这里选择下一部。"
+                  : "等待有待播管理权限的成员添加影片。"
+              }}
+            </p>
+            <div class="queue-widget-list">
+              <article
+                v-for="item in r.playlist"
+                :key="item.id"
+                class="queue-row"
+              >
+                <MediaThumbnail
+                  small
+                  :cover="
+                    catalog.roomRecord(r.room?.id, item.media_id)?.cover ??
+                    item.cover
+                  "
+                  :alt="
+                    catalog.roomRecord(r.room?.id, item.media_id)?.title ??
+                    item.title
+                  "
+                />
+                <h3>
+                  {{
+                    catalog.roomRecord(r.room?.id, item.media_id)?.title ??
+                    item.title
+                  }}
+                </h3>
+                <button
+                  class="icon-button"
+                  :aria-label="
+                    '播放 ' +
+                    (catalog.roomRecord(r.room?.id, item.media_id)?.title ??
+                      item.title)
+                  "
+                  :disabled="!r.can('change_media') || !r.connected"
+                  @click="r.choose(item.media_id)"
+                >
+                  <AppIcon name="play" />
+                </button>
+                <button
+                  v-if="r.can('queue')"
+                  class="icon-button"
+                  :aria-label="'移除 ' + item.title"
+                  :disabled="!r.connected"
+                  @click="r.run(() => r.removeQueue(item.id))"
+                >
+                  <AppIcon name="trash" />
+                </button>
+              </article>
+            </div>
+          </section>
+          <div v-else-if="item.type === 'members'" class="room-members-widget">
+            <PresencePanel
+              compact
+              :snapshot="r.presence"
+              :names="r.presenceNames"
+              :self-id="session.user?.id"
+            />
+          </div>
+        </template>
+      </RoomLayoutCanvas>
+      <RoomWidgetCatalog
+        v-model="catalogOpen"
+        :layout="layout"
+        @add="addWidget"
+        @locate="focusWidget"
+      />
+    </template>
+    <AppDialog v-model="platformOpen" title="添加平台视频" drawer>
+      <div ref="platformImport" class="room-platform-import">
+        <PlatformMediaImport v-if="r.roomActive && r.can('queue')" />
+      </div>
+    </AppDialog>
+    <AppDialog v-model="managementOpen" title="房间管理" drawer :busy="busy">
+      <p>
+        房间{{ r.lifecycleLabel }}。{{
+          r.roomActive
+            ? "这里的管理操作会影响整个房间。"
+            : "当前为只读状态，可以查看聊天记录和待播列表。"
+        }}
+      </p>
+      <Notice :message="r.cleanupError" error />
+      <Notice :message="error" error />
+      <Notice :message="message" />
+      <div class="room-actions">
+        <button
+          v-if="r.canManageRoom"
+          :disabled="busy || !r.state"
+          @click="run(manageOwnership)"
         >
-          <summary>添加平台视频</summary>
-          <PlatformMediaImport />
-        </details>
-        <RoomAccessPanel /></section></template
-    ><AppDialog v-model="inviteOpen" title="房间邀请" drawer :busy="busy"
+          转让房间
+        </button>
+        <button
+          v-if="r.can('close') && r.roomActive"
+          class="danger"
+          :disabled="busy || !r.state"
+          @click="lifecycleAction = 'close'"
+        >
+          关闭房间
+        </button>
+        <button
+          v-if="r.canManageRoom && r.room?.lifecycle === 'closed'"
+          :disabled="busy || !r.state"
+          @click="lifecycleAction = 'reopen'"
+        >
+          重新开放
+        </button>
+        <button
+          v-if="r.canManageRoom && r.room?.lifecycle === 'closed'"
+          :disabled="busy || !r.state"
+          @click="lifecycleAction = 'archive'"
+        >
+          归档房间
+        </button>
+        <RoomAccessPanel />
+      </div>
+      <DistributedComputePanel
+        v-if="managementOpen && r.room && r.state && r.roomActive"
+        :room-id="r.room.id"
+        :media-generation="r.state.media_generation"
+        :audio-index="r.audioIndex"
+        :active-job="r.distributedFacts?.job_id"
+        :sharing="r.peerSharing"
+        :stats="r.peerStats"
+        :activate="r.useDistributedOutput"
+        :original="r.useOriginalSource"
+        :share="r.startPeerSharing"
+        :stop-sharing="r.stopPeerSharing"
+      />
+    </AppDialog>
+    <AppDialog v-model="inviteOpen" title="房间邀请" drawer :busy="busy"
       ><p>
         邀请仅用于此房间，不授予私人媒体库权限。复制的邀请只显示一次，请妥善保存。
       </p>

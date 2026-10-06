@@ -1,10 +1,9 @@
 <script setup lang="ts">
-import { computed, ref, watch, onBeforeUnmount } from "vue";
+import { computed, ref, watch, onMounted, onBeforeUnmount } from "vue";
 import { useRoomRuntime } from "./room-runtime";
 import { useSession } from "../auth/session.store";
 import {
   displayedComments,
-  mergeTimeline,
   parseActivity,
   parseTimelinePage,
   reactionEmoji,
@@ -12,7 +11,11 @@ import {
   type MediaActivity,
   type TimelineComment,
 } from "./timeline-chat";
+import { historicalCutoffMs, mergeTimelineWindow } from "./timeline-view-state";
 import type { RoomMember } from "../../shared/api/types";
+const props = withDefaults(defineProps<{ visible?: boolean }>(), {
+  visible: true,
+});
 const r = useRoomRuntime(),
   session = useSession();
 const opened = ref(false),
@@ -27,6 +30,7 @@ const opened = ref(false),
   ordered = ref(true),
   showReactions = ref(true),
   error = ref(""),
+  revalidationError = ref(""),
   busy = ref(false),
   canModerate = ref(false),
   canAssign = ref(false),
@@ -37,6 +41,17 @@ const opened = ref(false),
   audit = ref<{ id: string; action: string; reason: string }[]>([]),
   manageOpen = ref(false),
   targetModerator = ref(true);
+const historyCutoffs = ref<Record<string, number | "">>({}),
+  browsingOlder = ref(false),
+  newerAvailable = ref(false),
+  loadingOlder = ref(false),
+  pageVisible = ref(!document.hidden);
+let latestPage: TimelineComment[] = [],
+  latestBefore: string | null = null,
+  windowSerial = 0,
+  submissionSerial = 0,
+  revalidateOnDisplay = false,
+  revalidationInFlight: AbortController | undefined;
 const reactions = ref<{ id: string; emoji: string; until: number }[]>([]);
 let serial = 0,
   pollSerial = 0,
@@ -44,33 +59,92 @@ let serial = 0,
   controller: AbortController | undefined,
   pending: Record<string, unknown> | undefined;
 const failed = ref(false);
+const displayError = computed(() => error.value || revalidationError.value);
 const atMs = computed(() => Math.max(0, Math.round(r.position * 1000)));
-const visible = computed(() =>
-  displayedComments(
-    comments.value,
-    atMs.value,
-    hideFuture.value,
-    ordered.value,
-  ),
-);
 const currentSelected = computed(
   () => !!current.value && selected.value === current.value.id,
 );
+const historicalCutoff = computed({
+  get: () => historyCutoffs.value[selected.value] ?? "",
+  set: (value: number | "") => {
+    historyCutoffs.value[selected.value] = value;
+  },
+});
+const cutoff = computed(() =>
+  currentSelected.value
+    ? atMs.value
+    : historicalCutoffMs(historicalCutoff.value),
+);
+const visible = computed(() =>
+  hideFuture.value && cutoff.value === null
+    ? []
+    : displayedComments(
+        comments.value,
+        cutoff.value ?? 0,
+        hideFuture.value,
+        ordered.value,
+      ),
+);
+const displayActive = computed(
+  () => opened.value && props.visible && pageVisible.value,
+);
+const emptyMessage = computed(() => {
+  if (!selected.value) return "请选择观影场次";
+  if (hideFuture.value && cutoff.value === null)
+    return "请设置此历史场次的浏览截止，或取消隐藏以显示全部已加载评论";
+  if (comments.value.length) return "已加载的评论在当前筛选截止之后";
+  return nextBefore.value
+    ? "当前页暂无评论，可继续加载更早评论"
+    : "此场次暂无评论";
+});
 const prefix = () => `/rooms/${r.room?.id}/timeline`;
-function reset() {
-  ++serial;
+function cancelRevalidation() {
+  revalidationInFlight?.abort();
+  revalidationInFlight = undefined;
+}
+function pauseDisplay() {
+  ++pollSerial;
+  cancelRevalidation();
   controller?.abort();
   clearTimeout(timer);
-  comments.value = [];
-  activities.value = [];
-  selected.value = "";
-  current.value = null;
-  reactions.value = [];
+}
+function discardPending(clearDraft = false) {
+  ++submissionSerial;
   pending = undefined;
   failed.value = false;
   busy.value = false;
+  if (clearDraft) text.value = "";
+}
+function clearWindow() {
+  ++windowSerial;
+  cancelRevalidation();
+  comments.value = [];
+  nextBefore.value = null;
+  latestPage = [];
+  latestBefore = null;
+  browsingOlder.value = false;
+  newerAvailable.value = false;
+  loadingOlder.value = false;
+  reactions.value = [];
+}
+function reset() {
+  ++serial;
+  pauseDisplay();
+  clearWindow();
+  activities.value = [];
+  selected.value = "";
+  current.value = null;
+  discardPending(true);
+  historyCutoffs.value = {};
+  revalidateOnDisplay = false;
+  revalidationError.value = "";
   error.value = "";
   manageOpen.value = false;
+  canModerate.value = false;
+  canAssign.value = false;
+  members.value = [];
+  target.value = "";
+  reason.value = "";
   audit.value = [];
 }
 function activeRequest() {
@@ -81,6 +155,7 @@ function activeRequest() {
 async function load(before?: string) {
   const room = r.room?.id,
     sequence = serial,
+    window = windowSerial,
     activity = selected.value;
   if (!room || !activity) return;
   const value = await session.api(
@@ -89,20 +164,76 @@ async function load(before?: string) {
     undefined,
     AbortSignal.timeout(15000),
   );
-  if (sequence !== serial || r.room?.id !== room || selected.value !== activity)
+  if (
+    sequence !== serial ||
+    window !== windowSerial ||
+    r.room?.id !== room ||
+    selected.value !== activity
+  )
     return;
   const page = parseTimelinePage(value, activity);
-  comments.value = mergeTimeline(comments.value, page.items);
-  if (before || comments.value.length <= 100)
+  if (before) {
+    comments.value = mergeTimelineWindow(comments.value, page.items, "older");
     nextBefore.value = page.nextBefore;
+    browsingOlder.value = true;
+  } else {
+    const previousLatest = latestPage.at(-1)?.id;
+    latestPage = mergeTimelineWindow(latestPage, page.items, "latest").slice(
+      -100,
+    );
+    latestBefore = page.nextBefore;
+    if (browsingOlder.value) {
+      comments.value = mergeTimelineWindow(
+        comments.value,
+        page.items,
+        "refresh",
+      );
+      if (previousLatest && latestPage.at(-1)?.id !== previousLatest)
+        newerAvailable.value = true;
+    } else {
+      comments.value = mergeTimelineWindow(
+        comments.value,
+        page.items,
+        "latest",
+      );
+      nextBefore.value =
+        comments.value.length > page.items.length
+          ? (comments.value[0]?.id ?? null)
+          : page.nextBefore;
+    }
+  }
+}
+async function loadEarlier() {
+  if (!nextBefore.value || loadingOlder.value) return;
+  const sequence = serial,
+    window = windowSerial;
+  loadingOlder.value = true;
+  try {
+    await load(nextBefore.value);
+  } catch (e) {
+    if (sequence === serial && window === windowSerial)
+      error.value = e instanceof Error ? e.message : "更早评论加载失败";
+  } finally {
+    if (sequence === serial && window === windowSerial)
+      loadingOlder.value = false;
+  }
+}
+function returnLatest() {
+  ++windowSerial;
+  comments.value = [...latestPage];
+  nextBefore.value = latestBefore;
+  browsingOlder.value = false;
+  newerAvailable.value = false;
+  loadingOlder.value = false;
+  pauseDisplay();
+  if (displayActive.value) void refresh();
 }
 async function refresh() {
-  if (!opened.value || !r.room?.id) return;
+  if (!displayActive.value || !r.room?.id) return;
   const room = r.room.id,
     sequence = serial,
     poll = ++pollSerial;
   try {
-    if (document.hidden) return;
     const result = await session.api<{
       activity: unknown;
       can_moderate: boolean;
@@ -113,14 +244,13 @@ async function refresh() {
     const activity = result.activity ? parseActivity(result.activity) : null,
       previous = current.value?.id;
     current.value = activity;
+    if (pending && pending.activity_id !== activity?.id) discardPending(true);
     canModerate.value = result.can_moderate === true;
     canAssign.value = result.can_assign_moderator === true;
     if (!selected.value || selected.value === previous) {
       if (selected.value !== activity?.id) {
         selected.value = activity?.id ?? "";
-        comments.value = [];
-        nextBefore.value = null;
-        reactions.value = [];
+        clearWindow();
       }
     }
     const list = await session.api<{ items: unknown[] }>(
@@ -135,6 +265,12 @@ async function refresh() {
       throw new TypeError("场次列表无效");
     activities.value = list.items.map(parseActivity);
     if (selected.value) await load();
+    if (sequence !== serial || poll !== pollSerial || r.room?.id !== room)
+      return;
+    // Retry a failed reconnect check at the existing bounded polling cadence.
+    if (revalidateOnDisplay) await revalidateCached();
+    if (sequence !== serial || poll !== pollSerial || r.room?.id !== room)
+      return;
     if (currentSelected.value && showReactions.value) {
       const events = await session.api<{
         items: { id: string; emoji: string; expires_at: number }[];
@@ -176,34 +312,44 @@ async function refresh() {
     )
       error.value = e instanceof Error ? e.message : "评论加载失败";
   } finally {
-    if (sequence === serial && poll === pollSerial && opened.value)
-      timer = setTimeout(() => void refresh(), error.value ? 10000 : 3000);
+    if (sequence === serial && poll === pollSerial && displayActive.value)
+      timer = setTimeout(
+        () => void refresh(),
+        displayError.value ? 10000 : 3000,
+      );
   }
 }
+watch([() => r.room?.id, () => session.epoch], () => {
+  reset();
+  if (displayActive.value) void refresh();
+});
+watch(displayActive, (active) => {
+  pauseDisplay();
+  if (active) {
+    if (revalidateOnDisplay) void revalidateCached();
+    void refresh();
+  }
+});
 watch(
-  () => [opened.value, r.room?.id, session.epoch] as const,
+  [
+    () => r.state?.media_id,
+    () => r.state?.media_generation,
+    () => r.room?.lifecycle_epoch,
+  ],
   () => {
-    reset();
-    if (opened.value) void refresh();
-  },
-);
-watch(
-  () =>
-    [
-      r.state?.media_id,
-      r.state?.media_generation,
-      r.room?.lifecycle_epoch,
-    ] as const,
-  () => {
-    if (opened.value) {
-      clearTimeout(timer);
-      controller?.abort();
-      ++serial;
-      void refresh();
-    }
+    // A new media/lifecycle context cannot reuse a submission from the old one.
+    ++serial;
+    discardPending(true);
+    if (selected.value === current.value?.id) selected.value = "";
+    current.value = null;
+    pauseDisplay();
+    if (displayActive.value) void refresh();
   },
 );
 function tombstone(ids: ReadonlySet<string>) {
+  latestPage = latestPage.map((m) =>
+    ids.has(m.id) ? { ...m, deleted: true, body: "" } : m,
+  );
   comments.value = comments.value.map((m) =>
     ids.has(m.id) ? { ...m, deleted: true, body: "" } : m,
   );
@@ -220,43 +366,68 @@ watch(
     tombstone(new Set(r.messages.filter((m) => m.deleted).map((m) => m.id))),
   { deep: true },
 );
+async function revalidateCached() {
+  if (!r.connected || !displayActive.value || revalidationInFlight) return;
+  const token = new AbortController(),
+    sequence = serial,
+    window = windowSerial,
+    room = r.room?.id,
+    cached = [...new Set([...comments.value, ...latestPage].map((m) => m.id))];
+  revalidationInFlight = token;
+  try {
+    for (let i = 0; i < cached.length; i += 100) {
+      if (!r.connected || !displayActive.value) return;
+      const history = await session.api<{ id: string; deleted?: boolean }[]>(
+        `/rooms/${room}/messages?check_ids=${cached.slice(i, i + 100).join(",")}`,
+        "GET",
+        undefined,
+        AbortSignal.any([token.signal, AbortSignal.timeout(15000)]),
+      );
+      if (
+        sequence !== serial ||
+        window !== windowSerial ||
+        revalidationInFlight !== token ||
+        r.room?.id !== room
+      )
+        return;
+      tombstone(new Set(history.filter((m) => m.deleted).map((m) => m.id)));
+    }
+    if (r.connected && revalidationInFlight === token) {
+      revalidateOnDisplay = false;
+      revalidationError.value = "";
+    }
+  } catch (e) {
+    if (
+      sequence === serial &&
+      window === windowSerial &&
+      revalidationInFlight === token
+    ) {
+      revalidationError.value =
+        e instanceof Error ? e.message : "评论删除状态核对失败";
+    }
+  } finally {
+    if (revalidationInFlight === token) revalidationInFlight = undefined;
+  }
+}
 watch(
   () => r.connected,
-  async (connected, previous) => {
-    if (!connected || previous || !opened.value || !comments.value.length)
-      return;
-    const sequence = serial,
-      room = r.room?.id,
-      cached = comments.value.map((m) => m.id);
-    try {
-      for (let i = 0; i < cached.length; i += 100) {
-        const history = await session.api<{ id: string; deleted?: boolean }[]>(
-          `/rooms/${room}/messages?check_ids=${cached.slice(i, i + 100).join(",")}`,
-        );
-        if (sequence !== serial || r.room?.id !== room) return;
-        tombstone(new Set(history.filter((m) => m.deleted).map((m) => m.id)));
-      }
-    } catch (e) {
-      if (sequence === serial)
-        error.value = e instanceof Error ? e.message : "评论删除状态核对失败";
-    }
+  (connected, previous) => {
+    if (!connected) {
+      revalidateOnDisplay = true;
+      cancelRevalidation();
+    } else if (!previous && revalidateOnDisplay) void revalidateCached();
   },
 );
 watch(selected, async (value, old) => {
   if (value === old) return;
-  comments.value = [];
-  nextBefore.value = null;
-  reactions.value = [];
+  clearWindow();
+  const sequence = serial,
+    window = windowSerial;
   try {
     await load();
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
-  }
-});
-watch(text, () => {
-  if (!busy.value && failed.value) {
-    pending = undefined;
-    failed.value = false;
+    if (sequence === serial && window === windowSerial)
+      error.value = e instanceof Error ? e.message : String(e);
   }
 });
 async function send() {
@@ -268,7 +439,8 @@ async function send() {
   )
     return;
   const room = r.room?.id,
-    sequence = serial;
+    sequence = serial,
+    submission = ++submissionSerial;
   error.value = "";
   busy.value = true;
   pending ??= {
@@ -280,6 +452,7 @@ async function send() {
       ? { media_time_ms: atMs.value }
       : {}),
   };
+  const activity = String(pending.activity_id);
   try {
     const result = await session.api<{ message: unknown }>(
       `${prefix()}/messages`,
@@ -287,23 +460,39 @@ async function send() {
       pending,
       AbortSignal.timeout(15000),
     );
-    if (sequence !== serial || r.room?.id !== room) return;
+    if (
+      sequence !== serial ||
+      submission !== submissionSerial ||
+      r.room?.id !== room
+    )
+      return;
     const page = parseTimelinePage(
       { items: [result.message], next_before: null, next_after: null },
-      selected.value,
+      activity,
     );
-    comments.value = mergeTimeline(comments.value, page.items);
+    if (selected.value === activity) {
+      comments.value = mergeTimelineWindow(
+        comments.value,
+        page.items,
+        browsingOlder.value ? "refresh" : "latest",
+      );
+      latestPage = mergeTimelineWindow(latestPage, page.items, "latest").slice(
+        -100,
+      );
+      if (browsingOlder.value) newerAvailable.value = true;
+    }
     pending = undefined;
     failed.value = false;
     text.value = "";
   } catch (e) {
-    if (sequence === serial) {
+    if (sequence === serial && submission === submissionSerial) {
       failed.value = true;
       error.value =
         e instanceof Error ? e.message : "评论未确认，请用原编号重试";
     }
   } finally {
-    if (sequence === serial) busy.value = false;
+    if (sequence === serial && submission === submissionSerial)
+      busy.value = false;
   }
 }
 async function react(emoji: string) {
@@ -366,10 +555,7 @@ async function moderation(messageId?: string) {
     });
     if (sequence !== serial) return;
     reason.value = "";
-    if (messageId)
-      comments.value = comments.value.map((m) =>
-        m.id === messageId ? { ...m, deleted: true, body: "" } : m,
-      );
+    if (messageId) tombstone(new Set([messageId]));
   } catch (e) {
     if (sequence === serial)
       error.value = e instanceof Error ? e.message : String(e);
@@ -388,7 +574,16 @@ async function showAudit() {
     error.value = e instanceof Error ? e.message : String(e);
   }
 }
-onBeforeUnmount(() => reset());
+function visibilityChanged() {
+  pageVisible.value = !document.hidden;
+}
+onMounted(() =>
+  document.addEventListener("visibilitychange", visibilityChanged),
+);
+onBeforeUnmount(() => {
+  document.removeEventListener("visibilitychange", visibilityChanged);
+  reset();
+});
 </script>
 <template>
   <section class="timeline-chat" aria-label="时间轴评论">
@@ -423,22 +618,52 @@ onBeforeUnmount(() => reset());
       </p>
       <div class="timeline-preferences">
         <label
-          ><input
-            v-model="hideFuture"
-            type="checkbox"
-          />隐藏当前进度之后的评论</label
+          ><input v-model="hideFuture" type="checkbox" />{{
+            currentSelected
+              ? "隐藏当前进度之后的评论"
+              : "隐藏浏览截止之后的评论"
+          }}</label
         ><label
           ><input v-model="ordered" type="checkbox" />按影片时间排序</label
         >
       </div>
-      <p class="helper">
+      <p v-if="currentSelected" class="helper">
         当前画面 {{ timeLabel(atMs) }}；隐藏未来评论仅影响展示
       </p>
-      <button v-if="nextBefore" :disabled="busy" @click="load(nextBefore)">
-        加载更早评论
+      <template v-else-if="selected">
+        <label
+          >历史浏览截止（秒）<input
+            v-model.number="historicalCutoff"
+            type="number"
+            min="0"
+            max="604800"
+            step="1"
+            placeholder="填写此场次已观看的秒数"
+        /></label>
+        <p class="helper">
+          历史场次独立筛选，不跟随当前影片进度
+          <template v-if="cutoff !== null"
+            >；浏览截止 {{ timeLabel(cutoff) }}</template
+          >
+        </p>
+      </template>
+      <button
+        v-if="nextBefore"
+        :disabled="busy || loadingOlder"
+        @click="loadEarlier"
+      >
+        {{ loadingOlder ? "正在加载更早评论…" : "加载更早评论" }}
       </button>
-      <div class="timeline-log" role="log" aria-live="polite">
-        <p v-if="!visible.length" class="helper">当前没有可显示的评论</p>
+      <button v-if="browsingOlder" @click="returnLatest">返回最新评论</button>
+      <p v-if="newerAvailable" class="helper" role="status">
+        有新评论，返回最新评论查看
+      </p>
+      <div
+        class="timeline-log"
+        role="log"
+        :aria-live="currentSelected && !browsingOlder ? 'polite' : 'off'"
+      >
+        <p v-if="!visible.length" class="helper">{{ emptyMessage }}</p>
         <article v-for="m in visible" :key="m.id">
           <b>{{ m.display_name }}</b
           ><small
@@ -468,7 +693,7 @@ onBeforeUnmount(() => reset());
           >时间轴评论<input
             v-model="text"
             maxlength="2000"
-            :disabled="busy || !r.roomActive"
+            :disabled="busy || failed || !r.roomActive"
             placeholder="评论当前画面" /></label
         ><button
           class="primary"
@@ -481,8 +706,8 @@ onBeforeUnmount(() => reset());
           v-if="failed"
           type="button"
           @click="
-            pending = undefined;
-            failed = false;
+            discardPending();
+            error = '';
           "
         >
           放弃未确认消息
@@ -515,7 +740,7 @@ onBeforeUnmount(() => reset());
           >
         </div>
       </div>
-      <p v-if="error" class="error" role="alert">{{ error }}</p>
+      <p v-if="displayError" class="error" role="alert">{{ displayError }}</p>
       <button v-if="canModerate" @click="manage">管理聊天</button>
       <div v-if="manageOpen && canModerate" class="moderation-form">
         <label

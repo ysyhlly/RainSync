@@ -10,7 +10,7 @@ async function sameVideo(page: import("@playwright/test").Page) {
   ).toBe(true);
 }
 
-test("empty rooms keep common actions visible and use panel switching at every single-column width", async ({
+test("empty rooms keep common actions and independent widgets visible at every width", async ({
   page,
 }, info) => {
   const app = await appFixture(page);
@@ -20,43 +20,35 @@ test("empty rooms keep common actions visible and use panel switching at every s
   await expect(
     page.getByRole("heading", { name: "开始一起观看" }),
   ).toBeVisible();
+  const actions = page.locator(".room-permanent-actions");
   await expect(
-    page
-      .locator(".room-tools")
-      .getByRole("button", { name: "房间邀请", exact: true }),
+    actions.getByRole("button", { name: "邀请", exact: true }),
   ).toBeInViewport();
-  const opening = await page.locator(".room-opening").boundingBox();
+  const opening = await page.locator(".room-command-bar").boundingBox();
   expect(opening?.y).toBeLessThan(350);
   await page.evaluate(() => {
     (window as any).__firstRoundVideo = document.querySelector("video");
   });
-  const tabs = page.getByRole("tablist", { name: "房间面板" });
+  // Independent widgets replace the former mutually exclusive chat/queue tabs.
   for (const width of [768, 1024, 1279]) {
     await page.setViewportSize({ width, height: 768 });
-    await expect(tabs).toBeVisible();
-    await page.getByRole("tab", { name: "待播", exact: true }).click();
-    await expect(page.locator("#room-chat")).toBeHidden();
+    await expect(page.locator("#room-chat")).toBeVisible();
+    await expect(page.locator("#room-queue")).toBeVisible();
     await expect(
-      page.getByRole("heading", { name: "待播列表", exact: true }),
+      actions.getByRole("button", { name: "邀请", exact: true }),
     ).toBeVisible();
-    await expect(
-      page
-        .locator(".room-tools")
-        .getByRole("button", { name: "房间邀请", exact: true }),
-    ).toBeVisible();
-    await expect(page.locator(".platform-import")).toBeHidden();
-    await page.getByRole("tab", { name: "聊天", exact: true }).click();
-    await expect(page.locator("#room-queue")).toBeHidden();
+    await expect(page.locator(".room-platform-import")).toBeHidden();
   }
-  await page
-    .locator(".room-tools")
-    .getByRole("button", { name: "粘贴平台链接" })
-    .click();
+  await actions.getByRole("button", { name: "粘贴平台链接" }).click();
+  await expect(
+    page.getByRole("dialog", { name: "添加平台视频" }),
+  ).toBeVisible();
   await expect(page.getByLabel("视频链接或分享文字")).toBeFocused();
   await expect(page.locator("#room-queue")).toBeVisible();
-  await expect(page.locator(".platform-import")).toBeVisible();
+  await expect(page.locator(".room-platform-import")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "添加平台视频" })).toBeHidden();
   await page.setViewportSize({ width: 1440, height: 900 });
-  await expect(tabs).toBeHidden();
   await expect(page.locator("#room-chat")).toBeVisible();
   await expect(page.locator("#room-queue")).toBeVisible();
   await sameVideo(page);
@@ -82,13 +74,13 @@ test("viewers in an empty room receive the waiting explanation without selection
     page.getByText("等待有控制权限的成员选择影片，你可以先在聊天中交流。"),
   ).toBeVisible();
   await expect(
-    page.getByRole("link", { name: "从媒体库选片", exact: true }),
+    page.getByRole("link", { name: "选择影片", exact: true }),
   ).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "粘贴平台链接", exact: true }),
   ).toHaveCount(0);
   await expect(
-    page.getByRole("button", { name: "房间邀请", exact: true }),
+    page.getByRole("button", { name: "邀请", exact: true }),
   ).toHaveCount(0);
   expect(app.preparations()).toBe(0);
   expect(app.errors).toEqual([]);

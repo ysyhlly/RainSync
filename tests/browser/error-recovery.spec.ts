@@ -32,11 +32,13 @@ test("playback denial has one diagnostic and preserves room controls with unknow
     .locator(".video-frame")
     .dispatchEvent("pointermove", { pointerType: "mouse" });
   await expect(page.locator(".playback-time")).toContainText("时长未知");
-  await expect(page.getByRole("slider", { name: "房间播放进度" })).toBeDisabled();
+  await expect(
+    page.getByRole("slider", { name: "房间播放进度" }),
+  ).toBeDisabled();
   await page
     .locator(".video-frame")
     .dispatchEvent("pointermove", { pointerType: "mouse" });
-  const play = page.getByRole("button", { name: "开始房间播放" });
+  const play = page.getByRole("button", { name: "播放房间", exact: true });
   await expect(play).toBeEnabled();
   await page.locator(".video-frame").hover();
   await play.click();
@@ -328,8 +330,7 @@ test("platform import failures show a safe reason, code, HTTP status and item di
     }),
   );
   await page.goto("/rooms/room");
-  const queueTab = page.getByRole("tab", { name: "待播", exact: true });
-  if (await queueTab.isVisible()) await queueTab.click();
+  await page.getByRole("button", { name: "粘贴平台链接", exact: true }).click();
   await page
     .getByRole("textbox", { name: /平台视频链接|视频链接|链接或分享文本/ })
     .fill("https://www.youtube.com/watch?v=aqz-KE-bpKQ");

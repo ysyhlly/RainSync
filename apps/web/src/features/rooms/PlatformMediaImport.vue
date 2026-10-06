@@ -31,11 +31,28 @@ const url = ref(""),
   provider = ref<NativePlatformProvider>("bilibili"),
   credentialMode = ref<NativePlatformCredentialMode>("anonymous"),
   collection = ref(false),
-  busy = ref(false),
+  phase = ref<
+    "idle" | "preview" | "preview-page" | "checking-import" | "import-submitted"
+  >("idle"),
   error = ref(""),
   preview = ref<PlatformImportPreview>(),
   selected = ref<string[]>([]),
   outcomes = ref<PlatformImportOutcome[]>([]);
+const busy = computed(() => phase.value !== "idle");
+const workLabel = computed(() => {
+  switch (phase.value) {
+    case "preview":
+      return "正在预览…";
+    case "preview-page":
+      return "正在预览下一页…";
+    case "checking-import":
+      return "正在检查导入条件…";
+    case "import-submitted":
+      return "正在等待导入结果…";
+    default:
+      return "";
+  }
+});
 const canControl = computed(
     () => r.roomActive && r.can("queue") && r.connected && !!r.room,
   ),
@@ -50,7 +67,7 @@ const work = createPlatformImportFence(() => ({
 }));
 function invalidate() {
   work.retire();
-  busy.value = false;
+  phase.value = "idle";
   preview.value = undefined;
   selected.value = [];
   outcomes.value = [];
@@ -81,7 +98,7 @@ async function previewVideos(continuation?: string) {
     chosenProvider = provider.value,
     isCollection = collection.value,
     mode = credentialMode.value;
-  busy.value = true;
+  phase.value = continuation ? "preview-page" : "preview";
   error.value = "";
   if (!continuation) {
     preview.value = undefined;
@@ -130,7 +147,7 @@ async function previewVideos(continuation?: string) {
     if (work.current(request))
       error.value = e instanceof Error ? e.message : "预览失败，请重试";
   } finally {
-    if (!request.signal.aborted && work.current(request)) busy.value = false;
+    if (!request.signal.aborted && work.current(request)) phase.value = "idle";
   }
 }
 async function importSelected(keys = selected.value) {
@@ -146,7 +163,7 @@ async function importSelected(keys = selected.value) {
     request = work.begin(),
     reviewed = preview.value,
     mode = credentialMode.value;
-  busy.value = true;
+  phase.value = "checking-import";
   error.value = "";
   try {
     const shortProviders = [
@@ -186,6 +203,7 @@ async function importSelected(keys = selected.value) {
         : {};
     if (!work.current(request)) return;
     const items = selectedPlatformImportItems(reviewed, keys, mode, statuses);
+    phase.value = "import-submitted";
     const value = await api.importPlatformBatch(room, items, request.signal);
     if (!work.current(request)) return;
     const merged = new Map(outcomes.value.map((o) => [o.key, o]));
@@ -200,17 +218,26 @@ async function importSelected(keys = selected.value) {
     if (work.current(request))
       error.value =
         (e instanceof Error ? e.message : "导入失败") +
-        "；结果未确认时可重试同一批条目，房间内不会重复创建";
+        (phase.value === "import-submitted"
+          ? "；结果未确认时可重试同一批条目，房间内不会重复创建"
+          : "；本次尚未提交导入，可检查后重试");
   } finally {
-    if (!request.signal.aborted && work.current(request)) busy.value = false;
+    if (!request.signal.aborted && work.current(request)) phase.value = "idle";
   }
 }
 function cancelWork() {
+  if (!busy.value) return;
+  const stopped = phase.value;
   work.retire();
-  busy.value = false;
-  error.value = preview.value
-    ? "已停止等待；服务端可能已导入部分条目。可重试同一批所选条目，房间内不会重复创建"
-    : "已停止等待预览，可重新预览";
+  phase.value = "idle";
+  error.value =
+    stopped === "import-submitted"
+      ? "已停止等待导入结果；服务端可能已导入部分条目。可重试同一批所选条目，房间内不会重复创建"
+      : stopped === "checking-import"
+        ? "已停止导入前检查，本次尚未提交导入；已显示的候选和选择保留"
+        : stopped === "preview-page"
+          ? "已停止等待本页预览，已显示的候选和选择保留"
+          : "已停止等待预览，可重新预览";
 }
 function selectAll() {
   selected.value =
@@ -272,7 +299,7 @@ function selectAll() {
         翻页绑定同一会话与合集，所选单集仍逐条验证完整观看权限。
       </p>
       <button class="primary" :disabled="busy || !url.trim() || !canControl">
-        {{ busy ? "正在处理…" : "预览可导入条目" }}
+        {{ busy ? workLabel : "预览可导入条目" }}
       </button>
     </form>
     <p class="helper">
@@ -288,6 +315,7 @@ function selectAll() {
       合集元数据不能替代每位观众独立的完整观看权限。
     </p>
     <p v-if="!r.can('queue')" class="helper">由房主导入并选择播放。</p>
+    <p v-if="busy" class="helper" role="status">{{ workLabel }}</p>
     <button v-if="busy" @click="cancelWork">停止等待</button>
     <Notice :message="error" error />
     <div v-if="preview" class="confirm-panel">
@@ -407,7 +435,7 @@ function selectAll() {
             :disabled="busy || !selected.length || !canControl"
             @click="importSelected()"
           >
-            {{ busy ? "正在导入…" : `导入所选 ${selected.length} 条` }}</button
+            {{ busy ? workLabel : `导入所选 ${selected.length} 条` }}</button
           ><button
             v-if="retryKeys.length"
             :disabled="busy || !canControl"

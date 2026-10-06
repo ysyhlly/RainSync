@@ -16,16 +16,22 @@ import PlaybackSettings from "./PlaybackSettings.vue";
 import PlaybackPreparation from "./PlaybackPreparation.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import { createPlayerChrome } from "./use-player-chrome";
+import { useRoomNotice } from "./room-notice";
 import {
   SubtitleLoadState,
   type SubtitleResource,
 } from "./subtitle-load-state";
-const props = defineProps<{ full: boolean }>();
+const props = defineProps<{
+  full: boolean;
+  anchor?: HTMLElement | null;
+  layoutEditing?: boolean;
+}>();
 const emit = defineEmits<{ miniResize: [height: number] }>();
 const r = useRoomRuntime(),
   element = ref<HTMLVideoElement>(),
   host = ref<HTMLElement>(),
   fullscreenError = ref("");
+const runtimeNotice = useRoomNotice(r);
 const miniCollapsed = ref(false);
 const shortViewport = matchMedia("(max-height: 500px)");
 function adaptMini() {
@@ -41,17 +47,141 @@ let miniObserver: ResizeObserver | undefined;
 function measureMini() {
   emit(
     "miniResize",
-    !props.full && !fullscreen.value && r.room
-      && !emptyRoom.value
+    !props.full && !fullscreen.value && r.room && !emptyRoom.value
       ? Math.ceil(host.value?.getBoundingClientRect().height ?? 0)
       : 0,
   );
 }
 const chrome = createPlayerChrome(matchMedia("(pointer: coarse)").matches);
 const { visible, fullscreen, hideCursor } = chrome;
-const emptyRoom = computed(() =>
-  !!r.state && !r.state.media_id && r.connected &&
-  !preparationVisible.value && !r.waiting && !r.blocked && !r.error && !r.recoveryLabel,
+const layoutLocked = computed(
+  () =>
+    !!(props.full && props.anchor && props.layoutEditing && !fullscreen.value),
+);
+watch(layoutLocked, (locked) => {
+  if (!locked) return;
+  chrome.setKeyboardFocus(false);
+  const active = document.activeElement;
+  if (active instanceof HTMLElement && host.value?.contains(active))
+    active.blur();
+});
+
+// The global host never changes parent or identity. A room widget contributes
+// only a measured box; CSS placement cannot trigger attach() or loadMedia().
+const anchorBox = shallowRef<{
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}>();
+let placementFrame = 0;
+let anchorObserver: ResizeObserver | undefined;
+let layoutObserver: MutationObserver | undefined;
+function measurePlacement() {
+  placementFrame = 0;
+  const anchor = props.anchor;
+  const parent = host.value?.offsetParent as HTMLElement | null;
+  if (!props.full || !anchor?.isConnected || !parent || fullscreen.value)
+    return;
+  const rect = anchor.getBoundingClientRect();
+  const origin = parent.getBoundingClientRect();
+  const next = {
+    left: rect.left - origin.left + parent.scrollLeft - parent.clientLeft,
+    top: rect.top - origin.top + parent.scrollTop - parent.clientTop,
+    width: rect.width,
+    height: rect.height,
+  };
+  const old = anchorBox.value;
+  if (
+    !old ||
+    Object.keys(next).some(
+      (key) => next[key as keyof typeof next] !== old[key as keyof typeof old],
+    )
+  )
+    anchorBox.value = next;
+}
+function schedulePlacement() {
+  if (!placementFrame) placementFrame = requestAnimationFrame(measurePlacement);
+}
+function ancestorMotionSettled(event: Event) {
+  // RouterView animates the page ancestor, outside the observed canvas subtree.
+  // Re-read the final box after that motion; no permanent animation loop needed.
+  if (
+    event.target instanceof Element &&
+    props.anchor &&
+    event.target.contains(props.anchor)
+  )
+    schedulePlacement();
+}
+const placementStyle = computed(() => {
+  if (!props.full || !props.anchor || fullscreen.value) return undefined;
+  const box = anchorBox.value;
+  return box
+    ? {
+        left: `${box.left}px`,
+        top: `${box.top}px`,
+        width: `${box.width}px`,
+        height: `${box.height}px`,
+      }
+    : { visibility: "hidden" as const };
+});
+watch(
+  () => [props.anchor, props.full] as const,
+  async (_value, _oldValue, onCleanup) => {
+    let active = true;
+    onCleanup(() => {
+      active = false;
+      anchorObserver?.disconnect();
+      layoutObserver?.disconnect();
+    });
+    anchorObserver?.disconnect();
+    layoutObserver?.disconnect();
+    anchorBox.value = undefined;
+    await nextTick();
+    if (active && props.full && props.anchor?.isConnected) {
+      anchorObserver = new ResizeObserver(schedulePlacement);
+      anchorObserver.observe(props.anchor);
+      if (host.value?.parentElement)
+        anchorObserver.observe(host.value.parentElement);
+      const canvas = props.anchor.closest(".room-layout-canvas");
+      if (canvas) {
+        layoutObserver = new MutationObserver(schedulePlacement);
+        layoutObserver.observe(canvas, {
+          subtree: true,
+          attributes: true,
+          childList: true,
+          attributeFilter: ["style", "class", "hidden"],
+        });
+        // Class removal also covers reduced-motion/zero-duration transitions.
+        for (
+          let ancestor = canvas.parentElement;
+          ancestor && ancestor !== host.value?.parentElement;
+          ancestor = ancestor.parentElement
+        )
+          layoutObserver.observe(ancestor, {
+            attributes: true,
+            attributeFilter: ["style", "class", "hidden"],
+          });
+      }
+      measurePlacement();
+    }
+  },
+  { flush: "post" },
+);
+watch(fullscreen, () => {
+  void nextTick().then(schedulePlacement);
+});
+
+const emptyRoom = computed(
+  () =>
+    !!r.state &&
+    !r.state.media_id &&
+    r.connected &&
+    !preparationVisible.value &&
+    !r.waiting &&
+    !r.blocked &&
+    !r.error &&
+    !r.recoveryLabel,
 );
 const preparationVisible = computed(
   () =>
@@ -75,7 +205,13 @@ watch(
   { immediate: true },
 );
 watch(
-  () => [props.full, fullscreen.value, miniCollapsed.value, r.room?.id, emptyRoom.value],
+  () => [
+    props.full,
+    fullscreen.value,
+    miniCollapsed.value,
+    r.room?.id,
+    emptyRoom.value,
+  ],
   () => {
     void nextTick().then(measureMini);
   },
@@ -133,6 +269,7 @@ function pointer() {
   chrome.setKeyboardFocus(false);
 }
 function key(event: KeyboardEvent) {
+  if (layoutLocked.value) return;
   if (event.key === "Tab" || event.key.startsWith("Arrow")) {
     keyboard = true;
     chrome.activity();
@@ -183,6 +320,13 @@ watch(
   },
 );
 onMounted(() => {
+  document.addEventListener("transitionend", ancestorMotionSettled, true);
+  document.addEventListener("transitioncancel", ancestorMotionSettled, true);
+  document.addEventListener("animationend", ancestorMotionSettled, true);
+  document.addEventListener("animationcancel", ancestorMotionSettled, true);
+  window.addEventListener("resize", schedulePlacement);
+  window.addEventListener("scroll", schedulePlacement, true);
+  window.visualViewport?.addEventListener("resize", schedulePlacement);
   shortViewport.addEventListener("change", adaptMini);
   if (host.value) {
     miniObserver = new ResizeObserver(measureMini);
@@ -196,6 +340,16 @@ onMounted(() => {
   document.addEventListener("pointerdown", pointer, true);
 });
 onBeforeUnmount(() => {
+  cancelAnimationFrame(placementFrame);
+  anchorObserver?.disconnect();
+  layoutObserver?.disconnect();
+  document.removeEventListener("transitionend", ancestorMotionSettled, true);
+  document.removeEventListener("transitioncancel", ancestorMotionSettled, true);
+  document.removeEventListener("animationend", ancestorMotionSettled, true);
+  document.removeEventListener("animationcancel", ancestorMotionSettled, true);
+  window.removeEventListener("resize", schedulePlacement);
+  window.removeEventListener("scroll", schedulePlacement, true);
+  window.visualViewport?.removeEventListener("resize", schedulePlacement);
   shortViewport.removeEventListener("change", adaptMini);
   miniObserver?.disconnect();
   emit("miniResize", 0);
@@ -211,6 +365,8 @@ onBeforeUnmount(() => {
     ref="host"
     v-show="!!r.room"
     class="playback-host"
+    :style="placementStyle"
+    :inert="layoutLocked"
     :class="[
       full ? 'full-player' : 'mini-player',
       {
@@ -219,6 +375,8 @@ onBeforeUnmount(() => {
         'mini-collapsed': !full && !fullscreen && miniCollapsed,
         'empty-room': emptyRoom,
         'has-room-media': !!r.state?.media_id,
+        'modular-player': full && !!anchor,
+        'layout-editing': full && !!anchor && layoutEditing,
       },
     ]"
     aria-label="房间播放器"
@@ -257,7 +415,9 @@ onBeforeUnmount(() => {
         :cues="r.platformDanmakuCues"
         :enabled="r.platformDanmakuEnabled"
         :video="element"
-        :can-seek="r.can('seek') && r.connected && !r.live && !!r.state?.media_id"
+        :can-seek="
+          r.can('seek') && r.connected && !r.live && !!r.state?.media_id
+        "
         @seek="
           (at) => {
             if (
@@ -273,11 +433,28 @@ onBeforeUnmount(() => {
       />
       <div v-if="!r.state?.media_id" class="player-empty">
         <AppIcon name="movie" :size="40" />
-        <p>{{ !r.state ? '正在读取房间内容…' : !r.roomActive ? '房间当前为只读状态' : '尚未选择影片' }}</p>
-        <p v-if="full && r.state && r.roomActive" class="helper">
-          {{ r.can('change_media') ? '选择一部影片，开始一起观看。' : '等待有控制权限的成员选择影片。' }}
+        <p>
+          {{
+            !r.state
+              ? "正在读取房间内容…"
+              : !r.roomActive
+                ? "房间当前为只读状态"
+                : "尚未选择影片"
+          }}
         </p>
-        <RouterLink v-if="full && r.can('change_media')" class="button primary" to="/library">从媒体库选片</RouterLink>
+        <p v-if="full && r.state && r.roomActive" class="helper">
+          {{
+            r.can("change_media")
+              ? "选择一部影片，开始一起观看。"
+              : "等待有控制权限的成员选择影片。"
+          }}
+        </p>
+        <RouterLink
+          v-if="full && r.can('change_media')"
+          class="button primary"
+          to="/library"
+          >从媒体库选片</RouterLink
+        >
       </div>
       <button
         v-if="r.blocked"
@@ -313,7 +490,13 @@ onBeforeUnmount(() => {
         :room="r.room?.name ?? ''"
         :connected="r.connected"
         :stopped="r.connectionStopped"
-        :owner="r.can('play') || r.can('pause') || r.can('seek') || r.can('set_rate') || r.can('change_media')"
+        :owner="
+          r.can('play') ||
+          r.can('pause') ||
+          r.can('seek') ||
+          r.can('set_rate') ||
+          r.can('change_media')
+        "
       />
       <div
         class="player-chrome"
@@ -336,11 +519,12 @@ onBeforeUnmount(() => {
         </PlaybackControls>
       </div>
       <p
-        v-if="fullscreen && r.error && r.preparation?.phase !== 'failed'"
+        v-for="notice in fullscreen && runtimeNotice ? [runtimeNotice] : []"
+        :key="notice.key"
         class="fullscreen-error"
         role="alert"
       >
-        {{ r.error }} <button @click="r.error = ''">关闭提示</button>
+        {{ notice.message }} <button @click="notice.dismiss">关闭提示</button>
       </p>
       <p v-if="fullscreenError" class="fullscreen-error" role="alert">
         {{ fullscreenError }}
@@ -373,10 +557,17 @@ onBeforeUnmount(() => {
           @retry="r.run(r.loadMedia)"
         />
         <span
-          v-else-if="!full && !fullscreen && (r.recoveryLabel || miniCollapsed || emptyRoom)"
+          v-else-if="
+            !full &&
+            !fullscreen &&
+            (r.recoveryLabel || miniCollapsed || emptyRoom)
+          "
           class="mini-status"
           role="status"
-        >{{ emptyRoom ? '尚未选择影片' : r.recoveryLabel || r.room?.name }}</span>
+          >{{
+            emptyRoom ? "尚未选择影片" : r.recoveryLabel || r.room?.name
+          }}</span
+        >
       </div>
       <RouterLink class="button return-room" :to="'/rooms/' + r.room?.id"
         >返回房间<AppIcon name="next"

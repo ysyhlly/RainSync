@@ -53,7 +53,10 @@ test("room, library, invitation and settings are usable", async ({
         },
       ];
     else if (path.endsWith("/invites"))
-      body = { room_id: "room", token: "invitation-test-token" };
+      body =
+        route.request().method() === "GET"
+          ? []
+          : { room_id: "room", token: "invitation-test-token" };
     await route.fulfill({ json: body });
   });
   await page.routeWebSocket("**/api/v1/ws", (ws) => {
@@ -151,7 +154,8 @@ test("room, library, invitation and settings are usable", async ({
   await page.getByLabel("聊天消息").press("Enter");
   await expect(page.getByText("今晚一起看")).toBeVisible();
   await roomPanel(page, "待播");
-  await page.getByRole("button", { name: "房间邀请", exact: true }).click();
+  await page.getByRole("button", { name: "邀请", exact: true }).click();
+  await page.getByRole("button", { name: "生成邀请", exact: true }).click();
   await expect(page.getByLabel("完整房间邀请")).toHaveValue(
     /invitation-test-token/,
   );
@@ -187,9 +191,13 @@ test("room, library, invitation and settings are usable", async ({
     }),
   );
   await roomPanel(page, "待播");
-  await page.getByRole("button", { name: "房间邀请", exact: true }).click();
+  await page.getByRole("button", { name: "邀请", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText("服务资源正忙");
   await expect(page.getByRole("alert")).toContainText(diagnostic);
+  await page
+    .getByRole("dialog", { name: "房间邀请", exact: true })
+    .getByRole("button", { name: "关闭弹窗" })
+    .click();
   await navigate(page, "媒体库");
   await page.getByRole("link", { name: "返回房间", exact: true }).click();
   await roomPanel(page, "聊天");

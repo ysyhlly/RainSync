@@ -434,7 +434,7 @@ test("reconnect merges missed chat and an old renewal cannot fail the new plan",
   await expect.poll(() => h.preparations.length).toBe(2);
   h.releaseRenew();
   await expect(page.getByRole("alert")).not.toContainText("播放会话已失效");
-  await expect(page.locator(".room-information h1")).toHaveText("a");
+  await expect(page.locator(".room-information-widget h1")).toHaveText("a");
 });
 
 test("rejected chat retains input until its own acknowledgement", async ({
@@ -839,7 +839,7 @@ test("room chooser without a selection preserves the current viewing connection"
   await navigate(page, "放映室");
   await expect(page.locator(".mini-player")).toBeVisible();
   await page.getByRole("link", { name: "返回房间", exact: true }).click();
-  await expect(page.locator(".room-information h1")).toHaveText("a");
+  await expect(page.locator(".room-information-widget h1")).toHaveText("a");
   await page.clock.fastForward(1000);
   expect(h.sockets).toHaveLength(1);
   expect(h.preparations).toHaveLength(1);
