@@ -402,7 +402,10 @@ await isolatedServer(
       ).toBeVisible();
       await expect(admin.locator(".connection-status")).toHaveText("房间连接正常");
       await admin
-        .getByRole("button", { name: "房间邀请", exact: true })
+        .getByRole("button", { name: "邀请", exact: true })
+        .click();
+      await admin
+        .getByRole("button", { name: "生成邀请", exact: true })
         .click();
       const roomInvitation = JSON.parse(
         await admin.getByLabel("完整房间邀请").inputValue(),

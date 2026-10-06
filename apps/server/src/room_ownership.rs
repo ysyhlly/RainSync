@@ -85,6 +85,11 @@ pub async fn transfer(
         membership.is_some(),
     )
     .await?;
+    // The room lock fences close against transfer. Keep the owner stable while
+    // cleanup is draining; settled closed/archived rooms remain transferable.
+    if lifecycle_state == "closing" {
+        return Err(err(StatusCode::CONFLICT, "room_not_active"));
+    }
     if target.is_none() {
         return Err(err(StatusCode::FORBIDDEN, "not_a_member"));
     }
