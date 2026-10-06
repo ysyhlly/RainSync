@@ -1,6 +1,7 @@
 //! Closed ordinary-job media recipes. These are intentionally separate from
 //! the deterministic, capture-owned static-HLS child recipe.
 mod assets;
+mod dolby_vision;
 mod encoder;
 mod hdr;
 mod input;
@@ -15,6 +16,7 @@ pub use assets::{
     AssetCatalog, AssetFile, EXTERNAL_ASS_INDEX, EXTERNAL_PGS_INDEX, EXTERNAL_SSA_INDEX,
     MAX_ASSET_BYTES, OwnedAssets, SubtitleAsset, validate_subtitle_bytes,
 };
+pub use dolby_vision::DolbyVisionSource;
 pub use encoder::{Backend, EncoderPreference, EncoderSelection, FallbackReason};
 pub use hdr::{HdrSource, classify_hdr};
 pub use input::{Input, OwnedLocalInput, WorkerGatewayInput};

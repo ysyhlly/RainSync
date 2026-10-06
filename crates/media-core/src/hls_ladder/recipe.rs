@@ -331,6 +331,7 @@ impl LadderRecipe {
                     height: r.height,
                     bitrate: r.video_maxrate,
                     framerate: 30.0,
+                    dolby_vision: None,
                 },
                 audio: r
                     .audio_bitrate

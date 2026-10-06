@@ -115,6 +115,9 @@ pub struct PlaybackCandidateResult {
     pub progressive: MediaTypeSupport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
+    pub dolby_vision_supported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub mse_supported: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

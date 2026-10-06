@@ -21,6 +21,7 @@ import {
   matchesAdvancedPlaybackPlan,
   sameAdvancedPlaybackRequest,
   validAdvancedPlaybackCapabilities,
+  needsDolbyVisionToneMap,
 } from "./advanced-playback-intent";
 import {
   localHlsLadderRequest,
@@ -2172,6 +2173,14 @@ export function createPlaybackRuntime(ctx: {
           : continuation
           ? { capabilities: continuation.capabilities }
           : await discoverCandidates(metrics, element);
+      if (serial !== loadSerial || !candidateIntentCurrent(metrics)) return;
+      if (!platform && !metrics.distributed && !metrics.advanced && !metrics.ladder && !continuation &&
+        metrics.mode === "auto" && needsDolbyVisionToneMap(advancedCapabilities.value,
+          discovered.concrete?.candidates, discovered.report, failedCandidates)) {
+        toneMapHdr.value = true;
+        await beginLoad("user_intent");
+        return;
+      }
       validateFiniteHlsChoice(metrics.mode, { advanced: metrics.advanced, ladder: metrics.ladder, distributed: metrics.distributed, continuation });
       const finiteParameters = !platform && metrics.mode === "finite_hls"
         ? finiteHlsRequestParameters(metrics.mode, media?.kind, discovered.capabilities)

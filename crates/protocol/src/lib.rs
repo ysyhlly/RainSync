@@ -300,6 +300,9 @@ pub struct VideoCapabilityConfiguration {
     pub height: u32,
     pub bitrate: u32,
     pub framerate: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub dolby_vision: Option<DolbyVisionConfiguration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]

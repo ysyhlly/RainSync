@@ -164,14 +164,19 @@ fn make(
 /// Only a measured hvc1/hev1 MP4 entry and explicit BT.709 SDR are supported.
 fn hevc_codec(stream: &Value) -> Option<String> {
     if stream["codec_name"] != "hevc"
+        || !matches!(stream["codec_tag_string"].as_str(), Some("hvc1" | "hev1"))
         || stream["color_transfer"] != "bt709"
         || stream["color_primaries"] != "bt709"
         || stream["color_space"] != "bt709"
     {
         return None;
     }
+    hevc_parameter_codec(stream)
+}
+
+fn hevc_parameter_codec(stream: &Value) -> Option<String> {
     let tag = stream["codec_tag_string"].as_str()?;
-    if !matches!(tag, "hvc1" | "hev1") {
+    if !matches!(tag, "hvc1" | "hev1" | "dvh1" | "dvhe") {
         return None;
     }
     let bytes = extradata(stream)?;
@@ -205,6 +210,15 @@ fn hevc_codec(stream: &Value) -> Option<String> {
         }
     }
     Some(codec)
+}
+
+fn native_dolby_vision(
+    video: &Value,
+) -> anyhow::Result<Option<crate::advanced_media::DolbyVisionSource>> {
+    // Keep the public candidate refusal compatible with existing HDR clients;
+    // the advanced recipe retains the more specific internal diagnosis.
+    crate::advanced_media::DolbyVisionSource::from_stream(video)
+        .map_err(|_| anyhow::anyhow!("hdr_unsupported"))
 }
 
 /// These are explicit source indicators, not a DRM scan or proof of its absence.
@@ -249,13 +263,15 @@ pub fn validate_motion_source(
 }
 
 fn validate_video_range(video: &Value) -> anyhow::Result<()> {
-    let hdr = matches!(
-        video["color_transfer"].as_str(),
-        Some("smpte2084" | "arib-std-b67")
-    ) || video["side_data_list"].as_array().is_some_and(|rows| {
-        rows.iter()
-            .any(|row| row["side_data_type"] == "DOVI configuration record")
-    });
+    let hdr = matches!(video["codec_tag_string"].as_str(), Some("dvh1" | "dvhe"))
+        || matches!(
+            video["color_transfer"].as_str(),
+            Some("smpte2084" | "arib-std-b67")
+        )
+        || video["side_data_list"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row["side_data_type"] == "DOVI configuration record")
+        });
     anyhow::ensure!(!hdr, "hdr_unsupported");
     // Pixel names are an explicit bounded <=8-bit set, not a heuristic that
     // mistakes missing bits_per_raw_sample or an unfamiliar name for SDR.
@@ -343,7 +359,19 @@ pub fn analyze(
         position_ms.is_finite() && position_ms >= 0.0,
         "invalid_position"
     );
-    let video = validate_source(meta)?;
+    // Candidate analysis may offer an original Dolby Vision file. The ordinary
+    // Worker range validator remains strict, so this never authorizes an SDR
+    // transcode that discards an RPU.
+    let streams = validate_protected_tracks(meta)?;
+    let first = streams
+        .iter()
+        .find(|s| s["codec_type"] == "video")
+        .ok_or_else(|| anyhow::anyhow!("no_video"))?;
+    let video = if native_dolby_vision(first)?.is_some() {
+        first
+    } else {
+        validate_source(meta)?
+    };
     analyze_video(
         meta,
         selected,
@@ -389,6 +417,15 @@ pub fn analyze_legacy_mapped_source(
         }
         Err(error) => return Err(error),
     };
+    if let Some(video) = streams.iter().find(|row| row["codec_type"] == "video")
+        && !crate::motion_video::is_attached_picture(video)
+        && native_dolby_vision(video)?.is_some()
+    {
+        // The legacy map equivalence proof includes the ordinary SDR range
+        // gate. Dolby offers only the original-file route, whose exact track
+        // layout is checked independently; no generated legacy map is used.
+        return analyze(meta, selected_audio, position_ms);
+    }
     let equivalent = match crate::motion_video::legacy_mapping_equivalent(meta, selected_audio) {
         Ok(()) => true,
         Err(error) if error.to_string() == "legacy_stream_mapping_unsupported" => false,
@@ -468,7 +505,14 @@ pub fn analyze_motion_source(
         position_ms.is_finite() && position_ms >= 0.0,
         "invalid_position"
     );
-    let selected = match validate_motion_source(meta) {
+    validate_protected_tracks(meta)?;
+    let motion = crate::motion_video::select(meta);
+    let selected = match motion.and_then(|selected| {
+        if native_dolby_vision(selected.stream)?.is_none() {
+            validate_video_range(selected.stream)?;
+        }
+        Ok(selected)
+    }) {
         Ok(selected) => selected,
         Err(error) if error.to_string() == "no_motion_video" => {
             return Ok(CandidateAnalysis {
@@ -542,8 +586,19 @@ fn analyze_video(
     } else {
         streams.iter().find(|v| v["codec_type"] == "audio")
     };
+    let dolby = native_dolby_vision(video)?;
     let avc = avc_codec(video);
-    let codec = avc.clone().or_else(|| hevc_codec(video));
+    let codec = if let Some(dolby) = dolby {
+        hevc_parameter_codec(video).map(|codec| {
+            if matches!(video["codec_tag_string"].as_str(), Some("dvh1" | "dvhe")) {
+                dolby.codec(video["codec_tag_string"] == "dvhe")
+            } else {
+                codec
+            }
+        })
+    } else {
+        avc.clone().or_else(|| hevc_codec(video))
+    };
     let configuration = codec
         .as_ref()
         .zip(video["width"].as_u64())
@@ -560,6 +615,12 @@ fn analyze_video(
                     height: height as u32,
                     framerate,
                     bitrate: bitrate as u32,
+                    dolby_vision: dolby.map(|source| {
+                        source.configuration(matches!(
+                            video["codec_tag_string"].as_str(),
+                            Some("hev1" | "dvhe")
+                        ))
+                    }),
                 })
         });
     let transform = video_transform
@@ -680,6 +741,17 @@ fn analyze_video(
             ));
         }
     }
+    if dolby.is_some() {
+        decisions.push(PlaybackRouteDecision {
+            candidate_id: "transcode_720p".into(),
+            offered: false,
+            reason: Reason::VideoCopyUnsupported,
+        });
+        return Ok(CandidateAnalysis {
+            candidates: result,
+            route_decisions: decisions,
+        });
+    }
     result.push(make(
         "transcode_720p",
         "transcode",
@@ -691,6 +763,7 @@ fn analyze_video(
             height: 720,
             bitrate: 4000000,
             framerate: 30.0,
+            dolby_vision: None,
         },
         audio.map(|_| output_audio()),
     ));

@@ -511,6 +511,7 @@ pub async fn run(
         let version=claim.spec["source_version"].as_str().unwrap().to_owned();
         let local=Arc::new(child_process::blocking(move ||OwnedLocalInput::open(&root,&resource,&version)).await??);
         let mut meta=local_probe(&local).await?;
+        local.verify_dolby_vision_rpu(&meta).await?;
         if let Some(assets)=claim.spec.get("advanced_assets") {meta["advanced_assets"]=assets.clone();}
         let audio=claim.spec["audio_index"].as_u64().map(u32::try_from).transpose()?;
         let request=claim.spec.get("advanced_media").map(|v|serde_json::from_value::<media_core::advanced_media::Request>(v.clone())).transpose()?;

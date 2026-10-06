@@ -69,6 +69,10 @@ const recipeDescription = computed(() => {
 <template>
   <fieldset v-if="caps" class="advanced-playback-settings" :disabled="disabled">
     <legend>高级播放</legend>
+    <p v-if="caps.dolby_vision" class="helper">
+      Dolby Vision 优先保留原生输出。设备不支持时自动转为
+      SDR；勾选下方选项也可使用 SDR 播放。
+    </p>
     <label v-if="caps.tone_map_hdr" class="advanced-tone-map">
       <input type="checkbox" :checked="toneMapHdr" @change="toneChanged" />
       HDR 转 SDR（色调映射）
@@ -89,9 +93,11 @@ const recipeDescription = computed(() => {
       当前片源未提供可用的 HDR 色调映射或 ASS/SSA/PGS 烧录选项。
     </p>
     <p v-else class="helper">
-      更改后重新加载。普通高级方案使用最高 720p H.264，多档方案使用已显示的各档目标；烧录字幕成为画面的一部分，关闭或切换需重新准备播放。
-      本地可使用已关联的外部字幕和字体；HTTP/NAS 当前支持片源内嵌字幕，并先作有界缓存。片源资格已检查，Worker 会再次核对实际 FFmpeg
-      能力。硬件编码由部署配置选择，无法从浏览器强制启用。
+      更改后重新加载。普通高级方案使用最高 720p
+      H.264，多档方案使用已显示的各档目标；烧录字幕成为画面的一部分，关闭或切换需重新准备播放。
+      本地可使用已关联的外部字幕和字体；HTTP/NAS
+      当前支持片源内嵌字幕，并先作有界缓存。片源资格已检查，Worker
+      会再次核对实际 FFmpeg 能力。硬件编码由部署配置选择，无法从浏览器强制启用。
     </p>
     <p v-if="recipeDescription" class="helper">
       当前方案编码目标：{{ recipeDescription }}。编码结果仍由 Worker 校验。

@@ -75,6 +75,16 @@
       "description": "Source eligibility only. The Worker independently checks its real FFmpeg\ninventory and owned input before running; no device execution is asserted.",
       "type": "object",
       "properties": {
+        "dolby_vision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DolbyVisionConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "schema_version": {
           "type": "integer",
           "format": "uint8",
@@ -161,6 +171,40 @@
         "channels",
         "bitrate",
         "samplerate"
+      ]
+    },
+    "DolbyVisionConfiguration": {
+      "description": "Freshly probed single-layer Dolby Vision facts, not a device guarantee.",
+      "type": "object",
+      "properties": {
+        "codec": {
+          "type": "string"
+        },
+        "compatibility_id": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "level": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "profile": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "level",
+        "compatibility_id",
+        "codec"
       ]
     },
     "LocalHlsLadderCapabilities": {
@@ -310,6 +354,16 @@
         },
         "content_type": {
           "type": "string"
+        },
+        "dolby_vision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DolbyVisionConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "framerate": {
           "type": "number",

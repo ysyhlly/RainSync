@@ -7,7 +7,8 @@ export type LocalHlsLadderFacts = { request: LocalHlsLadderRequest, renditions: 
 export type AdvancedPlaybackRequest = { schema_version: number, tone_map_hdr: boolean, subtitle_stream_index: number | null, };
 export type AdvancedSubtitleCodec = "ass" | "ssa" | "pgs";
 export type AdvancedSubtitleTrack = { index: number, codec: AdvancedSubtitleCodec, label: string, language: string, };
-export type AdvancedPlaybackCapabilities = { schema_version: number, tone_map_hdr: boolean, subtitle_streams: Array<AdvancedSubtitleTrack>, worker_runtime_required: boolean, };
+export type AdvancedPlaybackCapabilities = { schema_version: number, tone_map_hdr: boolean, subtitle_streams: Array<AdvancedSubtitleTrack>, worker_runtime_required: boolean, dolby_vision?: DolbyVisionConfiguration, };
+export type DolbyVisionConfiguration = { profile: number, level: number, compatibility_id: number, codec: string, };
 export type AdvancedPlaybackFacts = { request: AdvancedPlaybackRequest, subtitle_codec: AdvancedSubtitleCodec | null, video_basis: PlaybackOutputBasis, };
 export type NativePlatformCredentialMode = "own_or_anonymous" | "anonymous";
 export type NativePlatformProvider = "bilibili" | "douyin" | "tiktok" | "youtube";
@@ -143,7 +144,7 @@ available_until_ms: number | null,
  */
 seekable_media_ranges_ms?: Array<PlaybackMediaRange>, pending_job_id?: string, observation_version?: number, observation_seq?: number, };
 export type MediaTypeSupport = "unknown" | "unsupported" | "maybe" | "probably";
-export type VideoCapabilityConfiguration = { content_type: string, width: number, height: number, bitrate: number, framerate: number, };
+export type VideoCapabilityConfiguration = { content_type: string, width: number, height: number, bitrate: number, framerate: number, dolby_vision?: DolbyVisionConfiguration, };
 export type AudioCapabilityConfiguration = { content_type: string, channels: string, bitrate: number, samplerate: number, };
 export type MediaDecodingSupport = { supported: boolean, smooth: boolean, power_efficient: boolean, };
 export type MediaCapabilityCandidate = {
@@ -190,7 +191,7 @@ http_file_capabilities_version?: number, binding: string | null, candidates: Arr
  * At most the four server routes. Absent on legacy/unsupported providers.
  */
 route_decisions?: Array<PlaybackRouteDecision>, };
-export type PlaybackCandidateResult = { candidate_id: string, progressive: MediaTypeSupport, mse_supported?: boolean, file_decoding?: MediaDecodingSupport, mse_decoding?: MediaDecodingSupport, };
+export type PlaybackCandidateResult = { candidate_id: string, progressive: MediaTypeSupport, dolby_vision_supported?: boolean, mse_supported?: boolean, file_decoding?: MediaDecodingSupport, mse_decoding?: MediaDecodingSupport, };
 export type PlaybackCandidateReport = { binding: string, results: Array<PlaybackCandidateResult>,
 /**
  * Bounded client decode-failure history; never changes authorization.

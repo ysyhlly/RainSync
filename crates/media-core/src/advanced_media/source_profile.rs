@@ -54,47 +54,65 @@ impl VideoSourceProof {
                 "advanced_media_source_depth_mismatch"
             );
         }
-        let sar = text(stream, "sample_aspect_ratio")?;
-        let (a, b) = sar
-            .split_once(':')
-            .ok_or_else(|| anyhow::anyhow!("advanced_media_source_sar_required"))?;
-        let a = a.parse::<u32>()?;
-        let b = b.parse::<u32>()?;
-        ensure!(
-            (1..=65535).contains(&a) && (1..=65535).contains(&b),
-            "advanced_media_source_sar_required"
-        );
-        let transfer = text(stream, "color_transfer")?;
-        let primaries = text(stream, "color_primaries")?;
-        let matrix = text(stream, "color_space")?;
+        let dolby = super::DolbyVisionSource::from_stream(stream)?;
+        let sar = if dolby.is_some() && stream.get("sample_aspect_ratio").is_none() {
+            "N/A"
+        } else {
+            text(stream, "sample_aspect_ratio")?
+        };
+        if sar != "N/A" || dolby.is_none() {
+            let (a, b) = sar
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("advanced_media_source_sar_required"))?;
+            let a = a.parse::<u32>()?;
+            let b = b.parse::<u32>()?;
+            ensure!(
+                (1..=65535).contains(&a) && (1..=65535).contains(&b),
+                "advanced_media_source_sar_required"
+            );
+        }
+        // Profile 5 explicitly permits unspecified VUI color values; its RPU
+        // establishes the Dolby transform. Preserve that uncertainty in proof.
+        let color = |key| -> Result<&str> {
+            if dolby.is_some_and(|source| source.profile == 5) && stream.get(key).is_none() {
+                Ok("unknown")
+            } else {
+                text(stream, key)
+            }
+        };
+        let transfer = color("color_transfer")?;
+        let primaries = color("color_primaries")?;
+        let matrix = color("color_space")?;
         let range = text(stream, "color_range")?;
         ensure!(
             matches!(range, "tv" | "pc"),
             "advanced_media_source_color_required"
         );
-        match transfer {
-            "smpte2084" | "arib-std-b67" => {
-                ensure!(
-                    depth == 10
-                        && primaries == "bt2020"
-                        && matches!(matrix, "bt2020nc" | "bt2020c"),
+        if dolby.is_none() {
+            match transfer {
+                "smpte2084" | "arib-std-b67" => {
+                    ensure!(
+                        depth == 10
+                            && primaries == "bt2020"
+                            && matches!(matrix, "bt2020nc" | "bt2020c"),
+                        "advanced_media_source_color_mismatch"
+                    );
+                    super::classify_hdr(stream)?
+                        .ok_or_else(|| anyhow::anyhow!("advanced_media_source_color_required"))?;
+                }
+                "bt709" => ensure!(
+                    primaries == "bt709" && matrix == "bt709",
                     "advanced_media_source_color_mismatch"
-                );
-                super::classify_hdr(stream)?
-                    .ok_or_else(|| anyhow::anyhow!("advanced_media_source_color_required"))?;
-            }
-            "bt709" => ensure!(
-                primaries == "bt709" && matrix == "bt709",
-                "advanced_media_source_color_mismatch"
-            ),
-            "smpte170m" | "bt470bg" => ensure!(
-                matches!(
-                    (primaries, matrix),
-                    ("smpte170m", "smpte170m") | ("bt470bg", "bt470bg")
                 ),
-                "advanced_media_source_color_mismatch"
-            ),
-            _ => anyhow::bail!("advanced_media_source_color_unsupported"),
+                "smpte170m" | "bt470bg" => ensure!(
+                    matches!(
+                        (primaries, matrix),
+                        ("smpte170m", "smpte170m") | ("bt470bg", "bt470bg")
+                    ),
+                    "advanced_media_source_color_mismatch"
+                ),
+                _ => anyhow::bail!("advanced_media_source_color_unsupported"),
+            }
         }
         ensure!(
             !crate::video_needs_transform(stream),

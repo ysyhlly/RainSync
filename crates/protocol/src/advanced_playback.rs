@@ -1,6 +1,16 @@
 //! Closed, opt-in transforms for freshly probed owned local media.
 use super::*;
 
+/// Freshly probed single-layer Dolby Vision facts, not a device guarantee.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct DolbyVisionConfiguration {
+    pub profile: u8,
+    pub level: u8,
+    pub compatibility_id: u8,
+    pub codec: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 pub struct AdvancedPlaybackRequest {
@@ -37,6 +47,9 @@ pub struct AdvancedPlaybackCapabilities {
     pub tone_map_hdr: bool,
     pub subtitle_streams: Vec<AdvancedSubtitleTrack>,
     pub worker_runtime_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub dolby_vision: Option<DolbyVisionConfiguration>,
 }
 
 /// Committed constrained recipe intent, never a measured encoder result.

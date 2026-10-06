@@ -176,10 +176,24 @@ pub(crate) fn capabilities(meta: &Value, audio: Option<u32>) -> AdvancedPlayback
         tone_map_hdr: false,
         subtitle_streams: Vec::new(),
         worker_runtime_required: true,
+        dolby_vision: None,
     };
     if !cfg!(target_os = "linux") {
         return capabilities;
     }
+    capabilities.dolby_vision = media_core::motion_video::select(meta)
+        .ok()
+        .and_then(|selected| {
+            advanced_media::DolbyVisionSource::from_stream(selected.stream)
+                .ok()
+                .flatten()
+                .map(|source| {
+                    source.configuration(matches!(
+                        selected.stream["codec_tag_string"].as_str(),
+                        Some("hev1" | "dvhe")
+                    ))
+                })
+        });
     let hdr_request = AdvancedPlaybackRequest {
         schema_version: 1,
         tone_map_hdr: true,

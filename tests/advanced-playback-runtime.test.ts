@@ -41,6 +41,7 @@ function setup(
     dropEcho?: boolean;
     defer?: boolean;
     deferProbe?: boolean;
+    dolby?: boolean;
   } = {},
 ) {
   vi.useFakeTimers();
@@ -67,7 +68,17 @@ function setup(
         schema_version: 1,
         binding: body.advanced_playback ? "advanced-binding" : null,
         candidates: body.advanced_playback ? [candidate] : [],
-        advanced_playback: caps,
+        advanced_playback: options.dolby
+          ? {
+              ...caps,
+              dolby_vision: {
+                profile: 8,
+                level: 4,
+                compatibility_id: 4,
+                codec: "dvh1.08.04",
+              },
+            }
+          : caps,
         decision_reason: "actual_source",
       };
       if (options.deferProbe && body.advanced_playback)
@@ -180,10 +191,16 @@ function makePlan(body: any, advanced: boolean) {
     ...(advanced
       ? {
           selected_candidate_id: "transcode_720p",
-          subtitle_mode: "burned_in",
+          subtitle_mode:
+            body.advanced_playback.subtitle_stream_index === null
+              ? "none"
+              : "burned_in",
           advanced_playback: {
             request: structuredClone(body.advanced_playback),
-            subtitle_codec: "ass",
+            subtitle_codec:
+              body.advanced_playback.subtitle_stream_index === null
+                ? null
+                : "ass",
             video_basis: "constrained_encoder_recipe",
           },
         }
@@ -196,6 +213,27 @@ async function selectAdvanced(ctx: ReturnType<typeof setup>) {
   ctx.runtime.toneMapHdr.value = true;
   ctx.runtime.burnInSubtitleIndex.value = 0;
 }
+
+it("automatically creates one bound SDR intent for Dolby without changing room timing", async () => {
+  const ctx = setup({ dolby: true });
+  const before = { ...ctx.state.value };
+  try {
+    await ctx.runtime.loadMedia();
+    expect(ctx.advancedPosts()).toHaveLength(1);
+    const body = ctx.advancedPosts()[0][2];
+    expect(body.advanced_playback).toEqual({
+      schema_version: 1,
+      tone_map_hdr: true,
+      subtitle_stream_index: null,
+    });
+    expect(body.candidate_report.binding).toBe("advanced-binding");
+    expect(body.position_ms).toBe(5000);
+    expect(ctx.state.value).toEqual(before);
+    expect(ctx.runtime.toneMapHdr.value).toBe(true);
+  } finally {
+    ctx.cleanup();
+  }
+});
 
 it("uses actual source controls, bound candidates and the dedicated advanced admission", async () => {
   const ctx = setup();

@@ -2,6 +2,9 @@ import type {
   AdvancedPlaybackCapabilities,
   AdvancedPlaybackRequest,
   PlaybackPlan,
+  DolbyVisionConfiguration,
+  PlaybackCandidateSet,
+  PlaybackCandidateReport,
 } from "../../../../../packages/protocol";
 
 const codecs = new Set(["ass", "ssa", "pgs"]);
@@ -10,6 +13,25 @@ const uint32 = (value: unknown): value is number =>
   Number.isInteger(value) &&
   value >= 0 &&
   value <= 0xffffffff;
+
+export function validDolbyVisionConfiguration(
+  value: unknown,
+): value is DolbyVisionConfiguration {
+  if (!value || typeof value !== "object") return false;
+  const dolby = value as DolbyVisionConfiguration;
+  return (
+    uint32(dolby.level) &&
+    dolby.level >= 1 &&
+    dolby.level <= 13 &&
+    ((dolby.profile === 5 && dolby.compatibility_id === 0) ||
+      (dolby.profile === 8 && [1, 4].includes(dolby.compatibility_id))) &&
+    ["dvh1", "dvhe"].some(
+      (tag) =>
+        dolby.codec ===
+        `${tag}.${String(dolby.profile).padStart(2, "0")}.${String(dolby.level).padStart(2, "0")}`,
+    )
+  );
+}
 
 export function validAdvancedPlaybackCapabilities(
   value: unknown,
@@ -21,7 +43,9 @@ export function validAdvancedPlaybackCapabilities(
     typeof caps.tone_map_hdr !== "boolean" ||
     caps.worker_runtime_required !== true ||
     !Array.isArray(caps.subtitle_streams) ||
-    caps.subtitle_streams.length > 256
+    caps.subtitle_streams.length > 256 ||
+    (caps.dolby_vision !== undefined &&
+      !validDolbyVisionConfiguration(caps.dolby_vision))
   )
     return false;
   const seen = new Set<number>();
@@ -40,6 +64,33 @@ export function validAdvancedPlaybackCapabilities(
     seen.add(track.index);
     return true;
   });
+}
+
+/** A new per-viewer SDR intent; it never changes the room's playback state. */
+export function needsDolbyVisionToneMap(
+  caps: AdvancedPlaybackCapabilities | undefined,
+  candidates: PlaybackCandidateSet | undefined,
+  report: PlaybackCandidateReport | undefined,
+  excluded: readonly string[] = [],
+): boolean {
+  if (
+    !validAdvancedPlaybackCapabilities(caps) ||
+    !caps.dolby_vision ||
+    !caps.tone_map_hdr
+  )
+    return false;
+  return !candidates?.candidates.some(
+    (candidate) =>
+      candidate.video.dolby_vision &&
+      !excluded.includes(candidate.id) &&
+      report?.results.some(
+        (result) =>
+          result.candidate_id === candidate.id &&
+          result.dolby_vision_supported === true &&
+          result.file_decoding?.supported === true &&
+          ["maybe", "probably"].includes(result.progressive),
+      ),
+  );
 }
 
 /** One frozen per-viewer transform intent, never a filter or hardware choice. */

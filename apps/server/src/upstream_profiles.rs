@@ -155,6 +155,7 @@ pub fn envelope(
                 height: 720,
                 bitrate: 4_000_000,
                 framerate: 30.0,
+                dolby_vision: None,
             },
             // AAC-LC is a finite browser estimate. The requested output above
             // promises only the AAC family because product support varies.

@@ -72,6 +72,14 @@ impl Recipe {
         };
         let source_proof = super::extended_source_proof(selected.stream)?;
         let hdr = super::classify_hdr(selected.stream)?;
+        // The Vulkan color transform and hardware encoder use separate device
+        // contexts. Until that interop is qualified, Dolby uses the constrained
+        // software H.264 recipe instead of uploading its output to the wrong GPU.
+        let encoder = if hdr.is_some_and(HdrSource::is_dolby_vision) {
+            EncoderSelection::software_recipe()
+        } else {
+            encoder
+        };
         if hdr.is_some() {
             ensure!(request.tone_map_hdr, "hdr_tonemap_required");
         } else {
@@ -232,8 +240,12 @@ impl Recipe {
                 && (self.audio.is_none() || inventory.encoder("aac")),
             "advanced_media_encoder_unavailable"
         );
-        if self.hdr.is_some() {
-            inventory.require_filters(&["zscale", "tonemap", "sidedata"])?;
+        if let Some(hdr) = self.hdr {
+            if hdr.is_dolby_vision() {
+                inventory.require_filters(&["hwupload", "libplacebo", "hwdownload", "sidedata"])?;
+            } else {
+                inventory.require_filters(&["zscale", "tonemap", "sidedata"])?;
+            }
         }
         let output = output
             .to_str()
@@ -249,6 +261,14 @@ impl Recipe {
         let path = input.path()?;
         let mut args = vec!["-hide_banner".into(), "-nostdin".into(), "-y".into()];
         args.extend(self.encoder.initial_args()?);
+        if self.hdr.is_some_and(HdrSource::is_dolby_vision) {
+            args.extend([
+                "-init_hw_device".into(),
+                "vulkan=rainsync_dovi".into(),
+                "-filter_hw_device".into(),
+                "rainsync_dovi".into(),
+            ]);
+        }
         if self.subtitle.is_some() {
             inventory.require_filters(&["trim", "setpts"])?;
             args.push("-copyts".into());
@@ -568,6 +588,7 @@ pub fn analyze(
                 height: 720,
                 bitrate: 4_000_000,
                 framerate: 30.0,
+                dolby_vision: None,
             },
             audio: output_audio,
         }],

@@ -119,10 +119,26 @@ function configuration(
   sample: Pick<PlaybackCandidate, "video" | "audio">,
   type: "file" | "media-source",
 ): MediaDecodingConfiguration {
-  const { content_type: videoType, ...video } = sample.video;
+  const {
+    content_type: videoType,
+    dolby_vision: dolby,
+    ...video
+  } = sample.video;
   return {
     type,
-    video: { contentType: videoType, ...video },
+    video: {
+      contentType: videoType,
+      ...video,
+      ...(dolby
+        ? {
+            hdrMetadataType: "smpteSt2094-10" as HdrMetadataType,
+            colorGamut: "rec2020" as ColorGamut,
+            transferFunction: (dolby.compatibility_id === 4
+              ? "hlg"
+              : "pq") as TransferFunction,
+          }
+        : {}),
+    },
     ...(sample.audio
       ? {
           audio: {
@@ -215,6 +231,7 @@ export async function detectCandidateReport(
   candidates: PlaybackCandidateSet,
   mse?: MediaSourceProbe,
   mediaCapabilities?: MediaCapabilitiesProbe,
+  hdrDisplay = hasHdrDisplay(),
 ): Promise<PlaybackCandidateReport | undefined> {
   if (
     candidates.schema_version !== 1 ||
@@ -229,6 +246,7 @@ export async function detectCandidateReport(
       candidate_id: sample.id,
       progressive: canPlay(video, sample.content_type),
       mse_supported: mseSupport(mse, sample.content_type),
+      ...(sample.video.dolby_vision ? { dolby_vision_supported: false } : {}),
     }),
   );
   if (mediaCapabilities) {
@@ -242,6 +260,13 @@ export async function detectCandidateReport(
             configuration(sample, "file"),
           ).then((value) => {
             if (value) result.file_decoding = value;
+            const dolby = sample.video.dolby_vision;
+            if (dolby) {
+              result.dolby_vision_supported =
+                hdrDisplay &&
+                value?.supported === true &&
+                positive(canPlay(video, `video/mp4; codecs="${dolby.codec}"`));
+            }
           }),
         );
       if (sample.transport === "hls" && result.mse_supported === true)
@@ -272,4 +297,15 @@ export async function detectCandidateReport(
     results,
     excluded_candidates: [],
   });
+}
+
+function hasHdrDisplay(): boolean {
+  try {
+    return (
+      typeof matchMedia === "function" &&
+      matchMedia("(dynamic-range: high)").matches
+    );
+  } catch {
+    return false;
+  }
 }

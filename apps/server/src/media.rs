@@ -654,7 +654,9 @@ pub(crate) async fn prepare_playback(
                 local_fact_version.as_deref().or(source_version.as_deref()),
             )?;
             advanced_playback::analyze(&meta, body.audio_index, body.position_ms, request)?;
-        } else {
+        } else if body.candidate_report.is_none() {
+            // Concrete reports are revalidated against this fresh probe below.
+            // The legacy entry point remains restricted to ordinary SDR.
             media_core::capabilities::validate_source(&meta)
                 .map_err(playback_capabilities::probe_error)?;
         }
@@ -713,7 +715,9 @@ pub(crate) async fn prepare_playback(
         None
     };
     if mode == "auto" {
-        mode = if kind == "local" {
+        mode = if let Some(selection) = &selected {
+            selection.candidate.delivery_mode.as_str()
+        } else if kind == "local" {
             media_core::compatible_mode(&meta, body.audio_index.is_some())
                 .map_err(playback_capabilities::probe_error)?
         } else {
@@ -1097,7 +1101,7 @@ pub(crate) async fn prepare_playback(
                 .and_then(|v| v.parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v >= 0.0)
                 .map(|v| v * 1000.0);
-            let detected = if let Some(request)=&body.advanced_playback {advanced_playback::analyze(&meta,body.audio_index,body.position_ms,request)?;"transcode"} else {media_core::compatible_mode(&meta, body.audio_index.is_some()).map_err(playback_capabilities::probe_error)?};
+            let detected = if let Some(request)=&body.advanced_playback {advanced_playback::analyze(&meta,body.audio_index,body.position_ms,request)?;"transcode"} else if let Some(selection)=&selected {selection.candidate.delivery_mode.as_str()} else {media_core::compatible_mode(&meta, body.audio_index.is_some()).map_err(playback_capabilities::probe_error)?};
             if requested_mode == "auto" {
                 mode = detected;
             }

@@ -727,6 +727,13 @@ pub fn selected_agent_output(
     if meta["capability_source_version"].as_str() != Some(version) {
         return Err(err(StatusCode::CONFLICT, "source_changed"));
     }
+    if selection.candidate.delivery_mode == "direct"
+        && selection.candidate.video.dolby_vision.is_some()
+    {
+        // Original Dolby bytes use no legacy generated mapping. Still require
+        // exact candidate equality with the current version-matched probe.
+        return selected_output(selection, meta, audio_index, position_ms).map(Some);
+    }
     match media_core::motion_video::legacy_mapping_equivalent(meta, audio_index) {
         Ok(()) => selected_output(selection, meta, audio_index, position_ms).map(Some),
         Err(error)
@@ -749,6 +756,9 @@ fn playable(
     result: &protocol::PlaybackCandidateResult,
     caps: &protocol::PlaybackCapabilities,
 ) -> bool {
+    if candidate.video.dolby_vision.is_some() && result.dolby_vision_supported != Some(true) {
+        return false;
+    }
     let progressive = matches!(
         result.progressive,
         protocol::MediaTypeSupport::Maybe | protocol::MediaTypeSupport::Probably

@@ -29,6 +29,9 @@ pub fn constrain(args: &mut Vec<String>, network: bool, rewritten_hls: bool) {
     args.splice(at..at, self::args(network, rewritten_hls));
 }
 pub fn clean_environment(command: &mut tokio::process::Command) {
+    // Bound the CPU Vulkan ICD used by Dolby tone mapping. GPU drivers ignore
+    // this Mesa setting; it does not select a device or inherit a user filter.
+    command.env("LP_NUM_THREADS", "2");
     // Decoder/probe children never need service or object-store credentials.
     // This minimizes inherited environment; it is not an OS/filesystem sandbox.
     let scoped_names: Vec<std::ffi::OsString> = std::env::vars_os()

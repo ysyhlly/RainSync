@@ -28,6 +28,7 @@ fn main() {
         AdvancedSubtitleCodec::decl(),
         AdvancedSubtitleTrack::decl(),
         AdvancedPlaybackCapabilities::decl(),
+        DolbyVisionConfiguration::decl(),
         AdvancedPlaybackFacts::decl(),
         NativePlatformCredentialMode::decl(),
         NativePlatformProvider::decl(),

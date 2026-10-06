@@ -464,6 +464,40 @@
         "timestamp_shift_ms"
       ]
     },
+    "DolbyVisionConfiguration": {
+      "description": "Freshly probed single-layer Dolby Vision facts, not a device guarantee.",
+      "type": "object",
+      "properties": {
+        "codec": {
+          "type": "string"
+        },
+        "compatibility_id": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "level": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "profile": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "level",
+        "compatibility_id",
+        "codec"
+      ]
+    },
     "LocalHlsLadderFacts": {
       "description": "Exact server master recipe, never the client's currently decoded level.",
       "type": "object",
@@ -1528,6 +1562,16 @@
         },
         "content_type": {
           "type": "string"
+        },
+        "dolby_vision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DolbyVisionConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "framerate": {
           "type": "number",
