@@ -111,6 +111,7 @@ export interface Source {
   id: string;
   name: string;
   kind: string;
+  library_id?: string;
 }
 export interface Agent {
   id: string;

@@ -1002,6 +1002,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
             "/api/v1/sources",
             get(media::sources).post(media::add_source),
         )
+        .route("/api/v1/sources/{id}", delete(media::remove_source))
         .route("/api/v1/sources/{id}/test", post(media::scan))
         .route(
             "/api/v1/sources/{id}/access-policy",

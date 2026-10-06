@@ -16,6 +16,8 @@ const session = useSession(),
 const rows = ref<Source[]>([]),
   loaded = ref(false),
   open = ref(false),
+  removeOpen = ref(false),
+  removing = ref<Source>(),
   name = ref(""),
   kind = ref("local"),
   root = ref("/media"),
@@ -31,6 +33,31 @@ async function load() {
     rows.value = value;
     loaded.value = true;
   }
+}
+function managedElsewhere(source: Source) {
+  return (
+    source.kind === "agent" ||
+    source.kind === "s3" ||
+    (!!source.library_id &&
+      source.library_id !== "00000000-0000-0000-0000-000000000001")
+  );
+}
+function beginRemove(source: Source) {
+  error.value = "";
+  message.value = "";
+  removing.value = source;
+  removeOpen.value = true;
+}
+async function remove() {
+  const source = removing.value;
+  if (!source) return;
+  await session.api(`/sources/${source.id}`, "DELETE");
+  if (!alive) return;
+  rows.value = rows.value.filter((row) => row.id !== source.id);
+  delete scans.results[source.id];
+  removeOpen.value = false;
+  removing.value = undefined;
+  message.value = "片源已删除，关联影片已从媒体库移除";
 }
 async function create() {
   let parsed: Record<string, string> = {};
@@ -100,14 +127,22 @@ onBeforeUnmount(() => {
         <h1>片源管理</h1>
         <p>连接媒体目录或服务，检测并扫描可用影片。</p>
       </div>
-      <button class="primary" @click="open = true">
+      <button class="primary" :disabled="busy" @click="open = true">
         <AppIcon name="plus" />添加片源
       </button>
     </div>
-    <Notice v-if="!open" :message="error" error /><Notice :message="message" />
+    <Notice v-if="!open && !removeOpen" :message="error" error /><Notice
+      :message="message"
+    />
     <ScanAllSources />
     <p v-if="busy && !loaded" role="status">正在加载片源…</p>
-    <button v-if="error && !open" @click="run(load)">重新加载</button>
+    <button
+      v-if="error && !open && !removeOpen"
+      :disabled="busy"
+      @click="run(load)"
+    >
+      重新加载
+    </button>
     <div v-if="loaded && !rows.length" class="empty-state">
       <AppIcon name="movie" :size="40" />
       <h2>暂无片源</h2>
@@ -121,12 +156,27 @@ onBeforeUnmount(() => {
           <span class="helper">{{ row.kind }}</span>
         </div>
         <button
-          :disabled="scans.running || scans.results[row.id]?.busy"
+          :disabled="busy || scans.running || scans.results[row.id]?.busy"
           @click="scans.scan(row)"
         >
           <AppIcon name="refresh" />{{
             scans.results[row.id]?.busy ? "正在检测扫描…" : "检测并扫描"
           }}
+        </button>
+        <RouterLink v-if="row.kind === 'agent'" to="/admin/agents">
+          管理 NAS 设备
+        </RouterLink>
+        <span v-else-if="managedElsewhere(row)" class="helper">
+          请在所属媒体库中管理
+        </span>
+        <button
+          v-else
+          class="danger"
+          :aria-label="`删除片源 ${row.name}`"
+          :disabled="busy || scans.busy"
+          @click="beginRemove(row)"
+        >
+          删除
         </button>
         <Notice
           class="row-result"
@@ -191,5 +241,22 @@ onBeforeUnmount(() => {
         </button>
       </form></AppDialog
     >
+    <AppDialog v-model="removeOpen" title="删除片源" :busy="busy">
+      <p>
+        确认删除「{{
+          removing?.name
+        }}」？关联影片将从媒体库移除，房间历史记录会保留，不会删除原始媒体文件。
+      </p>
+      <p class="helper">若片源正在播放或准备播放，请先停止相关播放后再删除。</p>
+      <Notice :message="error" error />
+      <div class="dialog-actions">
+        <button :disabled="busy" autofocus @click="removeOpen = false">
+          取消
+        </button>
+        <button class="danger" :disabled="busy" @click="run(remove)">
+          {{ busy ? "正在删除…" : "确认删除片源" }}
+        </button>
+      </div>
+    </AppDialog>
   </section>
 </template>

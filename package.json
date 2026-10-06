@@ -24,6 +24,7 @@
     "test:deployment-operations": "node --test tests/source-access-contract.test.mjs tests/deployment-operations.test.mjs tests/postgres-recovery.test.mjs tests/preview-interruption.test.mjs",
     "test:room-authority": "node tests/room-authority-consistency.mjs && node tests/queued-control-authority.mjs",
     "test:local-source-freshness": "node tests/local-source-freshness.mjs",
+    "test:source-deletion": "node tests/source-deletion.mjs",
     "test:cache-writer-safety": "node tests/cache-writer-safety.mjs",
     "test:static-hls-pending-postgres": "node tests/static-hls-pending-postgres.mjs",
     "test:static-hls-pending-rust": "node tests/static-hls-pending-rust.mjs",

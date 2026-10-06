@@ -19,6 +19,10 @@ docker compose up --build -d
 配置数据库密码、`SOURCE_ENCRYPTION_KEY`、媒体目录和与浏览器地址一致的 `PUBLIC_ORIGIN`。
 数据库备份必须与加密密钥安全保存，否则已配置的片源凭据无法恢复。升级已有安装前备份并检查迁移与旧组件兼容性，不混用不同版本的 Server、Worker、Agent。
 
+片源管理支持确认删除本地、HTTP、Jellyfin 和 Emby 共享片源。删除会移除配置及媒体库入口，
+保留房间历史和播放列表引用，不删除原始媒体文件。正在播放或准备播放的片源须先停止相关播放。
+NAS 片源通过 NAS 设备页面撤销；所属媒体库中的片源继续受该媒体库权限管理。
+
 ## 已导入运行镜像接口
 
 运行镜像工作流输出压缩镜像包、`manifest.json` 和 `SHA256SUMS`。令 `EXPECTED_SOURCE_SHA` 为选择的精确 40 位 Git 提交 SHA，`ARTIFACT_DIRECTORY` 为该包所在目录：
@@ -65,6 +69,9 @@ python3 tests/runtime-images.test.py
 ```
 
 集成或部署测试只用于独立测试实例；按各脚本要求配置测试资源及外部输出目录，不使用已有生产数据库。
+`npm run test:source-deletion` 在隔离 PostgreSQL、Server 和真实 Vue/Chromium 中检查删除、取消、
+播放中提示、权限、事务回滚和延迟扫描；需先构建 Server，设置 `CARGO_TARGET_DIR` 和
+`RAINSYNC_ARTIFACT_DIR`，并准备 FFmpeg 和 Chromium（可用 `RAINSYNC_CHROMIUM_EXECUTABLE` 指定路径）。
 四个可选 Static HLS Docker 测试入口需要显式设置本地镜像、Cargo 注册表及配置路径；两个固定镜像校验入口还要求 `RAINSYNC_NATIVE_TEST_IMAGE_ID`、`RAINSYNC_SQL_POSTGRES_IMAGE_ID`。缺少或格式不正确的配置会在执行外部命令前失败。
 
 ## 文档与许可证
