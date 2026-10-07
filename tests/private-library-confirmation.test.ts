@@ -295,10 +295,16 @@ it("consumes successful library deletion even if its list refresh fails", async 
       return { deleted: true };
     throw new Error("列表刷新失败");
   });
+  p.controls.sourceUrl.value =
+    "https://fixture.invalid/file?secret=deleted-library";
+  p.controls.sourceConfig.value =
+    '{"headers":{"Authorization":"deleted-library"}}';
   p.controls.requestChange("deleteLibrary", "private");
   await p.controls.confirmChange();
   expect(p.controls.selected.value).toBeNull();
   expect(p.controls.confirmationOpen.value).toBe(false);
+  expect(p.controls.sourceUrl.value).toBe("");
+  expect(p.controls.sourceConfig.value).toBe("{}");
   expect(p.controls.notice.value).toContain("媒体库已删除");
   await p.controls.confirmChange();
   expect(
@@ -332,5 +338,52 @@ it("clears credential drafts on account change and ignores a late destructive re
   expect(p.controls.selected.value.id).toBe("new-account-library");
   expect(p.controls.notice.value).toBe("New account feedback");
   expect(p.session.api).toHaveBeenCalledTimes(1);
+  p.unmount();
+});
+
+it("clears library-scoped credential and sharing drafts before changing libraries", async () => {
+  const p = await page();
+  p.controls.sourceName.value = "Library A source";
+  p.controls.sourceUrl.value = "https://fixture.invalid/file?secret=library-a";
+  p.controls.sourceConfig.value = '{"headers":{"Authorization":"library-a"}}';
+  p.controls.sourceKind.value = "s3";
+  p.controls.attachId.value = "library-a-source";
+  p.controls.transferName.value = "library-a-owner";
+  p.controls.shareMedia.value = "library-a-media";
+  p.controls.shareMode.value = "room_members";
+  p.controls.minutes.value = 1440;
+  let finish!: (value: unknown) => void;
+  p.session.api.mockImplementation(async (path) => {
+    if (path === "/libraries/other")
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    return [];
+  });
+  const switching = p.controls.select("other");
+  expect(p.controls.sourceName.value).toBe("");
+  expect(p.controls.sourceUrl.value).toBe("");
+  expect(p.controls.sourceConfig.value).toBe("{}");
+  expect(p.controls.sourceKind.value).toBe("http");
+  expect(p.controls.attachId.value).toBe("");
+  expect(p.controls.transferName.value).toBe("");
+  expect(p.controls.shareMedia.value).toBe("");
+  expect(p.controls.shareMode.value).toBe("library_members");
+  expect(p.controls.minutes.value).toBe(120);
+  finish(library("other"));
+  await switching;
+  expect(p.controls.selected.value.id).toBe("other");
+  p.unmount();
+});
+
+it("restores the least-broad sharing draft when the active account changes", async () => {
+  const p = await page();
+  p.controls.shareMedia.value = "old-account-media";
+  p.controls.shareMode.value = "room_members";
+  p.controls.minutes.value = 1440;
+  p.session.epoch++;
+  expect(p.controls.shareMedia.value).toBe("");
+  expect(p.controls.shareMode.value).toBe("library_members");
+  expect(p.controls.minutes.value).toBe(120);
   p.unmount();
 });

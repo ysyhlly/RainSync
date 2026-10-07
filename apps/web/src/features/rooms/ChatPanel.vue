@@ -7,6 +7,12 @@ import TimelineChatPanel from "./TimelineChatPanel.vue";
 const props = withDefaults(defineProps<{ visible?: boolean }>(), {
   visible: true,
 });
+// History batches and live messages rerender the retained chat window. Reuse
+// the locale formatter instead of allocating one for every visible timestamp.
+const timeFormatter = new Intl.DateTimeFormat("zh-CN", {
+  hour: "2-digit",
+  minute: "2-digit",
+});
 const r = useRoomRuntime(),
   log = ref<HTMLElement>(),
   atBottom = ref(true),
@@ -86,12 +92,7 @@ onMounted(bottom);
           ><time
             v-if="m.created_at"
             :datetime="new Date(m.created_at).toISOString()"
-            >{{
-              new Date(m.created_at).toLocaleTimeString("zh-CN", {
-                hour: "2-digit",
-                minute: "2-digit",
-              })
-            }}</time
+            >{{ timeFormatter.format(new Date(m.created_at)) }}</time
           >
           <p>{{ m.body || "消息已删除" }}</p>
         </div>

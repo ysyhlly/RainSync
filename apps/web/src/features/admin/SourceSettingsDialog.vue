@@ -87,9 +87,21 @@ function clearDraft() {
 }
 function dismiss() {
   ++generation;
+  // Dismissal retires the draft, including when permission changes while a
+  // route guard is waiting for its discard confirmation.
+  pendingLeave?.(true);
+  pendingLeave = undefined;
   source.value = undefined;
   clearDraft();
   emit("close");
+}
+function focusDiscardDecision() {
+  void nextTick(() => {
+    const decision = document.getElementById("source-settings-continue");
+    decision?.focus({ preventScroll: true });
+    // Native focus scrolling does not account for the sticky action footer.
+    decision?.scrollIntoView({ block: "center" });
+  });
 }
 function canClose() {
   if (saving.value) return false;
@@ -97,9 +109,7 @@ function canClose() {
   if (!discardOpen.value) editingField = document.activeElement as HTMLElement;
   discardAction.value = "close";
   discardOpen.value = true;
-  void nextTick(() =>
-    document.getElementById("source-settings-continue")?.focus(),
-  );
+  focusDiscardDecision();
   return false;
 }
 function closeDraft() {
@@ -126,9 +136,7 @@ function requestReload() {
   editingField = document.activeElement as HTMLElement;
   discardAction.value = "reload";
   discardOpen.value = true;
-  void nextTick(() =>
-    document.getElementById("source-settings-continue")?.focus(),
-  );
+  focusDiscardDecision();
 }
 function reportFailure(cause: unknown) {
   const code = cause instanceof RequestFailure ? cause.code : "";

@@ -334,6 +334,7 @@ async function initialize() {
 }
 async function select(id: string) {
   const mine = ++serial;
+  if (selectedId.value !== id) clearLibraryDrafts();
   selectedId.value = id;
   detailBusy.value = true;
   pendingChange.value = null;
@@ -598,15 +599,16 @@ async function confirmChange() {
     } else if (change.kind === "deleteLibrary") {
       await api.remove(change.libraryId, change.revision);
       if (!current()) return;
+      clearLibraryDrafts();
       selected.value = null;
       selectedId.value = "";
       media.value = [];
     } else {
       await api.transfer(...args);
       if (!current()) return;
+      clearLibraryDrafts();
       selected.value = null;
       selectedId.value = "";
-      transferName.value = "";
     }
     if (!current()) return;
     // The mutation is complete. A later refresh failure must not leave a
@@ -614,15 +616,22 @@ async function confirmChange() {
     pendingChange.value = null;
   }, messages[change.kind]);
 }
-function clearSensitiveDrafts() {
+function clearLibraryDrafts() {
   sourceUrl.value = sourceName.value = attachId.value = "";
   sourceConfig.value = "{}";
   sourceKind.value = "http";
-  createName.value = editName.value = transferName.value = "";
+  editName.value = transferName.value = "";
+  shareMedia.value = "";
+  shareMode.value = "library_members";
+  minutes.value = 120;
   settingsSource.value = undefined;
   s3Edit.value = undefined;
   shareEdit.value = undefined;
   cancelGrantEdit();
+}
+function clearSensitiveDrafts() {
+  clearLibraryDrafts();
+  createName.value = "";
   error.value = notice.value = "";
 }
 onMounted(initialize);

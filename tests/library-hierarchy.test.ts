@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { createPinia, disposePinia, setActivePinia } from "pinia";
 import { effectScope, nextTick, ref } from "vue";
+import { RequestFailure } from "../apps/web/src/errors";
 import { useSession } from "../apps/web/src/features/auth/session.store";
 import {
   createLibraryState,
@@ -177,4 +178,232 @@ it("private-library changes synchronously clear the scope and fence old replies"
     "library_id=private-B",
   );
   expect(browser.node.value).toBe("B");
+});
+
+const unavailable = (code: string) =>
+  new RequestFailure({
+    error: { code, message: "目录已不可用" },
+  });
+
+it("removes a revoked current directory immediately and recovers from the accessible root", async () => {
+  const { session, library } = setup();
+  let rootReply!: (value: BrowsePage) => void;
+  session.api = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ...result("private-folder", "old-cursor"),
+      entries: [
+        {
+          type: "media",
+          media: { id: "private-film", title: "Private film", kind: "local" },
+        },
+      ],
+    })
+    .mockRejectedValueOnce(unavailable("MEDIA_NOT_FOUND"))
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          rootReply = resolve;
+        }),
+    ) as any;
+  await library.browse("private-folder");
+  const refresh = library.refresh();
+  await vi.waitFor(() => expect(session.api).toHaveBeenCalledTimes(3));
+  expect(library.items).toEqual([]);
+  expect(library.folders).toEqual([]);
+  expect(library.breadcrumbs).toEqual([{ id: null, name: "全部片源" }]);
+  expect([
+    library.node,
+    library.totalMedia,
+    library.page,
+    library.hasMore,
+  ]).toEqual([null, 0, 0, false]);
+  expect(library.busy).toBe(true);
+  expect(vi.mocked(session.api).mock.calls[2][0]).toBe(
+    "/media/browse?limit=24",
+  );
+  rootReply({ ...result(null), total_media: 0, entries: [] });
+  await refresh;
+  expect([
+    library.node,
+    library.totalMedia,
+    library.loaded,
+    library.error,
+    library.busy,
+  ]).toEqual([null, 0, true, "", false]);
+});
+
+it("a missing different directory does not invalidate the successful current snapshot", async () => {
+  const { session, library } = setup();
+  session.api = vi
+    .fn()
+    .mockResolvedValueOnce(result("A", "A-next"))
+    .mockRejectedValueOnce(unavailable("MEDIA_NOT_FOUND"))
+    .mockResolvedValueOnce(result("A")) as any;
+  await library.browse("A");
+  await library.browse("missing-B");
+  expect(library.node).toBe("A");
+  expect(library.folders).toHaveLength(1);
+  expect(library.requestedNode).toBe("missing-B");
+  await library.loadPage(1);
+  expect(vi.mocked(session.api).mock.calls[2][0]).toContain(
+    "node=A&after=A-next",
+  );
+});
+
+it("a denied private library clears its whole snapshot and retries only that private root", async () => {
+  const { session } = setup(),
+    scope = effectScope();
+  scopes.push(scope);
+  const browser = scope.run(() => createLibraryState(() => "private-A"))!;
+  session.api = vi
+    .fn()
+    .mockResolvedValueOnce(result("private-folder", "private-next"))
+    .mockRejectedValueOnce(unavailable("LIBRARY_NOT_FOUND"))
+    .mockResolvedValueOnce({
+      ...result(null),
+      entries: [],
+      total_media: 0,
+    }) as any;
+  await browser.browse("private-folder");
+  await browser.browse("another-folder");
+  expect(browser.items.value).toEqual([]);
+  expect(browser.folders.value).toEqual([]);
+  expect(browser.breadcrumbs.value).toEqual([{ id: null, name: "全部片源" }]);
+  expect([
+    browser.node.value,
+    browser.totalMedia.value,
+    browser.loaded.value,
+    browser.busy.value,
+  ]).toEqual([null, 0, false, false]);
+  expect(browser.error.value).toBe("目录已不可用");
+  await browser.retry();
+  expect(vi.mocked(session.api).mock.calls[2][0]).toBe(
+    "/media/browse?limit=24&library_id=private-A",
+  );
+});
+
+it("failed root recovery never restores a revoked snapshot and retry remains at root", async () => {
+  const { session, library } = setup();
+  session.api = vi
+    .fn()
+    .mockResolvedValueOnce(result("deleted-folder", "old-next"))
+    .mockRejectedValueOnce(unavailable("MEDIA_NOT_FOUND"))
+    .mockRejectedValueOnce(Error("temporary outage"))
+    .mockResolvedValueOnce(result(null)) as any;
+  await library.browse("deleted-folder");
+  await library.refresh();
+  expect(library.node).toBeNull();
+  expect(library.folders).toEqual([]);
+  expect(library.loaded).toBe(false);
+  expect(library.error).toBe("temporary outage");
+  await library.retry();
+  expect(vi.mocked(session.api).mock.calls[3][0]).toBe(
+    "/media/browse?limit=24",
+  );
+  expect(library.node).toBeNull();
+});
+
+it("a late denial for the old directory cannot clear a newer successful navigation", async () => {
+  const { session, library } = setup();
+  let rejectOld!: (error: Error) => void;
+  session.api = vi
+    .fn()
+    .mockResolvedValueOnce(result("old"))
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectOld = reject;
+        }),
+    )
+    .mockResolvedValueOnce(result("new")) as any;
+  await library.browse("old");
+  const old = library.refresh();
+  await library.browse("new");
+  rejectOld(unavailable("MEDIA_NOT_FOUND"));
+  await old;
+  expect([library.node, library.error, library.loaded]).toEqual([
+    "new",
+    "",
+    true,
+  ]);
+  expect(library.folders).toHaveLength(1);
+  expect(session.api).toHaveBeenCalledTimes(3);
+});
+
+it("a transient current-directory failure preserves cards, counts, and cursor history", async () => {
+  const { session, library } = setup();
+  session.api = vi
+    .fn()
+    .mockResolvedValueOnce(result("A", "A-next"))
+    .mockRejectedValueOnce(unavailable("UNAVAILABLE"))
+    .mockResolvedValueOnce(result("A")) as any;
+  await library.browse("A");
+  await library.refresh();
+  expect([
+    library.node,
+    library.totalMedia,
+    library.loaded,
+    library.hasMore,
+  ]).toEqual(["A", 150, true, true]);
+  expect(library.folders).toHaveLength(1);
+  await library.loadPage(1);
+  expect(vi.mocked(session.api).mock.calls[2][0]).toContain(
+    "node=A&after=A-next",
+  );
+});
+
+it("a missing private directory recovers inside its library rather than the global catalog", async () => {
+  const { session } = setup(),
+    scope = effectScope();
+  scopes.push(scope);
+  const browser = scope.run(() => createLibraryState(() => "private-A"))!;
+  session.api = vi
+    .fn()
+    .mockResolvedValueOnce(result("folder", "private-next"))
+    .mockRejectedValueOnce(unavailable("MEDIA_NOT_FOUND"))
+    .mockResolvedValueOnce({
+      ...result(null),
+      entries: [],
+      total_media: 0,
+    }) as any;
+  await browser.browse("folder");
+  await browser.refresh();
+  expect(vi.mocked(session.api).mock.calls[2][0]).toBe(
+    "/media/browse?limit=24&library_id=private-A",
+  );
+  expect([
+    browser.node.value,
+    browser.totalMedia.value,
+    browser.loaded.value,
+  ]).toEqual([null, 0, true]);
+});
+
+it("root recovery is fenced when a newer account replaces the revoked snapshot", async () => {
+  const { session, library } = setup();
+  let rootReply!: (value: BrowsePage) => void;
+  session.api = vi
+    .fn()
+    .mockResolvedValueOnce(result("folder"))
+    .mockRejectedValueOnce(unavailable("MEDIA_NOT_FOUND"))
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          rootReply = resolve;
+        }),
+    ) as any;
+  await library.browse("folder");
+  const recovery = library.refresh();
+  await vi.waitFor(() => expect(session.api).toHaveBeenCalledTimes(3));
+  session.accept({ id: "bob", username: "bob", csrf: "b", admin: false });
+  rootReply(result(null, "old-account-cursor"));
+  await recovery;
+  expect(library.items).toEqual([]);
+  expect(library.folders).toEqual([]);
+  expect([
+    library.loaded,
+    library.busy,
+    library.hasMore,
+    library.error,
+  ]).toEqual([false, false, false, ""]);
 });

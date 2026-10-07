@@ -236,6 +236,7 @@ pub async fn rename(
         .execute(&mut *tx)
         .await?;
     audit(&mut tx, id, u.id, "renamed", None).await?;
+    require_current_permission(&mut tx, u.id, id, "manage").await?;
     commit_caller(tx, &u, &h, false).await?;
     detail(State(app), h, Path(id)).await
 }
@@ -466,6 +467,7 @@ pub async fn share(
       .bind(grant).bind(id).bind(body.media_id).bind(source_generation).bind(body.room_id).bind(u.id).bind(body.mode).bind(lib.get::<i64,_>("permission_epoch")).bind(i64::from(body.expires_in_minutes)).execute(&mut *tx).await?;
     advance(&mut tx, id, false).await?;
     audit(&mut tx, id, u.id, "room_media_shared", Some(grant)).await?;
+    require_current_permission(&mut tx, u.id, id, "share_to_room").await?;
     commit_caller(tx, &u, &h, false).await?;
     Ok(media_titles::private_json(
         json!({"id":grant,"library_id":id,"revision":(lib.get::<i64,_>("revision")+1).to_string()}),
@@ -567,6 +569,13 @@ pub async fn revoke_share(
     }
     advance(&mut tx, id, true).await?;
     audit(&mut tx, id, u.id, "room_media_revoked", Some(grant)).await?;
+    // A grantor may always withdraw their own share, but another grantor's
+    // share still requires management authority after any lock wait.
+    let allowed: bool = sqlx::query_scalar("SELECT library_allowed($1,$2,'manage') OR EXISTS(SELECT 1 FROM room_media_grants WHERE id=$3 AND library_id=$2 AND grantor_id=$1)")
+        .bind(u.id).bind(id).bind(grant).fetch_one(&mut *tx).await?;
+    if !allowed {
+        return Err(err(StatusCode::NOT_FOUND, "library_not_found"));
+    }
     commit_caller(tx, &u, &h, false).await?;
     retire(&app).await?;
     Ok(media_titles::private_json(json!({"ok":true})))
@@ -693,6 +702,7 @@ pub async fn add_source(
     .await?;
     advance(&mut tx, id, false).await?;
     audit(&mut tx, id, u.id, "source_created", Some(source)).await?;
+    require_current_permission(&mut tx, u.id, id, "manage").await?;
     commit_caller(tx, &u, &h, u.admin).await?;
     Ok(media_titles::private_json(
         json!({"id":source,"library_id":id}),

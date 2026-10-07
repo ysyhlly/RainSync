@@ -78,10 +78,11 @@ function panel(
     csrf: "fixture",
   });
   session.api = api;
-  const focus = vi.fn();
+  const focus = vi.fn(),
+    scrollIntoView = vi.fn();
   vi.stubGlobal("document", {
     activeElement: { focus },
-    getElementById: () => ({ focus }),
+    getElementById: () => ({ focus, scrollIntoView }),
   });
   vi.stubGlobal("window", {
     addEventListener: vi.fn(),
@@ -125,6 +126,7 @@ function panel(
     session,
     api,
     focus,
+    scrollIntoView,
     close,
     onSaved,
     leave: () => leave(),
@@ -369,6 +371,25 @@ it("dirty cancel, escape/backdrop guard and route leave preserve edits until dis
   expect(mutationCalls(p.api)).toHaveLength(0);
   p.unmount();
 });
+
+it.each(["close", "reload"])(
+  "centers the dirty %s decision above sticky drawer actions",
+  async (action) => {
+    const p = panel(fixture("http")),
+      c = p.controls;
+    await ready(p);
+    p.focus.mockClear();
+    c.draft.value.name = "未保存名称";
+    if (action === "close") expect(c.canClose()).toBe(false);
+    else c.requestReload();
+    await nextTick();
+    expect(c.discardOpen.value).toBe(true);
+    expect(p.focus).toHaveBeenCalledWith({ preventScroll: true });
+    expect(p.scrollIntoView).toHaveBeenCalledWith({ block: "center" });
+    expect(mutationCalls(p.api)).toHaveLength(0);
+    p.unmount();
+  },
+);
 
 it("blocks duplicate saves and dismissal until the pending PATCH settles", async () => {
   const value = fixture();
@@ -733,6 +754,60 @@ it("retires a draft immediately if the same account loses its admin role", async
   expect(c.open.value).toBe(false);
   expect(c.draft.value.token).toBe("");
   expect(c.detail.value).toBeUndefined();
+  p.unmount();
+});
+
+it.each(["admin role", "required permission"])(
+  "settles a pending route leave when the %s changes",
+  async (change) => {
+    const p = panel(
+        fixture("emby"),
+        undefined,
+        change === "required permission"
+          ? { admin: false, requireAdmin: false }
+          : {},
+      ),
+      c = p.controls;
+    await ready(p);
+    c.draft.value.tokenMode = "replace";
+    c.draft.value.token = "unsaved-token";
+    const settled = vi.fn();
+    const leaving = Promise.resolve(p.leave()).then(settled);
+    expect(c.discardOpen.value).toBe(true);
+    if (change === "required permission") p.setProps({ requireAdmin: true });
+    else
+      p.session.accept({
+        id: "fixture",
+        username: "fixture",
+        admin: false,
+        csrf: "fixture",
+      });
+    await nextTick();
+    await nextTick();
+    expect(c.open.value).toBe(false);
+    expect(c.draft.value.token).toBe("");
+    expect(settled).toHaveBeenCalledWith(true);
+    await leaving;
+    expect(mutationCalls(p.api)).toHaveLength(0);
+    p.unmount();
+  },
+);
+
+it("permission dismissal resolves only the latest pending route leave", async () => {
+  const p = panel(fixture()),
+    c = p.controls;
+  await ready(p);
+  c.draft.value.name = "unsaved";
+  const first = p.leave();
+  const second = p.leave();
+  expect(await first).toBe(false);
+  p.session.accept({
+    id: "fixture",
+    username: "fixture",
+    admin: false,
+    csrf: "fixture",
+  });
+  expect(await second).toBe(true);
   p.unmount();
 });
 

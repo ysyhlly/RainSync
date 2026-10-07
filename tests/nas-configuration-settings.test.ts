@@ -328,6 +328,74 @@ it("suppresses repeated quota submits and ignores mutation/refresh responses aft
   expect(c.message.value).toBe("");
   expect(api.mock.calls).toHaveLength(2);
 });
+it.each(["AgentsPage", "ComputePolicyPanel"] as const)(
+  "%s ignores pending settings writes after same-account admin loss",
+  async (file) => {
+    const pending = deferred();
+    const api = vi.fn(async (_path: string, method = "GET") => {
+      if (method !== "GET") return pending.promise;
+      return file === "AgentsPage"
+        ? [node()]
+        : { enabled: true, nodes: [node()], limits };
+    });
+    const { c, session } = mount(file, api);
+    await ready(c);
+    let work: Promise<void>;
+    if (file === "AgentsPage") {
+      c.edit(c.rows.value[0]);
+      c.editName.value = "pending";
+      work = c.run(c.saveSettings);
+    } else {
+      c.openSettings(c.nodes.value[0]);
+      c.draftSlots.value = 2;
+      work = c.saveQuota();
+    }
+    expect(writes(api)).toHaveLength(1);
+    session.accept({
+      id: "owner",
+      username: "owner",
+      csrf: "fixture",
+      admin: false,
+    });
+    expect((c.settingsOpen ?? c.dialogOpen).value).toBe(false);
+    expect((c.editing ?? c.selected).value).toBe(null);
+    pending.resolve(node({ name: "pending", revision: 5 }));
+    await work;
+    expect((c.rows ?? c.nodes).value).toEqual([]);
+    expect(c.message.value).toBe("");
+    expect(c.error.value).toBe("");
+    expect(api.mock.calls).toHaveLength(2);
+  },
+);
+
+it.each(["AgentsPage", "ComputePolicyPanel"] as const)(
+  "%s ignores a pending read after same-account admin loss",
+  async (file) => {
+    const pending = deferred();
+    const api = vi.fn(async () => pending.promise);
+    const { c, session } = mount(file, api);
+    expect((c.refreshing ?? c.loading).value).toBe(true);
+    session.accept({
+      id: "owner",
+      username: "owner",
+      csrf: "fixture",
+      admin: false,
+    });
+    pending.resolve(
+      file === "AgentsPage"
+        ? [node()]
+        : { enabled: true, nodes: [node()], limits },
+    );
+    await vi.waitFor(() =>
+      expect(api.mock.settledResults[0]?.type).toBe("fulfilled"),
+    );
+    expect((c.refreshing ?? c.loading).value).toBe(false);
+    expect((c.rows ?? c.nodes).value).toEqual([]);
+    expect(c.loaded.value).toBe(false);
+    expect(writes(api)).toHaveLength(0);
+  },
+);
+
 it("revocation copy explicitly preserves records and does not claim a historical delete", () => {
   const source = readFileSync(
     new URL("../apps/web/src/features/admin/AgentsPage.vue", import.meta.url),

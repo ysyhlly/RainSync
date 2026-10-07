@@ -1,5 +1,6 @@
 import { defineStore } from "pinia";
 import { ref, watch, onScopeDispose, computed } from "vue";
+import { RequestFailure } from "../../errors";
 import { useSession } from "../auth/session.store";
 import { useMediaCatalog } from "./media-catalog.store";
 import { mediaApi, type BrowseFolder, type BrowsePage } from "./media.api";
@@ -41,7 +42,7 @@ export function createLibraryState(
     search: string,
     target: string | null,
     browsing: boolean,
-  ) {
+  ): Promise<void> {
     const id = ++serial,
       stamp = catalog.stamp(),
       scope = libraryId();
@@ -114,8 +115,25 @@ export function createLibraryState(
       catalog.remember(rows, stamp);
       refreshKey.value++;
     } catch (e) {
-      if (id === serial && !signal.aborted)
-        error.value = e instanceof Error ? e.message : String(e);
+      if (id !== serial || signal.aborted || scope !== libraryId()) return;
+      if (browsing && e instanceof RequestFailure) {
+        // A definitive denial invalidates the old snapshot; a transient error
+        // or a missing different destination must still preserve navigation.
+        if (scope && e.code === "LIBRARY_NOT_FOUND") {
+          reset();
+        } else if (
+          e.code === "MEDIA_NOT_FOUND" &&
+          target !== null &&
+          mode.value === "browse" &&
+          target === node.value
+        ) {
+          reset();
+          // The root request retains libraryId and cannot replay a stale cursor.
+          await request(0, "", null, true);
+          return;
+        }
+      }
+      error.value = e instanceof Error ? e.message : String(e);
     } finally {
       if (id === serial) busy.value = false;
     }
