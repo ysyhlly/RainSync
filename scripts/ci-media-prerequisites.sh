@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cleanup_ci_apt() {
+  # Only this invocation's mktemp leaf is eligible for recursive removal.
+  if [[ ${ci_apt_dir:-} =~ ^/tmp/rainsync-apt\.[[:alnum:]]{6}$ ]]; then
+    sudo rm -rf -- "$ci_apt_dir"
+    ci_apt_dir=''
+  fi
+}
+
 configure_ci_apt() {
   local ID VERSION_CODENAME UBUNTU_CODENAME codename architecture keyring
   # The runner's trusted OS metadata determines the suite; never mix releases.
@@ -13,8 +21,9 @@ configure_ci_apt() {
   fi
   keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
   test -r "$keyring"
-  : "${RUNNER_TEMP:?RUNNER_TEMP is required for isolated APT files}"
-  ci_apt_dir=$(mktemp -d "$RUNNER_TEMP/rainsync-apt.XXXXXX")
+  # Runner home/temp ancestors may deny traversal to _apt. This directory holds
+  # only public package indexes/archives; validation artifacts stay in RUNNER_TEMP.
+  ci_apt_dir=$(mktemp -d /tmp/rainsync-apt.XXXXXX)
   # APT's _apt sandbox must be able to read sources and reach partial downloads.
   chmod 755 "$ci_apt_dir"
   mkdir -p "$ci_apt_dir/sourceparts" "$ci_apt_dir/lists/partial" "$ci_apt_dir/cache/archives/partial"
@@ -39,12 +48,23 @@ EOF
   )
 }
 
+prepare_ci_apt_sandbox() {
+  local partial probe
+  for partial in "$ci_apt_dir/lists/partial" "$ci_apt_dir/cache/archives/partial"; do
+    sudo chown _apt:root "$partial"
+    sudo chmod 700 "$partial"
+    probe=$(sudo -u _apt -- mktemp "$partial/.sandbox-write.XXXXXX")
+    sudo -u _apt -- rm -- "$probe"
+  done
+}
+
 verify_media_prerequisites() {
   local packages=()
   if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then packages+=(ffmpeg); fi
   if ! command -v pg_config >/dev/null || ! test -x "$(pg_config --bindir)/initdb"; then packages+=(postgresql); fi
   if ((${#packages[@]})); then
     configure_ci_apt
+    prepare_ci_apt_sandbox
     sudo timeout --kill-after=15s 180s apt-get "${ci_apt_options[@]}" update
     sudo timeout --kill-after=15s 900s apt-get "${ci_apt_options[@]}" install -y --no-install-recommends "${packages[@]}"
   fi
@@ -54,5 +74,6 @@ verify_media_prerequisites() {
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  trap cleanup_ci_apt EXIT
   verify_media_prerequisites
 fi

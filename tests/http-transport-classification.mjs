@@ -1,4 +1,5 @@
-// Real Server/Worker/PostgreSQL classification; no media decoder is required.
+// Real Server/Worker/PostgreSQL classification. Auto uses the actual FFprobe;
+// a separate restarted Worker with empty PATH proves direct needs no decoder.
 import assert from "node:assert/strict";
 import { randomUUID, createHash } from "node:crypto";
 import { createServer } from "node:http";
@@ -11,7 +12,8 @@ import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
 
 let owned, upstream, upstreamPort;
 const checks = [],
-  requests = [];
+  requests = [],
+  phases = [];
 const playlist = Buffer.from(
   "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1,fixture title\nsegment.ts\n#EXT-X-ENDLIST\n",
 );
@@ -147,11 +149,11 @@ try {
     await new Promise((done) => upstream.listen(0, "127.0.0.1", done));
     upstreamPort = upstream.address().port;
     const origin = `http://127.0.0.1:${upstreamPort}`;
-    // An empty Worker PATH makes ffprobe/ffmpeg unavailable. Direct transport
-    // must be decided by the real authorized HTTP relay, not a decoder probe.
     const emptyPath = resolve(f.root, "empty-worker-path");
     await mkdir(emptyPath);
-    await f.startWorker({ PATH: emptyPath });
+    // Ordinary auto negotiation actually launches FFprobe. Keep its real PATH
+    // until this independent negative/replay phase has reached the source gate.
+    await f.startWorker();
     await f.startServer({ WORKER_URL: f.workerOrigin });
     const admin = f.client();
     const user = await admin.login();
@@ -196,6 +198,104 @@ try {
         assert.equal(response.status, 409, JSON.stringify(value));
         assert.equal(value.error.code, code);
       };
+      const plain = await admin.request("/sources", "POST", {
+        name: "auto no-validator phase",
+        kind: "http",
+        config: {
+          url: origin + "/plain.mp4",
+          headers: { Authorization: "Bearer owned-transport-fixture" },
+        },
+      });
+      await admin.request(`/sources/${plain.id}/test`, "POST");
+      const plainMedia = f.sql(
+        `SELECT id FROM media_items WHERE source_id='${plain.id}'`,
+      );
+      ws.send(
+        JSON.stringify({
+          protocol_version: 1,
+          room_id: room.id,
+          command_id: randomUUID(),
+          control_epoch: joined.control_epoch.id,
+          expected_revision: state.revision,
+          media_generation: state.media_generation,
+          type: "CHANGE_MEDIA",
+          payload: { media_id: plainMedia },
+        }),
+      );
+      state = (await next("ACK")).state;
+      const automatic = {
+        room_id: room.id,
+        media_generation: state.media_generation,
+        idempotency_key: randomUUID(),
+        mode: "auto",
+      };
+      const beforeAuto = requests.length;
+      await error(
+        await admin.raw("/playback-sessions", {
+          method: "POST",
+          body: automatic,
+        }),
+        "SOURCE_VERSION_REQUIRED",
+      );
+      assert.ok(
+        requests
+          .slice(beforeAuto)
+          .some(
+            (request) =>
+              request.path === "/plain.mp4" && request.method === "GET",
+          ),
+        "real FFprobe must reach the authorized source version gate",
+      );
+      const beforeReplay = requests.length;
+      await error(
+        await admin.raw("/playback-sessions", {
+          method: "POST",
+          body: automatic,
+        }),
+        "SOURCE_VERSION_REQUIRED",
+      );
+      assert.equal(
+        requests.length,
+        beforeReplay,
+        "nonretryable auto replay cannot re-probe",
+      );
+      const stopped = await f.stopWorker();
+      assert.ok(
+        stopped?.observed_close && Number.isInteger(stopped.pid),
+        "the owned auto-phase Worker must actually close before replacement",
+      );
+      const autoPidAbsent = verifyPidAbsent(stopped.pid);
+      const oldPortClosed = await verifyClosedPort(
+        Number(new URL(f.workerOrigin).port),
+      );
+      assert.ok(
+        autoPidAbsent && oldPortClosed,
+        "the exact owned auto Worker PID and port must be gone",
+      );
+      phases.push({
+        name: "real-ffprobe-auto",
+        result: "passed",
+        error: "SOURCE_VERSION_REQUIRED",
+        replay_origin_requests: 0,
+        worker: {
+          ...stopped,
+          pid_absent: autoPidAbsent,
+          port_closed: oldPortClosed,
+        },
+      });
+      // Preserve every original direct case and added one-body/cancellation
+      // assertion under a new owned process with both decoders unavailable.
+      await f.startWorker({ PATH: emptyPath });
+      assert.notEqual(
+        f.workerPid,
+        stopped.pid,
+        "direct phase uses a new owned Worker process",
+      );
+      phases.push({
+        name: "decoder-free-direct",
+        worker_pid: f.workerPid,
+        decoder_path_empty: true,
+      });
       for (const item of cases) {
         const { path, expected } = item;
         const source = await admin.request("/sources", "POST", {
@@ -225,34 +325,6 @@ try {
           }),
         );
         state = (await next("ACK")).state;
-        if (path === "/plain.mp4") {
-          const automatic = {
-            room_id: room.id,
-            media_generation: state.media_generation,
-            idempotency_key: randomUUID(),
-            mode: "auto",
-          };
-          await error(
-            await admin.raw("/playback-sessions", {
-              method: "POST",
-              body: automatic,
-            }),
-            "SOURCE_VERSION_REQUIRED",
-          );
-          const before = requests.length;
-          await error(
-            await admin.raw("/playback-sessions", {
-              method: "POST",
-              body: automatic,
-            }),
-            "SOURCE_VERSION_REQUIRED",
-          );
-          assert.equal(
-            requests.length,
-            before,
-            "nonretryable auto replay cannot re-probe",
-          );
-        }
         const input = {
           room_id: room.id,
           media_generation: state.media_generation,
@@ -467,6 +539,7 @@ try {
         ),
       );
       assert.ok(requests.every((request) => !request.path.includes("#")));
+      phases[1].result = "passed";
       result = "passed";
     } finally {
       ws.terminate();
@@ -491,6 +564,7 @@ try {
       result,
       checks,
       requests,
+      phases,
       cleanup: {
         ...cleanup,
         worker_pid_absent: workerPidAbsent,
