@@ -166,7 +166,9 @@ watch(
       measurePlacement();
     }
   },
-  { flush: "post" },
+  // A lazy host can arrive after the room anchor is already in its initial
+  // props. Initialize placement then too, after its own DOM refs are mounted.
+  { flush: "post", immediate: true },
 );
 watch(fullscreen, () => {
   void nextTick().then(schedulePlacement);
@@ -228,7 +230,7 @@ watch(
     subtitleResources.value = subtitleLoads.sync(r.sessionId, r.subtitles);
     updateSubtitleFailure();
   },
-  { immediate: true, deep: true },
+  { immediate: true },
 );
 watch(() => r.subtitleIndex, updateSubtitleFailure);
 function subtitleSettled(resource: SubtitleResource, event: Event) {

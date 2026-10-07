@@ -1,3 +1,11 @@
+vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
+  const { default: Hls } = await import("hls.js");
+  return {
+    getPlaybackMediaSource: () => Hls.getMediaSource(),
+    hasPlaybackMseApi: () => Hls.isMSESupported(),
+    supportsHlsPlayback: () => Hls.isSupported(),
+  };
+});
 import { afterEach, expect, it, vi } from "vitest";
 import { effectScope, reactive, ref } from "vue";
 import { createPlaybackRuntime } from "../apps/web/src/features/playback/playback-runtime";

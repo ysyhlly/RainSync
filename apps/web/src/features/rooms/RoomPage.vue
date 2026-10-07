@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import "../../styles/room-layout.css";
 import QueueFeedback from "./QueueFeedback.vue";
 import RoomMediaPicker from "./RoomMediaPicker.vue";
 import RoomViewingToolbar from "./RoomViewingToolbar.vue";

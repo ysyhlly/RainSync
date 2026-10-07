@@ -6,7 +6,9 @@ export function safeRedirect(value: unknown) {
       path.startsWith("//") ||
       value.includes("\\") ||
       path.includes("\\") ||
+      // eslint-disable-next-line no-control-regex -- Redirect input must reject ASCII controls and whitespace.
       /[\u0000-\u0020\u007f]/.test(value) ||
+      // eslint-disable-next-line no-control-regex -- Decoded paths must also reject encoded ASCII controls.
       /[\u0000-\u0020\u007f]/.test(path) ||
       path.startsWith("/login") ||
       path.startsWith("/register")

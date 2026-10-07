@@ -92,7 +92,7 @@ export function validShortAccountCookieInput(
       names.has(name) ||
       !value ||
       value.length > 2048 ||
-      /[\s,\\\"]/.test(value)
+      /[\s,\\"]/.test(value)
     )
       return false;
     names.add(name);
@@ -122,7 +122,8 @@ export function createShortAccountFlow(options: {
     hasInput: (cookie) => !!cookie.trim(),
     validateInput: (cookie) =>
       validShortAccountCookieInput(cookie, options.provider),
-    validateStatus: (value) => validateShortAccountStatus(value, options.provider),
+    validateStatus: (value) =>
+      validateShortAccountStatus(value, options.provider),
     change: (phase) => options.change({ phase }),
   });
 }

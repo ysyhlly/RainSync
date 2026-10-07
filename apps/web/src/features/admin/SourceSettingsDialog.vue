@@ -33,7 +33,7 @@ const props = withDefaults(
 );
 const emit = defineEmits<{ close: []; saved: [SourceSettingsSaved] }>();
 const session = useSession();
-const source = ref<Source>(),
+const selectedSource = ref<Source>(),
   detail = ref<SourceSettings>(),
   draft = ref(settingsDraft()),
   baseline = ref(settingsDraft()),
@@ -47,7 +47,7 @@ const source = ref<Source>(),
   advancedOpen = ref(false),
   discardOpen = ref(false),
   discardAction = ref<"close" | "reload">("close");
-const open = computed(() => !!source.value);
+const open = computed(() => !!selectedSource.value);
 const dirty = computed(
   () =>
     !!detail.value &&
@@ -66,7 +66,7 @@ const kindLabel = computed(
       http: "HTTP 媒体",
       jellyfin: "Jellyfin",
       emby: "Emby",
-    })[source.value?.kind ?? ""] ?? source.value?.kind,
+    })[selectedSource.value?.kind ?? ""] ?? selectedSource.value?.kind,
 );
 let alive = true;
 let generation = 0;
@@ -91,7 +91,7 @@ function dismiss() {
   // route guard is waiting for its discard confirmation.
   pendingLeave?.(true);
   pendingLeave = undefined;
-  source.value = undefined;
+  selectedSource.value = undefined;
   clearDraft();
   emit("close");
 }
@@ -176,7 +176,7 @@ function reportFailure(cause: unknown) {
   if (code === "SOURCE_CREDENTIALS_ORIGIN_CHANGED") advancedOpen.value = true;
 }
 async function load() {
-  const target = source.value;
+  const target = selectedSource.value;
   if (!target || saving.value) return;
   const current = ++generation;
   clearDraft();
@@ -371,7 +371,7 @@ watch(
     pendingLeave?.(false);
     pendingLeave = undefined;
     clearDraft();
-    source.value = value;
+    selectedSource.value = value;
     if (value) void load();
   },
   { immediate: true },

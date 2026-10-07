@@ -87,6 +87,7 @@ function fullPlatformUrl(input: string): URL {
   const raw = input.trim();
   if (
     raw.length > 2048 ||
+    // eslint-disable-next-line no-control-regex -- Deliberately reject unsafe control characters.
     /[\s\\#\u0000-\u001f\u007f]/.test(raw) ||
     !/^https:\/\/[A-Za-z0-9.-]+\//.test(raw) ||
     /\/(?:\.|\.\.)(?:\/|\?|$)/.test(raw)
@@ -773,6 +774,7 @@ export function validatePlatformImportPreview(
       (item.title !== null &&
         (typeof item.title !== "string" ||
           [...item.title].length > 200 ||
+          // eslint-disable-next-line no-control-regex -- Deliberately reject unsafe control characters.
           /[\u0000-\u001f\u007f\u2028\u2029]/.test(item.title)))
     )
       throw Error("导入响应不完整，请重新预览");
@@ -927,6 +929,7 @@ export function validatePlatformImportBatch(
       platform.part !== item.part ||
       typeof platform.content_id !== "string" ||
       !sameIdentity ||
+      // eslint-disable-next-line no-control-regex -- Deliberately reject unsafe control characters.
       /[\u0000-\u001f\u007f\u2028\u2029]/.test(media.title)
     )
       throw Error("批量导入中的视频身份不一致，请重新预览");

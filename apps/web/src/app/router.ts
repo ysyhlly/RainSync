@@ -1,87 +1,86 @@
-import { createRouter, createWebHistory } from "vue-router";
+import { createRouter, createWebHistory, type RouterHistory } from "vue-router";
 import { guestRoomPath } from "../features/auth/guest-session";
 import { useSession } from "../features/auth/session.store";
-import LoginPage from "../features/auth/LoginPage.vue";
-import RegisterPage from "../features/auth/RegisterPage.vue";
-import ProfilePage from "../features/account/ProfilePage.vue";
-import RoomsPage from "../features/rooms/RoomsPage.vue";
-import LibraryPage from "../features/library/LibraryPage.vue";
-import RoomPage from "../features/rooms/RoomPage.vue";
-import NotFoundPage from "./NotFoundPage.vue";
-import PrivateLibrariesPage from "../features/private-library/PrivateLibrariesPage.vue";
-import PluginsPage from "../features/plugins/PluginsPage.vue";
-import SourcesPage from "../features/admin/SourcesPage.vue";
-import AgentsPage from "../features/admin/AgentsPage.vue";
-import RegistrationInvitesPage from "../features/admin/RegistrationInvitesPage.vue";
-import CreateUserPage from "../features/admin/CreateUserPage.vue";
-import AdminSettingsPage from "../features/admin/AdminSettingsPage.vue";
 import { authenticationLocation, safeRedirect } from "./navigation";
-export function createApplicationRouter(base = "/") {
+export function createApplicationRouter(
+  base = "/",
+  history: RouterHistory = createWebHistory(base),
+) {
   const router = createRouter({
-    history: createWebHistory(base),
+    history,
     routes: [
       { path: "/", redirect: "/rooms" },
       {
         path: "/register",
-        component: RegisterPage,
+        component: () => import("../features/auth/RegisterPage.vue"),
         meta: { public: true, title: "账号注册" },
       },
       {
         path: "/account/profile",
-        component: ProfilePage,
+        component: () => import("../features/account/ProfilePage.vue"),
         meta: { title: "个人资料" },
       },
       {
         path: "/login",
-        component: LoginPage,
+        component: () => import("../features/auth/LoginPage.vue"),
         meta: { public: true, title: "登录" },
       },
-      { path: "/rooms", component: RoomsPage, meta: { title: "放映室" } },
+      {
+        path: "/rooms",
+        component: () => import("../features/rooms/RoomsPage.vue"),
+        meta: { title: "放映室" },
+      },
       {
         path: "/rooms/:id",
-        component: RoomPage,
+        component: () => import("../features/rooms/RoomPage.vue"),
         meta: { title: "观影", room: true },
       },
-      { path: "/library", component: LibraryPage, meta: { title: "媒体库" } },
+      {
+        path: "/library",
+        component: () => import("../features/library/LibraryPage.vue"),
+        meta: { title: "媒体库" },
+      },
       {
         path: "/libraries",
-        component: PrivateLibrariesPage,
+        component: () =>
+          import("../features/private-library/PrivateLibrariesPage.vue"),
         meta: { title: "私有媒体库" },
       },
       {
         path: "/admin/plugins",
-        component: PluginsPage,
+        component: () => import("../features/plugins/PluginsPage.vue"),
         meta: { title: "插件管理", requiresAdmin: true },
       },
       { path: "/admin", redirect: "/admin/settings" },
       {
         path: "/admin/settings",
-        component: AdminSettingsPage,
+        component: () => import("../features/admin/AdminSettingsPage.vue"),
         meta: { title: "管理员设置", requiresAdmin: true },
       },
       {
         path: "/admin/sources",
-        component: SourcesPage,
+        component: () => import("../features/admin/SourcesPage.vue"),
         meta: { title: "片源管理", requiresAdmin: true },
       },
       {
         path: "/admin/agents",
-        component: AgentsPage,
+        component: () => import("../features/admin/AgentsPage.vue"),
         meta: { title: "NAS 设备", requiresAdmin: true },
       },
       {
         path: "/admin/registration-invites",
-        component: RegistrationInvitesPage,
+        component: () =>
+          import("../features/admin/RegistrationInvitesPage.vue"),
         meta: { title: "账号与注册", requiresAdmin: true },
       },
       {
         path: "/admin/users",
-        component: CreateUserPage,
+        component: () => import("../features/admin/CreateUserPage.vue"),
         meta: { title: "手动创建账号", requiresAdmin: true },
       },
       {
         path: "/:pathMatch(.*)*",
-        component: NotFoundPage,
+        component: () => import("./NotFoundPage.vue"),
         meta: { title: "页面不存在" },
       },
     ],

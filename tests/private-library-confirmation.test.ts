@@ -2,6 +2,7 @@ import { mountSetup } from "./helpers/mount-setup";
 import * as Vue from "vue";
 import { expect, it, vi } from "vitest";
 import { privateLibraryApi } from "../apps/web/src/features/private-library/private-library.api";
+import { usePrivateLibraries } from "../apps/web/src/features/private-library/use-private-libraries";
 
 function library(id = "private") {
   return {
@@ -48,6 +49,14 @@ async function page() {
     useSession: () => session,
     useRoomRuntime: () => ({ room: null }),
     privateLibraryApi,
+    usePrivateLibraries,
+    LibraryManagementPanel: {},
+    LibraryMediaPanel: {},
+    LibraryRoomSharesPanel: {},
+    LibrarySourcesPanel: {},
+    LibraryAccessPanel: {},
+    IssuedSharesPanel: {},
+    LibraryDialogs: {},
     Notice: {},
     QueueFeedback: {},
     AppDialog: {},
@@ -55,13 +64,14 @@ async function page() {
     SourceSettingsDialog: {},
     LibraryBrowser: {},
   };
-  const { controls, unmount } = mountSetup(
+  const { controls: pageControls, unmount } = mountSetup(
     new URL(
       "../apps/web/src/features/private-library/PrivateLibrariesPage.vue",
       import.meta.url,
     ),
     imports,
   );
+  const controls = pageControls.screen;
   await vi.waitFor(() => expect(controls.selected.value?.id).toBe("private"));
   session.api.mockClear();
   return { controls, session, unmount };
@@ -98,6 +108,105 @@ it.each([
     p.unmount();
   },
 );
+
+it("a superseded library read cannot clear the newer loading state or select its result", async () => {
+  const p = await page();
+  const releases: ((value: unknown) => void)[] = [];
+  const signals: AbortSignal[] = [];
+  p.session.api.mockImplementation(async (path, _method, _body, signal) => {
+    if (path === "/libraries") {
+      signals.push(signal!);
+      return new Promise((resolve) => releases.push(resolve));
+    }
+    if (path.startsWith("/libraries/issued-shares"))
+      return { items: [], has_more: false };
+    if (path.includes("/media?")) return [];
+    return library(path.split("/")[2]);
+  });
+  const old = p.controls.initialize(),
+    newer = p.controls.initialize();
+  expect(signals[0].aborted).toBe(true);
+  releases[0]({ enabled: true, items: [library("old")] });
+  await old;
+  expect(p.controls.listBusy.value).toBe(true);
+  expect(p.controls.selected.value.id).toBe("private");
+  releases[1]({ enabled: true, items: [library("new")] });
+  await newer;
+  expect(p.controls.selected.value.id).toBe("new");
+  expect(p.controls.listBusy.value).toBe(false);
+  p.unmount();
+});
+
+it("unmount aborts owned reads and late responses cannot restore private state", async () => {
+  const p = await page();
+  const signals: AbortSignal[] = [],
+    releases: (() => void)[] = [];
+  p.session.api.mockImplementation(async (path, _method, _body, signal) => {
+    signals.push(signal!);
+    return new Promise((resolve) =>
+      releases.push(() =>
+        resolve(
+          path === "/libraries"
+            ? { enabled: true, items: [library("late")] }
+            : path.includes("issued-shares")
+              ? { items: [], has_more: false }
+              : library("late"),
+        ),
+      ),
+    );
+  });
+  const detail = p.controls.select("late"),
+    initialize = p.controls.initialize();
+  p.controls.sourceUrl.value = "https://fixture.invalid/credential-draft";
+  p.unmount();
+  expect(signals.every((signal) => signal.aborted)).toBe(true);
+  expect(p.controls.sourceUrl.value).toBe("");
+  releases.forEach((release) => release());
+  await Promise.all([detail, initialize]);
+  expect(p.controls.selected.value).toBeNull();
+  expect(p.controls.libraries.value).toEqual([]);
+  expect(p.controls.busy.value).toBe(false);
+});
+
+it("an old-account initialization error cannot overwrite the new account's feedback", async () => {
+  const p = await page();
+  let reject!: (failure: Error) => void;
+  p.session.api.mockImplementation(async (path) => {
+    if (path === "/libraries")
+      return new Promise((_resolve, fail) => (reject = fail));
+    return { items: [], has_more: false };
+  });
+  const old = p.controls.initialize();
+  p.session.epoch++;
+  p.controls.notice.value = "Current account feedback";
+  reject(new Error("Previous account read failed"));
+  await old;
+  expect(p.controls.error.value).toBe("");
+  expect(p.controls.notice.value).toBe("Current account feedback");
+  p.unmount();
+});
+
+it("explicit form model updates retain the refs used by permission commands", async () => {
+  const p = await page();
+  p.controls.grantFormModel.value = {
+    ...p.controls.grantForm,
+    grantName: "viewer",
+    play: false,
+  };
+  expect(p.controls.grantName.value).toBe("viewer");
+  expect(p.controls.play.value).toBe(false);
+  await p.controls.addGrant();
+  expect(p.session.api).toHaveBeenCalledWith(
+    "/libraries/private/grants",
+    "POST",
+    expect.objectContaining({
+      username: "viewer",
+      play: false,
+      expected_revision: "1",
+    }),
+  );
+  p.unmount();
+});
 
 it("invalidates confirmation when the selected library or active account changes", async () => {
   const p = await page();

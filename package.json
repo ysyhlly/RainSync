@@ -33,13 +33,21 @@
     "test:static-hls-pending-native": "node tests/static-hls-pending-native.mjs",
     "test:static-hls-worker-operation": "node tests/static-hls-worker-operation.mjs",
     "test:static-hls-owner-linux": "node tests/static-hls-owner-linux.mjs",
-    "test:static-hls-public-prepare": "node tests/static-hls-public-prepare.mjs"
+    "test:static-hls-public-prepare": "node tests/static-hls-public-prepare.mjs",
+    "lint": "eslint apps/web/src packages --max-warnings 0",
+    "test:frontend-bundle": "node --test tests/frontend-bundle-budget.test.mjs"
   },
   "devDependencies": {
+    "@eslint/js": "10.0.1",
     "@playwright/test": "^1.55.0",
+    "eslint": "10.12.0",
+    "eslint-plugin-vue": "10.11.1",
+    "globals": "17.13.0",
     "prettier": "^3.9.9",
     "typescript": "^5.9.0",
+    "typescript-eslint": "8.71.1",
     "vitest": "^5.0.2",
+    "vue-eslint-parser": "10.4.1",
     "ws": "^8.22.0"
   }
 }

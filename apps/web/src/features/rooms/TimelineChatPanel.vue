@@ -62,6 +62,10 @@ let serial = 0,
   controller: AbortController | undefined,
   pending: Record<string, unknown> | undefined;
 const failed = ref(false);
+let lifetime = new AbortController();
+function requestSignal(timeout: number) {
+  return AbortSignal.any([lifetime.signal, AbortSignal.timeout(timeout)]);
+}
 const displayError = computed(
   () =>
     error.value ||
@@ -85,7 +89,7 @@ const cutoff = computed(() =>
     ? atMs.value
     : historicalCutoffMs(historicalCutoff.value),
 );
-const visible = computed(() =>
+const visibleComments = computed(() =>
   hideFuture.value && cutoff.value === null
     ? []
     : displayedComments(
@@ -140,6 +144,8 @@ function clearWindow() {
   reactions.value = [];
 }
 function reset() {
+  lifetime.abort();
+  lifetime = new AbortController();
   ++serial;
   pauseDisplay();
   clearWindow();
@@ -175,7 +181,7 @@ async function load(before?: string) {
     `${prefix()}/messages?activity_id=${activity}${before ? `&before=${before}` : ""}`,
     "GET",
     undefined,
-    AbortSignal.timeout(15000),
+    requestSignal(15000),
   );
   if (
     sequence !== serial ||
@@ -358,6 +364,8 @@ watch(
   () => {
     // A new media/lifecycle context cannot reuse a submission from the old one.
     ++serial;
+    lifetime.abort();
+    lifetime = new AbortController();
     discardPending(true);
     if (selected.value === current.value?.id) selected.value = "";
     current.value = null;
@@ -366,12 +374,19 @@ watch(
   },
 );
 function tombstone(ids: ReadonlySet<string>) {
-  latestPage = latestPage.map((m) =>
-    ids.has(m.id) ? { ...m, deleted: true, body: "" } : m,
-  );
-  comments.value = comments.value.map((m) =>
-    ids.has(m.id) ? { ...m, deleted: true, body: "" } : m,
-  );
+  if (!ids.size) return;
+  const scrub = (messages: TimelineComment[]) => {
+    let changed = false;
+    const result = messages.map((message) => {
+      if (!ids.has(message.id) || (message.deleted && message.body === ""))
+        return message;
+      changed = true;
+      return { ...message, deleted: true, body: "" };
+    });
+    return changed ? result : messages;
+  };
+  latestPage = scrub(latestPage);
+  comments.value = scrub(comments.value);
 }
 watch(
   () => r.lastChatDeletion,
@@ -380,10 +395,14 @@ watch(
   },
 );
 watch(
-  () => r.messages,
+  // Track structure and deletion flags, not every message body/metadata field.
   () =>
-    tombstone(new Set(r.messages.filter((m) => m.deleted).map((m) => m.id))),
-  { deep: true },
+    JSON.stringify(
+      r.messages
+        .filter((message) => message.deleted)
+        .map((message) => message.id),
+    ),
+  (signature) => tombstone(new Set<string>(JSON.parse(signature))),
 );
 async function revalidateCached() {
   if (!r.connected || !displayActive.value || revalidationInFlight) return;
@@ -477,7 +496,7 @@ async function send() {
       `${prefix()}/messages`,
       "POST",
       pending,
-      AbortSignal.timeout(15000),
+      requestSignal(15000),
     );
     if (
       sequence !== serial ||
@@ -526,7 +545,7 @@ async function react(emoji: string) {
         activity_id: selected.value,
         emoji,
       },
-      AbortSignal.timeout(10000),
+      requestSignal(10000),
     );
     if (sequence === serial) {
       clearTimeout(timer);
@@ -541,12 +560,18 @@ async function manage() {
   const room = r.room?.id,
     sequence = serial;
   try {
-    const list = await session.api<RoomMember[]>(`/rooms/${room}/members`);
+    const list = await session.api<RoomMember[]>(
+      `/rooms/${room}/members`,
+      "GET",
+      undefined,
+      requestSignal(15000),
+    );
     if (sequence !== serial || r.room?.id !== room) return;
     members.value = list;
     manageOpen.value = true;
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
+    if (sequence === serial && r.room?.id === room)
+      error.value = e instanceof Error ? e.message : String(e);
   }
 }
 async function moderation(messageId?: string) {
@@ -559,19 +584,24 @@ async function moderation(messageId?: string) {
   busy.value = true;
   error.value = "";
   try {
-    await session.api(`${prefix()}/moderation`, "POST", {
-      action: messageId ? "delete" : action.value,
-      reason: reason.value,
-      ...(messageId
-        ? { message_id: messageId }
-        : {
-            target_user_id: target.value,
-            ...(action.value === "mute" ? { minutes: 10 } : {}),
-            ...(action.value === "moderator"
-              ? { moderator: targetModerator.value }
-              : {}),
-          }),
-    });
+    await session.api(
+      `${prefix()}/moderation`,
+      "POST",
+      {
+        action: messageId ? "delete" : action.value,
+        reason: reason.value,
+        ...(messageId
+          ? { message_id: messageId }
+          : {
+              target_user_id: target.value,
+              ...(action.value === "mute" ? { minutes: 10 } : {}),
+              ...(action.value === "moderator"
+                ? { moderator: targetModerator.value }
+                : {}),
+            }),
+      },
+      requestSignal(15000),
+    );
     if (sequence !== serial) return;
     reason.value = "";
     if (messageId) tombstone(new Set([messageId]));
@@ -583,14 +613,15 @@ async function moderation(messageId?: string) {
   }
 }
 async function showAudit() {
+  const sequence = serial;
   try {
-    const sequence = serial,
-      result = await session.api<{
-        items: { id: string; action: string; reason: string }[];
-      }>(`${prefix()}/audit`);
+    const result = await session.api<{
+      items: { id: string; action: string; reason: string }[];
+    }>(`${prefix()}/audit`, "GET", undefined, requestSignal(15000));
     if (sequence === serial) audit.value = result.items;
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
+    if (sequence === serial)
+      error.value = e instanceof Error ? e.message : String(e);
   }
 }
 function visibilityChanged() {
@@ -602,6 +633,7 @@ onMounted(() =>
 onBeforeUnmount(() => {
   document.removeEventListener("visibilitychange", visibilityChanged);
   reset();
+  lifetime.abort();
 });
 </script>
 <template>
@@ -682,8 +714,8 @@ onBeforeUnmount(() => {
         role="log"
         :aria-live="currentSelected && !browsingOlder ? 'polite' : 'off'"
       >
-        <p v-if="!visible.length" class="helper">{{ emptyMessage }}</p>
-        <article v-for="m in visible" :key="m.id">
+        <p v-if="!visibleComments.length" class="helper">{{ emptyMessage }}</p>
+        <article v-for="m in visibleComments" :key="m.id">
           <b>{{ m.display_name }}</b
           ><small
             >{{ timeLabel(m.media_time_ms) }} ·

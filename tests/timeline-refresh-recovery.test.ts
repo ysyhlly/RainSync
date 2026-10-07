@@ -32,20 +32,17 @@ function fixture() {
     roomActive: true,
     state: { media_id: "movie", media_generation: 1 },
     position: 0,
-    messages: [],
-    lastChatDeletion: undefined,
+    messages: [] as { id: string; body: string; deleted?: boolean }[],
+    lastChatDeletion: undefined as string | undefined,
   });
+  const document = Object.assign(new EventTarget(), { hidden: false });
   const panel = mountSetup(
     new URL(
       "../apps/web/src/features/rooms/TimelineChatPanel.vue",
       import.meta.url,
     ),
     {
-      document: {
-        hidden: false,
-        addEventListener() {},
-        removeEventListener() {},
-      },
+      document,
       useRoomRuntime: () => runtime,
       useSession: () => ({ epoch: 1, api }),
       ...timeline,
@@ -54,8 +51,52 @@ function fixture() {
     { visible: true },
   );
   cleanup.push(panel.unmount);
-  return { ...panel, api };
+  return { ...panel, api, runtime, document };
 }
+
+it("only deletion changes tombstone the timeline window; ordinary chat edits do not rebuild it", async () => {
+  const p = fixture();
+  const message = { id: "comment", body: "original", deleted: false };
+  p.controls.comments.value = [message];
+  p.runtime.messages = [{ ...message }];
+  await nextTick();
+  const window = p.controls.comments.value;
+  p.runtime.messages[0].body = "ordinary edit";
+  p.runtime.messages.push({ id: "new-chat", body: "hello" });
+  await nextTick();
+  expect(p.controls.comments.value).toBe(window);
+  p.runtime.messages[0].deleted = true;
+  await nextTick();
+  expect(p.controls.comments.value[0]).toMatchObject({
+    deleted: true,
+    body: "",
+  });
+  const deletedWindow = p.controls.comments.value;
+  p.runtime.lastChatDeletion = "comment";
+  await nextTick();
+  expect(p.controls.comments.value).toBe(deletedWindow);
+});
+
+it("unmount aborts a pending history read and removes visibility listeners without reviving polling", async () => {
+  const p = fixture();
+  let signal!: AbortSignal, finish!: (value: unknown) => void;
+  p.api.mockImplementation((_path, _method, _body, requestSignal) => {
+    signal = requestSignal!;
+    return new Promise((resolve) => (finish = resolve)) as any;
+  });
+  p.controls.selected.value = "activity";
+  await nextTick();
+  expect(signal.aborted).toBe(false);
+  p.unmount();
+  expect(signal.aborted).toBe(true);
+  p.document.hidden = true;
+  p.document.dispatchEvent(new Event("visibilitychange"));
+  expect(p.controls.pageVisible.value).toBe(true);
+  finish({ items: [], next_before: null, next_after: null });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(vi.getTimerCount()).toBe(0);
+  expect(p.controls.comments.value).toEqual([]);
+});
 
 it("clears a transient read error when the scheduled refresh succeeds", async () => {
   const p = fixture();

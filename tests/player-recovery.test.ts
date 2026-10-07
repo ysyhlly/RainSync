@@ -1,3 +1,11 @@
+vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
+  const { default: Hls } = await import("hls.js");
+  return {
+    getPlaybackMediaSource: () => Hls.getMediaSource(),
+    hasPlaybackMseApi: () => Hls.isMSESupported(),
+    supportsHlsPlayback: () => Hls.isSupported(),
+  };
+});
 import { afterEach, expect, it, vi } from "vitest";
 import { effectScope, ref } from "vue";
 import { createPlaybackRuntime } from "../apps/web/src/features/playback/playback-runtime";
@@ -96,6 +104,7 @@ function setup(
     fileFallback?: boolean;
     captureErrors?: boolean;
     candidateId?: string;
+    deferAttach?: boolean;
   } = {},
 ) {
   vi.useFakeTimers({
@@ -238,7 +247,7 @@ function setup(
     set: writes,
   });
   Object.defineProperty(el, "currentTime", { get: () => position, set: seeks });
-  runtime.attach(el);
+  if (!options.deferAttach) runtime.attach(el);
   return {
     runtime,
     session,
@@ -276,6 +285,59 @@ const playbackPosts = (s: ReturnType<typeof setup>) =>
   s.api.mock.calls.filter(
     ([path, method]) => isPlaybackPost(path) && method === "POST",
   );
+
+it("replays the original deferred generation when the host attaches after the room snapshot", async () => {
+  const s = setup({ deferAttach: true });
+  try {
+    await s.runtime.loadMedia();
+    expect(playbackPosts(s)).toHaveLength(0);
+    s.runtime.attach(s.el);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(playbackPosts(s)).toHaveLength(1);
+    expect(playbackPosts(s)[0][2].plan_generation).toBe(1);
+    expect(s.el.src).toBe("/authorized.mp4");
+    expect(meterStarts).toHaveLength(1);
+    s.runtime.attach(s.el);
+    s.runtime.onClockReady();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("keeps a late host's original load deferred until its clock is ready", async () => {
+  const s = setup({ deferAttach: true });
+  try {
+    s.clock.ready = false;
+    await s.runtime.loadMedia();
+    s.runtime.attach(s.el);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(playbackPosts(s)).toHaveLength(0);
+    s.clock.ready = true;
+    s.runtime.onClockReady();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(playbackPosts(s)).toHaveLength(1);
+    expect(playbackPosts(s)[0][2].plan_generation).toBe(1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("does not replay a late host's deferred load after its identity changes", async () => {
+  const s = setup({ deferAttach: true });
+  try {
+    await s.runtime.loadMedia();
+    ++s.session.epoch;
+    s.runtime.attach(s.el);
+    s.runtime.onClockReady();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(playbackPosts(s)).toHaveLength(0);
+    expect(s.el.src).toBe("");
+  } finally {
+    s.cleanup();
+  }
+});
 
 it("exposes queue, confirmed transcode and ready from one existing request", async () => {
   const s = setup({ rebuild: true });
@@ -651,6 +713,7 @@ it.each(["explicit authorization failure", "media network failure"])(
     try {
       s.el.readyState = 1;
       await s.runtime.loadMedia();
+      const queuedLoadedData = s.el.onloadeddata;
       if (failure === "media network failure") {
         s.el.error = { code: 2 };
         s.el.onerror();
@@ -660,7 +723,7 @@ it.each(["explicit authorization failure", "media network failure"])(
       expect(s.error.value).toBe(explicitError);
       expect(s.runtime.waiting.value).toBe(false);
       s.el.readyState = 2;
-      s.el.onloadeddata();
+      queuedLoadedData();
       expect(s.error.value).toBe(explicitError);
       expect(playbackPosts(s)).toHaveLength(1);
     } finally {
@@ -2505,7 +2568,12 @@ it("media replacement detaches the previous grant immediately while calibration 
     expect(s.el.src).toBe("");
     expect(s.runtime.sessionId.value).toBeNull();
     await vi.advanceTimersByTimeAsync(0);
-    expect(s.api).toHaveBeenCalledWith("/playback-sessions/session-1", "DELETE", undefined, expect.any(AbortSignal));
+    expect(s.api).toHaveBeenCalledWith(
+      "/playback-sessions/session-1",
+      "DELETE",
+      undefined,
+      expect.any(AbortSignal),
+    );
     expect(playbackPosts(s)).toHaveLength(1);
     s.clock.ready = true;
     s.runtime.onClockReady();
@@ -2523,12 +2591,21 @@ it("clearing the current media closes the old session without requiring clock ca
   try {
     await s.prepare();
     s.invalidate();
-    s.state.value = { ...s.state.value, media_id: null as any, media_generation: 2 };
+    s.state.value = {
+      ...s.state.value,
+      media_id: null as any,
+      media_generation: 2,
+    };
     s.runtime.mediaChanged();
     expect(s.el.src).toBe("");
     expect(s.runtime.sessionId.value).toBeNull();
     await vi.advanceTimersByTimeAsync(0);
-    expect(s.api.mock.calls.some(([path, method]) => path === "/playback-sessions/session-1" && method === "DELETE")).toBe(true);
+    expect(
+      s.api.mock.calls.some(
+        ([path, method]) =>
+          path === "/playback-sessions/session-1" && method === "DELETE",
+      ),
+    ).toBe(true);
     s.clock.ready = true;
     s.runtime.onClockReady();
     await vi.advanceTimersByTimeAsync(0);

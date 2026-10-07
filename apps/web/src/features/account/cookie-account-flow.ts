@@ -31,7 +31,6 @@ export function createCookieAccountFlow<
     busy = true;
     options.clearSecret();
     if (!options.validateInput(secret)) {
-      secret = "";
       busy = false;
       options.change("invalid");
       return;
@@ -47,7 +46,6 @@ export function createCookieAccountFlow<
       // Never surface service error text that could echo a session credential.
       if (current()) options.change("uncertain");
     } finally {
-      secret = "";
       busy = false;
     }
   }

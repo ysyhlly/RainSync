@@ -70,6 +70,12 @@ test("selection survives choosing a room and requires one explicit confirmation"
   ).toBeVisible();
   expect(app.commands.filter((c) => c.type === "CHANGE_MEDIA")).toHaveLength(0);
   await page.getByRole("button", { name: "进入房间", exact: true }).click();
+  // A positive read must complete in the destination component, rather than
+  // the outgoing RoomsPage during its route transition.
+  await expect(page).toHaveURL(/\/rooms\/room$/);
+  await expect(
+    page.getByRole("region", { name: "房间信息", exact: true }),
+  ).toBeVisible();
   const confirm = page.getByRole("button", { name: "确认播放所选影片" });
   await expect(confirm).toBeEnabled();
   expect(app.commands.filter((c) => c.type === "CHANGE_MEDIA")).toHaveLength(0);
@@ -225,4 +231,65 @@ test("revoked media clears a saved selection without changing the room", async (
     page.getByRole("button", { name: "确认播放所选影片" }),
   ).toHaveCount(0);
   expect(app.commands.filter((c) => c.type === "CHANGE_MEDIA")).toHaveLength(0);
+});
+
+test("public visibility denial survives the room-navigation confirmation handoff", async ({
+  page,
+}) => {
+  const app = await appFixture(page);
+  let releasePlaylist!: () => void, releaseDenied!: () => void;
+  const playlistGate = new Promise<void>(
+    (resolve) => (releasePlaylist = resolve),
+  );
+  const deniedGate = new Promise<void>((resolve) => (releaseDenied = resolve));
+  let heldPlaylist = false,
+    deniedSeen = false;
+  await page.route("**/api/v1/rooms/room/playlist", async (route) => {
+    if (!heldPlaylist) {
+      heldPlaylist = true;
+      await playlistGate;
+    }
+    await route.fulfill({ json: [] });
+  });
+  await page.route("**/api/v1/media/movie", async (route) => {
+    deniedSeen = true;
+    await deniedGate;
+    await route.fulfill({
+      status: 404,
+      json: { error: { code: "MEDIA_NOT_FOUND", message: "影片已不可访问" } },
+    });
+  });
+  try {
+    await page.goto("/library");
+    await openFixtureSource(page);
+    await page
+      .getByRole("button", { name: "播放 真实合成测试视频", exact: true })
+      .click();
+    await page.getByRole("button", { name: "进入房间", exact: true }).click();
+    await expect(
+      page.getByRole("button", { name: "确认播放所选影片" }),
+    ).toBeEnabled();
+    await expect(page).toHaveURL(/\/rooms$/);
+    await page.getByRole("button", { name: "确认播放所选影片" }).click();
+    await expect.poll(() => deniedSeen).toBe(true);
+    releasePlaylist();
+    await expect(page).toHaveURL(/\/rooms\/room$/);
+    await expect(
+      page.getByRole("region", { name: "房间信息", exact: true }),
+    ).toBeVisible();
+    releaseDenied();
+    await expect(
+      page.getByRole("button", { name: "确认播放所选影片" }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByText("影片已不可访问", { exact: true }),
+    ).toBeVisible();
+    expect(
+      app.commands.filter((command) => command.type === "CHANGE_MEDIA"),
+    ).toHaveLength(0);
+    expect(app.errors).toEqual([]);
+  } finally {
+    releasePlaylist();
+    releaseDenied();
+  }
 });

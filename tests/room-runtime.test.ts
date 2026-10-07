@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import { nextTick } from "vue";
+import { nextTick, watch } from "vue";
 import { useRoomRuntime } from "../apps/web/src/features/rooms/room-runtime";
 import { useSession } from "../apps/web/src/features/auth/session.store";
 
@@ -909,4 +909,158 @@ it("delegated room actions stay separate and a stale grant response cannot undo 
   } finally {
     runtime.$dispose();
   }
+});
+
+it("disposing an active room removes document/window listeners, timers and socket callbacks", async () => {
+  const add = vi.spyOn(EventTarget.prototype, "addEventListener");
+  const remove = vi.spyOn(EventTarget.prototype, "removeEventListener");
+  const { runtime, sockets, state } = lifecycleFixture();
+  try {
+    await runtime.enter({ id: "a", name: "A", owner_id: "user" });
+    const socket = sockets[0];
+    socket.onopen();
+    socket.onmessage({ data: JSON.stringify({ type: "SNAPSHOT", state }) });
+    runtime.chat = "pending receipt";
+    runtime.sendChat();
+    const listeners = add.mock.calls.flatMap((call, index) => {
+      const target = add.mock.contexts[index];
+      return target === window || target === document ? [{ target, call }] : [];
+    });
+    expect(listeners.map(({ call }) => call[0])).toEqual(expect.arrayContaining([
+      "focus", "pageshow", "visibilitychange",
+    ]));
+    runtime.$dispose();
+    await vi.advanceTimersByTimeAsync(0);
+    for (const { target, call } of listeners) {
+      expect(remove.mock.calls.some((removed, index) =>
+        remove.mock.contexts[index] === target &&
+        removed[0] === call[0] && removed[1] === call[1],
+      )).toBe(true);
+    }
+    expect(vi.getTimerCount()).toBe(0);
+    expect(socket.close).toHaveBeenCalled();
+    socket.onclose();
+    socket.onmessage({ data: JSON.stringify({ type: "SNAPSHOT", state: { ...state, revision: 999 } }) });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runtime.room).toBeNull();
+    expect(runtime.state).toBeNull();
+    expect(sockets).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    runtime.$dispose();
+    add.mockRestore();
+    remove.mockRestore();
+  }
+});
+
+it("a recovered lifecycle poll clears its own diagnostic without clearing a playback error", async () => {
+  let failing = true;
+  const fetcher = vi.fn(async (url: string) => {
+    if (!url.endsWith("/lifecycle")) return Response.json([]);
+    if (failing) throw new TypeError("Failed to fetch");
+    return Response.json({
+      lifecycle: "closing", lifecycle_epoch: 1, owner_id: "user", state,
+      cleanup: { last_error: null, completed: false, attempts: 1 },
+    });
+  });
+  const { runtime, sockets, state } = lifecycleFixture(fetcher);
+  try {
+    await runtime.enter({ id: "a", name: "A", owner_id: "user" });
+    sockets[0].onopen();
+    sockets[0].onmessage({ data: JSON.stringify({ type: "SNAPSHOT", state, lifecycle: "closing" }) });
+    runtime.error = "existing playback diagnostic";
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(runtime.cleanupError).toContain("将自动重试");
+    failing = false;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(runtime.cleanupError).toBe("");
+    expect(runtime.error).toBe("existing playback diagnostic");
+  } finally {
+    runtime.$dispose();
+  }
+});
+
+it("a delegated close grant allows closing, expires on time and cannot reopen or archive", async () => {
+  const writes: string[] = [];
+  const fetcher = vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/permissions")) return Response.json({
+      self_permissions: ["close"],
+      members: [{ user_id: "user", expires_at: Date.now() + 1_000 }],
+    });
+    if (init?.method === "POST") {
+      writes.push(url.split("/").at(-1)!);
+      return Response.json({
+        lifecycle: "closing", lifecycle_epoch: 1, owner_id: "owner",
+        state: { ...state, revision: 2 }, cleanup: null,
+      });
+    }
+    return Response.json([]);
+  });
+  const fixture = lifecycleFixture(fetcher);
+  const { runtime, sockets } = fixture;
+  const state = { ...fixture.state, controller_user_id: "owner" };
+  try {
+    await runtime.enter({ id: "a", name: "A", owner_id: "owner" });
+    sockets[0].onopen();
+    sockets[0].onmessage({ data: JSON.stringify({ type: "SNAPSHOT", state }) });
+    await runtime.refreshPermissions();
+    expect(runtime.canManageRoom).toBe(false);
+    expect(runtime.can("close")).toBe(true);
+    await expect(runtime.changeLifecycle("reopen")).rejects.toThrow("当前无法管理房间");
+    await expect(runtime.changeLifecycle("archive")).rejects.toThrow("当前无法管理房间");
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(runtime.changeLifecycle("close")).rejects.toThrow("当前无法管理房间");
+    expect(writes).toEqual([]);
+    await runtime.refreshPermissions();
+    await runtime.changeLifecycle("close");
+    expect(writes).toEqual(["close"]);
+    expect(runtime.room?.lifecycle).toBe("closing");
+  } finally {
+    runtime.$dispose();
+  }
+});
+
+it("publishes permissions and expiry atomically and malformed snapshots deny synchronous consumers", async () => {
+  let snapshot: unknown = { self_permissions: ["seek"], members: [{ user_id: "user", expires_at: Date.now() + 60_000 }] };
+  const fetcher = vi.fn(async (url: string) => Response.json(url.endsWith("/permissions") ? snapshot : []));
+  const { runtime } = lifecycleFixture(fetcher);
+  let stop: (() => void) | undefined;
+  try {
+    await runtime.enter({ id: "a", name: "A", owner_id: "owner" });
+    await runtime.refreshPermissions();
+    expect(runtime.can("seek")).toBe(true);
+    const observations: boolean[][] = [];
+    stop = watch(() => [runtime.can("seek"), runtime.can("pause")], value => observations.push(value), { flush: "sync" });
+    snapshot = { self_permissions: ["pause"], members: [{ user_id: "user", expires_at: Date.now() }] };
+    await runtime.refreshPermissions();
+    expect(observations).toEqual([[false, false]]);
+    observations.length = 0;
+    snapshot = [];
+    await runtime.refreshPermissions();
+    expect(observations).toEqual([[false, false]]);
+    expect(runtime.can("pause")).toBe(false);
+  } finally {
+    stop?.();
+    runtime.$dispose();
+  }
+});
+
+it("a same-user admin demotion cannot reuse delegation cached under the old role", async () => {
+  const fetcher = vi.fn(async (url: string) => Response.json(url.endsWith("/permissions")
+    ? { self_permissions: ["pause"], members: [{ user_id: "user", expires_at: null }] }
+    : []));
+  const { runtime } = lifecycleFixture(fetcher);
+  const session = useSession();
+  try {
+    session.accept({ id: "user", username: "user", csrf: "csrf", admin: true });
+    await runtime.enter({ id: "a", name: "A", owner_id: "owner" });
+    await runtime.refreshPermissions();
+    const epoch = session.epoch;
+    expect(runtime.can("pause")).toBe(true);
+    session.accept({ id: "user", username: "user", csrf: "csrf", admin: false });
+    expect(session.epoch).toBe(epoch);
+    expect(runtime.can("pause")).toBe(false);
+    await runtime.refreshPermissions();
+    expect(runtime.can("pause")).toBe(true);
+  } finally { runtime.$dispose(); }
 });

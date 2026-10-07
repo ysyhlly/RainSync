@@ -45,7 +45,10 @@ export const useSession = defineStore("session", () => {
       ...(external ? [external] : []),
     ]);
     const work = Promise.resolve().then(async () => {
-      await previous?.catch(() => {});
+      await previous?.catch(() => {
+        // Its original caller owns the error; only the cookie-ordering barrier
+        // is awaited here so a rejected predecessor cannot block a new login.
+      });
       signal.throwIfAborted();
       return action(signal);
     });
@@ -172,7 +175,11 @@ export const useSession = defineStore("session", () => {
     return user.value!;
   }
   async function load() {
-    while (authentication) await authentication.catch(() => {});
+    while (authentication)
+      await authentication.catch(() => {
+        // Waiting for authentication to settle does not retry or acknowledge it.
+        // The mutation's own caller reports failure before this fresh identity read.
+      });
     return readIdentity();
   }
   function login(username: string, password: string, signal?: AbortSignal) {

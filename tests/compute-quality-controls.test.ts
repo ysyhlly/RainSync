@@ -193,10 +193,10 @@ describe("NAS compute recipe controls", () => {
       });
       expect(c.jobOptions.value[1].label).toContain("2160p / UHD");
       c.jobs.value[0].primary_qualified = false;
-      await c.activate();
+      await c.activateOutput();
       expect(p.activate).not.toHaveBeenCalled();
       c.jobs.value[0].primary_qualified = true;
-      await c.activate();
+      await c.activateOutput();
       expect(p.activate).toHaveBeenCalledWith(
         {
           schema_version: 1,
@@ -228,11 +228,11 @@ describe("NAS compute recipe controls", () => {
         [true, true, false],
       ]) {
         [c.addresses.value, c.network.value, c.upload.value] = bits;
-        await c.share();
+        await c.shareOutput();
         expect(p.share).not.toHaveBeenCalled();
       }
       c.addresses.value = c.network.value = c.upload.value = true;
-      await c.share();
+      await c.shareOutput();
       expect(p.share).toHaveBeenCalledExactlyOnceWith({
         acknowledge_peer_addresses: true,
         confirm_current_network: true,

@@ -6,6 +6,7 @@ import { parse } from "@vue/compiler-sfc";
 import { useRoomRuntime } from "../apps/web/src/features/rooms/room-runtime";
 import { useSession } from "../apps/web/src/features/auth/session.store";
 import { privateLibraryApi } from "../apps/web/src/features/private-library/private-library.api";
+import { usePrivateLibraries } from "../apps/web/src/features/private-library/use-private-libraries";
 import { mountSetup } from "./helpers/mount-setup";
 
 const disposals: (() => void)[] = [];
@@ -78,71 +79,115 @@ function queueConnection(r: ReturnType<typeof useRoomRuntime>, sockets: any[]) {
   r.connect();
   const socket = sockets.at(-1);
   socket.onopen();
-  return { socket, frame: (value: unknown) => socket.onmessage({ data: JSON.stringify(value) }) };
+  return {
+    socket,
+    frame: (value: unknown) =>
+      socket.onmessage({ data: JSON.stringify(value) }),
+  };
 }
 
-it('refetches the viewer-filtered playlist when another participant changes it', async () => {
+it("refetches the viewer-filtered playlist when another participant changes it", async () => {
   const { runtime: r, api, sockets } = fixture();
   const { frame } = queueConnection(r, sockets);
-  api.mockImplementation(async (path) => path.endsWith('/playlist') ? rows(['new-visible-item']) : []);
-  r.playlist = rows(['old-visible-item']);
-  frame({ type: 'PLAYLIST_CHANGED' });
-  await vi.waitFor(() => expect(r.playlist).toEqual(rows(['new-visible-item'])));
-  expect(api.mock.calls.filter(([path]) => path.endsWith('/playlist'))).toHaveLength(1);
-  expect(api.mock.calls.every(([, method = 'GET']) => method === 'GET')).toBe(true);
+  api.mockImplementation(async (path) =>
+    path.endsWith("/playlist") ? rows(["new-visible-item"]) : [],
+  );
+  r.playlist = rows(["old-visible-item"]);
+  frame({ type: "PLAYLIST_CHANGED" });
+  await vi.waitFor(() =>
+    expect(r.playlist).toEqual(rows(["new-visible-item"])),
+  );
+  expect(
+    api.mock.calls.filter(([path]) => path.endsWith("/playlist")),
+  ).toHaveLength(1);
+  expect(api.mock.calls.every(([, method = "GET"]) => method === "GET")).toBe(
+    true,
+  );
 });
 
-it('coalesces queue invalidations while reading and performs one fresh trailing read', async () => {
+it("coalesces queue invalidations while reading and performs one fresh trailing read", async () => {
   const { runtime: r, api, sockets } = fixture();
   const { frame } = queueConnection(r, sockets);
-  const first = deferred(), second = deferred();
+  const first = deferred(),
+    second = deferred();
   let reads = 0;
-  api.mockImplementation(async (path) => path.endsWith('/playlist')
-    ? (++reads === 1 ? first.promise : second.promise) : []);
-  frame({ type: 'PLAYLIST_CHANGED' });
+  api.mockImplementation(async (path) =>
+    path.endsWith("/playlist")
+      ? ++reads === 1
+        ? first.promise
+        : second.promise
+      : [],
+  );
+  frame({ type: "PLAYLIST_CHANGED" });
   await nextTick();
-  for (let i = 0; i < 20; i++) frame({ type: 'PLAYLIST_CHANGED' });
+  for (let i = 0; i < 20; i++) frame({ type: "PLAYLIST_CHANGED" });
   expect(reads).toBe(1);
-  first.resolve(rows(['earlier']));
+  first.resolve(rows(["earlier"]));
   await vi.waitFor(() => expect(reads).toBe(2));
-  second.resolve(rows(['latest']));
-  await vi.waitFor(() => expect(r.playlist).toEqual(rows(['latest'])));
+  second.resolve(rows(["latest"]));
+  await vi.waitFor(() => expect(r.playlist).toEqual(rows(["latest"])));
   expect(reads).toBe(2);
 });
 
-it('refreshes the queue after a reconnect snapshot with unchanged media generation', async () => {
+it("refreshes the queue after a reconnect snapshot with unchanged media generation", async () => {
   const { runtime: r, api, sockets } = fixture();
   const state = {
-    room_id: room.id, revision: 3, media_id: null, media_generation: 7,
-    playback_status: 'paused', anchor_position_ms: 0, anchor_server_time_ms: 0,
-    playback_rate: 1, controller_user_id: room.owner_id, duration_ms: null, clock_epoch: 'clock',
+    room_id: room.id,
+    revision: 3,
+    media_id: null,
+    media_generation: 7,
+    playback_status: "paused",
+    anchor_position_ms: 0,
+    anchor_server_time_ms: 0,
+    playback_rate: 1,
+    controller_user_id: room.owner_id,
+    duration_ms: null,
+    clock_epoch: "clock",
   };
   r.state = state;
-  r.playlist = rows(['before-disconnect']);
+  r.playlist = rows(["before-disconnect"]);
   const { frame } = queueConnection(r, sockets);
-  api.mockImplementation(async (path) => path.endsWith('/playlist') ? rows(['after-disconnect'])
-    : path.endsWith('/permissions') ? { self_permissions: [], members: [] } : []);
-  frame({ type: 'SNAPSHOT', state, owner_id: room.owner_id, control_epoch: { id: 'renewed' } });
-  await vi.waitFor(() => expect(r.playlist).toEqual(rows(['after-disconnect'])));
+  api.mockImplementation(async (path) =>
+    path.endsWith("/playlist")
+      ? rows(["after-disconnect"])
+      : path.endsWith("/permissions")
+        ? { self_permissions: [], members: [] }
+        : [],
+  );
+  frame({
+    type: "SNAPSHOT",
+    state,
+    owner_id: room.owner_id,
+    control_epoch: { id: "renewed" },
+  });
+  await vi.waitFor(() =>
+    expect(r.playlist).toEqual(rows(["after-disconnect"])),
+  );
   expect(r.state?.media_generation).toBe(7);
 });
 
-it('cannot apply an old-room invalidation result or start its trailing refresh after leaving', async () => {
+it("cannot apply an old-room invalidation result or start its trailing refresh after leaving", async () => {
   const { runtime: r, api, sockets } = fixture();
   const { frame } = queueConnection(r, sockets);
   const old = deferred();
-  api.mockImplementation(async (path) => path === `/rooms/${room.id}/playlist` ? old.promise
-    : path.endsWith('/playlist') ? rows(['new-room-item'])
-    : path.endsWith('/permissions') ? { self_permissions: [], members: [] } : []);
-  frame({ type: 'PLAYLIST_CHANGED' });
+  api.mockImplementation(async (path) =>
+    path === `/rooms/${room.id}/playlist`
+      ? old.promise
+      : path.endsWith("/playlist")
+        ? rows(["new-room-item"])
+        : path.endsWith("/permissions")
+          ? { self_permissions: [], members: [] }
+          : [],
+  );
+  frame({ type: "PLAYLIST_CHANGED" });
   await nextTick();
-  frame({ type: 'PLAYLIST_CHANGED' });
-  await r.enter({ ...room, id: 'new-room' });
+  frame({ type: "PLAYLIST_CHANGED" });
+  await r.enter({ ...room, id: "new-room" });
   const calls = api.mock.calls.length;
-  old.resolve(rows(['private-old-room-item']));
+  old.resolve(rows(["private-old-room-item"]));
   await nextTick();
   await nextTick();
-  expect(r.playlist).toEqual(rows(['new-room-item']));
+  expect(r.playlist).toEqual(rows(["new-room-item"]));
   expect(api.mock.calls).toHaveLength(calls);
 });
 
@@ -354,7 +399,9 @@ it("retries a failed initial playlist fetch in the same room without replacing i
 it("focus and foreground wake refresh the current queue through the existing coalescer", async () => {
   const { runtime: r, api } = fixture();
   let reads = 0;
-  api.mockImplementation(async path => path.endsWith("/playlist") ? rows([`queue-${++reads}`]) : []);
+  api.mockImplementation(async (path) =>
+    path.endsWith("/playlist") ? rows([`queue-${++reads}`]) : [],
+  );
   await r.refreshPlaylist();
   window.dispatchEvent(new Event("focus"));
   await vi.waitFor(() => expect(r.playlist).toEqual(rows(["queue-2"])));
@@ -368,7 +415,9 @@ it("focus and foreground wake refresh the current queue through the existing coa
 it("returning to a loaded same room refreshes its queue and preserves its socket", async () => {
   const { runtime: r, api, sockets } = fixture();
   let reads = 0;
-  api.mockImplementation(async path => path.endsWith("/playlist") ? rows([`queue-${++reads}`]) : []);
+  api.mockImplementation(async (path) =>
+    path.endsWith("/playlist") ? rows([`queue-${++reads}`]) : [],
+  );
   queueConnection(r, sockets);
   await r.refreshPlaylist();
   await r.enter(room);
@@ -503,6 +552,14 @@ it("the actual private-library queue guard accepts a delegated queue permission 
     useRoomRuntime: () => r,
     useRoute: () => ({ query: {} }),
     privateLibraryApi,
+    usePrivateLibraries,
+    LibraryManagementPanel: {},
+    LibraryMediaPanel: {},
+    LibraryRoomSharesPanel: {},
+    LibrarySourcesPanel: {},
+    LibraryAccessPanel: {},
+    IssuedSharesPanel: {},
+    LibraryDialogs: {},
     LibraryBrowser: {},
     SourceSettingsDialog: {},
     Notice: {},
@@ -511,7 +568,12 @@ it("the actual private-library queue guard accepts a delegated queue permission 
     AppIcon: {},
   });
   disposals.push(page.unmount);
-  const ast = parse(readFileSync(url, "utf8")).descriptor.template!.ast!;
+  page.controls = page.controls.screen;
+  const mediaPanel = new URL(
+    "../apps/web/src/features/private-library/LibraryMediaPanel.vue",
+    import.meta.url,
+  );
+  const ast = parse(readFileSync(mediaPanel, "utf8")).descriptor.template!.ast!;
   let disabled = "";
   function findQueueButton(node: any) {
     if (

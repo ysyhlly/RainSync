@@ -61,6 +61,7 @@ async function saveSettings() {
   if (
     !trimmed ||
     [...trimmed].length > 120 ||
+    // eslint-disable-next-line no-control-regex -- Deliberately reject unsafe control characters.
     /[\u0000-\u001f\u007f-\u009f]/.test(trimmed)
   )
     throw Error("设备名称需为 1–120 个字符，不能包含控制字符");
@@ -76,7 +77,10 @@ async function saveSettings() {
     );
   } catch (e) {
     if ((e as { code?: string })?.code === "AGENT_SETTINGS_CONFLICT")
-      throw Error("设备名称已被其他管理员修改。请取消并刷新设备状态后重新编辑");
+      throw Error(
+        "设备名称已被其他管理员修改。请取消并刷新设备状态后重新编辑",
+        { cause: e },
+      );
     throw e;
   }
   if (!alive || context !== scope) return;

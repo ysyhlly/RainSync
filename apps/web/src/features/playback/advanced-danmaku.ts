@@ -127,6 +127,7 @@ export function safeProps(raw: Record<string, unknown>): SceneProps {
       if (
         typeof value !== "string" ||
         value.length > strings[key] ||
+        // eslint-disable-next-line no-control-regex -- Deliberately reject unsafe control characters.
         /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u202a-\u202e\u2066-\u2069]/.test(value)
       )
         throw new UnsupportedDanmaku();

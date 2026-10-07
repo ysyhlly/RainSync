@@ -137,12 +137,11 @@ export function createPlatformTextRuntime(ctx: {
       )
         continue;
       const text = [
-        ...cue.text
-          .replace(/[\n\r\t]/g, " ")
-          .replace(
-            /[\x00-\x1f\x7f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g,
-            "",
-          ),
+        ...cue.text.replace(/[\n\r\t]/g, " ").replace(
+          // eslint-disable-next-line no-control-regex -- Strip actual caption control/bidi characters before displaying decoded text.
+          /[\x00-\x1f\x7f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g,
+          "",
+        ),
       ]
         .slice(0, 2000)
         .join("")
@@ -419,7 +418,9 @@ export function createPlatformTextRuntime(ctx: {
         ctx.session.epoch !== epoch ||
         controller.signal.aborted
       ) {
-        await response.body?.cancel().catch(() => {});
+        await response.body?.cancel().catch(() => {
+          // An already rejected response has no caption state to apply.
+        });
         return;
       }
       if (!response.ok) {
@@ -447,7 +448,9 @@ export function createPlatformTextRuntime(ctx: {
         }
         vtt += decoder.decode();
       } catch (error) {
-        await reader.cancel().catch(() => {});
+        await reader.cancel().catch(() => {
+          // Keep the original read/parse failure when retiring its body.
+        });
         throw error;
       } finally {
         reader.releaseLock();
@@ -483,7 +486,8 @@ export function createPlatformTextRuntime(ctx: {
         );
       }
       nativeTrack.mode = "showing";
-    } catch (error) {
+    } catch {
+      // Retire a failed subtitle fetch/parse; a current viewer may explicitly retry.
       if (
         serial !== active ||
         subtitleSerial !== selection ||
@@ -765,7 +769,9 @@ export function createPlatformTextRuntime(ctx: {
         pending += decoder.decode();
         if (pending) throw new TypeError("实时弹幕帧不完整");
       } catch (error) {
-        await reader.cancel().catch(() => {});
+        await reader.cancel().catch(() => {
+          // Keep the original read/parse failure when retiring its body.
+        });
         throw error;
       } finally {
         reader.releaseLock();

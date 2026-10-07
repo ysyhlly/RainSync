@@ -24,6 +24,8 @@ export function mountSetup(
     .replace("export default", "return");
   const bindings = {
     _defineComponent: Vue.defineComponent,
+    _useModel: Vue.useModel,
+    _mergeModels: Vue.mergeModels,
     ref: Vue.ref,
     computed: Vue.computed,
     watch: Vue.watch,

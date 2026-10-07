@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onBeforeUnmount, watch } from "vue";
-import Hls from "hls.js";
+import { supportsHlsPlayback } from "./browser-mse";
 import AppSelect from "../../shared/ui/AppSelect.vue";
 import { useSession } from "../auth/session.store";
 import type { DistributedComputePlaybackIntent } from "../../../../../packages/protocol";
@@ -194,7 +194,7 @@ async function prepare() {
     await load();
   });
 }
-async function activate() {
+async function activateOutput() {
   await act(async () => {
     const job = jobs.value.find(
       (j) =>
@@ -211,7 +211,7 @@ async function activate() {
     );
   });
 }
-async function share() {
+async function shareOutput() {
   await act(async () => {
     if (!addresses.value || !network.value || !upload.value)
       throw Error("请先确认当前网络、上传与地址披露");
@@ -330,7 +330,7 @@ onBeforeUnmount(() => {
             j.id === selected && j.status === 'ready' && j.primary_qualified,
         )
       "
-      @click="activate"
+      @click="activateOutput"
     >
       用于房间主播放器
     </button>
@@ -370,9 +370,9 @@ onBeforeUnmount(() => {
           !upload ||
           !activeJob ||
           sharing ||
-          !Hls.isSupported()
+          !supportsHlsPlayback()
         "
-        @click="share"
+        @click="shareOutput"
       >
         启用主播放器分片共享
       </button>

@@ -23,7 +23,9 @@ const visible = computed(
 );
 async function reload() {
   // Only repeat the read. Successful queue mutations are never replayed here.
-  await runtime.refreshPlaylist().catch(() => {});
+  await runtime.refreshPlaylist().catch(() => {
+    // refreshPlaylist sets playlistError, rendered below with this same retry control.
+  });
 }
 </script>
 <template>

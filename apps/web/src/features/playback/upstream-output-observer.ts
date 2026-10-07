@@ -18,7 +18,9 @@ export function observeUpstreamOutput(options: {
   const stop = () => {
     active = false;
     controller.abort();
-    void reader?.cancel().catch(() => {});
+    void reader?.cancel().catch(() => {
+      // Optional observation is retired; cancellation cannot publish facts.
+    });
     clearTimeout(timer);
   };
   const until = performance.now() + 30_000;

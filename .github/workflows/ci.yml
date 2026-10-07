@@ -37,7 +37,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo run -p protocol --example export -- --check
-      - run: npm ci && npm test && npm run build
+      - run: npm ci && npm run lint && npm test && npm run build
+      - name: Verify frontend bundle boundaries
+        run: npm run test:frontend-bundle
       - run: npm run test:backend-contracts
       - name: Verify deployment configuration contracts
         run: node --test tests/deployment-settings.test.mjs

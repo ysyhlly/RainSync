@@ -49,6 +49,7 @@ export function validYoutubeCookieFile(input: string) {
   return (
     input.length > 0 &&
     input.length <= 32768 &&
+    // eslint-disable-next-line no-control-regex -- Deliberately reject unsafe control characters.
     !/[^\x09\x0a\x0d\x20-\x7e]/.test(input) &&
     /^# (?:Netscape )?HTTP Cookie File\r?\n/.test(input)
   );

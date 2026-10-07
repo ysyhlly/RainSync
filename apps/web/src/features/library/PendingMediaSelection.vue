@@ -12,6 +12,7 @@ const pending = usePendingMedia(),
   session = useSession();
 const busy = ref(false),
   error = ref("");
+const displayError = computed(() => error.value || pending.selectionError);
 let active = true,
   serial = 0;
 const canContinue = computed(
@@ -38,8 +39,9 @@ watch(
     ++serial;
     busy.value = false;
     error.value = "";
+    pending.clearContextError(runtime.selectionContext(), runtime.connected);
   },
-  { flush: "sync" },
+  { flush: "sync", immediate: true },
 );
 onBeforeUnmount(() => {
   active = false;
@@ -50,6 +52,7 @@ async function confirm() {
     room = runtime.room?.id;
   if (!selection || !room || busy.value || !canContinue.value) return;
   const mine = ++serial;
+  const context = runtime.selectionContext();
   busy.value = true;
   error.value = "";
   try {
@@ -62,6 +65,7 @@ async function confirm() {
       pending.selection !== selection ||
       selection.epoch !== session.epoch ||
       runtime.room?.id !== room ||
+      runtime.selectionContext() !== context ||
       !canContinue.value
     )
       return;
@@ -73,10 +77,25 @@ async function confirm() {
     }
     if (pending.selection === selection) pending.clear();
   } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    if (
+      e instanceof RequestFailure &&
+      e.code === "MEDIA_NOT_FOUND" &&
+      pending.selection === selection &&
+      selection.epoch === session.epoch &&
+      runtime.room?.id === room &&
+      runtime.connected &&
+      runtime.selectionContext() === context
+    ) {
+      // Public visibility belongs to this exact saved selection. Carry a
+      // confirmed denial across the RoomsPage -> RoomPage component handoff;
+      // a room-only metadata success grants no public-library visibility.
+      pending.rejectSelection(selection, message, context);
+      if (active) error.value = message;
+      return;
+    }
     if (active && mine === serial && pending.selection === selection) {
-      if (e instanceof RequestFailure && e.code === "MEDIA_NOT_FOUND")
-        pending.clear();
-      error.value = e instanceof Error ? e.message : String(e);
+      error.value = message;
     }
   } finally {
     if (active && mine === serial) busy.value = false;
@@ -84,7 +103,7 @@ async function confirm() {
 }
 </script>
 <template>
-  <Notice v-if="!pending.selection" :message="error" error />
+  <Notice v-if="!pending.selection" :message="displayError" error />
   <section
     v-if="pending.selection"
     class="panel pending-media-selection"
@@ -96,7 +115,7 @@ async function confirm() {
       在“{{ runtime.room.name }}”中播放，确认后会更换房间当前影片。
     </p>
     <p v-else>影片选择已保留。连接恢复且获得选片权限后，可确认继续。</p>
-    <Notice :message="error" error />
+    <Notice :message="displayError" error />
     <div class="form-actions">
       <button
         v-if="runtime.room"

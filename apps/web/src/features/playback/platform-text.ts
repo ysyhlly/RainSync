@@ -51,6 +51,7 @@ const plain = (value: unknown, max: number): value is string =>
   typeof value === "string" &&
   value.length > 0 &&
   [...value].length <= max &&
+  // eslint-disable-next-line no-control-regex -- Deliberately reject unsafe control characters.
   !/[\x00-\x1f\x7f\u2028\u2029\u202a-\u202e\u2066-\u2069]/.test(value);
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);

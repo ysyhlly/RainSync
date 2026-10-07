@@ -91,6 +91,7 @@ const attributes: Record<string, readonly string[]> = {
  * No DOM/network implementation is required for the validator's pure tests. */
 function parseGeneratedMpd(value: unknown): Node {
   if (typeof value !== "string" || value.length > 128 * 1024 ||
+    // eslint-disable-next-line no-control-regex -- Deliberately reject unsafe XML control characters.
     /[&\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value)) throw unsafe();
   const xml = value.trim().replace(
     /^<\?xml\s+version=(['"])1\.0\1(?:\s+encoding=(['"])utf-8\2)?\s*\?>\s*/i,

@@ -314,7 +314,9 @@ export class PlaybackRequests {
       : this.finalization;
     // Successor preparations and repeated stops must also wait for the final
     // grant sample, before any key cancellation can close the same grant.
-    this.finalization = finalization.catch(() => {});
+    this.finalization = finalization.catch(() => {
+      // stop() awaits the original rejection below; this barrier only orders later cleanup.
+    });
     await Promise.all([immediate, finishParent, finalization]);
     if (!continuation) for (const key of keys) await this.revoke(key);
   }
@@ -566,7 +568,9 @@ export class PlaybackRequests {
               if (this.continuation === continuation)
                 this.continuation = undefined;
             });
-          this.finalization = finishing.catch(() => {});
+          this.finalization = finishing.catch(() => {
+            // finish() returns the original rejection to its caller without poisoning the next barrier.
+          });
         }
         return finishing;
       },
@@ -627,7 +631,9 @@ export class PlaybackRequests {
       if (serial !== this.serial || error instanceof PlaybackCancelled)
         throw new PlaybackCancelled();
       if (cleanup.some((result) => result.status === "rejected"))
-        throw new Error("播放续接已停止；旧播放请求尚待清理，恢复连接后重试");
+        throw new Error("播放续接已停止；旧播放请求尚待清理，恢复连接后重试", {
+          cause: error,
+        });
       throw error;
     }
   }

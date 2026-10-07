@@ -5,10 +5,12 @@ const artifactDir = process.env.RAINSYNC_ARTIFACT_DIR;
 export default defineConfig({
   cacheDir: artifactDir ? resolve(artifactDir, "vite-cache") : undefined,
   build: {
+    manifest: true,
     outDir: artifactDir ? resolve(artifactDir, "web-dist") : "dist",
     emptyOutDir: true,
   },
   plugins: [vue()],
+  worker: { format: "es" },
   optimizeDeps: {
     include: ["vue", "pinia", "vue-router", "hls.js", "@tabler/icons-vue"],
   },

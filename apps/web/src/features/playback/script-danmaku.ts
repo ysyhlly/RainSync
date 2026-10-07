@@ -2,7 +2,6 @@
  * is no eval/Function, prototype lookup, DOM, network or ambient global scope.
  * Timers are compiled against media time, with a shared instruction budget.
  * API reference: CommentCoreLibrary/docs/scripting (Display/Tween/Utils/Player). */
-import { parse } from "acorn";
 import {
   easing,
   finishScene,
@@ -50,9 +49,18 @@ const aliases: Record<string, string> = {
   rotationY: "rotateY",
   text: "content",
 };
-export function compileScript(source: string): DanmakuScene {
+export class ScriptParserUnavailable extends Error {
+  constructor(cause: unknown) {
+    super("Script parser is unavailable", { cause });
+    this.name = "ScriptParserUnavailable";
+  }
+}
+export async function compileScript(source: string): Promise<DanmakuScene> {
   if (new TextEncoder().encode(source).length > 32768)
     throw new UnsupportedDanmaku();
+  const { parse } = await import("acorn").catch((cause) => {
+    throw new ScriptParserUnavailable(cause);
+  });
   const ast = parse(source, { ecmaVersion: 2020, sourceType: "script" }) as Ast;
   const nodes: SceneNode[] = [],
     timers: Timer[] = [];
@@ -651,10 +659,10 @@ export function compileScript(source: string): DanmakuScene {
       case "ForStatement":
       case "WhileStatement":
       case "DoWhileStatement": {
-        if (ast.init)
-          ast.init.type === "VariableDeclaration"
-            ? statement(ast.init, env)
-            : expression(ast.init, env);
+        if (ast.init) {
+          if (ast.init.type === "VariableDeclaration") statement(ast.init, env);
+          else expression(ast.init, env);
+        }
         let first = true;
         while (
           (ast.type === "DoWhileStatement" && first) ||

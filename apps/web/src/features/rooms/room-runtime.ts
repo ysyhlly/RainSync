@@ -1,4 +1,4 @@
-import { ref, computed, watch, onScopeDispose } from "vue";
+import { ref, shallowRef, computed, watch, onScopeDispose } from "vue";
 import { defineStore } from "pinia";
 import {
   Clock,
@@ -13,18 +13,25 @@ import type {
   QueueItem,
   RoomInvitation,
   RoomPermission,
-  RoomPermissionSnapshot,
   RoomInvitePolicy,
 } from "../../shared/api/types";
 import { RequestFailure, stopsReconnect } from "../../errors";
 import { StaleIdentity } from "../../shared/api/client";
 import { PlaybackCancelled } from "../../playback-request";
+import { reportFrontendError } from "../../app/global-errors";
 import { actionErrorMessage } from "../../shared/action-error";
 import { useMediaCatalog } from "../library/media-catalog.store";
 import { useSession } from "../auth/session.store";
 import { usePlatformAccount } from "../account/platform-account.store";
 import { createPlaybackRuntime } from "../playback/playback-runtime";
 import { lifecycleLabels } from "./room-lifecycle";
+import {
+  isPlaybackController,
+  permissionForControl,
+  readRoomPermissionGrant,
+  hasRoomPermission,
+  canManageRoom as hasRoomManagementAuthority,
+} from "./room-permissions";
 import { clientPlaybackStatus } from "./client-playback-status";
 import {
   PresenceState,
@@ -94,6 +101,17 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     playlist = ref<QueueItem[]>([]),
     chat = ref("");
   const remember = catalog.remember;
+  function retainMetadataFallback() {
+    // Missing/temporarily unavailable metadata keeps the current safe title.
+    // Playback loading has its own request and error boundary.
+  }
+  function retainPlaylistError() {
+    // refreshPlaylist already records its error for the queue retry control.
+    // A failed read must never turn a committed edit into a repeatable mutation.
+  }
+  function reportCleanupFailure(failure: unknown) {
+    reportFrontendError(failure, { source: "promise" });
+  }
   const currentTitle = computed(() =>
     state.value?.media_id
       ? (catalog.roomRecord(room.value?.id, state.value.media_id)?.title ??
@@ -104,7 +122,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     () => state.value?.media_id,
     (id) => {
       if (id && room.value)
-        void catalog.ensureRoom(room.value.id, id, true).catch(() => {});
+        void catalog.ensureRoom(room.value.id, id, true).catch(retainMetadataFallback);
     },
   );
   let metadataRefresh = 0;
@@ -128,7 +146,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       ) {
         const id = ids.shift()!;
         if (room.value)
-          await catalog.ensureRoom(room.value.id, id, true).catch(() => {});
+          await catalog.ensureRoom(room.value.id, id, true).catch(retainMetadataFallback);
       }
     };
     void Promise.all(Array.from({ length: Math.min(4, ids.length) }, work));
@@ -253,37 +271,43 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
   });
   const { video, position, waiting, blocked, applyState } = playback;
   const owner = computed(
-    () =>
-      roomActive.value &&
-      !!state.value &&
-      (state.value.controller_user_id === session.user?.id ||
-        !!session.user?.admin),
+    () => isPlaybackController(
+      roomActive.value,
+      state.value,
+      session.user,
+    ),
   );
-  const delegatedPermissions = ref<RoomPermission[]>([]);
-  const grantExpiresAt = ref<number | null>(null);
+  const permissionIdentity = () => `${session.epoch}:${!!session.user?.admin}`;
+  const noDelegation = () => ({ permissions: [] as readonly RoomPermission[], expiresAt: null as number | null, identity: permissionIdentity() });
+  const permissionGrant = shallowRef(noDelegation());
   function can(permission: RoomPermission) {
-    return roomActive.value && (owner.value ||
-      ((grantExpiresAt.value === null || grantExpiresAt.value > Date.now()) && delegatedPermissions.value.includes(permission)));
+    const grant = permissionGrant.value;
+    return hasRoomPermission(permission, {
+      active: roomActive.value,
+      controller: owner.value,
+      user: session.user,
+      delegated: grant.identity === permissionIdentity() ? grant.permissions : [],
+      expiresAt: grant.expiresAt,
+    });
   }
   let permissionsRequest = 0;
   async function refreshPermissions() {
-    const selected = room.value?.id, identity = session.epoch, request = ++permissionsRequest;
+    const selected = room.value?.id, identity = permissionIdentity(), request = ++permissionsRequest;
     if (!selected) return;
     try {
-      const snapshot = await session.api<RoomPermissionSnapshot>(`/rooms/${selected}/permissions`);
-      if (request !== permissionsRequest || room.value?.id !== selected || session.epoch !== identity) return;
-      delegatedPermissions.value = snapshot.self_permissions;
-      grantExpiresAt.value = snapshot.members.find((member) => member.user_id === session.user?.id)?.expires_at ?? null;
+      const snapshot = await session.api<unknown>(`/rooms/${selected}/permissions`);
+      if (request !== permissionsRequest || room.value?.id !== selected || permissionIdentity() !== identity) return;
+      permissionGrant.value = { ...readRoomPermissionGrant(snapshot, session.user?.id), identity };
     } catch {
-      if (request === permissionsRequest && room.value?.id === selected && session.epoch === identity) delegatedPermissions.value = [];
+      // Unsupported, malformed and failed snapshots deny delegation as one value.
+      if (request === permissionsRequest && room.value?.id === selected && permissionIdentity() === identity)
+        permissionGrant.value = noDelegation();
     }
   }
   const permissionRefresh = setInterval(() => { if (room.value) void refreshPermissions(); }, 30_000);
   onScopeDispose(() => clearInterval(permissionRefresh));
   const canManageRoom = computed(
-    () =>
-      !!room.value &&
-      (room.value.owner_id === session.user?.id || !!session.user?.admin),
+    () => hasRoomManagementAuthority(room.value, session.user),
   );
   let actionSerial = 0;
   const pendingActions = new Set<object>();
@@ -342,8 +366,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     controlEpoch = undefined;
     room.value = null;
     ++permissionsRequest;
-    delegatedPermissions.value = [];
-    grantExpiresAt.value = null;
+    permissionGrant.value = noDelegation();
     cleanupError.value = "";
     state.value = null;
     playlist.value = [];
@@ -362,13 +385,13 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     (id) => {
       catalog.reset();
       if (id) error.value = "";
-      void leave().catch(() => {});
+      void leave().catch(reportCleanupFailure);
     },
   );
   async function enter(r: Room) {
     if (room.value?.id === r.id) {
       if (playlistPending && !playlistLoaded.value) return playlistPending;
-      await playlistPending?.catch(() => {});
+      await playlistPending?.catch(retainPlaylistError);
       if (room.value?.id === r.id) await refreshPlaylist();
       return;
     }
@@ -556,7 +579,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       }
       if (v.type === "ROOM_PERMISSIONS_CHANGED") {
         if (v.user_id === session.user?.id) {
-          delegatedPermissions.value = [];
+          permissionGrant.value = noDelegation();
           void refreshPermissions().then(() => { if (serial === connectionSerial) connect(); });
         }
         return;
@@ -694,7 +717,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           chatPending.value = false;
           chatFailed.value = false;
           pendingChat = undefined;
-          if (wasActive || !old) void playback.reset().catch(() => {});
+          if (wasActive || !old) void playback.reset().catch(reportCleanupFailure);
           return;
         }
         if (duplicateState && wasActive) return;
@@ -742,8 +765,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     }
   }
   function send(type: string, payload?: unknown) {
-    const permission: RoomPermission = ({ PLAY: "play", PAUSE: "pause", SEEK: "seek", SET_RATE: "set_rate", CHANGE_MEDIA: "change_media", END_MEDIA: "change_media" } as const)[type as "PLAY" | "PAUSE" | "SEEK" | "SET_RATE" | "CHANGE_MEDIA" | "END_MEDIA"];
-    if (!connected.value || !can(permission) || !state.value || !controlEpoch)
+    const permission = permissionForControl(type);
+    if (!permission || !connected.value || !can(permission) || !state.value || !controlEpoch)
       return false;
     if (
       state.value.live &&
@@ -841,9 +864,9 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         operation.dirty = false;
         // A read already in flight may predate the committed edit. Wait for it,
         // then perform a fresh filtered read; bursts share one trailing refresh.
-        await playlistPending?.catch(() => {});
+        await playlistPending?.catch(retainPlaylistError);
         if (!current()) return;
-        await refreshPlaylist().catch(() => {});
+        await refreshPlaylist().catch(retainPlaylistError);
       }
     })().finally(() => {
       if (playlistInvalidation === operation) playlistInvalidation = undefined;
@@ -918,7 +941,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         queueNotice.value =
           kind === "add" ? "已加入当前房间待播" : "已从当前房间待播移除";
         queueReceipts.value[key] = queueNotice.value;
-        await refreshPlaylist().catch(() => {});
+        await refreshPlaylist().catch(retainPlaylistError);
       } finally {
         if (current()) {
           queueOperations.delete(key);
@@ -1013,7 +1036,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       chatPending.value = false;
       chatFailed.value = false;
       pendingChat = undefined;
-      void playback.reset().catch(() => {});
+      void playback.reset().catch(reportCleanupFailure);
     }
     return true;
   }
@@ -1029,7 +1052,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
   async function changeLifecycle(action: "close" | "reopen" | "archive") {
     const current = state.value,
       serial = roomSerial;
-    if (!current || !canManageRoom.value) throw Error("当前无法管理房间");
+    if (!current || !(canManageRoom.value || (action === "close" && can("close"))))
+      throw Error("当前无法管理房间");
     try {
       const value = await session.api<LifecycleView>(
         `/rooms/${current.room_id}/${action}`,
@@ -1043,10 +1067,20 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         failure instanceof RequestFailure &&
         ["REVISION_CONFLICT", "ROOM_LIFECYCLE_CONFLICT"].includes(failure.code)
       ) {
-        await refreshLifecycle().catch(() => {});
+        await refreshLifecycle().catch(() => {
+          // Keep the original conflict as the action error if its recovery read also fails.
+        });
       }
       throw failure;
     }
+  }
+  function refreshLifecycleInBackground() {
+    const serial = roomSerial, identity = session.epoch;
+    void refreshLifecycle().catch((failure) => {
+      if (serial === roomSerial && identity === session.epoch && room.value &&
+          !(failure instanceof StaleIdentity))
+        cleanupError.value = "暂时无法获取房间清理状态，将自动重试。";
+    });
   }
   function seek(event: Event) {
     position.value = Number((event.target as HTMLInputElement).value);
@@ -1056,7 +1090,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
   const statusTimer = setInterval(() => {
     checkClockContinuity();
     if (room.value?.lifecycle === "closing")
-      void refreshLifecycle().catch(() => {});
+      refreshLifecycleInBackground();
     if (
       roomActive.value &&
       clock.ready &&
@@ -1106,7 +1140,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     clearInterval(clockTimer);
     document.removeEventListener("visibilitychange", wake);
     window.removeEventListener("pageshow", pageShown);
-    void leave().catch(() => {});
+    void leave().catch(reportCleanupFailure);
   });
   return {
     room,
@@ -1146,6 +1180,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     enter,
     leave,
     connect,
+    // A confirmation may outlive its component, but never a room/reconnect epoch.
+    selectionContext: () => `${roomSerial}:${connectionSerial}`,
     send,
     sendChat,
     choose,

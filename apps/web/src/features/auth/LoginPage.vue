@@ -87,6 +87,7 @@ async function submitGuest() {
         await reloadPolicy();
         throw Error(
           "暂时无法通过此邀请进入。请确认站点和房间均允许访客，且邀请为有效的非定向观看邀请。",
+          { cause },
         );
       }
       if (
@@ -105,11 +106,13 @@ async function submitGuest() {
             guestNeedsLogout.value = true;
             throw Error(
               "浏览器保留着已结束的访客会话。请先退出旧会话，再确认邀请后重新进入。",
+              { cause: readError },
             );
           }
           guestUncertain.value = true;
           throw Error(
             "当前登录会话尚未确认，请先确认会话状态，不要重复使用邀请。",
+            { cause: readError },
           );
         }
         return;
@@ -129,6 +132,7 @@ async function submitGuest() {
         guestUncertain.value = true;
         throw Error(
           "访客进入结果尚未确认。请先确认当前会话，不要重复使用邀请。",
+          { cause },
         );
       }
       throw cause;
@@ -148,9 +152,11 @@ async function recoverGuest() {
       ) {
         guestUncertain.value = false;
         guestNeedsLogout.value = true;
-        throw Error("未发现有效访客会话，请向房主确认邀请仍有效后重新进入。");
+        throw Error("未发现有效访客会话，请向房主确认邀请仍有效后重新进入。", {
+          cause,
+        });
       }
-      throw Error("仍无法确认访客会话，请稍后重试确认。");
+      throw Error("仍无法确认访客会话，请稍后重试确认。", { cause });
     }
   });
 }
@@ -167,7 +173,7 @@ async function clearOldGuestSession() {
         !(cause instanceof RequestFailure) ||
         !["LOGIN_REQUIRED", "SESSION_EXPIRED"].includes(cause.code)
       )
-        throw Error("暂时无法确认旧会话状态，请稍后重试退出。");
+        throw Error("暂时无法确认旧会话状态，请稍后重试退出。", { cause });
     }
     if (!alive || session.user) return;
     await session.logout();

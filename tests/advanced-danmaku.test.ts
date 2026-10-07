@@ -69,16 +69,16 @@ describe("BAS media-time semantics", () => {
   );
 });
 describe("bounded BiliScript display interpreter", () => {
-  it("reads tweened properties at the timer callback's media time", () => {
+  it("reads tweened properties at the timer callback's media time", async () => {
     const scene =
-      compileScript(`var c=$.createComment("moving",{x:0,lifeTime:4});Tween.to(c,{x:100},2).play();
+      await compileScript(`var c=$.createComment("moving",{x:0,lifeTime:4});Tween.to(c,{x:100},2).play();
       Utils.timer(function(){$.createComment("observed",{x:c.x,lifeTime:2});},1000);`);
     expect(scene.nodes[1].props.x).toBe(50);
   });
 
-  it("hoists functions and handles collection loops, continue and switch fallthrough", () => {
+  it("hoists functions and handles collection loops, continue and switch fallthrough", async () => {
     const scene =
-      compileScript(`var titles=["one","two","three"]; for(var i in titles){if(i==1)continue; draw(titles[i]);}
+      await compileScript(`var titles=["one","two","three"]; for(var i in titles){if(i==1)continue; draw(titles[i]);}
       function draw(s){$.createComment(s,{lifeTime:4});}
       for(var s of ["four"]) {switch(s){case "four":draw(s);break;default:draw("wrong");}}`);
     expect(scene.nodes.map((n) => n.props.content)).toEqual([
@@ -88,9 +88,9 @@ describe("bounded BiliScript display interpreter", () => {
     ]);
   });
 
-  it("supports functions, arithmetic, loops, text, graphics and Tween serial/parallel timing", () => {
+  it("supports functions, arithmetic, loops, text, graphics and Tween serial/parallel timing", async () => {
     const scene =
-      compileScript(`function label(i) { return $.createComment("第"+(i+1)+"行", {x:i*50,y:20,size:24,lifeTime:8}); }
+      await compileScript(`function label(i) { return $.createComment("第"+(i+1)+"行", {x:i*50,y:20,size:24,lifeTime:8}); }
       var labels=[]; for(var i=0;i<3;i++){labels.push(label(i));}
       var s=$.createShape({lifeTime:8});s.graphics.beginFill(0x00a1d6,.8);s.graphics.drawRect(10,40,80,20);
       Tween.serial(Tween.to(labels[0],{x:100},2),Tween.to(labels[0],{alpha:0},1)).play();`);
@@ -103,8 +103,9 @@ describe("bounded BiliScript display interpreter", () => {
     expect(sampleSceneNode(scene.nodes[0], 2500, 672, 438).alpha).toBe(0.5);
     expect(scene.nodes[3].props.d).toContain("h80 v20");
   });
-  it("compiles delayed mutations and timed creations against media time", () => {
-    const scene = compileScript(`var c=$.createComment("first",{lifeTime:5});
+  it("compiles delayed mutations and timed creations against media time", async () => {
+    const scene =
+      await compileScript(`var c=$.createComment("first",{lifeTime:5});
       Utils.timer(function(){c.text="second";$.createComment("late",{x:50,lifeTime:2});},1000);`);
     expect(scene.nodes[1].start).toBe(1000);
     expect(sampleSceneNode(scene.nodes[0], 500, 672, 438).content).toBe(
@@ -117,17 +118,17 @@ describe("bounded BiliScript display interpreter", () => {
       "first",
     );
   });
-  it("turns an explicit click callback into a typed seek without an automatic playback action", () => {
-    const scene = compileScript(
+  it("turns an explicit click callback into a typed seek without an automatic playback action", async () => {
+    const scene = await compileScript(
       `var c=$.createComment("点击跳转",{lifeTime:5});c.addEventListener("click",function(){Player.seek(30000);});`,
     );
     expect(scene.nodes[0].kind).toBe("button");
     expect(scene.nodes[0].props.target).toEqual({ kind: "seek", at_ms: 30000 });
-    expect(() => compileScript("Player.seek(30000);")).toThrow();
+    await expect(compileScript("Player.seek(30000);")).rejects.toThrow();
   });
-  it("uses deterministic random values across replay", () => {
+  it("uses deterministic random values across replay", async () => {
     const code = '$.createComment("x",{x:Math.random()*600,lifeTime:4});';
-    expect(compileScript(code)).toEqual(compileScript(code));
+    expect(await compileScript(code)).toEqual(await compileScript(code));
   });
   it.each([
     "while(true){}",
@@ -141,7 +142,7 @@ describe("bounded BiliScript display interpreter", () => {
     'var c=$.createComment("x"); c.addEventListener("click",function(){c.text="changed";Player.seek(1);});',
     'setInterval(function(){$.createComment("many");},1);',
   ])("stops prohibited or runaway code: %s", (source) =>
-    expect(() => compileScript(source)).toThrow(),
+    expect(compileScript(source)).rejects.toThrow(),
   );
 });
 describe("advanced snapshot isolation and display bounds", () => {

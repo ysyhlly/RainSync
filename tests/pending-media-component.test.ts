@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { reactive } from "vue";
+import { reactive, watch } from "vue";
 import { mountSetup } from "./helpers/mount-setup";
 import { RequestFailure } from "../apps/web/src/errors";
 
@@ -26,8 +26,25 @@ function panel() {
       title: string;
       epoch: number;
     } | null,
+    selectionError: "",
+    selectionErrorContext: undefined as string | undefined,
     clear: vi.fn(() => {
       pending.selection = null;
+      pending.selectionError = "";
+    }),
+    rejectSelection: vi.fn((selection, message, context) => {
+      if (pending.selection !== selection || selection.epoch !== session.epoch)
+        return false;
+      pending.clear();
+      pending.selectionError = message;
+      pending.selectionErrorContext = context;
+      return true;
+    }),
+    clearContextError: vi.fn((context, connected) => {
+      if (!connected || pending.selectionErrorContext !== context) {
+        pending.selectionError = "";
+        pending.selectionErrorContext = undefined;
+      }
     }),
   });
   const runtime = reactive({
@@ -38,9 +55,17 @@ function panel() {
     state: { media_id: "current-movie" } as object | null,
     connected: true,
     permitted: true,
+    generation: 0,
+    selectionContext: () => String(runtime.generation),
     can: vi.fn(() => runtime.permitted),
     choose: vi.fn(async (_id: string) => true),
   });
+  const stopContext = watch(
+    [() => runtime.room?.id, () => runtime.connected],
+    () => runtime.generation++,
+    { flush: "sync" },
+  );
+  mounted.push(stopContext);
   const detail = deferred();
   const catalog = { ensure: vi.fn(() => detail.work) };
   const instance = mountSetup(
@@ -202,3 +227,62 @@ it("leaving the component during the detail request cannot issue a command later
   await confirming;
   expect(p.runtime.choose).not.toHaveBeenCalled();
 });
+
+it("a confirmed public denial survives a component handoff within the same room and login", async () => {
+  const p = panel();
+  const confirming = p.controls.confirm();
+  p.unmount();
+  p.detail.reject(
+    new RequestFailure({
+      error: { code: "MEDIA_NOT_FOUND", message: "影片已不可访问" },
+    }),
+  );
+  await confirming;
+  expect(p.pending.selection).toBeNull();
+  expect(p.pending.selectionError).toBe("影片已不可访问");
+  expect(p.runtime.choose).not.toHaveBeenCalled();
+});
+
+it("later room/connection changes hide an old denial without clearing a valid choice", async () => {
+  const p = panel();
+  const selection = p.pending.selection;
+  p.pending.selectionError = "旧上下文拒绝";
+  p.pending.selectionErrorContext = p.runtime.selectionContext();
+  p.runtime.room = { id: "another-room", name: "Another" };
+  expect(p.pending.selectionError).toBe("");
+  expect(p.pending.selection).toBe(selection);
+  p.pending.selectionError = "旧连接拒绝";
+  p.pending.selectionErrorContext = p.runtime.selectionContext();
+  p.runtime.connected = false;
+  expect(p.pending.selectionError).toBe("");
+  expect(p.pending.selection).toBe(selection);
+});
+
+it.each(["account", "selection", "room-return", "reconnect"])(
+  "a stale public denial after %s cannot retire the current selection",
+  async (change) => {
+    const p = panel();
+    const confirming = p.controls.confirm();
+    if (change === "account") p.session.epoch++;
+    else if (change === "selection")
+      p.pending.selection = { mediaId: "new-film", title: "新选片", epoch: 1 };
+    else if (change === "room-return") {
+      p.runtime.room = { id: "room-b", name: "B" };
+      p.runtime.room = { id: "room-a", name: "A" };
+    } else {
+      p.runtime.connected = false;
+      p.runtime.connected = true;
+    }
+    const current = p.pending.selection;
+    p.detail.reject(
+      new RequestFailure({
+        error: { code: "MEDIA_NOT_FOUND", message: "旧确认的拒绝" },
+      }),
+    );
+    await confirming;
+    expect(p.pending.selection).toBe(current);
+    expect(p.pending.selectionError).toBe("");
+    expect(p.pending.rejectSelection).not.toHaveBeenCalled();
+    expect(p.runtime.choose).not.toHaveBeenCalled();
+  },
+);

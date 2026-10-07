@@ -6,6 +6,12 @@ import { useSession } from "../features/auth/session.store";
 import { useRoomRuntime } from "../features/rooms/room-runtime";
 import { useAction } from "../shared/use-action";
 import {
+  frontendError,
+  dismissFrontendError,
+  reportFrontendError,
+} from "./global-errors";
+import { usePersistentPlaybackHost } from "./playback-host";
+import {
   adminNavigation,
   authenticationLocation,
   safeRedirect,
@@ -14,7 +20,6 @@ import AnimatedNavigation from "./AnimatedNavigation.vue";
 import AppIcon from "../shared/ui/AppIcon.vue";
 import UserAvatar from "../shared/ui/UserAvatar.vue";
 import Notice from "../shared/ui/Notice.vue";
-import PlaybackHost from "../features/playback/PlaybackHost.vue";
 import { providePlaybackPlacement } from "../features/playback/playback-placement";
 import { useRoomNotice } from "../features/playback/room-notice";
 import {
@@ -26,6 +31,8 @@ const session = useSession(),
   route = useRoute(),
   router = useRouter(),
   { busy, error, run } = useAction();
+const { shown: playbackHostShown, component: PlaybackHost } =
+  usePersistentPlaybackHost(() => !!runtime.room);
 watch(
   () => session.user,
   (user) => {
@@ -85,7 +92,9 @@ function clearLeavingPageInert(element: Element) {
 async function logout() {
   // leave() stops local media and reconnection synchronously. Remote cleanup
   // retains failed request keys and must never gate revoking authentication.
-  void runtime.leave().catch(() => {});
+  void runtime
+    .leave()
+    .catch((failure) => reportFrontendError(failure, { source: "promise" }));
   await session.logout();
   await router.replace("/login");
 }
@@ -186,6 +195,13 @@ async function retry() {
           重试连接
         </button>
       </div>
+      <div v-if="frontendError" class="global-notice frontend-notice">
+        <Notice :message="frontendError.message" error>
+          <button class="text-button" @click="dismissFrontendError">
+            关闭提示
+          </button>
+        </Notice>
+      </div>
       <div
         v-for="notice in currentNotice ? [currentNotice] : []"
         :key="notice.key"
@@ -233,6 +249,7 @@ async function retry() {
             ><component :is="Component" /></Transition></RouterView
       ></template>
       <PlaybackHost
+        v-if="playbackHostShown"
         :full="inRoom"
         :anchor="playbackAnchor"
         :layout-editing="layoutEditing"
