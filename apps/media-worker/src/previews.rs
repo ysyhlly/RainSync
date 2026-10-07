@@ -197,9 +197,10 @@ async fn supervise_preview<T>(
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn pending_database_observation_does_not_block_producer_deadline_or_stop() {
         for shutdown in [false, true] {
+            let began = tokio::time::Instant::now();
             let (cancel, mut producer_stop) = tokio::sync::watch::channel(false);
             let (stop, mut stopped) = tokio::sync::watch::channel(false);
             let produce = async move {
@@ -207,26 +208,40 @@ mod tests {
                 assert!(*producer_stop.borrow());
                 "drained"
             };
-            if shutdown {
-                stop.send_replace(true);
-            }
-            let result = tokio::time::timeout(
-                Duration::from_secs(1),
+            let supervised = tokio::spawn(async move {
                 supervise_preview(
                     produce,
                     std::future::pending(),
-                    tokio::time::Instant::now() + Duration::from_millis(20),
+                    began + Duration::from_millis(20),
                     &mut stopped,
                     || {
                         cancel.send_replace(true);
                     },
-                ),
-            )
-            .await
-            .unwrap();
-            assert_eq!(result, "drained");
+                )
+                .await
+            });
+            tokio::task::yield_now().await;
+            assert!(!supervised.is_finished());
+            assert_eq!(tokio::time::Instant::now(), began);
+            if shutdown {
+                stop.send_replace(true);
+            } else {
+                tokio::time::advance(Duration::from_millis(20)).await;
+            }
+            assert_eq!(supervised.await.unwrap(), "drained");
+            assert_eq!(
+                tokio::time::Instant::now(),
+                if shutdown {
+                    began
+                } else {
+                    began + Duration::from_millis(20)
+                }
+            );
+            drop(stop);
         }
-        let (_, mut stopped) = tokio::sync::watch::channel(false);
+        // Sender closure is a real shutdown signal. Keep the sender alive so
+        // this successful-producer case has no competing cancellation branch.
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
         let result = supervise_preview(
             std::future::ready("produced"),
             std::future::pending(),
@@ -236,5 +251,6 @@ mod tests {
         )
         .await;
         assert_eq!(result, "produced");
+        drop(stop);
     }
 }
