@@ -818,9 +818,64 @@ mod remote_asset_tests {
     use super::*;
     #[test]
     fn nas_assets_hold_original_source_and_cannot_borrow_files() {
-        let root =
-            std::env::temp_dir().join(format!("rainsync-nas-assets-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
+        const CHILD_ROOT: &str = "RAINSYNC_NAS_ASSET_TEST_ROOT";
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let root = if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            PathBuf::from(root)
+        } else {
+            let root = parent.join(format!("rainsync-nas-assets-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "remote_asset_tests::nas_assets_hold_original_source_and_cannot_borrow_files",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ROOT, &root)
+                .env("MEDIA_ROOT", &root);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+            let output = command.output().unwrap();
+            if root.exists() {
+                assert_eq!(
+                    root.canonicalize().unwrap().parent(),
+                    Some(parent.as_path())
+                );
+                assert!(
+                    root.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("rainsync-nas-assets-")
+                );
+                std::fs::remove_dir_all(&root).unwrap();
+            }
+            assert!(
+                output.status.success(),
+                "isolated NAS asset fixture failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated fixture did not execute its exact test"
+            );
+            return;
+        };
+        assert_eq!(
+            root.canonicalize().unwrap().parent(),
+            Some(parent.as_path())
+        );
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("rainsync-nas-assets-")
+        );
         std::fs::write(root.join("a.mkv"), b"original source").unwrap();
         std::fs::write(
             root.join("a.ass"),
@@ -834,6 +889,11 @@ mod remote_asset_tests {
         .version;
         let catalog =
             media_core::advanced_media::AssetCatalog::discover(&root, "a.mkv", &version).unwrap();
+        assert_eq!(
+            catalog.subtitles.len(),
+            1,
+            "owned-root fixture must discover the associated subtitle"
+        );
         let file = &catalog.subtitles[0].file;
         let request = json!({"resource":file.resource,"source_version":file.source_version,"bound_asset_catalog":catalog});
         let held = associated_asset_source(&root, &request).unwrap().unwrap();
@@ -844,10 +904,26 @@ mod remote_asset_tests {
         let mut unversioned = request.clone();
         unversioned["source_version"] = Value::Null;
         assert!(associated_asset_source(&root, &unversioned).is_err());
-        std::fs::write(root.join("a.mkv"), b"changed original").unwrap();
-        assert!(held.verify().is_err());
-        assert!(associated_asset_source(&root, &request).is_err());
-        drop(held);
+        #[cfg(windows)]
+        {
+            let error = std::fs::write(root.join("a.mkv"), b"changed original").unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(32),
+                "retained source must reject writes with ERROR_SHARING_VIOLATION"
+            );
+            held.verify().unwrap();
+            drop(held);
+            std::fs::write(root.join("a.mkv"), b"changed original").unwrap();
+            assert!(associated_asset_source(&root, &request).is_err());
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::write(root.join("a.mkv"), b"changed original").unwrap();
+            assert!(held.verify().is_err());
+            assert!(associated_asset_source(&root, &request).is_err());
+            drop(held);
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }
