@@ -119,6 +119,11 @@ await isolatedMediaStack("stream-revocation", async (f) => {
       cipher.getAuthTag(),
     ]).toString("base64");
   };
+  // These local/HTTP fixtures have no provider session or playback reporting.
+  // Match the production transport-only envelope; subtitle upstream_base is
+  // retained solely as a same-origin URL fence.
+  const transportOnlyEnvelope = (resource) =>
+    JSON.stringify({ encrypted: encrypt(resource), upstream_closed: true });
   async function openHandles() {
     if (process.platform !== "linux") return undefined;
     const paths = await readdir(`/proc/${f.workerPid}/fd`);
@@ -188,7 +193,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
         withPlaybackAdmission(
           f,
           { client: admin, user: userId, room: room.id, session: id },
-          `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
+          `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','${transportOnlyEnvelope(resource)}',now()+interval '1 hour')`,
         );
         const url = `${f.workerOrigin}/media-delivery/${id}/source?token=${token}`;
         const ranged = revoke === "membership" || revoke === "expiry";
@@ -361,7 +366,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
       withPlaybackAdmission(
         f,
         { client: admin, user: userId, room: room.id, session: id },
-        `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
+        `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','${transportOnlyEnvelope(resource)}',now()+interval '1 hour')`,
       );
       const path = mode === "subtitle" ? "subtitle-0.vtt" : "source";
       const url = `${f.workerOrigin}/media-delivery/${id}/${path}?token=${token}`;
@@ -439,7 +444,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
         withPlaybackAdmission(
           f,
           { client: admin, user: userId, room: room.id, session: id },
-          `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
+          `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','${transportOnlyEnvelope(resource)}',now()+interval '1 hour')`,
         );
         streams.push(
           start(
