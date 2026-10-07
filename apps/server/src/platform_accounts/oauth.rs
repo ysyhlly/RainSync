@@ -190,7 +190,7 @@ pub async fn status(
     super::maintenance::phase(guard_login_live(&mut tx, user.id, &login)).await?;
     let value = status_value(&app, p, row.as_ref(), &login);
     super::maintenance::commit(tx).await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -252,7 +252,7 @@ pub async fn start(
         }
         let value = login_value(&app, &row, None)?;
         super::maintenance::commit(tx).await?;
-        return Ok(registration::private_json(StatusCode::OK, value));
+        return Ok(responses::private_json(StatusCode::OK, value));
     }
     if !revision_matches(expected, s.revision, inserted) {
         return Err(err(StatusCode::CONFLICT, "platform_account_changed"));
@@ -320,7 +320,7 @@ pub async fn start(
             let row = lock_request(&mut tx, body.idempotency_key, user.id, &login, p).await?;
             let value = login_value(&app, &row, None)?;
             super::maintenance::commit(tx).await?;
-            return Ok(registration::private_json(StatusCode::OK, value));
+            return Ok(responses::private_json(StatusCode::OK, value));
         }
         None => {}
     }
@@ -331,7 +331,7 @@ pub async fn start(
     let row = lock_request(&mut tx, body.idempotency_key, user.id, &login, p).await?;
     let value = login_value(&app, &row, Some("waiting"))?;
     super::maintenance::commit(tx).await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 pub async fn read_login(
     State(app): State<App>,
@@ -357,7 +357,7 @@ pub async fn read_login(
     }
     let value = login_value(&app, &row, None)?;
     super::maintenance::commit(tx).await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 pub async fn cancel(
     State(app): State<App>,
@@ -385,7 +385,7 @@ pub async fn cancel(
     let row = lock_request(&mut tx, id, user.id, &login, p).await?;
     let value = login_value(&app, &row, None)?;
     super::maintenance::commit(tx).await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 pub async fn poll(
     State(app): State<App>,
@@ -403,14 +403,14 @@ pub async fn poll(
     if row.get::<String, _>("status") != "pending" {
         let value = login_value(&app, &row, None)?;
         super::maintenance::commit(tx).await?;
-        return Ok(registration::private_json(StatusCode::OK, value));
+        return Ok(responses::private_json(StatusCode::OK, value));
     }
     if !row.get::<bool, _>("live") || !request_matches(&row, scope(&account), c) {
         terminal(&mut tx, id, "expired").await?;
         row = lock_request(&mut tx, id, user.id, &login, p).await?;
         let value = login_value(&app, &row, None)?;
         super::maintenance::commit(tx).await?;
-        return Ok(registration::private_json(StatusCode::OK, value));
+        return Ok(responses::private_json(StatusCode::OK, value));
     }
     if row.get::<String, _>("mode") == "web"
         || row.get::<bool, _>("operation_live")
@@ -418,7 +418,7 @@ pub async fn poll(
     {
         let value = login_value(&app, &row, None)?;
         super::maintenance::commit(tx).await?;
-        return Ok(registration::private_json(StatusCode::OK, value));
+        return Ok(responses::private_json(StatusCode::OK, value));
     }
     if row.get::<bool, _>("exchange_started") {
         terminal(&mut tx, id, "failed").await?;
@@ -488,7 +488,7 @@ pub async fn poll(
             let row = lock_request(&mut tx, id, user.id, &login, p).await?;
             let value = login_value(&app, &row, stage)?;
             super::maintenance::commit(tx).await?;
-            Ok(registration::private_json(StatusCode::OK, value))
+            Ok(responses::private_json(StatusCode::OK, value))
         }
     }
 }
@@ -636,7 +636,7 @@ pub async fn claim(
         let row = lock_request(&mut tx, id, user.id, &login, p).await?;
         let value = login_value(&app, &row, None)?;
         super::maintenance::commit(tx).await?;
-        Ok(registration::private_json(StatusCode::OK, value))
+        Ok(responses::private_json(StatusCode::OK, value))
     }
 }
 async fn exchange(
@@ -660,7 +660,7 @@ async fn exchange(
             "platform_oauth_exchange_unknown",
         )
     })??;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 async fn exchange_preflight(
     app: &App,
@@ -892,7 +892,7 @@ pub async fn set_renewal(
     .await?;
     let value = status_value(&app, p, Some(&row), &login);
     super::maintenance::commit(tx).await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 pub async fn unlink(
     State(app): State<App>,
@@ -924,7 +924,7 @@ pub async fn unlink(
     .await?;
     let value = status_value(&app, p, Some(&row), &login);
     super::maintenance::commit(tx).await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 /// Bounded background pass; opt-in, originating login, configuration, exact
 /// revision and one-time operation nonce all remain required on publication.

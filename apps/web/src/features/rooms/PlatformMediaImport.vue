@@ -133,6 +133,17 @@ async function previewVideos(continuation?: string) {
     );
     if (!work.current(request)) return;
     if (continuation && preview.value) {
+      if (
+        value.items.length === 0 &&
+        value.failures.length > 0 &&
+        value.failures.every((failure) => failure.error.retryable)
+      ) {
+        // An unsuccessful page has not consumed the existing continuation.
+        // Keep its exact binding and the reviewed selection for an explicit
+        // retry; the server still enforces its original expiry and authority.
+        preview.value = { ...preview.value, failures: value.failures };
+        return;
+      }
       const items = new Map(
         preview.value.items.map((item) => [item.key, item]),
       );
@@ -330,7 +341,11 @@ function selectAll() {
         :disabled="busy || !canControl"
         @click="previewVideos(preview.next)"
       >
-        继续预览下一页
+        {{
+          preview.failures.some((failure) => failure.error.retryable)
+            ? "重试本页预览"
+            : "继续预览下一页"
+        }}
       </button>
       <p v-if="preview.omitted" class="helper" role="status">
         已省略 {{ preview.omitted }} 条访问受限的单集元数据

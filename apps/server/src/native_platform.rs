@@ -392,9 +392,7 @@ pub async fn create(
     Path(room): Path<Uuid>,
     Json(body): Json<ImportRequest>,
 ) -> Result<Response> {
-    Ok(media_titles::private_json(
-        import_one(&app, &h, room, body).await?,
-    ))
+    Ok(responses::ok_json(import_one(&app, &h, room, body).await?))
 }
 
 /// Batch and single imports share all controller, session and frozen-account
@@ -749,7 +747,7 @@ pub async fn scoped_detail(
     Path((room, media)): Path<(Uuid, Uuid)>,
 ) -> Result<Response> {
     let user = auth_viewer(&app, &h, false).await?;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         scoped_read(&app, user.id, room, media).await?,
     ))
 }

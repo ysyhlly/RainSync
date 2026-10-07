@@ -30,6 +30,9 @@ const opened = ref(false),
   ordered = ref(true),
   showReactions = ref(true),
   error = ref(""),
+  refreshError = ref(""),
+  selectionError = ref(""),
+  olderError = ref(""),
   revalidationError = ref(""),
   busy = ref(false),
   canModerate = ref(false),
@@ -59,7 +62,14 @@ let serial = 0,
   controller: AbortController | undefined,
   pending: Record<string, unknown> | undefined;
 const failed = ref(false);
-const displayError = computed(() => error.value || revalidationError.value);
+const displayError = computed(
+  () =>
+    error.value ||
+    selectionError.value ||
+    olderError.value ||
+    refreshError.value ||
+    revalidationError.value,
+);
 const atMs = computed(() => Math.max(0, Math.round(r.position * 1000)));
 const currentSelected = computed(
   () => !!current.value && selected.value === current.value.id,
@@ -125,6 +135,8 @@ function clearWindow() {
   browsingOlder.value = false;
   newerAvailable.value = false;
   loadingOlder.value = false;
+  selectionError.value = "";
+  olderError.value = "";
   reactions.value = [];
 }
 function reset() {
@@ -138,6 +150,7 @@ function reset() {
   historyCutoffs.value = {};
   revalidateOnDisplay = false;
   revalidationError.value = "";
+  refreshError.value = "";
   error.value = "";
   manageOpen.value = false;
   canModerate.value = false;
@@ -173,10 +186,12 @@ async function load(before?: string) {
     return;
   const page = parseTimelinePage(value, activity);
   if (before) {
+    olderError.value = "";
     comments.value = mergeTimelineWindow(comments.value, page.items, "older");
     nextBefore.value = page.nextBefore;
     browsingOlder.value = true;
   } else {
+    selectionError.value = "";
     const previousLatest = latestPage.at(-1)?.id;
     latestPage = mergeTimelineWindow(latestPage, page.items, "latest").slice(
       -100,
@@ -212,7 +227,7 @@ async function loadEarlier() {
     await load(nextBefore.value);
   } catch (e) {
     if (sequence === serial && window === windowSerial)
-      error.value = e instanceof Error ? e.message : "更早评论加载失败";
+      olderError.value = e instanceof Error ? e.message : "更早评论加载失败";
   } finally {
     if (sequence === serial && window === windowSerial)
       loadingOlder.value = false;
@@ -225,6 +240,7 @@ function returnLatest() {
   browsingOlder.value = false;
   newerAvailable.value = false;
   loadingOlder.value = false;
+  olderError.value = "";
   pauseDisplay();
   if (displayActive.value) void refresh();
 }
@@ -304,13 +320,16 @@ async function refresh() {
           until: Date.now() + e.expires_at - events.server_now_ms,
         }));
     } else reactions.value = [];
+    // A recovered read clears its own diagnostic, not an unconfirmed send or
+    // moderation action that still needs the user's attention.
+    refreshError.value = "";
   } catch (e) {
     if (
       sequence === serial &&
       poll === pollSerial &&
       !(e instanceof DOMException && e.name === "AbortError")
     )
-      error.value = e instanceof Error ? e.message : "评论加载失败";
+      refreshError.value = e instanceof Error ? e.message : "评论加载失败";
   } finally {
     if (sequence === serial && poll === pollSerial && displayActive.value)
       timer = setTimeout(
@@ -427,7 +446,7 @@ watch(selected, async (value, old) => {
     await load();
   } catch (e) {
     if (sequence === serial && window === windowSerial)
-      error.value = e instanceof Error ? e.message : String(e);
+      selectionError.value = e instanceof Error ? e.message : String(e);
   }
 });
 async function send() {

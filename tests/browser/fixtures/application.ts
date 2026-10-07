@@ -61,6 +61,8 @@ export async function appFixture(
     let value: unknown = { ok: true };
     if (path === "/admin/settings" && request.method() === "GET")
       return route.fulfill({ json: defaultAdminSettings });
+    if (path === "/libraries/issued-shares")
+      return route.fulfill({ json: { items: [], has_more: false } });
     if (path === "/auth/registration-policy")
       return route.fulfill({
         json: { registration_mode: "invite_only", guests_enabled: false },

@@ -97,6 +97,94 @@ fn quality_discovery_retains_only_actual_compatible_heights_and_is_bounded() {
     assert!(normalize(&data).is_err());
 }
 
+#[test]
+fn compatibility_discovery_excludes_muxed_only_and_retains_nonselected_source_heights() {
+    let mut data = adaptive_fixture();
+    let video1080 = data["requested_formats"][0].clone();
+    let mut video720 = video1080.clone();
+    video720["height"] = serde_json::json!(720);
+    video720["width"] = serde_json::json!(1280);
+    data["formats"] = serde_json::json!([fixture(), video720, video1080]);
+    let normalize_compat = |data: &serde_json::Value| {
+        normalize_json(
+            &serde_json::to_vec(data).unwrap(),
+            &parse_resource(ID).unwrap(),
+            NOW,
+            SelectionMode::CompatibilityAdaptive,
+        )
+        .unwrap()
+    };
+    assert_eq!(normalize_compat(&data).available_heights, vec![720, 1080]);
+    // A new selected 720 source changes the chosen source only, not discovery.
+    data["height"] = serde_json::json!(720);
+    data["width"] = serde_json::json!(1280);
+    data["requested_formats"][0]["height"] = serde_json::json!(720);
+    data["requested_formats"][0]["width"] = serde_json::json!(1280);
+    let downgraded = normalize_compat(&data);
+    assert_eq!(downgraded.available_heights, vec![720, 1080]);
+    assert_eq!(downgraded.playback.dimensions().1, Some(720));
+    assert!(validate_quality_limit(&downgraded, QualityLimit::P720).is_ok());
+}
+
+#[test]
+fn compatibility_quality_discovery_has_closed_extended_codec_container_and_pairing_policy() {
+    let mut data = adaptive_fixture();
+    let source = data["requested_formats"][0].clone();
+    let mut variants = Vec::new();
+    for (ext, codec, height) in [
+        ("mp4", "avc1.640028", 720),
+        ("mp4", "av01.0.08M.08", 1440),
+        ("webm", "vp09.00.40.08", 2160),
+        ("webm", "vp9", 4320),
+        ("webm", "avc1.640028", 240),      // wrong container/codec
+        ("mp4", "vp8", 360),               // unsupported codec
+        ("webm", "hvc1.2.4.L120.B0", 480), // no HEVC in WebM
+    ] {
+        let mut variant = source.clone();
+        variant["ext"] = serde_json::json!(ext);
+        variant["vcodec"] = serde_json::json!(codec);
+        variant["height"] = serde_json::json!(height);
+        variants.push(variant);
+    }
+    let mut expired = source.clone();
+    expired["height"] = serde_json::json!(144);
+    expired["url"] = serde_json::json!(format!(
+        "https://rr1.googlevideo.com/videoplayback?expire={NOW}"
+    ));
+    variants.push(expired);
+    let mut same_audio_url = source.clone();
+    same_audio_url["height"] = serde_json::json!(240);
+    same_audio_url["url"] = data["requested_formats"][1]["url"].clone();
+    variants.push(same_audio_url);
+    data["formats"] = serde_json::json!(variants);
+    let result = normalize_json(
+        &serde_json::to_vec(&data).unwrap(),
+        &parse_resource(ID).unwrap(),
+        NOW,
+        SelectionMode::CompatibilityAdaptive,
+    )
+    .unwrap();
+    assert_eq!(result.available_heights, vec![720, 1080, 1440, 2160, 4320]);
+    assert_eq!(normalize(&data).unwrap().available_heights, vec![720, 1080]);
+
+    let mut progressive = fixture();
+    progressive["formats"] = serde_json::json!([source]);
+    assert_eq!(
+        normalize(&progressive).unwrap().available_heights,
+        vec![360]
+    );
+    let mut invalid_audio = data["requested_formats"][1].clone();
+    invalid_audio["acodec"] = serde_json::json!("opus");
+    progressive["formats"]
+        .as_array_mut()
+        .unwrap()
+        .push(invalid_audio);
+    assert_eq!(
+        normalize(&progressive).unwrap().available_heights,
+        vec![360]
+    );
+}
+
 fn adaptive_fixture() -> serde_json::Value {
     let mut data = fixture();
     data.as_object_mut().unwrap().remove("url");

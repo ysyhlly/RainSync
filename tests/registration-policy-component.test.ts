@@ -5,7 +5,10 @@ import {
 import { afterEach, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { mountSetup } from "./helpers/mount-setup";
-import { useSession } from "../apps/web/src/features/auth/session.store";
+import {
+  RegistrationConfirmationRequired,
+  useSession,
+} from "../apps/web/src/features/auth/session.store";
 import {
   useRegistrationPolicy,
   checkedRegistrationPolicy,
@@ -53,6 +56,7 @@ function panel(
       guestRoomPath,
       parseGuestInvitation,
       validateNickname,
+      RegistrationConfirmationRequired,
       useSession,
       useRegistrationPolicy,
       useAction,
@@ -79,6 +83,68 @@ function fill(p: ReturnType<typeof panel>) {
   p.c.password.value = p.c.confirm.value = " valid pass ";
   p.c.nickname.value = "昵称";
 }
+it.each([
+  "DATABASE_ERROR",
+  "COMMIT_FAILED",
+  "INTERNAL_ERROR",
+  "SERVICE_UNAVAILABLE",
+  "REQUEST_TIMEOUT",
+  "INVALID_RESPONSE",
+  "ALREADY_AUTHENTICATED",
+])(
+  "reconciles structured %s signup uncertainty without resubmitting or clearing the draft",
+  async (code) => {
+    const p = panel();
+    await ready(p);
+    fill(p);
+    p.session.register = vi.fn(async () => {
+      throw new RequestFailure({ error: { code } });
+    });
+    p.session.load = vi.fn(async () => {
+      throw Error("temporarily unavailable");
+    });
+    await p.c.register();
+    expect(p.c.uncertain.value).toBe(true);
+    expect(p.c.password.value).toBe(" valid pass ");
+    expect(p.c.username.value).toBe("valid-user");
+    await p.c.register();
+    expect(p.session.register).toHaveBeenCalledOnce();
+    expect(p.session.load).toHaveBeenCalledOnce();
+    expect(p.replace).not.toHaveBeenCalled();
+  },
+);
+it("keeps a committed signup receipt and confirms the same account before leaving recovery", async () => {
+  const p = panel();
+  await ready(p);
+  fill(p);
+  const receipt = { id: "created-id", username: "valid-user" };
+  p.session.register = vi.fn(async () => {
+    throw new RegistrationConfirmationRequired(
+      receipt,
+      new RequestFailure({ error: { code: "SERVICE_UNAVAILABLE" } }),
+    );
+  });
+  p.session.load = vi.fn(async () => {
+    throw Error("temporarily unavailable");
+  });
+  await p.c.register();
+  expect(p.c.registrationReceipt.value).toEqual(receipt);
+  expect(p.c.uncertain.value).toBe(true);
+  expect(p.c.error.value).toContain("账号已创建");
+  p.session.load = vi.fn(
+    async () => ({ ...receipt, id: "different-id" }) as any,
+  );
+  expect(await p.c.confirmSession()).toBe(false);
+  expect(p.replace).not.toHaveBeenCalled();
+  p.session.load = vi.fn(async () => receipt as any);
+  await p.c.recover();
+  expect(p.replace).toHaveBeenCalledWith(
+    "/rooms/target?invite=room-token#confirm",
+  );
+  expect(p.c.password.value).toBe("");
+  expect(p.c.registrationReceipt.value).toBeUndefined();
+  expect(p.session.register).toHaveBeenCalledOnce();
+});
 it("open registration skips invite validation and omits code while preserving safe return", async () => {
   const p = panel();
   await ready(p);

@@ -52,7 +52,8 @@ try{
   assert.equal(f.sql('SELECT probe_challenge IS NULL AND probe_sha256 IS NULL AND probe_until IS NULL FROM static_hls_database_binding'),'t');
   assert.equal((await readdir(f.env.CACHE_ROOT)).some(v=>v.startsWith('.static-hls-probe-')),false);
   check('actual new Worker reads fresh same DB/cache challenge; positive compatibility still has admission disabled and unknown drain');
-  await f.stopWorker();await f.startWorker({CACHE_ROOT:resolve(f.root,'different-cache')});
+  report.different_cache_root=`${f.root}-different-cache`;
+  await f.stopWorker();await f.startWorker({CACHE_ROOT:report.different_cache_root});
   assert.deepEqual(await client.request(route,'POST'),{compatible:false,admission:'disabled',drain:'unknown'});
   check('actual new Worker with different configured cache remains incompatible');
   await f.stopWorker();

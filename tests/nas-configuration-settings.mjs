@@ -231,6 +231,42 @@ try {
         })
       ).job;
       assert.equal(claim.id, job.id);
+      // Freeze the room after renewal has pinned its policy. A settings write
+      // must wait on the same device-first order, never hold device -> policy
+      // while renewal owns policy -> device. No media process is involved.
+      const roomLocker = f.sqlProcess(undefined, { interactive: true });
+      let roomLockOutput = "";
+      roomLocker.stdout.on("data", bytes => { roomLockOutput += bytes; });
+      roomLocker.stdin.write(`BEGIN; SELECT id FROM rooms WHERE id='${room.id}' FOR NO KEY UPDATE; SELECT 'compute-room-locked';\n`);
+      let renewal, quotaChange;
+      try {
+        const deadline = Date.now() + 5000;
+        while (!roomLockOutput.includes("compute-room-locked")) {
+          assert.ok(Date.now() < deadline, "owned room lock acquired");
+          await delay(20);
+        }
+        renewal = agentRequest(`/agent-compute/jobs/${job.id}/renew`, {
+          connection_id: connection,
+          attempt: claim.attempt,
+          output_generation: claim.output_generation,
+        });
+        renewal.catch(() => {});
+        await f.waitForSql("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='SELECT lifecycle,lifecycle_epoch FROM rooms WHERE id=$1 FOR NO KEY UPDATE'", "1", 5000);
+        quotaChange = policy({ ...defaults, enabled: true, output_budget_bytes: 134217728, expected_revision: receipt.revision });
+        quotaChange.catch(() => {});
+        await f.waitForSql("SELECT (count(*)>=2)::text FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'", "true", 5000);
+        roomLocker.stdin.end("ROLLBACK;\n");
+        await roomLocker.done;
+        const results = await Promise.all([renewal, quotaChange]);
+        assert.equal(results[0].lease_ms, 20000);
+        receipt = results[1];
+        assert.equal(f.sql(`SELECT status||':'||output_budget_bytes FROM distributed_compute_jobs WHERE id='${job.id}'`), "running:67108864", "quota edit leaves the current attempt and frozen budget intact");
+        report.checks.push("concurrent renewal and quota edit use device-before-policy locks without deadlock or cancelling the live attempt");
+      } finally {
+        if (!roomLocker.stdin.writableEnded) roomLocker.stdin.end("ROLLBACK;\n");
+        await roomLocker.done.catch(() => {});
+        await Promise.allSettled([renewal, quotaChange].filter(Boolean));
+      }
       receipt = await policy({
         ...defaults,
         expected_revision: receipt.revision,

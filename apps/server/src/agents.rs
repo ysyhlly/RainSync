@@ -2,13 +2,46 @@ use super::*;
 use axum::extract::ws::Message;
 use futures_util::{SinkExt, StreamExt};
 
+// The Agent sends a heartbeat every five seconds. Six missed intervals close
+// only that connection; indexed-content readiness remains a separate fact.
+const CONTROL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct Control {
     pub(super) connection: Uuid,
+    last_received: tokio::time::Instant,
     scans: tokio::sync::mpsc::Sender<Scan>,
     manual_scan: bool,
     source_versions: Option<bool>,
     drain_receipts: Option<bool>,
 }
+impl Control {
+    fn live_at(&self, now: tokio::time::Instant) -> bool {
+        now.saturating_duration_since(self.last_received) < CONTROL_IDLE_TIMEOUT
+            && !self.scans.is_closed()
+    }
+}
+
+// Persist only authenticated incoming activity, fenced to the current socket.
+// An older socket cannot refresh or overwrite a replacement connection.
+async fn record_control_activity(
+    app: &App,
+    id: Uuid,
+    connection: Uuid,
+) -> Option<tokio::time::Instant> {
+    let received = tokio::time::Instant::now();
+    let updated = sqlx::query("UPDATE agents SET last_seen=clock_timestamp() WHERE id=$1 AND advanced_assets_connection=$2 AND NOT revoked")
+        .bind(id).bind(connection).execute(&app.db).await.ok()?;
+    if updated.rows_affected() != 1 {
+        return None;
+    }
+    let mut controls = app.agent_controls.lock().await;
+    let control = controls
+        .get_mut(&id)
+        .filter(|control| control.connection == connection)?;
+    control.last_received = received;
+    Some(received)
+}
+
 struct Scan {
     id: Uuid,
     reply: tokio::sync::oneshot::Sender<&'static str>,
@@ -30,7 +63,10 @@ pub async fn scan(
     }
     let (reply, result) = tokio::sync::oneshot::channel();
     let controls = app.agent_controls.lock().await;
-    let Some(control) = controls.get(&id) else {
+    let Some(control) = controls
+        .get(&id)
+        .filter(|c| c.live_at(tokio::time::Instant::now()))
+    else {
         return Ok(Json(json!({"status":"offline"})));
     };
     if control
@@ -96,7 +132,7 @@ pub async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     Ok(Json(Value::Array(rows.iter().map(|r| {
         let id: Uuid = r.get("id");
         let revoked: bool = r.get("revoked");
-        let control = controls.get(&id).filter(|_| !revoked);
+        let control = controls.get(&id).filter(|c| !revoked && c.live_at(tokio::time::Instant::now()));
         let count: i64 = r.get("indexed_count");
         let unversioned_count: i64 = r.get("unversioned_count");
         let capable = control.and_then(|c| c.source_versions);
@@ -237,10 +273,20 @@ pub async fn connect(
     Ok(upgrade.max_message_size(1024 * 1024).max_frame_size(1024 * 1024).on_upgrade(move |socket| async move {
         let (mut out, mut input) = socket.split();
         let connection = Uuid::new_v4();
-        if sqlx::query("UPDATE agents SET advanced_assets_version=0,advanced_assets_connection=$2 WHERE id=$1 AND NOT revoked").bind(id).bind(connection).execute(&app.db).await.is_err() {return;}
-        let mut uplink_metrics = crate::agent_metrics::Receiver::new(app.metrics.runtime.clone(), id, connection, token_hash);
         let (scan_tx, mut scans) = tokio::sync::mpsc::channel::<Scan>(1);
-        app.agent_controls.lock().await.insert(id, Control { connection, scans: scan_tx, manual_scan: false, source_versions: None, drain_receipts: None });
+        let mut last_received = tokio::time::Instant::now();
+        {
+            // Lock the agent before the control map, matching optional metrics.
+            // Commit the replacement identity while holding the map lock.
+            let Ok(mut tx) = app.db.begin().await else { return; };
+            let installed = sqlx::query("UPDATE agents SET advanced_assets_version=0,advanced_assets_connection=$2,last_seen=clock_timestamp() WHERE id=$1 AND token_hash=$3 AND NOT revoked")
+                .bind(id).bind(connection).bind(&token_hash).execute(&mut *tx).await;
+            if !matches!(installed, Ok(result) if result.rows_affected() == 1) { return; }
+            let mut controls = app.agent_controls.lock().await;
+            if tx.commit().await.is_err() { return; }
+            controls.insert(id, Control { connection, last_received, scans: scan_tx, manual_scan: false, source_versions: None, drain_receipts: None });
+        }
+        let mut uplink_metrics = crate::agent_metrics::Receiver::new(app.metrics.runtime.clone(), id, connection, token_hash);
         let mut supports_scan = false;
         let mut pending: Option<Scan> = None;
         let (pages, incoming) = tokio::sync::mpsc::channel(1);
@@ -253,6 +299,7 @@ pub async fn connect(
         });
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
         loop { tokio::select! {
+            _ = tokio::time::sleep_until(last_received + CONTROL_IDLE_TIMEOUT) => break,
             _ = uplink_metrics.poll_pending() => {},
             request = scans.recv() => {
                 let Some(request) = request else { break };
@@ -283,7 +330,7 @@ pub async fn connect(
                 if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3), out.send(Message::Text(ack.to_string().into()))).await, Ok(Ok(()))) || failed { break }
             }
             _ = tick.tick() => {
-                let valid = sqlx::query("UPDATE agents SET last_seen=now() WHERE id=$1 AND NOT revoked RETURNING id").bind(id).fetch_optional(&app.db).await;
+                let valid = sqlx::query("SELECT id FROM agents WHERE id=$1 AND advanced_assets_connection=$2 AND NOT revoked").bind(id).bind(connection).fetch_optional(&app.db).await;
                 if !matches!(valid, Ok(Some(_))) { break }
                 // Lock only the next transfer; claimed means dispatch attempted, not peer receipt.
                 let result: anyhow::Result<()> = async {
@@ -307,9 +354,16 @@ pub async fn connect(
             }
             message = input.next() => {
                 match message {
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {},
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                        let Some(received) = record_control_activity(&app, id, connection).await else { break };
+                        last_received = received;
+                    },
                     Some(Ok(Message::Text(text))) => {
                         let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
+                        if matches!(value["type"].as_str(), Some("HELLO" | "HEARTBEAT" | "TRANSFER_DRAINED" | "SCAN_BUSY" | "INDEX" | "INDEX_ABORT")) {
+                            let Some(received) = record_control_activity(&app, id, connection).await else { break };
+                            last_received = received;
+                        }
                         if value["type"] == "TRANSFER_DRAINED" {
                             let Some(transfer) = value["id"].as_str().and_then(|value|Uuid::parse_str(value).ok()) else { continue };
                             // The authenticated control identity may only settle
@@ -489,7 +543,31 @@ async fn ingest_index(
 
 #[cfg(test)]
 mod tests {
-    use super::{source_version_status, validated_name};
+    use super::{CONTROL_IDLE_TIMEOUT, Control, source_version_status, validated_name};
+
+    #[test]
+    fn online_state_uses_received_activity_and_a_live_current_channel() {
+        let (scans, receiver) = tokio::sync::mpsc::channel(1);
+        let received = tokio::time::Instant::now();
+        let mut control = Control {
+            connection: uuid::Uuid::new_v4(),
+            last_received: received,
+            scans,
+            manual_scan: false,
+            source_versions: Some(true),
+            drain_receipts: None,
+        };
+        assert!(control.live_at(received));
+        assert!(
+            control.live_at(received + CONTROL_IDLE_TIMEOUT - std::time::Duration::from_millis(1))
+        );
+        assert!(!control.live_at(received + CONTROL_IDLE_TIMEOUT));
+        control.last_received = received + std::time::Duration::from_secs(5);
+        assert!(control.live_at(received + CONTROL_IDLE_TIMEOUT));
+        assert_eq!(control.source_versions, Some(true));
+        drop(receiver);
+        assert!(!control.live_at(control.last_received));
+    }
 
     #[test]
     fn device_names_are_trimmed_and_bounded_without_control_characters() {

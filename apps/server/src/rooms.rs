@@ -659,6 +659,7 @@ pub(crate) async fn commit_controller(
 mod invites_runtime;
 #[path = "room_permissions.rs"]
 pub(crate) mod permissions_runtime;
+pub(crate) use invites_runtime::redeem_error;
 pub use invites_runtime::{invite, join, list_invites, revoke_invite};
 pub use permissions_runtime::{kick, permissions, revoke_permissions, set_permissions};
 pub async fn playlist(
@@ -686,7 +687,7 @@ pub async fn playlist(
     items.sort_by_key(|(order, id, _)| (*order, *id));
     let current = auth_viewer(&app, &h, false).await?;
     member(&app, &current, id).await?;
-    Ok(media_titles::private_json(Value::Array(
+    Ok(responses::ok_json(Value::Array(
         items.into_iter().map(|(_, _, value)| value).collect(),
     )))
 }
@@ -729,6 +730,8 @@ pub async fn add_playlist(
     let item = Uuid::new_v4();
     sqlx::query("INSERT INTO playlist_items SELECT $1,$2,$3,COALESCE(max(sort_order),0)+1 FROM playlist_items WHERE room_id=$2").bind(item).bind(id).bind(body.media_id).execute(&mut *tx).await?;
     commit_controller(tx, &h).await?;
+    // Invalidate only. Each viewer's REST read retains its own library filter.
+    broadcast_timeline(&app, id, json!({"type":"PLAYLIST_CHANGED"})).await;
     Ok(Json(json!({"id":item})))
 }
 pub async fn remove_playlist(
@@ -737,12 +740,16 @@ pub async fn remove_playlist(
     Path((id, item)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>> {
     let mut tx = controller(&app, &h, id).await?;
-    sqlx::query("DELETE FROM playlist_items WHERE room_id=$1 AND id=$2")
+    let removed = sqlx::query("DELETE FROM playlist_items WHERE room_id=$1 AND id=$2")
         .bind(id)
         .bind(item)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
     commit_controller(tx, &h).await?;
+    if removed > 0 {
+        broadcast_timeline(&app, id, json!({"type":"PLAYLIST_CHANGED"})).await;
+    }
     Ok(Json(json!({"ok":true})))
 }
 #[derive(Deserialize)]
@@ -750,6 +757,17 @@ pub struct MessageCursor {
     after: Option<Uuid>,
     check_ids: Option<String>,
 }
+fn chat_message_select(include_created_at: bool) -> String {
+    let created_at = if include_created_at {
+        "c.created_at,"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT c.id,CASE WHEN c.deleted_at IS NULL THEN c.body ELSE '' END AS body,c.deleted_at IS NOT NULL AS deleted,c.user_id,u.username,COALESCE(g.display_name,p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,{created_at}floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN guest_principals g ON g.user_id=u.id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id"
+    )
+}
+
 pub async fn messages(
     State(app): State<App>,
     h: HeaderMap,
@@ -770,11 +788,18 @@ pub async fn messages(
         if ids.is_empty() || ids.len() > 100 {
             return Err(err(StatusCode::BAD_REQUEST, "invalid_request"));
         }
-        sqlx::query("SELECT c.id,CASE WHEN c.deleted_at IS NULL THEN c.body ELSE '' END AS body,c.deleted_at IS NOT NULL AS deleted,c.user_id,u.username,COALESCE(g.display_name,p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN guest_principals g ON g.user_id=u.id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE c.room_id=$1 AND c.id=ANY($2) ORDER BY c.created_at,c.id").bind(id).bind(ids).fetch_all(&app.db).await?
+        sqlx::query(&format!(
+            "{} WHERE c.room_id=$1 AND c.id=ANY($2) ORDER BY c.created_at,c.id",
+            chat_message_select(false)
+        ))
+        .bind(id)
+        .bind(ids)
+        .fetch_all(&app.db)
+        .await?
     } else if let Some(after) = cursor.after {
-        sqlx::query("SELECT c.id,CASE WHEN c.deleted_at IS NULL THEN c.body ELSE '' END AS body,c.deleted_at IS NOT NULL AS deleted,c.user_id,u.username,COALESCE(g.display_name,p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN guest_principals g ON g.user_id=u.id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE c.room_id=$1 AND (NOT EXISTS(SELECT 1 FROM chat_messages WHERE id=$2 AND room_id=$1) OR (c.created_at,c.id) > (SELECT created_at,id FROM chat_messages WHERE id=$2 AND room_id=$1)) ORDER BY c.created_at,c.id LIMIT 100").bind(id).bind(after).fetch_all(&app.db).await?
+        sqlx::query(&format!("{} WHERE c.room_id=$1 AND (NOT EXISTS(SELECT 1 FROM chat_messages WHERE id=$2 AND room_id=$1) OR (c.created_at,c.id) > (SELECT created_at,id FROM chat_messages WHERE id=$2 AND room_id=$1)) ORDER BY c.created_at,c.id LIMIT 100", chat_message_select(false))).bind(id).bind(after).fetch_all(&app.db).await?
     } else {
-        sqlx::query("SELECT * FROM (SELECT c.id,CASE WHEN c.deleted_at IS NULL THEN c.body ELSE '' END AS body,c.deleted_at IS NOT NULL AS deleted,c.user_id,u.username,COALESCE(g.display_name,p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,c.created_at,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN guest_principals g ON g.user_id=u.id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE c.room_id=$1 ORDER BY c.created_at DESC,c.id DESC LIMIT 100) history ORDER BY created_at,id").bind(id).fetch_all(&app.db).await?
+        sqlx::query(&format!("SELECT * FROM ({} WHERE c.room_id=$1 ORDER BY c.created_at DESC,c.id DESC LIMIT 100) history ORDER BY created_at,id", chat_message_select(true))).bind(id).fetch_all(&app.db).await?
     };
     Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"body":r.get::<String,_>("body"),"user_id":r.get::<Uuid,_>("user_id"),"username":r.get::<String,_>("username"),"display_name":r.get::<String,_>("display_name"),"created_at":r.get::<i64,_>("created_at_ms"),"deleted":r.get::<bool,_>("deleted"),"avatar_url":avatars::url(r.get("user_id"),r.get("avatar_version"),r.get::<Option<String>,_>("avatar_content_type").is_some()),"avatar_version":r.get::<Option<Uuid>,_>("avatar_version")})).collect())))
 }
@@ -829,39 +854,36 @@ async fn persist_chat(
     .fetch_optional(&mut *tx)
     .await
     .map_err(|_| "database_error")?;
-    if let Some(row) = inserted {
-        let live: bool = sqlx::query_scalar("SELECT playback_login_allowed($1,$2)")
-            .bind(user_id)
-            .bind(session_hash)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|_| "database_error")?;
-        if !live {
-            return Err("session_expired");
+    let result = if let Some(row) = inserted {
+        (row.get("id"), row.get("created_at_ms"), false, false)
+    } else {
+        // The unique-index conflict waits for the concurrent insertion to commit.
+        // Read in a new statement so its committed row is visible at READ COMMITTED.
+        let existing = sqlx::query(
+            "SELECT id,body,body_digest,deleted_at IS NOT NULL AS deleted,floor(extract(epoch FROM created_at)*1000)::bigint AS created_at_ms FROM chat_messages WHERE room_id=$1 AND user_id=$2 AND client_message_id=$3",
+        )
+        .bind(room_id)
+        .bind(user_id)
+        .bind(client_message_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| "database_error")?;
+        if existing
+            .get::<Option<String>, _>("body_digest")
+            .as_deref()
+            .map_or(existing.get::<String, _>("body") != body, |digest| {
+                digest != hash(body)
+            })
+        {
+            return Err("invalid_request");
         }
-        tx.commit().await.map_err(|_| "database_error")?;
-        return Ok((row.get("id"), row.get("created_at_ms"), false, false));
-    }
-    // The unique-index conflict waits for the concurrent insertion to commit.
-    // Read in a new statement so its committed row is visible at READ COMMITTED.
-    let existing = sqlx::query(
-        "SELECT id,body,body_digest,deleted_at IS NOT NULL AS deleted,floor(extract(epoch FROM created_at)*1000)::bigint AS created_at_ms FROM chat_messages WHERE room_id=$1 AND user_id=$2 AND client_message_id=$3",
-    )
-    .bind(room_id)
-    .bind(user_id)
-    .bind(client_message_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|_| "database_error")?;
-    if existing
-        .get::<Option<String>, _>("body_digest")
-        .as_deref()
-        .map_or(existing.get::<String, _>("body") != body, |digest| {
-            digest != hash(body)
-        })
-    {
-        return Err("invalid_request");
-    }
+        (
+            existing.get("id"),
+            existing.get("created_at_ms"),
+            true,
+            existing.get("deleted"),
+        )
+    };
     let live: bool = sqlx::query_scalar("SELECT playback_login_allowed($1,$2)")
         .bind(user_id)
         .bind(session_hash)
@@ -872,12 +894,7 @@ async fn persist_chat(
         return Err("session_expired");
     }
     tx.commit().await.map_err(|_| "database_error")?;
-    Ok((
-        existing.get("id"),
-        existing.get("created_at_ms"),
-        true,
-        existing.get("deleted"),
-    ))
+    Ok(result)
 }
 
 pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: String) {

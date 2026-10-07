@@ -149,7 +149,7 @@ pub async fn get(State(app): State<App>, h: HeaderMap, Path(id): Path<Uuid>) -> 
     let config = parse_config(&app.decrypt(&row.get::<String, _>("config_encrypted"))?)?;
     let value = safe_detail(&row, &config);
     tx.commit().await?;
-    Ok(media_titles::private_json(value))
+    Ok(responses::ok_json(value))
 }
 pub async fn change(
     State(app): State<App>,
@@ -234,7 +234,7 @@ pub async fn change(
         // if this waiter is interrupted after the source update.
         source_access::retire(&app.db).await?;
     }
-    Ok(media_titles::private_json(value))
+    Ok(responses::ok_json(value))
 }
 #[cfg(test)]
 mod tests {

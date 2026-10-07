@@ -226,13 +226,13 @@ pub(super) async fn preview(
                     )
                 })
                 .transpose()?;
-            Ok(media_titles::private_json(json!({
+            Ok(responses::ok_json(json!({
                 "items":result.items.iter().map(reference_dto).collect::<Vec<_>>(),
                 "failures":[],"truncated":result.has_more,"limit":imports::MAX_ITEMS,
                 "next":next,"omitted":result.omitted,
             })))
         }
-        Err(error) => Ok(media_titles::private_json(json!({
+        Err(error) => Ok(responses::ok_json(json!({
             "items":[],"failures":[{"index":0,"error":import_failure(error)}],
             "truncated":false,"limit":imports::MAX_ITEMS,"next":null,"omitted":0,
         }))),
@@ -372,13 +372,11 @@ pub(super) async fn preview_youtube(
                     })
                 })
                 .collect::<Vec<_>>();
-            Ok(media_titles::private_json(
-                json!({"items":items,"failures":[],
+            Ok(responses::ok_json(json!({"items":items,"failures":[],
                 "truncated":result.preview.truncated,"limit":imports::MAX_ITEMS,"next":next,
-                "omitted":result.preview.unavailable}),
-            ))
+                "omitted":result.preview.unavailable})))
         }
-        Err(error) => Ok(media_titles::private_json(json!({"items":[],
+        Err(error) => Ok(responses::ok_json(json!({"items":[],
             "failures":[{"index":0,"error":youtube_preview_failure(error)}],
             "truncated":false,"limit":imports::MAX_ITEMS,"next":null,"omitted":0}))),
     }

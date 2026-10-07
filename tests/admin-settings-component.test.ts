@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { readFileSync } from "node:fs";
-import { nextTick } from "vue";
 import { useSession } from "../apps/web/src/features/auth/session.store";
 import { RequestFailure } from "../apps/web/src/errors";
 import { mountSetup } from "./helpers/mount-setup";

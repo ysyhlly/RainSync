@@ -65,7 +65,7 @@ pub(super) async fn item_metadata(
                     anyhow::anyhow!("upstream_metadata_request_failed")
                 }
             })?;
-        let mut response = request
+        let response = request
             .send()
             .await
             .map_err(|_| anyhow::anyhow!("upstream_metadata_request_failed"))?;
@@ -73,35 +73,63 @@ pub(super) async fn item_metadata(
             response.status() == reqwest::StatusCode::OK,
             "upstream_metadata_status"
         );
-        const MAX_BYTES: usize = 2 * 1024 * 1024;
-        ensure!(
-            response
-                .content_length()
-                .is_none_or(|n| n <= MAX_BYTES as u64),
-            "upstream_metadata_too_large"
-        );
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| anyhow::anyhow!("upstream_metadata_body_failed"))?
-        {
-            ensure!(
-                chunk.len() <= MAX_BYTES.saturating_sub(bytes.len()),
-                "upstream_metadata_too_large"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
-        let mut parser = serde_json::Deserializer::from_slice(&bytes);
-        let value = <UniqueValue as serde::Deserialize>::deserialize(&mut parser)
-            .map_err(|_| anyhow::anyhow!("upstream_metadata_invalid_json"))?;
-        parser
-            .end()
-            .map_err(|_| anyhow::anyhow!("upstream_metadata_invalid_json"))?;
-        Ok(value.0)
+        let (value, _) = read_unique_json(
+            response,
+            2 * 1024 * 1024,
+            JsonErrors {
+                too_large: "upstream_metadata_too_large",
+                body_failed: "upstream_metadata_body_failed",
+                invalid_json: "upstream_metadata_invalid_json",
+            },
+        )
+        .await?;
+        Ok(value)
     })
     .await
     .map_err(|_| anyhow::anyhow!("upstream_metadata_timeout"))?
+}
+
+#[derive(Clone, Copy)]
+struct JsonErrors {
+    too_large: &'static str,
+    body_failed: &'static str,
+    invalid_json: &'static str,
+}
+
+// Check both advertised and actual bytes before JSON allocation. Chunked and
+// incorrectly advertised responses receive exactly the same byte budget.
+async fn read_unique_json(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    errors: JsonErrors,
+) -> Result<(Value, usize)> {
+    ensure!(
+        response
+            .content_length()
+            .is_none_or(|n| n <= max_bytes as u64),
+        "{}",
+        errors.too_large
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| anyhow::anyhow!(errors.body_failed))?
+    {
+        ensure!(
+            chunk.len() <= max_bytes.saturating_sub(bytes.len()),
+            "{}",
+            errors.too_large
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    let mut parser = serde_json::Deserializer::from_slice(&bytes);
+    let value = <UniqueValue as serde::Deserialize>::deserialize(&mut parser)
+        .map_err(|_| anyhow::anyhow!(errors.invalid_json))?;
+    parser
+        .end()
+        .map_err(|_| anyhow::anyhow!(errors.invalid_json))?;
+    Ok((value.0, bytes.len()))
 }
 
 /// A duplicate identity/constraint is ambiguous even when both values agree.
@@ -269,7 +297,46 @@ pub async fn plan(
     Ok(request.send().await?.error_for_status()?.json().await?)
 }
 
+// These caps bound the all-or-nothing catalog held in memory. A capped scan
+// returns an error, never a partial catalog that could tombstone unseen items.
+const LIBRARY_SCAN_LIMITS: ScanLimits = ScanLimits {
+    page_bytes: 2 * 1024 * 1024,
+    total_bytes: 32 * 1024 * 1024,
+    items: 20_000,
+    timeout: std::time::Duration::from_secs(120),
+};
+const LIBRARY_JSON_ERRORS: JsonErrors = JsonErrors {
+    too_large: "library_response_too_large",
+    body_failed: "library_response_failed",
+    invalid_json: "invalid_library_json",
+};
+#[derive(Clone, Copy)]
+struct ScanLimits {
+    page_bytes: usize,
+    total_bytes: usize,
+    items: usize,
+    timeout: std::time::Duration,
+}
+
 pub async fn list(config: &SourceConfig, headers: BTreeMap<String, String>) -> Result<Vec<Item>> {
+    list_with_limits(config, headers, LIBRARY_SCAN_LIMITS).await
+}
+
+async fn list_with_limits(
+    config: &SourceConfig,
+    headers: BTreeMap<String, String>,
+    limits: ScanLimits,
+) -> Result<Vec<Item>> {
+    tokio::time::timeout(limits.timeout, scan_library(config, headers, limits))
+        .await
+        .map_err(|_| anyhow::anyhow!("library_scan_timeout"))?
+}
+
+async fn scan_library(
+    config: &SourceConfig,
+    headers: BTreeMap<String, String>,
+    limits: ScanLimits,
+) -> Result<Vec<Item>> {
     ensure!(
         !config.user_id.is_empty() && !config.token.is_empty(),
         "upstream_credentials_required"
@@ -278,6 +345,7 @@ pub async fn list(config: &SourceConfig, headers: BTreeMap<String, String>) -> R
     let mut items = Vec::new();
     let mut identities = HashSet::new();
     let mut expected_total = None;
+    let mut scanned_bytes = 0;
     loop {
         let start = items.len().to_string();
         let request = super::source_request(config, url.as_str(), reqwest::Method::GET, &headers)
@@ -293,10 +361,20 @@ pub async fn list(config: &SourceConfig, headers: BTreeMap<String, String>) -> R
                 ("Limit", "200"),
                 ("StartIndex", start.as_str()),
             ]);
-        let page: Value = request.send().await?.error_for_status()?.json().await?;
+        let remaining = limits.total_bytes - scanned_bytes;
+        ensure!(remaining > 0, "library_scan_byte_limit");
+        let response = request.send().await?.error_for_status()?;
+        let (page, bytes) = read_unique_json(
+            response,
+            limits.page_bytes.min(remaining),
+            LIBRARY_JSON_ERRORS,
+        )
+        .await?;
+        scanned_bytes += bytes;
         let total = page["TotalRecordCount"]
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("invalid_library_total"))?;
+        ensure!(total <= limits.items as u64, "library_scan_item_limit");
         ensure!(
             expected_total.is_none_or(|expected| expected == total),
             "library_changed_during_scan"
@@ -306,6 +384,10 @@ pub async fn list(config: &SourceConfig, headers: BTreeMap<String, String>) -> R
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("invalid_library_response"))?;
         ensure!(rows.len() <= 200, "invalid_library_page_size");
+        ensure!(
+            rows.len() <= limits.items.saturating_sub(items.len()),
+            "library_scan_item_limit"
+        );
         for row in rows {
             let id = row["Id"]
                 .as_str()
@@ -365,5 +447,178 @@ mod metadata_json_tests {
         ).unwrap();
         assert_eq!(value.0["Id"], "item");
         assert_eq!(value.0["Rate"], 29.97003);
+    }
+}
+
+#[cfg(test)]
+mod library_limit_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn fixture(
+        pages: Vec<String>,
+        chunked: bool,
+        delay: std::time::Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for body in pages {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut chunk = [0; 1024];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0 && request.len() + n <= 8192);
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                tokio::time::sleep(delay).await;
+                let reply = if chunked {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                        body.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                // Cancellation and pre-body Content-Length rejection may close
+                // the owned fixture before its bounded response is written.
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        (origin, server)
+    }
+
+    fn config(origin: &str) -> SourceConfig {
+        serde_json::from_value(serde_json::json!({
+            "url": origin, "user_id":"viewer", "token":"owned-fixture-token",
+            "access_policy":{"schema_version":1,"origins":[{"origin":origin,"cidrs":["127.0.0.1/32"]}]}
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn catalog_json_bounds_apply_to_known_length_and_chunked_responses() {
+        for chunked in [false, true] {
+            for (body, cap, expected) in [
+                (r#"{"Items":[],"TotalRecordCount":0}"#, 128, None),
+                (
+                    r#"{"Items":[],"TotalRecordCount":0}"#,
+                    16,
+                    Some("library_response_too_large"),
+                ),
+                (
+                    r#"{"Items":[],"TotalRecordCount":0,"TotalRecordCount":0}"#,
+                    128,
+                    Some("invalid_library_json"),
+                ),
+                (
+                    r#"{"Items":[{"Id":"one","Id":"one"}],"TotalRecordCount":1}"#,
+                    128,
+                    Some("invalid_library_json"),
+                ),
+            ] {
+                let (origin, server) =
+                    fixture(vec![body.into()], chunked, std::time::Duration::ZERO).await;
+                let response = reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap()
+                    .get(origin)
+                    .send()
+                    .await
+                    .unwrap();
+                let result = read_unique_json(response, cap, LIBRARY_JSON_ERRORS).await;
+                match expected {
+                    Some(error) => assert_eq!(result.unwrap_err().to_string(), error),
+                    None => assert_eq!(result.unwrap().1, body.len()),
+                }
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_limits_never_return_a_partial_success() {
+        let first = r#"{"Items":[{"Id":"one","Name":"One"}],"TotalRecordCount":2}"#.to_owned();
+        let second = r#"{"Items":[{"Id":"two","Name":"Two"}],"TotalRecordCount":2}"#.to_owned();
+        let ordinary = ScanLimits {
+            page_bytes: 1024,
+            total_bytes: 2048,
+            items: 2,
+            timeout: std::time::Duration::from_secs(2),
+        };
+        for (pages, limits, expected) in [
+            (vec![first.clone(), second.clone()], ordinary, None),
+            (
+                vec![first.clone()],
+                ScanLimits {
+                    items: 1,
+                    ..ordinary
+                },
+                Some("library_scan_item_limit"),
+            ),
+            (
+                vec![first.clone(), second.clone()],
+                ScanLimits {
+                    total_bytes: first.len() + second.len() - 1,
+                    ..ordinary
+                },
+                Some("library_response_too_large"),
+            ),
+            (
+                vec![first.clone(), first.clone()],
+                ordinary,
+                Some("duplicate_library_item"),
+            ),
+            (
+                vec![first.clone(), r#"{"Items":[],"TotalRecordCount":2}"#.into()],
+                ordinary,
+                Some("incomplete_library_response"),
+            ),
+            (
+                vec![first.clone(), r#"{"Items":[],"TotalRecordCount":1}"#.into()],
+                ordinary,
+                Some("library_changed_during_scan"),
+            ),
+        ] {
+            let (origin, server) = fixture(pages, false, std::time::Duration::ZERO).await;
+            let result = list_with_limits(&config(&origin), BTreeMap::new(), limits).await;
+            match expected {
+                Some(error) => assert_eq!(result.unwrap_err().to_string(), error),
+                None => assert_eq!(
+                    result
+                        .unwrap()
+                        .iter()
+                        .map(|item| item.resource.as_str())
+                        .collect::<Vec<_>>(),
+                    ["one", "two"]
+                ),
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn whole_catalog_deadline_includes_waiting_for_a_page() {
+        let (origin, server) = fixture(
+            vec![r#"{"Items":[],"TotalRecordCount":0}"#.into()],
+            false,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let result = list_with_limits(
+            &config(&origin),
+            BTreeMap::new(),
+            ScanLimits {
+                timeout: std::time::Duration::from_millis(30),
+                ..LIBRARY_SCAN_LIMITS
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), "library_scan_timeout");
+        server.await.unwrap();
     }
 }

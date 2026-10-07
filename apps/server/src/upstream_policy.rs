@@ -470,8 +470,22 @@ async fn retire(pool: &PgPool) -> anyhow::Result<()> {
     bounded(async {
         let mut db = Database::acquire(pool).await?;
         let mut tx = db.transaction().await?;
-        sqlx::query("UPDATE playback_sessions p SET stopped=true FROM media_items m JOIN sources s ON s.id=m.source_id WHERE p.media_id=m.id AND NOT p.stopped AND ((p.auth_login_hash IS NOT NULL AND NOT playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch)) OR (s.kind IN('jellyfin','emby') AND NOT playback_source_allowed(p.media_id,p.resource,p.id)))")
-            .execute(&mut *tx).await?;
+        // Evaluate the exact mutable-resource gate only after locking the row
+        // version passed to it. Busy grants wait for the next bounded sweep.
+        sqlx::query(
+            r#"WITH locked_sessions AS MATERIALIZED (
+                SELECT p.id,p.media_id,p.resource,p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch,s.kind
+                FROM playback_sessions p JOIN media_items m ON p.media_id=m.id JOIN sources s ON s.id=m.source_id
+                WHERE NOT p.stopped
+                ORDER BY p.id FOR UPDATE OF p SKIP LOCKED
+            )
+            UPDATE playback_sessions target SET stopped=true FROM locked_sessions p
+            WHERE target.id=p.id AND NOT target.stopped
+                AND ((p.auth_login_hash IS NOT NULL AND NOT playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch))
+                    OR (p.kind IN('jellyfin','emby') AND NOT playback_source_allowed(p.media_id,p.resource,p.id)))"#,
+        )
+        .execute(&mut *tx)
+        .await?;
         let job_health = cancel_jobs(&mut *tx, CancellationScope::StoppedSessions).await?;
         sqlx::query("UPDATE upstream_reservations u SET state='closing',close_reason=COALESCE(close_reason,CASE WHEN EXISTS(SELECT 1 FROM sources s WHERE s.id=u.source_id AND s.access_policy_revision=u.source_policy_revision) THEN 'upstream_policy_changed' ELSE 'source_changed' END),cleanup_after=COALESCE(cleanup_after,clock_timestamp()),cleanup_deadline=COALESCE(cleanup_deadline,clock_timestamp()+interval '60 seconds'),updated_at=clock_timestamp() WHERE u.state IN('preparing','active') AND (NOT playback_origin_allowed(u.user_id,u.room_id,u.auth_login_hash,u.auth_membership_epoch) OR NOT source_account_policy_allowed(u.source_id,u.source_policy_revision,u.account_policy_generation))")
             .execute(&mut *tx).await?;

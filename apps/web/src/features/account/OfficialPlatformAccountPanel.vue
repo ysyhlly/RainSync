@@ -340,12 +340,25 @@ onBeforeUnmount(() => {
       <p v-if="state.phase === 'uncertain'" role="status">
         授权结果尚未确认。可查询同一请求，不会自动重新授权
       </p>
+      <p v-if="state.phase === 'retryable'" role="status">
+        授权准备未完成。可重试准备同一请求
+      </p>
       <button
-        v-if="state.phase === 'idle' || state.phase === 'uncertain'"
+        v-if="
+          state.phase === 'idle' ||
+          state.phase === 'uncertain' ||
+          state.phase === 'retryable'
+        "
         :disabled="!ready || !consent || busy"
         @click="begin"
       >
-        {{ state.phase === "uncertain" ? "查询同一授权结果" : "准备官方授权" }}
+        {{
+          state.phase === "uncertain"
+            ? "查询同一授权结果"
+            : state.phase === "retryable"
+              ? "重试准备官方授权"
+              : "准备官方授权"
+        }}
       </button>
       <button @click="close">
         {{ state.phase === "confirmed" ? "完成" : "取消并关闭" }}

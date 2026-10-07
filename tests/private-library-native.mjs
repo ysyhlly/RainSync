@@ -108,12 +108,13 @@ try {
     PUBLIC_ORIGIN: origin,
     BIND: `127.0.0.1:${httpPort}`,
     MEDIA_ROOT: root,
-    CACHE_ROOT: root + "/cache",
+    CACHE_ROOT: root + "-cache",
     PRIVATE_LIBRARIES_ENABLED: "true",
     RAINSYNC_S3_SYNTH_ACCESS: "SYNTHETICACCESS",
     RAINSYNC_S3_SYNTH_SECRET: "synthetic-owned-local-secret",
     RUST_LOG: "warn",
   };
+  report.fixture_paths = { artifacts: root, media: env.MEDIA_ROOT, cache: env.CACHE_ROOT, retention: "owned fixture directories retained as evidence" };
   const serverBinary =
     process.env.RAINSYNC_SERVER_BINARY ||
     resolve(

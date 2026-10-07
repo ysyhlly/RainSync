@@ -225,8 +225,3 @@ export function addWidget(
   }
   return document;
 }
-
-export const addLayoutItem = addWidget;
-export const removeLayoutItem = removeWidget;
-export const moveLayoutItem = moveWidget;
-export const resizeLayoutItem = resizeWidget;

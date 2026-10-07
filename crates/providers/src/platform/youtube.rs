@@ -898,17 +898,23 @@ impl AvailableFormat {
                 .as_deref()
                 .is_some_and(|url| validate_media_url(url, now).is_ok())
     }
-    fn video_height(&self, adaptive: bool, now: u64) -> Option<u32> {
+    fn video_height(&self, adaptive: bool, now: u64, mode: SelectionMode) -> Option<u32> {
+        let compatibility = adaptive && mode == SelectionMode::CompatibilityAdaptive;
+        let codec = self.vcodec.as_deref().unwrap_or("");
+        let supported_video = self.ext.as_deref() == Some("mp4")
+            && (avc_codec(codec) || compatibility && mp4::valid_clear_extended_codec_hint(codec))
+            || compatibility && self.ext.as_deref() == Some("webm") && valid_webm_video_hint(codec);
         if !self.clear_direct(now)
-            || self.ext.as_deref() != Some("mp4")
-            || !self.vcodec.as_deref().is_some_and(avc_codec)
+            || !supported_video
             || self.acodec.as_deref() != Some(if adaptive { "none" } else { "mp4a.40.2" })
             || !bounded_dimensions(self.width, self.height)
             || self.width.is_none()
             || self.height.is_none()
             || !bounded_optional(self.fps, MAX_FPS)
             || (adaptive
-                && (!self.fps.is_some_and(|fps| bounded_positive(fps, MAX_FPS))
+                && (self.asr.is_some()
+                    || self.audio_channels.is_some()
+                    || !self.fps.is_some_and(|fps| bounded_positive(fps, MAX_FPS))
                     || !self
                         .tbr
                         .is_some_and(|rate| bounded_positive(rate, MAX_VIDEO_KBPS))))
@@ -1238,23 +1244,35 @@ fn normalize_json(
         }
         SelectedFormats::Pair(pair) => normalize_adaptive(&data, pair, now_seconds, mode)?,
     };
-    let adaptive_available = mode == SelectionMode::PreferAdaptive
-        && (matches!(playback, Playback::Adaptive { .. })
-            || data
-                .formats
-                .0
-                .iter()
-                .any(|format| format.compatible_audio(now_seconds)));
+    // Discovery follows the same source families as the fixed extractor
+    // selector. Compatibility requires a separate video/audio pair; muxed-only
+    // heights are not choices in that mode. Metadata is still not byte proof.
+    let compatible_pair = |video: &AvailableFormat| match &playback {
+        Playback::Adaptive { audio, .. } if video.url.as_deref() != Some(audio.url.as_str()) => {
+            true
+        }
+        _ => data
+            .formats
+            .0
+            .iter()
+            .any(|audio| audio.compatible_audio(now_seconds) && audio.url != video.url),
+    };
     let mut available_heights: Vec<u32> = data
         .formats
         .0
         .iter()
-        .filter_map(|format| {
-            format.video_height(false, now_seconds).or_else(|| {
-                adaptive_available
-                    .then(|| format.video_height(true, now_seconds))
-                    .flatten()
-            })
+        .filter_map(|format| match mode {
+            SelectionMode::ProgressiveOnly => format.video_height(false, now_seconds, mode),
+            SelectionMode::PreferAdaptive => {
+                format.video_height(false, now_seconds, mode).or_else(|| {
+                    compatible_pair(format)
+                        .then(|| format.video_height(true, now_seconds, mode))
+                        .flatten()
+                })
+            }
+            SelectionMode::CompatibilityAdaptive => compatible_pair(format)
+                .then(|| format.video_height(true, now_seconds, mode))
+                .flatten(),
         })
         .collect();
     if let Some(height) = playback.dimensions().1 {

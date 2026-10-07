@@ -1,3 +1,4 @@
+import { createCookieAccountFlow } from "./cookie-account-flow";
 import type { YoutubePlatformAccountStatus } from "./platform-account.api";
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -63,43 +64,10 @@ export function createYoutubeAccountFlow(options: {
   clearSecret: () => void;
   change: (phase: YoutubeAccountPhase) => void;
 }) {
-  let closed = false,
-    busy = false;
-  const controller = new AbortController();
-  const current = () =>
-    !closed && !controller.signal.aborted && options.current();
-  async function submit(
-    secret: string,
-    revision: string | null,
-    consent: boolean,
-  ) {
-    if (!current() || busy || !consent || !secret) return;
-    busy = true;
-    options.clearSecret();
-    if (!validYoutubeCookieFile(secret)) {
-      secret = "";
-      busy = false;
-      options.change("invalid");
-      return;
-    }
-    options.change("submitting");
-    try {
-      const value = await options.submit(secret, revision, controller.signal);
-      secret = "";
-      if (!current()) return;
-      validateYoutubeAccountStatus(value);
-      options.change(value.state === "connected" ? "stored" : "uncertain");
-    } catch {
-      if (current()) options.change("uncertain");
-    } finally {
-      secret = "";
-      busy = false;
-    }
-  }
-  function close() {
-    closed = true;
-    controller.abort();
-    options.clearSecret();
-  }
-  return { submit, close };
+  return createCookieAccountFlow({
+    ...options,
+    hasInput: (secret) => !!secret,
+    validateInput: validYoutubeCookieFile,
+    validateStatus: validateYoutubeAccountStatus,
+  });
 }

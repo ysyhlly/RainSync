@@ -2,21 +2,6 @@ use crate::*;
 use axum::extract::ConnectInfo;
 use std::net::SocketAddr;
 
-fn anonymous_request(app: &App, h: &HeaderMap) -> Result<()> {
-    origin(app, h)?;
-    if h.get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(';').next())
-        .map(str::trim)
-        != Some("application/json")
-    {
-        return Err(err(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_media_type",
-        ));
-    }
-    Ok(())
-}
 fn invalid_invite() -> Error {
     err(StatusCode::BAD_REQUEST, "registration_invite_invalid")
 }
@@ -33,7 +18,7 @@ pub async fn validate(
     h: HeaderMap,
     Json(body): Json<Validate>,
 ) -> Result<Response> {
-    anonymous_request(&app, &h)?;
+    account_security::anonymous_json_request(&app, &h)?;
     let source = app.account_security.source(peer, &h).to_string();
     account_security::rate_limit(
         &app.db,
@@ -51,7 +36,7 @@ pub async fn validate(
     let normalized = registration::normalize_code(&body.code).ok_or_else(invalid_invite)?;
     let row = sqlx::query("SELECT code_suffix,floor(extract(epoch FROM expires_at)*1000)::bigint AS expires_at,floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS server_time FROM registration_invites WHERE code_hash=$1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at>clock_timestamp()")
         .bind(registration::code_hash(&normalized)).fetch_optional(&app.db).await?.ok_or_else(invalid_invite)?;
-    Ok(registration::private_json(
+    Ok(responses::private_json(
         StatusCode::OK,
         json!({"code_suffix":row.get::<String,_>("code_suffix"),"expires_at":row.get::<i64,_>("expires_at"),"server_time":row.get::<i64,_>("server_time")}),
     ))
@@ -72,7 +57,7 @@ pub async fn register(
     h: HeaderMap,
     Json(body): Json<Register>,
 ) -> Result<Response> {
-    anonymous_request(&app, &h)?;
+    account_security::anonymous_json_request(&app, &h)?;
     if cookie(&h).is_some() {
         match auth(&app, &h, false).await {
             Ok(_) => return Err(err(StatusCode::CONFLICT, "already_authenticated")),
@@ -174,7 +159,7 @@ pub async fn register(
         .bind(hash(&session)).bind(id).bind(&csrf).execute(&mut *tx).await?;
     tx.commit().await?;
     // No post-commit query can turn a committed registration into an apparent failure.
-    let mut response = registration::private_json(
+    let mut response = responses::private_json(
         StatusCode::CREATED,
         json!({"id":id,"username":account.username,
         "display_name":display_name.as_ref().unwrap_or(&account.username),"admin":false,"csrf":csrf,"avatar_url":null,"avatar_version":null}),

@@ -19,7 +19,15 @@ import {
   decryptArchive,
   localConnection,
   pg,
+  readTransaction,
+  withDatabaseSnapshot,
 } from "./postgres-recovery.mjs";
+const keyInventory = JSON.parse(
+  await readFile(
+    new URL("../apps/server/src/source-key-inventory.json", import.meta.url),
+    "utf8",
+  ),
+);
 const sha = (value) => createHash("sha256").update(value).digest("hex");
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -43,7 +51,12 @@ export function validateMaterials(materials) {
       "configuration values must be strings",
     );
     assert.ok(
-      !["SOURCE_ENCRYPTION_KEY", "AGENT_TOKEN", "PAIR_CODE", "RAINSYNC_CONTROL_PEER_TOKEN"].includes(key),
+      ![
+        "SOURCE_ENCRYPTION_KEY",
+        "AGENT_TOKEN",
+        "PAIR_CODE",
+        "RAINSYNC_CONTROL_PEER_TOKEN",
+      ].includes(key),
       "source key, Agent credentials and cluster peer token must not be ordinary recovery configuration",
     );
   }
@@ -56,6 +69,11 @@ export function validateMaterials(materials) {
     materials.source_key ?? "",
     /^[A-Za-z0-9+/]{43}=$/,
     "source key must encode 32 bytes",
+  );
+  assert.ok(
+    Buffer.from(materials.source_key, "base64").toString("base64") ===
+      materials.source_key,
+    "source key must use canonical base64",
   );
   assert.ok(
     typeof materials.original_media_policy === "string" &&
@@ -95,14 +113,18 @@ export function decryptSource(value, encodedKey) {
     const data = Buffer.from(value, "base64"),
       key = Buffer.from(encodedKey, "base64");
     assert.equal(key.length, 32);
+    assert.equal(data.toString("base64"), value);
+    assert.equal(key.toString("base64"), encodedKey);
     assert.ok(data.length >= 28);
     const decipher = createDecipheriv("aes-256-gcm", key, data.subarray(0, 12));
     decipher.setAuthTag(data.subarray(-16));
     return JSON.parse(
-      Buffer.concat([
-        decipher.update(data.subarray(12, -16)),
-        decipher.final(),
-      ]).toString("utf8"),
+      new TextDecoder("utf-8", { fatal: true }).decode(
+        Buffer.concat([
+          decipher.update(data.subarray(12, -16)),
+          decipher.final(),
+        ]),
+      ),
     );
   } catch {
     throw Error(
@@ -110,7 +132,7 @@ export function decryptSource(value, encodedKey) {
     );
   }
 }
-async function rows(connection, query) {
+async function rows(connection, query, snapshot) {
   return JSON.parse(
     await pg(
       "psql",
@@ -120,65 +142,93 @@ async function rows(connection, query) {
         "-v",
         "ON_ERROR_STOP=1",
         "-c",
-        `BEGIN READ ONLY; SET LOCAL statement_timeout='5s'; ${query}; ROLLBACK;`,
+        `${readTransaction(connection, snapshot)} SET LOCAL statement_timeout='5s'; ${query}; ROLLBACK;`,
       ],
       connection,
     ),
   );
 }
-export async function verifyMaterials(connection, raw) {
+export async function verifyMaterials(connection, raw, { snapshot } = {}) {
+  if (!snapshot)
+    return withDatabaseSnapshot(connection, (held) =>
+      verifyMaterials(connection, raw, { snapshot: held }),
+    );
   localConnection(connection);
   const materials = validateMaterials(raw);
-  let checked = 0;
-  for (const table of ["sources", "source_access_policy_snapshots"]) {
+  let sourceChecked = 0,
+    platformChecked = 0;
+  for (const {
+    table,
+    column,
+    id_column: idColumn,
+    predicate,
+  } of keyInventory) {
     const present = await rows(
       connection,
       `SELECT to_json(to_regclass('public.${table}') IS NOT NULL)`,
+      snapshot,
     );
     if (!present) continue;
-    const idColumn = table === "sources" ? "id" : "source_id";
+    // Expiry is evaluated at the captured recovery point, not at a later batch.
+    const atSnapshot = predicate.replaceAll(
+      "clock_timestamp()",
+      `'${snapshot.started_at}'::timestamptz`,
+    );
     let after = null;
     while (true) {
       const batch = await rows(
         connection,
-        `SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT ${idColumn} AS id,config_encrypted FROM ${table} WHERE ${after === null ? "TRUE" : `${idColumn}>'${after}'::uuid`} ORDER BY ${idColumn} LIMIT 100) t`,
+        `SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT ${idColumn} AS id,${column} AS ciphertext FROM ${table} WHERE (${atSnapshot}) AND ${after === null ? "TRUE" : `${idColumn}>'${after}'::uuid`} ORDER BY ${idColumn} LIMIT 100) t`,
+        snapshot,
       );
       for (const row of batch) {
         assert.match(row.id, uuid);
-        decryptSource(row.config_encrypted, materials.source_key);
-        checked++;
+        decryptSource(row.ciphertext, materials.source_key);
+        if (table === "sources" || table === "source_access_policy_snapshots")
+          sourceChecked++;
+        else platformChecked++;
       }
       if (batch.length < 100) break;
       after = batch.at(-1).id;
     }
   }
-  const agents = await rows(
-    connection,
-    "SELECT COALESCE(json_agg(json_build_object('id',id,'token_hash',token_hash,'revoked',revoked)), '[]'::json) FROM agents",
+  const savedAgents = new Map(
+    materials.agents.map((agent) => [agent.id, agent]),
   );
-  const active = agents.filter((agent) => !agent.revoked && agent.token_hash);
+  let active = 0,
+    after = null;
+  while (true) {
+    const agents = await rows(
+      connection,
+      `SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT id,token_hash FROM agents WHERE NOT revoked AND token_hash IS NOT NULL AND token_hash<>'' AND ${after === null ? "TRUE" : `id>'${after}'::uuid`} ORDER BY id LIMIT 100) t`,
+      snapshot,
+    );
+    for (const actual of agents) {
+      assert.match(actual.id, uuid);
+      const saved = savedAgents.get(actual.id);
+      assert.ok(
+        saved && actual.token_hash === sha(saved.credential.token),
+        "all and only active paired Agent credentials must match; never revive revoked credentials",
+      );
+      active++;
+    }
+    if (agents.length < 100) break;
+    after = agents.at(-1).id;
+  }
   assert.equal(
     materials.agents.length,
-    active.length,
+    active,
     "all and only active paired Agent credentials must be present",
   );
-  for (const saved of materials.agents) {
-    const actual = agents.find((agent) => agent.id === saved.id);
-    assert.ok(
-      actual &&
-        !actual.revoked &&
-        actual.token_hash &&
-        actual.token_hash === sha(saved.credential.token),
-      "Agent credential mismatch or revoked credential; re-pair under separate authorization, never revive revoked credentials",
-    );
-  }
   return {
-    source_records_decrypted: checked,
-    active_agent_credentials_matched: active.length,
+    source_records_decrypted: sourceChecked,
+    platform_records_decrypted: platformChecked,
+    active_agent_credentials_matched: active,
     receipt_scope:
       "existing persisted receipt bytes preserved only; no historical process release proof inferred",
   };
 }
+
 async function separateKeys(a, b) {
   assert.notEqual(
     await realpath(a),
@@ -219,13 +269,25 @@ export async function createRecoverySet({
 }) {
   separateDestinations(databaseOutput, materialOutput);
   await separateKeys(databaseKeyFile, materialKeyFile);
-  const checked = await verifyMaterials(connection, materials);
-  // All preflight authentication checks precede creating a backup.
-  const database = await backup({
+  // Freeze caller-owned input across asynchronous validation and serialization.
+  materials = structuredClone(validateMaterials(materials));
+  const { checked, database } = await withDatabaseSnapshot(
     connection,
-    output: databaseOutput,
-    keyFile: databaseKeyFile,
-  });
+    async (snapshot) => {
+      const checked = await verifyMaterials(connection, materials, {
+        snapshot,
+      });
+      // All preflight authentication checks precede creating a backup. pg_dump
+      // imports precisely the snapshot used by every material/inventory query.
+      const database = await backup({
+        connection,
+        output: databaseOutput,
+        keyFile: databaseKeyFile,
+        snapshot,
+      });
+      return { checked, database };
+    },
+  );
   await mkdir(materialOutput, { mode: 0o700 });
   const temporary = resolve(materialOutput, "materials.tmp"),
     archive = resolve(materialOutput, "materials.aesgcm");
@@ -247,6 +309,8 @@ export async function createRecoverySet({
       archive: "materials.aesgcm",
       archive_sha256: sha(await readFile(archive)),
       checked,
+      snapshot_started_at: database.snapshot_started_at,
+      material_database_snapshot_matched: true,
       custody:
         "separate encrypted material archive; keep this archive and its key under access control independent of the database archive/key",
       production_recovery_accepted: false,
@@ -428,10 +492,11 @@ if (
   resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 )
   cli().catch((error) => {
+    // Closed categories only. JSON.parse and assertion diffs can quote secrets.
     console.error(
-      error.code
-        ? "recovery I/O failed; inspect private paths and access"
-        : error.message,
+      error instanceof SyntaxError
+        ? "recovery JSON is invalid; inspect private input without publishing its contents"
+        : "recovery failed; inspect private input, key custody, database and archive validation",
     );
     process.exitCode = 1;
   });

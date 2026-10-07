@@ -1,4 +1,4 @@
-//! Inactive, closed HTTP representation contract for original child output.
+//! Closed HTTP representation contract for explicitly enabled child delivery.
 //!
 //! The child recipe produces `index.m3u8`, `init.mp4`, and at most five
 //! `sNNN.m4s` files. Those names must never enter the generic `indexN` output
@@ -280,35 +280,15 @@ fn invalid_range() -> (StatusCode, String) {
 }
 
 fn parse_range(headers: &HeaderMap) -> Result<Option<Range>> {
-    let mut values = headers.get_all(header::RANGE).iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() || value.as_bytes().len() > 128 {
-        return Err(invalid_range());
-    }
-    let value = value.to_str().map_err(|_| invalid_range())?.trim();
-    let bounds = value.strip_prefix("bytes=").ok_or_else(invalid_range)?;
-    let (first, last) = bounds.split_once('-').ok_or_else(invalid_range)?;
-    let number = |value: &str| -> Result<usize> {
-        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(invalid_range());
-        }
-        value.parse().map_err(|_| invalid_range())
-    };
-    let range = if first.is_empty() {
-        Range::Suffix(number(last)?)
-    } else if last.is_empty() {
-        Range::From(number(first)?)
-    } else {
-        let first = number(first)?;
-        let last = number(last)?;
-        if first > last {
-            return Err(invalid_range());
-        }
-        Range::Inclusive { first, last }
-    };
-    Ok(Some(range))
+    super::static_hls_range::parse(headers)
+        .map(|range| {
+            range.map(|range| match range {
+                ReadRange::From(first) => Range::From(first),
+                ReadRange::Inclusive { first, last } => Range::Inclusive { first, last },
+                ReadRange::Suffix(length) => Range::Suffix(length),
+            })
+        })
+        .map_err(|()| invalid_range())
 }
 
 /// Private response metadata, always derived after real owner validation.
@@ -610,17 +590,50 @@ mod tests {
                 header::RANGE,
                 axum::http::HeaderValue::from_bytes(value.as_bytes()).unwrap(),
             );
-            assert!(Request::parse(&Method::GET, &headers).is_err(), "{value}");
+            assert_eq!(
+                Request::parse(&Method::GET, &headers).err().unwrap(),
+                invalid_range(),
+                "{value}"
+            );
         }
         for name in [header::RANGE, header::IF_RANGE] {
             let mut headers = HeaderMap::new();
             headers.insert(name.clone(), "bytes=0-3".parse().unwrap());
             headers.append(name.clone(), "bytes=3-9".parse().unwrap());
-            assert!(Request::parse(&Method::GET, &headers).is_err());
+            assert_eq!(
+                Request::parse(&Method::GET, &headers).err().unwrap(),
+                invalid_range()
+            );
             headers.remove(name.clone());
             headers.insert(name, "x".repeat(129).parse().unwrap());
-            assert!(Request::parse(&Method::GET, &headers).is_err());
+            assert_eq!(
+                Request::parse(&Method::GET, &headers).err().unwrap(),
+                invalid_range()
+            );
         }
+    }
+
+    #[test]
+    fn range_raw_header_limit_is_checked_before_trimming() {
+        let value = format!("bytes={}-1", "0".repeat(120));
+        assert_eq!(value.len(), 128);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, value.parse().unwrap());
+        assert_eq!(
+            Request::parse(&Method::GET, &headers).unwrap().range,
+            Some(Range::Inclusive { first: 0, last: 1 })
+        );
+        headers.insert(header::RANGE, format!("{value} ").parse().unwrap());
+        assert_eq!(
+            Request::parse(&Method::GET, &headers).err().unwrap(),
+            invalid_range()
+        );
+        assert!(
+            Request::parse(&Method::HEAD, &headers)
+                .unwrap()
+                .range
+                .is_none()
+        );
     }
 
     #[test]

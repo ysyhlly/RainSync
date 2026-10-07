@@ -2,11 +2,16 @@ import type { ApiClient } from '../../shared/api/client';
 export interface SharedFile { name:string; url:string; sha256:string; size_bytes:number }
 export interface SharedDirectory { session_id?:string; job_id:string; output_generation:string; files:SharedFile[] }
 export interface PeerStats { peerBytes:number; httpBytes:number; uploadedBytes:number; duplicateBytes:number; badHashes:number; fallbacks:number }
+interface PeerAuthorization {
+  version:1; peer_id:string; room_id:string; job_id:string; output_generation:string; session_id:string|null;
+  lease_ms:number; peers:{peer_id:string;lease_ms:number}[];
+}
 interface Pending { file:SharedFile; data:Uint8Array; received:number; resolve:(data:ArrayBuffer)=>void; reject:(error:Error)=>void }
 interface Peer { pc:RTCPeerConnection; channel?:RTCDataChannel; pending:Map<number,Pending>; cancelled:Set<number>; uploads:Set<number>; ice:RTCIceCandidateInit[] }
 export const MAX_FILE_BYTES=8*1024*1024;
 export const CACHE_BYTES=32*1024*1024;
 const MAX_PEERS=3, CHUNK_BYTES=8192, HIGH_WATER=128*1024;
+export const PEER_AUTHORIZATION_MS=3000;
 const shaPattern=/^[a-f0-9]{64}$/;
 const uuidPattern=/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 export function validateSharedDirectory(value:SharedDirectory,room:string,job:string,session?:string,outputGeneration?:string):SharedDirectory {
@@ -47,7 +52,10 @@ export class RoomP2PTransport {
   private lifecycle=0;
   private uploadAt=0;
   private timer?:ReturnType<typeof setTimeout>;
-  private polling=false;
+  private polling?:number;
+  private authorizedUntil=0;
+  private authorizedPeers=new Map<string,number>();
+  private authorizationTimer?:ReturnType<typeof setTimeout>;
   private releaseBattery?:()=>void;
   private connection?:EventTarget;
   private onNetworkChange=()=>void this.stop();
@@ -73,21 +81,52 @@ export class RoomP2PTransport {
     if(batteryNavigator.getBattery){const b=await batteryNavigator.getBattery();current();if(!b.charging&&b.level<=0.2)throw Error('低电量时暂停 P2P 上传');const low=()=>{if(!b.charging&&b.level<=0.2)void this.stop()};b.addEventListener('levelchange',low);b.addEventListener('chargingchange',low);this.releaseBattery=()=>{b.removeEventListener('levelchange',low);b.removeEventListener('chargingchange',low)};}
     await this.prepare();current();
     const value=this.directory!;
-    const joined=await this.api<{peer_id:string;peers:string[];output_generation:string}>(this.primary?`/playback-sessions/${this.primary.session}/distributed/p2p`:`/rooms/${this.room}/compute/${this.job}/p2p`,'POST',consent);
+    const requestedAt=performance.now();
+    const joined=await this.api<{peer_id:string;peers:string[];output_generation:string;authorization:PeerAuthorization}>(this.primary?`/playback-sessions/${this.primary.session}/distributed/p2p`:`/rooms/${this.room}/compute/${this.job}/p2p`,'POST',consent);
     if(lifecycle!==this.lifecycle){if(uuidPattern.test(joined.peer_id))await this.api(`/room-p2p/${joined.peer_id}`,'DELETE').catch(()=>{});current();}
-    if(joined.output_generation!==value.output_generation||!uuidPattern.test(joined.peer_id)||joined.peers.length>3)throw Error('P2P 输出代次已变化');
-    this.peerId=joined.peer_id;this.stopped=false;document.addEventListener('visibilitychange',this.onVisibility);this.connection=(navigator as Navigator & {connection?:EventTarget}).connection;this.connection?.addEventListener('change',this.onNetworkChange);
-    for(const id of joined.peers){current();await this.connect(id,true);}
+    if(joined.output_generation!==value.output_generation||!uuidPattern.test(joined.peer_id)||!Array.isArray(joined.peers)||joined.peers.length>3)throw Error('P2P 输出代次已变化');
+    this.peerId=joined.peer_id;this.stopped=false;this.applyAuthorization(joined.authorization,requestedAt);document.addEventListener('visibilitychange',this.onVisibility);this.connection=(navigator as Navigator & {connection?:EventTarget}).connection;this.connection?.addEventListener('change',this.onNetworkChange);
+    for(const id of joined.peers){current();if(this.authorizedPeers.has(id))await this.connect(id,true);}
     current();
     this.nextAuthorization=performance.now()+10000;this.timer=setTimeout(()=>void this.poll(),500);
     }catch(error){if(lifecycle===this.lifecycle)await this.stop();throw error;}
   }
+  private applyAuthorization(value:PeerAuthorization,requestedAt:number):void{
+    if(!value||value.version!==1||value.peer_id!==this.peerId||value.room_id!==this.room||value.job_id!==this.job||value.output_generation!==this.directory?.output_generation||value.session_id!==(this.primary?.session??null)||!Number.isSafeInteger(value.lease_ms)||value.lease_ms<=0||value.lease_ms>PEER_AUTHORIZATION_MS||!Array.isArray(value.peers)||value.peers.length>31)throw Error('P2P 授权绑定不匹配');
+    const peers=new Map<string,number>();
+    for(const p of value.peers){
+      if(!p||!uuidPattern.test(p.peer_id)||p.peer_id===this.peerId||peers.has(p.peer_id)||!Number.isSafeInteger(p.lease_ms)||p.lease_ms<=0||p.lease_ms>value.lease_ms)throw Error('P2P 对端授权无效');
+      peers.set(p.peer_id,requestedAt+p.lease_ms);
+    }
+    // Anchor leases before the request, never at receipt: slow/replayed replies
+    // cannot extend permission. An unavailable control plane expires fail-closed.
+    this.authorizedUntil=requestedAt+value.lease_ms;this.authorizedPeers=peers;
+    if(this.authorizedUntil<=performance.now())throw Error('P2P 授权已过期');
+    this.expireAuthorization();
+  }
+  private expireAuthorization():void{
+    if(this.authorizationTimer)clearTimeout(this.authorizationTimer);
+    if(this.stopped)return;
+    const now=performance.now();
+    if(now>=this.authorizedUntil){void this.stop();return;}
+    for(const id of this.peers.keys())if((this.authorizedPeers.get(id)??0)<=now)this.drop(id);
+    for(const [id,until]of this.authorizedPeers)if(until<=now)this.authorizedPeers.delete(id);
+    const next=Math.min(this.authorizedUntil,...this.authorizedPeers.values());
+    this.authorizationTimer=setTimeout(()=>this.expireAuthorization(),Math.max(1,next-now));
+  }
+  private peerAuthorized(id:string,peer?:Peer):boolean{
+    if(this.stopped)return false;
+    if(performance.now()>=this.authorizedUntil){void this.stop();return false;}
+    if((this.authorizedPeers.get(id)??0)<=performance.now()){this.drop(id);return false;}
+    return !peer||this.peers.get(id)===peer;
+  }
   has(url:string):boolean{return this.files.has(new URL(url,location.origin).pathname);}
   private async sendSignal(recipient:string,kind:string,payload:object):Promise<void>{
-    if(this.stopped||!this.peerId)throw Error('P2P 已关闭');
+    if(!this.peerId||!this.peerAuthorized(recipient))throw Error('P2P 已关闭');
     await this.api(`/room-p2p/${this.peerId}/signal`,'POST',{recipient,kind,payload});
   }
   private async connect(id:string,offer:boolean):Promise<Peer>{
+    if(!this.peerAuthorized(id))throw Error('P2P 对端授权已过期');
     const existing=this.peers.get(id);if(existing)return existing;
     if(!uuidPattern.test(id)||id===this.peerId||this.peers.size>=MAX_PEERS)throw Error('P2P 连接数量超过上限');
     // No STUN/TURN is configured or contacted automatically. Administrators must explicitly provision relay support separately.
@@ -100,12 +139,12 @@ export class RoomP2PTransport {
     return peer;
   }
   private channel(id:string,peer:Peer,ch:RTCDataChannel):void{
-    if(ch.label!=='rainsync-chunks-v1'||peer.channel){ch.close();return;}
+    if(!this.peerAuthorized(id,peer)||ch.label!=='rainsync-chunks-v1'||peer.channel){ch.close();return;}
     peer.channel=ch;ch.binaryType='arraybuffer';ch.bufferedAmountLowThreshold=32*1024;
     ch.onmessage=e=>{void this.receive(id,peer,e.data).catch(()=>this.drop(id));};ch.onclose=()=>this.drop(id);
   }
   private async receive(id:string,peer:Peer,message:unknown):Promise<void>{
-    if(this.stopped)return;
+    if(!this.peerAuthorized(id,peer))return;
     if(message instanceof ArrayBuffer){
       if(message.byteLength<9||message.byteLength>CHUNK_BYTES+8)throw Error('P2P 块长度无效');
       const view=new DataView(message),request=view.getUint32(0),offset=view.getUint32(4),pending=peer.pending.get(request);
@@ -114,30 +153,34 @@ export class RoomP2PTransport {
       pending.data.set(bytes,offset);pending.received+=bytes.length;
       if(pending.received===pending.file.size_bytes){const buffer=pending.data.buffer as ArrayBuffer;
         if(!await verifySharedBytes(pending.file,buffer)){peer.pending.delete(request);this.stats.badHashes++;pending.reject(Error('P2P 哈希校验失败'));this.drop(id);return;}
-        if(this.stopped||peer.pending.get(request)!==pending)return;peer.pending.delete(request);this.stats.peerBytes+=buffer.byteLength;this.remember(pending.file,buffer);pending.resolve(buffer);this.changed();}
+        if(!this.peerAuthorized(id,peer)||peer.pending.get(request)!==pending)return;peer.pending.delete(request);this.stats.peerBytes+=buffer.byteLength;this.remember(pending.file,buffer);pending.resolve(buffer);this.changed();}
       return;
     }
     if(typeof message!=='string'||message.length>1024)throw Error('P2P 控制消息无效');
     const m=JSON.parse(message) as {type:string;id:number;name?:string;job?:string;generation?:string};
     if(!Number.isSafeInteger(m.id)||m.id<1||m.id>0xffffffff)throw Error('P2P 请求 ID 无效');
     if(m.type==='reject'){const pending=peer.pending.get(m.id);peer.pending.delete(m.id);pending?.reject(Error('P2P 分片暂不可用'));}
-    else if(m.type==='cancel'){peer.cancelled.add(m.id);if(peer.cancelled.size>16){this.drop(id);}}
+    else if(m.type==='cancel'){
+      // Completed/rejected requests have no remaining upload to cancel. Their
+      // late messages must not accumulate until a healthy peer is dropped.
+      if(peer.uploads.has(m.id))peer.cancelled.add(m.id);
+    }
     else if(m.type==='request'){
       if(m.job!==this.job||m.generation!==this.directory?.output_generation||peer.uploads.size>=1)throw Error('P2P 请求绑定不匹配');
       const file=[...this.files.values()].find(f=>f.name===m.name),cached=file&&this.cache.get(file.sha256);
       if(!file||!cached||Date.now()-cached.added>60000||file.name==='index.m3u8'){peer.channel?.send(JSON.stringify({type:'reject',id:m.id}));return;}
-      peer.uploads.add(m.id);void this.upload(peer,m.id,cached.data).catch(()=>this.drop(id)).finally(()=>{peer.uploads.delete(m.id);peer.cancelled.delete(m.id)});
+      peer.uploads.add(m.id);void this.upload(id,peer,m.id,cached.data).catch(()=>this.drop(id)).finally(()=>{peer.uploads.delete(m.id);peer.cancelled.delete(m.id)});
     }else throw Error('P2P 控制类型无效');
   }
-  private async upload(peer:Peer,id:number,data:ArrayBuffer):Promise<void>{
+  private async upload(peerId:string,peer:Peer,id:number,data:ArrayBuffer):Promise<void>{
     const ch=peer.channel;if(!ch)return;
     for(let offset=0;offset<data.byteLength;offset+=CHUNK_BYTES){
-      if(this.stopped||document.visibilityState==='hidden'||peer.cancelled.has(id)||ch.readyState!=='open')return;
+      if(!this.peerAuthorized(peerId,peer)||document.visibilityState==='hidden'||peer.cancelled.has(id)||ch.readyState!=='open')return;
       const n=Math.min(CHUNK_BYTES,data.byteLength-offset);
       const delay=Math.max(0,this.uploadAt-performance.now());this.uploadAt=Math.max(this.uploadAt,performance.now())+n/250000*1000;
       if(delay)await new Promise<void>(resolve=>setTimeout(resolve,delay));
-      if(this.stopped||peer.cancelled.has(id)||ch.readyState!=='open')return;
-      while(ch.bufferedAmount>HIGH_WATER){await new Promise<void>((resolve,reject)=>{const done=()=>{clearTimeout(timer);ch.removeEventListener('bufferedamountlow',done);resolve()};const timer=setTimeout(()=>{ch.removeEventListener('bufferedamountlow',done);reject(Error('P2P 发送背压超时'))},1000);ch.addEventListener('bufferedamountlow',done,{once:true});});if(this.stopped||peer.cancelled.has(id))return;}
+      if(!this.peerAuthorized(peerId,peer)||peer.cancelled.has(id)||ch.readyState!=='open')return;
+      while(ch.bufferedAmount>HIGH_WATER){await new Promise<void>((resolve,reject)=>{const done=()=>{clearTimeout(timer);ch.removeEventListener('bufferedamountlow',done);resolve()};const timer=setTimeout(()=>{ch.removeEventListener('bufferedamountlow',done);reject(Error('P2P 发送背压超时'))},1000);ch.addEventListener('bufferedamountlow',done,{once:true});});if(!this.peerAuthorized(peerId,peer)||peer.cancelled.has(id)||ch.readyState!=='open')return;}
       const frame=new ArrayBuffer(n+8),view=new DataView(frame);view.setUint32(0,id);view.setUint32(4,offset);new Uint8Array(frame,8).set(new Uint8Array(data,offset,n));ch.send(frame);this.stats.uploadedBytes+=n;this.changed();
     }
   }
@@ -151,7 +194,7 @@ export class RoomP2PTransport {
     const parsed=new URL(url,location.origin);if(parsed.origin!==location.origin)throw Error('P2P 地址不匹配');
     const file=this.files.get(parsed.pathname);if(!file)throw Error('P2P 分片未在可信目录中');
     const wait=file.name==='index.m3u8'?0:peerWaitMs(file.size_bytes,bufferSeconds);
-    const ready=[...this.peers.values()].find(p=>p.channel?.readyState==='open'&&p.pending.size===0);
+    const ready=[...this.peers.entries()].find(([id,p])=>this.peerAuthorized(id,p)&&p.channel?.readyState==='open'&&p.pending.size===0)?.[1];
     if(!this.stopped&&wait>0&&ready){
       signal.throwIfAborted();
       let timer:ReturnType<typeof setTimeout>|undefined;let aborted:(()=>void)|undefined;const id=this.nextId++;if(this.nextId>0xffffffff)this.nextId=1;
@@ -162,7 +205,7 @@ export class RoomP2PTransport {
         const pending=ready.pending.get(id)!;const originalResolve=pending.resolve,originalReject=pending.reject;
         pending.resolve=data=>{if(aborted)signal.removeEventListener('abort',aborted);originalResolve(data)};pending.reject=e=>{if(aborted)signal.removeEventListener('abort',aborted);originalReject(e)};
         ready.channel!.send(JSON.stringify({type:'request',id,name:file.name,job:this.job,generation:this.directory!.output_generation}));
-      });return bytes;}catch(error){if(signal.aborted)throw error;this.stats.fallbacks++;}finally{if(timer)clearTimeout(timer);if(aborted)signal.removeEventListener('abort',aborted);const unfinished=ready.pending.get(id);if(unfinished)this.stats.duplicateBytes+=unfinished.received;ready.pending.delete(id);if(ready.channel?.readyState==='open')ready.channel.send(JSON.stringify({type:'cancel',id}));}
+      });return bytes;}catch(error){if(signal.aborted)throw error;this.stats.fallbacks++;}finally{if(timer)clearTimeout(timer);if(aborted)signal.removeEventListener('abort',aborted);const unfinished=ready.pending.get(id);if(unfinished)this.stats.duplicateBytes+=unfinished.received;ready.pending.delete(id);if(unfinished&&ready.channel?.readyState==='open')ready.channel.send(JSON.stringify({type:'cancel',id}));}
     }
     signal.throwIfAborted();const response=await fetch(file.url,{signal,credentials:'same-origin',cache:'no-store',redirect:'error'});
     if(!response.ok||!response.body)throw Error('HTTP 分片加载失败');
@@ -172,21 +215,27 @@ export class RoomP2PTransport {
     this.stats.httpBytes+=bytes.byteLength;this.remember(file,bytes);this.changed();return bytes;
   }
   private async poll():Promise<void>{
-    if(this.stopped||!this.peerId||this.polling)return;this.polling=true;
+    const lifecycle=this.lifecycle,peerId=this.peerId;
+    if(this.stopped||!peerId||this.polling===lifecycle)return;this.polling=lifecycle;
+    const current=()=>!this.stopped&&this.lifecycle===lifecycle&&this.peerId===peerId;
     try{
-      const reply=await this.api<{cursor:number;signals:{sender:string;kind:string;payload:RTCSessionDescriptionInit & RTCIceCandidateInit}[]}>(`/room-p2p/${this.peerId}?after=${this.cursor}`);
-      if(this.stopped)return;this.cursor=reply.cursor;
-      for(const s of reply.signals){const p=await this.connect(s.sender,false);
-        if(s.kind==='offer'){await p.pc.setRemoteDescription(s.payload);for(const ice of p.ice)await p.pc.addIceCandidate(ice);p.ice=[];const a=await p.pc.createAnswer();await p.pc.setLocalDescription(a);await this.sendSignal(s.sender,'answer',{type:a.type,sdp:a.sdp});}
-        else if(s.kind==='answer'){await p.pc.setRemoteDescription(s.payload);for(const ice of p.ice)await p.pc.addIceCandidate(ice);p.ice=[];}
+      const requestedAt=performance.now(),peers=[...this.peers.keys()].join(',');
+      const reply=await this.api<{cursor:number;authorization:PeerAuthorization;signals:{sender:string;kind:string;payload:RTCSessionDescriptionInit & RTCIceCandidateInit}[]}>(`/room-p2p/${peerId}?after=${this.cursor}&peers=${peers}`);
+      if(!current())return;
+      this.applyAuthorization(reply.authorization,requestedAt);this.cursor=reply.cursor;
+      for(const s of reply.signals){
+        if(!current())return;if(!this.peerAuthorized(s.sender))continue;
+        const p=await this.connect(s.sender,false);if(!current())return;
+        if(s.kind==='offer'){await p.pc.setRemoteDescription(s.payload);if(!current()||!this.peerAuthorized(s.sender,p))return;for(const ice of p.ice)await p.pc.addIceCandidate(ice);p.ice=[];const a=await p.pc.createAnswer();if(!current()||!this.peerAuthorized(s.sender,p))return;await p.pc.setLocalDescription(a);if(!current()||!this.peerAuthorized(s.sender,p))return;await this.sendSignal(s.sender,'answer',{type:a.type,sdp:a.sdp});}
+        else if(s.kind==='answer'){await p.pc.setRemoteDescription(s.payload);if(!current()||!this.peerAuthorized(s.sender,p))return;for(const ice of p.ice)await p.pc.addIceCandidate(ice);p.ice=[];}
         else if(s.kind==='ice'){if(p.pc.remoteDescription)await p.pc.addIceCandidate(s.payload);else{if(p.ice.length>=64)throw Error('P2P ICE 数量超过上限');p.ice.push(s.payload);}}
       }
-      if(performance.now()>this.nextAuthorization){const fresh=validateSharedDirectory(await this.api<SharedDirectory>(this.directoryPath()),this.room,this.job,this.primary?.session,this.primary?.outputGeneration);if(fresh.output_generation!==this.directory?.output_generation)throw Error('P2P 输出代次变化');this.nextAuthorization=performance.now()+10000;}
-    }catch{await this.stop();}finally{this.polling=false;if(!this.stopped)this.timer=setTimeout(()=>void this.poll(),1000);}
+      if(current()&&performance.now()>this.nextAuthorization){const fresh=validateSharedDirectory(await this.api<SharedDirectory>(this.directoryPath()),this.room,this.job,this.primary?.session,this.primary?.outputGeneration);if(!current())return;if(fresh.output_generation!==this.directory?.output_generation)throw Error('P2P 输出代次变化');this.nextAuthorization=performance.now()+10000;}
+    }catch{if(current())await this.stop();}finally{if(this.polling===lifecycle)this.polling=undefined;if(current())this.timer=setTimeout(()=>void this.poll(),1000);}
   }
-  private drop(id:string):void{const p=this.peers.get(id);if(!p)return;this.peers.delete(id);for(const request of p.pending.values())request.reject(Error('P2P 连接已关闭'));p.pending.clear();p.channel?.close();p.pc.close();}
+  private drop(id:string):void{const p=this.peers.get(id);if(!p)return;this.peers.delete(id);this.authorizedPeers.delete(id);for(const request of p.pending.values())request.reject(Error('P2P 连接已关闭'));p.pending.clear();p.channel?.close();p.pc.close();}
   async stop():Promise<void>{
-    ++this.lifecycle;if(this.timer)clearTimeout(this.timer);this.stopped=true;document.removeEventListener('visibilitychange',this.onVisibility);this.releaseBattery?.();this.releaseBattery=undefined;this.connection?.removeEventListener('change',this.onNetworkChange);this.connection=undefined;
+    ++this.lifecycle;if(this.timer)clearTimeout(this.timer);if(this.authorizationTimer)clearTimeout(this.authorizationTimer);this.authorizedUntil=0;this.authorizedPeers.clear();this.stopped=true;document.removeEventListener('visibilitychange',this.onVisibility);this.releaseBattery?.();this.releaseBattery=undefined;this.connection?.removeEventListener('change',this.onNetworkChange);this.connection=undefined;
     for(const id of [...this.peers.keys()])this.drop(id);this.cache.clear();this.cachedBytes=0;
     const peer=this.peerId;this.peerId=undefined;if(peer)await this.api(`/room-p2p/${peer}`,'DELETE').catch(()=>{});this.changed();
   }

@@ -94,10 +94,35 @@ async fn join_scope(
         return Err(err(StatusCode::CONFLICT, "p2p_scope_changed"));
     }
     let peers:Vec<Uuid>=sqlx::query_scalar("SELECT id FROM room_p2p_peers WHERE room_id=$1 AND job_id=$2 AND output_generation=$3 AND id<>$4 AND room_p2p_peer_authorized(id) AND (playback_session_id IS NULL)=($5::uuid IS NULL) ORDER BY id LIMIT 3").bind(room).bind(job).bind(generation).bind(id).bind(session).fetch_all(&mut *tx).await?;
+    let authorization = peer_authorization(&mut tx, id, &peers).await?;
     tx.commit().await?;
     Ok(Json(
-        json!({"peer_id":id,"peers":peers,"output_generation":generation,"ttl_ms":30000,"max_peers":3,"upload_bytes_per_second":250000,"chunk_bytes":16384}),
+        json!({"peer_id":id,"peers":peers,"authorization":authorization,"output_generation":generation,"ttl_ms":30000,"max_peers":3,"upload_bytes_per_second":250000,"chunk_bytes":16384}),
     ))
+}
+// An uploader may serve only peers in this short-lived, server-checked snapshot.
+// Do not expose principals, login hashes, or another viewer's playback session.
+// The request-start clock on the browser also bounds DB/network response delays.
+const PEER_AUTHORIZATION_MS: i64 = 3000;
+async fn peer_authorization(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    peer: Uuid,
+    candidates: &[Uuid],
+) -> Result<Value> {
+    let scope = sqlx::query("SELECT p.room_id,p.job_id,p.output_generation,p.playback_session_id,LEAST($2,FLOOR(EXTRACT(EPOCH FROM (LEAST(p.expires_at,login.expires_at,j.expires_at,playback.expires_at)-clock_timestamp()))*1000)::bigint) AS lease_ms FROM room_p2p_peers p JOIN sessions login ON login.token_hash=p.login_hash AND login.user_id=p.user_id JOIN distributed_compute_jobs j ON j.id=p.job_id LEFT JOIN playback_sessions playback ON playback.id=p.playback_session_id WHERE p.id=$1 AND room_p2p_peer_authorized(p.id)")
+        .bind(peer).bind(PEER_AUTHORIZATION_MS).fetch_optional(&mut **tx).await?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "p2p_peer_expired"))?;
+    let lease_ms: i64 = scope.get("lease_ms");
+    if lease_ms <= 0 {
+        return Err(err(StatusCode::NOT_FOUND, "p2p_peer_expired"));
+    }
+    // Only revalidate the caller's current connections and senders whose signals
+    // it is receiving. This is not a new room-wide discovery/list-members API.
+    let peers = sqlx::query("SELECT p.id,LEAST($3,FLOOR(EXTRACT(EPOCH FROM (LEAST(p.expires_at,login.expires_at,j.expires_at,playback.expires_at)-clock_timestamp()))*1000)::bigint) AS lease_ms FROM room_p2p_peers a JOIN room_p2p_peers p ON p.room_id=a.room_id AND p.job_id=a.job_id AND p.output_generation=a.output_generation AND (p.playback_session_id IS NULL)=(a.playback_session_id IS NULL) JOIN sessions login ON login.token_hash=p.login_hash AND login.user_id=p.user_id JOIN distributed_compute_jobs j ON j.id=p.job_id LEFT JOIN playback_sessions playback ON playback.id=p.playback_session_id WHERE a.id=$1 AND p.id=ANY($2) AND p.id<>a.id AND room_p2p_peer_authorized(a.id) AND room_p2p_peer_authorized(p.id) ORDER BY p.id LIMIT 31")
+        .bind(peer).bind(candidates).bind(lease_ms).fetch_all(&mut **tx).await?;
+    Ok(
+        json!({"version":1,"peer_id":peer,"room_id":scope.get::<Uuid,_>("room_id"),"job_id":scope.get::<Uuid,_>("job_id"),"output_generation":scope.get::<Uuid,_>("output_generation"),"session_id":scope.get::<Option<Uuid>,_>("playback_session_id"),"lease_ms":lease_ms,"peers":peers.iter().filter(|p|p.get::<i64,_>("lease_ms")>0).map(|p|json!({"peer_id":p.get::<Uuid,_>("id"),"lease_ms":p.get::<i64,_>("lease_ms")})).collect::<Vec<_>>()}),
+    )
 }
 async fn owner(app: &App, h: &HeaderMap, peer: Uuid, write: bool) -> Result<User> {
     enabled()?;
@@ -153,6 +178,26 @@ pub async fn signal(
 pub struct Cursor {
     #[serde(default)]
     after: i64,
+    peers: Option<String>,
+}
+impl Cursor {
+    fn connected_peers(&self) -> Result<Vec<Uuid>> {
+        let Some(peers) = self.peers.as_deref().filter(|s| !s.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        if peers.len() > 3 * 36 + 2 {
+            return Err(err(StatusCode::BAD_REQUEST, "invalid_p2p_signal"));
+        }
+        let ids = peers
+            .split(',')
+            .map(Uuid::parse_str)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_p2p_signal"))?;
+        if ids.len() > 3 {
+            return Err(err(StatusCode::BAD_REQUEST, "invalid_p2p_signal"));
+        }
+        Ok(ids)
+    }
 }
 pub async fn poll(
     State(app): State<App>,
@@ -161,6 +206,7 @@ pub async fn poll(
     Query(cursor): Query<Cursor>,
 ) -> Result<Json<Value>> {
     owner(&app, &h, peer, false).await?;
+    let mut candidates = cursor.connected_peers()?;
     let mut tx = app.db.begin().await?;
     // Every renewal rechecks the old expiry first. Expired tickets cannot resurrect.
     let n=sqlx::query("UPDATE room_p2p_peers SET expires_at=clock_timestamp()+interval '30 seconds' WHERE id=$1 AND room_p2p_peer_authorized(id)").bind(peer).execute(&mut *tx).await?.rows_affected();
@@ -177,9 +223,11 @@ pub async fn poll(
         .bind(next)
         .execute(&mut *tx)
         .await?;
+    candidates.extend(rows.iter().map(|r| r.get::<Uuid, _>("sender")));
+    let authorization = peer_authorization(&mut tx, peer, &candidates).await?;
     tx.commit().await?;
     Ok(Json(
-        json!({"cursor":next,"ttl_ms":30000,"signals":rows.iter().map(|r|json!({"sender":r.get::<Uuid,_>("sender"),"kind":r.get::<String,_>("kind"),"payload":r.get::<Value,_>("payload")})).collect::<Vec<_>>()}),
+        json!({"cursor":next,"ttl_ms":30000,"authorization":authorization,"signals":rows.iter().map(|r|json!({"sender":r.get::<Uuid,_>("sender"),"kind":r.get::<String,_>("kind"),"payload":r.get::<Value,_>("payload")})).collect::<Vec<_>>()}),
     ))
 }
 pub async fn leave(
@@ -196,4 +244,46 @@ pub async fn leave(
         .execute(&app.db)
         .await?;
     Ok(Json(json!({"ok":true})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connected_peer_revalidation_is_bounded_and_uuid_only() {
+        for peers in [None, Some(String::new())] {
+            assert!(
+                Cursor { after: 0, peers }
+                    .connected_peers()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let cursor = Cursor {
+            after: 7,
+            peers: Some(
+                ids.iter()
+                    .map(Uuid::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        };
+        assert_eq!(cursor.connected_peers().unwrap(), ids);
+        for peers in [
+            "not-a-peer".to_owned(),
+            format!("{},", ids[0]),
+            format!("{},{},{},{}", ids[0], ids[1], ids[2], Uuid::new_v4()),
+        ] {
+            assert!(
+                Cursor {
+                    after: 0,
+                    peers: Some(peers)
+                }
+                .connected_peers()
+                .is_err()
+            );
+        }
+    }
 }

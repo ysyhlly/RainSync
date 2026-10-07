@@ -38,6 +38,8 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo run -p protocol --example export -- --check
       - run: npm ci && npm test && npm run build
+      - name: Verify deployment configuration contracts
+        run: node --test tests/deployment-settings.test.mjs
       - run: node tests/postgres-readiness.mjs
       - run: cargo build --workspace --bins --examples --locked && node tests/integration.mjs
       - run: npm run test:priority-remediation
@@ -61,11 +63,28 @@ jobs:
           test -x "$CARGO_TARGET_DIR/debug/rainsync-nas-agent"
           test -x "$CARGO_TARGET_DIR/debug/rainsync-compute-node"
           timeout --signal=TERM --kill-after=15s 180s node tests/distributed-compute-admission.mjs
+          timeout --signal=TERM --kill-after=15s 180s node tests/distributed-compute-retention.mjs
           timeout --signal=TERM --kill-after=15s 600s node tests/distributed-compute-hd.mjs
           # Settings and hierarchy use owned databases and synthetic records only.
           for test in admin-settings scoped-guests-migration scoped-guests source-settings plugin-configuration-migration plugin-configuration-runtime nas-configuration-settings media-hierarchy-migration media-hierarchy-native private-library-lifecycle-migration private-library-settings-native private-library-expiry-native; do
             timeout --signal=TERM --kill-after=15s 180s node "tests/$test.mjs"
           done
+      - name: Verify two-node control routing
+        timeout-minutes: 10
+        run: timeout --signal=TERM --kill-after=15s 540s node tests/control-cluster-runtime.mjs
+      - name: Verify cross-client queue propagation
+        timeout-minutes: 4
+        run: timeout --signal=TERM --kill-after=15s 180s node tests/queue-propagation.mjs
+      - name: Verify library lifecycle and resource limits
+        timeout-minutes: 10
+        run: |
+          timeout --signal=TERM --kill-after=15s 240s node tests/remaining-library-lifecycle.mjs
+          timeout --signal=TERM --kill-after=15s 240s node tests/source-resource-limits.mjs
+      - name: Verify recovery integrity and current upgrade baseline
+        timeout-minutes: 4
+        run: |
+          export RAINSYNC_NATIVE_POSTGRES_BIN="$(pg_config --bindir)"
+          timeout --signal=TERM --kill-after=15s 180s node --test tests/recovery-integrity.test.mjs tests/current-baseline-upgrade.test.mjs
       - run: npm run test:accounts
       - name: Verify avatars with the deployment image's FFmpeg
         run: |

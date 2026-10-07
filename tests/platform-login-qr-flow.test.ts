@@ -441,3 +441,104 @@ it("close fences a delayed payload-free poll and does not generate a new QR", as
   expect(start).toHaveBeenCalledTimes(1);
   expect(poll).toHaveBeenCalledTimes(1);
 });
+
+it.each(["transient", "cooldown-ended"])(
+  "expires the retained QR at its original deadline after %s without retrying",
+  async (failureKind) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const start = vi.fn(async () => response({ expires_at: 15000 }));
+    const poll = vi.fn(async () => {
+      if (failureKind === "cooldown-ended") throw rateLimited(5000);
+      throw new TypeError("temporary network failure");
+    });
+    const { login, change } = flow(start, poll);
+    await login.start();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(change.mock.calls.at(-1)?.[0]).toMatchObject({
+      phase: "uncertain",
+      payload,
+    });
+    await vi.advanceTimersByTimeAsync(11999);
+    expect(change.mock.calls.at(-1)?.[0].payload).toBe(payload);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(change.mock.calls.at(-1)?.[0]).toEqual({
+      phase: "expired",
+      message: "二维码已过期，请重新确认登录",
+    });
+    await login.start();
+    await vi.advanceTimersByTimeAsync(300000);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(poll).toHaveBeenCalledTimes(1);
+    await login.close();
+  },
+);
+
+it("expires a QR while its poll is pending and fences a late confirmation", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  let resolve!: (value: PlatformLogin) => void;
+  const poll = vi.fn(
+    (_id: string, _signal: AbortSignal) =>
+      new Promise<PlatformLogin>((done) => {
+        resolve = done;
+      }),
+  );
+  const { login, change, confirmed } = flow(
+    async () => response({ expires_at: 5000 }),
+    poll,
+  );
+  await login.start();
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(change.mock.calls.at(-1)?.[0].phase).toBe("expired");
+  expect(poll.mock.calls[0][1].aborted).toBe(true);
+  resolve(response({ status: "confirmed", qr_payload: null }));
+  await vi.advanceTimersByTimeAsync(1);
+  expect(change.mock.calls.at(-1)?.[0].phase).toBe("expired");
+  expect(confirmed).not.toHaveBeenCalled();
+  await login.close();
+});
+
+it("clears the independent QR deadline on close and terminal completion", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  for (const closeEarly of [true, false]) {
+    const { login, change } = flow(
+      async () => response({ expires_at: 15000 }),
+      async () => response({ status: "confirmed", qr_payload: null }),
+    );
+    await login.start();
+    if (closeEarly) await login.close();
+    else await vi.advanceTimersByTimeAsync(3000);
+    const updates = change.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(300000);
+    expect(change).toHaveBeenCalledTimes(updates);
+    await login.close();
+  }
+});
+
+it("checks the deadline before applying a late poll when browser timers were suspended", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  let resolve!: (value: PlatformLogin) => void;
+  const poll = vi.fn(
+    () =>
+      new Promise<PlatformLogin>((done) => {
+        resolve = done;
+      }),
+  );
+  const { login, change, confirmed } = flow(
+    async () => response({ expires_at: 5000 }),
+    poll,
+  );
+  await login.start();
+  await vi.advanceTimersByTimeAsync(3000);
+  // Move the supplied clock without executing the pending deadline callback.
+  vi.setSystemTime(10000);
+  resolve(response({ status: "confirmed", qr_payload: null }));
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(change.mock.calls.at(-1)?.[0].phase).toBe("expired");
+  expect(confirmed).not.toHaveBeenCalled();
+  await login.close();
+});

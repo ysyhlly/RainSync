@@ -201,7 +201,7 @@ pub async fn browse(
         }
     }
     tx.commit().await?;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"entries":entries,"breadcrumbs":breadcrumbs,"node":query.node,"next_cursor":next_cursor(&query,next),"total_media":total}),
     ))
 }

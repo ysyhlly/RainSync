@@ -66,7 +66,7 @@ pub async fn status(State(app): State<App>, headers: HeaderMap) -> Result<Respon
     super::maintenance::phase(guard_login_live(&mut tx, user.id, &login)).await?;
     let value = public_status(status_value(account.as_ref()), row.as_ref());
     super::maintenance::commit(tx).await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -103,7 +103,7 @@ pub async fn set_preference(
     super::maintenance::phase(guard_login_live(&mut tx, user.id, &login)).await?;
     let value = public_status(status_value(Some(&row)), None);
     super::maintenance::commit(tx).await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 /// One bounded pass. Caller supplies shutdown-aware cadence; nothing runs at
 /// import/startup and no account can be renewed without a fresh QR opt-in.

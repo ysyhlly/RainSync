@@ -44,7 +44,7 @@ pub fn url(user: Uuid, version: Option<Uuid>, present: bool) -> Option<String> {
 }
 async fn metadata(app: &App, user: Uuid) -> Result<Response> {
     let value = profile::value(app, user).await?;
-    Ok(registration::private_json(
+    Ok(responses::private_json(
         StatusCode::OK,
         json!({"avatar_url":value["avatar_url"],"avatar_version":value["avatar_version"]}),
     ))

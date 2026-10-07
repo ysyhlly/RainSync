@@ -74,8 +74,18 @@ try{await isolatedMediaStack('distributed-compute',async f=>{
   await admin.request(`/rooms/${room.id}/compute/${prepared.id}/p2p`,'POST',{...consent,acknowledge_peer_addresses:false},400);
   const planB=await viewer.request('/playback-sessions/distributed-compute','POST',primaryBody());
   assert.notEqual(planB.session_id,planA.session_id);assert.equal(planB.distributed_compute.output_generation,planA.distributed_compute.output_generation);
+  const assertPeerAuthorization=(reply,peer,session_id,expectedPeers)=>{
+   const a=reply.authorization;
+   assert.deepEqual(Object.keys(a).sort(),['version','peer_id','room_id','job_id','output_generation','session_id','lease_ms','peers'].sort());
+   assert.equal(a.version,1);assert.equal(a.peer_id,peer);assert.equal(a.room_id,room.id);assert.equal(a.job_id,prepared.id);assert.equal(a.output_generation,ready.output_generation);assert.equal(a.session_id,session_id);
+   assert.ok(Number.isInteger(a.lease_ms)&&a.lease_ms>0&&a.lease_ms<=3000);
+   assert.deepEqual(a.peers.map(p=>p.peer_id).sort(),expectedPeers.slice().sort());
+   for(const p of a.peers){assert.deepEqual(Object.keys(p).sort(),['peer_id','lease_ms'].sort());assert.ok(Number.isInteger(p.lease_ms)&&p.lease_ms>0&&p.lease_ms<=a.lease_ms);}
+  };
   const primaryPeerA=await admin.request(`/playback-sessions/${planA.session_id}/distributed/p2p`,'POST',consent);
   const primaryPeerB=await viewer.request(`/playback-sessions/${planB.session_id}/distributed/p2p`,'POST',consent);assert.equal(primaryPeerB.peers[0],primaryPeerA.peer_id);
+  assertPeerAuthorization(primaryPeerA,primaryPeerA.peer_id,planA.session_id,[]);
+  assertPeerAuthorization(primaryPeerB,primaryPeerB.peer_id,planB.session_id,[primaryPeerA.peer_id]);
   await viewer.request(`/room-p2p/${primaryPeerB.peer_id}/signal`,'POST',{recipient:primaryPeerA.peer_id,kind:'offer',payload:{type:'offer',sdp:'owned-primary-test'}});
   assert.equal((await admin.request(`/room-p2p/${primaryPeerA.peer_id}?after=0`)).signals[0].sender,primaryPeerB.peer_id);
   await viewer.request('/playback-sessions/distributed-compute','POST',{...primaryBody(),audio_index:1},409);
@@ -86,24 +96,59 @@ try{await isolatedMediaStack('distributed-compute',async f=>{
   const successorBody=primaryBody(originalPrimary.viewer_id,2);const successor=await admin.request('/playback-sessions/distributed-compute','POST',successorBody);assert.notEqual(successor.session_id,planA.session_id);
   await admin.request(`/playback-sessions/${planA.session_id}/distributed/directory`,'GET',undefined,410);
   await admin.request(`/room-p2p/${primaryPeerA.peer_id}`,'GET',undefined,404);
+  assertPeerAuthorization(await viewer.request(`/room-p2p/${primaryPeerB.peer_id}?peers=${primaryPeerA.peer_id}`),primaryPeerB.peer_id,planB.session_id,[]);
   await admin.request('/playback-sessions/distributed-compute','POST',originalPrimary,409);
   report.checks.push('distinct viewers share the same exact qualified output through independently authorized session peers; wrong generation/endpoint/login rejected; newer viewer plan fences previous HTTP, peer, replay');
   const peerA=await admin.request(`/rooms/${room.id}/compute/${prepared.id}/p2p`,'POST',consent),peerB=await viewer.request(`/rooms/${room.id}/compute/${prepared.id}/p2p`,'POST',consent);assert.equal(peerB.peers[0],peerA.peer_id);
   await viewer.request(`/room-p2p/${peerB.peer_id}/signal`,'POST',{recipient:peerA.peer_id,kind:'offer',payload:{type:'offer',sdp:'owned-test'}});
   const inbox=await admin.request(`/room-p2p/${peerA.peer_id}?after=0`);assert.equal(inbox.signals[0].sender,peerB.peer_id);
+  assertPeerAuthorization(peerB,peerB.peer_id,null,[peerA.peer_id]);
+  assertPeerAuthorization(inbox,peerA.peer_id,null,[peerB.peer_id]);
+  const revalidated=await admin.request(`/room-p2p/${peerA.peer_id}?after=${inbox.cursor}&peers=${peerB.peer_id}`);
+  assert.equal(revalidated.signals.length,0);assertPeerAuthorization(revalidated,peerA.peer_id,null,[peerB.peer_id]);
+  await admin.request(`/room-p2p/${peerA.peer_id}?peers=invalid`,'GET',undefined,400);
+  await admin.request(`/room-p2p/${peerA.peer_id}?peers=${[peerB.peer_id,randomUUID(),randomUUID(),randomUUID()].join(',')}`,'GET',undefined,400);
+  assertPeerAuthorization(await admin.request(`/room-p2p/${peerA.peer_id}?peers=${randomUUID()}`),peerA.peer_id,null,[]);
   await viewer.request(`/room-p2p/${peerB.peer_id}/signal`,'POST',{recipient:randomUUID(),kind:'offer',payload:{}},404);
   const anonymous=f.client();await anonymous.request(`/room-p2p/${peerA.peer_id}`,'GET',undefined,401);
-  report.checks.push('explicit upload/address/network consent; authenticated same-room same-generation signal delivery; target/auth rejection');
+  f.sql(`UPDATE room_p2p_peers SET expires_at=clock_timestamp()+interval '2 seconds' WHERE id='${peerB.peer_id}'`);
+  const shortLease=await admin.request(`/room-p2p/${peerA.peer_id}?peers=${peerB.peer_id}`);
+  assertPeerAuthorization(shortLease,peerA.peer_id,null,[peerB.peer_id]);assert.ok(shortLease.authorization.peers[0].lease_ms<=2000);
+  f.sql(`UPDATE room_p2p_peers SET expires_at=clock_timestamp()-interval '1 second' WHERE id='${peerB.peer_id}'`);
+  assertPeerAuthorization(await admin.request(`/room-p2p/${peerA.peer_id}?peers=${peerB.peer_id}`),peerA.peer_id,null,[]);
+  report.checks.push('explicit consent and same-scope signaling; bounded opaque peer snapshots revalidate established peers without pending signals; expired tickets and replaced primary plans disappear from the still-authorized sender snapshot; remote leases shorten to ticket expiry');
   // Browser transport check uses the actual implementation with real local WebRTC, no STUN/TURN.
   const {chromium}=await import('@playwright/test');const esbuild=await import('esbuild');
   const bundle=await esbuild.build({entryPoints:[resolve('apps/web/src/features/playback/room-p2p.ts')],bundle:true,write:false,format:'iife',globalName:'RainSyncP2P',platform:'browser'});
   let browser;try{browser=await chromium.launch({executablePath:process.env.CHROMIUM_BIN??'/usr/bin/chromium',headless:true,chromiumSandbox:true});}catch(error){report.browser={result:'blocked',error:String(error)};console.log('Browser transport acceptance blocked:',String(error).split('\n')[0]);}
+  const pages=[];
   if(browser)try{
-   const contexts=[await browser.newContext(),await browser.newContext()];const clients=[admin,viewer];const pages=[];
+   const contexts=[await browser.newContext(),await browser.newContext()];const clients=[admin,viewer];
    for(let i=0;i<2;i++){
     const cookie=clients[i].cookie;await contexts[i].addCookies([{name:cookie.slice(0,cookie.indexOf('=')),value:cookie.slice(cookie.indexOf('=')+1),url:f.origin}]);
     const page=await contexts[i].newPage();pages.push(page);await page.goto(f.origin+'/health');await page.addScriptTag({content:bundle.outputFiles[0].text});
-    await page.evaluate(async({room,job,csrf})=>{const api=async(path,method='GET',body)=>{const r=await fetch('/api/v1'+path,{method,headers:{'Content-Type':'application/json','x-csrf-token':csrf},body:body===undefined?undefined:JSON.stringify(body)});if(!r.ok)throw Error(`API ${r.status}`);return r.json()};window.transport=new RainSyncP2P.RoomP2PTransport(api,room,job);await window.transport.start({acknowledge_peer_addresses:true,confirm_current_network:true,upload_allowed:true});},{room:room.id,job:prepared.id,csrf:clients[i].csrf});
+    await page.evaluate(async({room,job,csrf})=>{
+     // Failure-only diagnostics are bounded and contain states/counts/lifetimes,
+     // never SDP, candidate addresses, principal IDs or authentication values.
+     const trace=[];window.p2pTrace=trace;
+     const record=entry=>{trace.push({at_ms:Math.round(performance.now()),...entry});if(trace.length>128)trace.shift()};
+     const state=()=>{const t=window.transport,now=performance.now();return {active:t.active,visibility:document.visibilityState,lease_ms:Math.round(t.authorizedUntil-now),authorized_peers:t.authorizedPeers.size,peers:[...t.peers.entries()].map(([id,p])=>({connection:p.pc.connectionState,ice:p.pc.iceConnectionState,gathering:p.pc.iceGatheringState,signaling:p.pc.signalingState,channel:p.channel?.readyState??'absent',lease_ms:Math.round((t.authorizedPeers.get(id)??0)-now),pending:p.pending.size,uploading:p.uploads.size}))}};
+     window.p2pState=state;
+     const api=async(path,method='GET',body)=>{
+      const operation=path.endsWith('/directory')?'directory':path.endsWith('/signal')?'signal':method==='DELETE'?'leave':method==='POST'?'join':'poll';
+      const started=performance.now();
+      try{const r=await fetch('/api/v1'+path,{method,headers:{'Content-Type':'application/json','x-csrf-token':csrf},body:body===undefined?undefined:JSON.stringify(body)});
+       record({event:'api',operation,status:r.status,duration_ms:Math.round(performance.now()-started)});
+       if(!r.ok)throw Error(`API ${r.status}`);return r.json();
+      }catch(error){record({event:'api_error',operation,error_name:error.name});throw error;}
+     };
+     window.transport=new RainSyncP2P.RoomP2PTransport(api,room,job);
+     const t=window.transport;
+     for(const method of ['stop','drop']){const original=t[method];t[method]=function(...args){record({event:method,state:state()});return original.apply(this,args)}}
+     const authorize=t.applyAuthorization;t.applyAuthorization=function(value,requestedAt){record({event:'authorization',version:value?.version,lease_ms:value?.lease_ms,elapsed_ms:Math.round(performance.now()-requestedAt),peer_count:value?.peers?.length,scope_matches:!!value&&value.peer_id===this.peerId&&value.room_id===this.room&&value.job_id===this.job&&value.output_generation===this.directory?.output_generation&&value.session_id===(this.primary?.session??null)});try{return authorize.call(this,value,requestedAt)}catch(error){record({event:'authorization_error',error_name:error.name});throw error}};
+     document.addEventListener('visibilitychange',()=>record({event:'visibility',state:state()}));
+     await t.start({acknowledge_peer_addresses:true,confirm_current_network:true,upload_allowed:true});record({event:'started',state:state()});
+    },{room:room.id,job:prepared.id,csrf:clients[i].csrf});
    }
    await until(()=>pages[0].evaluate(()=>[...window.transport.peers.values()].some(p=>p.channel?.readyState==='open')),'real browser DataChannel',20000);
    const segment=directory.files.find(file=>file.name.endsWith('.ts'));assert.ok(segment);
@@ -116,10 +161,16 @@ try{await isolatedMediaStack('distributed-compute',async f=>{
    const fallback=await pages[1].evaluate(()=>window.transport.stats);assert.ok(fallback.httpBytes>=segment.size_bytes);
    await Promise.all(pages.map(p=>p.evaluate(()=>window.transport.stop())));
    report.checks.push('peer cancellation/disconnect leaves complete independent authenticated HTTP fallback');
+  }catch(error){
+   report.browser={result:'failed',pages:await Promise.all(pages.map(async page=>{try{return await page.evaluate(()=>({state:window.p2pState?.(),trace:window.p2pTrace??[]}))}catch{return {state:'unavailable'}}}))};
+   throw error;
   }finally{await browser.close()}
+  const observerPeer=await admin.request(`/rooms/${room.id}/compute/${prepared.id}/p2p`,'POST',consent);
   const revokedPeer=await viewer.request(`/rooms/${room.id}/compute/${prepared.id}/p2p`,'POST',consent);
   f.sql(`DELETE FROM room_members WHERE room_id='${room.id}' AND user_id=(SELECT id FROM users WHERE username='compute-viewer')`);
   await viewer.request(`/room-p2p/${revokedPeer.peer_id}`,'GET',undefined,404);
+  assertPeerAuthorization(await admin.request(`/room-p2p/${observerPeer.peer_id}?peers=${revokedPeer.peer_id}`),observerPeer.peer_id,null,[]);
+  report.checks.push('membership removal disappears from an independently authorized sender snapshot, without a receiver poll or disconnect');
   const priorEpoch=f.sql("SELECT permission_epoch FROM private_libraries WHERE visibility='instance_shared'");
   f.sql("UPDATE private_libraries SET permission_epoch=permission_epoch+1 WHERE visibility='instance_shared'");
   assert.equal(f.sql(`SELECT distributed_compute_authorized('${prepared.id}')`),'f');

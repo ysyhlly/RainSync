@@ -1,6 +1,9 @@
 //! Policy-gated, fenced NAS-local jobs. The ordinary Agent token never grants compute by itself.
 use super::*;
-use axum::{body::Bytes, extract::DefaultBodyLimit};
+use axum::{
+    body::Bytes,
+    extract::{DefaultBodyLimit, Query},
+};
 use futures_util::TryStreamExt;
 use media_core::distributed_compute::{
     COMPUTE_RECIPES, MAX_SEGMENT_BYTES, MAX_SOURCE_DURATION_SECONDS, compute_recipe,
@@ -220,9 +223,18 @@ pub async fn heartbeat(
     tx.commit().await?;
     Ok(Json(json!({"slots":slots,"heartbeat_seconds":4})))
 }
-pub async fn catalog(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogQuery {
+    after: Option<Uuid>,
+}
+pub async fn catalog(
+    State(app): State<App>,
+    h: HeaderMap,
+    Query(query): Query<CatalogQuery>,
+) -> Result<Json<Value>> {
     let id = agent(&app, &h).await?;
-    let rows=sqlx::query("SELECT m.id,m.resource,m.source_version FROM media_items m JOIN distributed_compute_policy p ON p.agent_id=m.source_id AND p.enabled LEFT JOIN distributed_compute_sources c ON c.media_id=m.id AND c.source_version=m.source_version WHERE m.source_id=$1 AND m.available AND m.source_version IS NOT NULL AND c.media_id IS NULL ORDER BY m.id LIMIT 32").bind(id).fetch_all(&app.db).await?;
+    let rows=sqlx::query("SELECT m.id,m.resource,m.source_version FROM media_items m JOIN distributed_compute_policy p ON p.agent_id=m.source_id AND p.enabled LEFT JOIN distributed_compute_sources c ON c.media_id=m.id AND c.source_version=m.source_version WHERE m.source_id=$1 AND m.available AND m.source_version IS NOT NULL AND c.media_id IS NULL AND ($2::uuid IS NULL OR m.id>$2) ORDER BY m.id LIMIT 32").bind(id).bind(query.after).fetch_all(&app.db).await?;
     Ok(Json(
         json!({"items":rows.iter().map(|r|json!({"media_id":r.get::<Uuid,_>("id"),"resource":r.get::<String,_>("resource"),"source_version":r.get::<String,_>("source_version")})).collect::<Vec<_>>()}),
     ))
@@ -522,12 +534,27 @@ async fn lock_job(
     agent: Uuid,
     f: &Fence,
 ) -> Result<i64> {
-    let room: Option<Uuid> =
-        sqlx::query_scalar("SELECT room_id FROM distributed_compute_jobs WHERE id=$1")
+    let origin: Option<(Uuid, Uuid)> =
+        sqlx::query_as("SELECT j.room_id,a.id FROM distributed_compute_jobs j JOIN media_items m ON m.id=j.media_id JOIN agents a ON a.id=m.source_id WHERE j.id=$1")
             .bind(id)
             .fetch_optional(&mut **tx)
             .await?;
-    let room = room.ok_or_else(|| err(StatusCode::CONFLICT, "compute_lease_lost"))?;
+    let (room, source_agent) =
+        origin.ok_or_else(|| err(StatusCode::CONFLICT, "compute_lease_lost"))?;
+    // Settings/revocation lock the device before its policy. Pin both devices
+    // in UUID order before the policy, including when a replica owns the work.
+    // Keeping the later authority recheck does not justify inverting that order.
+    let mut agents = vec![agent, source_agent];
+    agents.sort_unstable();
+    agents.dedup();
+    let locked =
+        sqlx::query("SELECT id FROM agents WHERE id=ANY($1) AND NOT revoked ORDER BY id FOR SHARE")
+            .bind(&agents)
+            .fetch_all(&mut **tx)
+            .await?;
+    if locked.len() != agents.len() {
+        return Err(err(StatusCode::CONFLICT, "compute_lease_lost"));
+    }
     sqlx::query("SELECT agent_id FROM distributed_compute_policy WHERE agent_id=$1 FOR UPDATE")
         .bind(agent)
         .fetch_optional(&mut **tx)
@@ -1082,6 +1109,11 @@ mod tests {
 pub async fn cleanup(app: &App) -> anyhow::Result<()> {
     let Ok(root) = enabled() else { return Ok(()) };
     sqlx::query("UPDATE distributed_compute_jobs SET status='cancelled',error='compute_authority_lost' WHERE status IN('queued','running','ready') AND NOT distributed_compute_authorized(id)").execute(&app.db).await?;
+    // Short-lived signaling must not depend on filesystem/history cleanup.
+    sqlx::query("DELETE FROM room_p2p_signals WHERE expires_at<=clock_timestamp()")
+        .execute(&app.db)
+        .await?;
+    sqlx::query("DELETE FROM room_p2p_peers WHERE expires_at<=clock_timestamp() OR NOT room_p2p_peer_authorized(id)").execute(&app.db).await?;
     let mut directories = match tokio::fs::read_dir(&root).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1117,16 +1149,14 @@ pub async fn cleanup(app: &App) -> anyhow::Result<()> {
             let _ = tokio::fs::remove_dir(job.path()).await;
         }
     }
-    sqlx::query("DELETE FROM distributed_compute_attempts a USING distributed_compute_jobs j WHERE a.job_id=j.id AND j.expires_at<clock_timestamp()-interval '48 hours' AND a.process_reaped_at IS NOT NULL AND a.files_removed_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM room_cleanup_tasks c WHERE c.room_id=a.room_id AND c.completed_at IS NULL)").execute(&app.db).await?;
+    sqlx::query("DELETE FROM distributed_compute_attempts a USING distributed_compute_jobs j WHERE a.job_id=j.id AND j.expires_at<clock_timestamp()-interval '48 hours' AND a.process_reaped_at IS NOT NULL AND a.files_removed_at IS NOT NULL AND (a.server_verification_started_at IS NULL OR a.server_verification_reaped_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM room_cleanup_tasks c WHERE c.room_id=a.room_id AND c.completed_at IS NULL)").execute(&app.db).await?;
+    // Playback bindings are immutable retained session history. Keep their job
+    // rather than cascading away evidence or repeatedly failing the whole batch.
     sqlx::query(
-        "DELETE FROM distributed_compute_jobs j WHERE expires_at<clock_timestamp()-interval '1 hour' AND NOT EXISTS(SELECT 1 FROM distributed_compute_attempts a WHERE a.job_id=j.id)",
+        "DELETE FROM distributed_compute_jobs j WHERE expires_at<clock_timestamp()-interval '1 hour' AND NOT EXISTS(SELECT 1 FROM distributed_compute_attempts a WHERE a.job_id=j.id) AND NOT EXISTS(SELECT 1 FROM distributed_playback_bindings b WHERE b.job_id=j.id)",
     )
     .execute(&app.db)
     .await?;
-    sqlx::query("DELETE FROM room_p2p_signals WHERE expires_at<=clock_timestamp()")
-        .execute(&app.db)
-        .await?;
-    sqlx::query("DELETE FROM room_p2p_peers WHERE expires_at<=clock_timestamp() OR NOT room_p2p_peer_authorized(id)").execute(&app.db).await?;
     Ok(())
 }
 

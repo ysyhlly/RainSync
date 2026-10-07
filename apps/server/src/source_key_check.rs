@@ -4,40 +4,21 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::TryStreamExt;
 
 pub async fn verify(db: &sqlx::PgPool, key: &Aes256Gcm) -> anyhow::Result<()> {
-    for (table, column, predicate) in [
-        ("sources", "config_encrypted", ""),
-        ("source_access_policy_snapshots", "config_encrypted", ""),
-        (
-            "platform_accounts",
-            "credential_encrypted",
-            "WHERE credential_encrypted IS NOT NULL",
-        ),
-        (
-            "platform_oauth_accounts",
-            "token_encrypted",
-            "WHERE token_encrypted IS NOT NULL",
-        ),
-        (
-            "platform_oauth_requests",
-            "secret_encrypted",
-            "WHERE secret_encrypted IS NOT NULL",
-        ),
-        (
-            "platform_account_renewals",
-            "refresh_encrypted",
-            "WHERE refresh_encrypted IS NOT NULL",
-        ),
-        (
-            "platform_login_requests",
-            "qr_key_encrypted",
-            "WHERE status='pending' AND expires_at>clock_timestamp() AND qr_key_encrypted IS NOT NULL",
-        ),
-        (
-            "platform_login_requests",
-            "qr_payload_encrypted",
-            "WHERE status='pending' AND expires_at>clock_timestamp() AND qr_payload_encrypted IS NOT NULL",
-        ),
-    ] {
+    // Shared fixed inventory with recovery material validation. Keep predicate
+    // changes here and in backups atomic by consuming the same embedded data.
+    #[derive(serde::Deserialize)]
+    struct Field {
+        table: String,
+        column: String,
+        predicate: String,
+    }
+    let inventory: Vec<Field> = serde_json::from_str(include_str!("source-key-inventory.json"))?;
+    for Field {
+        table,
+        column,
+        predicate,
+    } in inventory
+    {
         let present: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(format!("public.{table}"))
             .fetch_one(db)
@@ -46,7 +27,7 @@ pub async fn verify(db: &sqlx::PgPool, key: &Aes256Gcm) -> anyhow::Result<()> {
             continue;
         }
         // Fixed identifiers only. Keep memory bounded for large source tables.
-        let query = format!("SELECT {column} FROM {table} {predicate}");
+        let query = format!("SELECT {column} FROM {table} WHERE {predicate}");
         let mut rows = sqlx::query_scalar::<_, String>(&query).fetch(db);
         while let Some(value) = rows.try_next().await? {
             let valid = valid_ciphertext(key, &value);

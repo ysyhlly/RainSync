@@ -6,17 +6,22 @@ import {
   type YoutubePlatformAccountStatus,
 } from "./platform-account.api";
 import { validateYoutubeAccountStatus } from "./youtube-account-flow";
+import { createAccountRequestSlot } from "./account-request-slot";
 
 export function createYoutubeAccountStore(
   session: ReturnType<typeof useSession>,
 ) {
   const status = ref<YoutubePlatformAccountStatus>(),
     change = ref(0);
-  let serial = 0,
-    controller = new AbortController(),
-    pending: Promise<YoutubePlatformAccountStatus> | undefined,
-    mutation: Promise<YoutubePlatformAccountStatus> | undefined;
   const api = youtubePlatformAccountApi(session.api);
+  const work = createAccountRequestSlot({
+    epoch: () => session.epoch,
+    cached: (force) => (force ? undefined : status.value),
+    read: api.status,
+    accept,
+    timeoutMs: 20000,
+    busyMessage: "YouTube 会话操作尚未确认，请刷新状态",
+  });
   function accept(value: YoutubePlatformAccountStatus) {
     value = validateYoutubeAccountStatus(value);
     const previous = status.value;
@@ -32,77 +37,21 @@ export function createYoutubeAccountStore(
       ++change.value;
     return value;
   }
-  function retire() {
-    ++serial;
-    controller.abort();
-    controller = new AbortController();
-    pending = mutation = undefined;
-  }
   function reset() {
-    retire();
+    work.retire();
     status.value = undefined;
     ++change.value;
   }
-  function refresh(force = false): Promise<YoutubePlatformAccountStatus> {
-    if (mutation) {
-      const epoch = session.epoch;
-      return mutation
-        .catch(() => undefined)
-        .then(() => {
-          if (session.epoch !== epoch) throw new StaleIdentity();
-          return refresh(force);
-        });
-    }
-    if (pending) return pending;
-    if (!force && status.value) return Promise.resolve(status.value);
-    const epoch = session.epoch,
-      generation = serial,
-      signal = controller.signal;
-    const request = api
-      .status(signal)
-      .then((value) => {
-        if (epoch !== session.epoch || generation !== serial || signal.aborted)
-          throw new StaleIdentity();
-        return accept(value);
-      })
-      .finally(() => {
-        if (pending === request) pending = undefined;
-      });
-    pending = request;
-    return request;
-  }
+  const refresh = work.refresh;
   function mutate(
     expectedRevision: string | null,
     action: (signal: AbortSignal) => Promise<YoutubePlatformAccountStatus>,
     external?: AbortSignal,
   ) {
-    if (mutation)
-      return Promise.reject(Error("YouTube 会话操作尚未确认，请刷新状态"));
-    if (!status.value || status.value.revision !== expectedRevision)
-      return Promise.reject(new StaleIdentity());
-    retire();
-    const epoch = session.epoch,
-      generation = serial,
-      signal = AbortSignal.any([
-        controller.signal,
-        AbortSignal.timeout(20000),
-        ...(external ? [external] : []),
-      ]);
-    const request = Promise.resolve()
-      .then(() => {
-        signal.throwIfAborted();
-        return action(signal);
-      })
-      .then((value) => {
-        if (epoch !== session.epoch || generation !== serial || signal.aborted)
-          throw new StaleIdentity();
-        return accept(value);
-      })
-      .finally(() => {
-        if (mutation === request) mutation = undefined;
-      });
-    mutation = request;
-    return request;
+    return work.mutate(action, accept, external, () => {
+      if (!status.value || status.value.revision !== expectedRevision)
+        throw new StaleIdentity();
+    });
   }
   const importCredential = (
     secret: string,

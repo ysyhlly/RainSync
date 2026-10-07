@@ -26,6 +26,8 @@ async function contentFixture(page: Page) {
   await page.route("**/api/v1/libraries**", (route) => {
     const request = route.request(),
       url = new URL(request.url());
+    if (url.pathname === "/api/v1/libraries/issued-shares")
+      return route.fulfill({ json: { items: [], has_more: false } });
     if (url.pathname === "/api/v1/libraries")
       return route.fulfill({ json: { enabled: true, items: libraries } });
     const library = libraries.find((item) =>

@@ -4,6 +4,7 @@
 // RAINSYNC_SOURCE_ACCESS_BINDING_FILE), RAINSYNC_ARTIFACT_DIR, CARGO_TARGET_DIR,
 // and optionally RAINSYNC_NATIVE_POSTGRES_BIN. No build/install is performed.
 import assert from "node:assert/strict";
+import { safeFailure } from "./fixtures/safe-failure.mjs";
 import { execFileSync, spawn } from "node:child_process";
 import {
   createCipheriv,
@@ -79,6 +80,7 @@ for (const path of [
   "tests/fixtures/playback-admission.mjs",
   "tests/fixtures/media-stack.mjs",
   "tests/fixtures/postgres.mjs",
+  "tests/fixtures/safe-failure.mjs",
 ]) {
   coordinatorInputs.push({
     path,
@@ -150,8 +152,8 @@ async function scenario(name, run) {
     });
     console.log(`PASS ${name}; foreign requests=0`);
   } catch (error) {
-    // Assertion descriptions are deliberately free of bearer tokens and ciphertext.
-    record.error = error.message;
+    // Node assertion messages include actual/expected diffs despite safe labels.
+    record.error = safeFailure(error);
     throw error;
   }
 }
@@ -539,6 +541,12 @@ try {
         encrypted: encrypt(resource),
         source_policy_revision: revision,
       };
+      // Match wrap_resource's transport-only grants. These fixture sources
+      // issue no provider check-in; legacy reporting must not rewrite their
+      // exact resource envelope while Worker delivery is checking it.
+      if (["local", "agent", "http"].includes(resource.kind) && !Object.hasOwn(resource, "upstream_base")) {
+        envelope.upstream_closed = true;
+      }
       const insert = `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at,lifecycle_epoch) SELECT ${quote(id)},${quote(user.id)},r.id,${quote(src.media)},(s.state->>'media_generation')::bigint,${quote(digest(token))},${json(envelope)},now()+interval '1 hour',r.lifecycle_epoch FROM rooms r JOIN room_snapshots s ON s.room_id=r.id WHERE r.id=${quote(room.id)}`;
       withPlaybackAdmission(f, { client: admin, user: user.id, room: room.id, session: id }, insert);
       assert.equal(
@@ -1447,7 +1455,7 @@ try {
   outcome = "passed";
 } catch (error) {
   failure = error;
-  throw error;
+  throw new Error(`source-access verification failed: ${safeFailure(error)}; inspect the named scenario in the safe report`);
 } finally {
   for (const req of consumers) req.destroy();
   for (const child of children) child.kill("SIGKILL");
@@ -1489,7 +1497,7 @@ try {
         {
           schema_version: 1,
           result: outcome,
-          error: failure?.message,
+          error: safeFailure(failure),
           binding_file: bindingFile,
           binding_sha256: digest(bindingBytes),
           source_digest: binding.source_digest,
@@ -1521,6 +1529,6 @@ try {
       ) + "\n",
     );
     console.log(`Evidence: ${resolve(reportRoot, "report.json")}`);
-    if (finalBinding !== "passed") throw failure;
+    if (finalBinding !== "passed") throw new Error("source-access final binding verification failed");
   }
 }

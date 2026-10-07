@@ -8,6 +8,7 @@ import {
 } from "../apps/web/src/features/room-layout/layout-model";
 import {
   MAX_LAYOUT_STORAGE_BYTES,
+  copyLayoutGeometry,
   loadRoomLayout,
   roomLayoutStorageKey,
   saveRoomLayout,
@@ -55,6 +56,41 @@ const key = (user = "user-a", breakpoint: LayoutBreakpoint = "wide") =>
 
 // These tests call the real model, geometry, Vue refs and persistence functions.
 describe("room layout storage", () => {
+  it.each(["wide", "narrow"] as const)(
+    "copies fresh %s geometry through the shared whitelist",
+    (breakpoint) => {
+      const expected = createDefaultLayout(breakpoint);
+      const document = Object.assign(createDefaultLayout(breakpoint), {
+        token: "do-not-copy",
+      });
+      Object.assign(document.items[0], { media: { title: "do-not-copy" } });
+      Object.defineProperty(document, "privatePayload", {
+        get: () => {
+          throw new Error("Unrelated payload must not be read");
+        },
+      });
+      Object.defineProperty(document.items[0], "privatePayload", {
+        get: () => {
+          throw new Error("Unrelated item payload must not be read");
+        },
+      });
+      document.items.forEach(Object.freeze);
+      Object.freeze(document.items);
+      Object.freeze(document);
+
+      const copied = copyLayoutGeometry(document);
+      expect(copied).toEqual(expected);
+      expect(copied).not.toBe(document);
+      expect(copied.items).not.toBe(document.items);
+      copied.items.forEach((item, index) => {
+        expect(item).not.toBe(document.items[index]);
+      });
+      copied.items[0].y += 1;
+      expect(document.items[0].y).toBe(expected.items[0].y);
+      expect(copyLayoutGeometry(document)).toEqual(expected);
+    },
+  );
+
   it("isolates account and viewport profiles, with no anonymous persistent key", () => {
     expect(key("user:a")).not.toBe(key("user%3Aa"));
     expect(key("user-a", "wide")).not.toBe(key("user-a", "narrow"));

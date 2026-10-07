@@ -1,5 +1,6 @@
 import type { OAuthLogin, OAuthStatus } from "./platform-oauth.api";
 import type { ShortPlatformProvider } from "./platform-account.api";
+import { RequestFailure } from "../../errors";
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function validateOAuthStatus(
   v: OAuthStatus,
@@ -137,6 +138,7 @@ export interface OAuthFlowState {
     | "confirmed"
     | "expired"
     | "failed"
+    | "retryable"
     | "uncertain";
   login?: OAuthLogin;
 }
@@ -156,7 +158,9 @@ export function createOAuthFlow(options: {
   const id = (options.uuid ?? (() => crypto.randomUUID()))();
   let closed = false,
     busy = false,
+    attempted = false,
     started = false,
+    observed = false,
     deadline = Infinity,
     timer: ReturnType<typeof setTimeout> | undefined;
   const controller = new AbortController(),
@@ -166,9 +170,38 @@ export function createOAuthFlow(options: {
   const publish = (state: OAuthFlowState) => {
     if (current()) options.change(state);
   };
+  function failed(error: unknown, reading: boolean) {
+    if (!current()) return;
+    const code = error instanceof RequestFailure ? error.code : undefined;
+    const missing = reading && code === "PLATFORM_LOGIN_REQUEST_NOT_FOUND";
+    if (now() >= deadline || (missing && observed)) {
+      publish({ phase: "expired" });
+    } else if (
+      missing ||
+      (!reading &&
+        [
+          "RATE_LIMITED",
+          "PLATFORM_OAUTH_APPLICATION_CONFIGURATION_REQUIRED",
+          "PLATFORM_STORAGE_CONSENT_REQUIRED",
+          "PLATFORM_ACCOUNT_CHANGED",
+          "PLATFORM_LOGIN_IN_PROGRESS",
+        ].includes(code ?? ""))
+    ) {
+      // These start rejections precede request creation. An exact absent read
+      // also permits an explicit retry, but only with this same id: a delayed
+      // first start is still fenced by the server's account lock/idempotency.
+      started = false;
+      publish({ phase: "retryable" });
+    } else {
+      // Transport, malformed responses and unknown errors may have committed.
+      // Do not repeat creation until an exact read proves this id is absent.
+      publish({ phase: "uncertain" });
+    }
+  }
   function apply(value: OAuthLogin) {
     if (!current()) return;
     validateOAuthLogin(value, options.provider, id);
+    observed = true;
     if (value.status !== "pending") {
       publish({ phase: value.status });
       if (value.status === "confirmed") options.confirmed();
@@ -199,8 +232,8 @@ export function createOAuthFlow(options: {
               controller.signal,
             ),
           );
-        } catch {
-          publish({ phase: "uncertain" });
+        } catch (error) {
+          failed(error, true);
         }
       },
       Math.min(
@@ -211,19 +244,26 @@ export function createOAuthFlow(options: {
   }
   async function start() {
     if (!current() || busy) return;
+    if (!started && now() >= deadline) {
+      publish({ phase: "expired" });
+      return;
+    }
     busy = true;
     clearTimeout(timer);
+    const reading = started;
+    attempted = started = true;
+    // Bound same-id recovery too; an old missing request must not silently
+    // become a fresh external grant after server retention has elapsed.
+    deadline = Math.min(deadline, now() + 180000);
     publish({ phase: "starting" });
     try {
-      const value = await (started ? options.read : options.start)(
+      const value = await (reading ? options.read : options.start)(
         id,
         controller.signal,
       );
-      started = true;
       apply(value);
-    } catch {
-      started = true;
-      publish({ phase: "uncertain" });
+    } catch (error) {
+      failed(error, reading);
     } finally {
       busy = false;
     }
@@ -234,7 +274,7 @@ export function createOAuthFlow(options: {
     closed = true;
     clearTimeout(timer);
     controller.abort();
-    if (started || busy) {
+    if (attempted) {
       if (mayCancel) await options.cancel(id);
     }
   }

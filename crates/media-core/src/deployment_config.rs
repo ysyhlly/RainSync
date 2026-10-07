@@ -66,8 +66,17 @@ fn canonical_destination(path: &Path) -> Result<PathBuf> {
                     name != ".." && name != ".",
                     "root contains unresolved path components"
                 );
+                let parent = ancestor.parent().context("root has no parent")?;
+                // A dangling symlink is not a not-yet-created directory. Check
+                // its entry without a terminal slash or /. that would cause
+                // symlink_metadata to follow it rather than inspect the link.
+                match std::fs::symlink_metadata(parent.join(name)) {
+                    Ok(_) => anyhow::bail!("root contains an unresolved symlink"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => anyhow::bail!("root cannot be resolved; check directory access"),
+                }
                 tail.push(name.to_owned());
-                ancestor = ancestor.parent().context("root has no parent")?;
+                ancestor = parent;
             }
             Err(_) => anyhow::bail!("root cannot be resolved; check directory access"),
         }
@@ -75,9 +84,14 @@ fn canonical_destination(path: &Path) -> Result<PathBuf> {
 }
 
 pub fn distinct_roots(media: &Path, cache: &Path) -> Result<()> {
+    let media = canonical_destination(media)?;
+    let cache = canonical_destination(cache)?;
+    // Path::starts_with compares components, so /data/media-cache remains a
+    // valid sibling of /data/media. Neither root may own the other's tree:
+    // cache eviction must never reach originals, or scanning reach outputs.
     ensure!(
-        canonical_destination(media)? != canonical_destination(cache)?,
-        "CACHE_ROOT must not resolve to MEDIA_ROOT (including aliases/symlinks)"
+        !media.starts_with(&cache) && !cache.starts_with(&media),
+        "MEDIA_ROOT and CACHE_ROOT must not resolve to overlapping directories (equal, ancestor or descendant; including aliases/symlinks)"
     );
     Ok(())
 }
@@ -125,8 +139,12 @@ impl Settings {
         // Agent receipt-only recovery must survive a missing media mount. Its
         // existing RootCheck remains the owner of media-path availability.
         if !matches!(role, Role::Agent) {
-            if let Some(media) = env("MEDIA_ROOT") {
-                distinct_roots(Path::new(&media), &cache_root)?;
+            let media = env("MEDIA_ROOT");
+            // Runtime local-source consumers use /media when it is omitted.
+            // Keep the existing optional mount check, but never skip overlap
+            // validation for the effective default root.
+            distinct_roots(Path::new(media.as_deref().unwrap_or("/media")), &cache_root)?;
+            if let Some(media) = media {
                 ensure!(
                     Path::new(&media).is_dir(),
                     "MEDIA_ROOT must be an accessible directory"
@@ -212,19 +230,162 @@ mod tests {
         );
     }
 
-    #[test]
-    fn canonical_paths_reject_equal_roots_before_creation() {
-        let root = std::env::temp_dir().join(format!("rainsync-config-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
-        assert!(distinct_roots(&root, &root.join(".")).is_err());
-        assert!(distinct_roots(&root, &root.join("new-cache")).is_ok());
-        #[cfg(unix)]
-        {
-            let alias = root.with_extension("alias");
-            std::os::unix::fs::symlink(&root, &alias).unwrap();
-            assert!(distinct_roots(&root, &alias).is_err());
-            std::fs::remove_file(alias).unwrap();
+    struct RootFixture(PathBuf);
+
+    impl RootFixture {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("rainsync-config-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
         }
-        std::fs::remove_dir(root).unwrap();
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+
+        fn directory(&self, name: &str) -> PathBuf {
+            let path = self.path(name);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        }
+    }
+
+    impl Drop for RootFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn assert_overlapping(media: &Path, cache: &Path) {
+        let error = distinct_roots(media, cache).unwrap_err().to_string();
+        assert!(error.contains("must not resolve to overlapping directories"));
+        assert!(!error.contains("rainsync-config-"));
+    }
+
+    #[test]
+    fn canonical_paths_reject_equal_and_nested_roots_before_creation() {
+        let fixture = RootFixture::new();
+        let media = fixture.directory("media");
+        let nested = fixture.directory("media/existing/deep");
+        assert_overlapping(&media, &media.join("."));
+        assert_overlapping(&media, &nested);
+        assert_overlapping(&nested, &media);
+        let missing = media.join("new-cache/deep");
+        assert_overlapping(&media, &missing);
+        assert_overlapping(&missing, &media);
+        assert_overlapping(&missing, &missing);
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn canonical_paths_allow_disjoint_siblings_with_matching_string_prefixes() {
+        let fixture = RootFixture::new();
+        let media = fixture.directory("media");
+        for sibling in ["cache", "media-cache", "media2", "..media"] {
+            let path = fixture.directory(sibling);
+            distinct_roots(&media, &path).unwrap();
+            distinct_roots(&path, &media).unwrap();
+        }
+        let missing = fixture.path("media-new/cache");
+        distinct_roots(&media, &missing).unwrap();
+        distinct_roots(&fixture.path("new/media"), &fixture.path("new/cache")).unwrap();
+        assert!(!missing.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_paths_resolve_symlinks_and_existing_parents_of_missing_tails() {
+        let fixture = RootFixture::new();
+        let media = fixture.directory("media");
+        let nested = fixture.directory("media/existing");
+        let alias = fixture.path("alias");
+        std::os::unix::fs::symlink(&media, &alias).unwrap();
+        assert_overlapping(&media, &alias);
+        assert_overlapping(&media, &alias.join("existing"));
+        assert_overlapping(&alias.join("existing"), &media);
+        assert_overlapping(&alias, &nested);
+        assert_overlapping(&media, &alias.join("not-created/deep"));
+        assert_overlapping(&alias.join("not-created/deep"), &media);
+        let parent_alias = fixture.path("parent-alias");
+        std::os::unix::fs::symlink(&fixture.0, &parent_alias).unwrap();
+        assert_overlapping(&media, &parent_alias.join("media/new-cache"));
+        assert_overlapping(
+            &parent_alias.join("cache/new-media"),
+            &fixture.path("cache"),
+        );
+        distinct_roots(&media, &parent_alias.join("cache/new-cache")).unwrap();
+        assert!(!alias.join("not-created").exists());
+        assert!(!fixture.path("cache").exists());
+        let deep_alias = fixture.path("deep-alias");
+        std::os::unix::fs::symlink(&nested, &deep_alias).unwrap();
+        assert_overlapping(&media, &deep_alias.join(".."));
+        assert!(distinct_roots(&media, &fixture.path("missing/../media")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_paths_fail_closed_for_dangling_symlinks() {
+        let fixture = RootFixture::new();
+        let media = fixture.directory("media");
+        let alias = fixture.path("dangling-alias");
+        std::os::unix::fs::symlink(fixture.path("missing"), &alias).unwrap();
+        assert!(distinct_roots(&media, &alias).is_err());
+        assert!(distinct_roots(&media, &alias.join("cache")).is_err());
+        assert!(distinct_roots(&media, &alias.join(".")).is_err());
+        assert!(distinct_roots(&media, Path::new(&format!("{}/", alias.display()))).is_err());
+    }
+
+    #[test]
+    fn server_and_worker_reject_overlapping_roots_without_touching_media() {
+        let fixture = RootFixture::new();
+        let cache = fixture.directory("cache");
+        let media = fixture.directory(&format!("cache/{}", uuid::Uuid::new_v4()));
+        let sentinel = media.join("original-media.sentinel");
+        std::fs::write(&sentinel, b"owned disposable original-media fixture").unwrap();
+        for role in [Role::Server, Role::Worker] {
+            for (media, cache) in [(&media, &cache), (&cache, &media)] {
+                let error = Settings::read(role, |name| match name {
+                    "MEDIA_ROOT" => Some(media.to_str().unwrap().into()),
+                    "CACHE_ROOT" => Some(cache.to_str().unwrap().into()),
+                    "SOURCE_ENCRYPTION_KEY" => Some("checked-by-caller".into()),
+                    _ => None,
+                })
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains("must not resolve to overlapping directories"));
+            }
+        }
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"owned disposable original-media fixture"
+        );
+    }
+
+    #[test]
+    fn server_and_worker_validate_default_media_root_too() {
+        for role in [Role::Server, Role::Worker] {
+            let error = Settings::read(role, |name| match name {
+                "CACHE_ROOT" => Some("/media/cache".into()),
+                "SOURCE_ENCRYPTION_KEY" => Some("checked-by-caller".into()),
+                _ => None,
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("must not resolve to overlapping directories"));
+        }
+    }
+
+    #[test]
+    fn agent_receipt_recovery_keeps_its_existing_missing_media_contract() {
+        let fixture = RootFixture::new();
+        let missing = fixture.path("missing-media");
+        Settings::read(Role::Agent, |name| match name {
+            "SERVER_URL" => Some("http://localhost:8080".into()),
+            "MEDIA_ROOT" | "CACHE_ROOT" => Some(missing.to_str().unwrap().into()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(!missing.exists());
     }
 }

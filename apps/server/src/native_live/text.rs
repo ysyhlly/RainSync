@@ -79,7 +79,7 @@ pub async fn catalog(
 ) -> Result<Response> {
     let (authority, _, _) = scope(&app, &headers, session, &query.token).await?;
     delivery::check(&app, &authority).await?;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"subtitle_tracks":[],"subtitles_status":Availability::Unsupported,"danmaku_status":Availability::Available}),
     ))
 }
@@ -110,7 +110,7 @@ pub async fn history(
     let cues = text::live::parse_history(&bytes, started, now).map_err(live_text_error)?;
     verify_broadcast(&app, &identity, &account, deadline).await?;
     delivery::check(&app, &authority).await?;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"cues":cues,"snapshot":true,"broadcast_started_ms":started*1000,"server_now_ms":now}),
     ))
 }

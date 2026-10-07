@@ -306,7 +306,7 @@ test(
       schema_version: 1,
       result: "failed",
       scope:
-        "fresh empty RainSync schema from frozen 1-86 files (85 migrations, version 63 absent); not a real old production database or app acceptance",
+        "fresh empty RainSync schema from frozen 1-88 files (87 migrations, version 63 absent); not a real old production database or app acceptance",
       started_at: new Date().toISOString(),
     };
     try {

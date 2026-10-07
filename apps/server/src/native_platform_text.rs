@@ -118,7 +118,7 @@ async fn resolve(
         Operation::Catalog => {
             let catalog = discover(app, &scope, deadline).await?;
             let tracks: Vec<_> = catalog.tracks.into_iter().map(|d| d.track).collect();
-            media_titles::private_json(
+            responses::ok_json(
                 json!({"subtitle_tracks":tracks,"subtitles_status":catalog.status,"danmaku_status":if scope.entry.provider=="bilibili"{Availability::Available}else{Availability::Unsupported}}),
             )
         }
@@ -241,9 +241,9 @@ async fn resolve(
                 cues.retain(|c| c.program.is_none() && c.interaction.is_none());
             }
             if rendering_version == 3 {
-                media_titles::private_json(json!({"cues":cues,"snapshot":true,"warnings":warnings}))
+                responses::ok_json(json!({"cues":cues,"snapshot":true,"warnings":warnings}))
             } else {
-                media_titles::private_json(json!({"cues":cues,"snapshot":true}))
+                responses::ok_json(json!({"cues":cues,"snapshot":true}))
             }
         }
     };
@@ -455,6 +455,10 @@ fn short_text_error(error: short_video::Error) -> Error {
         short_video::Error::Restricted("login_required") | short_video::Error::Status(401) => err(
             StatusCode::UNPROCESSABLE_ENTITY,
             "native_platform_subtitle_login_required",
+        ),
+        short_video::Error::Restricted("caption_identity_ambiguous") => err(
+            StatusCode::NOT_FOUND,
+            "native_platform_subtitle_unavailable",
         ),
         short_video::Error::Restricted("caption_metadata_unavailable") => err(
             StatusCode::UNPROCESSABLE_ENTITY,

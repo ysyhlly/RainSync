@@ -1,6 +1,4 @@
-import { readFileSync } from "node:fs";
-import { parse, compileScript } from "@vue/compiler-sfc";
-import ts from "typescript";
+import { mountSetup } from "./helpers/mount-setup";
 import * as Vue from "vue";
 import { expect, it, vi } from "vitest";
 import { useAction } from "../apps/web/src/shared/use-action";
@@ -13,29 +11,7 @@ async function page() {
   const list = vi
     .fn<() => Promise<unknown>>()
     .mockRejectedValue(new Error("首次加载失败"));
-  const source = readFileSync(
-    new URL("../apps/web/src/features/rooms/RoomsPage.vue", import.meta.url),
-    "utf8",
-  );
-  const script = compileScript(parse(source).descriptor, {
-    id: "rooms-load-fixture",
-  }).content;
-  const js = ts
-    .transpileModule(script, {
-      compilerOptions: {
-        target: ts.ScriptTarget.ES2022,
-        module: ts.ModuleKind.ESNext,
-      },
-    })
-    .outputText.replace(/import[\s\S]*?from\s+["'][^"']+["'];?\s*/g, "")
-    .replace("export default", "return");
   const imports = {
-    _defineComponent: Vue.defineComponent,
-    ref: Vue.ref,
-    computed: Vue.computed,
-    watch: Vue.watch,
-    onMounted: Vue.onMounted,
-    onBeforeUnmount: Vue.onBeforeUnmount,
     useRouter: () => ({ push: vi.fn() }),
     useSession: () => ({ user: { id: "owner" } }),
     useRoomRuntime: () => ({ room: null, enter: vi.fn() }),
@@ -50,33 +26,12 @@ async function page() {
     Notice: {},
     PendingMediaSelection: {},
   };
-  const component = new Function(...Object.keys(imports), js)(
-    ...Object.values(imports),
+  const { controls, unmount } = mountSetup(
+    new URL("../apps/web/src/features/rooms/RoomsPage.vue", import.meta.url),
+    imports,
   );
-  let controls: any;
-  const setup = component.setup;
-  component.setup = (props: unknown, context: unknown) => {
-    controls = setup(props, context);
-    return () => null;
-  };
-  const renderer = Vue.createRenderer<any, any>({
-    patchProp() {},
-    insert(node, parent) {
-      node.parent = parent;
-    },
-    remove() {},
-    createElement: () => ({}),
-    createText: () => ({}),
-    createComment: () => ({}),
-    setText() {},
-    setElementText() {},
-    parentNode: (node) => node.parent,
-    nextSibling: () => null,
-  });
-  const app = renderer.createApp(component);
-  app.mount({});
   await vi.waitFor(() => expect(controls.loadError.value).toBe("首次加载失败"));
-  return { controls, list, unmount: () => app.unmount() };
+  return { controls, list, unmount };
 }
 
 it.each(["joinOpen", "createOpen"])(

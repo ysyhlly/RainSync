@@ -32,7 +32,7 @@ pub async fn status(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
     let cleanup = sqlx::query("SELECT attempts,last_error,completed_at IS NOT NULL AS completed FROM room_cleanup_tasks WHERE room_id=$1 AND lifecycle_epoch=$2")
         .bind(id).bind(row.get::<i64,_>("lifecycle_epoch")).fetch_optional(&app.db).await?;
-    Ok(media_titles::private_json(json!({
+    Ok(responses::ok_json(json!({
         "lifecycle":row.get::<String,_>("lifecycle"),
         "lifecycle_epoch":row.get::<i64,_>("lifecycle_epoch"),
         "owner_id":row.get::<Uuid,_>("owner_id"),
@@ -212,7 +212,7 @@ async fn change(
     authority.commit(tx).await?;
     observation.confirmed();
     rooms::lifecycle_changed(app, &state, target, epoch, event_id).await;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"lifecycle":target,"lifecycle_epoch":epoch,"owner_id":owner,"state":state,"event_id":event_id}),
     ))
 }

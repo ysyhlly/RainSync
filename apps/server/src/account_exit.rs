@@ -16,7 +16,7 @@ pub async fn preview(State(app): State<App>, h: HeaderMap) -> Result<Response> {
             .await?;
     let last_admin: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND admin) AND NOT EXISTS(SELECT 1 FROM users u WHERE u.id<>$1 AND u.admin AND NOT EXISTS(SELECT 1 FROM account_exits e WHERE e.user_id=u.id))")
         .bind(user.id).fetch_one(&app.db).await?;
-    Ok(media_titles::private_json(json!({
+    Ok(responses::ok_json(json!({
         "can_delete": rooms.is_empty() && libraries.is_empty() && !last_admin,
         "last_admin": last_admin,
         "rooms": rooms.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"lifecycle":r.get::<String,_>("lifecycle")})).collect::<Vec<_>>(),
@@ -46,20 +46,12 @@ pub async fn delete(
         .fetch_one(&app.db)
         .await?;
     let expected = stored.clone();
-    let permit = app
-        .account_security
-        .hashes
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| account_security::limited(1))?;
-    let valid = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        PasswordHash::new(&stored).ok().is_some_and(|p| {
-            Argon2::default()
-                .verify_password(body.password.as_bytes(), &p)
-                .is_ok()
-        })
-    })
+    // Retirement intentionally treats a failed worker as invalid credentials.
+    let valid = account_security::password_verification_worker(
+        &app.account_security,
+        stored,
+        body.password,
+    )?
     .await
     .unwrap_or(false);
     if !valid {

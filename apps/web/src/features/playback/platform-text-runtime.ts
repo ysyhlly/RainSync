@@ -18,6 +18,8 @@ import {
 export function createPlatformTextRuntime(ctx: {
   session: ReturnType<typeof useSession>;
   video: Ref<HTMLVideoElement | undefined>;
+  /** Stable viewer/room/media/account identity, excluding grant and quality. */
+  preferenceScope?: () => string | undefined;
 }) {
   const platformSubtitleTracks = ref<PlatformSubtitleTrack[]>([]),
     platformSubtitleId = ref<string | null>(null),
@@ -28,6 +30,28 @@ export function createPlatformTextRuntime(ctx: {
     platformTextError = ref(""),
     platformTextLive = ref(false),
     platformLiveDanmakuMode = ref<"off" | "history" | "realtime">("off");
+  let preferenceOwner: string | undefined;
+  let preferredSubtitle: PlatformSubtitleTrack | undefined;
+  let preferredDanmaku = false;
+  function ownerFor(plan: PlaybackPlan) {
+    const scope = ctx.preferenceScope?.();
+    if (
+      (ctx.preferenceScope && !scope) ||
+      !plan.media_id ||
+      !Number.isSafeInteger(plan.media_generation) ||
+      !plan.native_platform ||
+      plan.native_platform.live
+    )
+      return undefined;
+    return JSON.stringify([
+      scope,
+      ctx.session.epoch,
+      plan.media_id,
+      plan.media_generation,
+      plan.native_platform.provider,
+      plan.native_platform.credential_mode,
+    ]);
+  }
   let serial = 0,
     subtitleSerial = 0,
     danmakuSerial = 0,
@@ -168,8 +192,17 @@ export function createPlatformTextRuntime(ctx: {
         track.mode = "hidden";
         const key = `cc${watched.size}`;
         const observe = () => {
-          if (current())
-            ingestLiveInbandCaptions(key, Array.from(track.cues ?? []));
+          if (!current()) return;
+          const retained = track.cues;
+          const recent: TextTrackCue[] = [];
+          if (retained)
+            for (
+              let index = Math.max(0, retained.length - 512);
+              index < retained.length;
+              index++
+            )
+              recent.push(retained[index]);
+          ingestLiveInbandCaptions(key, recent);
         };
         track.addEventListener("cuechange", observe);
         disposers.push(() => track.removeEventListener("cuechange", observe));
@@ -194,7 +227,8 @@ export function createPlatformTextRuntime(ctx: {
       nativeTrack.removeCue(cue);
     nativeTrack.mode = "disabled";
   }
-  function reset() {
+  /** Retire grant-owned resources immediately without treating renewal as Off. */
+  function retire() {
     removeInbandListeners?.();
     removeInbandListeners = undefined;
     inband.clear();
@@ -222,6 +256,12 @@ export function createPlatformTextRuntime(ctx: {
     platformDanmakuCues.value = [];
     platformTextError.value = "";
   }
+  function reset() {
+    retire();
+    preferenceOwner = undefined;
+    preferredSubtitle = undefined;
+    preferredDanmaku = false;
+  }
   /** Retire old cues and in-flight catalogs without requesting unsupported text. */
   function unsupported() {
     reset();
@@ -233,7 +273,10 @@ export function createPlatformTextRuntime(ctx: {
     return `${path}${suffix}?${query}`;
   }
   async function bind(plan: PlaybackPlan) {
-    reset();
+    const owner = ownerFor(plan);
+    if (!owner || owner !== preferenceOwner) reset();
+    else retire();
+    preferenceOwner = owner;
     base = platformTextBase(plan, location.origin);
     if (!base) {
       if (platformInbandLive(plan, location.origin)) {
@@ -256,7 +299,9 @@ export function createPlatformTextRuntime(ctx: {
       : 0;
     if (platformTextLive.value) observeNativeLiveCaptions(plan);
     const active = serial,
-      epoch = ctx.session.epoch;
+      epoch = ctx.session.epoch,
+      subtitleSelection = subtitleSerial,
+      danmakuSelection = danmakuSerial;
     const controller = new AbortController();
     catalogRequest = controller;
     platformSubtitleStatus.value = platformDanmakuStatus.value = "loading";
@@ -282,6 +327,36 @@ export function createPlatformTextRuntime(ctx: {
           ? "available"
           : catalog.subtitleStatus;
       platformDanmakuStatus.value = catalog.danmakuStatus;
+      // Only the new validated catalog can supply the current request identity.
+      // Missing or changed metadata retires the preference instead of silently
+      // retargeting it or resurrecting it on a later refresh.
+      const restore: Promise<void>[] = [];
+      if (
+        !platformTextLive.value &&
+        subtitleSerial === subtitleSelection &&
+        preferredSubtitle
+      ) {
+        const previous = preferredSubtitle;
+        const equivalent = catalog.tracks.find(
+          (track) =>
+            track.id === previous.id &&
+            track.language === previous.language &&
+            track.automatic === previous.automatic,
+        );
+        if (equivalent && catalog.subtitleStatus === "available")
+          restore.push(selectPlatformSubtitle(equivalent.id));
+        else preferredSubtitle = undefined;
+      }
+      if (
+        !platformTextLive.value &&
+        danmakuSerial === danmakuSelection &&
+        preferredDanmaku
+      ) {
+        if (catalog.danmakuStatus === "available")
+          restore.push(setPlatformDanmaku(true));
+        else preferredDanmaku = false;
+      }
+      await Promise.all(restore);
     } catch (error) {
       if (
         serial !== active ||
@@ -307,6 +382,7 @@ export function createPlatformTextRuntime(ctx: {
     subtitleRequest?.abort();
     clearTrack();
     platformSubtitleId.value = null;
+    preferredSubtitle = undefined;
     platformTextError.value = "";
     if (id === null) return;
     const descriptor = platformSubtitleTracks.value.find(
@@ -319,6 +395,8 @@ export function createPlatformTextRuntime(ctx: {
       return;
     }
     if (!base) return;
+    if (preferenceOwner && !platformTextLive.value)
+      preferredSubtitle = { ...descriptor };
     platformSubtitleId.value = id;
     const controller = new AbortController();
     subtitleRequest = controller;
@@ -335,6 +413,15 @@ export function createPlatformTextRuntime(ctx: {
           ]),
         },
       );
+      if (
+        serial !== active ||
+        subtitleSerial !== selection ||
+        ctx.session.epoch !== epoch ||
+        controller.signal.aborted
+      ) {
+        await response.body?.cancel().catch(() => {});
+        return;
+      }
       if (!response.ok) {
         const failure = new RequestFailure(
           await response.json().catch(() => null),
@@ -406,6 +493,7 @@ export function createPlatformTextRuntime(ctx: {
         return;
       clearTrack();
       platformSubtitleId.value = null;
+      preferredSubtitle = undefined;
       platformTextError.value = "平台字幕加载失败，可选择语言重试";
     } finally {
       if (subtitleRequest === controller) subtitleRequest = undefined;
@@ -447,6 +535,11 @@ export function createPlatformTextRuntime(ctx: {
       await setPlatformLiveDanmaku(enabled ? "history" : "off");
       return;
     }
+    preferredDanmaku =
+      !!preferenceOwner &&
+      enabled &&
+      !!base &&
+      platformDanmakuStatus.value === "available";
     const selection = ++danmakuSerial,
       active = serial,
       epoch = ctx.session.epoch;
@@ -507,6 +600,7 @@ export function createPlatformTextRuntime(ctx: {
       } catch (error) {
         if (!current()) return;
         platformDanmakuEnabled.value = false;
+        preferredDanmaku = false;
         platformDanmakuCues.value = [];
         platformTextError.value = textFailure(
           error,
@@ -696,6 +790,7 @@ export function createPlatformTextRuntime(ctx: {
     }
   }
   watch(() => ctx.session.epoch, reset, { flush: "sync" });
+  if (ctx.preferenceScope) watch(ctx.preferenceScope, reset, { flush: "sync" });
   watch(
     ctx.video,
     (value, previous) => {
@@ -721,6 +816,7 @@ export function createPlatformTextRuntime(ctx: {
     setPlatformLiveDanmaku,
     ingestLiveInbandCaptions,
     bind,
+    retire,
     reset,
     unsupported,
     selectPlatformSubtitle,

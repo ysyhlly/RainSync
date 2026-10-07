@@ -1,4 +1,5 @@
 import {
+  cloneLayout,
   createDefaultLayout,
   validateLayout,
   type LayoutBreakpoint,
@@ -65,18 +66,7 @@ function hasUnsupportedVersion(value: unknown): boolean {
 
 /** Rebuild the schema explicitly so extra properties can never reach storage. */
 export function copyLayoutGeometry(layout: LayoutDocument): LayoutDocument {
-  return {
-    version: 1,
-    breakpoint: layout.breakpoint,
-    items: layout.items.map(({ id, type, x, y, w, h }) => ({
-      id,
-      type,
-      x,
-      y,
-      w,
-      h,
-    })),
-  };
+  return cloneLayout(layout);
 }
 
 export function loadRoomLayout(

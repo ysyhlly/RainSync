@@ -244,7 +244,24 @@ export function createPlaybackRuntime(ctx: {
             : accountRevision("bilibili"),
         ])
       : undefined;
-  const platformText = createPlatformTextRuntime({ session, video });
+  const platformText = createPlatformTextRuntime({
+    session,
+    video,
+    preferenceScope: () => roomIsActive() && state.value?.media_id
+      ? JSON.stringify([
+          session.user?.id, session.epoch, state.value.room_id,
+          state.value.media_id, state.value.media_generation,
+          nativeCredentialMode.value,
+          ctx.platformAccountChange?.value ?? 0,
+          ctx.shortPlatformAccountChanges?.value.douyin ?? 0,
+          ctx.shortPlatformAccountChanges?.value.tiktok ?? 0,
+          ctx.youtubePlatformAccountChange?.value ?? 0,
+          ctx.shortPlatformAccountIds?.value.douyin,
+          ctx.shortPlatformAccountIds?.value.tiktok,
+          ctx.youtubePlatformAccountId?.value,
+        ])
+      : undefined,
+  });
   const nativeQualityMaxHeight = ref<NativePlatformMaxHeight>("auto"),
     nativeQualityOptions = ref<NativePlatformQualityOption[]>([]),
     nativeQualitySelectedHeight = ref<number>();
@@ -1484,7 +1501,7 @@ export function createPlaybackRuntime(ctx: {
     upstreamObserver = undefined;
     upstreamMeasuredOutput.value = undefined;
     upstreamMeasuredMatchesRequested.value = undefined;
-    platformText.reset();
+    platformText.retire();
     liveWindowProbe?.abort();
     liveWindowProbe = undefined;
     liveWindowProgressStop?.();
@@ -1621,7 +1638,7 @@ export function createPlaybackRuntime(ctx: {
       !!advanced,
     );
     validateFiniteHlsChoice(mode.value, { advanced, ladder, distributed: distributedIntent.value });
-    platformText.reset();
+    platformText.retire();
     const t0 = performance.now();
     finishMetrics();
     // A source/account refresh immediately retires the owned platform decoder,

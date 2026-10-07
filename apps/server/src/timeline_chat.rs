@@ -183,7 +183,7 @@ pub async fn current(
     let current = activity(&mut tx, &g).await?;
     let at = position(&g, &app)?;
     commit(tx, &g).await?;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"activity":current,"position_ms":at,"can_moderate":can_manage(&g),"can_assign_moderator":g.admin||g.owner==g.user,"emoji":EMOJI}),
     ))
 }
@@ -243,7 +243,7 @@ pub async fn messages(
     }
     let items: Vec<Value> = rows.iter().map(message).collect();
     commit(tx, &g).await?;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"items":items,"next_before":if more&&page.after.is_none(){items.first().map(|v|v["id"].clone())}else{None},"next_after":if more&&page.after.is_some(){items.last().map(|v|v["id"].clone())}else{None}}),
     ))
 }
@@ -305,7 +305,7 @@ pub async fn post(
         }
         let result = message(&row);
         commit(tx, &g).await?;
-        return Ok(media_titles::private_json(
+        return Ok(responses::ok_json(
             json!({"message":result,"replayed":true}),
         ));
     }
@@ -346,7 +346,7 @@ pub async fn post(
     let mut event = result.clone();
     event["type"] = json!("CHAT");
     rooms::broadcast_timeline(&app, room, event).await;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"message":result,"replayed":false}),
     ))
 }
@@ -374,7 +374,7 @@ pub async fn react(
             return Err(err(StatusCode::CONFLICT, "reaction_conflict"));
         }
         commit(tx, &g).await?;
-        return Ok(media_titles::private_json(json!({"replayed":true})));
+        return Ok(responses::ok_json(json!({"replayed":true})));
     }
     let now = activity(&mut tx, &g)
         .await?
@@ -396,9 +396,7 @@ pub async fn react(
     sqlx::query("INSERT INTO room_reaction_receipts(id,room_id,user_id,client_reaction_id,request_digest) VALUES($1,$2,$3,$4,$5)").bind(id).bind(room).bind(g.user).bind(r.client_reaction_id).bind(digest).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO room_reactions(id,room_id,user_id,activity_id,media_time_ms,emoji) VALUES($1,$2,$3,$4,$5,$6)").bind(id).bind(room).bind(g.user).bind(r.activity_id).bind(at).bind(r.emoji).execute(&mut *tx).await?;
     commit(tx, &g).await?;
-    Ok(media_titles::private_json(
-        json!({"id":id,"replayed":false}),
-    ))
+    Ok(responses::ok_json(json!({"id":id,"replayed":false})))
 }
 pub async fn reactions(
     State(app): State<App>,
@@ -418,7 +416,7 @@ pub async fn reactions(
             .fetch_one(&mut *tx)
             .await?;
     commit(tx, &g).await?;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"items":items,"server_now_ms":now}),
     ))
 }
@@ -556,7 +554,7 @@ pub async fn moderate(
     if let Some(id) = deleted {
         rooms::broadcast_timeline(&app, room, json!({"type":"CHAT_DELETED","id":id})).await;
     }
-    Ok(media_titles::private_json(json!({"audit_id":audit})))
+    Ok(responses::ok_json(json!({"audit_id":audit})))
 }
 pub async fn audit(
     State(app): State<App>,
@@ -570,7 +568,7 @@ pub async fn audit(
     let rows=sqlx::query("SELECT id,actor_id,target_user_id,message_id,action,reason,floor(extract(epoch FROM created_at)*1000)::bigint AS at_ms FROM room_chat_audit WHERE room_id=$1 ORDER BY created_at DESC,id DESC LIMIT 100").bind(room).fetch_all(&mut *tx).await?;
     let items:Vec<_>=rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"actor_id":r.get::<Uuid,_>("actor_id"),"target_user_id":r.get::<Option<Uuid>,_>("target_user_id"),"message_id":r.get::<Option<Uuid>,_>("message_id"),"action":r.get::<String,_>("action"),"reason":r.get::<String,_>("reason"),"created_at":r.get::<i64,_>("at_ms")})).collect();
     commit(tx, &g).await?;
-    Ok(media_titles::private_json(json!({"items":items})))
+    Ok(responses::ok_json(json!({"items":items})))
 }
 
 pub async fn activities(
@@ -582,7 +580,7 @@ pub async fn activities(
     let rows=sqlx::query("SELECT id,media_id,media_generation,lifecycle_epoch,versioned,floor(extract(epoch FROM created_at)*1000)::bigint AS at_ms FROM room_media_activities WHERE room_id=$1 ORDER BY created_at DESC,id DESC LIMIT 50").bind(room).fetch_all(&mut *tx).await?;
     let items:Vec<_>=rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"media_id":r.get::<Uuid,_>("media_id"),"media_generation":r.get::<i64,_>("media_generation"),"lifecycle_epoch":r.get::<i64,_>("lifecycle_epoch"),"versioned":r.get::<bool,_>("versioned"),"created_at":r.get::<i64,_>("at_ms")})).collect();
     commit(tx, &g).await?;
-    Ok(media_titles::private_json(json!({"items":items})))
+    Ok(responses::ok_json(json!({"items":items})))
 }
 
 #[cfg(test)]

@@ -1,21 +1,13 @@
+import { unusedPort } from "./unused-port.mjs";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
-import { createConnection, createServer } from "node:net";
+import { createConnection } from "node:net";
 import { resolve } from "node:path";
 
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
-async function unusedPort() {
-  const listener = createServer();
-  await new Promise((done, reject) =>
-    listener.once("error", reject).listen(0, "127.0.0.1", done),
-  );
-  const port = listener.address().port;
-  await new Promise((done) => listener.close(done));
-  return port;
-}
 
 export async function verifyClosedPort(port) {
   return new Promise((done, reject) => {

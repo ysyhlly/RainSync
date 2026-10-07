@@ -281,7 +281,7 @@ pub async fn library(
     let user = auth(&app, &h, false).await?;
     let rows=sqlx::query(&format!("{} WHERE {} AND ($2::uuid IS NULL OR m.id>$2) AND strpos(lower(COALESCE(u.title,m.shared_title,m.title)),lower($3))>0 ORDER BY m.id LIMIT $4", media_titles::SELECT, media_titles::BROWSE))
         .bind(user.id).bind(query.after).bind(query.search).bind(query.limit.unwrap_or(100).clamp(1,200)).fetch_all(&app.db).await?;
-    Ok(media_titles::private_json(Value::Array(
+    Ok(responses::ok_json(Value::Array(
         rows.iter().map(media_titles::media).collect(),
     )))
 }

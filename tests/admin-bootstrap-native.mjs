@@ -1,3 +1,4 @@
+import { unusedPort } from "./fixtures/unused-port.mjs";
 // Actual first-account initialization against owned native PostgreSQL + real PTYs.
 // No existing DB, user password, production environment, or Docker daemon needed.
 import assert from "node:assert/strict";
@@ -5,7 +6,6 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { once } from "node:events";
@@ -22,13 +22,7 @@ const root = await mkdtemp(resolve(artifacts, "admin-bootstrap-"));
 // Deliberately enumerate ordinary environment fields. Do not inherit credential
 // variables such as ADMIN_PASSWORD, DATABASE_URL, or SSH/cloud secrets.
 const ordinaryEnv = { PATH: process.env.PATH, HOME: root, LANG: "C.UTF-8" };
-async function unusedPort() {
-  const listener = createServer();
-  await new Promise((done, reject) => listener.once("error", reject).listen(0, "127.0.0.1", done));
-  const port = listener.address().port;
-  await new Promise((done) => listener.close(done));
-  return port;
-}
+
 const pgPort = await unusedPort(), httpPort = await unusedPort();
 const init = spawnSync(resolve(bin, "initdb"), ["-D", root + "/data", "-A", "trust", "-U", "postgres", "--no-locale", "--encoding=UTF8"],
   { env: ordinaryEnv, encoding: "utf8", timeout: 60000 });
@@ -180,7 +174,8 @@ try {
   check(JSON.stringify((await client.query("SELECT id, username, password_hash, admin FROM users")).rows) === stored, "release entrypoint CLI route preserves existing account/hash");
 
   const origin = `http://127.0.0.1:${httpPort}`;
-  const serverEnv = { ...bootstrapEnv, SOURCE_ENCRYPTION_KEY: randomBytes(32).toString("base64"), PUBLIC_ORIGIN: origin, BIND: `127.0.0.1:${httpPort}`, MEDIA_ROOT: root, CACHE_ROOT: root + "/cache" };
+  const serverEnv = { ...bootstrapEnv, SOURCE_ENCRYPTION_KEY: randomBytes(32).toString("base64"), PUBLIC_ORIGIN: origin, BIND: `127.0.0.1:${httpPort}`, MEDIA_ROOT: root, CACHE_ROOT: root + "-cache" };
+  report.fixture_paths = { artifacts: root, media: serverEnv.MEDIA_ROOT, cache: serverEnv.CACHE_ROOT, retention: "owned fixture directories retained as evidence" };
   check(!Object.hasOwn(serverEnv, "ADMIN_PASSWORD") && !Object.hasOwn(serverEnv, "ADMIN_USERNAME"), "normal startup has no plaintext admin env");
   server = spawn(serverBinary, [], { env: serverEnv, stdio: ["ignore", "pipe", "pipe"] });
   const serverDone = once(server, "close");

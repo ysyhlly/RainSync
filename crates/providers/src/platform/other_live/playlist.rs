@@ -3,11 +3,12 @@
 use super::{
     Error, MAX_PLAYLIST_BYTES, Provider, Result, validate_playlist_url, validate_segment_url,
 };
+pub(crate) use crate::platform::live_playlist_syntax::parse_program_date_time;
+use crate::platform::live_playlist_syntax::{MAX_SEQUENCE, duration, integer, invalid};
 use reqwest::Url;
 use std::{collections::HashSet, fmt};
 const MAX_SEGMENTS: usize = 120;
 const MAX_WINDOW_MS: u64 = 180_000;
-const MAX_SEQUENCE: u64 = 9_007_199_254_740_991;
 #[derive(Clone, PartialEq, Eq)]
 pub struct Segment {
     pub sequence: u64,
@@ -163,41 +164,6 @@ impl Playlist {
         }
         Ok(output)
     }
-}
-fn invalid() -> Error {
-    Error::InvalidResponse("live_playlist_shape")
-}
-fn integer(s: &str) -> Result<u64> {
-    if s.is_empty()
-        || s.len() > 16
-        || !s.bytes().all(|b| b.is_ascii_digit())
-        || (s.len() > 1 && s.starts_with('0'))
-    {
-        return Err(invalid());
-    }
-    let n = s.parse::<u64>().map_err(|_| invalid())?;
-    if n > MAX_SEQUENCE {
-        return Err(invalid());
-    }
-    Ok(n)
-}
-fn duration(s: &str) -> Result<u32> {
-    if s.is_empty()
-        || s.len() > 16
-        || !s.bytes().all(|b| b.is_ascii_digit() || b == b'.')
-        || s.bytes().filter(|b| *b == b'.').count() > 1
-    {
-        return Err(invalid());
-    }
-    let value = s.parse::<f64>().map_err(|_| invalid())?;
-    if !value.is_finite() || !(0.001..=30.0).contains(&value) {
-        return Err(invalid());
-    }
-    let millis = (value * 1000.0).round();
-    if (value * 1000.0 - millis).abs() > 0.001 {
-        return Err(Error::Restricted("live_submillisecond_duration_denied"));
-    }
-    Ok(millis as u32)
 }
 /// Only a media playlist with clear full TS segments is admitted. Masters, LL-HLS,
 /// maps, byte ranges, encryption (even METHOD=NONE), variable substitution,
@@ -501,98 +467,6 @@ impl RollingWindow {
         self.latest = Some(next);
         Ok(())
     }
-}
-/// Strict RFC3339 milliseconds for source validation only. The first slice does
-/// not expose a frame-aligned time map merely because a playlist supplies PDT.
-pub(crate) fn parse_program_date_time(value: &str) -> Result<i64> {
-    if !value.is_ascii() || !(20..=29).contains(&value.len()) {
-        return Err(invalid());
-    }
-    let b = value.as_bytes();
-    if b.get(4) != Some(&b'-')
-        || b.get(7) != Some(&b'-')
-        || b.get(10) != Some(&b'T')
-        || b.get(13) != Some(&b':')
-        || b.get(16) != Some(&b':')
-    {
-        return Err(invalid());
-    }
-    let number = |start: usize, end: usize| -> Result<i64> {
-        let s = value.get(start..end).ok_or_else(invalid)?;
-        if !s.bytes().all(|n| n.is_ascii_digit()) {
-            return Err(invalid());
-        }
-        s.parse().map_err(|_| invalid())
-    };
-    let (year, month, day, hour, minute, second) = (
-        number(0, 4)?,
-        number(5, 7)?,
-        number(8, 10)?,
-        number(11, 13)?,
-        number(14, 16)?,
-        number(17, 19)?,
-    );
-    if !(2000..=2099).contains(&year)
-        || !(1..=12).contains(&month)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return Err(invalid());
-    }
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let maxday = match month {
-        2 => {
-            if leap {
-                29
-            } else {
-                28
-            }
-        }
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    };
-    if !(1..=maxday).contains(&day) {
-        return Err(invalid());
-    }
-    let mut index = 19;
-    let mut fraction = 0;
-    if b.get(index) == Some(&b'.') {
-        index += 1;
-        let start = index;
-        while b.get(index).is_some_and(|n| n.is_ascii_digit()) {
-            index += 1;
-        }
-        let count = index - start;
-        if !(1..=3).contains(&count) {
-            return Err(invalid());
-        }
-        fraction = number(start, index)? * 10i64.pow((3 - count) as u32);
-    }
-    let offset = match b.get(index) {
-        Some(b'Z') if index + 1 == b.len() => 0,
-        Some(sign @ (b'+' | b'-')) if index + 6 == b.len() && b[index + 3] == b':' => {
-            let h = number(index + 1, index + 3)?;
-            let m = number(index + 4, index + 6)?;
-            if h > 14 || m > 59 || h == 14 && m != 0 {
-                return Err(invalid());
-            }
-            (h * 3600 + m * 60) * if *sign == b'+' { 1 } else { -1 }
-        }
-        _ => return Err(invalid()),
-    };
-    // Gregorian days from civil, epoch 1970-01-01 (Howard Hinnant algorithm).
-    let y = year - if month <= 2 { 1 } else { 0 };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = month + if month > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Ok(
-        ((era * 146097 + doe - 719468) * 86400 + hour * 3600 + minute * 60 + second - offset)
-            * 1000
-            + fraction,
-    )
 }
 #[cfg(test)]
 mod freshness_tests {

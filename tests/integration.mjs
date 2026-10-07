@@ -51,7 +51,7 @@ const env = {
   BIND: "127.0.0.1:18080",
   WORKER_BIND: "127.0.0.1:18081",
   MEDIA_ROOT: root,
-  CACHE_ROOT: resolve(root, "cache"),
+  CACHE_ROOT: `${root}-cache`,
   RUST_LOG: "warn",
 };
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1010,6 +1010,7 @@ try {
   }
   probeMetadata = undefined;
   await writeFile(resolve(root, "mock-http-requests.json"), JSON.stringify(mockRequests, null, 2));
+  await writeFile(resolve(root, "fixture-paths.json"), JSON.stringify({ artifacts: root, media: env.MEDIA_ROOT, cache: env.CACHE_ROOT, retention: "owned fixture directories retained as evidence" }, null, 2));
   console.log("PASS: remote auto probes and selects direct/remux/transcode");
   for (const kind of ["jellyfin", "emby"]) {
     const source = await admin.request("/sources", "POST", {

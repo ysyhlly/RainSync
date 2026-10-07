@@ -1,3 +1,4 @@
+use crate::responses::private_json;
 use crate::*;
 use axum::extract::Query;
 
@@ -12,10 +13,6 @@ const FIELDS: &str = "SELECT i.id,i.batch_id,i.code_suffix,i.used_by, b.created_
     WHEN i.expires_at<=clock_timestamp() THEN 'expired' ELSE 'unused' END AS status \
     FROM registration_invites i JOIN registration_invite_batches b ON b.id=i.batch_id \
     LEFT JOIN users u ON u.id=i.used_by LEFT JOIN user_profiles p ON p.user_id=u.id";
-
-pub fn private_json(status: StatusCode, value: Value) -> Response {
-    (status, [(header::CACHE_CONTROL, "no-store")], Json(value)).into_response()
-}
 
 fn new_code() -> String {
     let mut random = [0u8; 20];

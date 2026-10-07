@@ -8,6 +8,17 @@ import { RequestFailure } from "../../errors";
 type ServerIdentity = Pick<Identity, "id" | "username" | "admin" | "csrf"> &
   Partial<Profile> &
   Partial<Pick<Identity, "guest" | "guest_room_id" | "guest_expires_at">>;
+export class RegistrationConfirmationRequired extends Error {
+  constructor(
+    readonly receipt: Pick<Identity, "id" | "username">,
+    cause: unknown,
+  ) {
+    super("账号已创建，登录状态尚未确认，请使用刚设置的账号登录确认", {
+      cause,
+    });
+    this.name = "RegistrationConfirmationRequired";
+  }
+}
 export const useSession = defineStore("session", () => {
   const user = ref<Identity | null>(null),
     epoch = ref(0),
@@ -194,12 +205,23 @@ export const useSession = defineStore("session", () => {
         input,
         active,
       );
-      active.throwIfAborted();
-      return readIdentity(active, {
-        username: input.username,
-        csrf: result.csrf,
-        id: result.id,
-      });
+      if (!result?.id || result.username !== input.username)
+        throw new TypeError("注册响应不完整，请先确认账号创建结果");
+      try {
+        active.throwIfAborted();
+        return await readIdentity(active, {
+          username: input.username,
+          csrf: result.csrf,
+          id: result.id,
+        });
+      } catch (cause) {
+        // A failed identity read cannot turn a committed signup back into a
+        // safely retryable creation. Keep its identity receipt without logging in.
+        throw new RegistrationConfirmationRequired(
+          { id: result.id, username: result.username },
+          cause,
+        );
+      }
     }, signal);
   }
   function guest(

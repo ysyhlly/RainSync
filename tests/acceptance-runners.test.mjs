@@ -8,12 +8,10 @@ import {
   calibrateClock,
   applyCalibration,
   resourceTrends,
-  syncSummary,
 } from "../scripts/acceptance-measurements.mjs";
 import { digestJson } from "../scripts/release-evidence.mjs";
 import {
   redactEvidence,
-  createJournal,
   boundedCall,
 } from "../scripts/acceptance-runtime.mjs";
 import {
@@ -1063,4 +1061,45 @@ test("redaction removes source-key and database assignments from free-text failu
     redactEvidence(`source_sha256=${safe} source_key_sha256=${safe}`),
     `source_sha256=${safe} source_key_sha256=${safe}`,
   );
+});
+
+test("upstream reconciliation locks current resource before exact authorization and defers busy grants", async () => {
+  const source = await readFile(new URL("../crates/persistence/src/upstream_reservations.rs", import.meta.url), "utf8");
+  const reconcile = source.slice(source.indexOf("pub async fn reconcile("), source.indexOf("pub async fn recover("));
+  const cte = reconcile.match(/WITH locked_sessions AS MATERIALIZED \(([\s\S]*?)\)\s*UPDATE upstream_reservations u/);
+  assert.ok(cte, "resource-check input is an explicit materialized locking CTE");
+  const locked = cte[1].replace(/\s+/g, " ");
+  assert.match(locked, /SELECT p\.id,p\.media_id,p\.resource,p\.room_id,p\.user_id,p\.stopped,p\.expires_at,p\.generation/);
+  assert.match(locked, /candidate\.id=p\.id AND candidate\.state='active'/);
+  assert.match(locked, /ORDER BY p\.id FOR SHARE OF p SKIP LOCKED/);
+  assert.doesNotMatch(locked, /playback_source_allowed|\bLIMIT\b/);
+  const decision = reconcile.slice(reconcile.indexOf("UPDATE upstream_reservations u")).replace(/\s+/g, " ");
+  assert.match(decision, /NOT EXISTS\(SELECT 1 FROM playback_sessions present WHERE present\.id=u\.id\) OR EXISTS\(SELECT 1 FROM locked_sessions p WHERE p\.id=u\.id AND NOT EXISTS\(/);
+  assert.match(decision, /JOIN room_members m ON m\.room_id=p\.room_id AND m\.user_id=p\.user_id/);
+  assert.match(decision, /WHERE s\.room_id=p\.room_id AND NOT p\.stopped AND playback_source_allowed\(p\.media_id,p\.resource,p\.id\) AND p\.expires_at>clock_timestamp\(\) AND \(s\.state->>'media_generation'\)::bigint=p\.generation/);
+  assert.match(decision, /r\.owner_epoch=\$1 AND r\.lease_until>clock_timestamp\(\)/);
+  assert.match(decision, /cleanup_attempts>=5 OR cleanup_deadline<=clock_timestamp\(\)/);
+  const migration = await readFile(new URL("../migrations/0070_private_libraries.sql", import.meta.url), "utf8");
+  assert.match(migration, /CREATE FUNCTION playback_source_allowed\(media uuid,resource jsonb,session uuid\) RETURNS boolean LANGUAGE sql VOLATILE/);
+  assert.match(migration, /p\.id=\$3 AND p\.media_id=\$1 AND p\.resource=\$2/);
+});
+
+test("upstream policy retirement checks locked identity and resource inside existing bounded transaction", async () => {
+  const source = await readFile(new URL("../apps/server/src/upstream_policy.rs", import.meta.url), "utf8");
+  const retire = source.slice(source.indexOf("async fn retire("), source.indexOf("async fn ready("));
+  const cte = retire.match(/WITH locked_sessions AS MATERIALIZED \(([\s\S]*?)\)\s*UPDATE playback_sessions target/);
+  assert.ok(cte);
+  const locked = cte[1].replace(/\s+/g, " ");
+  assert.match(locked, /p\.resource,p\.user_id,p\.room_id,p\.auth_login_hash,p\.auth_membership_epoch,s\.kind/);
+  assert.match(locked, /WHERE NOT p\.stopped ORDER BY p\.id FOR UPDATE OF p SKIP LOCKED/);
+  assert.doesNotMatch(locked, /playback_origin_allowed|playback_source_allowed|\bLIMIT\b/);
+  const decision = retire.slice(retire.indexOf("UPDATE playback_sessions target")).replace(/\s+/g, " ");
+  assert.match(decision, /FROM locked_sessions p WHERE target\.id=p\.id AND NOT target\.stopped/);
+  assert.match(decision, /NOT playback_origin_allowed\(p\.user_id,p\.room_id,p\.auth_login_hash,p\.auth_membership_epoch\)/);
+  assert.match(decision, /p\.kind IN\('jellyfin','emby'\) AND NOT playback_source_allowed\(p\.media_id,p\.resource,p\.id\)/);
+  assert.ok(retire.indexOf("UPDATE playback_sessions target") < retire.indexOf("cancel_jobs("));
+  assert.ok(retire.indexOf("cancel_jobs(") < retire.indexOf("UPDATE upstream_reservations u"));
+  assert.match(retire, /bounded\(async/);
+  assert.match(source, /DATABASE_BUDGET: Duration = Duration::from_millis\(500\)/);
+  assert.match(source, /set_config\('statement_timeout','350ms',true\),set_config\('lock_timeout','250ms',true\)/);
 });

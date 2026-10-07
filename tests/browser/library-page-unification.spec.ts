@@ -58,6 +58,8 @@ async function privateLibraryFixture(page: Page) {
         method: request.method(),
         body: request.postDataJSON(),
       });
+    if (path === "/api/v1/libraries/issued-shares")
+      return route.fulfill({ json: { items: [], has_more: false } });
     if (path === "/api/v1/libraries")
       return route.fulfill({ json: { enabled: true, items: [detail] } });
     if (path.endsWith("/media")) return route.fulfill({ json: [app.media[0]] });

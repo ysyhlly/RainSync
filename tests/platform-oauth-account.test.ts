@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { RequestFailure } from "../apps/web/src/errors";
 import {
   createOAuthFlow,
   validateOAuthLogin,
@@ -227,4 +228,227 @@ it("Bili renewal cannot claim enabled after an uncertain rotation", () => {
   } as const;
   expect(validateBilibiliRenewal(v).state).toBe("uncertain");
   expect(() => validateBilibiliRenewal({ ...v, enabled: true })).toThrow();
+});
+
+function recoveryFlow(
+  overrides: {
+    start?: (id: string, signal: AbortSignal) => Promise<OAuthLogin>;
+    read?: (id: string, signal: AbortSignal) => Promise<OAuthLogin>;
+    current?: () => boolean;
+    now?: () => number;
+  } = {},
+) {
+  const start = vi.fn(overrides.start ?? (async () => login()));
+  const read = vi.fn(overrides.read ?? (async () => login()));
+  const change = vi.fn();
+  const cancel = vi.fn().mockResolvedValue(undefined);
+  const confirmed = vi.fn();
+  const flow = createOAuthFlow({
+    provider: "douyin",
+    current: overrides.current ?? (() => true),
+    start,
+    read,
+    poll: vi.fn(),
+    cancel,
+    change,
+    confirmed,
+    uuid: () => id,
+    now: overrides.now ?? (() => 0),
+  });
+  return { flow, start, read, change, cancel, confirmed };
+}
+
+it.each([
+  "RATE_LIMITED",
+  "PLATFORM_OAUTH_APPLICATION_CONFIGURATION_REQUIRED",
+  "PLATFORM_STORAGE_CONSENT_REQUIRED",
+  "PLATFORM_ACCOUNT_CHANGED",
+  "PLATFORM_LOGIN_IN_PROGRESS",
+])(
+  "definitive pre-creation %s can retry the same id without reading a missing request",
+  async (code) => {
+    vi.useFakeTimers();
+    const h = recoveryFlow();
+    h.start.mockRejectedValueOnce(
+      new RequestFailure({
+        error: { code, message: "private upstream fixture" },
+      }),
+    );
+    await h.flow.start();
+    expect(h.change).toHaveBeenLastCalledWith({ phase: "retryable" });
+    await h.flow.start();
+    expect(h.start).toHaveBeenCalledTimes(2);
+    expect(h.start.mock.calls.map(([requestId]) => requestId)).toEqual([
+      id,
+      id,
+    ]);
+    expect(h.read).not.toHaveBeenCalled();
+    expect(h.change).toHaveBeenLastCalledWith({
+      phase: "pending",
+      login: login(),
+    });
+    expect(JSON.stringify(h.change.mock.calls)).not.toContain(
+      "private upstream fixture",
+    );
+    await h.flow.close();
+  },
+);
+
+it("unknown creation reads first, exact missing unlocks only an explicit same-id start retry", async () => {
+  vi.useFakeTimers();
+  const h = recoveryFlow();
+  h.start.mockRejectedValueOnce(new TypeError("transport outcome unknown"));
+  h.read.mockRejectedValueOnce(
+    new RequestFailure({ error: "platform_login_request_not_found" }),
+  );
+  await h.flow.start();
+  expect(h.change).toHaveBeenLastCalledWith({ phase: "uncertain" });
+  await h.flow.start();
+  expect(h.change).toHaveBeenLastCalledWith({ phase: "retryable" });
+  expect(h.start).toHaveBeenCalledOnce();
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(h.start).toHaveBeenCalledOnce();
+  await h.flow.start();
+  expect(h.start.mock.calls.map(([requestId]) => requestId)).toEqual([id, id]);
+  expect(h.read).toHaveBeenCalledExactlyOnceWith(id, expect.any(AbortSignal));
+  expect(h.change).toHaveBeenLastCalledWith({
+    phase: "pending",
+    login: login(),
+  });
+  await h.flow.close();
+});
+
+it.each([
+  Error("platform_login_request_not_found"),
+  new RequestFailure({ error: "not_found" }),
+  new RequestFailure({ error: "rate_limited" }),
+  new RequestFailure({
+    error: "platform_oauth_application_configuration_required",
+  }),
+  new RequestFailure({
+    error: { code: "PLATFORM_LOGIN_REQUEST_CONFLICT", retryable: true },
+  }),
+  new RequestFailure({ error: "platform_login_changed" }),
+])(
+  "unconfirmed read failures never permit blind creation: %s",
+  async (error) => {
+    const h = recoveryFlow({
+      start: async () => {
+        throw Error("lost response");
+      },
+      read: async () => {
+        throw error;
+      },
+    });
+    await h.flow.start();
+    await h.flow.start();
+    await h.flow.start();
+    expect(h.start).toHaveBeenCalledOnce();
+    expect(h.read).toHaveBeenCalledTimes(2);
+    expect(h.change).toHaveBeenLastCalledWith({ phase: "uncertain" });
+    await h.flow.close();
+  },
+);
+
+it("a previously observed OAuth request disappearing expires without recreating its grant", async () => {
+  vi.useFakeTimers();
+  const h = recoveryFlow();
+  h.read.mockRejectedValue(
+    new RequestFailure({ error: "platform_login_request_not_found" }),
+  );
+  await h.flow.start();
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(h.change).toHaveBeenLastCalledWith({ phase: "expired" });
+  await h.flow.start();
+  expect(h.start).toHaveBeenCalledOnce();
+  expect(h.change).toHaveBeenLastCalledWith({ phase: "expired" });
+  await h.flow.close();
+});
+
+it("an unknown attempt cannot recreate a missing request beyond its original lifetime", async () => {
+  let now = 0;
+  const h = recoveryFlow({ now: () => now });
+  h.start.mockRejectedValueOnce(Error("lost response"));
+  h.read.mockRejectedValue(
+    new RequestFailure({ error: "platform_login_request_not_found" }),
+  );
+  await h.flow.start();
+  now = 180001;
+  await h.flow.start();
+  expect(h.change).toHaveBeenLastCalledWith({ phase: "expired" });
+  await h.flow.start();
+  expect(h.start).toHaveBeenCalledOnce();
+  await h.flow.close();
+});
+
+it("close after an absent read fences a delayed start using the original cancellation id", async () => {
+  const h = recoveryFlow();
+  h.start.mockRejectedValueOnce(Error("lost response"));
+  h.read.mockRejectedValueOnce(
+    new RequestFailure({ error: "platform_login_request_not_found" }),
+  );
+  await h.flow.start();
+  await h.flow.start();
+  await h.flow.close();
+  await h.flow.start();
+  expect(h.cancel).toHaveBeenCalledExactlyOnceWith(id);
+  expect(h.start).toHaveBeenCalledOnce();
+});
+
+it.each(["close", "identity"])(
+  "a late absent read cannot unlock retry after %s",
+  async (ending) => {
+    let current = true;
+    let reject!: (error: unknown) => void;
+    const reading = new Promise<OAuthLogin>((_, no) => {
+      reject = no;
+    });
+    const h = recoveryFlow({ current: () => current, read: () => reading });
+    h.start.mockRejectedValueOnce(Error("lost response"));
+    await h.flow.start();
+    const retry = h.flow.start();
+    if (ending === "identity") current = false;
+    await h.flow.close();
+    const count = h.change.mock.calls.length;
+    reject(new RequestFailure({ error: "platform_login_request_not_found" }));
+    await retry;
+    await h.flow.start();
+    expect(h.change).toHaveBeenCalledTimes(count);
+    expect(h.start).toHaveBeenCalledOnce();
+    expect(h.confirmed).not.toHaveBeenCalled();
+    expect(h.cancel).toHaveBeenCalledTimes(ending === "close" ? 1 : 0);
+  },
+);
+
+it("same-id retry permission expires without extending the original recovery deadline", async () => {
+  let now = 0;
+  const h = recoveryFlow({ now: () => now });
+  h.start.mockRejectedValueOnce(Error("lost response"));
+  h.read.mockRejectedValueOnce(
+    new RequestFailure({ error: "platform_login_request_not_found" }),
+  );
+  await h.flow.start();
+  await h.flow.start();
+  expect(h.change).toHaveBeenLastCalledWith({ phase: "retryable" });
+  now = 180001;
+  await h.flow.start();
+  expect(h.change).toHaveBeenLastCalledWith({ phase: "expired" });
+  expect(h.start).toHaveBeenCalledOnce();
+  expect(h.read).toHaveBeenCalledOnce();
+  await h.flow.close();
+});
+
+it("a malformed successful creation response still queries before any retry", async () => {
+  const h = recoveryFlow();
+  h.start.mockResolvedValueOnce(login({ provider: "tiktok" }));
+  h.read.mockResolvedValueOnce(
+    login({ status: "confirmed", authorization_url: null }),
+  );
+  await h.flow.start();
+  expect(h.change).toHaveBeenLastCalledWith({ phase: "uncertain" });
+  await h.flow.start();
+  expect(h.start).toHaveBeenCalledOnce();
+  expect(h.read).toHaveBeenCalledExactlyOnceWith(id, expect.any(AbortSignal));
+  expect(h.confirmed).toHaveBeenCalledOnce();
+  await h.flow.close();
 });

@@ -41,6 +41,8 @@ async function fixture(page: Page, enabled = true) {
   await page.route("**/api/v1/libraries**", async (route) => {
     const path = new URL(route.request().url()).pathname,
       method = route.request().method();
+    if (path === "/api/v1/libraries/issued-shares")
+      return route.fulfill({ json: { items: [], has_more: false } });
     if (path === "/api/v1/libraries")
       return route.fulfill({ json: { enabled, items: [detail()] } });
     if (path === "/api/v1/libraries/private/media")

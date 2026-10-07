@@ -3,7 +3,6 @@ import { defineStore } from "pinia";
 import {
   Clock,
   reconnectDelay,
-  target,
 } from "../../../../../packages/sync-engine";
 import type { RoomState } from "../../../../../packages/protocol";
 import type {
@@ -16,11 +15,11 @@ import type {
   RoomPermission,
   RoomPermissionSnapshot,
   RoomInvitePolicy,
-  Media,
 } from "../../shared/api/types";
 import { RequestFailure, stopsReconnect } from "../../errors";
 import { StaleIdentity } from "../../shared/api/client";
 import { PlaybackCancelled } from "../../playback-request";
+import { actionErrorMessage } from "../../shared/action-error";
 import { useMediaCatalog } from "../library/media-catalog.store";
 import { useSession } from "../auth/session.store";
 import { usePlatformAccount } from "../account/platform-account.store";
@@ -248,7 +247,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     run,
     ended: (position_ms) => send("END_MEDIA", { position_ms }),
   });
-  const { video, position, waiting, blocked, applyState, loadMedia } = playback;
+  const { video, position, waiting, blocked, applyState } = playback;
   const owner = computed(
     () =>
       roomActive.value &&
@@ -300,7 +299,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
         !(e instanceof PlaybackCancelled) &&
         !(e instanceof StaleIdentity)
       )
-        error.value = e instanceof Error ? e.message : String(e);
+        error.value = actionErrorMessage(e);
     } finally {
       pendingActions.delete(token);
       busy.value = pendingActions.size > 0;
@@ -320,6 +319,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     busy.value = false;
     ++playlistRequest;
     playlistPending = undefined;
+    playlistInvalidation = undefined;
     playlistLoading.value = false;
     playlistLoaded.value = false;
     playlistError.value = "";
@@ -534,6 +534,10 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       }
       if (!v.state && typeof v.control_epoch?.id === "string")
         controlEpoch = v.control_epoch.id;
+      if (v.type === "PLAYLIST_CHANGED") {
+        invalidatePlaylist();
+        return;
+      }
       if (v.type === "ROOM_PERMISSIONS_CHANGED") {
         if (v.user_id === session.user?.id) {
           delegatedPermissions.value = [];
@@ -629,6 +633,9 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           !snapshotReady || old?.clock_epoch !== next.clock_epoch;
         snapshotReady = true;
         state.value = next;
+        // Queue changes do not change media revision. Recover edits made while
+        // disconnected (and a lagged invalidation) on every accepted snapshot.
+        if (v.type === "SNAPSHOT") invalidatePlaylist();
         if (v.type === "SNAPSHOT" && recoveryFence) {
           // State/owner/lifecycle/control epoch are now applied. Calibration and
           // media work are independent; telemetry cannot delay either of them.
@@ -677,7 +684,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           old.live?.broadcast_id !== next.live?.broadcast_id
         ) {
           playback.mediaChanged();
-          void refreshPlaylist().catch(() => {});
+          if (v.type !== "SNAPSHOT") invalidatePlaylist();
         } else if (v.action?.type === "SEEK")
           void run(() => applyState(true, true), true);
         else {
@@ -791,6 +798,36 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     queuePendingKeys = ref<string[]>([]);
   let playlistRequest = 0,
     playlistPending: Promise<void> | undefined;
+  let playlistInvalidation: { dirty: boolean } | undefined;
+  function invalidatePlaylist() {
+    const selected = room.value?.id;
+    if (!selected) return;
+    if (playlistInvalidation) {
+      playlistInvalidation.dirty = true;
+      return;
+    }
+    const operation = { dirty: true },
+      serial = roomSerial,
+      identity = session.epoch;
+    playlistInvalidation = operation;
+    const current = () =>
+      playlistInvalidation === operation &&
+      serial === roomSerial &&
+      identity === session.epoch &&
+      room.value?.id === selected;
+    void (async () => {
+      while (current() && operation.dirty) {
+        operation.dirty = false;
+        // A read already in flight may predate the committed edit. Wait for it,
+        // then perform a fresh filtered read; bursts share one trailing refresh.
+        await playlistPending?.catch(() => {});
+        if (!current()) return;
+        await refreshPlaylist().catch(() => {});
+      }
+    })().finally(() => {
+      if (playlistInvalidation === operation) playlistInvalidation = undefined;
+    });
+  }
   const queueOperations = new Map<string, Promise<void>>();
   function queueReceipt(kind: "add" | "remove", id: string) {
     return queueReceipts.value[`${kind}:${id}`] ?? "";

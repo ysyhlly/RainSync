@@ -1,6 +1,4 @@
-import { readFileSync } from "node:fs";
-import { parse, compileScript } from "@vue/compiler-sfc";
-import ts from "typescript";
+import { mountSetup } from "./helpers/mount-setup";
 import * as Vue from "vue";
 import { expect, it, vi } from "vitest";
 import { privateLibraryApi } from "../apps/web/src/features/private-library/private-library.api";
@@ -38,37 +36,14 @@ async function page() {
         _signal?: AbortSignal,
       ): Promise<any> => {
         if (path === "/libraries") return { enabled: true, items: [library()] };
+        if (path.startsWith("/libraries/issued-shares"))
+          return { items: [], has_more: false };
         if (path.includes("/media?")) return [];
         return library(path.split("/")[2]);
       },
     ),
   });
-  const source = readFileSync(
-    new URL(
-      "../apps/web/src/features/private-library/PrivateLibrariesPage.vue",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  const script = compileScript(parse(source).descriptor, {
-    id: "private-library-fixture",
-  }).content;
-  const js = ts
-    .transpileModule(script, {
-      compilerOptions: {
-        target: ts.ScriptTarget.ES2022,
-        module: ts.ModuleKind.ESNext,
-      },
-    })
-    .outputText.replace(/import[\s\S]*?from\s+["'][^"']+["'];?\s*/g, "")
-    .replace("export default", "return");
   const imports = {
-    _defineComponent: Vue.defineComponent,
-    ref: Vue.ref,
-    computed: Vue.computed,
-    watch: Vue.watch,
-    onMounted: Vue.onMounted,
-    onBeforeUnmount: Vue.onBeforeUnmount,
     useRoute: () => ({ query: {} }),
     useSession: () => session,
     useRoomRuntime: () => ({ room: null }),
@@ -80,34 +55,16 @@ async function page() {
     SourceSettingsDialog: {},
     LibraryBrowser: {},
   };
-  const component = new Function(...Object.keys(imports), js)(
-    ...Object.values(imports),
+  const { controls, unmount } = mountSetup(
+    new URL(
+      "../apps/web/src/features/private-library/PrivateLibrariesPage.vue",
+      import.meta.url,
+    ),
+    imports,
   );
-  let controls: any;
-  const setup = component.setup;
-  component.setup = (props: unknown, context: unknown) => {
-    controls = setup(props, context);
-    return () => null;
-  };
-  const renderer = Vue.createRenderer<any, any>({
-    patchProp() {},
-    insert(node, parent) {
-      node.parent = parent;
-    },
-    remove() {},
-    createElement: () => ({}),
-    createText: () => ({}),
-    createComment: () => ({}),
-    setText() {},
-    setElementText() {},
-    parentNode: (node) => node.parent,
-    nextSibling: () => null,
-  });
-  const app = renderer.createApp(component);
-  app.mount({});
   await vi.waitFor(() => expect(controls.selected.value?.id).toBe("private"));
   session.api.mockClear();
-  return { controls, session, unmount: () => app.unmount() };
+  return { controls, session, unmount };
 }
 
 it.each([
@@ -387,3 +344,182 @@ it("restores the least-broad sharing draft when the active account changes", asy
   expect(p.controls.minutes.value).toBe(120);
   p.unmount();
 });
+
+it("lets a former library member confirm withdrawal without selecting an inaccessible library", async () => {
+  const p = await page();
+  const share = {
+    id: "mine",
+    library_id: "expired",
+    revision: "7",
+    media_id: "media",
+    room_id: "room",
+    title: null,
+    mode: "room_members",
+    expires_at: Date.now() + 60_000,
+    active: false,
+  };
+  p.controls.selected.value = null;
+  p.controls.issuedShares.value = [share];
+  p.controls.requestWithdrawal(share);
+  expect(p.controls.withdrawalOpen.value).toBe(true);
+  expect(p.session.api).not.toHaveBeenCalled();
+  p.controls.withdrawalOpen.value = false;
+  await p.controls.confirmWithdrawal();
+  expect(p.session.api).not.toHaveBeenCalled();
+  p.controls.requestWithdrawal(share);
+  await p.controls.confirmWithdrawal();
+  expect(p.session.api).toHaveBeenCalledWith(
+    "/libraries/expired/room-shares/mine",
+    "DELETE",
+    { expected_revision: "7" },
+  );
+  expect(p.controls.withdrawalOpen.value).toBe(false);
+  await p.controls.confirmWithdrawal();
+  expect(
+    p.session.api.mock.calls.filter((call) => call[1] === "DELETE"),
+  ).toHaveLength(1);
+  p.unmount();
+});
+
+it("refreshes a conflicting own-share revision without retrying the withdrawal", async () => {
+  const p = await page();
+  const share = {
+    id: "mine",
+    library_id: "private",
+    revision: "7",
+    media_id: "media",
+    room_id: "room",
+    title: null,
+    mode: "room_members",
+    expires_at: Date.now() + 60_000,
+    active: true,
+  };
+  p.controls.issuedShares.value = [share];
+  p.session.api.mockImplementation(async (path, method = "GET") => {
+    if (method === "DELETE") throw new Error("revision conflict");
+    if (path === "/libraries/issued-shares")
+      return { items: [{ ...share, revision: "8" }], has_more: false };
+    return library();
+  });
+  p.controls.requestWithdrawal(share);
+  await p.controls.confirmWithdrawal();
+  await p.controls.confirmWithdrawal();
+  expect(p.controls.error.value).toContain("分享记录已变化");
+  expect(
+    p.session.api.mock.calls.filter((call) => call[1] === "DELETE"),
+  ).toHaveLength(1);
+  p.session.epoch++;
+  expect(p.controls.withdrawalOpen.value).toBe(false);
+  expect(p.controls.issuedShares.value).toEqual([]);
+  p.unmount();
+});
+
+it("discards an issued-share response after an identity switch", async () => {
+  const p = await page();
+  let resolve!: (value: unknown) => void;
+  p.session.api.mockImplementation(
+    () =>
+      new Promise((done) => {
+        resolve = done;
+      }),
+  );
+  const loading = p.controls.loadIssuedShares();
+  p.session.epoch++;
+  resolve({ items: [{ id: "previous-account-share" }], has_more: true });
+  await loading;
+  expect(p.controls.issuedShares.value).toEqual([]);
+  expect(p.controls.issuedHasMore.value).toBe(false);
+  expect(p.controls.issuedBusy.value).toBe(false);
+  p.unmount();
+});
+
+it.each(["http", "s3"])(
+  "uses the scoped settings and deletion routes for shared %s",
+  async (kind) => {
+    const p = await page();
+    p.controls.selected.value.visibility = "instance_shared";
+    const source = {
+      id: "shared-source",
+      name: "Shared source",
+      kind,
+      revision: "4",
+      access_policy_revision: 1,
+    };
+    p.controls.selected.value.sources = [source];
+    p.session.api.mockImplementation(async (path, method = "GET") => {
+      if (path.endsWith("/sources/shared-source") && method === "GET")
+        return {
+          ...source,
+          config: { url: "https://fixture.example", s3: { bucket: "fixture" } },
+          credentials: {},
+        };
+      if (path === "/libraries/issued-shares")
+        return { items: [], has_more: false };
+      if (path === "/libraries") return { enabled: true, items: [library()] };
+      return library();
+    });
+    await p.controls.editSource(source);
+    if (kind === "s3")
+      expect(p.session.api).toHaveBeenCalledWith(
+        "/libraries/private/sources/shared-source",
+        "GET",
+        undefined,
+        expect.any(AbortSignal),
+      );
+    else expect(p.controls.settingsSource.value).toEqual(source);
+    p.controls.requestChange("deleteSource", source.id, source.name);
+    await p.controls.confirmChange();
+    expect(p.session.api).toHaveBeenCalledWith(
+      "/libraries/private/sources/shared-source",
+      "DELETE",
+      { expected_revision: "4", expected_library_revision: "1" },
+    );
+    p.unmount();
+  },
+);
+
+it.each([
+  {},
+  { items: null, has_more: false },
+  { items: [], has_more: "false" },
+  { items: [], has_more: true },
+  { items: [null], has_more: false },
+  { items: [{ id: "incomplete-share" }], has_more: false },
+])(
+  "keeps valid library and share state when an issued-share page is malformed: %j",
+  async (malformed) => {
+    const p = await page();
+    const share = {
+      id: "mine",
+      library_id: "private",
+      revision: "7",
+      media_id: "media",
+      room_id: "room",
+      title: null,
+      mode: "room_members",
+      expires_at: Date.now() + 60_000,
+      active: false,
+    };
+    p.controls.issuedShares.value = [share];
+    p.controls.issuedHasMore.value = true;
+    p.session.api
+      .mockResolvedValueOnce(malformed)
+      .mockResolvedValueOnce({ items: [share], has_more: false });
+    await p.controls.loadIssuedShares();
+    expect(p.controls.selected.value.id).toBe("private");
+    expect(p.controls.issuedShares.value).toEqual([share]);
+    expect(p.controls.issuedHasMore.value).toBe(true);
+    expect(p.controls.issuedError.value).toBe(
+      "分享列表响应不完整，请刷新分享后重试",
+    );
+    expect(p.controls.issuedBusy.value).toBe(false);
+    await p.controls.loadIssuedShares();
+    expect(p.controls.issuedShares.value).toEqual([share]);
+    expect(p.controls.issuedError.value).toBe("");
+    expect(p.controls.issuedHasMore.value).toBe(false);
+    expect(p.session.api.mock.calls.every((call) => call[1] === "GET")).toBe(
+      true,
+    );
+    p.unmount();
+  },
+);

@@ -16,6 +16,7 @@ import {
   validatePlatformAccountCheck,
 } from "./platform-account-check";
 import { createYoutubeAccountStore } from "./youtube-account.store";
+import { createAccountRequestSlot } from "./account-request-slot";
 export const usePlatformAccount = defineStore("platform-account", () => {
   const session = useSession(),
     status = ref<PlatformAccountStatus>(),
@@ -28,24 +29,31 @@ export const usePlatformAccount = defineStore("platform-account", () => {
       douyin: 0,
       tiktok: 0,
     });
-  const shortWork: Record<
-    ShortPlatformProvider,
-    {
-      serial: number;
-      controller: AbortController;
-      pending?: Promise<ShortPlatformAccountStatus>;
-      mutation?: Promise<ShortPlatformAccountStatus>;
-    }
-  > = {
-    douyin: { serial: 0, controller: new AbortController() },
-    tiktok: { serial: 0, controller: new AbortController() },
-  };
-  let pending: Promise<PlatformAccountStatus> | undefined,
-    mutation: Promise<PlatformAccountStatus | PlatformAccountCheck> | undefined,
-    controller = new AbortController(),
-    serial = 0;
   const api = platformAccountApi(session.api);
   const youtube = createYoutubeAccountStore(session);
+  const biliWork = createAccountRequestSlot({
+    epoch: () => session.epoch,
+    cached: (force) => (force ? undefined : status.value),
+    read: api.status,
+    accept,
+    timeoutMs: 30000,
+    busyMessage: "平台账号操作尚未确认，请稍后刷新状态",
+  });
+  const shortWork = {
+    douyin: createShortWork("douyin"),
+    tiktok: createShortWork("tiktok"),
+  };
+  function createShortWork(provider: ShortPlatformProvider) {
+    return createAccountRequestSlot({
+      epoch: () => session.epoch,
+      cached: () => shortStatuses.value[provider],
+      read: (signal) =>
+        shortPlatformAccountApi(session.api, provider).status(signal),
+      accept: (value) => acceptShort(provider, value),
+      timeoutMs: 20000,
+      busyMessage: "平台账号操作尚未确认，请稍后刷新状态",
+    });
+  }
   function accept(value: PlatformAccountStatus) {
     value = validatePlatformAccountStatus(value);
     const old = status.value;
@@ -61,75 +69,14 @@ export const usePlatformAccount = defineStore("platform-account", () => {
     }
     return value;
   }
-  function refresh(force = false): Promise<PlatformAccountStatus> {
-    if (mutation) {
-      const epoch = session.epoch;
-      return mutation
-        .catch(() => undefined)
-        .then(() => {
-          if (epoch !== session.epoch) throw new StaleIdentity();
-          return refresh(force);
-        });
-    }
-    if (pending) return pending;
-    if (!force && status.value) return Promise.resolve(status.value);
-    const epoch = session.epoch,
-      generation = serial,
-      signal = controller.signal;
-    const work = api
-      .status(signal)
-      .then((value) => {
-        if (epoch !== session.epoch || generation !== serial || signal.aborted)
-          throw new StaleIdentity();
-        return accept(value);
-      })
-      .finally(() => {
-        if (pending === work) pending = undefined;
-      });
-    pending = work;
-    return work;
-  }
-  function mutateBili<T extends PlatformAccountStatus | PlatformAccountCheck>(
-    action: (signal: AbortSignal) => Promise<T>,
-    publish: (value: T) => T,
-    external?: AbortSignal,
-  ): Promise<T> {
-    if (mutation)
-      return Promise.reject(Error("平台账号操作尚未确认，请稍后刷新状态"));
-    ++serial;
-    controller.abort();
-    controller = new AbortController();
-    pending = undefined;
-    const epoch = session.epoch,
-      generation = serial,
-      signal = AbortSignal.any([
-        controller.signal,
-        AbortSignal.timeout(30000),
-        ...(external ? [external] : []),
-      ]);
-    const request = Promise.resolve()
-      .then(() => {
-        signal.throwIfAborted();
-        return action(signal);
-      })
-      .then((value) => {
-        if (session.epoch !== epoch || generation !== serial || signal.aborted)
-          throw new StaleIdentity();
-        return publish(value);
-      })
-      .finally(() => {
-        if (mutation === request) mutation = undefined;
-      });
-    mutation = request;
-    return request;
-  }
+  const refresh = biliWork.refresh;
   function unlink() {
-    return mutateBili(api.unlink, accept);
+    return biliWork.mutate(api.unlink, accept);
   }
   function checkLogin(external?: AbortSignal) {
     const observed = status.value;
     if (!observed) return Promise.reject(new StaleIdentity());
-    return mutateBili(
+    return biliWork.mutate(
       (signal) => api.check(observed.revision, signal),
       (value) => {
         value = validatePlatformAccountCheck(value);
@@ -174,47 +121,11 @@ export const usePlatformAccount = defineStore("platform-account", () => {
       };
     return value;
   }
-  function retireShort(provider: ShortPlatformProvider) {
-    const work = shortWork[provider];
-    ++work.serial;
-    work.controller.abort();
-    work.controller = new AbortController();
-    work.pending = undefined;
-    work.mutation = undefined;
-    return work;
-  }
   function refreshShort(
     provider: ShortPlatformProvider,
     force = false,
   ): Promise<ShortPlatformAccountStatus> {
-    const work = shortWork[provider];
-    if (work.mutation) {
-      const epoch = session.epoch;
-      return work.mutation
-        .catch(() => undefined)
-        .then(() => {
-          if (epoch !== session.epoch) throw new StaleIdentity();
-          return refreshShort(provider, force);
-        });
-    }
-    if (work.pending) return work.pending;
-    const cached = shortStatuses.value[provider];
-    if (!force && cached) return Promise.resolve(cached);
-    const epoch = session.epoch,
-      serial = work.serial,
-      signal = work.controller.signal;
-    const request = shortPlatformAccountApi(session.api, provider)
-      .status(signal)
-      .then((value) => {
-        if (session.epoch !== epoch || work.serial !== serial || signal.aborted)
-          throw new StaleIdentity();
-        return acceptShort(provider, value);
-      })
-      .finally(() => {
-        if (work.pending === request) work.pending = undefined;
-      });
-    work.pending = request;
-    return request;
+    return shortWork[provider].refresh(force);
   }
   function mutateShort(
     provider: ShortPlatformProvider,
@@ -222,34 +133,16 @@ export const usePlatformAccount = defineStore("platform-account", () => {
     action: (signal: AbortSignal) => Promise<ShortPlatformAccountStatus>,
     external?: AbortSignal,
   ) {
-    if (shortWork[provider].mutation)
-      return Promise.reject(Error("平台账号操作尚未确认，请稍后刷新状态"));
-    const cached = shortStatuses.value[provider];
-    if (!cached || cached.revision !== expectedRevision)
-      return Promise.reject(new StaleIdentity());
-    const work = retireShort(provider),
-      epoch = session.epoch,
-      serial = work.serial;
-    const signal = AbortSignal.any([
-      work.controller.signal,
-      AbortSignal.timeout(20000),
-      ...(external ? [external] : []),
-    ]);
-    const request = Promise.resolve()
-      .then(() => {
-        signal.throwIfAborted();
-        return action(signal);
-      })
-      .then((value) => {
-        if (session.epoch !== epoch || work.serial !== serial || signal.aborted)
+    return shortWork[provider].mutate(
+      action,
+      (value) => acceptShort(provider, value),
+      external,
+      () => {
+        const cached = shortStatuses.value[provider];
+        if (!cached || cached.revision !== expectedRevision)
           throw new StaleIdentity();
-        return acceptShort(provider, value);
-      })
-      .finally(() => {
-        if (work.mutation === request) work.mutation = undefined;
-      });
-    work.mutation = request;
-    return request;
+      },
+    );
   }
   function importShort(
     provider: ShortPlatformProvider,
@@ -283,16 +176,12 @@ export const usePlatformAccount = defineStore("platform-account", () => {
   watch(
     [() => session.epoch, () => session.user?.id, () => session.user?.csrf],
     () => {
-      controller.abort();
-      controller = new AbortController();
-      ++serial;
-      pending = undefined;
-      mutation = undefined;
+      biliWork.retire();
       status.value = undefined;
       lastCheck.value = undefined;
       ++change.value;
-      retireShort("douyin");
-      retireShort("tiktok");
+      shortWork.douyin.retire();
+      shortWork.tiktok.retire();
       shortStatuses.value = {};
       youtube.reset();
       shortChanges.value = {

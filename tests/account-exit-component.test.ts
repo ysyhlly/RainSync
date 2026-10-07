@@ -1,6 +1,4 @@
-import { readFileSync } from "node:fs";
-import { parse, compileScript } from "@vue/compiler-sfc";
-import ts from "typescript";
+import { mountSetup } from "./helpers/mount-setup";
 import * as Vue from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { expect, it, vi } from "vitest";
@@ -19,68 +17,20 @@ function panel(api: any) {
   session.api = api;
   const replace = vi.fn(),
     router = { replace };
-  const source = readFileSync(
+  const { controls, unmount } = mountSetup(
     new URL(
       "../apps/web/src/features/account/AccountExitPanel.vue",
       import.meta.url,
     ),
-    "utf8",
-  );
-  const script = compileScript(parse(source).descriptor, {
-    id: "account-exit-fixture",
-  }).content;
-  const js = ts
-    .transpileModule(script, {
-      compilerOptions: {
-        target: ts.ScriptTarget.ES2022,
-        module: ts.ModuleKind.ESNext,
-      },
-    })
-    .outputText.replace(/import[\s\S]*?from\s+["'][^"']+["'];?\s*/g, "")
-    .replace("export default", "return");
-  const component = new Function(
-    "_defineComponent",
-    "ref",
-    "watch",
-    "useRouter",
-    "useSession",
-    "useAction",
-    "Notice",
-    "AppDialog",
-    js,
-  )(
-    Vue.defineComponent,
-    Vue.ref,
-    Vue.watch,
-    () => router,
-    useSession,
-    useAction,
-    {},
-    {},
-  );
-  let controls: any;
-  const setup = component.setup;
-  component.setup = (props: any, context: any) => {
-    controls = setup(props, context);
-    return () => null;
-  };
-  const renderer = Vue.createRenderer<any, any>({
-    patchProp() {},
-    insert(node, parent) {
-      node.parent = parent;
+    {
+      useRouter: () => router,
+      useSession,
+      useAction,
+      Notice: {},
+      AppDialog: {},
     },
-    remove() {},
-    createElement: () => ({}),
-    createText: () => ({}),
-    createComment: () => ({}),
-    setText() {},
-    setElementText() {},
-    parentNode: (node) => node.parent,
-    nextSibling: () => null,
-  });
-  const app = renderer.createApp(component);
-  app.mount({});
-  return { controls, session, replace, unmount: () => app.unmount() };
+  );
+  return { controls, session, replace, unmount };
 }
 
 it("requires current ownership preflight and exact confirmation before sending account deletion", async () => {

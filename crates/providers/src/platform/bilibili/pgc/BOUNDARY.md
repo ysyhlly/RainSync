@@ -61,6 +61,17 @@ entitlement, DRM, encryption, identity mismatch and malformed track cases.
   filtering both apply. A ceiling with no compatible stream fails; it cannot
   silently choose a higher stream or make another request.
 
+## Quality discovery and selection
+
+The server uses the same single, viewer-bound normal playback request with
+`qn=127` to discover every admitted clear AVC rendition, independently of the
+selected pixel ceiling. The provider's whole-playback, exact-content and
+returned-current-quality checks remain mandatory; advertised qualities without
+an admitted track never become menu options. Auto still selects at most 1080p.
+Manual downgrades keep the complete authorized menu, and selecting an upgrade
+performs fresh discovery with the same account and identity checks. No denied
+request is retried, and no alternate account or route is used for discovery.
+
 ## Bounds and remaining gates
 
 JSON: 2 MiB and unique object keys; metadata: 2,000 episodes/100 sections;

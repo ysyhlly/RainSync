@@ -10,7 +10,7 @@ pub async fn value(app: &App, id: Uuid) -> Result<Value> {
 }
 pub async fn get_profile(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     let user = auth(&app, &h, false).await?;
-    Ok(registration::private_json(
+    Ok(responses::private_json(
         StatusCode::OK,
         value(&app, user.id).await?,
     ))
@@ -37,7 +37,7 @@ pub async fn update(
             .execute(&app.db)
             .await?;
     }
-    Ok(registration::private_json(
+    Ok(responses::private_json(
         StatusCode::OK,
         value(&app, user.id).await?,
     ))

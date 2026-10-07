@@ -435,7 +435,7 @@ pub async fn status(State(app): State<App>, headers: HeaderMap) -> Result<Respon
     guard_login_live(&mut tx, user.id, &login).await?;
     let value = status_value(row.as_ref());
     tx.commit().await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 
 #[derive(Deserialize)]
@@ -512,7 +512,7 @@ pub async fn check_login(
     else {
         let value = check_value(status_value(row.as_ref()), "none", None);
         tx.commit().await?;
-        return Ok(registration::private_json(StatusCode::OK, value));
+        return Ok(responses::private_json(StatusCode::OK, value));
     };
     let scope = account_scope(account);
     let expires_at: Option<i64> = account.get("credential_expires_at_ms");
@@ -581,7 +581,7 @@ pub async fn check_login(
         Some(checked_at),
     );
     tx.commit().await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 
 #[derive(Deserialize)]
@@ -803,7 +803,7 @@ pub async fn start_login(
         }
         let value = qr_response(&app, &request, true, None)?;
         tx.commit().await?;
-        return Ok(registration::private_json(StatusCode::OK, value));
+        return Ok(responses::private_json(StatusCode::OK, value));
     }
     // Retire expired requests and requests from a vanished originating login.
     // A live same-login request remains exclusive until cancel or expiry.
@@ -886,7 +886,7 @@ pub async fn start_login(
     let current = lock_request(&mut tx, current.scope.request_id, user.id, &login).await?;
     let value = qr_response(&app, &current, true, Some("waiting"))?;
     tx.commit().await?;
-    Ok(registration::private_json(StatusCode::CREATED, value))
+    Ok(responses::private_json(StatusCode::CREATED, value))
 }
 
 pub async fn poll_login(
@@ -911,7 +911,7 @@ pub async fn poll_login(
     if request.status != "pending" || request.operation_live || !request.ready_to_poll {
         let value = qr_response(&app, &request, false, None)?;
         tx.commit().await?;
-        return Ok(registration::private_json(StatusCode::OK, value));
+        return Ok(responses::private_json(StatusCode::OK, value));
     }
     let Some(cipher) = request.qr_key_encrypted.as_deref() else {
         // Never recreate a QR key when its generation outcome is unknown.
@@ -919,7 +919,7 @@ pub async fn poll_login(
         request.status = "failed".into();
         let value = qr_response(&app, &request, false, None)?;
         tx.commit().await?;
-        return Ok(registration::private_json(StatusCode::OK, value));
+        return Ok(responses::private_json(StatusCode::OK, value));
     };
     let key_secret = app
         .decrypt(cipher)
@@ -1021,7 +1021,7 @@ pub async fn poll_login(
     let current = lock_request(&mut tx, id, user.id, &login).await?;
     let value = qr_response(&app, &current, false, stage)?;
     tx.commit().await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 
 pub async fn cancel_login(
@@ -1059,7 +1059,7 @@ pub async fn cancel_login(
     }
     let value = qr_response(&app, &request, false, None)?;
     tx.commit().await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 
 pub async fn unlink(State(app): State<App>, headers: HeaderMap) -> Result<Response> {
@@ -1085,7 +1085,7 @@ pub async fn unlink(State(app): State<App>, headers: HeaderMap) -> Result<Respon
     // Existing and historical native grants retain their immutable provenance.
     // The current-account SQL predicate rejects the old revision immediately;
     // delivery revalidation drains active streams without an account→room lock.
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 
 // Only locally imported web sessions are supported for these providers. Official
@@ -1141,7 +1141,7 @@ pub async fn short_status(
     guard_login_live(&mut tx, user.id, &login).await?;
     let value = short_status_value(provider, row.as_ref());
     tx.commit().await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 
 /// Deserialize-only ingress: never derive Debug or Serialize for raw cookies.
@@ -1252,7 +1252,7 @@ pub async fn import_short_credential(
         .await?;
     let value = short_status_value(provider, Some(&row));
     tx.commit().await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 
 pub async fn unlink_short(
@@ -1293,7 +1293,7 @@ pub async fn unlink_short(
     tx.commit().await?;
     // Historical grants retain immutable provenance; their stale provider-bound
     // revisions fail native_platform_source_allowed during delivery rechecks.
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 
 #[cfg(test)]

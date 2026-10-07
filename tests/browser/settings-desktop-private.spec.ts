@@ -100,6 +100,8 @@ async function fixture(
         method,
         body: req.postData() ? req.postDataJSON() : null,
       });
+    if (path === "/api/v1/libraries/issued-shares")
+      return route.fulfill({ json: { items: [], has_more: false } });
     if (path === "/api/v1/libraries")
       return route.fulfill({
         json: { enabled: true, items: removed ? [] : [detail()] },
@@ -478,11 +480,9 @@ test("private hierarchy preserves library scope when sharing a movie beyond the 
   await expect(page.locator(".media-card")).toHaveCount(24);
   await page.getByRole("button", { name: "下一页", exact: true }).click();
   await expect(page.locator(".media-card")).toHaveCount(12);
-  const card = page
-    .locator(".media-card")
-    .filter({
-      has: page.getByRole("heading", { name: "私人目录影片 54", exact: true }),
-    });
+  const card = page.locator(".media-card").filter({
+    has: page.getByRole("heading", { name: "私人目录影片 54", exact: true }),
+  });
   await card.getByRole("button", { name: "选择分享", exact: true }).click();
   await expect(
     card.getByRole("button", { name: "已选择分享", exact: true }),

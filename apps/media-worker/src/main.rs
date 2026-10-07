@@ -54,6 +54,7 @@ mod static_hls_operation_client;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../../server/src/static_hls_parent_plan.rs"]
 mod static_hls_parent_plan;
+mod static_hls_range;
 mod static_hls_read;
 mod transfer_state;
 mod upstream_output;

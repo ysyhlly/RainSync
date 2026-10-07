@@ -20,7 +20,23 @@
 
 升级前保存数据库与独立恢复材料、已部署镜像 ID、配置/密钥版本和完整迁移校验和。
 在空缓存与隔离新库中验证旧库升级，覆盖登录、播放、seek、停止、Agent 与权限回收；
-旧组件兼容必须针对实际新旧组合执行 [兼容测试入口](../tests/compatibility-rollback.mjs)。
+当前新旧组件组合使用 [隔离升级/恢复演练](../deploy/preview-transition.mjs)：
+为实际基线和候选分别提供完整冻结源码、成功构建 binding、完整迁移集与二进制摘要，
+同时在发布台账记录两个完整提交 SHA。工具拒绝同源/同二进制冒充升级；
+升级后的迁移集合不被旧版本支持时，从原备份恢复到独立新库再运行旧版本。
+不修改 SQLx 的未知版本或校验和检查来让旧二进制通过。
+
+[近期基线 SQL 回归](../tests/current-baseline-upgrade.test.mjs) 固定
+`bc0f9f1d8683ee27be581661d0e9dde36088fe55`（0086）并记录候选 HEAD 完整 SHA，
+逐文件核对全部已发布迁移和候选字节，验证带账号/session/房间/媒体记录的 0086→0088
+升级、guest 默认关闭，以及原基线和候选备份分别恢复到新库。执行前需完整 Git 历史、
+`RAINSYNC_NATIVE_POSTGRES_BIN` 和独立的 `RAINSYNC_ARTIFACT_DIR`，运行
+`node --test tests/current-baseline-upgrade.test.mjs`。此检查是合成 SQL/恢复证据，
+不代替真实登录、播放、Agent 或两组实际二进制验收。
+
+`tests/compatibility-rollback.mjs`、`tests/migration-upgrade.mjs` 与
+`scripts/prepare-compatibility.ps1` 仅保留 0019→0022 的历史账号/profile 回归。
+它们要求显式历史模式及冻结 0022 候选；不能作为当前版本兼容入口或当前通过凭据。
 失败时使用已验证的旧镜像和原备份恢复到另一个新库，切换前检查两端连接。
 不做降序迁移、不让旧二进制写入已升级的新库、不自动覆盖现有数据库。
 

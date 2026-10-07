@@ -137,8 +137,39 @@ pub async fn activate(
 /// Reconcile room, request and source authorization. Account-observed upstream
 /// grants are invalidated on restart before this maintenance loop starts.
 pub async fn reconcile(pool: &PgPool, epoch: Uuid) -> Result<()> {
-    sqlx::query("UPDATE upstream_reservations u SET state='closing',close_reason=COALESCE(close_reason,'upstream_authorization_lost'),cleanup_after=COALESCE(cleanup_after,clock_timestamp()),cleanup_deadline=COALESCE(cleanup_deadline,clock_timestamp()+interval '60 seconds'),updated_at=clock_timestamp() WHERE (u.state IN('preparing','active') AND NOT EXISTS(SELECT 1 FROM rooms life WHERE life.id=u.room_id AND life.lifecycle='active' AND life.lifecycle_epoch=u.lifecycle_epoch) OR u.state='preparing' AND (u.auth_login_hash IS NULL OR NOT playback_origin_allowed(u.user_id,u.room_id,u.auth_login_hash,u.auth_membership_epoch)) OR u.state='preparing' AND NOT EXISTS(SELECT 1 FROM playback_requests r WHERE r.user_id=u.user_id AND r.idempotency_key=u.request_key AND r.session_id=u.id AND r.status='pending' AND r.owner_epoch=$1 AND r.lease_until>clock_timestamp()) OR u.state='active' AND NOT EXISTS(SELECT 1 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN room_members m ON m.room_id=p.room_id AND m.user_id=p.user_id WHERE p.id=u.id AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource,p.id) AND p.expires_at>clock_timestamp() AND (s.state->>'media_generation')::bigint=p.generation))")
-        .bind(epoch).execute(pool).await?;
+    // The exact-resource gate is VOLATILE and reads a fresh session snapshot.
+    // Lock and retain the same current resource before calling it, otherwise a
+    // concurrent resource refresh can look like lost authority. A present row
+    // skipped for contention is deferred, never treated as a missing grant.
+    sqlx::query(
+        r#"WITH locked_sessions AS MATERIALIZED (
+            SELECT p.id,p.media_id,p.resource,p.room_id,p.user_id,p.stopped,p.expires_at,p.generation
+            FROM playback_sessions p
+            WHERE EXISTS(SELECT 1 FROM upstream_reservations candidate WHERE candidate.id=p.id AND candidate.state='active')
+            ORDER BY p.id FOR SHARE OF p SKIP LOCKED
+        )
+        UPDATE upstream_reservations u
+        SET state='closing',close_reason=COALESCE(close_reason,'upstream_authorization_lost'),
+            cleanup_after=COALESCE(cleanup_after,clock_timestamp()),
+            cleanup_deadline=COALESCE(cleanup_deadline,clock_timestamp()+interval '60 seconds'),
+            updated_at=clock_timestamp()
+        WHERE (u.state IN('preparing','active') AND NOT EXISTS(SELECT 1 FROM rooms life WHERE life.id=u.room_id AND life.lifecycle='active' AND life.lifecycle_epoch=u.lifecycle_epoch)
+            OR u.state='preparing' AND (u.auth_login_hash IS NULL OR NOT playback_origin_allowed(u.user_id,u.room_id,u.auth_login_hash,u.auth_membership_epoch))
+            OR u.state='preparing' AND NOT EXISTS(SELECT 1 FROM playback_requests r WHERE r.user_id=u.user_id AND r.idempotency_key=u.request_key AND r.session_id=u.id AND r.status='pending' AND r.owner_epoch=$1 AND r.lease_until>clock_timestamp())
+            OR u.state='active' AND (
+                NOT EXISTS(SELECT 1 FROM playback_sessions present WHERE present.id=u.id)
+                OR EXISTS(SELECT 1 FROM locked_sessions p WHERE p.id=u.id AND NOT EXISTS(
+                    SELECT 1 FROM room_snapshots s JOIN room_members m ON m.room_id=p.room_id AND m.user_id=p.user_id
+                    WHERE s.room_id=p.room_id AND NOT p.stopped
+                        AND playback_source_allowed(p.media_id,p.resource,p.id)
+                        AND p.expires_at>clock_timestamp()
+                        AND (s.state->>'media_generation')::bigint=p.generation
+                ))
+            ))"#,
+    )
+    .bind(epoch)
+    .execute(pool)
+    .await?;
     sqlx::query("UPDATE upstream_reservations SET state='closed',negotiation='not_sent',close_reason=COALESCE(close_reason,'upstream_authorization_lost'),closed_at=clock_timestamp(),updated_at=clock_timestamp() WHERE state='closing' AND negotiation='reserved'")
         .execute(pool).await?;
     sqlx::query("UPDATE upstream_reservations SET state='cleanup_failed',negotiation='unknown',close_reason=COALESCE(close_reason,'upstream_negotiation_unknown'),last_error='upstream_session_unknown',io_claim=NULL,io_kind=NULL,io_lease_until=NULL,io_observation_seq=NULL,io_observation=NULL,updated_at=clock_timestamp() WHERE negotiation='running' AND io_lease_until<=clock_timestamp()")

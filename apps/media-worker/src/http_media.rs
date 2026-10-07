@@ -182,9 +182,48 @@ fn manifest_failure(error: anyhow::Error) -> (StatusCode, String) {
     }
 }
 
+/// A range body starts at its Content-Range offset, not at the file header.
+/// Compressed media may contain arbitrary manifest-looking bytes mid-file.
+fn sniff_playback_prefix(
+    range: Option<&http_delivery::ContentRange>,
+    prefix: &[u8],
+) -> anyhow::Result<bool> {
+    if matches!(range, Some(http_delivery::ContentRange::Partial { start, .. }) if *start != 0) {
+        return Ok(false);
+    }
+    http_delivery::hls_prefix(prefix)
+}
+
 #[cfg(test)]
 mod timeline_tests {
     use super::*;
+
+    #[test]
+    fn provider_nonzero_ranges_do_not_reinterpret_payload_as_file_headers() {
+        let range = http_delivery::ContentRange::Partial {
+            start: 4096,
+            end: 8191,
+            total: Some(16384),
+        };
+        for bytes in [
+            b"<compressed media payload".as_slice(),
+            b"#EXTM3U\ncompressed media payload",
+            b"ffconcat version 1.0",
+            &[0xff, 0xfe, 0x01, 0x02],
+        ] {
+            assert!(!sniff_playback_prefix(Some(&range), bytes).unwrap());
+        }
+        let beginning = http_delivery::ContentRange::Partial {
+            start: 0,
+            end: 1023,
+            total: Some(16384),
+        };
+        for range in [None, Some(&beginning)] {
+            assert!(sniff_playback_prefix(range, b"<MPD>").is_err());
+            assert!(sniff_playback_prefix(range, b"#EXTM3U\n").unwrap());
+            assert!(!sniff_playback_prefix(range, b"\0\0\0\x18ftypisom").unwrap());
+        }
+    }
 
     #[test]
     fn complete_numbered_vod_passes_the_delivery_guard_without_rewriting_its_timeline() {
@@ -292,7 +331,8 @@ async fn prepare(
     let final_target = response.url().clone();
     let status = response.status();
     input_failure.status(status);
-    http_delivery::validate_range_response(status, response.headers()).map_err(failure)?;
+    let response_range =
+        http_delivery::validate_range_response(status, response.headers()).map_err(failure)?;
     if status == StatusCode::RANGE_NOT_SATISFIABLE {
         let mut out = Response::builder()
             .status(status)
@@ -390,12 +430,16 @@ async fn prepare(
     let sniffed = if kind == Some(Kind::Key) {
         false
     } else {
-        http_delivery::hls_prefix(&prefix).map_err(|e| {
+        sniff_playback_prefix(response_range.as_ref(), &prefix).map_err(|e| {
             input_failure.permanent();
             failure(e)
         })?
     };
     if declared || sniffed {
+        // Never rewrite a partial representation as a complete playlist.
+        if status == StatusCode::PARTIAL_CONTENT {
+            return Err(failure("partial_upstream_manifest"));
+        }
         if kind == Some(Kind::Key) {
             return Err(failure("invalid_key_manifest"));
         }

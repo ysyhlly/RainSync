@@ -42,7 +42,7 @@ pub async fn catalog(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     let rows = sqlx::query("SELECT * FROM rainsync_plugins ORDER BY id")
         .fetch_all(&app.db)
         .await?;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"api_major":1,"api_minor":0,"catalog":IDS.iter().map(|id|manifest(id)).collect::<Vec<_>>(),"installed":rows.iter().filter(|r| !r.get::<bool,_>("removed")).map(installed).collect::<Vec<_>>(),"configuration_revisions":rows.iter().map(|r|(r.get::<String,_>("id"),json!(r.get::<i64,_>("revision").to_string()))).collect::<serde_json::Map<String,Value>>(),"runtime_boundary":"仅运行编译进应用的封闭声明式扩展，无远程脚本、网络、文件、数据库或凭据权限"}),
     ))
 }
@@ -133,6 +133,18 @@ pub async fn configure(
         return Err(err(StatusCode::CONFLICT, "plugin_revision_conflict"));
     }
     let login = admin_login(&mut tx, &h, user.id).await?;
+    if let Some(row) = &previous
+        && !row.get::<bool, _>("removed")
+        && row.get::<String, _>("version") == body.version
+        && row.get::<bool, _>("enabled") == body.enabled
+        && row.get::<Value, _>("config") == body.config
+        && row.get::<Value, _>("granted_permissions") == json!(body.granted_permissions)
+    {
+        // Preserve the last meaningful rollback snapshot and CAS receipt.
+        let result = installed(row);
+        commit(tx, &login, user.id).await?;
+        return Ok(responses::ok_json(result));
+    }
     let action = if let Some(r) = &previous {
         if r.get::<bool, _>("removed") {
             "install"
@@ -157,7 +169,7 @@ pub async fn configure(
         .await?;
     let result = installed(&row);
     commit(tx, &login, user.id).await?;
-    Ok(media_titles::private_json(result))
+    Ok(responses::ok_json(result))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -208,7 +220,7 @@ pub async fn remove(
         actual + 1
     };
     commit(tx, &login, user.id).await?;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"id":id,"removed":true,"revision":removed_revision.to_string()}),
     ))
 }
@@ -266,7 +278,7 @@ pub async fn rollback(
         .await?;
     let result = installed(&row);
     commit(tx, &login, user.id).await?;
-    Ok(media_titles::private_json(result))
+    Ok(responses::ok_json(result))
 }
 fn transform(id: &str, version: &str, config: &Value, media: &Value) -> Option<Value> {
     match id {
@@ -324,7 +336,7 @@ pub async fn metadata(
     if latest != media {
         return Err(err(StatusCode::CONFLICT, "plugin_media_changed"));
     }
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"media_id":id,"extensions":output,"api_major":1}),
     ))
 }
@@ -332,7 +344,7 @@ pub async fn audit(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     let user = auth(&app, &h, false).await?;
     admin(&user)?;
     let rows=sqlx::query("SELECT id,plugin_id,revision,action,artifact_digest,floor(extract(epoch FROM created_at)*1000)::bigint AS at_ms FROM rainsync_plugin_audit ORDER BY created_at DESC,id DESC LIMIT 100").fetch_all(&app.db).await?;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"items":rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"plugin_id":r.get::<String,_>("plugin_id"),"revision":r.get::<i64,_>("revision").to_string(),"action":r.get::<String,_>("action"),"artifact_digest":r.get::<String,_>("artifact_digest"),"created_at":r.get::<i64,_>("at_ms")})).collect::<Vec<_>>()}),
     ))
 }

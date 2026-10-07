@@ -2,19 +2,21 @@
 use crate::*;
 use axum::body::{Body, to_bytes};
 use axum::extract::{
-    Request,
+    ConnectInfo, Request,
     ws::{Message, WebSocket},
 };
 use axum::middleware::Next;
 use futures_util::{SinkExt, StreamExt};
 use persistence::room_node_leases::{self as leases, Lease, Route};
 use std::collections::{BTreeMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 
 const PEER: &str = "x-rainsync-control-peer";
 const SECRET: &str = "x-rainsync-control-secret";
+const GUEST_RATE_IDENTITY: &str = "x-rainsync-control-guest-rate-identity";
 const MAX_BODY: usize = 65536;
 const MAX_RESPONSE: usize = 1048576;
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -449,7 +451,35 @@ fn node_route(path: &str) -> bool {
             | "/api/v1/metrics"
     )
 }
-pub async fn middleware(State(app): State<App>, request: Request, next: Next) -> Response {
+fn guest_rate_identity(
+    security: &account_security::Security,
+    request: &Request,
+    authenticated_peer: bool,
+) -> Result<account_security::GuestRateIdentity> {
+    if authenticated_peer {
+        // The private source is meaningful only together with the existing
+        // allowlisted-node/shared-secret authentication. Reject ambiguous or
+        // missing context rather than grouping a peer's users into one bucket.
+        let mut values = request.headers().get_all(GUEST_RATE_IDENTITY).iter();
+        let identity = values
+            .next()
+            .and_then(|value| value.to_str().ok())
+            .and_then(account_security::GuestRateIdentity::from_authenticated_peer);
+        if values.next().is_some() {
+            return Err(err(StatusCode::FORBIDDEN, "control_peer_rejected"));
+        }
+        return identity.ok_or_else(|| err(StatusCode::FORBIDDEN, "control_peer_rejected"));
+    }
+    // Public callers cannot select the private identity. Derive it from the
+    // actual socket and the same configured proxy trust used without a cluster.
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "service_unavailable"))?;
+    Ok(security.guest_rate_identity(peer.0, request.headers()))
+}
+
+pub async fn middleware(State(app): State<App>, mut request: Request, next: Next) -> Response {
     let Some(cluster) = app.control_cluster.as_ref() else {
         return next.run(request).await;
     };
@@ -469,6 +499,19 @@ pub async fn middleware(State(app): State<App>, request: Request, next: Next) ->
         };
     }
     let room = room_path(path);
+    let guest_entry = request.method() == axum::http::Method::POST
+        && path
+            .strip_prefix("/api/v1/rooms/")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(room, tail)| tail == "guest-session" && Uuid::parse_str(room).is_ok());
+    let guest_identity = if guest_entry {
+        match guest_rate_identity(&app.account_security, &request, peer) {
+            Ok(identity) => Some(identity),
+            Err(error) => return error.into_response(),
+        }
+    } else {
+        None
+    };
     let route = if path == "/api/v1/rooms" && request.method() == axum::http::Method::POST && !peer
     {
         match cluster.new_room_route().await {
@@ -494,6 +537,9 @@ pub async fn middleware(State(app): State<App>, request: Request, next: Next) ->
         };
     };
     if route.node == cluster.node() {
+        if let Some(identity) = guest_identity {
+            request.extensions_mut().insert(identity);
+        }
         return next.run(request).await;
     }
     if peer {
@@ -518,6 +564,9 @@ pub async fn middleware(State(app): State<App>, request: Request, next: Next) ->
         .header(PEER, cluster.node().to_string())
         .header(SECRET, &cluster.inner.settings.secret)
         .body(body);
+    if let Some(identity) = guest_identity {
+        outgoing = outgoing.header(GUEST_RATE_IDENTITY, identity.as_str());
+    }
     for name in [
         header::COOKIE,
         header::ORIGIN,
@@ -549,16 +598,7 @@ pub async fn middleware(State(app): State<App>, request: Request, next: Next) ->
             body.extend_from_slice(&chunk)
         }
         let mut response = Response::builder().status(status).body(Body::from(body))?;
-        for name in [
-            header::CONTENT_TYPE,
-            header::CACHE_CONTROL,
-            header::RETRY_AFTER,
-            header::VARY,
-        ] {
-            if let Some(value) = headers.get(&name) {
-                response.headers_mut().insert(name, value.clone());
-            }
-        }
+        forward_response_headers(&headers, &mut response, guest_entry);
         Ok::<_, anyhow::Error>(response)
     })
     .await;
@@ -569,6 +609,30 @@ pub async fn middleware(State(app): State<App>, request: Request, next: Next) ->
                 cluster.invalidate(room).await;
             }
             err(StatusCode::SERVICE_UNAVAILABLE, "room_owner_unavailable").into_response()
+        }
+    }
+}
+
+fn forward_response_headers(headers: &HeaderMap, response: &mut Response, guest_entry: bool) {
+    for name in [
+        header::CONTENT_TYPE,
+        header::CACHE_CONTROL,
+        header::RETRY_AFTER,
+        header::VARY,
+    ] {
+        if let Some(value) = headers.get(&name) {
+            response.headers_mut().insert(name, value.clone());
+        }
+    }
+    // A trusted room owner has already committed the new guest's invitation
+    // redemption. Its HttpOnly cookie is the only login credential; dropping it
+    // strands that membership. Keep separate Set-Cookie fields separate, and
+    // retain the closed header policy for every other route and error response.
+    if guest_entry && response.status() == StatusCode::CREATED {
+        for value in headers.get_all(header::SET_COOKIE) {
+            response
+                .headers_mut()
+                .append(header::SET_COOKIE, value.clone());
         }
     }
 }
@@ -639,6 +703,99 @@ pub async fn proxy_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn guest_rate_context_requires_authenticated_unambiguous_peer() {
+        // Use ordinary configuration without changing process-wide environment.
+        let direct_source: SocketAddr = "192.0.2.1:1234".parse().unwrap();
+        let security = account_security::Security::for_test();
+        let mut request = Request::new(Body::empty());
+        request.extensions_mut().insert(ConnectInfo(direct_source));
+        let expected = security.guest_rate_identity(direct_source, request.headers());
+        request
+            .headers_mut()
+            .insert(GUEST_RATE_IDENTITY, "a".repeat(64).parse().unwrap());
+        request
+            .headers_mut()
+            .insert("x-forwarded-for", "198.51.100.2".parse().unwrap());
+        assert_eq!(
+            guest_rate_identity(&security, &request, false).unwrap(),
+            expected
+        );
+        assert_ne!(
+            guest_rate_identity(&security, &request, true).unwrap(),
+            expected
+        );
+        request
+            .headers_mut()
+            .insert(GUEST_RATE_IDENTITY, expected.as_str().parse().unwrap());
+        assert_eq!(
+            guest_rate_identity(&security, &request, true).unwrap(),
+            expected
+        );
+        request
+            .headers_mut()
+            .append(GUEST_RATE_IDENTITY, expected.as_str().parse().unwrap());
+        assert!(guest_rate_identity(&security, &request, true).is_err());
+        request.headers_mut().remove(GUEST_RATE_IDENTITY);
+        assert!(guest_rate_identity(&security, &request, true).is_err());
+        for value in ["a".repeat(65), "G".repeat(64)] {
+            request
+                .headers_mut()
+                .insert(GUEST_RATE_IDENTITY, value.parse().unwrap());
+            assert!(guest_rate_identity(&security, &request, true).is_err());
+        }
+        request.extensions_mut().clear();
+        assert!(guest_rate_identity(&security, &request, false).is_err());
+    }
+
+    #[test]
+    fn only_successful_guest_entry_forwards_each_session_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+        headers.insert(header::CONNECTION, "close".parse().unwrap());
+        headers.insert(SECRET, "never-forward-peer-secret".parse().unwrap());
+        headers.insert(GUEST_RATE_IDENTITY, "a".repeat(64).parse().unwrap());
+        for cookie in [
+            "rainsync_session=synthetic; HttpOnly; SameSite=Strict; Path=/; Max-Age=7200; Secure",
+            "other_synthetic=value; HttpOnly; Path=/",
+        ] {
+            headers.append(header::SET_COOKIE, cookie.parse().unwrap());
+        }
+        for (guest_entry, status, expected_cookies) in [
+            (true, StatusCode::CREATED, 2),
+            (false, StatusCode::CREATED, 0),
+            (true, StatusCode::UNAUTHORIZED, 0),
+            (true, StatusCode::CONFLICT, 0),
+            (true, StatusCode::OK, 0),
+        ] {
+            let mut response = Response::builder()
+                .status(status)
+                .body(Body::empty())
+                .unwrap();
+            forward_response_headers(&headers, &mut response, guest_entry);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert!(!response.headers().contains_key(header::CONNECTION));
+            assert!(!response.headers().contains_key(SECRET));
+            assert!(!response.headers().contains_key(GUEST_RATE_IDENTITY));
+            let cookies: Vec<_> = response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .collect();
+            assert_eq!(cookies.len(), expected_cookies);
+            if expected_cookies != 0 {
+                assert_eq!(
+                    cookies,
+                    headers
+                        .get_all(header::SET_COOKIE)
+                        .iter()
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
     #[test]
     fn origins_never_accept_credentials_paths_or_remote_plaintext() {
         for origin in [

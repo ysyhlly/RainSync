@@ -189,7 +189,7 @@ async fn preview_youtube_playlist(
             false,
         ),
     };
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"items":items,"failures":failures,"truncated":truncated,"limit":imports::MAX_ITEMS}),
     ))
 }
@@ -332,7 +332,7 @@ pub async fn preview(
     // A preview cannot be published to a revoked owner or expired login.
     let tx = rooms::controller(&app, &h, room).await?;
     rooms::commit_controller(tx, &h).await?;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"items":items,"failures":failures,"truncated":truncated,"limit":imports::MAX_ITEMS}),
     ))
 }
@@ -523,7 +523,7 @@ pub async fn batch(
     // never be returned after controller/login revocation during a later item.
     let tx = rooms::controller(&app, &h, room).await?;
     rooms::commit_controller(tx, &h).await?;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"outcomes":outcomes,"stopped":stop}),
     ))
 }

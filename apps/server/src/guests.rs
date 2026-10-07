@@ -1,6 +1,6 @@
 //! Explicit, invite-bound two-hour viewers. Ordinary auth is closed to guests.
 use crate::*;
-use axum::extract::ConnectInfo;
+use axum::{Extension, extract::ConnectInfo};
 use std::net::SocketAddr;
 
 #[derive(Deserialize)]
@@ -13,22 +13,12 @@ pub struct Entry {
 pub async fn enter(
     State(app): State<App>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    forwarded_identity: Option<Extension<account_security::GuestRateIdentity>>,
     h: HeaderMap,
     Path(room_id): Path<Uuid>,
     Json(body): Json<Entry>,
 ) -> Result<Response> {
-    origin(&app, &h)?;
-    if h.get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(';').next())
-        .map(str::trim)
-        != Some("application/json")
-    {
-        return Err(err(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_media_type",
-        ));
-    }
+    account_security::anonymous_json_request(&app, &h)?;
     // Neither a registered account nor an existing guest is silently replaced.
     // Check raw live sessions, including a guest invalidated by a newer policy.
     if let Some(cookie) = cookie(&h) {
@@ -38,14 +28,10 @@ pub async fn enter(
             return Err(err(StatusCode::CONFLICT, "already_authenticated"));
         }
     }
-    account_security::rate_limit(
-        &app.db,
-        "guest-entry",
-        &app.account_security.source(peer, &h).to_string(),
-        10,
-        600,
-    )
-    .await?;
+    let identity = forwarded_identity
+        .map(|Extension(identity)| identity)
+        .unwrap_or_else(|| app.account_security.guest_rate_identity(peer, &h));
+    account_security::guest_rate_limit(&app.db, &identity).await?;
     let display_name =
         account_rules::display_name(body.display_name.as_deref())?.unwrap_or_else(|| "游客".into());
     if body.token.len() != 64 || !body.token.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -98,15 +84,11 @@ pub async fn enter(
         .bind(id).bind(room_id).bind(hash(&login)).bind(&display_name).fetch_one(&mut *tx).await?;
     persistence::room_invites::redeem(&mut tx, room_id, id, &invitation)
         .await
-        .map_err(|e| match e.to_string().as_str() {
-            "invalid_invite" => err(StatusCode::FORBIDDEN, "invalid_invite"),
-            "room_full" => err(StatusCode::CONFLICT, "room_full"),
-            _ => e.into(),
-        })?;
+        .map_err(rooms::redeem_error)?;
     sqlx::query("INSERT INTO sessions(token_hash,user_id,csrf,expires_at) SELECT login_hash,user_id,$2,expires_at FROM guest_principals WHERE user_id=$1")
         .bind(id).bind(&csrf).execute(&mut *tx).await?;
     tx.commit().await?;
-    let mut response = registration::private_json(
+    let mut response = responses::private_json(
         StatusCode::CREATED,
         json!({"id":id,"username":username,"display_name":display_name,"admin":false,"csrf":csrf,"avatar_url":null,"avatar_version":null,"guest":true,"guest_room_id":room_id,"guest_expires_at":expires}),
     );
@@ -169,7 +151,7 @@ pub async fn access(
     .fetch_one(&app.db)
     .await?;
     let global:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM admin_settings WHERE singleton AND COALESCE(guests_enabled,false))").fetch_one(&app.db).await?;
-    Ok(registration::private_json(
+    Ok(responses::private_json(
         StatusCode::OK,
         json!({"enabled":enabled,"guests_enabled":global,"session_ttl_seconds":7200,"invite_required":true}),
     ))
@@ -186,7 +168,7 @@ pub async fn set_access(
     sqlx::query("INSERT INTO room_guest_access(room_id,enabled,updated_by) VALUES($1,$2,$3) ON CONFLICT(room_id) DO UPDATE SET enabled=EXCLUDED.enabled,updated_by=EXCLUDED.updated_by,updated_at=clock_timestamp()")
         .bind(room).bind(body.enabled).bind(actor).execute(&mut *tx).await?;
     authority.commit(tx).await?;
-    Ok(registration::private_json(
+    Ok(responses::private_json(
         StatusCode::OK,
         json!({"enabled":body.enabled}),
     ))

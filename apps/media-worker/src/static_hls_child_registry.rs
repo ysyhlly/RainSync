@@ -1,4 +1,4 @@
-//! Inactive, same-startup child capture custody.
+//! Same-startup child capture custody for explicitly enabled child execution.
 //!
 //! A caller must first commit the one-shot child claim. The bound Worker then
 //! obtains the actual parent's already-retained control from its original local

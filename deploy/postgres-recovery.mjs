@@ -2,7 +2,7 @@
 // overwriting archive or restoring over an existing database is supported.
 // Authentication stays in inherited env/libpq; reports never contain a DSN.
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import {
   createCipheriv,
@@ -69,35 +69,36 @@ export function localConnection(connection) {
   return url;
 }
 
-export async function pg(program, args, connection, timeout = 60000) {
+function pgInvocation(program, connection) {
   const url = localConnection(connection);
   const binary = process.env.RAINSYNC_NATIVE_POSTGRES_BIN
     ? resolve(process.env.RAINSYNC_NATIVE_POSTGRES_BIN, program)
     : program;
+  const inherited = { ...process.env };
+  for (const name of ["PGSERVICE", "PGSERVICEFILE", "PGHOSTADDR", "PGOPTIONS"])
+    delete inherited[name];
+  return {
+    binary,
+    env: {
+      ...inherited,
+      PGDATABASE: decodeURIComponent(url.pathname.slice(1)),
+      PGHOST: url.hostname.replace(/^\[|\]$/g, ""),
+      PGPORT: url.port || "5432",
+      PGUSER: decodeURIComponent(url.username),
+      PGPASSWORD: decodeURIComponent(url.password),
+      PGSSLMODE: url.searchParams.get("sslmode") || "prefer",
+      PGCONNECT_TIMEOUT: "5",
+      PGAPPNAME: "rainsync-isolated-recovery",
+    },
+  };
+}
+
+export async function pg(program, args, connection, timeout = 60000) {
+  const { binary, env } = pgInvocation(program, connection);
   try {
-    const inherited = { ...process.env };
-    for (const name of [
-      "PGSERVICE",
-      "PGSERVICEFILE",
-      "PGHOSTADDR",
-      "PGOPTIONS",
-    ])
-      delete inherited[name];
     return (
       await execute(binary, args, {
-        // Explicit libpq fields also work when createdb/pg_restore override the
-        // database name. A PGDATABASE URI alone would lose host/auth on `-d`.
-        env: {
-          ...inherited,
-          PGDATABASE: decodeURIComponent(url.pathname.slice(1)),
-          PGHOST: url.hostname.replace(/^\[|\]$/g, ""),
-          PGPORT: url.port || "5432",
-          PGUSER: decodeURIComponent(url.username),
-          PGPASSWORD: decodeURIComponent(url.password),
-          PGSSLMODE: url.searchParams.get("sslmode") || "prefer",
-          PGCONNECT_TIMEOUT: "5",
-          PGAPPNAME: "rainsync-isolated-recovery",
-        },
+        env,
         encoding: "utf8",
         windowsHide: true,
         timeout,
@@ -109,6 +110,105 @@ export async function pg(program, args, connection, timeout = 60000) {
     throw Error(
       `${program} failed (exit ${typeof error.code === "number" ? error.code : "unavailable"}); inspect the isolated PostgreSQL service`,
     );
+  }
+}
+
+// Only this module can issue a live snapshot handle. Importers must use the
+// same database and finish while its exporting read-only transaction is held.
+const snapshots = new WeakMap();
+function snapshotState(connection, snapshot) {
+  const state = snapshots.get(snapshot);
+  assert.ok(
+    state && state.connection === connection && state.active,
+    "database snapshot is not active for this connection",
+  );
+  return state;
+}
+export function readTransaction(connection, snapshot) {
+  if (!snapshot) return "BEGIN READ ONLY;";
+  const { id } = snapshotState(connection, snapshot);
+  return `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '${id}';`;
+}
+export async function withDatabaseSnapshot(connection, run) {
+  const { binary, env } = pgInvocation("psql", connection);
+  const child = spawn(binary, ["-X", "-qAtw", "-v", "ON_ERROR_STOP=1"], {
+    env,
+    windowsHide: true,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let active = true;
+  let state;
+  let output = "";
+  let readyResolve, readyReject;
+  const ready = new Promise((done, reject) => {
+    readyResolve = done;
+    readyReject = reject;
+  });
+  const failure = () =>
+    Error(
+      "database snapshot could not be held; no complete recovery set accepted",
+    );
+  const done = new Promise((resolve) => {
+    child.once("close", (code) => {
+      active = false;
+      if (state) state.active = false;
+      readyReject(failure());
+      resolve(code);
+    });
+  });
+  child.once("error", () => readyReject(failure()));
+  child.stdin.on("error", () => readyReject(failure()));
+  // Never collect stderr: libpq diagnostics can contain authentication data.
+  child.stderr.resume();
+  child.stdout.on("data", (chunk) => {
+    output += chunk.toString("utf8");
+    if (output.length > 4096) {
+      readyReject(failure());
+      child.kill("SIGKILL");
+      return;
+    }
+    const newline = output.indexOf("\n");
+    if (newline < 0) return;
+    try {
+      const value = JSON.parse(output.slice(0, newline));
+      assert.match(value.id, /^[0-9A-Fa-f]+-[0-9A-Fa-f]+-[0-9]+$/);
+      assert.ok(Number.isFinite(Date.parse(value.started_at)));
+      readyResolve(value);
+    } catch {
+      readyReject(failure());
+    }
+  });
+  const startupTimer = setTimeout(() => {
+    readyReject(failure());
+    child.kill("SIGKILL");
+  }, 10000);
+  const lifetimeTimer = setTimeout(() => child.kill("SIGKILL"), 40 * 60 * 1000);
+  child.stdin.write(
+    "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n" +
+      "SET LOCAL statement_timeout='5s'; SET LOCAL idle_in_transaction_session_timeout='40min';\n" +
+      "SELECT json_build_object('id',pg_export_snapshot(),'started_at',transaction_timestamp());\n",
+  );
+  try {
+    const value = await ready;
+    clearTimeout(startupTimer);
+    assert.ok(active, "database snapshot exporter closed before validation");
+    const handle = Object.freeze({
+      started_at: new Date(value.started_at).toISOString(),
+    });
+    state = { ...value, connection, active: true };
+    snapshots.set(handle, state);
+    return await run(handle);
+  } finally {
+    clearTimeout(startupTimer);
+    clearTimeout(lifetimeTimer);
+    if (state) state.active = false;
+    if (active) child.stdin.end("ROLLBACK;\n\\q\n");
+    const stopTimer = setTimeout(() => child.kill("SIGKILL"), 3000);
+    try {
+      await done;
+    } finally {
+      clearTimeout(stopTimer);
+    }
   }
 }
 
@@ -156,7 +256,10 @@ export async function matchMigrationBaseline(installed, migrationsDirectory) {
   };
 }
 
-export async function preflight(connection, { migrationsDirectory } = {}) {
+export async function preflight(
+  connection,
+  { migrationsDirectory, snapshot } = {},
+) {
   localConnection(connection);
   const existing = await pg(
     "psql",
@@ -166,7 +269,7 @@ export async function preflight(connection, { migrationsDirectory } = {}) {
       "-v",
       "ON_ERROR_STOP=1",
       "-c",
-      "BEGIN READ ONLY; SET LOCAL statement_timeout='5s'; SELECT json_build_object('server_version', current_setting('server_version'), 'schema_present', to_regclass('public._sqlx_migrations') IS NOT NULL); ROLLBACK;",
+      `${readTransaction(connection, snapshot)} SET LOCAL statement_timeout='5s'; SELECT json_build_object('server_version', current_setting('server_version'), 'schema_present', to_regclass('public._sqlx_migrations') IS NOT NULL); ROLLBACK;`,
     ],
     connection,
   );
@@ -182,7 +285,7 @@ export async function preflight(connection, { migrationsDirectory } = {}) {
           "-v",
           "ON_ERROR_STOP=1",
           "-c",
-          "BEGIN READ ONLY; SET LOCAL statement_timeout='5s'; SELECT COALESCE(json_agg(json_build_object('version',version,'success',success,'checksum',encode(checksum,'hex')) ORDER BY version),'[]'::json) FROM _sqlx_migrations; ROLLBACK;",
+          `${readTransaction(connection, snapshot)} SET LOCAL statement_timeout='5s'; SELECT COALESCE(json_agg(json_build_object('version',version,'success',success,'checksum',encode(checksum,'hex')) ORDER BY version),'[]'::json) FROM _sqlx_migrations; ROLLBACK;`,
         ],
         connection,
       ),
@@ -335,17 +438,30 @@ async function privateDirectory(path) {
   if (process.platform !== "win32") await chmod(path, 0o700);
 }
 
-export async function backup({ connection, output, keyFile }) {
+export async function backup({ connection, output, keyFile, snapshot }) {
+  if (!snapshot)
+    return withDatabaseSnapshot(connection, (held) =>
+      backup({ connection, output, keyFile, snapshot: held }),
+    );
+  const { id: snapshotId } = snapshotState(connection, snapshot);
   localConnection(connection);
   await keyMaterial(keyFile).then((key) => key.fill(0));
-  const baseline = await preflight(connection);
+  const baseline = await preflight(connection, { snapshot });
   await privateDirectory(output);
   const plain = resolve(output, "database.dump.tmp"),
     encrypted = resolve(output, "database.dump.aesgcm");
   try {
     await pg(
       "pg_dump",
-      ["-w", "-Fc", "--no-owner", "--no-acl", "-f", plain],
+      [
+        "-w",
+        "-Fc",
+        "--no-owner",
+        "--no-acl",
+        `--snapshot=${snapshotId}`,
+        "-f",
+        plain,
+      ],
       connection,
       1800000,
     );
@@ -363,6 +479,8 @@ export async function backup({ connection, output, keyFile }) {
       schema_version: 1,
       id: randomUUID(),
       created_at: new Date().toISOString(),
+      snapshot_started_at: snapshot.started_at,
+      consistency: "exported PostgreSQL repeatable-read snapshot",
       encryption: "AES-256-GCM",
       archive: "database.dump.aesgcm",
       archive_sha256: await digest(encrypted),
@@ -545,6 +663,10 @@ if (
   resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 )
   cli().catch((error) => {
-    console.error(error.message);
+    console.error(
+      error instanceof SyntaxError
+        ? "recovery JSON is invalid; inspect private input without publishing its contents"
+        : "recovery failed; inspect private connection, key and archive validation",
+    );
     process.exitCode = 1;
   });

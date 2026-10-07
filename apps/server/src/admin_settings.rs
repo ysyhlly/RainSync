@@ -131,7 +131,7 @@ fn projection(app: &App, row: &PgRow) -> Result<Value> {
 
 // Same user-before-session lock order as existing administrator settings writes.
 // Hold both through commit; recheck real-clock expiry after settings-row waits.
-async fn lock_admin(
+pub(crate) async fn lock_admin(
     tx: &mut Transaction<'_, Postgres>,
     user: &User,
     headers: &HeaderMap,
@@ -157,7 +157,7 @@ async fn lock_admin(
     }
     Ok(login)
 }
-async fn finish(tx: Transaction<'_, Postgres>, user: &User, login: &str) -> Result<()> {
+pub(crate) async fn finish(tx: Transaction<'_, Postgres>, user: &User, login: &str) -> Result<()> {
     let mut tx = tx;
     let live: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.user_id=$2 AND s.expires_at>clock_timestamp() AND u.admin AND account_active(u.id))")
         .bind(login).bind(user.id).fetch_one(&mut *tx).await?;
@@ -176,7 +176,7 @@ pub async fn get(State(app): State<App>, headers: HeaderMap) -> Result<Response>
     let row = sqlx::query(SELECT).fetch_one(&mut *tx).await?;
     let value = projection(&app, &row)?;
     finish(tx, &user, &login).await?;
-    Ok(media_titles::private_json(value))
+    Ok(responses::ok_json(value))
 }
 
 pub async fn change(
@@ -220,7 +220,7 @@ pub async fn change(
     };
     let value = projection(&app, &row)?;
     finish(tx, &user, &login).await?;
-    Ok(media_titles::private_json(value))
+    Ok(responses::ok_json(value))
 }
 
 /// Public access-policy discovery contains only two intentional public flags.
@@ -235,7 +235,7 @@ pub async fn registration_policy(State(app): State<App>) -> Result<Response> {
     let value =
         json!({"registration_mode":mode,"guests_enabled":row.try_get::<bool,_>("guests_enabled")?});
     tx.commit().await?;
-    Ok(media_titles::private_json(value))
+    Ok(responses::ok_json(value))
 }
 
 #[cfg(test)]

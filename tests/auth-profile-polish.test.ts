@@ -7,7 +7,10 @@ import { afterEach, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { nextTick, shallowRef } from "vue";
 import { mountSetup } from "./helpers/mount-setup";
-import { useSession } from "../apps/web/src/features/auth/session.store";
+import {
+  RegistrationConfirmationRequired,
+  useSession,
+} from "../apps/web/src/features/auth/session.store";
 import { useAction } from "../apps/web/src/shared/use-action";
 import {
   authenticationLocation,
@@ -44,6 +47,7 @@ function auth(file: "LoginPage" | "RegisterPage") {
       guestRoomPath,
       parseGuestInvitation,
       validateNickname,
+      RegistrationConfirmationRequired,
       useSession,
       useRegistrationPolicy: () => ({
         policy: ref({
@@ -178,6 +182,7 @@ async function profile() {
       guestRoomPath,
       parseGuestInvitation,
       validateNickname,
+      RegistrationConfirmationRequired,
       useSession,
       useRegistrationPolicy: () => ({
         policy: ref({

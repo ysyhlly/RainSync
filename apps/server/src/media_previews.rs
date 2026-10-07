@@ -65,7 +65,7 @@ pub async fn status(
 async fn states(app: &App, user: Uuid, ids: &[Uuid]) -> Result<Response> {
     let rows=sqlx::query(&format!("SELECT m.id,p.status AS preview_status,p.result_revision AS preview_revision FROM media_items m JOIN sources s ON s.id=m.source_id LEFT JOIN media_previews p ON p.media_id=m.id AND {FRESH} WHERE m.id=ANY($1) AND {VALID} AND library_media_allowed($2,m.id,'browse',NULL)"))
         .bind(ids).bind(user).fetch_all(&app.db).await?;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"items":rows.iter().map(|r|json!({"media_id":r.get::<Uuid,_>("id"),"cover":cover(r)})).collect::<Vec<_>>()}),
     ))
 }

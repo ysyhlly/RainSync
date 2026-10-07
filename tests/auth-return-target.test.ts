@@ -10,7 +10,10 @@ import {
   authenticationLocation,
   safeRedirect,
 } from "../apps/web/src/app/navigation";
-import { useSession } from "../apps/web/src/features/auth/session.store";
+import {
+  RegistrationConfirmationRequired,
+  useSession,
+} from "../apps/web/src/features/auth/session.store";
 import { useAction } from "../apps/web/src/shared/use-action";
 import {
   validateAccount,
@@ -61,6 +64,7 @@ it("login and registration retain the same safe destination and expiry explanati
     guestRoomPath,
     parseGuestInvitation,
     validateNickname,
+    RegistrationConfirmationRequired,
     useSession,
     useRegistrationPolicy: () => ({
       policy: ref({ registration_mode: "invite_only", guests_enabled: false }),

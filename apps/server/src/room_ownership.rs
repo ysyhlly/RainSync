@@ -18,7 +18,7 @@ pub async fn members(
     }
     let rows = sqlx::query("SELECT u.id,u.username,COALESCE(g.display_name,p.display_name,u.username) AS display_name,u.principal_kind FROM room_members m JOIN users u ON u.id=m.user_id LEFT JOIN guest_principals g ON g.user_id=u.id LEFT JOIN user_profiles p ON p.user_id=u.id WHERE m.room_id=$1 AND account_active(u.id) ORDER BY u.username,u.id")
         .bind(id).fetch_all(&app.db).await?;
-    Ok(media_titles::private_json(Value::Array(
+    Ok(responses::ok_json(Value::Array(
         rows.iter()
             .map(|row| {
                 json!({
@@ -143,7 +143,7 @@ pub async fn transfer(
         .await?;
     authority.commit(tx).await?;
     rooms::ownership_changed(&app, &next, body.owner_id, event_id).await;
-    Ok(media_titles::private_json(
+    Ok(responses::ok_json(
         json!({"owner_id":body.owner_id,"state":next,"event_id":event_id}),
     ))
 }

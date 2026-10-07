@@ -1,3 +1,4 @@
+import { unusedPort } from "./unused-port.mjs";
 import { reapOwnedChildren } from "../../deploy/owned-process.mjs";
 import { spawn, execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -9,20 +10,10 @@ import {
 } from "./postgres.mjs";
 import { createWriteStream } from "node:fs";
 import { resolve } from "node:path";
-import { createServer } from "node:net";
 import assert from "node:assert/strict";
 
 export const delay = (ms) => new Promise((done) => setTimeout(done, ms));
 
-async function unusedPort() {
-  const listener = createServer();
-  await new Promise((done, reject) =>
-    listener.once("error", reject).listen(0, "127.0.0.1", done),
-  );
-  const port = listener.address().port;
-  await new Promise((done) => listener.close(done));
-  return port;
-}
 
 export class Client {
   cookie = "";
@@ -138,6 +129,12 @@ export async function isolatedServer(name, run, options = {}) {
       );
       return {
         completed: true,
+        fixture_paths: {
+          artifacts: root,
+          media: fixture.env?.MEDIA_ROOT,
+          cache: fixture.env?.CACHE_ROOT,
+          retention: "owned fixture directories retained as evidence",
+        },
         servers,
         server_port: port,
         server_port_closed: listenerClosed,
@@ -270,7 +267,8 @@ export async function isolatedServer(name, run, options = {}) {
       PUBLIC_ORIGIN: origin,
       BIND: `127.0.0.1:${port}`,
       MEDIA_ROOT: root,
-      CACHE_ROOT: resolve(root, "cache"),
+      // Keep existing media/artifact paths; cache must be an owned sibling.
+      CACHE_ROOT: `${root}-cache`,
       RUST_LOG: "warn",
       TRUSTED_PROXY_CIDRS: "",
       ...options.env,

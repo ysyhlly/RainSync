@@ -41,6 +41,17 @@ export interface RoomShare {
   active: boolean;
   max_expires_at: number;
 }
+export interface IssuedRoomShare {
+  id: string;
+  library_id: string;
+  revision: string;
+  media_id: string;
+  room_id: string;
+  title: string | null;
+  mode: RoomShare["mode"];
+  expires_at: number;
+  active: boolean;
+}
 export interface LibraryDetail extends Library {
   sources?: LibrarySource[];
   grants?: LibraryGrant[];
@@ -61,6 +72,14 @@ export function privateLibraryApi(api: ApiClient) {
     list: (signal?: AbortSignal) =>
       api<{ enabled: boolean; items: Library[] }>(
         "/libraries",
+        "GET",
+        undefined,
+        signal,
+      ),
+    issuedShares: (after?: string, signal?: AbortSignal) =>
+      api<{ items: IssuedRoomShare[]; has_more: boolean }>(
+        "/libraries/issued-shares" +
+          (after ? "?" + new URLSearchParams({ after }) : ""),
         "GET",
         undefined,
         signal,

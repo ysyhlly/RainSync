@@ -1,5 +1,6 @@
 import { onScopeDispose, ref } from "vue";
 import { StaleIdentity } from "./api/client";
+import { actionErrorMessage } from "./action-error";
 export function useAction() {
   const busy = ref(false),
     error = ref(""),
@@ -24,7 +25,7 @@ export function useAction() {
         !(e instanceof StaleIdentity) &&
         !(e instanceof DOMException && e.name === "AbortError")
       )
-        error.value = e instanceof Error ? e.message : String(e);
+        error.value = actionErrorMessage(e);
     } finally {
       if (active && id === serial) busy.value = false;
     }

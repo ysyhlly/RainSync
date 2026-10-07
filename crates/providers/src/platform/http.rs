@@ -53,7 +53,6 @@ const MAX_MEDIA_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_MEDIA_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
 const USER_AGENT: &str = "Mozilla/5.0 RainSync/0.1";
 const REFERER: &str = "https://www.bilibili.com/";
-const DOUYIN_PAGE_USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1 RainSync/0.1";
 const MAX_PLAY_LOCATION_BYTES: usize = 8192;
 
 type Result<T> = std::result::Result<T, bilibili::Error>;
@@ -465,7 +464,7 @@ fn page_headers(
     {
         headers.insert(
             header::USER_AGENT,
-            HeaderValue::from_static(DOUYIN_PAGE_USER_AGENT),
+            HeaderValue::from_static(short_video::DOUYIN_USER_AGENT),
         );
     }
     headers.insert(
@@ -1208,7 +1207,7 @@ mod tests {
                 (
                     "User-Agent".into(),
                     if provider == Provider::Douyin {
-                        DOUYIN_PAGE_USER_AGENT.into()
+                        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1 RainSync/0.1".into()
                     } else {
                         USER_AGENT.into()
                     },
@@ -1218,6 +1217,7 @@ mod tests {
             ]);
             let headers = page_headers(endpoint, provider, &expected, None).unwrap();
             assert_eq!(headers.len(), 4);
+            assert_eq!(headers[header::USER_AGENT], expected["User-Agent"].as_str());
             assert!(!headers.contains_key(header::COOKIE));
             assert!(!headers.contains_key(header::AUTHORIZATION));
             assert!(page_headers(endpoint, provider, &BTreeMap::new(), None).is_ok());

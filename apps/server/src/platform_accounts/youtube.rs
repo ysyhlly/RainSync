@@ -53,7 +53,7 @@ pub async fn youtube_status(State(app): State<App>, headers: HeaderMap) -> Resul
     guard_login_live(&mut tx, user.id, &login).await?;
     let value = status_value(app.youtube.viewer_credentials_enabled(), row.as_ref());
     tx.commit().await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 
 #[derive(Deserialize)]
@@ -134,7 +134,7 @@ pub async fn import_youtube_credential(
         .await?;
     let value = status_value(app.youtube.viewer_credentials_enabled(), Some(&row));
     tx.commit().await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 
 pub async fn unlink_youtube(
@@ -169,7 +169,7 @@ pub async fn unlink_youtube(
         .await?;
     let value = status_value(app.youtube.viewer_credentials_enabled(), Some(&row));
     tx.commit().await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 
 #[cfg(test)]

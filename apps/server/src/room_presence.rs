@@ -9,6 +9,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+fn protocol_snapshot(room: Uuid, snapshot: presence::Snapshot) -> protocol::PresenceSnapshot {
+    protocol::PresenceSnapshot {
+        room_id: room,
+        presence_epoch: snapshot.epoch,
+        presence_seq: snapshot.seq,
+        members: snapshot
+            .members
+            .into_iter()
+            .map(|member| protocol::PresenceMember {
+                user_id: member.user_id,
+                connection_count: member.connection_count,
+            })
+            .collect(),
+    }
+}
+
 struct State {
     leases: presence::Presence,
     sessions: HashMap<Uuid, String>,
@@ -154,19 +170,7 @@ impl Runtime {
             .map(|(id, _)| id)
             .collect();
         state.sessions.retain(|id, _| alive.contains(id));
-        let snapshot = protocol::PresenceSnapshot {
-            room_id: self.room,
-            presence_epoch: snapshot.epoch,
-            presence_seq: snapshot.seq,
-            members: snapshot
-                .members
-                .into_iter()
-                .map(|member| protocol::PresenceMember {
-                    user_id: member.user_id,
-                    connection_count: member.connection_count,
-                })
-                .collect(),
-        };
+        let snapshot = protocol_snapshot(self.room, snapshot);
         let mut value = json!(snapshot);
         value["type"] = json!("PRESENCE_SNAPSHOT");
         self.bus.send_presence(value);
@@ -273,19 +277,7 @@ impl Runtime {
                 .checked_snapshot(&checked, &authorized, Instant::now());
             self.publish(&mut state);
             if let Some(snapshot) = snapshot {
-                return Ok(Some(protocol::PresenceSnapshot {
-                    room_id: self.room,
-                    presence_epoch: snapshot.epoch,
-                    presence_seq: snapshot.seq,
-                    members: snapshot
-                        .members
-                        .into_iter()
-                        .map(|member| protocol::PresenceMember {
-                            user_id: member.user_id,
-                            connection_count: member.connection_count,
-                        })
-                        .collect(),
-                }));
+                return Ok(Some(protocol_snapshot(self.room, snapshot)));
             }
         }
         Ok(None)
@@ -304,6 +296,53 @@ mod tests {
             })),
             bus: delivery::Bus::new(),
         }
+    }
+
+    #[test]
+    fn protocol_snapshot_preserves_stamp_order_and_connection_counts() {
+        let room = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let users = [Uuid::new_v4(), Uuid::new_v4()];
+        let snapshot = protocol_snapshot(
+            room,
+            presence::Snapshot {
+                epoch,
+                seq: u32::MAX,
+                members: vec![
+                    presence::Member {
+                        user_id: users[0],
+                        connection_count: 2,
+                    },
+                    presence::Member {
+                        user_id: users[1],
+                        connection_count: 1,
+                    },
+                ],
+            },
+        );
+        assert_eq!(
+            json!(snapshot),
+            json!({
+                "room_id":room,
+                "presence_epoch":epoch,
+                "presence_seq":u32::MAX,
+                "members":[
+                    {"user_id":users[0],"connection_count":2},
+                    {"user_id":users[1],"connection_count":1},
+                ],
+            })
+        );
+        let empty = protocol_snapshot(
+            room,
+            presence::Snapshot {
+                epoch,
+                seq: 0,
+                members: vec![],
+            },
+        );
+        assert!(empty.members.is_empty());
+        assert_eq!(empty.presence_seq, 0);
+        assert_eq!(empty.presence_epoch, epoch);
     }
 
     #[tokio::test]

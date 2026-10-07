@@ -67,15 +67,7 @@ Agent 凭据保存在其状态目录，重启复用；管理员可撤销设备�
 
 ## 开发检查
 
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-npm ci
-npm test
-npm run build
-python3 tests/runtime-images.test.py
-```
+提交前的 Rust、协议生成、前端及交付检查命令统一见 [开发贡献指南](CONTRIBUTING.md)。
 
 集成或部署测试只用于独立测试实例；按各脚本要求配置测试资源及外部输出目录，不使用已有生产数据库。
 `npm run test:source-deletion` 在隔离 PostgreSQL、Server 和真实 Vue/Chromium 中检查删除、取消、

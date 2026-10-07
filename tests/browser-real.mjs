@@ -1,6 +1,6 @@
+import { unusedPort } from "./fixtures/unused-port.mjs";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { createServer as netServer } from "node:net";
 import { createWriteStream } from "node:fs";
 import { copyFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -10,15 +10,7 @@ import { isolatedServer, delay } from "./fixtures/server.mjs";
 
 // Real isolated Server/PostgreSQL/Worker + Vue browser. No HTTP/WS route mocks.
 const entry = process.env.RAINSYNC_TEST_ENTRY ?? "";
-async function unusedPort() {
-  const s = netServer();
-  await new Promise((done, reject) =>
-    s.once("error", reject).listen(0, "127.0.0.1", done),
-  );
-  const port = s.address().port;
-  await new Promise((done) => s.close(done));
-  return port;
-}
+
 const vitePort = await unusedPort(),
   workerPort = await unusedPort(),
   origin = `http://127.0.0.1:${vitePort}`,

@@ -1,0 +1,50 @@
+[
+  {
+    "table": "sources",
+    "column": "config_encrypted",
+    "id_column": "id",
+    "predicate": "TRUE"
+  },
+  {
+    "table": "source_access_policy_snapshots",
+    "column": "config_encrypted",
+    "id_column": "source_id",
+    "predicate": "TRUE"
+  },
+  {
+    "table": "platform_accounts",
+    "column": "credential_encrypted",
+    "id_column": "id",
+    "predicate": "credential_encrypted IS NOT NULL"
+  },
+  {
+    "table": "platform_oauth_accounts",
+    "column": "token_encrypted",
+    "id_column": "id",
+    "predicate": "token_encrypted IS NOT NULL"
+  },
+  {
+    "table": "platform_oauth_requests",
+    "column": "secret_encrypted",
+    "id_column": "id",
+    "predicate": "secret_encrypted IS NOT NULL"
+  },
+  {
+    "table": "platform_account_renewals",
+    "column": "refresh_encrypted",
+    "id_column": "account_id",
+    "predicate": "refresh_encrypted IS NOT NULL"
+  },
+  {
+    "table": "platform_login_requests",
+    "column": "qr_key_encrypted",
+    "id_column": "id",
+    "predicate": "status='pending' AND expires_at>clock_timestamp() AND qr_key_encrypted IS NOT NULL"
+  },
+  {
+    "table": "platform_login_requests",
+    "column": "qr_payload_encrypted",
+    "id_column": "id",
+    "predicate": "status='pending' AND expires_at>clock_timestamp() AND qr_payload_encrypted IS NOT NULL"
+  }
+]

@@ -235,7 +235,6 @@ function presenceName(userId: string) {
     ? session.user.display_name
     : r.presenceNames[userId] || "房间成员";
 }
-const emptyRoom = computed(() => !!r.state && !r.state.media_id);
 const preparationMessage = computed(() => {
   if (!r.state) return "正在读取房间内容，请稍候。";
   if (!r.roomActive) return "房间当前为只读状态，可以查看聊天记录和待播列表。";

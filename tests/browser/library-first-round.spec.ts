@@ -164,6 +164,8 @@ test("private library pagination uses the applied query until a new search succe
   const requests: URL[] = [];
   await page.route("**/api/v1/libraries**", (route) => {
     const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/libraries/issued-shares")
+      return route.fulfill({ json: { items: [], has_more: false } });
     if (url.pathname === "/api/v1/libraries")
       return route.fulfill({ json: { enabled: true, items: [detail] } });
     if (url.pathname === "/api/v1/libraries/private")

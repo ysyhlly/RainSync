@@ -1,3 +1,4 @@
+import { createCookieAccountFlow } from "./cookie-account-flow";
 import type {
   ShortPlatformAccountStatus,
   ShortPlatformProvider,
@@ -116,46 +117,12 @@ export function createShortAccountFlow(options: {
   clearSecret: () => void;
   change: (state: ShortAccountFlowState) => void;
 }) {
-  let closed = false,
-    busy = false;
-  const controller = new AbortController();
-  const current = () =>
-    !closed && !controller.signal.aborted && options.current();
-  async function submit(
-    cookie: string,
-    revision: string | null,
-    consent: boolean,
-  ) {
-    if (!current() || busy || !consent || !cookie.trim()) return;
-    busy = true;
-    options.clearSecret();
-    if (!validShortAccountCookieInput(cookie, options.provider)) {
-      cookie = "";
-      busy = false;
-      options.change({ phase: "invalid" });
-      return;
-    }
-    options.change({ phase: "submitting" });
-    try {
-      const value = await options.submit(cookie, revision, controller.signal);
-      cookie = "";
-      if (!current()) return;
-      validateShortAccountStatus(value, options.provider);
-      options.change({
-        phase: value.state === "connected" ? "stored" : "uncertain",
-      });
-    } catch {
-      // Never surface service error text that could echo a session credential.
-      if (current()) options.change({ phase: "uncertain" });
-    } finally {
-      cookie = "";
-      busy = false;
-    }
-  }
-  function close() {
-    closed = true;
-    controller.abort();
-    options.clearSecret();
-  }
-  return { submit, close };
+  return createCookieAccountFlow({
+    ...options,
+    hasInput: (cookie) => !!cookie.trim(),
+    validateInput: (cookie) =>
+      validShortAccountCookieInput(cookie, options.provider),
+    validateStatus: (value) => validateShortAccountStatus(value, options.provider),
+    change: (phase) => options.change({ phase }),
+  });
 }

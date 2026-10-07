@@ -35,6 +35,22 @@ try {
     f.sql(`INSERT INTO sources(id,name,kind,config_encrypted) VALUES('${agent.id}','owned synthetic NAS','agent','unused-owned-fixture'); INSERT INTO media_items(id,source_id,title,resource,source_version) VALUES('${media}','${agent.id}','owned synthetic clip','clip.mp4','${version}')`);
     const source = { media_id: media, source_version: version, content_sha256: hash, size_bytes: 1024 };
     await agentRequest('/agent-compute/catalog', source);
+    // More than one failed/unregistered page cannot conceal later identities.
+    // These are metadata-only owned fixtures; no source bytes or encoder exist.
+    f.sql(`INSERT INTO media_items(id,source_id,title,resource,source_version) SELECT gen_random_uuid(),'${agent.id}','catalog page '||i,'catalog-'||i||'.mp4','${version}' FROM generate_series(1,34) i`);
+    const catalogPage = async after => {
+      const response = await fetch(f.origin + '/api/v1/agent-compute/catalog' + (after ? `?after=${after}` : ''), { headers: { Authorization: `Bearer ${agent.token}` } });
+      assert.equal(response.status, 200);
+      return (await response.json()).items;
+    };
+    const firstCatalogPage = await catalogPage(), secondCatalogPage = await catalogPage(firstCatalogPage.at(-1).media_id);
+    assert.deepEqual([firstCatalogPage.length, secondCatalogPage.length], [32, 2]);
+    const catalogIds = [...firstCatalogPage, ...secondCatalogPage].map(item => item.media_id);
+    assert.equal(new Set(catalogIds).size, 34);
+    assert.deepEqual(catalogIds, [...catalogIds].sort());
+    assert.equal((await catalogPage(secondCatalogPage.at(-1).media_id)).length, 0);
+    assert.equal((await catalogPage())[0].media_id, firstCatalogPage[0].media_id, 'catalog scan can wrap to retry failed identities');
+    report.checks.push('bounded optional catalog keyset traverses more than 32 unregistered items and wraps without skipping or duplicating identities');
     const room = await admin.request('/rooms', 'POST', { name: 'owned HD admission' });
     f.sql(`UPDATE room_snapshots SET state=state||jsonb_build_object('media_id','${media}','media_generation',1) WHERE room_id='${room.id}'`);
     const setDuration = duration => f.sql(`UPDATE media_items SET metadata='${JSON.stringify({ capability_source_version: version, format: { duration: String(duration) }, streams: [{ index: 0, codec_type: 'video' }] })}'::jsonb WHERE id='${media}'`);

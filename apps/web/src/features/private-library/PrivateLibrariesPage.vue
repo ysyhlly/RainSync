@@ -14,6 +14,7 @@ import {
   type LibraryGrant,
   type LibrarySource,
   type RoomShare,
+  type IssuedRoomShare,
   type ScanStatus,
 } from "./private-library.api";
 import type { Media } from "../../shared/api/types";
@@ -34,6 +35,94 @@ const libraries = ref<Library[]>([]),
   busy = ref(false),
   error = ref(""),
   notice = ref("");
+const issuedShares = ref<IssuedRoomShare[]>([]),
+  issuedBusy = ref(false),
+  issuedError = ref(""),
+  issuedHasMore = ref(false),
+  withdrawal = ref<IssuedRoomShare>();
+const withdrawalOpen = computed({
+  get: () => !!withdrawal.value,
+  set: (open: boolean) => {
+    if (!open) withdrawal.value = undefined;
+  },
+});
+let issuedSerial = 0,
+  issuedController: AbortController | undefined;
+async function loadIssuedShares(next = false) {
+  if (next && (issuedBusy.value || !issuedHasMore.value)) return;
+  const mine = ++issuedSerial,
+    epoch = session.epoch;
+  issuedController?.abort();
+  issuedController = new AbortController();
+  issuedBusy.value = true;
+  issuedError.value = "";
+  try {
+    const value = await api.issuedShares(
+      next ? issuedShares.value.at(-1)?.id : undefined,
+      issuedController.signal,
+    );
+    if (!alive || mine !== issuedSerial || epoch !== session.epoch) return;
+    if (
+      !value ||
+      !Array.isArray(value.items) ||
+      typeof value.has_more !== "boolean" ||
+      (value.has_more && value.items.length === 0) ||
+      value.items.some(
+        (item) =>
+          !item ||
+          ![item.id, item.library_id, item.media_id, item.room_id].every(
+            (id) => typeof id === "string" && id.length > 0,
+          ) ||
+          typeof item.revision !== "string" ||
+          !/^[1-9]\d*$/.test(item.revision) ||
+          (item.title !== null && typeof item.title !== "string") ||
+          !["room_members", "library_members"].includes(item.mode) ||
+          !Number.isSafeInteger(item.expires_at) ||
+          typeof item.active !== "boolean",
+      )
+    )
+      throw new Error("分享列表响应不完整，请刷新分享后重试");
+    issuedShares.value = next
+      ? [...issuedShares.value, ...value.items]
+      : value.items;
+    issuedHasMore.value = value.has_more;
+  } catch (e) {
+    if (alive && mine === issuedSerial && epoch === session.epoch)
+      issuedError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    if (mine === issuedSerial) issuedBusy.value = false;
+  }
+}
+function requestWithdrawal(share: IssuedRoomShare) {
+  if (!busy.value && !issuedBusy.value) withdrawal.value = { ...share };
+}
+async function confirmWithdrawal() {
+  const change = withdrawal.value;
+  if (!change || busy.value) return;
+  const currentShare = issuedShares.value.find((item) => item.id === change.id);
+  if (!currentShare || currentShare.revision !== change.revision) {
+    error.value = "分享记录已变化，请关闭确认窗口，刷新后重新操作。";
+    return;
+  }
+  await run(
+    async (current) => {
+      try {
+        await api.revokeShare(change.library_id, change.id, change.revision);
+      } catch (e) {
+        if (current()) await loadIssuedShares();
+        throw e;
+      }
+      if (!current()) return;
+      withdrawal.value = undefined;
+      issuedShares.value = issuedShares.value.filter(
+        (item) => item.id !== change.id,
+      );
+    },
+    "房间分享已撤销；其他有效分享仍保留，已有播放需重新打开",
+    true,
+    false,
+  );
+}
 const createName = ref(""),
   editName = ref(""),
   grantName = ref(""),
@@ -321,7 +410,8 @@ async function loadList() {
 async function initialize() {
   error.value = "";
   try {
-    if (!(await loadList())) return;
+    const [loaded] = await Promise.all([loadList(), loadIssuedShares()]);
+    if (!loaded) return;
     const id =
       typeof route.query.library === "string"
         ? route.query.library
@@ -371,7 +461,8 @@ async function select(id: string) {
   }
 }
 async function refresh() {
-  if (!(await loadList())) return;
+  const [loaded] = await Promise.all([loadList(), loadIssuedShares()]);
+  if (!loaded) return;
   if (selected.value) await select(selected.value.id);
 }
 async function loadMedia(next = false) {
@@ -577,7 +668,7 @@ async function confirmChange() {
   }
   const messages: Record<ChangeKind, string> = {
     revoke: "授权已撤销，相关播放已失效",
-    revokeShare: "房间分享已撤销",
+    revokeShare: "房间分享已撤销；其他有效分享仍保留，已有播放需重新打开",
     transfer: "所有权已转移，原所有者不保留默认权限",
     attach: "片源归属已迁移。旧授权已失效",
     deleteLibrary: "媒体库已删除，原始媒体文件未删除",
@@ -659,6 +750,12 @@ watch(
     enabled.value = false;
     mediaBusy.value = false;
     mediaError.value = "";
+    ++issuedSerial;
+    issuedController?.abort();
+    issuedShares.value = [];
+    issuedBusy.value = issuedHasMore.value = false;
+    issuedError.value = "";
+    withdrawal.value = undefined;
     libraries.value = [];
     selected.value = null;
     media.value = [];
@@ -667,6 +764,8 @@ watch(
 );
 onBeforeUnmount(() => {
   alive = false;
+  ++issuedSerial;
+  issuedController?.abort();
   ++operationSerial;
   clearSensitiveDrafts();
   ++listSerial;
@@ -691,7 +790,13 @@ onBeforeUnmount(() => {
     </div>
     <div class="page-stack">
       <div
-        v-if="error && !confirmationOpen && !shareEditOpen && !s3EditOpen"
+        v-if="
+          error &&
+          !confirmationOpen &&
+          !shareEditOpen &&
+          !s3EditOpen &&
+          !withdrawalOpen
+        "
         class="surface-card surface-card--compact"
       >
         <Notice :message="error" error />
@@ -1445,6 +1550,49 @@ onBeforeUnmount(() => {
           </template>
         </div>
       </div>
+      <section class="surface-card page-stack" aria-label="我发出的分享">
+        <div class="section-heading">
+          <div class="section-heading__copy">
+            <h2>我发出的分享</h2>
+            <p class="helper">
+              即使媒体库授权已到期，也可以撤销自己发出的分享。
+            </p>
+          </div>
+          <button :disabled="busy || issuedBusy" @click="loadIssuedShares()">
+            刷新分享
+          </button>
+        </div>
+        <Notice :message="issuedError" error />
+        <ul v-if="issuedShares.length" class="data-list">
+          <li v-for="item in issuedShares" :key="item.id" class="data-row">
+            <div class="data-row__body">
+              <strong>{{ item.title ?? "无浏览权限的影片" }}</strong>
+              <p class="helper">
+                房间 {{ item.room_id }} ·
+                {{ item.active ? "有效" : "已失效" }} · 到期
+                {{ new Date(item.expires_at).toLocaleString() }}
+              </p>
+            </div>
+            <button
+              class="danger"
+              :disabled="busy || issuedBusy"
+              @click="requestWithdrawal(item)"
+            >
+              撤销我的分享
+            </button>
+          </li>
+        </ul>
+        <p v-else class="helper">
+          {{ issuedBusy ? "正在加载分享…" : "没有待撤销的分享" }}
+        </p>
+        <button
+          v-if="issuedHasMore"
+          :disabled="busy || issuedBusy"
+          @click="loadIssuedShares(true)"
+        >
+          加载更多分享
+        </button>
+      </section>
     </div>
     <SourceSettingsDialog
       v-if="selected"
@@ -1454,6 +1602,24 @@ onBeforeUnmount(() => {
       @close="settingsSource = undefined"
       @saved="sourceSaved"
     />
+    <AppDialog v-model="withdrawalOpen" title="撤销我的房间分享" :busy="busy">
+      <div v-if="withdrawal" class="page-stack">
+        <p>
+          {{ withdrawal.title ?? "无浏览权限的影片" }} · 房间
+          {{ withdrawal.room_id }}
+        </p>
+        <p class="helper">
+          撤销这份分享后，其他有效分享仍保留。当前库已有播放需要重新打开，已经下载的数据无法收回。
+        </p>
+        <Notice :message="error" error />
+        <div class="dialog-actions">
+          <button :disabled="busy" @click="withdrawalOpen = false">取消</button>
+          <button class="danger" :disabled="busy" @click="confirmWithdrawal">
+            确认撤销我的分享
+          </button>
+        </div>
+      </div>
+    </AppDialog>
     <AppDialog v-model="shareEditOpen" title="房间分享设置" :busy="busy">
       <form v-if="shareEdit" class="page-stack" @submit.prevent="saveShare">
         <p>{{ shareEdit.title }}</p>
@@ -1571,7 +1737,7 @@ onBeforeUnmount(() => {
           <template v-else>
             <p>撤销“{{ pendingChange.targetLabel }}”的房间分享？</p>
             <p class="helper">
-              依赖这份分享的房间成员将失去播放授权，已经下载的数据无法收回。
+              依赖这份分享的房间成员将失去播放授权。其他有效分享仍保留，当前库已有播放需要重新打开，已经下载的数据无法收回。
             </p>
           </template>
         </div>

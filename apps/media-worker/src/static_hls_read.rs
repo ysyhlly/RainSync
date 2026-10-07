@@ -188,36 +188,8 @@ fn resource_key(path: &str) -> Result<ReadResource> {
 }
 
 fn parse_range(headers: &HeaderMap) -> Result<Option<ReadRange>> {
-    let mut values = headers.get_all(header::RANGE).iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    let invalid = || (StatusCode::BAD_REQUEST, "invalid_static_hls_range".into());
-    if values.next().is_some() || value.as_bytes().len() > 128 {
-        return Err(invalid());
-    }
-    let value = value.to_str().map_err(|_| invalid())?.trim();
-    let bounds = value.strip_prefix("bytes=").ok_or_else(invalid)?;
-    let (first, last) = bounds.split_once('-').ok_or_else(invalid)?;
-    let number = |value: &str| -> Result<usize> {
-        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(invalid());
-        }
-        value.parse().map_err(|_| invalid())
-    };
-    let range = if first.is_empty() {
-        ReadRange::Suffix(number(last)?)
-    } else if last.is_empty() {
-        ReadRange::From(number(first)?)
-    } else {
-        let first = number(first)?;
-        let last = number(last)?;
-        if first > last {
-            return Err(invalid());
-        }
-        ReadRange::Inclusive { first, last }
-    };
-    Ok(Some(range))
+    super::static_hls_range::parse(headers)
+        .map_err(|()| (StatusCode::BAD_REQUEST, "invalid_static_hls_range".into()))
 }
 
 fn satisfiable(range: ReadRange, total: usize) -> bool {
@@ -249,5 +221,94 @@ fn read_error(error: anyhow::Error) -> (StatusCode, String) {
             (StatusCode::NOT_FOUND, "static_hls_resource_missing".into())
         }
         _ => unavailable(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_range_errors_keep_the_parent_status_and_code() {
+        let expected = (StatusCode::BAD_REQUEST, "invalid_static_hls_range".into());
+        for value in [
+            "",
+            "bytes=",
+            "bytes=-",
+            "bytes=9-3",
+            "bytes=0-2,4-8",
+            "bytes=+1-2",
+            "bytes=--5",
+            "bytes=1-18446744073709551616",
+            "items=0-2",
+            "bytes =0-2",
+            "bytes=0 -2",
+            "bytes=0- 2",
+            "Bytes=0-2",
+            "bytes=０-2",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::RANGE,
+                axum::http::HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+            );
+            assert_eq!(parse_range(&headers).err().unwrap(), expected, "{value}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.append(header::RANGE, "bytes=0-3".parse().unwrap());
+        headers.append(header::RANGE, "bytes=4-9".parse().unwrap());
+        assert_eq!(parse_range(&headers).err().unwrap(), expected);
+    }
+
+    #[test]
+    fn range_forms_and_raw_header_byte_limit_are_unchanged() {
+        assert!(parse_range(&HeaderMap::new()).unwrap().is_none());
+        for (value, expected) in [
+            ("bytes=3-9", (0, 3, 9)),
+            ("bytes=0-", (1, 0, 0)),
+            ("bytes=-5", (2, 5, 0)),
+            ("bytes=-0", (2, 0, 0)),
+            ("  bytes=003-009  ", (0, 3, 9)),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::RANGE, value.parse().unwrap());
+            let actual = match parse_range(&headers).unwrap().unwrap() {
+                ReadRange::Inclusive { first, last } => (0, first, last),
+                ReadRange::From(first) => (1, first, 0),
+                ReadRange::Suffix(length) => (2, length, 0),
+            };
+            assert_eq!(actual, expected, "{value}");
+        }
+        let mut headers = HeaderMap::new();
+        let value = format!("bytes={}-1", "0".repeat(120));
+        assert_eq!(value.len(), 128);
+        headers.insert(header::RANGE, value.parse().unwrap());
+        assert!(matches!(
+            parse_range(&headers),
+            Ok(Some(ReadRange::Inclusive { first: 0, last: 1 }))
+        ));
+        headers.insert(header::RANGE, format!("{value} ").parse().unwrap());
+        assert_eq!(
+            parse_range(&headers).err().unwrap(),
+            (StatusCode::BAD_REQUEST, "invalid_static_hls_range".into())
+        );
+        assert!(!satisfiable(ReadRange::Suffix(0), 20));
+    }
+
+    #[test]
+    fn if_range_retains_parent_exact_match_and_duplicate_behavior() {
+        let mut headers = HeaderMap::new();
+        assert!(if_range_matches(&headers, "\"current\""));
+        for (value, expected) in [
+            ("\"current\"", true),
+            ("\"old\"", false),
+            ("W/\"current\"", false),
+        ] {
+            headers.insert(header::IF_RANGE, value.parse().unwrap());
+            assert_eq!(if_range_matches(&headers, "\"current\""), expected);
+        }
+        headers.insert(header::IF_RANGE, "\"current\"".parse().unwrap());
+        headers.append(header::IF_RANGE, "\"current\"".parse().unwrap());
+        assert!(!if_range_matches(&headers, "\"current\""));
     }
 }

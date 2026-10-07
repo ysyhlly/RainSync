@@ -49,6 +49,7 @@ mod private_library;
 mod profile;
 mod registration;
 mod registration_auth;
+mod responses;
 mod room_cleanup;
 mod room_diagnostics;
 mod room_lifecycle;
@@ -309,15 +310,8 @@ async fn login(State(app): State<App>, h: HeaderMap, Json(body): Json<Login>) ->
         .await?
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid_credentials"))?;
     let stored: String = row.get("password_hash");
-    let valid = tokio::task::spawn_blocking(move || {
-        PasswordHash::new(&stored).ok().is_some_and(|p| {
-            Argon2::default()
-                .verify_password(body.password.as_bytes(), &p)
-                .is_ok()
-        })
-    })
-    .await
-    .unwrap_or(false);
+    let valid =
+        account_security::password_verify(&app.account_security, stored, body.password).await?;
     if !valid {
         return Err(err(StatusCode::UNAUTHORIZED, "invalid_credentials"));
     }
@@ -372,7 +366,7 @@ async fn me(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     value["admin"] = json!(u.admin);
     value["csrf"] = json!(csrf);
     guests::add_identity(&app, u.id, &mut value).await?;
-    Ok(registration::private_json(StatusCode::OK, value))
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 async fn logout(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     origin(&app, &h)?;
@@ -401,11 +395,13 @@ async fn users(
     h: HeaderMap,
     Json(body): Json<account_rules::NewAccount>,
 ) -> Result<Json<Value>> {
-    admin(&auth(&app, &h, true).await?)?;
+    let actor = auth(&app, &h, true).await?;
+    admin(&actor)?;
     let display_name = body.validate()?;
     let pw = account_security::password_hash(&app, body.password).await?;
     let id = Uuid::new_v4();
     let mut tx = app.db.begin().await?;
+    let login = admin_settings::lock_admin(&mut tx, &actor, &h, true).await?;
     sqlx::query("INSERT INTO users VALUES($1,$2,$3,false)")
         .bind(id)
         .bind(body.username)
@@ -420,7 +416,7 @@ async fn users(
             .execute(&mut *tx)
             .await?;
     }
-    tx.commit().await?;
+    admin_settings::finish(tx, &actor, &login).await?;
     Ok(Json(json!({"id":id})))
 }
 async fn ws(State(app): State<App>, h: HeaderMap, upgrade: WebSocketUpgrade) -> Result<Response> {
@@ -803,6 +799,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route(
             "/api/v1/libraries",
             get(private_library::list).post(private_library::create),
+        )
+        .route(
+            "/api/v1/libraries/issued-shares",
+            get(private_library::issued_shares),
         )
         .route(
             "/api/v1/libraries/{id}",

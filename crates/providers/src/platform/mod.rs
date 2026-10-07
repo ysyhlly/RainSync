@@ -3,6 +3,7 @@
 pub mod bilibili;
 pub mod http;
 pub mod imports;
+mod live_playlist_syntax;
 pub mod oauth;
 pub mod short_video;
 pub mod text;

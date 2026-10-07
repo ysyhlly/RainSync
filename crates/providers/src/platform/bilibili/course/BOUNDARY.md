@@ -87,6 +87,20 @@ single-track fragmented MP4 parser, not a default AAC rate.
   identity and extra fragment records are unsupported. Post-roll playback and
   lesson sequencing beyond the main episode require a separate reviewed design
 
+## Quality discovery and selection
+
+The server uses the same single, viewer-bound normal playback request with
+`qn=127` to discover every admitted clear AVC rendition, independently of the
+selected pixel ceiling. The provider's whole-playback, exact-content and
+returned-current-quality checks remain mandatory; advertised qualities without
+an admitted track never become menu options. Auto still selects at most 1080p.
+Manual downgrades keep the complete authorized menu, and selecting an upgrade
+performs fresh discovery with the same account and identity checks. No denied
+request is retried, and no alternate account or route is used for discovery.
+
+The selected AAC initialization proof remains required when the rate is absent,
+and its byte length and strong validator remain bound to the selected audio.
+
 ## Missing-rate byte probe
 
 Course audio parsing preserves missing sampling rate as unknown in private

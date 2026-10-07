@@ -1,6 +1,14 @@
 use super::*;
 use protocol::RoomPermission;
 
+pub(crate) fn redeem_error(error: anyhow::Error) -> Error {
+    match error.to_string().as_str() {
+        "invalid_invite" => err(StatusCode::FORBIDDEN, "invalid_invite"),
+        "room_full" => err(StatusCode::CONFLICT, "room_full"),
+        _ => error.into(),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
@@ -104,7 +112,7 @@ pub async fn list_invites(
         .bind(room).fetch_all(&mut *tx).await?;
     let result=rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"room_id":room,"created_by":r.get::<Option<Uuid>,_>("created_by"),"invited_user_id":r.get::<Option<Uuid>,_>("invited_user_id"),"role":r.get::<String,_>("granted_role"),"permissions":r.get::<Vec<String>,_>("permissions"),"max_uses":r.get::<Option<i32>,_>("max_uses"),"use_count":r.get::<i32,_>("use_count"),"revoked":r.get::<bool,_>("revoked"),"revoked_at":r.get::<Option<i64>,_>("revoked_at_ms"),"expired":r.get::<bool,_>("expired"),"expires_at":r.get::<i64,_>("expires_at_ms")})).collect::<Vec<_>>();
     commit_controller(tx, &h).await?;
-    Ok(media_titles::private_json(json!(result)))
+    Ok(responses::ok_json(json!(result)))
 }
 pub async fn revoke_invite(
     State(app): State<App>,
@@ -139,11 +147,7 @@ pub async fn join(
         .map_err(room_lifecycle::gate_error)?;
     persistence::room_invites::redeem(&mut tx, room, actor.id, &hash(&body.token))
         .await
-        .map_err(|e| match e.to_string().as_str() {
-            "invalid_invite" => err(StatusCode::FORBIDDEN, "invalid_invite"),
-            "room_full" => err(StatusCode::CONFLICT, "room_full"),
-            _ => e.into(),
-        })?;
+        .map_err(redeem_error)?;
     // Admission must still belong to the exact live login after lock waits.
     let login = hash(&cookie(&h).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "login_required"))?);
     let locked_csrf: Option<String> = sqlx::query_scalar(
@@ -165,4 +169,27 @@ pub async fn join(
     }
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redeem_error_preserves_known_statuses_and_unknown_error_policy() {
+        for (message, status, code) in [
+            ("invalid_invite", StatusCode::FORBIDDEN, "invalid_invite"),
+            ("room_full", StatusCode::CONFLICT, "room_full"),
+            (
+                "unexpected database error",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "operation_failed",
+            ),
+        ] {
+            let Error(actual_status, actual_code, retry) = redeem_error(anyhow::anyhow!(message));
+            assert_eq!(actual_status, status);
+            assert_eq!(actual_code, code);
+            assert_eq!(retry, None);
+        }
+    }
 }

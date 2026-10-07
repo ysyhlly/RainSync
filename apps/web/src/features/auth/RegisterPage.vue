@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch, onBeforeUnmount, nextTick } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { useSession } from "./session.store";
+import { RegistrationConfirmationRequired, useSession } from "./session.store";
 import { useRegistrationPolicy } from "./registration-policy";
 import { RequestFailure } from "../../errors";
 import { validateAccount } from "./account-rules";
@@ -23,6 +23,7 @@ const session = useSession(),
   uncertain = ref(false),
   expires = ref<number>(),
   retrySeconds = ref(0);
+const registrationReceipt = ref<{ id: string; username: string }>();
 const {
   policy,
   loading: policyLoading,
@@ -146,13 +147,17 @@ async function complete() {
   password.value = "";
   confirm.value = "";
   code.value = "";
+  registrationReceipt.value = undefined;
   await router.replace(returnTo.value);
 }
 async function confirmSession() {
   try {
     const user = await session.load();
     if (!alive) return false;
-    if (user.username === username.value) {
+    if (
+      user.username === username.value &&
+      (!registrationReceipt.value || user.id === registrationReceipt.value.id)
+    ) {
       await complete();
       return true;
     }
@@ -208,7 +213,26 @@ async function register() {
     await complete();
   } catch (e) {
     if (!alive) return;
-    if (e instanceof RequestFailure) {
+    if (e instanceof RegistrationConfirmationRequired)
+      registrationReceipt.value = e.receipt;
+    // Only explicit pre-commit denials make another signup safe. A structured
+    // server/transport failure can also follow an already-committed account.
+    const definite =
+      e instanceof RequestFailure &&
+      [
+        "REGISTRATION_CLOSED",
+        "USERNAME_TAKEN",
+        "REGISTRATION_INVITE_INVALID",
+        "USERNAME_OR_PASSWORD_INVALID",
+        "INVALID_REQUEST",
+        "RATE_LIMITED",
+        "FORBIDDEN",
+        "CSRF_REJECTED",
+        "ORIGIN_REJECTED",
+        "UNSUPPORTED_MEDIA_TYPE",
+        "GUEST_RESTRICTED",
+      ].includes(e.code);
+    if (definite) {
       failure(e);
       if (e.code === "REGISTRATION_CLOSED") {
         password.value = confirm.value = "";
@@ -223,15 +247,13 @@ async function register() {
         confirm.value = "";
         fieldError.value = { field: "code", message: error.value };
         await focus("register-code");
-      } else if (e.code === "ALREADY_AUTHENTICATED") {
-        uncertain.value = true;
-        await confirmSession();
       }
     } else {
       uncertain.value = true;
       if (!(await confirmSession()) && !session.user)
-        error.value =
-          "注册结果尚未确认。请使用刚设置的登录账号和密码登录确认，不要重复提交注册。";
+        error.value = registrationReceipt.value
+          ? "账号已创建，登录状态尚未确认。请使用刚设置的账号登录确认，不要重复提交注册。"
+          : "注册结果尚未确认。请使用刚设置的登录账号和密码登录确认，不要重复提交注册。";
     }
   } finally {
     busy.value = false;
@@ -247,7 +269,13 @@ async function recover() {
       error.value = "当前已登录其他账号，请先退出该账号。";
       return;
     }
-    await session.login(username.value, password.value, authentication.signal);
+    const user = await session.login(
+      username.value,
+      password.value,
+      authentication.signal,
+    );
+    if (registrationReceipt.value && user.id !== registrationReceipt.value.id)
+      throw new Error("当前登录账号与本次注册结果不一致，请先退出当前账号。");
     if (alive) await complete();
   } catch (e) {
     if (alive) failure(e);

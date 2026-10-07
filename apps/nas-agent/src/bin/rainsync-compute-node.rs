@@ -67,6 +67,19 @@ fn upload_budget_reason(status: u16, body: &[u8]) -> Option<&'static str> {
         _ => None,
     }
 }
+// Allow a bounded slow uplink (64 KiB/s plus HTTP/storage overhead) without
+// weakening the three-second deadline used by ordinary control requests.
+fn artifact_upload_timeout(bytes: usize) -> Result<Duration> {
+    ensure!(
+        bytes > 0 && bytes as u64 <= media_core::distributed_compute::MAX_SEGMENT_BYTES,
+        "compute_segment_bounds"
+    );
+    Ok(Duration::from_secs(15 + (bytes as u64).div_ceil(64 * 1024)))
+}
+fn retryable_upload_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 502 | 503 | 504)
+}
+
 async fn require_upload_success(mut response: reqwest::Response) -> Result<()> {
     let status = response.status();
     if status.is_success() {
@@ -157,24 +170,48 @@ impl Node {
         let reply=self.call("/agent-compute/heartbeat",Some(json!({"connection_id":self.connection,"capabilities":self.caps,"self_test":{"version":1,"ffmpeg_sample":"passed","runtime_slots":1}}))).await?;
         Ok(reply["slots"].as_u64().unwrap_or(1).min(1) as usize)
     }
-    async fn register_catalog(&self) -> Result<()> {
-        let catalog = self.call("/agent-compute/catalog", None).await?;
-        for item in catalog["items"].as_array().into_iter().flatten() {
-            let resource = item["resource"]
-                .as_str()
-                .context("compute_catalog_resource")?
-                .to_owned();
-            let version = item["source_version"]
-                .as_str()
-                .context("compute_catalog_version")?
-                .to_owned();
-            let root = self.root.clone();
-            let (sha, bytes) = tokio::task::spawn_blocking(move || {
-                verify_source(&root, &resource, &version, None)
-            })
-            .await??;
-            self.call("/agent-compute/catalog",Some(json!({"media_id":item["media_id"],"source_version":item["source_version"],"content_sha256":sha,"size_bytes":bytes}))).await?;
+    async fn register_catalog(&self, after: &mut Option<Uuid>) -> Result<()> {
+        let path = after.map_or_else(
+            || "/agent-compute/catalog".to_owned(),
+            |id| format!("/agent-compute/catalog?after={id}"),
+        );
+        let catalog = self.call(&path, None).await?;
+        let items = catalog["items"]
+            .as_array()
+            .context("compute_catalog_items")?;
+        ensure!(items.len() <= 32, "compute_catalog_page_limit");
+        let next = if items.len() == 32 {
+            Some(serde_json::from_value::<Uuid>(
+                items.last().unwrap()["media_id"].clone(),
+            )?)
+        } else {
+            None
+        };
+        for item in items {
+            let registration = async {
+                let resource = item["resource"]
+                    .as_str()
+                    .context("compute_catalog_resource")?
+                    .to_owned();
+                let version = item["source_version"]
+                    .as_str()
+                    .context("compute_catalog_version")?
+                    .to_owned();
+                let root = self.root.clone();
+                let (sha, bytes) = tokio::task::spawn_blocking(move || {
+                    verify_source(&root, &resource, &version, None)
+                })
+                .await??;
+                self.call("/agent-compute/catalog",Some(json!({"media_id":item["media_id"],"source_version":item["source_version"],"content_sha256":sha,"size_bytes":bytes}))).await?;
+                Ok::<(), anyhow::Error>(())
+            }.await;
+            if let Err(error) = registration {
+                tracing::warn!(media_id=?item["media_id"],error=%error,"compute catalog item unavailable; continuing other items and queued work");
+            }
         }
+        // A full failed page must not permanently hide later valid sources.
+        // Wrap at the end so repaired/version-changed items are retried later.
+        *after = next;
         Ok(())
     }
     async fn verify_owned(&self, j: &Job, stop: &mut watch::Receiver<bool>) -> Result<()> {
@@ -395,6 +432,105 @@ impl Node {
             }
         }
     }
+    async fn upload_owned(
+        &self,
+        j: &Job,
+        stop: &mut watch::Receiver<bool>,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let timeout = artifact_upload_timeout(bytes.len())?;
+        ensure!(
+            bytes.len() as u64 <= j.output_budget_bytes,
+            "compute_output_budget_exceeded"
+        );
+        ensure!(!*stop.borrow(), "compute_shutdown");
+        let before = tokio::time::Instant::now();
+        let renewal_path = format!("/agent-compute/jobs/{}/renew", j.id);
+        let fence = serde_json::to_value(self.fence(j))?;
+        let renewed = tokio::select! {
+            biased;
+            _ = stopped(stop) => anyhow::bail!("compute_shutdown"),
+            result = self.call(&renewal_path, Some(fence.clone())) => result?,
+        };
+        let lease_ms = renewed["lease_ms"]
+            .as_u64()
+            .context("compute_lease_missing")?;
+        ensure!((1..=20000).contains(&lease_ms), "compute_lease_invalid");
+        let mut lease_deadline = before + Duration::from_millis(lease_ms);
+        ensure!(
+            tokio::time::Instant::now() < lease_deadline,
+            "compute_lease_lost"
+        );
+        let operation_deadline = tokio::time::Instant::now() + timeout;
+        let sha = hex::encode(Sha256::digest(&bytes));
+        let request = self
+            .http
+            .post(format!(
+                "{}/api/v1/agent-compute/jobs/{}/files/{name}",
+                self.server, j.id
+            ))
+            .bearer_auth(&self.token)
+            .timeout(timeout)
+            .header("x-compute-connection", self.connection.to_string())
+            .header("x-compute-attempt", j.attempt.to_string())
+            .header("x-compute-generation", j.output_generation.to_string())
+            .header("x-content-sha256", sha)
+            .body(bytes);
+        let upload = async {
+            // The endpoint is immutable by job/generation/name/hash. A single
+            // retry may recover a lost response without charging bytes twice.
+            for attempt in 0..2 {
+                let response = request
+                    .try_clone()
+                    .context("compute_upload_not_repeatable")?
+                    .send()
+                    .await;
+                match response {
+                    Ok(response) if attempt == 0 && retryable_upload_status(response.status()) => {}
+                    Ok(response) => return require_upload_success(response).await,
+                    Err(error)
+                        if attempt == 0
+                            && (error.is_timeout()
+                                || error.is_connect()
+                                || error.is_request()
+                                || error.is_body()) => {}
+                    Err(_) => anyhow::bail!("compute_upload_request_failed"),
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            unreachable!("the final attempt always returns")
+        };
+        tokio::pin!(upload);
+        let mut next_renewal = tokio::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            tokio::select! {
+                biased;
+                _ = stopped(stop) => anyhow::bail!("compute_shutdown"),
+                _ = tokio::time::sleep_until(lease_deadline) => anyhow::bail!("compute_lease_lost"),
+                _ = tokio::time::sleep_until(operation_deadline) => anyhow::bail!("compute_upload_deadline"),
+                result = &mut upload => return result,
+                _ = tokio::time::sleep_until(next_renewal) => {
+                    let before = tokio::time::Instant::now();
+                    let renewal = self.call(&renewal_path, Some(fence.clone()));
+                    tokio::pin!(renewal);
+                    let reply = tokio::select! {
+                        biased;
+                        _ = stopped(stop) => anyhow::bail!("compute_shutdown"),
+                        _ = tokio::time::sleep_until(lease_deadline) => anyhow::bail!("compute_lease_lost"),
+                        _ = tokio::time::sleep_until(operation_deadline) => anyhow::bail!("compute_upload_deadline"),
+                        result = &mut upload => return result,
+                        result = &mut renewal => result?,
+                    };
+                    ensure!(tokio::time::Instant::now() < lease_deadline, "compute_lease_lost");
+                    let lease_ms = reply["lease_ms"].as_u64().context("compute_lease_missing")?;
+                    ensure!((1..=20000).contains(&lease_ms), "compute_lease_invalid");
+                    lease_deadline = before + Duration::from_millis(lease_ms);
+                    next_renewal = tokio::time::Instant::now() + Duration::from_secs(4);
+                }
+            }
+        }
+    }
     async fn execute(
         &self,
         j: Job,
@@ -486,14 +622,12 @@ impl Node {
             ensure!(directory_bytes(&out).await? <= j.output_budget_bytes, "compute_output_budget_exceeded");
             for name in names {
                 ensure!(!*stop.borrow(), "compute_shutdown");
-                self.call(&format!("/agent-compute/jobs/{}/renew", j.id), Some(serde_json::to_value(self.fence(&j))?)).await?;
-                let bytes = tokio::fs::read(out.join(&name)).await?;
-                ensure!(!bytes.is_empty() && bytes.len() as u64 <= qualification::MAX_SEGMENT_BYTES, "compute_segment_bounds");
-                let sha = hex::encode(Sha256::digest(&bytes));
-                let response = self.http.post(format!("{}/api/v1/agent-compute/jobs/{}/files/{name}", self.server, j.id)).bearer_auth(&self.token)
-                    .header("x-compute-connection", self.connection.to_string()).header("x-compute-attempt", j.attempt.to_string())
-                    .header("x-compute-generation", j.output_generation.to_string()).header("x-content-sha256", sha).body(bytes).send().await?;
-                require_upload_success(response).await?;
+                let path = out.join(&name);
+                let length = tokio::fs::metadata(&path).await?.len();
+                ensure!(length > 0 && length <= qualification::MAX_SEGMENT_BYTES, "compute_segment_bounds");
+                let bytes = tokio::fs::read(&path).await?;
+                ensure!(bytes.len() as u64 == length, "compute_output_changed");
+                self.upload_owned(&j, &mut stop, &name, bytes).await?;
             }
             let mut finish = serde_json::to_value(self.fence(&j))?;
             finish["qualification"] = serde_json::to_value(&report)?;
@@ -881,16 +1015,13 @@ async fn run() -> Result<()> {
         }
     });
     let work = async {
+        let mut catalog_after = None;
         loop {
             if *shutdown.borrow() {
                 break;
             }
             journal.flush(&n).await?;
-            if let Err(e) = n.register_catalog().await {
-                tracing::warn!(error=%e,"catalog registration failed; retrying while no job is owned");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
+            // Already indexed work is independent of new catalog failures.
             let reply = match n
                 .call(
                     "/agent-compute/claim",
@@ -955,6 +1086,9 @@ async fn run() -> Result<()> {
                         .await;
                 }
             } else {
+                if let Err(e) = n.register_catalog(&mut catalog_after).await {
+                    tracing::warn!(error=%e,"catalog page registration failed; queued work remains eligible");
+                }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
@@ -987,6 +1121,103 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn failed_catalog_items_do_not_hide_later_pages_or_valid_items() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = std::env::temp_dir().join(format!("compute-catalog-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(root.join("good.mp4"), b"owned fingerprint fixture")
+            .await
+            .unwrap();
+        let version = media_core::file_version::snapshot_file(
+            &std::fs::File::open(root.join("good.mp4")).unwrap(),
+        )
+        .unwrap()
+        .version;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_version = version.clone();
+        let server = tokio::spawn(async move {
+            let mut registered = Vec::new();
+            for request_index in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let (head, body) = loop {
+                    let mut chunk = [0; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0 && bytes.len() + read <= 8192);
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let head = String::from_utf8(bytes[..end].to_vec()).unwrap();
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break (head, bytes[end + 4..end + 4 + length].to_vec());
+                        }
+                    }
+                };
+                let reply = match request_index {
+                    0 => {
+                        assert!(head.starts_with("GET /api/v1/agent-compute/catalog HTTP/"));
+                        json!({"items":(1..=32).map(|id|json!({"media_id":Uuid::from_u128(id),"resource":"missing.mp4","source_version":"stat-v1:missing"})).collect::<Vec<_>>()})
+                    }
+                    1 => {
+                        assert!(head.starts_with(&format!("GET /api/v1/agent-compute/catalog?after={} HTTP/", Uuid::from_u128(32))));
+                        json!({"items":[
+                            {"media_id":Uuid::from_u128(33),"resource":"also-missing.mp4","source_version":"stat-v1:missing"},
+                            {"media_id":Uuid::from_u128(34),"resource":"good.mp4","source_version":expected_version}
+                        ]})
+                    }
+                    _ => {
+                        assert!(head.starts_with("POST /api/v1/agent-compute/catalog HTTP/"));
+                        registered.push(serde_json::from_slice::<Value>(&body).unwrap());
+                        json!({"ok":true})
+                    }
+                }.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).as_bytes()).await.unwrap();
+            }
+            registered
+        });
+        let node = Node {
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap(),
+            server: format!("http://{address}"),
+            token: "owned-test-token".into(),
+            connection: Uuid::new_v4(),
+            root: root.clone(),
+            output: root.join("unused-output"),
+            ffmpeg: "unused".into(),
+            ffprobe: "unused".into(),
+            caps: vec![],
+        };
+        let mut after = None;
+        node.register_catalog(&mut after).await.unwrap();
+        assert_eq!(after, Some(Uuid::from_u128(32)));
+        node.register_catalog(&mut after).await.unwrap();
+        assert_eq!(after, None);
+        let registered = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0]["media_id"], json!(Uuid::from_u128(34)));
+        assert_eq!(registered[0]["source_version"], version);
+        assert_eq!(registered[0]["size_bytes"], 25);
+        assert_eq!(
+            registered[0]["content_sha256"],
+            hex::encode(Sha256::digest(b"owned fingerprint fixture"))
+        );
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
     #[test]
     fn admitted_audio_selection_is_required_and_absolute() {
         let mut job = json!({"id":Uuid::new_v4(),"attempt":1,"output_generation":Uuid::new_v4(),"lease_ms":20000,"resource":"fixture.mp4","source_version":"version","content_sha256":"a".repeat(64),"source_bytes":1,"recipe":"remux_hls_v1","output_budget_bytes":1000,"selected_video_index":3});
@@ -1174,5 +1405,216 @@ mod tests {
             validate_measured_output_budget(recipe, 1800.0, true, 1).unwrap();
         }
         assert!(validate_measured_output_budget("arbitrary", 30.0, true, u64::MAX).is_err());
+    }
+}
+
+#[cfg(test)]
+mod upload_deadline_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn upload_deadlines_are_size_bounded_and_do_not_change_control_timeouts() {
+        assert_eq!(artifact_upload_timeout(1).unwrap(), Duration::from_secs(16));
+        assert_eq!(
+            artifact_upload_timeout(3 * 1024 * 1024).unwrap(),
+            Duration::from_secs(63)
+        );
+        assert_eq!(
+            artifact_upload_timeout(8 * 1024 * 1024).unwrap(),
+            Duration::from_secs(143)
+        );
+        assert!(artifact_upload_timeout(0).is_err());
+        assert!(artifact_upload_timeout(8 * 1024 * 1024 + 1).is_err());
+        assert!(!retryable_upload_status(
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        ));
+        assert!(!retryable_upload_status(reqwest::StatusCode::CONFLICT));
+    }
+
+    #[derive(Default)]
+    struct Requests {
+        renewals: usize,
+        uploads: Vec<(String, Vec<u8>)>,
+    }
+
+    async fn exercise_upload(
+        delay: Duration,
+        first_upload_status: u16,
+        lease_ms: u64,
+        stop_after: Option<Duration>,
+    ) -> (Result<()>, Requests) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Requests::default()));
+        let recorded = requests.clone();
+        let (server_stop, mut server_stopped) = watch::channel(false);
+        let server = tokio::spawn(async move {
+            let mut handlers = tokio::task::JoinSet::new();
+            loop {
+                let stream = tokio::select! {
+                    _ = stopped(&mut server_stopped) => break,
+                    stream = listener.accept() => stream.unwrap().0,
+                };
+                let recorded = recorded.clone();
+                handlers.spawn(async move {
+                    let mut stream = stream;
+                    let mut bytes = Vec::new();
+                    let (head, body) = loop {
+                        let mut chunk = [0; 1024];
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0 && bytes.len() + n <= 8192);
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                            let head = String::from_utf8(bytes[..end].to_vec()).unwrap();
+                            let length = head.lines().find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                            }).unwrap_or(0);
+                            if bytes.len() >= end + 4 + length {
+                                break (head, bytes[end + 4..end + 4 + length].to_vec());
+                            }
+                        }
+                    };
+                    let is_renewal = head.lines().next().unwrap().contains("/renew ");
+                    let status = {
+                        let mut requests = recorded.lock().unwrap();
+                        if is_renewal {
+                            requests.renewals += 1;
+                            200
+                        } else {
+                            let first = requests.uploads.is_empty();
+                            requests.uploads.push((head, body));
+                            if first { first_upload_status } else { 200 }
+                        }
+                    };
+                    if !is_renewal { tokio::time::sleep(delay).await; }
+                    let body = if is_renewal { json!({"lease_ms":lease_ms}) }
+                        else if status == 413 { json!({"error":{"code":"COMPUTE_OUTPUT_BUDGET_EXCEEDED"}}) }
+                        else { json!({"ok":true}) }.to_string();
+                    let reply = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                });
+            }
+            handlers.abort_all();
+            while let Some(result) = handlers.join_next().await {
+                if let Err(error) = result {
+                    assert!(error.is_cancelled(), "fixture handler failed: {error}");
+                }
+            }
+        });
+        let node = Node {
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap(),
+            server: format!("http://{address}"),
+            token: "owned-fixture-token".into(),
+            connection: Uuid::new_v4(),
+            root: PathBuf::new(),
+            output: PathBuf::new(),
+            ffmpeg: "unused".into(),
+            ffprobe: "unused".into(),
+            caps: vec![],
+        };
+        let job = Job {
+            id: Uuid::new_v4(),
+            attempt: 1,
+            output_generation: Uuid::new_v4(),
+            lease_ms,
+            resource: "unused.mp4".into(),
+            source_version: "fixture".into(),
+            content_sha256: "a".repeat(64),
+            source_bytes: 1,
+            recipe: "remux_hls_v1".into(),
+            selected_video_index: 0,
+            selected_audio_index: None,
+            output_budget_bytes: 1024,
+        };
+        let (stop, mut stopped_rx) = watch::channel(false);
+        let shutdown = stop_after.map(|delay| {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                stop.send_replace(true);
+            })
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(8),
+            node.upload_owned(
+                &job,
+                &mut stopped_rx,
+                "segment00000.ts",
+                b"ordinary owned artifact".to_vec(),
+            ),
+        )
+        .await
+        .unwrap();
+        if let Some(shutdown) = shutdown {
+            shutdown.await.unwrap();
+        }
+        server_stop.send_replace(true);
+        server.await.unwrap();
+        let records = Arc::try_unwrap(requests)
+            .ok()
+            .unwrap()
+            .into_inner()
+            .unwrap();
+        for (headers, body) in &records.uploads {
+            assert_eq!(body, b"ordinary owned artifact");
+            let headers = headers.to_ascii_lowercase();
+            for required in [
+                format!("x-compute-connection: {}", node.connection),
+                format!("x-compute-attempt: {}", job.attempt),
+                format!("x-compute-generation: {}", job.output_generation),
+                format!("x-content-sha256: {}", hex::encode(Sha256::digest(body))),
+            ] {
+                assert!(headers.contains(&required));
+            }
+        }
+        (outcome, records)
+    }
+
+    #[tokio::test]
+    async fn slower_than_control_deadline_upload_renews_the_same_attempt() {
+        let (result, requests) =
+            exercise_upload(Duration::from_millis(4500), 200, 20000, None).await;
+        result.unwrap();
+        assert_eq!(requests.uploads.len(), 1);
+        assert!(requests.renewals >= 2);
+    }
+
+    #[tokio::test]
+    async fn upload_retries_preserve_artifact_identity_and_quota_failures_do_not_retry() {
+        let (result, requests) = exercise_upload(Duration::ZERO, 503, 20000, None).await;
+        result.unwrap();
+        assert_eq!(requests.uploads.len(), 2);
+        assert_eq!(requests.uploads[0], requests.uploads[1]);
+        let (result, requests) = exercise_upload(Duration::ZERO, 413, 20000, None).await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "compute_output_budget_exceeded"
+        );
+        assert_eq!(requests.uploads.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upload_stops_on_shutdown_or_lease_expiry_without_waiting_for_http() {
+        let started = tokio::time::Instant::now();
+        let (result, requests) = exercise_upload(
+            Duration::from_secs(5),
+            200,
+            20000,
+            Some(Duration::from_millis(100)),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), "compute_shutdown");
+        assert_eq!(requests.uploads.len(), 1);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let (result, requests) = exercise_upload(Duration::from_secs(5), 200, 100, None).await;
+        assert_eq!(result.unwrap_err().to_string(), "compute_lease_lost");
+        assert_eq!(requests.uploads.len(), 1);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

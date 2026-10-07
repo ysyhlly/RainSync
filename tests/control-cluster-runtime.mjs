@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {createHash,randomBytes,randomUUID} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:net';
+import {request as httpRequest} from 'node:http';
 import {createWriteStream} from 'node:fs';
 import {readFile,writeFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
@@ -46,6 +47,81 @@ try {
   assert.equal(f.sql(`SELECT owner_node FROM room_leases WHERE room_id=${quote(controlClosing)}`),nodes[1]);
   await admin.request(`/rooms/${controlClosing}/reopen`,'POST',{expected_revision:controlClosed.state.revision});
   report.checks.push('live control-only owner independently reconciles positive database receipts to closed and can reopen through the public gateway');
+  // Guest admission commits on the remote room owner, but its only login
+  // credential must reach the browser through the public media gateway.
+  const settingsBeforeGuest=await admin.request('/admin/settings');
+  await admin.request('/admin/settings','PATCH',{expected_revision:settingsBeforeGuest.revision,changes:{guests_enabled:true}});
+  await admin.request(`/rooms/${controlClosing}/guest-access`,'PUT',{enabled:true});
+  const guestInvite=await admin.request(`/rooms/${controlClosing}/invites`,'POST',{max_uses:1});
+  const guest=f.client();
+  const guestResponse=await guest.raw(`/rooms/${controlClosing}/guest-session`,{method:'POST',body:{token:guestInvite.token,display_name:'Cluster guest'}});
+  assert.equal(guestResponse.status,201,'remote owner creates the guest through the public gateway');
+  const guestCookie=guestResponse.headers.get('set-cookie');
+  assert.ok(guestCookie?.startsWith('rainsync_session='),'gateway preserves the guest login cookie');
+  assert.ok(guestCookie.includes('HttpOnly')&&guestCookie.includes('SameSite=Strict')&&guestCookie.includes('Max-Age=7200'),'gateway preserves guest cookie restrictions');
+  const guestIdentity=await guestResponse.json();guest.csrf=guestIdentity.csrf;
+  assert.equal((await guest.request('/auth/me')).id,guestIdentity.id,'guest cookie authenticates at the public media authority');
+  assert.equal((await secondaryClient(guest).request('/auth/me')).id,guestIdentity.id,'the same guest login authenticates at its room owner');
+  assert.deepEqual((await guest.request('/rooms')).map(value=>value.id),[controlClosing]);
+  await guest.request(`/rooms/${controlClosing}/guest-session`,'POST',{token:guestInvite.token},409);
+  assert.equal(f.sql(`SELECT use_count FROM invites WHERE id=${quote(guestInvite.id)}`),'1','retry with the established cookie consumes no second invitation use');
+  assert.equal(f.sql(`SELECT count(*) FROM guest_principals WHERE room_id=${quote(controlClosing)}`),'1','forwarded admission creates exactly one guest identity');
+  await admin.request(`/rooms/${controlClosing}/members/${guestIdentity.id}`,'DELETE');
+  await guest.request('/auth/me','GET',undefined,401);
+  assert.equal(f.sql(`SELECT count(*) FROM room_members WHERE room_id=${quote(controlClosing)}`),'1','remote owner removes only the temporary guest membership');
+  // Distinct loopback clients use real source sockets; no proxy-header trust
+  // or host network configuration is added to this disposable two-node fixture.
+  const guestRateHeader='x-rainsync-control-guest-rate-identity';
+  const guestAttempt=(origin,source,body,headers={})=>new Promise((resolve,reject)=>{
+   const request=httpRequest(new URL(`/api/v1/rooms/${controlClosing}/guest-session`,origin),{
+    method:'POST',localAddress:source,agent:false,
+    signal:AbortSignal.any([f.abortSignal,AbortSignal.timeout(20000)]),
+    headers:{Origin:f.origin,'Content-Type':'application/json',...headers},
+   },response=>{
+    let data='';response.setEncoding('utf8');response.on('data',chunk=>data+=chunk);
+    response.on('error',reject);response.on('end',()=>{
+     try{resolve({status:response.statusCode,headers:response.headers,body:JSON.parse(data)})}catch(error){reject(error)}
+    });
+   });
+   request.on('error',reject);request.end(JSON.stringify(body));
+  });
+  const sourceA='127.0.0.2',sourceB='127.0.0.3';
+  const guestRateKey=source=>createHash('sha256').update('account-rate:guest-entry:'+source).digest('hex');
+  const attempts=source=>Number(f.sql(`SELECT COALESCE((SELECT attempts FROM account_rate_limits WHERE scope='guest-entry' AND key_hash=${quote(guestRateKey(source))}),0)`));
+  const admissionBefore=f.sql(`SELECT json_build_array((SELECT count(*) FROM guest_principals WHERE room_id=${quote(controlClosing)}),(SELECT count(*) FROM sessions),(SELECT count(*) FROM room_members WHERE room_id=${quote(controlClosing)}))`);
+  for(let attempt=0;attempt<10;attempt++){
+   const result=await guestAttempt(attempt%2===0?f.origin:secondaryOrigin,sourceA,{token:'invalid'},{
+    [guestRateHeader]:createHash('sha256').update(`untrusted-${attempt}`).digest('hex'),
+    'X-Forwarded-For':`198.51.100.${attempt+1}`,
+   });
+   assert.equal(result.status,403,'invalid invitation remains denied before the fixed-window limit');
+   assert.equal(result.body.error.code,'INVALID_INVITE');
+   assert.equal(attempts(sourceA),attempt+1,'direct owner and forwarded gateway share the original source bucket; spoofed headers cannot select a new bucket');
+  }
+  for(const origin of [f.origin,secondaryOrigin]){
+   const limited=await guestAttempt(origin,sourceA,{token:guestInvite.token},{[guestRateHeader]:'b'.repeat(64),'X-Forwarded-For':'203.0.113.9'});
+   assert.equal(limited.status,429,'the exhausted source stays limited through either gateway despite browser-supplied identity');
+   assert.ok(Number(limited.headers['retry-after'])>0);
+  }
+  assert.equal(attempts(sourceA),11,'attempt storage remains capped at the existing ceiling');
+  const independent=await guestAttempt(f.origin,sourceB,{token:'invalid'},{[guestRateHeader]:'b'.repeat(64),'X-Forwarded-For':'203.0.113.9'});
+  assert.equal(independent.status,403,'another client behind the same forwarding node has its own allowance');
+  assert.equal(independent.body.error.code,'INVALID_INVITE');
+  assert.equal(attempts(sourceB),1);
+  const expiredUse=await guestAttempt(secondaryOrigin,sourceB,{token:guestInvite.token});
+  assert.equal(expiredUse.status,403,'rate identity does not bypass the one-use invitation admission gate');
+  assert.equal(attempts(sourceB),2);
+  const peerRejected=await guestAttempt(f.origin,sourceB,{token:'invalid'},{
+   'x-rainsync-control-peer':nodes[1],'x-rainsync-control-secret':'not-the-fixture-peer-secret',[guestRateHeader]:'c'.repeat(64),
+  });
+  assert.equal(peerRejected.status,403,'an untrusted caller cannot activate peer context by naming an allowlisted node');
+  assert.equal(attempts(sourceB),2,'rejected peer headers never reach guest admission');
+  assert.equal(f.sql(`SELECT use_count FROM invites WHERE id=${quote(guestInvite.id)}`),'1');
+  assert.equal(f.sql(`SELECT json_build_array((SELECT count(*) FROM guest_principals WHERE room_id=${quote(controlClosing)}),(SELECT count(*) FROM sessions),(SELECT count(*) FROM room_members WHERE room_id=${quote(controlClosing)}))`),admissionBefore,'failed admissions issue no guest identities, sessions or memberships');
+  report.checks.push('distinct original socket clients retain independent guest admission buckets across two gateways; direct and forwarded attempts share one source window, forged source/XFF/peer headers cannot evade limits, and invite/session/membership gates remain enforced');
+  const settingsAfterGuest=await admin.request('/admin/settings');
+  await admin.request('/admin/settings','PATCH',{expected_revision:settingsAfterGuest.revision,changes:{guests_enabled:false}});
+  report.checks.push('remote-owner guest entry forwards its HttpOnly cookie; public and owner authentication restore one scoped identity, retry spends one invite use only, and owner removal revokes it');
   const createKey=randomUUID(),createBody={name:'same creation key across control gateways'};
   const createHeaders={'Idempotency-Key':createKey};
   const firstCreated=await admin.request('/rooms','POST',createBody,200,createHeaders);
@@ -199,7 +275,7 @@ try {
    for(const record of children)if(record.wasStopped){record.child.kill('SIGCONT');record.wasStopped=false;}
    await reapOwnedChildren([...children]);
   }
- },{beforeStart:async f=>{report.server_binary_sha256=createHash('sha256').update(await readFile(resolve(f.target,'rainsync-server'))).digest('hex');secondaryPort=await port();secondaryOrigin=`http://127.0.0.1:${secondaryPort}`;Object.assign(f.env,{RAINSYNC_CONTROL_CLUSTER:'1',RAINSYNC_CONTROL_NODE_ID:nodes[0],RAINSYNC_CONTROL_ROLE:'media',RAINSYNC_CONTROL_NODES:JSON.stringify({[nodes[0]]:f.origin,[nodes[1]]:secondaryOrigin}),RAINSYNC_CONTROL_PEER_TOKEN:randomBytes(32).toString('hex')})},signal:AbortSignal.timeout(150000)});
+ },{beforeStart:async f=>{report.server_binary_sha256=createHash('sha256').update(await readFile(resolve(f.target,'rainsync-server'))).digest('hex');secondaryPort=await port();secondaryOrigin=`http://127.0.0.1:${secondaryPort}`;Object.assign(f.env,{TRUSTED_PROXY_CIDRS:'',RAINSYNC_CONTROL_CLUSTER:'1',RAINSYNC_CONTROL_NODE_ID:nodes[0],RAINSYNC_CONTROL_ROLE:'media',RAINSYNC_CONTROL_NODES:JSON.stringify({[nodes[0]]:f.origin,[nodes[1]]:secondaryOrigin}),RAINSYNC_CONTROL_PEER_TOKEN:randomBytes(32).toString('hex')})},signal:AbortSignal.timeout(150000)});
  report.cleanup=await fixture.verifyStopped();
 }catch(error){report.result='failed';report.error=String(error);throw error}
 finally {

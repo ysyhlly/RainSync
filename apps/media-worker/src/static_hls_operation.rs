@@ -107,7 +107,6 @@ impl Registry {
     /// handle does not claim the parent or authorize a child; it only lets the
     /// child coordinator await that same owner's positive disposal after the
     /// durable claim stops parent delivery. Never reconstruct it from a UUID.
-    #[allow(dead_code)]
     pub(super) async fn parent_control_for_child(
         &self,
         input: &media_core::static_hls::contracts::input::FrozenInput,
@@ -148,7 +147,6 @@ impl Registry {
     }
 
     /// Original-owner consumption; public grant authority is a separate gate.
-    #[allow(dead_code)]
     pub(super) async fn read_original(
         &self,
         input: &media_core::static_hls::contracts::input::FrozenInput,
@@ -162,8 +160,8 @@ impl Registry {
             .await
     }
 
-    /// Internal publication prerequisite. Public prepare remains disabled until
-    /// the publication transaction and its grant/compatibility gates are wired.
+    /// Internal original-owner publication prerequisite; public prepare enforces
+    /// its separate publication transaction and grant/compatibility gates.
     #[allow(dead_code)]
     pub(super) async fn publication_original(
         &self,

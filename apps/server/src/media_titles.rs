@@ -1,4 +1,5 @@
 use super::*;
+use crate::responses::ok_json;
 
 // $1 is always the authenticated viewer, never an input user id.
 pub const SELECT: &str = "SELECT m.id,COALESCE(u.title,m.shared_title,m.title) AS title,m.title AS original_title,m.shared_title,m.shared_title_revision,u.title AS personal_title,COALESCE(u.revision,0) AS personal_title_revision,m.duration_ms,s.kind,p.status AS preview_status,p.result_revision AS preview_revision FROM media_items m JOIN sources s ON s.id=m.source_id LEFT JOIN media_user_titles u ON u.media_id=m.id AND u.user_id=$1 LEFT JOIN media_previews p ON p.media_id=m.id AND p.source_generation=m.preview_generation AND p.recipe_version=2 AND (s.kind IN ('local','agent') OR p.generated_at IS NULL OR p.generated_at>clock_timestamp()-interval '24 hours')";
@@ -18,10 +19,6 @@ pub fn media(row: &sqlx::postgres::PgRow) -> Value {
     })
 }
 
-pub fn private_json(value: Value) -> Response {
-    ([(header::CACHE_CONTROL, "no-store")], Json(value)).into_response()
-}
-
 pub async fn read(app: &App, viewer: Uuid, id: Uuid) -> Result<Value> {
     let row = sqlx::query(&format!("{SELECT} WHERE {BROWSE} AND m.id=$2"))
         .bind(viewer)
@@ -38,7 +35,7 @@ pub async fn detail(
     Path(id): Path<Uuid>,
 ) -> Result<Response> {
     let user = auth(&app, &h, false).await?;
-    Ok(private_json(read(&app, user.id, id).await?))
+    Ok(ok_json(read(&app, user.id, id).await?))
 }
 
 #[derive(Deserialize)]
@@ -136,5 +133,5 @@ async fn change(app: App, h: HeaderMap, id: Uuid, body: Value, shared: bool) -> 
         return Err(err(StatusCode::CONFLICT, "media_title_conflict"));
     }
     tx.commit().await?;
-    Ok(private_json(read(&app, user.id, id).await?))
+    Ok(ok_json(read(&app, user.id, id).await?))
 }

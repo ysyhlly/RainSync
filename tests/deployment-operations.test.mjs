@@ -17,7 +17,7 @@ import {
   readdir,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { origin, configuration, endpointChecks } from "../deploy/diagnose.mjs";
 import {
   decryptSource,
@@ -123,6 +123,130 @@ test("origin/root checks reject unsafe configuration without leaking values", as
     await rm(root, { recursive: true, force: true });
   }
 });
+const rootOverlap = /must not resolve to overlapping directories/;
+const rootEnvironment = (media, cache) => ({
+  SOURCE_ENCRYPTION_KEY: Buffer.alloc(32).toString("base64"),
+  MEDIA_ROOT: media,
+  CACHE_ROOT: cache,
+});
+
+async function withRootSafetyFixture(run) {
+  const root = await mkdtemp(join(tmpdir(), "rainsync-root-safety-"));
+  try {
+    await run(root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("deployment roots reject equality and both nesting directions without touching media", async () => {
+  await withRootSafetyFixture(async (root) => {
+    const cache = join(root, "cache");
+    const media = join(cache, randomUUID());
+    await mkdir(media, { recursive: true });
+    const sentinel = join(media, "original-media.sentinel");
+    await writeFile(sentinel, "owned disposable original-media fixture");
+    for (const [left, right] of [
+      [media, cache],
+      [media, media],
+      [cache, media],
+      [media, join(media, "not-created", "deep")],
+      [join(media, "not-created", "deep"), media],
+    ]) {
+      await assert.rejects(
+        configuration(rootEnvironment(left, right)),
+        (error) => {
+          assert.match(error.message, rootOverlap);
+          assert.ok(!error.message.includes(root));
+          return true;
+        },
+      );
+    }
+    assert.equal(
+      await readFile(sentinel, "utf8"),
+      "owned disposable original-media fixture",
+    );
+  });
+});
+
+test("deployment roots allow sibling names sharing a string prefix", async () => {
+  await withRootSafetyFixture(async (root) => {
+    const media = join(root, "media");
+    await mkdir(media);
+    for (const name of ["cache", "media-cache", "media2", "..media"]) {
+      const cache = join(root, name);
+      await mkdir(cache);
+      await configuration(rootEnvironment(media, cache));
+      await configuration(rootEnvironment(cache, media));
+    }
+  });
+});
+
+test(
+  "deployment roots resolve symlink aliases and nonexistent tails",
+  { skip: process.platform === "win32" },
+  async () => {
+    await withRootSafetyFixture(async (root) => {
+      const media = join(root, "media");
+      const nested = join(media, "existing");
+      const cache = join(root, "cache");
+      await mkdir(nested, { recursive: true });
+      await mkdir(cache);
+      const alias = join(root, "alias");
+      await symlink(media, alias);
+      const parentAlias = join(root, "parent-alias");
+      await symlink(root, parentAlias);
+      for (const [left, right] of [
+        [media, alias],
+        [media, join(alias, "existing")],
+        [join(alias, "existing"), media],
+        [media, join(alias, "not-created", "deep")],
+        [join(alias, "not-created", "deep"), media],
+        [media, join(parentAlias, "media", "new-cache")],
+        [join(parentAlias, "cache", "new-media"), cache],
+      ]) {
+        await assert.rejects(
+          configuration(rootEnvironment(left, right)),
+          rootOverlap,
+        );
+      }
+      await configuration(rootEnvironment(media, join(parentAlias, "cache")));
+      // Preserve OS symlink/.. semantics instead of normalizing .. first.
+      const deepAlias = join(root, "deep-alias");
+      await symlink(nested, deepAlias);
+      await assert.rejects(
+        configuration(rootEnvironment(media, `${deepAlias}${sep}..`)),
+        rootOverlap,
+      );
+    });
+  },
+);
+
+test(
+  "deployment roots fail closed on dangling symlinks and unresolved parent components",
+  { skip: process.platform === "win32" },
+  async () => {
+    await withRootSafetyFixture(async (root) => {
+      const media = join(root, "media");
+      await mkdir(media);
+      const dangling = join(root, "dangling");
+      await symlink(join(root, "missing"), dangling);
+      for (const cache of [dangling, `${dangling}${sep}`, join(dangling, "new-cache")]) {
+        await assert.rejects(
+          configuration(rootEnvironment(media, cache)),
+          /root contains an unresolved symlink/,
+        );
+      }
+      await assert.rejects(
+        configuration(
+          rootEnvironment(media, `${root}${sep}missing${sep}..${sep}media`),
+        ),
+        /root contains unresolved path components/,
+      );
+    });
+  },
+);
+
 test("endpoint gate rejects SPA, redirects, stale checks and mismatched service identity", async () => {
   const endpoints = {
     publicOrigin: "http://server.test",

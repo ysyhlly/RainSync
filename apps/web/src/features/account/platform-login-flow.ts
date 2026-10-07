@@ -33,8 +33,10 @@ export function createPlatformLoginFlow(options: {
     loginId: string | undefined,
     qrPayload: string | undefined;
   let controller = new AbortController(),
-    timer: ReturnType<typeof setTimeout> | undefined;
+    timer: ReturnType<typeof setTimeout> | undefined,
+    expiryTimer: ReturnType<typeof setTimeout> | undefined;
   let closed = false,
+    finished = false,
     loginDeadline: number | undefined,
     retryDeadline: number | undefined;
   const now = options.now ?? (() => performance.now());
@@ -46,6 +48,35 @@ export function createPlatformLoginFlow(options: {
     generation === serial &&
     options.current() &&
     !controller.signal.aborted;
+  function clearDeadline() {
+    clearTimeout(expiryTimer);
+    expiryTimer = undefined;
+    loginDeadline = undefined;
+  }
+  function expire() {
+    finished = true;
+    ++serial;
+    controller.abort();
+    clearTimeout(timer);
+    clearDeadline();
+    qrPayload = undefined;
+    retryDeadline = undefined;
+    publish({ phase: "expired", message: "二维码已过期，请重新确认登录" });
+  }
+  // QR expiry is independent from polling and retry cooldowns. A retry can
+  // replace the request controller, but never extend this original deadline.
+  function armExpiry(generation: number) {
+    clearTimeout(expiryTimer);
+    expiryTimer = undefined;
+    if (!qrPayload || loginDeadline === undefined) return;
+    const tick = () => {
+      if (!current(generation)) return;
+      const remaining = loginDeadline! - now();
+      if (remaining <= 0) expire();
+      else expiryTimer = setTimeout(tick, remaining);
+    };
+    tick();
+  }
   function validate(value: PlatformLogin, fromPoll: boolean) {
     if (!value || typeof value !== "object")
       throw new LoginResponseFailure("Invalid login response");
@@ -130,6 +161,10 @@ export function createPlatformLoginFlow(options: {
     return value;
   }
   function failed(error: unknown, fromPoll: boolean) {
+    if (loginDeadline !== undefined && now() >= loginDeadline) {
+      expire();
+      return;
+    }
     const failure = error instanceof RequestFailure ? error : undefined;
     const invalidResponse = error instanceof LoginResponseFailure;
     const code =
@@ -153,8 +188,9 @@ export function createPlatformLoginFlow(options: {
         "SESSION_EXPIRED",
       ].includes(code ?? "");
     if (terminal) {
+      finished = true;
       qrPayload = undefined;
-      loginDeadline = undefined;
+      clearDeadline();
     }
     const state: PlatformLoginFlowState = {
       phase: expired ? "expired" : terminal ? "failed" : "uncertain",
@@ -177,13 +213,7 @@ export function createPlatformLoginFlow(options: {
       const countdown = () => {
         if (!current(generation)) return;
         if (loginDeadline !== undefined && now() >= loginDeadline) {
-          qrPayload = undefined;
-          loginDeadline = undefined;
-          retryDeadline = undefined;
-          publish({
-            phase: "expired",
-            message: "二维码已过期，请重新确认登录",
-          });
+          expire();
           return;
         }
         const seconds = Math.ceil(Math.max(0, retryDeadline! - now()) / 1000);
@@ -210,9 +240,16 @@ export function createPlatformLoginFlow(options: {
   }
   function apply(value: PlatformLogin, generation: number, fromPoll = false) {
     if (!current(generation)) return;
+    // A resumed tab may process a settled request before its overdue timer.
+    if (loginDeadline !== undefined && now() >= loginDeadline) {
+      expire();
+      return;
+    }
     validate(value, fromPoll);
     loginId = value.id;
     if (value.status !== "pending") {
+      finished = true;
+      clearDeadline();
       key = undefined;
       loginId = undefined;
       qrPayload = undefined;
@@ -236,9 +273,10 @@ export function createPlatformLoginFlow(options: {
     );
     const remaining = Math.max(0, loginDeadline - now());
     if (!remaining) {
-      publish({ phase: "expired", message: "二维码已过期，请重新确认登录" });
+      expire();
       return;
     }
+    armExpiry(generation);
     publish({
       phase: "pending",
       stage: value.stage ?? "waiting",
@@ -253,7 +291,7 @@ export function createPlatformLoginFlow(options: {
       timer = undefined;
       if (!current(generation)) return;
       if (now() >= deadline) {
-        publish({ phase: "expired", message: "二维码已过期，请重新确认登录" });
+        expire();
         return;
       }
       try {
@@ -270,6 +308,7 @@ export function createPlatformLoginFlow(options: {
   async function start() {
     if (
       closed ||
+      finished ||
       !options.current() ||
       (retryDeadline !== undefined && now() < retryDeadline)
     )
@@ -282,11 +321,10 @@ export function createPlatformLoginFlow(options: {
     key ??= (options.uuid ?? (() => crypto.randomUUID()))();
     const fromPoll = !!loginId && !!qrPayload;
     if (fromPoll && loginDeadline !== undefined && now() >= loginDeadline) {
-      qrPayload = undefined;
-      loginDeadline = undefined;
-      publish({ phase: "expired", message: "二维码已过期，请重新确认登录" });
+      expire();
       return;
     }
+    armExpiry(generation);
     publish({ phase: "starting", payload: qrPayload });
     try {
       const response = fromPoll
@@ -302,6 +340,7 @@ export function createPlatformLoginFlow(options: {
     closed = true;
     ++serial;
     clearTimeout(timer);
+    clearDeadline();
     controller.abort();
     const pending = loginId ?? key;
     key = undefined;

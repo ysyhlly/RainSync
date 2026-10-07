@@ -99,3 +99,15 @@ it("uses scoped CAS paths for source settings, tombstones and share edits", asyn
   ]);
   expect(calls[4]?.[0]).toBe("/libraries/lib%2Fid/room-shares/share%2Fid");
 });
+
+it("lists only the caller's issued shares through a paginated account-scoped route", async () => {
+  const calls: unknown[][] = [];
+  const api = privateLibraryApi((async (...args: unknown[]) => {
+    calls.push(args);
+    return { items: [], has_more: false };
+  }) as ApiClient);
+  await api.issuedShares();
+  await api.issuedShares("share/id");
+  expect(calls[0]?.[0]).toBe("/libraries/issued-shares");
+  expect(calls[1]?.[0]).toBe("/libraries/issued-shares?after=share%2Fid");
+});

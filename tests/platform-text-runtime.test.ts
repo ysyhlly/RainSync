@@ -6,7 +6,14 @@ import type { useSession } from "../apps/web/src/features/auth/session.store";
 const sessionId = "00000000-0000-4000-8000-000000000001";
 const plan = {
   session_id: sessionId,
-  native_platform: { version: 1 },
+  media_id: "media-1",
+  media_generation: 1,
+  timeline_origin_ms: 0,
+  native_platform: {
+    version: 1,
+    provider: "youtube",
+    credential_mode: "anonymous",
+  },
   playback_url: `/api/v1/platform-delivery/${sessionId}/manifest.mpd?token=${"a".repeat(64)}`,
 } as PlaybackPlan;
 const track = {
@@ -28,7 +35,10 @@ function deferred<T>() {
   return { promise, resolve };
 }
 const scopes: ReturnType<typeof effectScope>[] = [];
-function setup(api = vi.fn().mockResolvedValue(catalog)) {
+function setup(
+  api = vi.fn().mockResolvedValue(catalog),
+  preferenceScope?: () => string | undefined,
+) {
   vi.stubGlobal("location", { origin: "https://rainsync.test" });
   vi.stubGlobal(
     "VTTCue",
@@ -59,6 +69,7 @@ function setup(api = vi.fn().mockResolvedValue(catalog)) {
     createPlatformTextRuntime({
       session: session as unknown as ReturnType<typeof useSession>,
       video,
+      preferenceScope,
     }),
   )!;
   return { runtime, cues, textTrack, element, session, video, api };
@@ -397,22 +408,18 @@ it("aborts an owned realtime response and removes cues before late queued bytes"
     },
     cancel,
   });
-  const fetch = vi
-    .fn()
-    .mockResolvedValue(
-      new Response(body, {
-        headers: { "Content-Type": "application/x-ndjson; charset=utf-8" },
-      }),
-    );
+  const fetch = vi.fn().mockResolvedValue(
+    new Response(body, {
+      headers: { "Content-Type": "application/x-ndjson; charset=utf-8" },
+    }),
+  );
   vi.stubGlobal("fetch", fetch);
   const { runtime, element } = setup(
-    vi
-      .fn()
-      .mockResolvedValue({
-        subtitle_tracks: [],
-        subtitles_status: "unsupported",
-        danmaku_status: "available",
-      }),
+    vi.fn().mockResolvedValue({
+      subtitle_tracks: [],
+      subtitles_status: "unsupported",
+      danmaku_status: "available",
+    }),
   );
   Object.assign(element, { currentTime: 10 });
   const live = {
@@ -450,4 +457,296 @@ it("aborts an owned realtime response and removes cues before late queued bytes"
   expect(cancel).toHaveBeenCalled();
   expect(runtime.platformDanmakuCues.value).toEqual([]);
   expect(runtime.platformLiveDanmakuMode.value).toBe("off");
+});
+
+describe("platform text preferences across fresh grants", () => {
+  const subtitle = () =>
+    new Response(
+      "WEBVTT\n\n00:00:04.000 --> 00:00:06.000\nclip\n\n00:00:07.000 --> 00:00:08.000\nnext\n\n",
+      { headers: { "Content-Type": "text/vtt; charset=utf-8" } },
+    );
+  const snapshot = {
+    snapshot: true,
+    cues: [{ at_ms: 5000, text: "now", mode: "scroll" }],
+  };
+  function fresh(extra: Partial<PlaybackPlan> = {}) {
+    return {
+      ...plan,
+      session_id: "00000000-0000-4000-8000-000000000002",
+      playback_url: `/api/v1/platform-delivery/00000000-0000-4000-8000-000000000002/manifest.mpd?token=${"b".repeat(64)}`,
+      ...extra,
+    } as PlaybackPlan;
+  }
+  function apiForText() {
+    return vi.fn((url: string) =>
+      Promise.resolve(url.includes("/catalog?") ? catalog : snapshot),
+    );
+  }
+  it.each(["automatic refresh", "quality reload", "compatibility seek"])(
+    "keeps selections through %s using only the new grant",
+    async (kind) => {
+      const fetch = vi.fn().mockImplementation(async () => subtitle());
+      vi.stubGlobal("fetch", fetch);
+      const { runtime, cues, api } = setup(apiForText());
+      await runtime.bind(plan);
+      await runtime.selectPlatformSubtitle(track.id);
+      await runtime.setPlatformDanmaku(true);
+      runtime.retire();
+      expect(cues).toEqual([]);
+      expect(runtime.platformDanmakuCues.value).toEqual([]);
+      const replacement = fresh(
+        kind === "compatibility seek"
+          ? {
+              timeline_origin_ms: 5000,
+              transport: "hls",
+              delivery_mode: "transcode",
+              rebuild_on_seek: true,
+              playback_url: `/api/v1/platform-delivery/00000000-0000-4000-8000-000000000002/compatibility/index.m3u8?token=${"b".repeat(64)}&attempt=7`,
+              native_platform: {
+                ...plan.native_platform!,
+                compatibility: {
+                  version: 1,
+                  mode: "hls_avc_aac",
+                  output: {
+                    attempt: 7,
+                    complete: false,
+                    width: 1280,
+                    height: 720,
+                    codecs: "avc1.64001F,mp4a.40.2",
+                  },
+                },
+              },
+            }
+          : {},
+      );
+      await runtime.bind(replacement);
+      expect(runtime.platformSubtitleId.value).toBe(track.id);
+      expect(runtime.platformDanmakuEnabled.value).toBe(true);
+      expect(fetch.mock.calls.at(-1)?.[0]).toContain(replacement.session_id);
+      expect(fetch.mock.calls.at(-1)?.[0]).toContain("token=" + "b".repeat(64));
+      expect(api.mock.calls.at(-1)?.[0]).toContain("token=" + "b".repeat(64));
+      expect(cues[0]).toMatchObject({
+        startTime: kind === "compatibility seek" ? 0 : 4,
+      });
+      expect(runtime.platformDanmakuCues.value[0].at_ms).toBe(
+        kind === "compatibility seek" ? 0 : 5000,
+      );
+    },
+  );
+  it("fences old subtitle and danmaku loads while restoring pending intent", async () => {
+    const oldSubtitle = deferred<Response>(),
+      oldDanmaku = deferred<unknown>();
+    const fetch = vi
+      .fn()
+      .mockImplementationOnce(() => oldSubtitle.promise)
+      .mockImplementation(async () => subtitle());
+    vi.stubGlobal("fetch", fetch);
+    const api = apiForText()
+      .mockImplementationOnce(async () => catalog)
+      .mockImplementationOnce(() => oldDanmaku.promise);
+    const { runtime, cues } = setup(api);
+    await runtime.bind(plan);
+    const selecting = runtime.selectPlatformSubtitle(track.id);
+    const enabling = runtime.setPlatformDanmaku(true);
+    await runtime.bind(fresh());
+    oldSubtitle.resolve(subtitle());
+    oldDanmaku.resolve(snapshot);
+    await Promise.all([selecting, enabling]);
+    expect(fetch.mock.calls[0][1].signal.aborted).toBe(true);
+    expect(api.mock.calls[1][3].aborted).toBe(true);
+    expect(cues).toHaveLength(2);
+    expect(runtime.platformDanmakuCues.value).toHaveLength(1);
+    expect(runtime.platformSubtitleId.value).toBe(track.id);
+    expect(runtime.platformDanmakuEnabled.value).toBe(true);
+  });
+  it("explicit Off during rediscovery cancels restoration and future reloads", async () => {
+    const pending = deferred<unknown>();
+    const fetch = vi.fn().mockImplementation(async () => subtitle());
+    vi.stubGlobal("fetch", fetch);
+    const api = apiForText();
+    const { runtime } = setup(api);
+    await runtime.bind(plan);
+    await runtime.selectPlatformSubtitle(track.id);
+    await runtime.setPlatformDanmaku(true);
+    api.mockImplementationOnce(() => pending.promise);
+    const reloading = runtime.bind(fresh());
+    await runtime.selectPlatformSubtitle(null);
+    await runtime.setPlatformDanmaku(false);
+    pending.resolve(catalog);
+    await reloading;
+    await runtime.bind(fresh());
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(
+      api.mock.calls.filter(([url]) => url.includes("/danmaku?")),
+    ).toHaveLength(1);
+    expect(runtime.platformSubtitleId.value).toBeNull();
+    expect(runtime.platformDanmakuEnabled.value).toBe(false);
+  });
+  it.each(["media", "generation", "viewer", "room-account"])(
+    "clears preferences on a changed %s identity",
+    async (axis) => {
+      const owner = shallowRef("owner-room-account-1");
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation(async () => subtitle()),
+      );
+      const { runtime, session } = setup(apiForText(), () => owner.value);
+      await runtime.bind(plan);
+      await runtime.selectPlatformSubtitle(track.id);
+      await runtime.setPlatformDanmaku(true);
+      if (axis === "viewer") session.epoch++;
+      if (axis === "room-account") owner.value = "owner-room-account-2";
+      await runtime.bind(
+        fresh(
+          axis === "media"
+            ? { media_id: "media-2" }
+            : axis === "generation"
+              ? { media_generation: 2 }
+              : {},
+        ),
+      );
+      expect(runtime.platformSubtitleId.value).toBeNull();
+      expect(runtime.platformDanmakuEnabled.value).toBe(false);
+    },
+  );
+  it.each(["missing", "wrong-language", "wrong-role"])(
+    "does not resurrect a %s subtitle identity on subsequent grants",
+    async (kind) => {
+      const fetch = vi.fn().mockImplementation(async () => subtitle());
+      vi.stubGlobal("fetch", fetch);
+      const api = apiForText();
+      const { runtime } = setup(api);
+      await runtime.bind(plan);
+      await runtime.selectPlatformSubtitle(track.id);
+      api.mockImplementationOnce(async () => ({
+        ...catalog,
+        subtitles_status: kind === "missing" ? "none" : "available",
+        subtitle_tracks:
+          kind === "missing"
+            ? []
+            : [
+                {
+                  ...track,
+                  language: kind === "wrong-language" ? "ja" : "en",
+                  automatic: kind === "wrong-role",
+                },
+              ],
+      }));
+      await runtime.bind(fresh());
+      await runtime.bind(fresh());
+      expect(runtime.platformSubtitleId.value).toBeNull();
+      expect(fetch).toHaveBeenCalledTimes(1);
+    },
+  );
+  it("does not reconnect realtime live danmaku after a fresh live grant", async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      new Response("", {
+        headers: { "Content-Type": "application/x-ndjson; charset=utf-8" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    const { runtime } = setup(apiForText());
+    const live = {
+      ...plan,
+      native_platform: {
+        ...plan.native_platform!,
+        live: {
+          version: 1,
+          sync_mode: "live_edge_control",
+          broadcast_id: "123:456:1700000000",
+        },
+      },
+      playback_url: `/api/v1/platform-live-delivery/${sessionId}/playlist.m3u8?token=${"a".repeat(64)}`,
+    } as PlaybackPlan;
+    await runtime.bind(live);
+    await runtime.setPlatformLiveDanmaku("realtime");
+    await runtime.bind(live);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(runtime.platformLiveDanmakuMode.value).toBe("off");
+  });
+});
+
+it("keeps ingesting recent native live cues when the decoder retains over 512", async () => {
+  const { runtime, element, cues } = setup();
+  const retained = Array.from({ length: 513 }, (_, index) => ({
+    startTime: index,
+    endTime: index + 1,
+    text: `cue-${index}`,
+  }));
+  let observe: (() => void) | undefined;
+  const source = {
+    kind: "captions",
+    mode: "disabled",
+    cues: retained,
+    addEventListener: (_name: string, callback: () => void) => {
+      observe = callback;
+    },
+    removeEventListener: vi.fn(),
+  };
+  const tracks = Object.assign([source], {
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+  });
+  const live = {
+    ...plan,
+    native_platform: {
+      ...plan.native_platform!,
+      live: {
+        version: 1,
+        sync_mode: "live_edge_control",
+        broadcast_id: "123:456:1700000000",
+      },
+    },
+    playback_url: `/api/v1/platform-live-delivery/${sessionId}/playlist.m3u8?token=${"a".repeat(64)}`,
+  } as PlaybackPlan;
+  Object.assign(element, {
+    currentTime: 512,
+    currentSrc: "https://rainsync.test" + live.playback_url,
+    textTracks: tracks,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+  });
+  await runtime.bind(live);
+  expect(runtime.platformSubtitleTracks.value).toHaveLength(1);
+  await runtime.selectPlatformSubtitle("ic1");
+  expect(cues.at(-1)).toMatchObject({ text: "cue-512" });
+  retained.push({ startTime: 513, endTime: 514, text: "latest" });
+  observe!();
+  expect(cues.at(-1)).toMatchObject({ text: "latest" });
+  expect(cues.length).toBeLessThanOrEqual(512);
+  runtime.reset();
+  observe!();
+  expect(cues).toEqual([]);
+});
+
+it("ignores a retired subtitle grant's late denial before invalidating the current viewer", async () => {
+  const pending = deferred<Response>();
+  const fetch = vi
+    .fn()
+    .mockImplementationOnce(() => pending.promise)
+    .mockImplementation(
+      async () =>
+        new Response("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nnew\n\n", {
+          headers: { "Content-Type": "text/vtt; charset=utf-8" },
+        }),
+    );
+  vi.stubGlobal("fetch", fetch);
+  const { runtime, session, cues } = setup();
+  await runtime.bind(plan);
+  const old = runtime.selectPlatformSubtitle(track.id);
+  await runtime.bind({
+    ...plan,
+    session_id: "00000000-0000-4000-8000-000000000002",
+    playback_url: `/api/v1/platform-delivery/00000000-0000-4000-8000-000000000002/manifest.mpd?token=${"b".repeat(64)}`,
+  });
+  pending.resolve(
+    new Response(JSON.stringify({ error: { code: "SESSION_EXPIRED" } }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+  await old;
+  expect(session.invalidate).not.toHaveBeenCalled();
+  expect(runtime.platformSubtitleId.value).toBe(track.id);
+  expect(cues).toEqual([{ startTime: 1, endTime: 2, text: "new" }]);
 });

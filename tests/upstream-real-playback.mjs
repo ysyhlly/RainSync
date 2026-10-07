@@ -685,7 +685,7 @@ async function nativeStack(upstream, product, run) {
       WORKER_URL: workerOrigin,
       WORKER_BIND: new URL(workerOrigin).host,
       MEDIA_ROOT: stackRoot,
-      CACHE_ROOT: resolve(stackRoot, "cache"),
+      CACHE_ROOT: `${stackRoot}-cache`,
       RUST_LOG: "warn",
       TRUSTED_PROXY_CIDRS: "",
       PATH: `${ffmpegBin}${process.platform === "win32" ? ";" : ":"}${process.env.PATH ?? ""}`,
@@ -696,6 +696,12 @@ async function nativeStack(upstream, product, run) {
     await health(workerOrigin, worker);
     product.native = {
       fixture_id: id,
+      fixture_paths: {
+        artifacts: stackRoot,
+        media: fixture.env.MEDIA_ROOT,
+        cache: fixture.env.CACHE_ROOT,
+        retention: "owned fixture directories retained as evidence",
+      },
       container,
       container_id: databaseId,
       origin,

@@ -1,9 +1,16 @@
 // Read-only post-start gate, run from the actual browser/Agent network location.
 // HTTP probes never include credentials and never follow redirects.
 import assert from "node:assert/strict";
-import { realpath, stat, access } from "node:fs/promises";
+import { realpath, stat, lstat, access } from "node:fs/promises";
 import { constants } from "node:fs";
-import { dirname, basename, resolve } from "node:path";
+import {
+  dirname,
+  basename,
+  isAbsolute,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { fileURLToPath } from "node:url";
 
 export function origin(name, value) {
@@ -27,7 +34,8 @@ export function origin(name, value) {
   return url.origin;
 }
 async function canonicalDestination(path) {
-  path = resolve(path);
+  // Keep symlink/.. traversal semantics until realpath has resolved it.
+  path = isAbsolute(path) ? path : `${process.cwd()}${sep}${path}`;
   try {
     return await realpath(path);
   } catch (error) {
@@ -35,7 +43,25 @@ async function canonicalDestination(path) {
   }
   const parent = dirname(path);
   assert.notEqual(parent, path, "root has no existing ancestor");
-  return resolve(await canonicalDestination(parent), basename(path));
+  const name = basename(path);
+  assert.ok(
+    name !== ".." && name !== ".",
+    "root contains unresolved path components",
+  );
+  // Strip terminal separators without normalizing symlink/.. parents.
+  const entry = await lstat(`${parent}${sep}${name}`).catch((error) => {
+    if (error.code !== "ENOENT") throw Error("root cannot be resolved");
+    return null;
+  });
+  assert.ok(!entry, "root contains an unresolved symlink");
+  return resolve(await canonicalDestination(parent), name);
+}
+function containsPath(parent, child) {
+  const tail = relative(parent, child);
+  return (
+    tail === "" ||
+    (tail !== ".." && !tail.startsWith(`..${sep}`) && !isAbsolute(tail))
+  );
 }
 export async function configuration(env = process.env) {
   const publicOrigin = origin(
@@ -59,12 +85,14 @@ export async function configuration(env = process.env) {
       Buffer.from(env.SOURCE_ENCRYPTION_KEY, "base64").length === 32,
     "SOURCE_ENCRYPTION_KEY must encode exactly 32 bytes",
   );
-  const media = resolve(env.MEDIA_ROOT ?? "/media"),
-    cache = resolve(env.CACHE_ROOT ?? "/cache");
-  assert.notEqual(
-    await canonicalDestination(media),
-    await canonicalDestination(cache),
-    "CACHE_ROOT must not resolve to MEDIA_ROOT",
+  const media = env.MEDIA_ROOT ?? "/media",
+    cache = env.CACHE_ROOT ?? "/cache";
+  const canonicalMedia = await canonicalDestination(media),
+    canonicalCache = await canonicalDestination(cache);
+  assert.ok(
+    !containsPath(canonicalMedia, canonicalCache) &&
+      !containsPath(canonicalCache, canonicalMedia),
+    "MEDIA_ROOT and CACHE_ROOT must not resolve to overlapping directories (equal, ancestor or descendant; including aliases/symlinks)",
   );
   assert.ok(
     (await stat(media)).isDirectory(),

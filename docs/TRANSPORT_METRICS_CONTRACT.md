@@ -19,9 +19,10 @@ interval included a hidden page. Persisted-page restoration and discontinuous
 clocks discard the sample. Initial failed joins do not invent an earlier disconnect. A browser
 online hint is not an independent observation of network restoration.
 
-These are explicitly client-reported successful recoveries. Never call them
-the independent tester's network-restored-to-snapshot timing from NEXT_PLAN
-§12.1. Unrecovered or unreported outages are absent, not zero or successful.
+These are explicitly client-reported successful recoveries. They do not measure
+the interval from independently observed network restoration to snapshot
+application; that requires a separate tester's observation of network restoration.
+Unrecovered or unreported outages are absent, not zero or successful.
 There is one packet slot per socket, no timer, retry, persistent queue or ACK.
 Missing server marker means ordinary control recovery continues without data.
 Metrics frames cannot refresh heartbeat/presence, issue credentials, broadcast,
