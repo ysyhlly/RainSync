@@ -351,10 +351,49 @@ impl Input<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn isolated_local_root() -> Option<PathBuf> {
+        const CHILD_ROOT: &str = "RAINSYNC_ADVANCED_INPUT_CHILD_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            return Some(PathBuf::from(root).join("source"));
+        }
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("advanced-media-owner-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "advanced_media::input::tests::local_input_retains_original_descriptor_but_detects_replacement",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, &root)
+            .env("MEDIA_ROOT", &root);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let output = command.output();
+        assert!(root.starts_with(temp));
+        let cleanup = std::fs::remove_dir_all(root);
+        let output = output.expect("isolated input fixture process");
+        assert!(
+            output.status.success(),
+            "isolated input fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        cleanup.unwrap();
+        None
+    }
+
     #[test]
     fn local_input_retains_original_descriptor_but_detects_replacement() {
-        let root =
-            std::env::temp_dir().join(format!("advanced-media-owner-{}", uuid::Uuid::new_v4()));
+        let Some(root) = isolated_local_root() else {
+            return;
+        };
         std::fs::create_dir(&root).unwrap();
         let path = root.join("source.mkv");
         std::fs::write(&path, b"original").unwrap();
@@ -371,7 +410,9 @@ mod tests {
         #[cfg(windows)]
         {
             let error = std::fs::rename(&path, root.join("original.mkv")).unwrap_err();
-            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            // Rust's ErrorKind mapping varies; Windows must report the exact
+            // sharing violation caused by the retained read-only descriptor.
+            assert_eq!(error.raw_os_error(), Some(32));
             owner.verify().unwrap();
             drop(owner);
             std::fs::rename(&path, root.join("original.mkv")).unwrap();

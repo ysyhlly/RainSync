@@ -460,16 +460,71 @@ mod playback_tests {
     }
     #[tokio::test]
     async fn local_library_exceeding_ten_thousand_is_not_discarded() {
+        const CHILD_ROOT: &str = "RAINSYNC_PROVIDER_LIBRARY_TEST_ROOT";
         let parent = std::env::temp_dir().canonicalize().unwrap();
-        let root = parent.join(format!(
-            "rainsync-provider-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+        let root = if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            std::path::PathBuf::from(root)
+        } else {
+            let root = parent.join(format!(
+                "rainsync-provider-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "tests::local_library_exceeding_ten_thousand_is_not_discarded",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ROOT, &root)
+                .env("MEDIA_ROOT", &root);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+            let output = command.output().unwrap();
+            if root.exists() {
+                assert_eq!(
+                    root.canonicalize().unwrap().parent(),
+                    Some(parent.as_path())
+                );
+                assert!(
+                    root.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("rainsync-provider-test-")
+                );
+                std::fs::remove_dir_all(&root).unwrap();
+            }
+            assert!(
+                output.status.success(),
+                "isolated local library fixture failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated fixture did not execute its exact test"
+            );
+            return;
+        };
+        assert_eq!(
+            root.canonicalize().unwrap().parent(),
+            Some(parent.as_path())
+        );
+        assert!(
+            root.file_name()
                 .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&root).unwrap();
+                .to_string_lossy()
+                .starts_with("rainsync-provider-test-")
+        );
         for i in 0..10001 {
             std::fs::write(root.join(format!("{i}.mp4")), []).unwrap();
         }

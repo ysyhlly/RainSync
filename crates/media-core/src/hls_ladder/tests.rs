@@ -811,6 +811,38 @@ fn hdr_ladder_composes_one_closed_source_graph_and_qualifies_every_output_color(
 }
 
 #[cfg(target_os = "linux")]
+fn isolated_ass_root() -> Option<std::path::PathBuf> {
+    const CHILD_ROOT: &str = "RAINSYNC_ASS_LADDER_CHILD_ROOT";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        return Some(std::path::PathBuf::from(root).join("source"));
+    }
+    let temp = std::env::temp_dir();
+    let root = temp.join(format!("rainsync-ladder-ass-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "hls_ladder::tests::ass_ladder_splits_after_owned_burnin_and_trims_one_shared_av_origin",
+            "--nocapture",
+        ])
+        .env(CHILD_ROOT, &root)
+        .env("MEDIA_ROOT", &root)
+        .output();
+    assert!(root.starts_with(temp));
+    let cleanup = std::fs::remove_dir_all(root);
+    let output = output.expect("isolated ladder fixture process");
+    assert!(
+        output.status.success(),
+        "isolated ladder fixture failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    cleanup.unwrap();
+    None
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn ass_ladder_splits_after_owned_burnin_and_trims_one_shared_av_origin() {
     use crate::advanced_media::{DeviceObservation, Input, Inventory, OwnedLocalInput, Request};
@@ -826,7 +858,9 @@ fn ass_ladder_splits_after_owned_burnin_and_trims_one_shared_av_origin() {
         subtitle_stream_index: Some(7),
     };
     let recipe = LadderRecipe::from_advanced_probe(&meta, Some(1), 5.0, &request).unwrap();
-    let root = std::env::temp_dir().join(format!("rainsync-ladder-ass-{}", uuid::Uuid::new_v4()));
+    let Some(root) = isolated_ass_root() else {
+        return;
+    };
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("fixture.mkv"), b"synthetic source custody").unwrap();
     let version =

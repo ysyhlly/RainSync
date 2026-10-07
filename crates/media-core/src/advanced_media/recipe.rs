@@ -625,9 +625,38 @@ mod tests {
     fn inventory() -> Inventory {
         Inventory::from_reports(" V....D libx264 encoder\n A..... aac encoder\n V....D h264_nvenc encoder\n V..... h264_qsv encoder\n V....D h264_vaapi encoder", " ... null V->V\n ... scale V->V\n ... setsar V->V\n ... pad V->V\n ... format V->V\n ... trim V->V\n ... setpts V->V\n ... subtitles V->V\n ... ass V->V\n ... overlay VV->V\n ... zscale V->V\n ... tonemap V->V\n ... sidedata V->V\n ... atrim A->A\n ... asetpts A->A\n ... hwupload V->V", " S..... ass subtitle\n S..... ssa subtitle\n S..... pgssub subtitle", "ffmpeg version fixture", DeviceObservation { nvenc_device_present:true, vaapi_render_node:Some("/dev/dri/renderD128".into()), qsv_render_node:Some("/dev/dri/renderD128".into()) }).unwrap()
     }
-    fn owned() -> (std::path::PathBuf, OwnedLocalInput) {
-        let root =
-            std::env::temp_dir().join(format!("advanced-media-recipe-{}", uuid::Uuid::new_v4()));
+    fn owned(test: &str) -> Option<(std::path::PathBuf, OwnedLocalInput)> {
+        const CHILD_ROOT: &str = "RAINSYNC_ADVANCED_RECIPE_CHILD_ROOT";
+        let root = if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            std::path::PathBuf::from(root).join("source")
+        } else {
+            let temp = std::env::temp_dir();
+            let root = temp.join(format!("advanced-media-recipe-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", test, "--nocapture"])
+                .env(CHILD_ROOT, &root)
+                .env("MEDIA_ROOT", &root);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+            let output = command.output();
+            assert!(root.starts_with(temp));
+            let cleanup = std::fs::remove_dir_all(root);
+            let output = output.expect("isolated recipe fixture process");
+            assert!(
+                output.status.success(),
+                "isolated recipe fixture failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            cleanup.unwrap();
+            return None;
+        };
         std::fs::create_dir(&root).unwrap();
         std::fs::write(
             root.join("source.mkv"),
@@ -640,7 +669,7 @@ mod tests {
         .unwrap()
         .version;
         let owner = OwnedLocalInput::open(&root, "source.mkv", &version).unwrap();
-        (root, owner)
+        Some((root, owner))
     }
     #[test]
     fn subtitle_recipe_keeps_absolute_indices_original_timestamps_and_owned_fonts() {
@@ -659,7 +688,11 @@ mod tests {
             EncoderSelection::software_recipe(),
         )
         .unwrap();
-        let (root, input) = owned();
+        let Some((root, input)) = owned(
+            "advanced_media::recipe::tests::subtitle_recipe_keeps_absolute_indices_original_timestamps_and_owned_fonts",
+        ) else {
+            return;
+        };
         let args = recipe
             .ffmpeg_args(
                 Input::OwnedLocal(&input),
@@ -688,7 +721,11 @@ mod tests {
         if !cfg!(target_os = "linux") {
             return;
         }
-        let (root, input) = owned();
+        let Some((root, input)) = owned(
+            "advanced_media::recipe::tests::external_assets_use_only_owned_descriptors_and_source_relative_timing",
+        ) else {
+            return;
+        };
         std::fs::write(
             root.join("source.ass"),
             b"[Script Info]\n[Events]\nFormat: Layer, Text\n",
@@ -752,7 +789,11 @@ mod tests {
         if !cfg!(target_os = "linux") {
             return;
         }
-        let (root, input) = owned();
+        let Some((root, input)) = owned(
+            "advanced_media::recipe::tests::associated_fonts_augment_embedded_ass_without_switching_to_external_text",
+        ) else {
+            return;
+        };
         std::fs::create_dir(root.join("source.fonts")).unwrap();
         std::fs::write(root.join("source.fonts/f.ttf"), b"\0\x01\0\0font fixture").unwrap();
         let catalog =
@@ -811,7 +852,11 @@ mod tests {
             EncoderSelection::software_recipe(),
         )
         .unwrap();
-        let (root, input) = owned();
+        let Some((root, input)) = owned(
+            "advanced_media::recipe::tests::pgs_uses_bitmap_overlay_and_never_libass_text_conversion",
+        ) else {
+            return;
+        };
         let args = recipe
             .ffmpeg_args(
                 Input::OwnedLocal(&input),
@@ -873,7 +918,11 @@ mod tests {
     fn all_hardware_backends_have_closed_fixed_output_recipes() {
         let meta = metadata();
         let inventory = inventory();
-        let (root, input) = owned();
+        let Some((root, input)) = owned(
+            "advanced_media::recipe::tests::all_hardware_backends_have_closed_fixed_output_recipes",
+        ) else {
+            return;
+        };
         for preference in [
             EncoderPreference::PreferNvenc,
             EncoderPreference::PreferQsv,

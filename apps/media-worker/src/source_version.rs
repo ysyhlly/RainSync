@@ -82,9 +82,57 @@ mod tests {
 
     #[tokio::test]
     async fn final_identity_check_detects_changed_or_missing_local_file() {
-        let root =
-            std::env::temp_dir().join(format!("rainsync-source-version-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
+        const CHILD_ROOT: &str = "RAINSYNC_SOURCE_VERSION_TEST_ROOT";
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let root = if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            std::path::PathBuf::from(root)
+        } else {
+            let root = parent.join(format!("rainsync-source-version-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "source_version::tests::final_identity_check_detects_changed_or_missing_local_file", "--nocapture", "--test-threads=1"])
+                .env(CHILD_ROOT, &root).env("MEDIA_ROOT", &root);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+            let output = command.output().unwrap();
+            if root.exists() {
+                assert_eq!(
+                    root.canonicalize().unwrap().parent(),
+                    Some(parent.as_path())
+                );
+                assert!(
+                    root.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("rainsync-source-version-")
+                );
+                std::fs::remove_dir_all(&root).unwrap();
+            }
+            assert!(
+                output.status.success(),
+                "isolated source version fixture failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated fixture did not execute its exact test"
+            );
+            return;
+        };
+        assert_eq!(
+            root.canonicalize().unwrap().parent(),
+            Some(parent.as_path())
+        );
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("rainsync-source-version-")
+        );
         let path = root.join("input.mp4");
         std::fs::write(&path, b"first").unwrap();
         let version = media_core::file_version::snapshot_file(&std::fs::File::open(&path).unwrap())

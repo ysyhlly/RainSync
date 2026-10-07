@@ -596,6 +596,38 @@ mod tests {
 #[cfg(test)]
 mod content_tests {
     use super::*;
+
+    fn isolated_asset_root() -> Option<PathBuf> {
+        const CHILD_ROOT: &str = "RAINSYNC_ADVANCED_ASSETS_CHILD_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            return Some(PathBuf::from(root).join("source"));
+        }
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!("rainsync-assets-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "advanced_media::assets::content_tests::owned_assets_copy_only_bound_fonts_and_detect_replacement",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, &root)
+            .env("MEDIA_ROOT", &root)
+            .output();
+        assert!(root.starts_with(temp));
+        let cleanup = std::fs::remove_dir_all(root);
+        let output = output.expect("isolated asset fixture process");
+        assert!(
+            output.status.success(),
+            "isolated asset fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        cleanup.unwrap();
+        None
+    }
+
     #[test]
     fn format_checks_are_bounded_and_do_not_resolve_references() {
         assert!(validate_subtitle_bytes(SubtitleKind::Ass,b"[Script Info]\n[V4+ Styles]\nFormat: Name, Fontname\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n").is_ok());
@@ -617,7 +649,9 @@ mod content_tests {
         if !cfg!(target_os = "linux") {
             return;
         }
-        let root = std::env::temp_dir().join(format!("rainsync-assets-{}", uuid::Uuid::new_v4()));
+        let Some(root) = isolated_asset_root() else {
+            return;
+        };
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("a.mkv"), b"source fixture").unwrap();
         std::fs::write(
