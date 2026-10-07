@@ -1528,6 +1528,10 @@ try {
           const held = await lock(f, "SELECT 1");
           let handoff, handoffReady, newer, invalidation;
           try {
+            const blockerPid = Number(
+              await held.query("SELECT pg_backend_pid()"),
+            );
+            assert.ok(Number.isSafeInteger(blockerPid) && blockerPid > 0);
             if (mode === "connection")
               handoff = await lock(
                 f,
@@ -1556,14 +1560,17 @@ try {
                 f.origin.replace("http:", "ws:") + "/api/v1/agents/ws",
                 { Authorization: `Bearer ${identity.token}` },
               );
+              // The heartbeat finished before the owned Agent row lock, and
+              // neither the handoff row query nor queued reports have been sent.
+              // Replacement initialization must be its sole blocked activity.
               await until(
                 async () =>
                   Number(
                     await held.query(
-                      "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='UPDATE agents SET advanced_assets_version=0,advanced_assets_connection=$2 WHERE id=$1 AND NOT revoked'",
+                      `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND ${blockerPid}=ANY(pg_blocking_pids(pid))`,
                     ),
                   ) === 1,
-                "Replacement initialization queued first",
+                "Replacement initialization is the sole waiter on the owned Agent lock before handoff",
                 250,
                 5,
               );
