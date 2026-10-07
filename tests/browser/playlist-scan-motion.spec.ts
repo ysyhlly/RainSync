@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { appFixture } from "./fixtures/application";
+import { appFixture, openFixtureSource } from "./fixtures/application";
 
 test("bulk scans include offline NAS and preserve successful source results", async ({
   page,
@@ -26,6 +26,7 @@ test("bulk scans include offline NAS and preserve successful source results", as
     await route.fulfill({ json: { status: "offline" } });
   });
   await page.goto("/library");
+  await openFixtureSource(page);
   await page.getByRole("button", { name: "扫描所有片源" }).click();
   await expect(page.locator(".scan-results")).toContainText(
     "本次扫描发现 3 部影片",
@@ -41,6 +42,7 @@ test("viewer cannot see scan-all and library retains queue button", async ({
 }) => {
   await appFixture(page, { admin: false });
   await page.goto("/library");
+  await openFixtureSource(page);
   await expect(page.getByRole("button", { name: "扫描所有片源" })).toHaveCount(
     0,
   );

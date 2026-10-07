@@ -86,10 +86,12 @@ pub async fn create(
         .execute(&mut *tx)
         .await?;
     lock_caller(&mut tx, &u, &h, false).await?;
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM private_libraries WHERE owner_id=$1")
-        .bind(u.id)
-        .fetch_one(&mut *tx)
-        .await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM private_libraries WHERE owner_id=$1 AND deleted_at IS NULL",
+    )
+    .bind(u.id)
+    .fetch_one(&mut *tx)
+    .await?;
     if count >= 20 {
         return Err(err(StatusCode::CONFLICT, "library_limit"));
     }
@@ -116,12 +118,12 @@ pub async fn detail(
     let mut value = library_value(&row);
     // No titles, source paths, credentials or grants leak to room-only viewers.
     if row.get::<bool, _>("manage") {
-        let sources=sqlx::query("SELECT id,name,kind,access_policy_revision FROM sources WHERE library_id=$1 ORDER BY name,id").bind(id).fetch_all(&app.db).await?;
-        value["sources"]=json!(sources.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"kind":r.get::<String,_>("kind"),"access_policy_revision":r.get::<i64,_>("access_policy_revision")})).collect::<Vec<_>>());
+        let sources=sqlx::query("SELECT id,name,kind,access_policy_revision,settings_revision FROM sources WHERE library_id=$1 AND deleted_at IS NULL ORDER BY name,id").bind(id).fetch_all(&app.db).await?;
+        value["sources"]=json!(sources.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"kind":r.get::<String,_>("kind"),"revision":r.get::<i64,_>("settings_revision").to_string(),"access_policy_revision":r.get::<i64,_>("access_policy_revision")})).collect::<Vec<_>>());
         let grants=sqlx::query("SELECT g.*,u.username,floor(extract(epoch FROM g.expires_at)*1000)::bigint AS expiry FROM library_grants g JOIN users u ON u.id=g.user_id WHERE g.library_id=$1 ORDER BY u.username").bind(id).fetch_all(&app.db).await?;
         value["grants"]=json!(grants.iter().map(|r|json!({"user_id":r.get::<Uuid,_>("user_id"),"username":r.get::<String,_>("username"),"browse":r.get::<bool,_>("browse"),"play":r.get::<bool,_>("play"),"share_to_room":r.get::<bool,_>("share_to_room"),"manage":r.get::<bool,_>("manage"),"expires_at":r.get::<i64,_>("expiry")})).collect::<Vec<_>>());
-        let shares=sqlx::query("SELECT g.id,g.media_id,g.room_id,g.mode,g.permission_epoch,m.title,floor(extract(epoch FROM g.expires_at)*1000)::bigint AS expiry,(g.revoked_at IS NULL AND g.permission_epoch=$2 AND g.source_generation=m.library_source_generation AND m.available AND g.expires_at>clock_timestamp() AND library_allowed(g.grantor_id,g.library_id,'share_to_room')) AS active FROM room_media_grants g JOIN media_items m ON m.id=g.media_id WHERE g.library_id=$1 ORDER BY g.created_at DESC LIMIT 100").bind(id).bind(row.get::<i64,_>("permission_epoch")).fetch_all(&app.db).await?;
-        value["room_shares"]=json!(shares.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"media_id":r.get::<Uuid,_>("media_id"),"room_id":r.get::<Uuid,_>("room_id"),"mode":r.get::<String,_>("mode"),"title":r.get::<String,_>("title"),"expires_at":r.get::<i64,_>("expiry"),"active":r.get::<bool,_>("active")})).collect::<Vec<_>>());
+        let shares=sqlx::query("SELECT g.id,g.media_id,g.room_id,g.mode,g.permission_epoch,m.title,floor(extract(epoch FROM g.created_at+interval '24 hours')*1000)::bigint AS max_expiry,floor(extract(epoch FROM g.expires_at)*1000)::bigint AS expiry,(g.revoked_at IS NULL AND g.permission_epoch=$2 AND g.source_generation=m.library_source_generation AND m.available AND g.expires_at>clock_timestamp() AND library_allowed(g.grantor_id,g.library_id,'share_to_room')) AS active FROM room_media_grants g JOIN media_items m ON m.id=g.media_id WHERE g.library_id=$1 ORDER BY g.created_at DESC LIMIT 100").bind(id).bind(row.get::<i64,_>("permission_epoch")).fetch_all(&app.db).await?;
+        value["room_shares"]=json!(shares.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"media_id":r.get::<Uuid,_>("media_id"),"room_id":r.get::<Uuid,_>("room_id"),"mode":r.get::<String,_>("mode"),"title":r.get::<String,_>("title"),"expires_at":r.get::<i64,_>("expiry"),"max_expires_at":r.get::<i64,_>("max_expiry"),"active":r.get::<bool,_>("active")})).collect::<Vec<_>>());
         let rows=sqlx::query("SELECT id,actor_id,action,target_id,floor(extract(epoch FROM created_at)*1000)::bigint AS created_ms FROM library_permission_audit WHERE library_id=$1 ORDER BY created_at DESC,id LIMIT 100").bind(id).fetch_all(&app.db).await?;
         value["audit"]=json!(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"actor_id":r.get::<Option<Uuid>,_>("actor_id"),"action":r.get::<String,_>("action"),"target_id":r.get::<Option<Uuid>,_>("target_id"),"created_at":r.get::<i64,_>("created_ms")})).collect::<Vec<_>>());
     }
@@ -318,6 +320,55 @@ pub async fn revoke(
     retire(&app).await?;
     detail(State(app), h, Path(id)).await
 }
+/// Archive the scope rather than deleting rows referenced by audit, playback,
+/// playlists and compute. No source is detached or reassigned to shared scope.
+pub async fn remove(
+    State(app): State<App>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Expected>,
+) -> Result<Response> {
+    let u = auth(&app, &h, true).await?;
+    let mut tx = app.db.begin().await?;
+    lock_caller(&mut tx, &u, &h, false).await?;
+    let lib = lock_manage(&mut tx, u.id, id, revision(&body.expected_revision)?).await?;
+    if id == Uuid::from_u128(1) || lib.get::<String, _>("visibility") != "private" {
+        return Err(err(StatusCode::CONFLICT, "library_shared_protected"));
+    }
+    if lib.get::<Option<Uuid>, _>("owner_id") != Some(u.id) {
+        return Err(err(StatusCode::FORBIDDEN, "library_owner_required"));
+    }
+    sqlx::query("SELECT id FROM sources WHERE library_id=$1 ORDER BY id FOR UPDATE")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let managed_elsewhere: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sources WHERE library_id=$1 AND deleted_at IS NULL AND kind='agent')")
+        .bind(id).fetch_one(&mut *tx).await?;
+    if managed_elsewhere {
+        // Device pairing has a separate lifecycle. Never revoke a device as
+        // an implicit side effect of a library owner's configuration removal.
+        return Err(err(StatusCode::CONFLICT, "library_managed_sources"));
+    }
+    require_idle_sources(&mut tx, id, None).await?;
+    let empty = app.encrypt(&json!({}))?;
+    sqlx::query("UPDATE sources SET config_encrypted=$2,deleted_at=clock_timestamp() WHERE library_id=$1 AND deleted_at IS NULL")
+        .bind(id).bind(empty).execute(&mut *tx).await?;
+    sqlx::query("UPDATE media_items SET available=false WHERE source_id IN(SELECT id FROM sources WHERE library_id=$1)")
+        .bind(id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM library_grants WHERE library_id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE room_media_grants SET revoked_at=COALESCE(revoked_at,clock_timestamp()) WHERE library_id=$1")
+        .bind(id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE private_libraries SET deleted_at=clock_timestamp(),revision=revision+1,permission_epoch=permission_epoch+1 WHERE id=$1")
+        .bind(id).execute(&mut *tx).await?;
+    audit(&mut tx, id, u.id, "library_deleted", None).await?;
+    commit_caller(tx, &u, &h, false).await?;
+    retire(&app).await?;
+    Ok(media_titles::private_json(json!({"id":id,"deleted":true})))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transfer {
@@ -420,6 +471,83 @@ pub async fn share(
         json!({"id":grant,"library_id":id,"revision":(lib.get::<i64,_>("revision")+1).to_string()}),
     ))
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateShare {
+    mode: String,
+    expires_at: i64,
+    expected_revision: String,
+}
+pub async fn update_share(
+    State(app): State<App>,
+    h: HeaderMap,
+    Path((id, grant)): Path<(Uuid, Uuid)>,
+    Json(body): Json<UpdateShare>,
+) -> Result<Response> {
+    require_enabled()?;
+    let u = auth(&app, &h, true).await?;
+    if !matches!(body.mode.as_str(), "room_members" | "library_members") || body.expires_at <= 0 {
+        return Err(err(StatusCode::BAD_REQUEST, "library_invalid"));
+    }
+    let mut tx = app.db.begin().await?;
+    // Read only a currently authorized target before taking locks in playback
+    // order: room, membership, caller, library, source/media, then share.
+    let room: Uuid = sqlx::query_scalar("SELECT g.room_id FROM room_media_grants g WHERE g.id=$1 AND g.library_id=$2 AND library_allowed($3,$2,'share_to_room') AND (g.grantor_id=$3 OR library_allowed($3,$2,'manage'))")
+        .bind(grant).bind(id).bind(u.id).fetch_optional(&mut *tx).await?
+        .ok_or_else(||err(StatusCode::NOT_FOUND,"library_not_found"))?;
+    let active_room: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM rooms WHERE id=$1 AND lifecycle='active' FOR SHARE")
+            .bind(room)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if active_room.is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "room_not_found"));
+    }
+    let member: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
+    )
+    .bind(room)
+    .bind(u.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if member.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "not_a_member"));
+    }
+    lock_caller(&mut tx, &u, &h, false).await?;
+    let lib = sqlx::query("SELECT * FROM private_libraries WHERE id=$1 AND library_allowed($2,id,'share_to_room') FOR UPDATE")
+        .bind(id).bind(u.id).fetch_optional(&mut *tx).await?
+        .ok_or_else(||err(StatusCode::NOT_FOUND,"library_not_found"))?;
+    if lib.get::<i64, _>("revision") != revision(&body.expected_revision)? {
+        return Err(err(StatusCode::CONFLICT, "library_conflict"));
+    }
+    let epoch = lib.get::<i64, _>("permission_epoch");
+    let current = sqlx::query("SELECT g.id,floor(extract(epoch FROM g.expires_at)*1000)::bigint AS previous_expiry,(to_timestamp($5::double precision/1000)>clock_timestamp() AND to_timestamp($5::double precision/1000)<=g.created_at+interval '24 hours') AS expiry_valid FROM room_media_grants g JOIN media_items m ON m.id=g.media_id JOIN sources s ON s.id=m.source_id WHERE g.id=$1 AND g.library_id=$2 AND g.room_id=$6 AND s.library_id=$2 AND s.deleted_at IS NULL AND g.permission_epoch=$3 AND g.revoked_at IS NULL AND g.expires_at>clock_timestamp() AND g.source_generation=m.library_source_generation AND m.available AND library_allowed(g.grantor_id,$2,'share_to_room') AND (g.grantor_id=$4 OR library_allowed($4,$2,'manage')) FOR SHARE OF m,s")
+        .bind(grant).bind(id).bind(epoch).bind(u.id).bind(body.expires_at).bind(room)
+        .fetch_optional(&mut *tx).await?.ok_or_else(||err(StatusCode::CONFLICT,"library_share_inactive"))?;
+    if !current.get::<bool, _>("expiry_valid") {
+        return Err(err(StatusCode::BAD_REQUEST, "library_share_expiry_invalid"));
+    }
+    sqlx::query("UPDATE room_media_grants SET mode=$3,expires_at=to_timestamp($4::double precision/1000) WHERE id=$1 AND library_id=$2")
+        .bind(grant).bind(id).bind(body.mode).bind(body.expires_at).execute(&mut *tx).await?;
+    advance(&mut tx, id, true).await?;
+    // Fence previously issued playback without invalidating other current
+    // shares, and never revive grants already stale at the old epoch.
+    sqlx::query("UPDATE room_media_grants SET permission_epoch=$3 WHERE library_id=$1 AND permission_epoch=$2 AND revoked_at IS NULL AND expires_at>clock_timestamp()")
+        .bind(id).bind(epoch).bind(epoch+1).execute(&mut *tx).await?;
+    audit(&mut tx, id, u.id, "room_media_updated", Some(grant)).await?;
+    require_current_permission(&mut tx, u.id, id, "share_to_room").await?;
+    let still_live: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM room_media_grants WHERE id=$1 AND library_id=$2 AND revoked_at IS NULL AND expires_at>clock_timestamp() AND to_timestamp($3::double precision/1000)>clock_timestamp() AND library_allowed(grantor_id,library_id,'share_to_room') AND (grantor_id=$4 OR library_allowed($4,library_id,'manage')))")
+        .bind(grant).bind(id).bind(current.get::<i64,_>("previous_expiry")).bind(u.id).fetch_one(&mut *tx).await?;
+    if !still_live {
+        return Err(err(StatusCode::CONFLICT, "library_share_inactive"));
+    }
+    commit_caller(tx, &u, &h, false).await?;
+    retire(&app).await?;
+    Ok(media_titles::private_json(
+        json!({"id":grant,"revision":(lib.get::<i64,_>("revision")+1).to_string()}),
+    ))
+}
+
 pub async fn revoke_share(
     State(app): State<App>,
     h: HeaderMap,
@@ -429,7 +557,7 @@ pub async fn revoke_share(
     let u = auth(&app, &h, true).await?;
     let mut tx = app.db.begin().await?;
     lock_caller(&mut tx, &u, &h, false).await?;
-    let lib=sqlx::query("SELECT * FROM private_libraries WHERE id=$1 AND (library_allowed($2,id,'manage') OR EXISTS(SELECT 1 FROM room_media_grants g WHERE g.id=$3 AND g.library_id=$1 AND g.grantor_id=$2)) FOR UPDATE").bind(id).bind(u.id).bind(grant).fetch_optional(&mut *tx).await?.ok_or_else(||err(StatusCode::NOT_FOUND,"library_not_found"))?;
+    let lib=sqlx::query("SELECT * FROM private_libraries WHERE id=$1 AND deleted_at IS NULL AND (library_allowed($2,id,'manage') OR EXISTS(SELECT 1 FROM room_media_grants g WHERE g.id=$3 AND g.library_id=$1 AND g.grantor_id=$2)) FOR UPDATE").bind(id).bind(u.id).bind(grant).fetch_optional(&mut *tx).await?.ok_or_else(||err(StatusCode::NOT_FOUND,"library_not_found"))?;
     if lib.get::<i64, _>("revision") != revision(&body.expected_revision)? {
         return Err(err(StatusCode::CONFLICT, "library_conflict"));
     }
@@ -542,10 +670,12 @@ pub async fn add_source(
     if allowed.is_none() {
         return Err(err(StatusCode::NOT_FOUND, "library_not_found"));
     }
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM sources WHERE library_id=$1")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sources WHERE library_id=$1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
     if count >= 100 {
         return Err(err(StatusCode::CONFLICT, "library_source_limit"));
     }
@@ -570,6 +700,283 @@ pub async fn add_source(
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct SourceChange {
+    expected_revision: String,
+    name: Option<String>,
+    config: Option<serde_json::Map<String, Value>>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceExpected {
+    expected_revision: String,
+    expected_library_revision: String,
+}
+async fn require_current_permission(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: Uuid,
+    library: Uuid,
+    action: &str,
+) -> Result<()> {
+    // Row locks freeze configuration, not the wall-clock expiry of a grant.
+    let allowed: bool = sqlx::query_scalar("SELECT library_allowed($1,$2,$3)")
+        .bind(user)
+        .bind(library)
+        .bind(action)
+        .fetch_one(&mut **tx)
+        .await?;
+    if !allowed {
+        return Err(err(StatusCode::NOT_FOUND, "library_not_found"));
+    }
+    Ok(())
+}
+async fn lock_source_library(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: Uuid,
+    library: Uuid,
+) -> Result<()> {
+    let allowed: Option<Uuid> = sqlx::query_scalar("SELECT id FROM private_libraries WHERE id=$1 AND visibility='private' AND library_allowed($2,id,'manage') FOR UPDATE")
+        .bind(library).bind(user).fetch_optional(&mut **tx).await?;
+    if allowed.is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "library_not_found"));
+    }
+    Ok(())
+}
+fn manageable_private_source(row: &sqlx::postgres::PgRow) -> Result<()> {
+    if !matches!(row.get::<String, _>("kind").as_str(), "http" | "s3") {
+        return Err(err(StatusCode::CONFLICT, "source_managed_elsewhere"));
+    }
+    Ok(())
+}
+pub async fn source_detail(
+    State(app): State<App>,
+    h: HeaderMap,
+    Path((library, source)): Path<(Uuid, Uuid)>,
+) -> Result<Response> {
+    let u = auth(&app, &h, false).await?;
+    let mut tx = app.db.begin().await?;
+    lock_caller(&mut tx, &u, &h, false).await?;
+    lock_source_library(&mut tx, u.id, library).await?;
+    let row = sqlx::query(
+        "SELECT * FROM sources WHERE id=$1 AND library_id=$2 AND deleted_at IS NULL FOR SHARE",
+    )
+    .bind(source)
+    .bind(library)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| err(StatusCode::NOT_FOUND, "source_not_found"))?;
+    manageable_private_source(&row)?;
+    let config =
+        source_settings::parse_config(&app.decrypt(&row.get::<String, _>("config_encrypted"))?)?;
+    let value = source_settings::safe_detail(&row, &config);
+    require_current_permission(&mut tx, u.id, library, "manage").await?;
+    commit_caller(tx, &u, &h, false).await?;
+    Ok(media_titles::private_json(value))
+}
+pub async fn update_source(
+    State(app): State<App>,
+    h: HeaderMap,
+    Path((library, source)): Path<(Uuid, Uuid)>,
+    Json(body): Json<SourceChange>,
+) -> Result<Response> {
+    require_enabled()?;
+    let u = auth(&app, &h, true).await?;
+    let expected = source_settings::revision(&body.expected_revision)?;
+    let operator = u.admin && body.config.is_some();
+    let mut tx = app.db.begin().await?;
+    lock_caller(&mut tx, &u, &h, operator).await?;
+    lock_source_library(&mut tx, u.id, library).await?;
+    let row = sqlx::query(
+        "SELECT * FROM sources WHERE id=$1 AND library_id=$2 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(source)
+    .bind(library)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| err(StatusCode::NOT_FOUND, "source_not_found"))?;
+    manageable_private_source(&row)?;
+    if row.get::<i64, _>("settings_revision") != expected {
+        return Err(err(StatusCode::CONFLICT, "source_changed"));
+    }
+    let kind: String = row.get("kind");
+    let old_raw = app.decrypt(&row.get::<String, _>("config_encrypted"))?;
+    let old = source_settings::parse_config(&old_raw)?;
+    let mut raw = old_raw.clone();
+    if let Some(patch) = &body.config {
+        if !u.admin
+            && (kind == "s3"
+                || patch
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "url" | "headers")))
+        {
+            return Err(err(StatusCode::FORBIDDEN, "admin_required"));
+        }
+        raw = source_settings::merge_config(&kind, &old_raw, patch)?;
+        if !u.admin && patch.contains_key("url") {
+            let url = raw["url"]
+                .as_str()
+                .ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid_source"))?;
+            let policy = providers::access_policy::SourceAccessPolicy::public_origin(url)
+                .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_source_url"))?;
+            raw["access_policy"] = serde_json::to_value(policy).map_err(anyhow::Error::from)?;
+        }
+    }
+    let next = source_settings::parse_config(&raw)?;
+    if kind == "http" && old.url != next.url {
+        let same_origin = providers::validate_url(&old.url)
+            .ok()
+            .zip(providers::validate_url(&next.url).ok())
+            .is_some_and(|(old, next)| old.origin() == next.origin());
+        let explicit_headers = body
+            .config
+            .as_ref()
+            .is_some_and(|patch| patch.contains_key("headers"));
+        if !same_origin
+            && ((!old.headers.is_empty() && !explicit_headers)
+                || !old.token.is_empty()
+                || !old.user_id.is_empty())
+        {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "source_credentials_origin_changed",
+            ));
+        }
+    }
+    let changed = serde_json::to_value(&old).map_err(anyhow::Error::from)?
+        != serde_json::to_value(&next).map_err(anyhow::Error::from)?;
+    let next_name = body
+        .name
+        .as_deref()
+        .map(source_settings::name)
+        .transpose()?
+        .unwrap_or_else(|| row.get("name"));
+    if changed {
+        source_settings::validate_config(&kind, &next)?;
+        if kind == "s3" {
+            providers::s3::validate_config(&next)
+                .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_source"))?;
+        }
+        if kind == "http" && next.url != old.url {
+            let collision:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_items WHERE source_id=$1 AND resource=$2) AND EXISTS(SELECT 1 FROM media_items WHERE source_id=$1 AND resource=$3)")
+                .bind(source).bind(&next.url).bind(&old.url).fetch_one(&mut *tx).await?;
+            if collision {
+                return Err(err(StatusCode::CONFLICT, "source_changed"));
+            }
+            sqlx::query("UPDATE media_items SET resource=$3,metadata='{}'::jsonb,duration_ms=NULL,source_version=NULL WHERE source_id=$1 AND resource=$2")
+                .bind(source).bind(&old.url).bind(&next.url).execute(&mut *tx).await?;
+        }
+        sqlx::query("UPDATE media_items SET available=false WHERE source_id=$1")
+            .bind(source)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let encrypted = if changed {
+        app.encrypt(&raw)?
+    } else {
+        row.get("config_encrypted")
+    };
+    let updated =
+        sqlx::query("UPDATE sources SET name=$2,config_encrypted=$3 WHERE id=$1 RETURNING *")
+            .bind(source)
+            .bind(next_name)
+            .bind(encrypted)
+            .fetch_one(&mut *tx)
+            .await?;
+    let did_change = updated.get::<i64, _>("settings_revision") != expected;
+    if did_change {
+        advance(&mut tx, library, false).await?;
+        audit(&mut tx, library, u.id, "source_updated", Some(source)).await?;
+    }
+    let mut value = source_settings::safe_detail(&updated, &next);
+    value["config_changed"] = json!(changed);
+    value["rescan_required"] = json!(changed);
+    require_current_permission(&mut tx, u.id, library, "manage").await?;
+    commit_caller(tx, &u, &h, operator).await?;
+    if changed {
+        retire(&app).await?;
+    }
+    Ok(media_titles::private_json(value))
+}
+async fn require_idle_sources(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    library: Uuid,
+    source: Option<Uuid>,
+) -> Result<()> {
+    // Source locks are already held. Preparation admission takes a source share
+    // lock, so no new reader can enter between this check and tombstoning.
+    let in_use: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions p JOIN media_items m ON m.id=p.media_id JOIN sources s ON s.id=m.source_id WHERE s.library_id=$1 AND ($2::uuid IS NULL OR s.id=$2) AND NOT p.stopped AND p.expires_at>clock_timestamp()) OR EXISTS(SELECT 1 FROM upstream_reservations r JOIN sources s ON s.id=r.source_id WHERE s.library_id=$1 AND ($2::uuid IS NULL OR s.id=$2) AND (r.state IN('preparing','active','closing') OR r.io_claim IS NOT NULL OR r.io_uncertain))")
+        .bind(library).bind(source).fetch_one(&mut **tx).await?;
+    if in_use {
+        let unconfirmed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM upstream_reservations r JOIN sources s ON s.id=r.source_id WHERE s.library_id=$1 AND ($2::uuid IS NULL OR s.id=$2) AND r.state='cleanup_failed' AND (r.io_uncertain OR r.io_claim IS NOT NULL))")
+            .bind(library).bind(source).fetch_one(&mut **tx).await?;
+        return Err(err(
+            StatusCode::CONFLICT,
+            if unconfirmed {
+                "source_cleanup_unconfirmed"
+            } else {
+                "source_in_use"
+            },
+        ));
+    }
+    Ok(())
+}
+
+pub async fn remove_source(
+    State(app): State<App>,
+    h: HeaderMap,
+    Path((library, source)): Path<(Uuid, Uuid)>,
+    Json(body): Json<SourceExpected>,
+) -> Result<Response> {
+    let u = auth(&app, &h, true).await?;
+    let mut tx = app.db.begin().await?;
+    lock_caller(&mut tx, &u, &h, false).await?;
+    let lib = lock_manage(
+        &mut tx,
+        u.id,
+        library,
+        revision(&body.expected_library_revision)?,
+    )
+    .await?;
+    if lib.get::<String, _>("visibility") != "private" {
+        return Err(err(StatusCode::CONFLICT, "source_managed_elsewhere"));
+    }
+    let row = sqlx::query(
+        "SELECT * FROM sources WHERE id=$1 AND library_id=$2 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(source)
+    .bind(library)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| err(StatusCode::NOT_FOUND, "source_not_found"))?;
+    manageable_private_source(&row)?;
+    if row.get::<i64, _>("settings_revision") != source_settings::revision(&body.expected_revision)?
+    {
+        return Err(err(StatusCode::CONFLICT, "source_changed"));
+    }
+    require_idle_sources(&mut tx, library, Some(source)).await?;
+    let empty = app.encrypt(&json!({}))?;
+    sqlx::query("UPDATE sources SET config_encrypted=$2,deleted_at=clock_timestamp() WHERE id=$1")
+        .bind(source)
+        .bind(empty)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE media_items SET available=false WHERE source_id=$1")
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE room_media_grants SET revoked_at=COALESCE(revoked_at,clock_timestamp()) WHERE library_id=$1 AND media_id IN(SELECT id FROM media_items WHERE source_id=$2)")
+        .bind(library).bind(source).execute(&mut *tx).await?;
+    advance(&mut tx, library, false).await?;
+    audit(&mut tx, library, u.id, "source_deleted", Some(source)).await?;
+    require_current_permission(&mut tx, u.id, library, "manage").await?;
+    commit_caller(tx, &u, &h, false).await?;
+    retire(&app).await?;
+    Ok(media_titles::private_json(
+        json!({"id":source,"deleted":true}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Attach {
     source_id: Uuid,
     expected_revision: String,
@@ -587,17 +994,18 @@ pub async fn attach_source(
     lock_caller(&mut tx, &u, &h, true).await?;
     // This is an explicit audited operator action. Normal private catalog reads
     // remain unavailable to an administrator without a library grant.
-    let previous: Uuid = sqlx::query_scalar("SELECT library_id FROM sources WHERE id=$1")
-        .bind(body.source_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "source_not_found"))?;
-    sqlx::query("SELECT id FROM private_libraries WHERE id IN($1,$2) ORDER BY id FOR UPDATE")
+    let previous: Uuid =
+        sqlx::query_scalar("SELECT library_id FROM sources WHERE id=$1 AND deleted_at IS NULL")
+            .bind(body.source_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, "source_not_found"))?;
+    sqlx::query("SELECT id FROM private_libraries WHERE id IN($1,$2) AND deleted_at IS NULL ORDER BY id FOR UPDATE")
         .bind(id)
         .bind(previous)
         .execute(&mut *tx)
         .await?;
-    let lib = sqlx::query("SELECT * FROM private_libraries WHERE id=$1")
+    let lib = sqlx::query("SELECT * FROM private_libraries WHERE id=$1 AND deleted_at IS NULL")
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
@@ -605,10 +1013,12 @@ pub async fn attach_source(
     if lib.get::<i64, _>("revision") != revision(&body.expected_revision)? {
         return Err(err(StatusCode::CONFLICT, "library_conflict"));
     }
-    let current: Uuid = sqlx::query_scalar("SELECT library_id FROM sources WHERE id=$1 FOR UPDATE")
-        .bind(body.source_id)
-        .fetch_one(&mut *tx)
-        .await?;
+    let current: Uuid = sqlx::query_scalar(
+        "SELECT library_id FROM sources WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(body.source_id)
+    .fetch_one(&mut *tx)
+    .await?;
     if current != previous {
         return Err(err(StatusCode::CONFLICT, "source_changed"));
     }
@@ -660,7 +1070,7 @@ pub async fn scan_status(
     Path((lib, source)): Path<(Uuid, Uuid)>,
 ) -> Result<Response> {
     let user = auth(&app, &h, false).await?;
-    let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sources WHERE id=$1 AND library_id=$2 AND library_allowed($3,$2,'manage'))").bind(source).bind(lib).bind(user.id).fetch_one(&app.db).await?;
+    let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sources WHERE id=$1 AND library_id=$2 AND deleted_at IS NULL AND library_allowed($3,$2,'manage'))").bind(source).bind(lib).bind(user.id).fetch_one(&app.db).await?;
     if !allowed {
         return Err(err(StatusCode::NOT_FOUND, "source_not_found"));
     }
@@ -690,7 +1100,7 @@ pub async fn scan(
 ) -> Result<Response> {
     require_enabled()?;
     let user = auth(&app, &h, true).await?;
-    let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sources WHERE id=$1 AND library_id=$2 AND library_allowed($3,$2,'manage'))").bind(source).bind(lib).bind(user.id).fetch_one(&app.db).await?;
+    let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sources WHERE id=$1 AND library_id=$2 AND deleted_at IS NULL AND library_allowed($3,$2,'manage'))").bind(source).bind(lib).bind(user.id).fetch_one(&app.db).await?;
     if !allowed {
         return Err(err(StatusCode::NOT_FOUND, "source_not_found"));
     }
@@ -712,7 +1122,7 @@ async fn lock_scan_caller(
         lock_caller(tx, user, headers, false).await?;
         let allowed:Option<Uuid>=sqlx::query_scalar("SELECT id FROM private_libraries WHERE id=$1 AND library_allowed($2,id,'manage') FOR SHARE").bind(library).bind(user.id).fetch_optional(&mut **tx).await?;
         let scope: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM sources WHERE id=$1 AND library_id=$2)",
+            "SELECT EXISTS(SELECT 1 FROM sources WHERE id=$1 AND library_id=$2 AND deleted_at IS NULL)",
         )
         .bind(source)
         .bind(library)
@@ -750,7 +1160,7 @@ async fn scan_source_page_as(
     let mut tx = app.db.begin().await?;
     lock_scan_caller(&mut tx, source, &caller).await?;
     let source_row = sqlx::query(
-        "SELECT kind,config_encrypted,access_policy_revision FROM sources WHERE id=$1 FOR SHARE",
+        "SELECT kind,config_encrypted,access_policy_revision FROM sources WHERE id=$1 AND deleted_at IS NULL FOR SHARE",
     )
     .bind(source)
     .fetch_optional(&mut *tx)
@@ -766,7 +1176,9 @@ async fn scan_source_page_as(
             .await
             .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_scan_failed"))?;
         for item in &items {
-            sqlx::query("INSERT INTO media_items(id,source_id,title,resource,metadata) VALUES($1,$2,$3,$4,$5) ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,metadata=EXCLUDED.metadata,available=true").bind(Uuid::new_v4()).bind(source).bind(&item.title).bind(&item.resource).bind(json!({"preview_scan":scan})).execute(&mut *tx).await?;
+            let mut metadata = item.metadata.clone();
+            metadata["preview_scan"] = json!(scan);
+            sqlx::query("INSERT INTO media_items(id,source_id,title,resource,metadata) VALUES($1,$2,$3,$4,$5) ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,metadata=EXCLUDED.metadata,available=true").bind(Uuid::new_v4()).bind(source).bind(&item.title).bind(&item.resource).bind(metadata).execute(&mut *tx).await?;
         }
         let resources = items.iter().map(|i| i.resource.clone()).collect::<Vec<_>>();
         sqlx::query(
@@ -880,11 +1292,12 @@ async fn scan_source_page_as(
     };
     let mut tx = app.db.begin().await?;
     lock_scan_caller(&mut tx, source, &caller).await?;
-    let source_current: i64 =
-        sqlx::query_scalar("SELECT access_policy_revision FROM sources WHERE id=$1 FOR SHARE")
-            .bind(source)
-            .fetch_one(&mut *tx)
-            .await?;
+    let source_current: i64 = sqlx::query_scalar(
+        "SELECT access_policy_revision FROM sources WHERE id=$1 AND deleted_at IS NULL FOR SHARE",
+    )
+    .bind(source)
+    .fetch_one(&mut *tx)
+    .await?;
     let row = sqlx::query("SELECT * FROM s3_index_scans WHERE source_id=$1 FOR UPDATE")
         .bind(source)
         .fetch_one(&mut *tx)

@@ -22,6 +22,7 @@ mod local_hls_ladder;
 mod local_hls_ladder_readiness;
 mod media;
 mod media_authorization;
+mod media_browse;
 mod media_previews;
 mod media_titles;
 mod metrics;
@@ -55,6 +56,7 @@ mod rooms;
 mod s3_playback;
 mod source_access;
 mod source_key_check;
+mod source_settings;
 mod static_hls_availability;
 mod static_hls_child_parent;
 mod static_hls_child_plan;
@@ -705,7 +707,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route("/api/v1/admin/plugins/audit", get(plugins::audit))
         .route(
             "/api/v1/admin/plugins/{id}",
-            axum::routing::put(plugins::configure),
+            axum::routing::put(plugins::configure).delete(plugins::remove),
         )
         .route(
             "/api/v1/admin/plugins/{id}/rollback",
@@ -715,6 +717,12 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route(
             "/api/v1/libraries/{id}/sources",
             post(private_library::add_source),
+        )
+        .route(
+            "/api/v1/libraries/{id}/sources/{source}",
+            get(private_library::source_detail)
+                .patch(private_library::update_source)
+                .delete(private_library::remove_source),
         )
         .route(
             "/api/v1/libraries/{id}/attach-source",
@@ -758,7 +766,9 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         )
         .route(
             "/api/v1/libraries/{id}",
-            get(private_library::detail).put(private_library::rename),
+            get(private_library::detail)
+                .put(private_library::rename)
+                .delete(private_library::remove),
         )
         .route(
             "/api/v1/libraries/{id}/grants",
@@ -778,7 +788,8 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         )
         .route(
             "/api/v1/libraries/{id}/room-shares/{grant}",
-            axum::routing::delete(private_library::revoke_share),
+            axum::routing::delete(private_library::revoke_share)
+                .patch(private_library::update_share),
         )
         .route("/api/v1/libraries/{id}/media", get(private_library::media))
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
@@ -1026,13 +1037,19 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
             "/api/v1/sources",
             get(media::sources).post(media::add_source),
         )
-        .route("/api/v1/sources/{id}", delete(media::remove_source))
+        .route(
+            "/api/v1/sources/{id}",
+            get(source_settings::get)
+                .patch(source_settings::change)
+                .delete(media::remove_source),
+        )
         .route("/api/v1/sources/{id}/test", post(media::scan))
         .route(
             "/api/v1/sources/{id}/access-policy",
             post(source_access::change),
         )
         .route("/api/v1/media", get(media::library))
+        .route("/api/v1/media/browse", get(media_browse::browse))
         .route(
             "/api/v1/media/previews",
             get(media_previews::status).post(media_previews::request),
@@ -1087,7 +1104,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         )
         .route("/api/v1/agents", get(agents::list).post(agents::create))
         .route("/api/v1/agents/pair", post(agents::pair))
-        .route("/api/v1/agents/{id}", delete(agents::revoke))
+        .route(
+            "/api/v1/agents/{id}",
+            axum::routing::put(agents::update).delete(agents::revoke),
+        )
         .route("/api/v1/agents/{id}/scan", post(agents::scan))
         .route("/api/v1/agents/ws", get(agents::connect))
         .route("/api/v1/agents/drain-ws", get(agent_drain::connect))

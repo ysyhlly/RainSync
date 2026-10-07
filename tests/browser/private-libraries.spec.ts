@@ -24,6 +24,20 @@ async function fixture(page: Page, enabled = true) {
     room_shares: [],
     audit: [],
   });
+  await page.route("**/api/v1/media/browse?**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("library_id") !== "private")
+      return route.fallback();
+    return route.fulfill({
+      json: {
+        entries: [{ type: "media", media: app.media[0] }],
+        breadcrumbs: [{ id: null, name: "当前媒体库" }],
+        node: null,
+        next_cursor: null,
+        total_media: 1,
+      },
+    });
+  });
   await page.route("**/api/v1/libraries**", async (route) => {
     const path = new URL(route.request().url()).pathname,
       method = route.request().method();
@@ -71,7 +85,9 @@ test("private library rename conflict keeps draft and uses new revision only on 
   await field.fill("我的保留草稿");
   f.conflict();
   await page.getByRole("button", { name: "保存名称", exact: true }).click();
-  await expect(page.getByText("媒体库已变化，请核对最新版本")).toBeVisible();
+  await expect(
+    page.getByText("媒体库已被其他操作修改。请核对最新内容后重新操作。"),
+  ).toBeVisible();
   await expect(field).toHaveValue("我的保留草稿");
   expect(f.updates).toHaveLength(1);
   expect(f.updates[0].expected_revision).toBe("1");

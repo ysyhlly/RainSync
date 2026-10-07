@@ -43,7 +43,7 @@ pub async fn catalog(State(app): State<App>, h: HeaderMap) -> Result<Response> {
         .fetch_all(&app.db)
         .await?;
     Ok(media_titles::private_json(
-        json!({"api_major":1,"api_minor":0,"catalog":IDS.iter().map(|id|manifest(id)).collect::<Vec<_>>(),"installed":rows.iter().map(installed).collect::<Vec<_>>(),"runtime_boundary":"仅运行编译进应用的封闭声明式扩展，无远程脚本、网络、文件、数据库或凭据权限"}),
+        json!({"api_major":1,"api_minor":0,"catalog":IDS.iter().map(|id|manifest(id)).collect::<Vec<_>>(),"installed":rows.iter().filter(|r| !r.get::<bool,_>("removed")).map(installed).collect::<Vec<_>>(),"configuration_revisions":rows.iter().map(|r|(r.get::<String,_>("id"),json!(r.get::<i64,_>("revision").to_string()))).collect::<serde_json::Map<String,Value>>(),"runtime_boundary":"仅运行编译进应用的封闭声明式扩展，无远程脚本、网络、文件、数据库或凭据权限"}),
     ))
 }
 #[derive(Deserialize)]
@@ -134,7 +134,9 @@ pub async fn configure(
     }
     let login = admin_login(&mut tx, &h, user.id).await?;
     let action = if let Some(r) = &previous {
-        if r.get::<String, _>("version") != body.version {
+        if r.get::<bool, _>("removed") {
+            "install"
+        } else if r.get::<String, _>("version") != body.version {
             "upgrade"
         } else if r.get::<bool, _>("enabled") != body.enabled {
             if body.enabled { "enable" } else { "disable" }
@@ -144,9 +146,9 @@ pub async fn configure(
     } else {
         "install"
     };
-    let previous=previous.as_ref().map(|r|json!({"version":r.get::<String,_>("version"),"enabled":r.get::<bool,_>("enabled"),"config":r.get::<Value,_>("config"),"granted_permissions":r.get::<Value,_>("granted_permissions")}));
+    let previous=previous.as_ref().filter(|r| !r.get::<bool,_>("removed")).map(|r|json!({"version":r.get::<String,_>("version"),"enabled":r.get::<bool,_>("enabled"),"config":r.get::<Value,_>("config"),"granted_permissions":r.get::<Value,_>("granted_permissions")}));
     let artifact = digest(&id, &body.version);
-    sqlx::query("INSERT INTO rainsync_plugins(id,version,enabled,config,granted_permissions,revision,artifact_digest,previous_state,updated_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(id) DO UPDATE SET version=EXCLUDED.version,enabled=EXCLUDED.enabled,config=EXCLUDED.config,granted_permissions=EXCLUDED.granted_permissions,revision=EXCLUDED.revision,artifact_digest=EXCLUDED.artifact_digest,previous_state=EXCLUDED.previous_state,updated_by=EXCLUDED.updated_by,updated_at=clock_timestamp()")
+    sqlx::query("INSERT INTO rainsync_plugins(id,version,enabled,config,granted_permissions,revision,artifact_digest,previous_state,updated_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(id) DO UPDATE SET removed=false,version=EXCLUDED.version,enabled=EXCLUDED.enabled,config=EXCLUDED.config,granted_permissions=EXCLUDED.granted_permissions,revision=EXCLUDED.revision,artifact_digest=EXCLUDED.artifact_digest,previous_state=EXCLUDED.previous_state,updated_by=EXCLUDED.updated_by,updated_at=clock_timestamp()")
  .bind(&id).bind(&body.version).bind(body.enabled).bind(body.config).bind(json!(body.granted_permissions)).bind(actual+1).bind(&artifact).bind(previous).bind(user.id).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO rainsync_plugin_audit(id,plugin_id,actor_id,revision,action,artifact_digest) VALUES($1,$2,$3,$4,$5,$6)").bind(Uuid::new_v4()).bind(&id).bind(user.id).bind(actual+1).bind(action).bind(artifact).execute(&mut *tx).await?;
     let row = sqlx::query("SELECT * FROM rainsync_plugins WHERE id=$1")
@@ -161,6 +163,54 @@ pub async fn configure(
 #[serde(deny_unknown_fields)]
 pub struct Rollback {
     expected_revision: String,
+}
+/// Remove operator configuration, not the compiled-in catalog entry. A bounded
+/// tombstone preserves CAS across reinstall and keeps foreign-keyed audit facts.
+pub async fn remove(
+    State(app): State<App>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Rollback>,
+) -> Result<Response> {
+    if !valid_id(&id) {
+        return Err(err(StatusCode::NOT_FOUND, "plugin_not_found"));
+    }
+    let expected = revision(&body.expected_revision)?;
+    let user = auth(&app, &h, true).await?;
+    admin(&user)?;
+    let mut tx = app.db.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout='3s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!("rainsync:plugin:{id}"))
+        .execute(&mut *tx)
+        .await?;
+    let row = sqlx::query("SELECT * FROM rainsync_plugins WHERE id=$1 FOR UPDATE")
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "plugin_not_found"))?;
+    let actual: i64 = row.get("revision");
+    if actual != expected {
+        return Err(err(StatusCode::CONFLICT, "plugin_revision_conflict"));
+    }
+    let login = admin_login(&mut tx, &h, user.id).await?;
+    // A repeated remove of the current tombstone is harmless and must not
+    // manufacture additional audit events or revisions.
+    let removed_revision = if row.get::<bool, _>("removed") {
+        actual
+    } else {
+        sqlx::query("UPDATE rainsync_plugins SET removed=true,enabled=false,config='{}'::jsonb,granted_permissions='[]'::jsonb,previous_state=NULL,revision=$2,updated_by=$3,updated_at=clock_timestamp() WHERE id=$1")
+            .bind(&id).bind(actual+1).bind(user.id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO rainsync_plugin_audit(id,plugin_id,actor_id,revision,action,artifact_digest) VALUES($1,$2,$3,$4,'remove',$5)")
+            .bind(Uuid::new_v4()).bind(&id).bind(user.id).bind(actual+1).bind(row.get::<String,_>("artifact_digest")).execute(&mut *tx).await?;
+        actual + 1
+    };
+    commit(tx, &login, user.id).await?;
+    Ok(media_titles::private_json(
+        json!({"id":id,"removed":true,"revision":removed_revision.to_string()}),
+    ))
 }
 pub async fn rollback(
     State(app): State<App>,
@@ -190,6 +240,9 @@ pub async fn rollback(
     let actual: i64 = row.get("revision");
     if actual != expected {
         return Err(err(StatusCode::CONFLICT, "plugin_revision_conflict"));
+    }
+    if row.get::<bool, _>("removed") {
+        return Err(err(StatusCode::CONFLICT, "plugin_no_rollback"));
     }
     let prior: Value = row
         .get::<Option<Value>, _>("previous_state")
@@ -249,7 +302,7 @@ pub async fn metadata(
     let user = auth(&app, &h, false).await?;
     // Existing authoritative catalog visibility/ACL remains the only media grant.
     let media = media_titles::read(&app, user.id, id).await?;
-    let rows=sqlx::query("SELECT id,version,config,granted_permissions,revision FROM rainsync_plugins WHERE enabled ORDER BY id LIMIT 2").fetch_all(&app.db).await?;
+    let rows=sqlx::query("SELECT id,version,config,granted_permissions,revision FROM rainsync_plugins WHERE enabled AND NOT removed ORDER BY id LIMIT 2").fetch_all(&app.db).await?;
     let mut output = Vec::new();
     for row in rows {
         let plugin: String = row.get("id");

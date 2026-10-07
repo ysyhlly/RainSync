@@ -63,3 +63,39 @@ describe("scoped library API", () => {
     expect(calls[2]?.[2]).toEqual({ restart: true });
   });
 });
+
+it("uses scoped CAS paths for source settings, tombstones and share edits", async () => {
+  const calls: unknown[][] = [];
+  const api = privateLibraryApi((async (...args: unknown[]) => {
+    calls.push(args);
+    return {};
+  }) as ApiClient);
+  await api.sourceSettings("lib/id", "src/id");
+  await api.updateSource("lib/id", "src/id", {
+    expected_revision: "6",
+    name: "Renamed",
+  });
+  await api.removeSource("lib/id", "src/id", "7", "8");
+  await api.remove("lib/id", "9");
+  await api.updateShare("lib/id", "share/id", {
+    expected_revision: "10",
+    mode: "library_members",
+    expires_at: 12345,
+  });
+  expect(calls[0]?.[0]).toBe("/libraries/lib%2Fid/sources/src%2Fid");
+  expect(calls[1]).toEqual([
+    "/libraries/lib%2Fid/sources/src%2Fid",
+    "PATCH",
+    { expected_revision: "6", name: "Renamed" },
+  ]);
+  expect(calls[2]?.[2]).toEqual({
+    expected_revision: "7",
+    expected_library_revision: "8",
+  });
+  expect(calls[3]).toEqual([
+    "/libraries/lib%2Fid",
+    "DELETE",
+    { expected_revision: "9" },
+  ]);
+  expect(calls[4]?.[0]).toBe("/libraries/lib%2Fid/room-shares/share%2Fid");
+});

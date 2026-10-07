@@ -77,6 +77,8 @@ async function page() {
     QueueFeedback: {},
     AppDialog: {},
     AppIcon: {},
+    SourceSettingsDialog: {},
+    LibraryBrowser: {},
   };
   const component = new Function(...Object.keys(imports), js)(
     ...Object.values(imports),
@@ -113,6 +115,7 @@ it.each([
   ["revokeShare", "share", "/libraries/private/room-shares/share", "DELETE"],
   ["transfer", "new-owner", "/libraries/private/transfer", "POST"],
   ["attach", "source", "/libraries/private/attach-source", "POST"],
+  ["deleteLibrary", "private", "/libraries/private", "DELETE"],
 ])(
   "requires explicit confirmation for %s, and cancellation sends nothing",
   async (kind, target, path, method) => {
@@ -201,5 +204,133 @@ it("consumes a successful transfer before a failed list refresh and preserves it
   expect(p.controls.error.value).toBe("");
   expect(p.controls.notice.value).toBe("所有权已转移，原所有者不保留默认权限");
   expect(transferCount).toBe(1);
+  p.unmount();
+});
+
+it("prefills an existing account grant and cancellation clears the editing target", async () => {
+  const p = await page();
+  p.controls.editGrant({
+    user_id: "viewer",
+    username: "fixed-user",
+    browse: false,
+    play: true,
+    share_to_room: true,
+    manage: false,
+    expires_at: Date.now() + 2 * 3_600_000,
+  });
+  expect(p.controls.editingGrant.value).toBe("viewer");
+  expect(p.controls.grantName.value).toBe("fixed-user");
+  expect(p.controls.browse.value).toBe(false);
+  expect(p.controls.shareRight.value).toBe(true);
+  expect(p.controls.hours.value).toBe(2);
+  p.controls.cancelGrantEdit();
+  expect(p.controls.editingGrant.value).toBeUndefined();
+  expect(p.session.api).not.toHaveBeenCalled();
+  p.unmount();
+});
+
+it("requires both source and library revisions when removing a private source", async () => {
+  const p = await page();
+  p.controls.selected.value.sources = [
+    {
+      id: "source",
+      name: "Private HTTP",
+      kind: "http",
+      revision: "7",
+      access_policy_revision: 2,
+    },
+  ];
+  p.controls.requestChange("deleteSource", "source", "Private HTTP");
+  expect(p.session.api).not.toHaveBeenCalled();
+  await p.controls.confirmChange();
+  expect(p.session.api).toHaveBeenCalledWith(
+    "/libraries/private/sources/source",
+    "DELETE",
+    { expected_revision: "7", expected_library_revision: "1" },
+  );
+  p.unmount();
+});
+
+it("does not expose deletion confirmation for a shared library or non-owner", async () => {
+  const p = await page();
+  p.controls.selected.value.visibility = "instance_shared";
+  p.controls.requestChange("deleteLibrary", "private");
+  expect(p.controls.confirmationOpen.value).toBe(false);
+  p.controls.selected.value.visibility = "private";
+  p.controls.selected.value.owner_id = "other";
+  p.controls.requestChange("deleteLibrary", "private");
+  expect(p.controls.confirmationOpen.value).toBe(false);
+  p.unmount();
+});
+
+it("keeps room share identity, validates its original expiry ceiling and fences stale revisions", async () => {
+  const p = await page();
+  const expires = Date.now() + 60 * 60_000;
+  p.controls.editShare({
+    id: "share",
+    title: "One movie",
+    mode: "library_members",
+    active: true,
+    expires_at: expires,
+    max_expires_at: expires + 60 * 60_000,
+  });
+  expect(p.controls.shareEdit.value.mode).toBe("library_members");
+  p.controls.shareEdit.value.expires = p.controls.localDateTime(
+    expires + 3 * 60 * 60_000,
+  );
+  await p.controls.saveShare();
+  expect(p.session.api).not.toHaveBeenCalled();
+  p.controls.shareEdit.value.expires = p.controls.localDateTime(expires);
+  p.controls.selected.value.revision = "2";
+  await p.controls.saveShare();
+  expect(p.session.api).not.toHaveBeenCalled();
+  expect(p.controls.error.value).toContain("重新打开");
+  p.unmount();
+});
+
+it("consumes successful library deletion even if its list refresh fails", async () => {
+  const p = await page();
+  p.session.api.mockImplementation(async (path, method = "GET") => {
+    if (path === "/libraries/private" && method === "DELETE")
+      return { deleted: true };
+    throw new Error("列表刷新失败");
+  });
+  p.controls.requestChange("deleteLibrary", "private");
+  await p.controls.confirmChange();
+  expect(p.controls.selected.value).toBeNull();
+  expect(p.controls.confirmationOpen.value).toBe(false);
+  expect(p.controls.notice.value).toContain("媒体库已删除");
+  await p.controls.confirmChange();
+  expect(
+    p.session.api.mock.calls.filter((call) => call[1] === "DELETE"),
+  ).toHaveLength(1);
+  p.unmount();
+});
+
+it("clears credential drafts on account change and ignores a late destructive response", async () => {
+  const p = await page();
+  let finish!: (value: unknown) => void;
+  p.session.api.mockImplementation(async (_path, method = "GET") => {
+    if (method === "DELETE")
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    return library();
+  });
+  p.controls.sourceUrl.value = "https://fixture.invalid/file?secret=sensitive";
+  p.controls.sourceConfig.value = '{"headers":{"Authorization":"sensitive"}}';
+  p.controls.requestChange("deleteLibrary", "private");
+  const saving = p.controls.confirmChange();
+  await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+  p.session.epoch++;
+  expect(p.controls.sourceUrl.value).toBe("");
+  expect(p.controls.sourceConfig.value).toBe("{}");
+  p.controls.selected.value = library("new-account-library");
+  p.controls.notice.value = "New account feedback";
+  finish({ deleted: true });
+  await saving;
+  expect(p.controls.selected.value.id).toBe("new-account-library");
+  expect(p.controls.notice.value).toBe("New account feedback");
+  expect(p.session.api).toHaveBeenCalledTimes(1);
   p.unmount();
 });

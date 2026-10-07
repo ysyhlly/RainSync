@@ -289,6 +289,7 @@ pub async fn list(config: &SourceConfig, headers: BTreeMap<String, String>) -> R
                 ("SortBy", "SortName"),
                 ("SortOrder", "Ascending"),
                 ("EnableTotalRecordCount", "true"),
+                ("Fields", "SeriesName,SeasonName"),
                 ("Limit", "200"),
                 ("StartIndex", start.as_str()),
             ]);
@@ -328,7 +329,12 @@ pub async fn list(config: &SourceConfig, headers: BTreeMap<String, String>) -> R
                 title: row["Name"].as_str().unwrap_or("Untitled").into(),
                 resource: id.into(),
                 duration_ms,
-                metadata: serde_json::json!({"ImageTags":row["ImageTags"],"BackdropImageTags":row["BackdropImageTags"]}),
+                // Deliberate allowlist: upstream Path, server URLs and credentials
+                // never become browser folder names or opaque browse tokens.
+                metadata: serde_json::json!({"ImageTags":row["ImageTags"],"BackdropImageTags":row["BackdropImageTags"],
+                    "Type":row["Type"],"SeriesId":row["SeriesId"],"SeriesName":row["SeriesName"],
+                    "SeasonId":row["SeasonId"],"SeasonName":row["SeasonName"],
+                    "ParentIndexNumber":row["ParentIndexNumber"],"IndexNumber":row["IndexNumber"]}),
             });
         }
         ensure!(items.len() as u64 <= total, "invalid_library_total");

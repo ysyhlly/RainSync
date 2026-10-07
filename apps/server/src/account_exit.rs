@@ -10,7 +10,7 @@ pub async fn preview(State(app): State<App>, h: HeaderMap) -> Result<Response> {
             .fetch_all(&app.db)
             .await?;
     let libraries =
-        sqlx::query("SELECT id,name,revision FROM private_libraries WHERE owner_id=$1 ORDER BY id")
+        sqlx::query("SELECT id,name,revision FROM private_libraries WHERE owner_id=$1 AND deleted_at IS NULL ORDER BY id")
             .bind(user.id)
             .fetch_all(&app.db)
             .await?;
@@ -112,7 +112,7 @@ pub async fn delete(
     if current.get::<bool, _>("admin") && !other_admin {
         return Err(err(StatusCode::CONFLICT, "account_last_admin"));
     }
-    let owns: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM rooms WHERE owner_id=$1) OR EXISTS(SELECT 1 FROM private_libraries WHERE owner_id=$1)")
+    let owns: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM rooms WHERE owner_id=$1) OR EXISTS(SELECT 1 FROM private_libraries WHERE owner_id=$1 AND deleted_at IS NULL)")
         .bind(user.id).fetch_one(&mut *tx).await?;
     if owns {
         return Err(err(StatusCode::CONFLICT, "account_ownership_required"));

@@ -60,6 +60,7 @@ function fixture(url: URL, api: any, patch = {}) {
     {
       useSession,
       AppSelect: {},
+      AppDialog: {},
       AppIcon: {},
       Notice: {},
       Hls: { isSupported: () => true },
@@ -378,7 +379,8 @@ describe("NAS compute node capability and budget guidance", () => {
 
   it("keeps disabled policy actions and missing capability/budget warnings in the rendered template", () => {
     const source = readFileSync(policyUrl, "utf8").replace(/\s+/g, " ");
-    expect(source).toContain(':disabled="busy || loading || !enabled"');
+    expect(source).toContain("node.revoked || (!enabled && !node.enabled)");
+    expect(source).toContain('@click="requestChange(node)"');
     expect(source).toContain('v-if="!node.capabilities?.length"');
     expect(source).toContain('v-else-if="missingHdRecipes(node).length"');
     expect(source).toContain("当前配额：");

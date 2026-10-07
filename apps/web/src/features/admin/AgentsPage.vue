@@ -27,13 +27,67 @@ const session = useSession(),
   code = ref(""),
   remaining = ref(0),
   revoking = ref<Agent | null>(null),
-  revokeOpen = ref(false);
+  revokeOpen = ref(false),
+  settingsOpen = ref(false),
+  editing = ref<Agent | null>(null),
+  editName = ref(""),
+  computeRefresh = ref(0);
 let expires = 0,
   alive = true,
   scope = 0,
   loadSerial = 0,
   dialogSerial = 0;
 const revokedIds = new Set<string>();
+function edit(row: Agent) {
+  if (
+    row.revoked ||
+    busy.value ||
+    refreshing.value ||
+    open.value ||
+    revokeOpen.value ||
+    settingsOpen.value
+  )
+    return;
+  editing.value = { ...row };
+  editName.value = row.name;
+  error.value = "";
+  settingsOpen.value = true;
+}
+async function saveSettings() {
+  const target = editing.value,
+    context = scope;
+  if (!settingsOpen.value || !target || target.revoked) return;
+  const trimmed = editName.value.trim();
+  if (
+    !trimmed ||
+    [...trimmed].length > 120 ||
+    /[\u0000-\u001f\u007f-\u009f]/.test(trimmed)
+  )
+    throw Error("设备名称需为 1–120 个字符，不能包含控制字符");
+  let result: { id: string; name: string };
+  try {
+    result = await session.api<{ id: string; name: string }>(
+      `/agents/${target.id}`,
+      "PUT",
+      {
+        name: trimmed,
+        expected_name: target.name,
+      },
+    );
+  } catch (e) {
+    if ((e as { code?: string })?.code === "AGENT_SETTINGS_CONFLICT")
+      throw Error("设备名称已被其他管理员修改。请取消并刷新设备状态后重新编辑");
+    throw e;
+  }
+  if (!alive || context !== scope) return;
+  rows.value = rows.value.map((row) =>
+    row.id === target.id ? { ...row, name: result.name } : row,
+  );
+  message.value = "设备名称已保存，现有配对、目录和媒体索引保持不变";
+  ++computeRefresh.value;
+  if (editing.value?.id === target.id) settingsOpen.value = false;
+  await load();
+}
 function ignoredFailure(e: unknown) {
   return (
     e instanceof StaleIdentity ||
@@ -104,6 +158,7 @@ async function create() {
     remaining.value = 600;
   }
   message.value = "设备已添加，配对码已生成";
+  ++computeRefresh.value;
   await load();
 }
 async function revoke() {
@@ -126,8 +181,19 @@ async function revoke() {
   revoking.value = null;
   revokeOpen.value = false;
   message.value = "设备已撤销，后续连接将被拒绝";
+  ++computeRefresh.value;
   await load();
 }
+watch(
+  settingsOpen,
+  (value) => {
+    if (!value) {
+      editing.value = null;
+      editName.value = "";
+    }
+  },
+  { flush: "sync" },
+);
 watch(
   open,
   (value) => {
@@ -154,7 +220,7 @@ watch(
     error.value = refreshError.value = message.value = "";
     rows.value = [];
     revokedIds.clear();
-    open.value = revokeOpen.value = false;
+    open.value = revokeOpen.value = settingsOpen.value = false;
     code.value = name.value = "";
     expires = remaining.value = 0;
     revoking.value = null;
@@ -180,7 +246,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="button-row">
         <button
-          v-if="!open && !revokeOpen"
+          v-if="!open && !revokeOpen && !settingsOpen"
           :disabled="busy || refreshing"
           @click="load"
         >
@@ -190,7 +256,7 @@ onBeforeUnmount(() => {
         </button>
         <button
           class="primary"
-          :disabled="busy || refreshing || open || revokeOpen"
+          :disabled="busy || refreshing || open || revokeOpen || settingsOpen"
           @click="
             code = '';
             name = '';
@@ -203,7 +269,7 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </div>
-    <template v-if="!open && !revokeOpen">
+    <template v-if="!open && !revokeOpen && !settingsOpen">
       <Notice :message="message" />
       <Notice :message="error" error />
       <Notice :message="refreshError" error />
@@ -255,22 +321,72 @@ onBeforeUnmount(() => {
             {{ agentDrainLabel(row) }}
           </p>
         </div>
-        <button
-          class="danger"
-          :disabled="row.revoked || busy || refreshing || open || revokeOpen"
-          @click="
-            revoking = row;
-            revokeOpen = true;
-          "
-        >
-          撤销设备
-        </button>
+        <div class="button-row">
+          <button
+            :disabled="
+              row.revoked ||
+              busy ||
+              refreshing ||
+              open ||
+              revokeOpen ||
+              settingsOpen
+            "
+            @click="edit(row)"
+          >
+            <AppIcon name="settings" />设备设置
+          </button>
+          <button
+            class="danger"
+            :disabled="
+              row.revoked ||
+              busy ||
+              refreshing ||
+              open ||
+              revokeOpen ||
+              settingsOpen
+            "
+            @click="
+              revoking = row;
+              revokeOpen = true;
+            "
+          >
+            撤销设备
+          </button>
+        </div>
       </article>
     </div>
     <p v-if="rows.length" class="helper">
       连接状态以最近一次刷新为准；文件版本索引就绪不代表设备当前在线或所有影片均可播放。
     </p>
-    <ComputePolicyPanel class="agent-compute" />
+    <ComputePolicyPanel :key="computeRefresh" class="agent-compute" />
+    <AppDialog v-model="settingsOpen" title="NAS 设备设置" :busy="busy">
+      <p class="helper">
+        修改显示名称会同步更新对应片源名称，不需要重新配对。目录路径和 Agent
+        连接配置需在设备上修改。
+      </p>
+      <form @submit.prevent="run(saveSettings)">
+        <label
+          >设备名称<input
+            v-model="editName"
+            required
+            maxlength="120"
+            :disabled="busy"
+            autofocus
+        /></label>
+        <Notice :message="error" error />
+        <div class="dialog-actions">
+          <button type="button" :disabled="busy" @click="settingsOpen = false">
+            取消
+          </button>
+          <button
+            class="primary"
+            :disabled="busy || refreshing || !editName.trim()"
+          >
+            {{ busy ? "正在保存…" : "保存设备设置" }}
+          </button>
+        </div>
+      </form>
+    </AppDialog>
     <AppDialog v-model="open" title="添加NAS设备" drawer :busy="busy"
       ><Notice :message="message" />
       <Notice :message="error" error />
@@ -311,7 +427,9 @@ onBeforeUnmount(() => {
       ><p>
         撤销
         {{ revoking?.name }}
-        后，设备凭据失效，无法继续同步和读取设备片源。现有账号不受影响。
+        后，设备凭据失效，无法继续同步和读取设备片源，依赖它的播放与本地计算也会失效。此操作不能恢复；再次连接需要添加并配对新设备。
+        保留设备记录、媒体索引和任务历史，不会删除 NAS
+        上的原文件。现有账号不受影响。
       </p>
       <Notice :message="error" error />
       <div class="dialog-actions">

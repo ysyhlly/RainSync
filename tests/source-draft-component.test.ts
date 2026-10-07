@@ -43,6 +43,7 @@ function panel(api: any) {
       AppIcon: {},
       Notice: {},
       ScanAllSources: {},
+      SourceSettingsDialog: {},
     },
   );
   return { ...instance, session, focus, leave: () => leave() };

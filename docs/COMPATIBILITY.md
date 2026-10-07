@@ -28,3 +28,7 @@
 迁移版本/校验和、FFmpeg 包版本/构建证明、浏览器/操作系统与上游固定版本、
 测试时间和报告摘要，以及明确的未通过项。构建步骤见 [运行制品](RUNTIME_ARTIFACTS.md)，
 恢复步骤见 [备份运维](BACKUP_OPERATIONS.md)。
+
+插件配置生命周期增加迁移 0084 与 `configuration_revisions` 读契约；删除后保留修订标记，
+旧 Web 不具备重新安装时的完整围栏语义。使用同一候选的 Server/Web，禁止旧 Server 写入
+已升级数据库；具体删除、重新授权与回退边界见 [高级功能](ADVANCED_FEATURES.md#内置插件配置的删除与重新安装)。

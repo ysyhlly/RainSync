@@ -1,4 +1,4 @@
-import { mediaExtraResponse } from "./fixtures/media";
+import { mediaExtraResponse, mediaRecord } from "./fixtures/media";
 import { readFileSync } from "node:fs";
 import { test, expect, type Page, type WebSocketRoute } from "@playwright/test";
 import { navigate, chooseRoom, showOptions } from "./fixtures/navigation";
@@ -26,7 +26,70 @@ test("library navigation requests bounded pages and searches beyond the current 
       })),
     });
   });
+  const browseQueries: URLSearchParams[] = [];
+  await page.route("**/api/v1/media/browse?*", (route) => {
+    const q = new URL(route.request().url()).searchParams;
+    browseQueries.push(q);
+    const node = q.get("node"),
+      start = q.get("after") ? Number(q.get("after")!.split("-")[1]) + 1 : 0,
+      limit = Number(q.get("limit")),
+      rows = Array.from({ length: Math.min(limit, 150 - start) }, (_, n) =>
+        mediaRecord({
+          id: `item-${start + n}`,
+          title: `entry-${start + n}`,
+          kind: "http",
+        }),
+      );
+    return route.fulfill({
+      json: {
+        node,
+        breadcrumbs: [
+          { id: null, name: "全部片源" },
+          ...(node ? [{ id: "source", name: "分页测试片源" }] : []),
+          ...(node === "folder" ? [{ id: "folder", name: "分页目录" }] : []),
+        ],
+        entries: !node
+          ? [
+              {
+                type: "source",
+                id: "source",
+                name: "分页测试片源",
+                kind: "http",
+                media_count: 150,
+              },
+            ]
+          : node === "source"
+            ? [
+                {
+                  type: "folder",
+                  id: "folder",
+                  name: "分页目录",
+                  media_count: 150,
+                },
+              ]
+            : rows.map((media) => ({ type: "media", media })),
+        total_media: 150,
+        next_cursor:
+          node === "folder" && start + limit < 150 ? rows.at(-1)!.id : null,
+      },
+    });
+  });
   await navigate(page, "媒体库");
+  await page
+    .getByRole("button", { name: "打开片源 分页测试片源", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "打开目录 分页目录", exact: true })
+    .click();
+  await expect(page.locator(".media-card")).toHaveCount(24);
+  await page.getByRole("button", { name: "下一页", exact: true }).click();
+  await expect(page.locator(".media-card")).toHaveCount(24);
+  expect(browseQueries.at(-1)!.get("after")).toBe("item-23");
+  await page.getByRole("button", { name: "上一页", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "播放 entry-0", exact: true }),
+  ).toBeVisible();
+  expect(browseQueries.every((q) => q.get("limit") === "24")).toBe(true);
   await page.getByLabel("搜索影片").fill("entry");
   await page.getByLabel("搜索影片").press("Enter");
   await expect(page.locator(".media-card")).toHaveCount(24);

@@ -62,6 +62,10 @@ jobs:
           test -x "$CARGO_TARGET_DIR/debug/rainsync-compute-node"
           timeout --signal=TERM --kill-after=15s 180s node tests/distributed-compute-admission.mjs
           timeout --signal=TERM --kill-after=15s 600s node tests/distributed-compute-hd.mjs
+          # Settings and hierarchy use owned databases and synthetic records only.
+          for test in source-settings plugin-configuration-migration plugin-configuration-runtime nas-configuration-settings media-hierarchy-migration media-hierarchy-native private-library-lifecycle-migration private-library-settings-native; do
+            timeout --signal=TERM --kill-after=15s 180s node "tests/$test.mjs"
+          done
       - run: npm run test:accounts
       - name: Verify avatars with the deployment image's FFmpeg
         run: |

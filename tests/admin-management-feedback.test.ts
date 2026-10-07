@@ -34,7 +34,7 @@ function panel(file: "PluginsPage" | "ComputePolicyPanel", api: any) {
       `../apps/web/src/features/${file === "PluginsPage" ? "plugins" : "admin"}/${file}.vue`,
       import.meta.url,
     ),
-    { useSession, AppSelect: {}, AppIcon: {}, Notice: {} },
+    { useSession, AppSelect: {}, AppDialog: {}, AppIcon: {}, Notice: {} },
   );
 }
 

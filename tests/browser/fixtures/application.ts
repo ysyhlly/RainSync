@@ -72,7 +72,33 @@ export async function appFixture(
       authenticated = false;
     } else if (path === "/rooms")
       value = request.method() === "POST" ? { id: "room" } : [room];
-    else if (path === "/media") {
+    else if (path === "/media/browse") {
+      searches.push(url.search);
+      const node = url.searchParams.get("node");
+      const offset = url.searchParams.has("after") ? 24 : 0;
+      value = {
+        node,
+        breadcrumbs: [
+          { id: null, name: "全部片源" },
+          ...(node ? [{ id: "fixture-source", name: "测试片源" }] : []),
+        ],
+        entries: node
+          ? media
+              .slice(offset, offset + 24)
+              .map((media) => ({ type: "media", media }))
+          : [
+              {
+                type: "source",
+                id: "fixture-source",
+                name: "测试片源",
+                kind: "local",
+                media_count: media.length,
+              },
+            ],
+        total_media: media.length,
+        next_cursor: node && offset + 24 < media.length ? "fixture-next" : null,
+      };
+    } else if (path === "/media") {
       searches.push(url.search);
       const query = url.searchParams.get("search") ?? "";
       const filtered = media.filter((x) => x.title.includes(query));
@@ -299,4 +325,14 @@ export async function appFixture(
     preparations: () => preparations,
     socket: () => socket,
   };
+}
+
+// Card-action regressions enter the real source group introduced by hierarchy.
+export async function openFixtureSource(page: Page) {
+  await page.locator(".folder-card, .media-card").first().waitFor();
+  const source = page.getByRole("button", {
+    name: "打开片源 测试片源",
+    exact: true,
+  });
+  if (await source.count()) await source.click();
 }

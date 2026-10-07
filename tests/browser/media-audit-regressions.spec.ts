@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { appFixture } from "./fixtures/application";
+import { appFixture, openFixtureSource } from "./fixtures/application";
 
 test("queue thumbnail image retry is reachable inside its compact bounds", async ({
   page,
@@ -63,6 +63,7 @@ for (const scope of ["personal", "shared"] as const) {
   }) => {
     const app = await appFixture(page);
     await page.goto("/library");
+    await openFixtureSource(page);
     await page
       .getByRole("button", { name: "重命名 真实合成测试视频", exact: true })
       .click();
@@ -105,6 +106,7 @@ for (const scope of ["personal", "shared"] as const) {
       title: "opened title",
     });
     await page.goto("/library");
+    await openFixtureSource(page);
     await page
       .getByRole("button", { name: "重命名 opened title", exact: true })
       .click();
@@ -185,6 +187,7 @@ for (const recovery of ["focus", "manual"] as const) {
       });
     });
     await page.goto("/library");
+    await openFixtureSource(page);
     const card = page.locator(".media-card").first();
     await expect.poll(() => images).toBe(1);
     await expect(card.locator("img")).toHaveCount(0);
@@ -200,7 +203,9 @@ for (const recovery of ["focus", "manual"] as const) {
           .getByRole("button", { name: "重新加载封面", exact: true })
           .click();
       else {
-        const response = page.waitForResponse((r) => /\/media\?/.test(r.url()));
+        const response = page.waitForResponse((r) =>
+          /\/media\/browse\?/.test(r.url()),
+        );
         await page.evaluate(() => window.dispatchEvent(new Event("focus")));
         await response;
       }

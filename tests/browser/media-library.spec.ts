@@ -1,11 +1,12 @@
 import { test, expect } from "@playwright/test";
-import { appFixture } from "./fixtures/application";
+import { appFixture, openFixtureSource } from "./fixtures/application";
 import { navigate } from "./fixtures/navigation";
 test("rename conflict preserves draft; lost response is read back; clear restores shared title", async ({
   page,
 }) => {
   const app = await appFixture(page);
   await page.goto("/library");
+  await openFixtureSource(page);
   await page
     .getByRole("button", { name: "重命名 真实合成测试视频", exact: true })
     .click();
@@ -61,6 +62,7 @@ test("rename updates library and playing metadata without another media session"
     (window as any).__video = document.querySelector("video");
   });
   await navigate(page, "媒体库");
+  await openFixtureSource(page);
   await page
     .getByRole("button", { name: "重命名 真实合成测试视频", exact: true })
     .click();
@@ -99,6 +101,7 @@ test("ordinary viewer sees only personal rename and preview batches contain visi
       batches.push(r.postDataJSON().media_ids);
   });
   await page.goto("/library");
+  await openFixtureSource(page);
   await page
     .getByRole("button", { name: "重命名 真实合成测试视频", exact: true })
     .click();

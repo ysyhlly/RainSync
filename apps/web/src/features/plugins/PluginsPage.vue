@@ -2,6 +2,7 @@
 import { ref, onMounted, onBeforeUnmount, watch } from "vue";
 import { useSession } from "../auth/session.store";
 import type { Media } from "../../shared/api/types";
+import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import AppSelect from "../../shared/ui/AppSelect.vue";
 import Notice from "../../shared/ui/Notice.vue";
@@ -31,6 +32,9 @@ const session = useSession(),
   catalog = ref<Manifest[]>([]),
   catalogLoaded = ref(false),
   installed = ref<Record<string, Installed>>({}),
+  configurationRevisions = ref<Record<string, string>>({}),
+  removal = ref<{ id: string; name: string; revision: string } | null>(null),
+  removalError = ref(""),
   draft = ref<Record<string, Draft>>({}),
   draftBase = ref<Record<string, Draft>>({}),
   draftRevision = ref<Record<string, string>>({}),
@@ -71,13 +75,18 @@ function dirty(id: string) {
     JSON.stringify(draft.value[id]) !== JSON.stringify(draftBase.value[id])
   );
 }
+function currentRevision(id: string) {
+  return (
+    configurationRevisions.value[id] ?? installed.value[id]?.revision ?? "0"
+  );
+}
 function resetDraft(id: string) {
   const m = catalog.value.find((item) => item.id === id);
   if (!m) return;
   const value = pluginDraft(m, installed.value[id]);
   draft.value[id] = value;
   draftBase.value[id] = { ...value };
-  draftRevision.value[id] = installed.value[id]?.revision ?? "0";
+  draftRevision.value[id] = currentRevision(id);
 }
 async function load() {
   const request = ++serial,
@@ -85,6 +94,7 @@ async function load() {
   const result = await session.api<{
     catalog: Manifest[];
     installed: Installed[];
+    configuration_revisions?: Record<string, string>;
   }>("/admin/plugins", "GET", undefined, AbortSignal.timeout(15000));
   if (!alive || context !== scope || request !== serial) return;
   if (
@@ -96,6 +106,9 @@ async function load() {
     throw new TypeError("插件目录无效");
   catalog.value = result.catalog;
   installed.value = Object.fromEntries(result.installed.map((p) => [p.id, p]));
+  configurationRevisions.value =
+    result.configuration_revisions ??
+    Object.fromEntries(result.installed.map((p) => [p.id, p.revision]));
   // A dirty draft stays attached to the revision it was edited from. Merely
   // reading a newer server revision must not authorize overwriting it.
   for (const m of result.catalog) {
@@ -140,6 +153,7 @@ async function save(id: string) {
   if (!alive || context !== scope) return;
   ++serial;
   installed.value[id] = result;
+  configurationRevisions.value[id] = result.revision;
   resetDraft(id);
   message.value = "插件设置已保存，新请求使用此配置版本";
   extensions.value = [];
@@ -158,6 +172,7 @@ async function rollback(id: string) {
   if (!alive || context !== scope) return;
   ++serial;
   installed.value[id] = result;
+  configurationRevisions.value[id] = result.revision;
   resetDraft(id);
   message.value = "已恢复上一次配置，修订号继续递增";
   extensions.value = [];
@@ -168,6 +183,60 @@ async function rollback(id: string) {
     if (alive && context === scope)
       error.value = `配置已恢复，但目录刷新失败：${e instanceof Error ? e.message : String(e)}。请刷新目录与状态，无需再次恢复。`;
   }
+}
+function askRemove(id: string) {
+  const plugin = catalog.value.find((item) => item.id === id),
+    saved = installed.value[id];
+  if (busy.value || !plugin || !saved) return;
+  removalError.value = "";
+  removal.value = { id, name: plugin.name, revision: saved.revision };
+}
+function closeRemoval() {
+  if (busy.value) return;
+  removal.value = null;
+  removalError.value = "";
+}
+async function removeConfiguration() {
+  const target = removal.value,
+    context = scope;
+  if (!target || busy.value) return;
+  await run(target.id, async () => {
+    removalError.value = "";
+    try {
+      const result = await session.api<{
+        id: string;
+        removed: boolean;
+        revision: string;
+      }>(
+        `/admin/plugins/${target.id}`,
+        "DELETE",
+        { expected_revision: target.revision },
+        AbortSignal.timeout(15000),
+      );
+      if (!alive || context !== scope) return;
+      if (
+        result.id !== target.id ||
+        result.removed !== true ||
+        !/^[1-9]\d*$/.test(result.revision) ||
+        result.revision !== (BigInt(target.revision) + 1n).toString()
+      )
+        throw new Error("删除结果未确认，请刷新目录与状态后核对");
+      ++serial;
+      delete installed.value[target.id];
+      configurationRevisions.value[target.id] = result.revision;
+      resetDraft(target.id);
+      removal.value = null;
+      message.value =
+        "插件配置和上一次配置已删除，权限已撤销。新请求不再输出此扩展；内置目录及变更记录仍保留，可重新配置安装。";
+      extensions.value = [];
+      previewLoaded.value = false;
+      audits.value = [];
+      auditLoaded.value = false;
+    } catch (e) {
+      if (alive && context === scope)
+        removalError.value = `删除未完成或结果尚未确认：${e instanceof Error ? e.message : String(e)}。可取消并刷新目录核对；配置冲突时请重新确认当前修订。`;
+    }
+  });
 }
 async function preview() {
   if (!selectedMedia.value) return;
@@ -227,6 +296,9 @@ watch(
     ++serial;
     catalog.value = [];
     installed.value = {};
+    configurationRevisions.value = {};
+    removal.value = null;
+    removalError.value = "";
     draft.value = {};
     draftBase.value = {};
     draftRevision.value = {};
@@ -379,10 +451,7 @@ onBeforeUnmount(() => {
             </p>
           </details>
           <p
-            v-if="
-              draftRevision[plugin.id] !==
-              (installed[plugin.id]?.revision ?? '0')
-            "
+            v-if="draftRevision[plugin.id] !== currentRevision(plugin.id)"
             class="helper"
             role="status"
           >
@@ -396,7 +465,7 @@ onBeforeUnmount(() => {
             >
               {{
                 busy === plugin.id
-                  ? "保存中…"
+                  ? "处理中…"
                   : installed[plugin.id]
                     ? "保存配置与版本"
                     : "安装插件"
@@ -411,10 +480,16 @@ onBeforeUnmount(() => {
               恢复上一次配置
             </button>
             <button
-              v-if="
-                draftRevision[plugin.id] !==
-                (installed[plugin.id]?.revision ?? '0')
-              "
+              v-if="installed[plugin.id]"
+              type="button"
+              class="danger"
+              :disabled="!!busy"
+              @click="askRemove(plugin.id)"
+            >
+              删除配置并停用
+            </button>
+            <button
+              v-if="draftRevision[plugin.id] !== currentRevision(plugin.id)"
               type="button"
               :disabled="!!busy"
               @click="resetDraft(plugin.id)"
@@ -491,12 +566,14 @@ onBeforeUnmount(() => {
       >
         <div class="section-heading__copy">
           <h2>变更记录</h2>
-          <p class="helper">查看插件安装、版本升级与配置回退记录。</p>
+          <p class="helper">查看插件安装、版本升级、配置回退与删除记录。</p>
         </div>
         <div class="button-row">
           <button :disabled="!!busy" @click="run('audit', audit)">
             {{
-              busy === "audit" ? "正在读取记录…" : "查看安装、升级与回退记录"
+              busy === "audit"
+                ? "正在读取记录…"
+                : "查看安装、升级、回退与删除记录"
             }}
           </button>
         </div>
@@ -504,7 +581,7 @@ onBeforeUnmount(() => {
           按需读取记录，核对插件与配置修订。
         </p>
         <p v-else-if="!audits.length" class="helper" role="status">
-          暂无安装、升级或回退记录。
+          暂无插件变更记录。
         </p>
         <ul v-else class="plugin-results">
           <li v-for="entry in audits" :key="entry.id">
@@ -514,6 +591,40 @@ onBeforeUnmount(() => {
         </ul>
       </section>
     </div>
+    <AppDialog
+      :model-value="!!removal"
+      title="删除插件配置"
+      :busy="!!busy"
+      @update:model-value="
+        (open) => {
+          if (!open) closeRemoval();
+        }
+      "
+    >
+      <template v-if="removal">
+        <p>删除“{{ removal.name }}”的配置（修订 {{ removal.revision }}）？</p>
+        <p class="helper">
+          将停用此插件、撤销权限，并删除已保存配置和上一次可回退的配置。此插件的未保存草稿也会清空，不能通过“恢复上一次配置”撤销。
+        </p>
+        <p class="helper">
+          新的元数据请求将不再输出此扩展；已显示的标签需刷新后消失。内置目录和变更记录保留，可重新配置安装，原媒体与播放不受影响。
+        </p>
+        <Notice :message="removalError" error />
+        <div class="button-row">
+          <button type="button" :disabled="!!busy" @click="closeRemoval">
+            取消
+          </button>
+          <button
+            type="button"
+            class="danger"
+            :disabled="!!busy"
+            @click="removeConfiguration"
+          >
+            {{ busy ? "正在删除…" : "确认删除配置并停用" }}
+          </button>
+        </div>
+      </template>
+    </AppDialog>
   </section>
 </template>
 <style scoped>

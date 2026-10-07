@@ -112,3 +112,23 @@ GPU 需设备映射和实测驱动/编码器，设置 `RAINSYNC_VIDEO_ENCODER` �
 诊断码，保留独立的进程与文件回收义务，不公开 FFmpeg 输出、宿主路径或凭据。
 `COMPUTE_RECIPE_UNAVAILABLE` 表示同源或等价副本没有声明该配方的已授权节点，
 应先更新、启动并授权匹配 companion；已注册的离线节点允许排队，领取仍须有效心跳。
+
+### 内置插件配置的删除与重新安装
+
+插件管理中的“删除配置并停用”只删除该插件的当前设置、上一次可回退设置及显式权限，
+并停止后续请求的扩展输出。已经显示的标签需刷新；原媒体和播放权限不变。
+确认对话框绑定插件名称及修订，取消不会改动草稿。删除后表单恢复未安装的默认状态，
+重新安装必须重新授予 `metadata:read`，不能通过配置回退恢复已删除的内容。
+
+两个编译内置的目录条目不能从应用中删除。迁移 0084 保留仅含身份、版本、摘要和修订等
+管理事实的停用标记，以及不含配置正文的变更记录，防止删除后旧草稿绕过修订围栏。
+`GET /admin/plugins` 的 `configuration_revisions` 包括这些标记；重新安装须携带最新修订，
+从未安装时才使用 `0`。`DELETE /admin/plugins/{id}` 要求管理员、CSRF 和
+`expected_revision`；与保存/回退共用数据库锁，在同一事务中撤销输出并写入审计。
+已删除标记的同修订删除重试不增加记录；旧修订请求返回冲突，应刷新核对后重新确认。
+
+迁移前备份，Server/Web 使用包含 0084 的同一候选；不让旧二进制写入新库。
+配置删除不可用“恢复上一次配置”撤销；应用版本回退仍走隔离备份恢复流程，不能降序迁移。
+本地检查入口：`tests/plugin-configuration-migration.mjs`、
+`tests/plugin-configuration-runtime.mjs`、`tests/plugin-configuration-lifecycle.test.ts`、
+`tests/browser/plugin-configuration.spec.ts`；模拟浏览器与隔离合成数据不代表线上验收。

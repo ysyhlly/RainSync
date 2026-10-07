@@ -23,7 +23,7 @@ fn upstream_track_title(stream: &Value) -> Value {
 
 pub async fn sources(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     admin(&auth(&app, &h, false).await?)?;
-    let rows = sqlx::query("SELECT s.id,s.name,s.kind,s.library_id,s.access_policy_revision,CASE WHEN s.kind NOT IN ('jellyfin','emby') THEN NULL ELSE jsonb_build_object('state',CASE WHEN a.state='allowed' AND a.valid_until<=clock_timestamp() THEN 'unknown' ELSE COALESCE(a.state,'unknown') END,'reason',CASE WHEN a.state='allowed' AND a.valid_until<=clock_timestamp() THEN 'upstream_policy_expired' ELSE COALESCE(a.reason,'upstream_policy_unknown') END) END AS account_policy FROM sources s LEFT JOIN source_account_policies a ON a.source_id=s.id AND a.source_revision=s.access_policy_revision ORDER BY s.name")
+    let rows = sqlx::query("SELECT s.id,s.name,s.kind,s.library_id,s.access_policy_revision,CASE WHEN s.kind NOT IN ('jellyfin','emby') THEN NULL ELSE jsonb_build_object('state',CASE WHEN a.state='allowed' AND a.valid_until<=clock_timestamp() THEN 'unknown' ELSE COALESCE(a.state,'unknown') END,'reason',CASE WHEN a.state='allowed' AND a.valid_until<=clock_timestamp() THEN 'upstream_policy_expired' ELSE COALESCE(a.reason,'upstream_policy_unknown') END) END AS account_policy FROM sources s LEFT JOIN source_account_policies a ON a.source_id=s.id AND a.source_revision=s.access_policy_revision WHERE s.deleted_at IS NULL ORDER BY s.name")
         .fetch_all(&app.db)
         .await?;
     Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"kind":r.get::<String,_>("kind"),"library_id":r.get::<Uuid,_>("library_id"),"access_policy_revision":r.get::<i64,_>("access_policy_revision"),"account_policy":r.get::<Option<Value>,_>("account_policy")})).collect())))
@@ -150,11 +150,13 @@ pub async fn scan(
 ) -> Result<Json<Value>> {
     admin(&auth(&app, &h, true).await?)?;
     let mut tx = app.db.begin().await?;
-    let row = sqlx::query("SELECT kind,config_encrypted FROM sources WHERE id=$1 FOR SHARE")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "source_not_found"))?;
+    let row = sqlx::query(
+        "SELECT kind,config_encrypted FROM sources WHERE id=$1 AND deleted_at IS NULL FOR SHARE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| err(StatusCode::NOT_FOUND, "source_not_found"))?;
     if row.get::<String, _>("kind") == "s3" {
         tx.commit().await?;
         let status: Option<String> =
@@ -235,7 +237,7 @@ async fn guard_scan(
 ) -> Result<()> {
     // Lock source authority before the scan row, matching source removal's
     // lock order. A delayed provider response cannot recreate removed media.
-    sqlx::query("SELECT id FROM sources WHERE id=$1 FOR SHARE")
+    sqlx::query("SELECT id FROM sources WHERE id=$1 AND deleted_at IS NULL FOR SHARE")
         .bind(id)
         .fetch_optional(&mut **tx)
         .await?

@@ -16,6 +16,8 @@ import AppDialog from "../../shared/ui/AppDialog.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import Notice from "../../shared/ui/Notice.vue";
 import ScanAllSources from "./ScanAllSources.vue";
+import SourceSettingsDialog from "./SourceSettingsDialog.vue";
+import type { SourceSettingsSaved } from "./source-settings";
 import { useSourceScans } from "./source-scans.store";
 import { parseHttpAssetAssociation } from "./http-asset-association";
 const scans = useSourceScans();
@@ -34,6 +36,7 @@ const rows = ref<Source[]>([]),
   open = ref(false),
   removeOpen = ref(false),
   removing = ref<Source>(),
+  settings = ref<Source>(),
   name = ref(""),
   kind = ref("local"),
   root = ref("/media"),
@@ -153,6 +156,20 @@ function beginRemove(source: Source) {
   removing.value = source;
   removeOpen.value = true;
 }
+function beginSettings(source: Source) {
+  if (busy.value || managedElsewhere(source) || !session.user?.admin) return;
+  error.value = message.value = "";
+  settings.value = source;
+}
+function settingsSaved(source: SourceSettingsSaved) {
+  rows.value = rows.value.map((row) =>
+    row.id === source.id ? { ...row, name: source.name } : row,
+  );
+  if (source.config_changed) delete scans.results[source.id];
+  message.value = source.rescan_required
+    ? "片源设置已保存，关联影片已保留。请检测并扫描以更新媒体信息。"
+    : "片源设置已保存";
+}
 async function remove() {
   const source = removing.value;
   if (!source) return;
@@ -258,6 +275,7 @@ watch(
     open.value = false;
     removeOpen.value = false;
     removing.value = undefined;
+    settings.value = undefined;
     pendingLeave?.(true);
     pendingLeave = undefined;
   },
@@ -357,15 +375,23 @@ onBeforeUnmount(() => {
             <span v-else-if="managedElsewhere(row)" class="helper">
               请在所属媒体库中管理
             </span>
-            <button
-              v-else
-              class="danger"
-              :aria-label="`删除片源 ${row.name}`"
-              :disabled="busy || scans.busy"
-              @click="beginRemove(row)"
-            >
-              删除
-            </button>
+            <template v-else>
+              <button
+                :aria-label="`片源设置 ${row.name}`"
+                :disabled="busy || scans.busy || !session.user?.admin"
+                @click="beginSettings(row)"
+              >
+                <AppIcon name="settings" />设置
+              </button>
+              <button
+                class="danger"
+                :aria-label="`删除片源 ${row.name}`"
+                :disabled="busy || scans.busy"
+                @click="beginRemove(row)"
+              >
+                删除
+              </button>
+            </template>
           </div>
         </div>
         <Notice
@@ -509,6 +535,11 @@ onBeforeUnmount(() => {
         </div>
       </form></AppDialog
     >
+    <SourceSettingsDialog
+      :source="settings"
+      @close="settings = undefined"
+      @saved="settingsSaved"
+    />
     <AppDialog v-model="removeOpen" title="删除片源" :busy="busy">
       <p>
         确认删除「{{
@@ -536,7 +567,7 @@ onBeforeUnmount(() => {
 @media (min-width: 1100px) {
   .source-row-actions {
     display: grid;
-    grid-template-columns: 10.5rem 7rem;
+    grid-template-columns: 10.5rem 11.5rem;
     align-items: center;
     gap: var(--space-3);
   }
@@ -544,6 +575,7 @@ onBeforeUnmount(() => {
     display: flex;
     justify-content: flex-start;
     align-items: center;
+    gap: var(--space-2);
     min-width: 0;
     text-align: left;
     overflow-wrap: anywhere;

@@ -27,6 +27,9 @@ pub enum ErrorCode {
     ComputeDrainReceiptNotOwned,
     NasComputeDisabled,
     InvalidComputePolicy,
+    ComputePolicyConflict,
+    InvalidAgentName,
+    AgentSettingsConflict,
     InvalidComputeCapability,
     ComputeNotAuthorized,
     InvalidComputeSource,
@@ -68,6 +71,12 @@ pub enum ErrorCode {
     LibrarySourceLimit,
     LibraryConflict,
     LibraryOwnerRequired,
+    LibrarySharedProtected,
+    LibraryManagedSources,
+    LibraryShareInactive,
+    LibraryShareExpiryInvalid,
+    SourceCredentialsOriginChanged,
+    SourceCleanupUnconfirmed,
     SourceAlreadyAttached,
     S3SourceRequired,
     S3ScanFailed,
@@ -407,6 +416,9 @@ impl ErrorCode {
 
             Self::NasComputeDisabled => "服务器尚未启用 NAS 本地计算",
             Self::InvalidComputePolicy => "计算授权参数无效",
+            Self::ComputePolicyConflict => "计算配置已被其他管理员修改，请刷新并重新确认",
+            Self::InvalidAgentName => "设备名称需为 1–120 个字符，不能包含控制字符",
+            Self::AgentSettingsConflict => "设备名称已被其他管理员修改，请刷新并重新确认",
             Self::InvalidComputeCapability => "节点计算能力报告无效",
             Self::ComputeNotAuthorized => "此设备尚未获得计算授权",
             Self::InvalidComputeSource => "计算片源身份无效",
@@ -471,6 +483,18 @@ impl ErrorCode {
             Self::LibrarySourceLimit => "当前媒体库的片源数量已达上限",
             Self::LibraryConflict => "媒体库权限或资料已变化，请核对最新版本后再提交",
             Self::LibraryOwnerRequired => "此操作仅限媒体库所有者",
+            Self::LibrarySharedProtected => "实例共享媒体库不能删除",
+            Self::LibraryManagedSources => {
+                "媒体库含有 NAS 设备片源，请管理员先明确迁移其归属，再删除媒体库"
+            }
+            Self::LibraryShareInactive => "这份房间分享已失效，请重新创建分享",
+            Self::LibraryShareExpiryInvalid => "到期时间须晚于现在，且不超过本次分享创建后 24 小时",
+            Self::SourceCredentialsOriginChanged => {
+                "更换服务域名时，请明确替换或清除已保存请求头，避免向新地址发送凭据"
+            }
+            Self::SourceCleanupUnconfirmed => {
+                "上游清理结果未确认，请管理员检查上游活动和清理记录，暂不能删除配置"
+            }
             Self::SourceAlreadyAttached => "此片源已属于当前媒体库",
             Self::S3SourceRequired => "此片源类型不支持私人库索引入口",
             Self::S3ScanFailed => "S3 本页读取失败，已保存扫描进度，可以继续",
@@ -824,6 +848,66 @@ mod tests {
         );
     }
     #[test]
+    fn private_configuration_lifecycle_codes_are_specific_and_terminal() {
+        for (reason, status, expected) in [
+            (
+                "library_shared_protected",
+                409,
+                ErrorCode::LibrarySharedProtected,
+            ),
+            (
+                "library_managed_sources",
+                409,
+                ErrorCode::LibraryManagedSources,
+            ),
+            (
+                "library_share_inactive",
+                409,
+                ErrorCode::LibraryShareInactive,
+            ),
+            (
+                "library_share_expiry_invalid",
+                400,
+                ErrorCode::LibraryShareExpiryInvalid,
+            ),
+            (
+                "source_credentials_origin_changed",
+                400,
+                ErrorCode::SourceCredentialsOriginChanged,
+            ),
+            (
+                "source_cleanup_unconfirmed",
+                409,
+                ErrorCode::SourceCleanupUnconfirmed,
+            ),
+        ] {
+            let code = ErrorCode::from_reason(reason, status);
+            assert_eq!(code, expected);
+            assert!(!code.retryable());
+            assert_eq!(
+                serde_json::to_value(code).unwrap(),
+                serde_json::json!(reason.to_ascii_uppercase())
+            );
+            assert!(!ApiError::new(code, Uuid::nil()).message.is_empty());
+        }
+        assert!(
+            ErrorCode::SourceCredentialsOriginChanged
+                .message()
+                .contains("请求头")
+        );
+        assert!(
+            ErrorCode::SourceCleanupUnconfirmed
+                .message()
+                .contains("管理员")
+        );
+        assert!(
+            ErrorCode::LibraryShareExpiryInvalid
+                .message()
+                .contains("24 小时")
+        );
+    }
+
+    #[test]
     fn new_library_compute_and_p2p_reasons_are_specific() {
         for (reason, status, expected) in [
             (
@@ -834,6 +918,17 @@ mod tests {
             ("library_conflict", 409, ErrorCode::LibraryConflict),
             ("s3_scan_failed", 502, ErrorCode::S3ScanFailed),
             ("nas_compute_disabled", 503, ErrorCode::NasComputeDisabled),
+            ("invalid_agent_name", 400, ErrorCode::InvalidAgentName),
+            (
+                "agent_settings_conflict",
+                409,
+                ErrorCode::AgentSettingsConflict,
+            ),
+            (
+                "compute_policy_conflict",
+                409,
+                ErrorCode::ComputePolicyConflict,
+            ),
             ("compute_lease_lost", 409, ErrorCode::ComputeLeaseLost),
             ("p2p_consent_required", 400, ErrorCode::P2pConsentRequired),
             ("invalid_p2p_signal", 400, ErrorCode::InvalidP2pSignal),

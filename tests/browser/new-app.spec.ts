@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { appFixture, appBase } from "./fixtures/application";
+import { appFixture, appBase, openFixtureSource } from "./fixtures/application";
 
 test("new entry keeps one video and connection through library navigation and same-room return", async ({
   page,
@@ -51,10 +51,11 @@ test("library pages use bounded cursors and server search without invented metad
 }) => {
   const app = await appFixture(page);
   await page.goto(appBase + "/library");
+  await openFixtureSource(page);
   await expect(page.locator(".media-card")).toHaveCount(24);
   await page.getByRole("button", { name: "下一页" }).click();
   await expect(page.locator(".media-card")).toHaveCount(6);
-  expect(app.searches.some((s) => s.includes("after=movie-23"))).toBe(true);
+  expect(app.searches.some((s) => s.includes("after=fixture-next"))).toBe(true);
   await page.getByLabel("搜索影片").fill("测试影片 29");
   await page.getByLabel("搜索影片").press("Enter");
   await expect(page.locator(".media-card")).toHaveCount(1);
@@ -98,6 +99,7 @@ test("beige tokens, media ratio, dialogs and required widths remain usable", asy
     page.getByRole("button", { name: "创建房间", exact: true }),
   ).toBeFocused();
   await page.goto(appBase + "/library");
+  await openFixtureSource(page);
   for (const width of [360, 390, 768, 1024, 1440, 1920]) {
     await page.setViewportSize({ width, height: 900 });
     expect(

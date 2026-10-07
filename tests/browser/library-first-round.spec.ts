@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { appFixture } from "./fixtures/application";
+import { appFixture, openFixtureSource } from "./fixtures/application";
 import { mediaRecord } from "./fixtures/media";
 
 test("failed new query preserves the old page, announces it, and retries from page one", async ({
@@ -27,6 +27,7 @@ test("failed new query preserves the old page, announces it, and retries from pa
     return route.fulfill({ json: all.slice(start, start + 25) });
   });
   await page.goto("/library");
+  await openFixtureSource(page);
   await page.getByLabel("搜索影片").fill("A");
   await page.getByLabel("搜索影片").press("Enter");
   await expect(page.locator(".media-card").first()).toContainText("A 影片 0");
@@ -60,6 +61,7 @@ test("selection survives choosing a room and requires one explicit confirmation"
 }) => {
   const app = await appFixture(page);
   await page.goto("/library");
+  await openFixtureSource(page);
   await page
     .getByRole("button", { name: "播放 真实合成测试视频", exact: true })
     .click();
@@ -85,6 +87,7 @@ test("cancelling a selection before entering a room never sends it", async ({
 }) => {
   const app = await appFixture(page);
   await page.goto("/library");
+  await openFixtureSource(page);
   await page
     .getByRole("button", { name: "播放 真实合成测试视频", exact: true })
     .click();
@@ -175,11 +178,15 @@ test("private library pagination uses the applied query until a new search succe
     return route.fulfill({ json: all.slice(start, start + 50) });
   });
   await page.goto("/libraries");
+  // The default is now directory browsing. Enter an applied server search
+  // before checking that later edits cannot change pagination's query.
+  await page.getByLabel("搜索当前库").fill("A");
+  await page.getByRole("button", { name: "搜索", exact: true }).click();
   await expect(page.locator(".private-media-list li")).toHaveCount(50);
   await page.getByLabel("搜索当前库").fill("B");
   await page.getByRole("button", { name: "加载更多", exact: true }).click();
   await expect(page.locator(".private-media-list li")).toHaveCount(53);
-  expect(requests.at(-1)?.searchParams.get("search")).toBe("");
+  expect(requests.at(-1)?.searchParams.get("search")).toBe("A");
   expect(requests.at(-1)?.searchParams.get("after")).toBe("A-49");
   await page.getByRole("button", { name: "搜索", exact: true }).click();
   await expect(page.locator(".private-media-list li")).toHaveCount(3);
@@ -196,6 +203,7 @@ test("revoked media clears a saved selection without changing the room", async (
 }) => {
   const app = await appFixture(page);
   await page.goto("/library");
+  await openFixtureSource(page);
   await page
     .getByRole("button", { name: "播放 真实合成测试视频", exact: true })
     .click();

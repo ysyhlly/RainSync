@@ -1,4 +1,8 @@
 import type { ApiClient } from "../../shared/api/client";
+import type {
+  SourceSettings,
+  SourceSettingsSaved,
+} from "../admin/source-settings";
 import type { Media } from "../../shared/api/types";
 export interface LibraryPermissions {
   browse: boolean;
@@ -16,6 +20,7 @@ export interface Library {
   permissions: LibraryPermissions;
 }
 export interface LibrarySource {
+  revision: string;
   id: string;
   name: string;
   kind: string;
@@ -34,6 +39,7 @@ export interface RoomShare {
   mode: "room_members" | "library_members";
   expires_at: number;
   active: boolean;
+  max_expires_at: number;
 }
 export interface LibraryDetail extends Library {
   sources?: LibrarySource[];
@@ -65,6 +71,8 @@ export function privateLibraryApi(api: ApiClient) {
       api<LibraryDetail>("/libraries", "POST", { name }),
     rename: (id: string, name: string, expected_revision: string) =>
       api<LibraryDetail>(root(id), "PUT", { name, expected_revision }),
+    remove: (id: string, expected_revision: string) =>
+      api<{ deleted: boolean }>(root(id), "DELETE", { expected_revision }),
     grant: (
       id: string,
       body: LibraryPermissions & {
@@ -88,6 +96,41 @@ export function privateLibraryApi(api: ApiClient) {
       id: string,
       body: { name: string; kind: string; config: unknown },
     ) => api<{ id: string }>(root(id) + "/sources", "POST", body),
+    sourceSettings: (id: string, source: string, signal?: AbortSignal) =>
+      api<
+        SourceSettings & {
+          config: SourceSettings["config"] & { s3?: Record<string, unknown> };
+        }
+      >(
+        root(id) + "/sources/" + encodeURIComponent(source),
+        "GET",
+        undefined,
+        signal,
+      ),
+    updateSource: (
+      id: string,
+      source: string,
+      body: {
+        expected_revision: string;
+        name?: string;
+        config?: Record<string, unknown>;
+      },
+    ) =>
+      api<SourceSettingsSaved>(
+        root(id) + "/sources/" + encodeURIComponent(source),
+        "PATCH",
+        body,
+      ),
+    removeSource: (
+      id: string,
+      source: string,
+      expected_revision: string,
+      expected_library_revision: string,
+    ) =>
+      api(root(id) + "/sources/" + encodeURIComponent(source), "DELETE", {
+        expected_revision,
+        expected_library_revision,
+      }),
     attach: (id: string, source_id: string, expected_revision: string) =>
       api(root(id) + "/attach-source", "POST", {
         source_id,
@@ -129,6 +172,20 @@ export function privateLibraryApi(api: ApiClient) {
       api<{ id: string; revision: string }>(
         root(id) + "/room-shares",
         "POST",
+        body,
+      ),
+    updateShare: (
+      id: string,
+      grant: string,
+      body: {
+        mode: RoomShare["mode"];
+        expires_at: number;
+        expected_revision: string;
+      },
+    ) =>
+      api<{ id: string; revision: string }>(
+        root(id) + "/room-shares/" + encodeURIComponent(grant),
+        "PATCH",
         body,
       ),
     revokeShare: (id: string, grant: string, expected_revision: string) =>

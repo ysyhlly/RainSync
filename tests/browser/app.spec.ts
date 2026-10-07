@@ -1,4 +1,4 @@
-import { mediaExtraResponse } from "./fixtures/media";
+import { mediaExtraResponse, mediaRecord } from "./fixtures/media";
 import { test, expect, type WebSocketRoute } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { navigate, roomPanel, showOptions } from "./fixtures/navigation";
@@ -24,10 +24,26 @@ test("room, library, invitation and settings are usable", async ({
   const commands: Record<string, unknown>[] = [];
   const firstEpoch = "11111111-1111-4111-8111-111111111111";
   const nextEpoch = "22222222-2222-4222-8222-222222222222";
+  const libraryMedia = [
+    { id: "movie", title: "山海之间", kind: "local", duration_ms: 5400000 },
+    {
+      id: "movie2",
+      title: "午夜列车",
+      kind: "jellyfin",
+      duration_ms: 6000000,
+    },
+    { id: "movie3", title: "夏日来信", kind: "http", duration_ms: 4800000 },
+    {
+      id: "movie4",
+      title: "云端漫步",
+      kind: "agent",
+      duration_ms: 4200000,
+    },
+  ].map(mediaRecord);
   await page.clock.install();
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/api/v1/**", async (route) => {
-    const extra = mediaExtraResponse(route);
+    const extra = mediaExtraResponse(route, libraryMedia);
     if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
     let body: unknown = [];
@@ -35,23 +51,7 @@ test("room, library, invitation and settings are usable", async ({
       body = { id: "owner", username: "雨声", admin: true, csrf: "test" };
     else if (path === "/api/v1/rooms")
       body = [{ id: "room", name: "周末放映室", owner_id: "owner" }];
-    else if (path === "/api/v1/media")
-      body = [
-        { id: "movie", title: "山海之间", kind: "local", duration_ms: 5400000 },
-        {
-          id: "movie2",
-          title: "午夜列车",
-          kind: "jellyfin",
-          duration_ms: 6000000,
-        },
-        { id: "movie3", title: "夏日来信", kind: "http", duration_ms: 4800000 },
-        {
-          id: "movie4",
-          title: "云端漫步",
-          kind: "agent",
-          duration_ms: 4200000,
-        },
-      ];
+    else if (path === "/api/v1/media") body = libraryMedia;
     else if (path.endsWith("/invites"))
       body =
         route.request().method() === "GET"
@@ -135,6 +135,9 @@ test("room, library, invitation and settings are usable", async ({
   await page.getByRole("button", { name: "进入房间", exact: true }).click();
   await expect(page.locator(".connection-status")).toHaveText("房间连接正常");
   await navigate(page, "媒体库");
+  await page
+    .getByRole("button", { name: "打开片源 回归测试片源", exact: true })
+    .click();
   await page
     .getByRole("button", { name: "播放 山海之间", exact: true })
     .click();

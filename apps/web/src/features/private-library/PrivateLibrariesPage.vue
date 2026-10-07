@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import LibraryBrowser from "../library/LibraryBrowser.vue";
+import SourceSettingsDialog from "../admin/SourceSettingsDialog.vue";
+import type { SourceSettingsSaved } from "../admin/source-settings";
 import QueueFeedback from "../rooms/QueueFeedback.vue";
 import { ref, computed, onMounted, onBeforeUnmount, watch } from "vue";
 import { useRoute } from "vue-router";
@@ -8,6 +11,9 @@ import {
   privateLibraryApi,
   type Library,
   type LibraryDetail,
+  type LibraryGrant,
+  type LibrarySource,
+  type RoomShare,
   type ScanStatus,
 } from "./private-library.api";
 import type { Media } from "../../shared/api/types";
@@ -32,7 +38,8 @@ const createName = ref(""),
   editName = ref(""),
   grantName = ref(""),
   transferName = ref(""),
-  hours = ref(168);
+  hours = ref(168),
+  editingGrant = ref<string>();
 const browse = ref(true),
   play = ref(true),
   shareRight = ref(false),
@@ -42,6 +49,7 @@ const sourceName = ref(""),
   sourceUrl = ref(""),
   sourceConfig = ref("{}"),
   attachId = ref("");
+const libraryBrowser = ref<InstanceType<typeof LibraryBrowser>>();
 const media = ref<Media[]>([]),
   search = ref(""),
   appliedQuery = ref(""),
@@ -53,7 +61,188 @@ const media = ref<Media[]>([]),
 const shareMedia = ref(""),
   shareMode = ref<"room_members" | "library_members">("library_members"),
   minutes = ref(120);
-type ChangeKind = "revoke" | "revokeShare" | "transfer" | "attach";
+const settingsSource = ref<LibrarySource>(),
+  shareEdit = ref<{
+    id: string;
+    libraryId: string;
+    revision: string;
+    title: string;
+    mode: RoomShare["mode"];
+    expires: string;
+    maxExpires: number;
+  }>(),
+  s3Edit = ref<{
+    id: string;
+    libraryId: string;
+    revision: string;
+    name: string;
+    url: string;
+    urlRedacted: boolean;
+    replaceUrl: boolean;
+    config: string;
+    originalConfig: string;
+    originalUrl: string;
+  }>();
+const shareEditOpen = computed({
+  get: () => !!shareEdit.value,
+  set: (value: boolean) => {
+    if (!value) shareEdit.value = undefined;
+  },
+});
+const s3EditOpen = computed({
+  get: () => !!s3Edit.value,
+  set: (value: boolean) => {
+    if (!value) s3Edit.value = undefined;
+  },
+});
+function localDateTime(value: number) {
+  const date = new Date(value);
+  return new Date(value - date.getTimezoneOffset() * 60_000)
+    .toISOString()
+    .slice(0, 16);
+}
+function editGrant(grant: LibraryGrant) {
+  if (busy.value) return;
+  editingGrant.value = grant.user_id;
+  grantName.value = grant.username;
+  browse.value = grant.browse;
+  play.value = grant.play;
+  shareRight.value = grant.share_to_room;
+  manage.value = grant.manage;
+  hours.value = Math.max(
+    1,
+    Math.min(720, Math.ceil((grant.expires_at - Date.now()) / 3_600_000)),
+  );
+}
+function cancelGrantEdit() {
+  editingGrant.value = undefined;
+  grantName.value = "";
+  browse.value = play.value = true;
+  shareRight.value = manage.value = false;
+  hours.value = 168;
+}
+function editShare(share: RoomShare) {
+  const lib = selected.value;
+  if (!lib || busy.value || !share.active) return;
+  error.value = "";
+  shareEdit.value = {
+    id: share.id,
+    libraryId: lib.id,
+    revision: lib.revision,
+    title: share.title,
+    mode: share.mode,
+    expires: localDateTime(share.expires_at),
+    maxExpires: share.max_expires_at,
+  };
+}
+async function saveShare() {
+  const draft = shareEdit.value,
+    lib = selected.value;
+  if (!draft || !lib || busy.value) return;
+  if (draft.libraryId !== lib.id || draft.revision !== lib.revision) {
+    error.value = "媒体库已变化，请关闭设置并重新打开后再保存。";
+    return;
+  }
+  const expires = new Date(draft.expires).getTime();
+  if (
+    !Number.isFinite(expires) ||
+    expires <= Date.now() ||
+    expires > draft.maxExpires
+  ) {
+    error.value = "到期时间须晚于现在，且不超过本次分享创建后 24 小时。";
+    return;
+  }
+  await run(async (current) => {
+    await api.updateShare(lib.id, draft.id, {
+      mode: draft.mode,
+      expires_at: expires,
+      expected_revision: draft.revision,
+    });
+    if (current()) shareEdit.value = undefined;
+  }, "分享设置已保存，已有播放需重新打开；其他有效分享仍保留");
+}
+async function editSource(source: LibrarySource) {
+  const lib = selected.value;
+  if (!lib || busy.value) return;
+  if (source.kind === "http") {
+    settingsSource.value = source;
+    return;
+  }
+  if (source.kind !== "s3") return;
+  const selection = serial;
+  await run(
+    async () => {
+      const value = await api.sourceSettings(
+        lib.id,
+        source.id,
+        controller?.signal,
+      );
+      if (!alive || selection !== serial || selected.value?.id !== lib.id)
+        return;
+      const config = JSON.stringify(value.config.s3, null, 2);
+      s3Edit.value = {
+        id: value.id,
+        libraryId: lib.id,
+        revision: value.revision,
+        name: value.name,
+        url: value.config.url ?? "",
+        urlRedacted: !!value.credentials.url_redacted,
+        replaceUrl: false,
+        config,
+        originalConfig: config,
+        originalUrl: value.config.url ?? "",
+      };
+    },
+    "",
+    false,
+  );
+}
+async function saveS3() {
+  const draft = s3Edit.value,
+    lib = selected.value;
+  if (!draft || !lib || draft.libraryId !== lib.id || busy.value) return;
+  await run(async (current) => {
+    const config: Record<string, unknown> = {};
+    if (session.user?.admin) {
+      if (draft.config !== draft.originalConfig)
+        config.s3 = JSON.parse(draft.config);
+      if (
+        (!draft.urlRedacted && draft.url !== draft.originalUrl) ||
+        draft.replaceUrl
+      )
+        config.url = draft.url;
+    }
+    await api.updateSource(lib.id, draft.id, {
+      name: draft.name,
+      expected_revision: draft.revision,
+      ...(Object.keys(config).length ? { config } : {}),
+    });
+    if (current()) s3Edit.value = undefined;
+  }, "片源设置已保存。连接配置变化后需重新扫描");
+}
+async function sourceSaved(value: SourceSettingsSaved) {
+  notice.value = value.rescan_required
+    ? "片源设置已保存，请重新扫描索引"
+    : "片源名称已保存";
+  // Keep the settings dialog open; update only its enclosing library revision.
+  const id = selected.value?.id,
+    selection = serial;
+  if (!id) return;
+  try {
+    const detail = await api.detail(id);
+    if (alive && selection === serial && selected.value?.id === id)
+      selected.value = detail;
+  } catch (e) {
+    if (selection === serial) fail(e);
+  }
+}
+type ChangeKind =
+  | "revoke"
+  | "revokeShare"
+  | "transfer"
+  | "attach"
+  | "deleteLibrary"
+  | "deleteSource";
 const pendingChange = ref<{
   kind: ChangeKind;
   libraryId: string;
@@ -61,6 +250,7 @@ const pendingChange = ref<{
   revision: string;
   target: string;
   targetLabel: string;
+  sourceRevision?: string;
 } | null>(null);
 const confirmationOpen = computed({
   get: () => pendingChange.value !== null,
@@ -73,12 +263,16 @@ const confirmationTitles: Record<ChangeKind, string> = {
   revokeShare: "撤销房间分享",
   transfer: "转移媒体库所有权",
   attach: "迁移片源归属",
+  deleteLibrary: "删除私人媒体库",
+  deleteSource: "删除片源配置",
 };
 const confirmationLabels: Record<ChangeKind, string> = {
   revoke: "确认撤销授权",
   revokeShare: "确认撤销分享",
   transfer: "确认转移所有权",
   attach: "确认迁入当前库",
+  deleteLibrary: "确认删除媒体库",
+  deleteSource: "确认删除片源",
 };
 let alive = true,
   listSerial = 0,
@@ -86,9 +280,27 @@ let alive = true,
   serial = 0,
   controller: AbortController | undefined,
   mediaSerial = 0,
-  mediaController: AbortController | undefined;
+  mediaController: AbortController | undefined,
+  operationSerial = 0;
 function fail(e: unknown) {
-  error.value = e instanceof Error ? e.message : String(e);
+  const code = e && typeof e === "object" && "code" in e ? String(e.code) : "";
+  const messages: Record<string, string> = {
+    LIBRARY_MANAGED_SOURCES:
+      "库中含有 NAS 设备片源。请管理员先在目标媒体库中明确迁入这些片源，再删除当前库；不会自动迁入共享库或撤销设备。",
+    LIBRARY_SHARED_PROTECTED: "实例共享库不能删除。",
+    LIBRARY_SHARE_INACTIVE: "这份分享已失效，请重新创建分享。",
+    LIBRARY_SHARE_EXPIRY_INVALID:
+      "到期时间须晚于现在，且不超过本次分享创建后 24 小时。",
+    LIBRARY_CONFLICT: "媒体库已被其他操作修改。请核对最新内容后重新操作。",
+    SOURCE_IN_USE:
+      "片源仍在播放、准备或清理中。请先停止相关播放，等待清理完成后再删除。",
+    SOURCE_CLEANUP_UNCONFIRMED:
+      "上游清理结果仍未确认，暂不能删除配置。请管理员检查上游活动和清理记录；单纯等待不会自动解除此限制。",
+    SOURCE_CHANGED: "片源配置已变化，请关闭设置并重新打开后再保存。",
+    SOURCE_CREDENTIALS_ORIGIN_CHANGED:
+      "更换服务域名时，请明确替换或清除已保存请求头，以免将凭据发送到新地址。",
+  };
+  error.value = messages[code] ?? (e instanceof Error ? e.message : String(e));
 }
 async function loadList() {
   const mine = ++listSerial;
@@ -125,6 +337,10 @@ async function select(id: string) {
   selectedId.value = id;
   detailBusy.value = true;
   pendingChange.value = null;
+  settingsSource.value = undefined;
+  shareEdit.value = undefined;
+  s3Edit.value = undefined;
+  cancelGrantEdit();
   controller?.abort();
   ++mediaSerial;
   mediaController?.abort();
@@ -197,48 +413,62 @@ async function loadMedia(next = false) {
   }
 }
 async function run(
-  action: () => Promise<unknown>,
+  action: (current: () => boolean) => Promise<unknown>,
   success: string,
   refreshAfter = true,
+  bindSelection = true,
 ) {
   if (busy.value) return false;
+  const operation = ++operationSerial,
+    epoch = session.epoch,
+    selection = serial;
+  const current = () =>
+    alive &&
+    operation === operationSerial &&
+    epoch === session.epoch &&
+    (!bindSelection || selection === serial);
   busy.value = true;
   error.value = "";
   notice.value = "";
   try {
-    await action();
+    await action(current);
+    if (!current()) return false;
     notice.value = success;
     if (refreshAfter) await refresh();
     return true;
   } catch (e) {
-    fail(e); // Preserve form drafts. Read current revision, but never retry the mutation.
+    if (!current()) return false;
+    fail(e); // Preserve form drafts; never retry a mutation automatically.
     if (selected.value) {
+      const id = selected.value.id;
       try {
-        const fresh = await api.detail(selected.value.id);
-        selected.value = fresh;
+        const fresh = await api.detail(id);
+        if (current() && selected.value?.id === id) selected.value = fresh;
       } catch {}
     }
     return false;
   } finally {
-    busy.value = false;
+    if (operation === operationSerial && epoch === session.epoch)
+      busy.value = false;
   }
 }
 async function create() {
   await run(
-    async () => {
+    async (current) => {
       const value = await api.create(createName.value);
+      if (!current()) return;
       createName.value = "";
-      await loadList();
-      await select(value.id);
+      if ((await loadList()) && current()) await select(value.id);
     },
     "私人媒体库已创建",
     false,
+    false,
   );
 }
-function addGrant() {
+async function addGrant() {
   const lib = selected.value;
   if (lib)
-    void run(
+    await run(
       () =>
         api.grant(lib.id, {
           username: grantName.value,
@@ -255,24 +485,31 @@ function addGrant() {
 function addSource() {
   const lib = selected.value;
   if (!lib) return;
-  void run(() => {
+  void run(async (current) => {
     const config = JSON.parse(sourceConfig.value);
     if (!config || typeof config !== "object" || Array.isArray(config))
       throw new Error("片源配置必须是 JSON 对象");
-    return api.source(lib.id, {
+    await api.source(lib.id, {
       name: sourceName.value,
       kind: sourceKind.value,
       config: { ...config, url: sourceUrl.value },
     });
+    if (current()) {
+      sourceName.value = sourceUrl.value = "";
+      sourceConfig.value = "{}";
+    }
   }, "片源已添加，请扫描索引");
 }
 function scan(source: string, restart: boolean) {
   const lib = selected.value;
   if (!lib) return;
   void run(
-    async () => {
-      scans.value[source] = await api.scan(lib.id, source, restart);
+    async (current) => {
+      const status = await api.scan(lib.id, source, restart);
+      if (!current()) return;
+      scans.value[source] = status;
       await loadMedia(false);
+      if (current()) await libraryBrowser.value?.refresh();
     },
     "本页索引已保存，可继续扫描",
     false,
@@ -305,6 +542,16 @@ async function choose(id: string) {
 function requestChange(kind: ChangeKind, target: string, targetLabel = target) {
   const lib = selected.value;
   if (!lib || busy.value || !target.trim()) return;
+  if (
+    kind === "deleteLibrary" &&
+    (lib.visibility !== "private" || lib.owner_id !== session.user?.id)
+  )
+    return;
+  if (
+    kind === "deleteSource" &&
+    !lib.sources?.find((source) => source.id === target)?.revision
+  )
+    return;
   error.value = "";
   pendingChange.value = {
     kind,
@@ -313,6 +560,10 @@ function requestChange(kind: ChangeKind, target: string, targetLabel = target) {
     revision: lib.revision,
     target: target.trim(),
     targetLabel,
+    sourceRevision:
+      kind === "deleteSource"
+        ? lib.sources?.find((source) => source.id === target)?.revision
+        : undefined,
   };
 }
 async function confirmChange() {
@@ -328,33 +579,69 @@ async function confirmChange() {
     revokeShare: "房间分享已撤销",
     transfer: "所有权已转移，原所有者不保留默认权限",
     attach: "片源归属已迁移。旧授权已失效",
+    deleteLibrary: "媒体库已删除，原始媒体文件未删除",
+    deleteSource: "片源配置已删除，原始媒体文件未删除",
   };
-  await run(async () => {
+  await run(async (current) => {
     const args = [change.libraryId, change.target, change.revision] as const;
     if (change.kind === "revoke") await api.revoke(...args);
     else if (change.kind === "revokeShare") await api.revokeShare(...args);
     else if (change.kind === "attach") await api.attach(...args);
-    else {
+    else if (change.kind === "deleteSource") {
+      if (!change.sourceRevision) throw new Error("请重新加载片源后操作");
+      await api.removeSource(
+        change.libraryId,
+        change.target,
+        change.sourceRevision,
+        change.revision,
+      );
+    } else if (change.kind === "deleteLibrary") {
+      await api.remove(change.libraryId, change.revision);
+      if (!current()) return;
+      selected.value = null;
+      selectedId.value = "";
+      media.value = [];
+    } else {
       await api.transfer(...args);
+      if (!current()) return;
       selected.value = null;
       selectedId.value = "";
       transferName.value = "";
     }
+    if (!current()) return;
     // The mutation is complete. A later refresh failure must not leave a
     // live confirmation that could submit the completed action again.
     pendingChange.value = null;
   }, messages[change.kind]);
 }
+function clearSensitiveDrafts() {
+  sourceUrl.value = sourceName.value = attachId.value = "";
+  sourceConfig.value = "{}";
+  sourceKind.value = "http";
+  createName.value = editName.value = transferName.value = "";
+  settingsSource.value = undefined;
+  s3Edit.value = undefined;
+  shareEdit.value = undefined;
+  cancelGrantEdit();
+  error.value = notice.value = "";
+}
 onMounted(initialize);
 watch(
   () => session.epoch,
   () => {
+    ++operationSerial;
+    busy.value = false;
+    clearSensitiveDrafts();
     ++listSerial;
     listController?.abort();
     listBusy.value = false;
     detailBusy.value = false;
     selectedId.value = "";
     pendingChange.value = null;
+    settingsSource.value = undefined;
+    shareEdit.value = undefined;
+    s3Edit.value = undefined;
+    cancelGrantEdit();
     ++serial;
     controller?.abort();
     ++mediaSerial;
@@ -371,6 +658,8 @@ watch(
 );
 onBeforeUnmount(() => {
   alive = false;
+  ++operationSerial;
+  clearSensitiveDrafts();
   ++listSerial;
   listController?.abort();
   ++serial;
@@ -393,7 +682,7 @@ onBeforeUnmount(() => {
     </div>
     <div class="page-stack">
       <div
-        v-if="error && !confirmationOpen"
+        v-if="error && !confirmationOpen && !shareEditOpen && !s3EditOpen"
         class="surface-card surface-card--compact"
       >
         <Notice :message="error" error />
@@ -523,6 +812,19 @@ onBeforeUnmount(() => {
               /></label>
               <button :disabled="busy">保存名称</button>
             </form>
+            <button
+              v-if="
+                selected.visibility === 'private' &&
+                selected.owner_id === session.user?.id
+              "
+              class="danger"
+              :disabled="busy"
+              @click="
+                requestChange('deleteLibrary', selected.id, selected.name)
+              "
+            >
+              删除媒体库
+            </button>
           </section>
         </div>
         <div class="library-content page-stack">
@@ -573,8 +875,35 @@ onBeforeUnmount(() => {
                   重新加载影片
                 </button>
               </div>
+              <LibraryBrowser
+                v-if="!appliedQuery"
+                :key="selected.id"
+                ref="libraryBrowser"
+                :library-id="selected.id"
+              >
+                <template #actions="{ media: item }">
+                  <button
+                    v-if="selected.permissions.share_to_room"
+                    :aria-pressed="shareMedia === item.id"
+                    :disabled="busy"
+                    @click="shareMedia = item.id"
+                  >
+                    {{ shareMedia === item.id ? "已选择分享" : "选择分享" }}
+                  </button>
+                  <button
+                    :disabled="
+                      busy || !canQueue || runtime.queuePending('add', item.id)
+                    "
+                    :aria-busy="runtime.queuePending('add', item.id)"
+                    @click="choose(item.id)"
+                  >
+                    <AppIcon name="plus" />加入当前房间待播
+                  </button>
+                  <QueueFeedback :media-id="item.id" />
+                </template>
+              </LibraryBrowser>
               <p
-                v-if="mediaBusy"
+                v-if="mediaBusy && appliedQuery"
                 class="loading-state loading-state--inline"
                 role="status"
               >
@@ -591,7 +920,9 @@ onBeforeUnmount(() => {
                 输入新关键词后点击搜索；加载更多沿用当前结果的查询。
               </p>
               <div
-                v-if="!mediaBusy && !mediaError && !media.length"
+                v-if="
+                  appliedQuery && !mediaBusy && !mediaError && !media.length
+                "
                 class="empty-state empty-state--compact"
               >
                 <span class="empty-state__icon"
@@ -629,12 +960,16 @@ onBeforeUnmount(() => {
                   >选择放映室</RouterLink
                 >
               </p>
-              <ul class="private-media-list data-list" :aria-busy="mediaBusy">
+              <ul
+                v-if="appliedQuery"
+                class="private-media-list data-list"
+                :aria-busy="mediaBusy"
+              >
                 <li v-for="item in media" :key="item.id" class="data-row">
                   <div class="data-row__body">
                     <strong>{{ item.title }}</strong>
                     <p class="helper">{{ item.kind }}</p>
-                  <QueueFeedback :media-id="item.id" />
+                    <QueueFeedback :media-id="item.id" />
                   </div>
                   <div class="data-row__actions">
                     <button
@@ -660,7 +995,7 @@ onBeforeUnmount(() => {
                 </li>
               </ul>
               <button
-                v-if="hasMore"
+                v-if="hasMore && appliedQuery"
                 :disabled="mediaBusy"
                 @click="loadMedia(true)"
               >
@@ -716,6 +1051,15 @@ onBeforeUnmount(() => {
                 <label
                   >影片<select v-model="shareMedia" required>
                     <option value="" disabled>选择影片</option>
+                    <option
+                      v-if="
+                        shareMedia &&
+                        !media.some((item) => item.id === shareMedia)
+                      "
+                      :value="shareMedia"
+                    >
+                      已选中的影片
+                    </option>
                     <option
                       v-for="item in media"
                       :key="item.id"
@@ -773,19 +1117,31 @@ onBeforeUnmount(() => {
                       {{ new Date(shareItem.expires_at).toLocaleString() }}
                     </p>
                   </div>
-                  <button
-                    class="danger"
-                    :disabled="busy || !shareItem.active"
-                    @click="
-                      requestChange(
-                        'revokeShare',
-                        shareItem.id,
-                        shareItem.title,
-                      )
-                    "
-                  >
-                    撤销分享
-                  </button>
+                  <div class="data-row__actions">
+                    <button
+                      :disabled="
+                        busy ||
+                        !shareItem.active ||
+                        !selected.permissions.share_to_room
+                      "
+                      @click="editShare(shareItem)"
+                    >
+                      设置
+                    </button>
+                    <button
+                      class="danger"
+                      :disabled="busy || !shareItem.active"
+                      @click="
+                        requestChange(
+                          'revokeShare',
+                          shareItem.id,
+                          shareItem.title,
+                        )
+                      "
+                    >
+                      撤销分享
+                    </button>
+                  </div>
                 </li>
               </ul>
               <p v-else class="helper">
@@ -839,6 +1195,18 @@ onBeforeUnmount(() => {
                     v-if="source.kind === 's3' || source.kind === 'http'"
                     class="data-row__actions"
                   >
+                    <button :disabled="busy" @click="editSource(source)">
+                      设置
+                    </button>
+                    <button
+                      class="danger"
+                      :disabled="busy"
+                      @click="
+                        requestChange('deleteSource', source.id, source.name)
+                      "
+                    >
+                      删除
+                    </button>
                     <button :disabled="busy" @click="scan(source.id, true)">
                       重新扫描
                     </button>
@@ -854,11 +1222,12 @@ onBeforeUnmount(() => {
                       :disabled="busy"
                       @click="
                         run(
-                          async () => {
-                            scans[source.id] = await api.scanStatus(
+                          async (current) => {
+                            const status = await api.scanStatus(
                               selected!.id,
                               source.id,
                             );
+                            if (current()) scans[source.id] = status;
                           },
                           '扫描状态已更新',
                           false,
@@ -948,10 +1317,14 @@ onBeforeUnmount(() => {
               </div>
               <form class="library-form-grid" @submit.prevent="addGrant">
                 <label
-                  >固定登录账号<input v-model="grantName" required
+                  >固定登录账号<input
+                    v-model="grantName"
+                    :readonly="!!editingGrant"
+                    required
                 /></label>
                 <label
-                  >有效小时<input
+                  >{{ editingGrant ? "从保存起有效小时" : "有效小时"
+                  }}<input
                     v-model.number="hours"
                     type="number"
                     min="1"
@@ -980,7 +1353,17 @@ onBeforeUnmount(() => {
                   保存授权会使旧播放与分享失效，需要重新分享。
                 </p>
                 <div class="button-row library-wide">
-                  <button class="primary" :disabled="busy">保存授权</button>
+                  <button class="primary" :disabled="busy">
+                    {{ editingGrant ? "保存授权设置" : "保存授权" }}
+                  </button>
+                  <button
+                    v-if="editingGrant"
+                    type="button"
+                    :disabled="busy"
+                    @click="cancelGrantEdit"
+                  >
+                    取消编辑
+                  </button>
                 </div>
               </form>
               <ul v-if="selected.grants?.length" class="data-list">
@@ -995,15 +1378,20 @@ onBeforeUnmount(() => {
                       到期 {{ new Date(grant.expires_at).toLocaleString() }}
                     </p>
                   </div>
-                  <button
-                    class="danger"
-                    :disabled="busy"
-                    @click="
-                      requestChange('revoke', grant.user_id, grant.username)
-                    "
-                  >
-                    撤销
-                  </button>
+                  <div class="data-row__actions">
+                    <button :disabled="busy" @click="editGrant(grant)">
+                      设置
+                    </button>
+                    <button
+                      class="danger"
+                      :disabled="busy"
+                      @click="
+                        requestChange('revoke', grant.user_id, grant.username)
+                      "
+                    >
+                      撤销
+                    </button>
+                  </div>
                 </li>
               </ul>
               <p v-else class="helper">
@@ -1049,6 +1437,88 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </div>
+    <SourceSettingsDialog
+      v-if="selected"
+      :source="settingsSource"
+      :api-base="`/libraries/${encodeURIComponent(selected.id)}/sources`"
+      :require-admin="false"
+      @close="settingsSource = undefined"
+      @saved="sourceSaved"
+    />
+    <AppDialog v-model="shareEditOpen" title="房间分享设置" :busy="busy">
+      <form v-if="shareEdit" class="page-stack" @submit.prevent="saveShare">
+        <p>{{ shareEdit.title }}</p>
+        <label
+          >观看范围<select v-model="shareEdit.mode">
+            <option value="library_members">仅已有库播放权限的房间成员</option>
+            <option value="room_members">允许本房间有效成员观看此影片</option>
+          </select></label
+        >
+        <label
+          >到期时间<input
+            v-model="shareEdit.expires"
+            type="datetime-local"
+            :max="localDateTime(shareEdit.maxExpires)"
+            required
+        /></label>
+        <p class="helper">
+          最晚到期
+          {{
+            new Date(shareEdit.maxExpires).toLocaleString()
+          }}。修改会终止当前库的旧播放，请重新打开播放；其他有效分享保持可用。
+        </p>
+        <Notice :message="error" error />
+        <div class="dialog-actions">
+          <button type="button" :disabled="busy" @click="shareEditOpen = false">
+            取消</button
+          ><button class="primary" :disabled="busy">保存分享设置</button>
+        </div>
+      </form>
+    </AppDialog>
+    <AppDialog v-model="s3EditOpen" title="S3 片源设置" :busy="busy">
+      <form v-if="s3Edit" class="page-stack" @submit.prevent="saveS3">
+        <label
+          >片源名称<input v-model="s3Edit.name" required maxlength="100"
+        /></label>
+        <template v-if="session.user?.admin">
+          <label v-if="s3Edit.urlRedacted"
+            ><input
+              v-model="s3Edit.replaceUrl"
+              type="checkbox"
+            />替换已保存地址（原地址含敏感参数，不会显示）</label
+          >
+          <label
+            >服务地址<input
+              v-model="s3Edit.url"
+              type="url"
+              :disabled="s3Edit.urlRedacted && !s3Edit.replaceUrl"
+              :required="!s3Edit.urlRedacted || s3Edit.replaceUrl"
+          /></label>
+          <label
+            >S3 配置 JSON<textarea
+              v-model="s3Edit.config"
+              rows="10"
+              spellcheck="false"
+              required
+            />
+          </label>
+          <p class="helper">
+            包含 region、bucket、prefix、addressing_style 和
+            credential_ref。凭据只能填写已配置的 RAINSYNC_S3_*
+            环境变量名，不填写密钥值。连接变化会使已有播放失效，需重新扫描索引。
+          </p>
+        </template>
+        <p v-else class="helper">
+          S3 连接和凭据引用由管理员配置，你可以修改名称。
+        </p>
+        <Notice :message="error" error />
+        <div class="dialog-actions">
+          <button type="button" :disabled="busy" @click="s3EditOpen = false">
+            取消</button
+          ><button class="primary" :disabled="busy">保存片源设置</button>
+        </div>
+      </form>
+    </AppDialog>
     <AppDialog
       v-model="confirmationOpen"
       :title="
@@ -1069,6 +1539,18 @@ onBeforeUnmount(() => {
             <p>将片源 {{ pendingChange.targetLabel }} 迁入当前库？</p>
             <p class="helper">
               整份片源的可见范围将改变，旧授权将失效。这项操作会写入管理审计。
+            </p>
+          </template>
+          <template v-else-if="pendingChange.kind === 'deleteLibrary'">
+            <p>删除“{{ pendingChange.targetLabel }}”及其中的片源配置？</p>
+            <p class="helper">
+              所有账户授权和房间分享将撤销，播放会停止，保存的片源凭据会清除。原始媒体文件不受影响，历史与审计记录保留。此页面无法恢复已删除配置。
+            </p>
+          </template>
+          <template v-else-if="pendingChange.kind === 'deleteSource'">
+            <p>删除片源“{{ pendingChange.targetLabel }}”？</p>
+            <p class="helper">
+              保存的连接凭据会清除，影片将从目录隐藏，相关播放与分享失效。不会删除原始媒体文件，也不会把私人影片迁入共享库。
             </p>
           </template>
           <template v-else-if="pendingChange.kind === 'revoke'">

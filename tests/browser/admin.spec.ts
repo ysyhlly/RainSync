@@ -316,7 +316,10 @@ test("NAS history is not claimed online; pairing and revoke preserve actual cont
     "文件版本索引状态未知",
   );
   await page.getByRole("button", { name: "添加设备", exact: true }).click();
-  await page.getByLabel("设备名称").fill("第二设备");
+  await page
+    .getByRole("dialog", { name: "添加NAS设备", exact: true })
+    .getByLabel("设备名称", { exact: true })
+    .fill("第二设备");
   await page.getByRole("button", { name: "生成配对码" }).click();
   await expect(page.getByLabel("配对码", { exact: true })).toHaveValue(
     "PAIR-SYNTHETIC",

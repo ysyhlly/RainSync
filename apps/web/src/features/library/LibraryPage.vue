@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import LibraryHierarchy from "./LibraryHierarchy.vue";
 import QueueFeedback from "../rooms/QueueFeedback.vue";
 import { ref, computed, onMounted, onBeforeUnmount } from "vue";
 import { useMediaCatalog } from "./media-catalog.store";
@@ -23,7 +24,10 @@ const library = useLibrary(),
   search = ref(library.requestedQuery);
 const queryChanged = computed(
   () =>
-    search.value !== library.query || library.requestedQuery !== library.query,
+    search.value !== library.query ||
+    library.requestedQuery !== library.query ||
+    library.requestedMode !== library.mode ||
+    library.requestedNode !== library.node,
 );
 const catalog = useMediaCatalog(),
   grid = ref<HTMLElement>(),
@@ -35,13 +39,18 @@ const previews = useVisiblePreviews(grid, () =>
   items.value.map((item) => item.id),
 );
 function refresh() {
-  if (!library.busy && !library.error)
-    void library.load(library.page, library.query);
+  if (!library.busy && !library.error) void library.refresh();
 }
 let debounce: ReturnType<typeof setTimeout> | undefined;
 function submit() {
   clearTimeout(debounce);
-  void library.load(0, search.value);
+  if (search.value.trim()) void library.load(0, search.value);
+  else void library.browse();
+}
+function navigate(node: string | null) {
+  clearTimeout(debounce);
+  search.value = "";
+  void library.browse(node);
 }
 function clearSearch() {
   search.value = "";
@@ -94,7 +103,7 @@ onBeforeUnmount(() => {
           <AppIcon name="search" /><input
             v-model="search"
             aria-label="搜索影片"
-            placeholder="搜索影片标题"
+            placeholder="跨目录搜索所有影片标题"
             type="search"
             @input="input"
           /><button type="submit">搜索</button>
@@ -103,6 +112,18 @@ onBeforeUnmount(() => {
           <ScanAllSources @complete="refresh" />
         </div>
       </div>
+      <LibraryHierarchy
+        v-if="library.mode === 'browse'"
+        :folders="library.folders"
+        :breadcrumbs="library.breadcrumbs"
+        :busy="library.busy"
+        :total-media="library.loaded ? library.totalMedia : undefined"
+        @navigate="navigate"
+      />
+      <p v-else class="helper">
+        搜索范围：全部可访问片源与目录
+        <button class="text-button" @click="clearSearch">返回目录浏览</button>
+      </p>
       <div v-if="library.error" class="surface-card surface-card--compact">
         <Notice :message="library.error" error /><button
           v-if="library.error"
@@ -117,7 +138,7 @@ onBeforeUnmount(() => {
         class="loading-state loading-state--inline"
         role="status"
       >
-        正在加载影片…
+        正在加载媒体库…
       </div>
       <p
         v-if="library.loaded && (library.busy || library.error || queryChanged)"
@@ -125,14 +146,14 @@ onBeforeUnmount(() => {
         role="status"
       >
         仍显示上次成功加载的{{
-          library.query ? `“${library.query}”搜索` : "全部影片"
+          library.query ? `“${library.query}”搜索` : "目录"
         }}结果， 第 {{ library.page + 1 }} 页。
       </p>
       <div
         v-if="
           library.loaded &&
           !library.busy &&
-          !library.items.length &&
+          !library.entryCount &&
           !library.error
         "
         class="empty-state surface-card"
@@ -189,7 +210,11 @@ onBeforeUnmount(() => {
         >
           <div class="section-heading__copy">
             <h2>
-              {{ library.query ? `“${library.query}”的搜索结果` : "全部影片" }}
+              {{
+                library.query
+                  ? `“${library.query}”的搜索结果`
+                  : "当前目录的影片"
+              }}
             </h2>
             <p class="helper">已加载 {{ items.length }} 部影片</p>
           </div>
@@ -274,21 +299,21 @@ onBeforeUnmount(() => {
         </article>
       </div>
       <nav
-        v-if="library.items.length || library.page"
+        v-if="library.entryCount || library.page"
         class="pagination"
-        aria-label="影片分页"
+        aria-label="媒体库分页"
       >
         <button
           :disabled="library.busy || queryChanged || library.page === 0"
-          @click="library.load(library.page - 1)"
+          @click="library.loadPage(library.page - 1)"
         >
           <AppIcon name="back" />上一页</button
         ><span
-          >第 {{ library.page + 1 }} 页 · 本页
-          {{ library.items.length }} 部</span
+          >第 {{ library.page + 1 }} 页 · 本页 {{ library.entryCount }}
+          {{ library.mode === "flat" ? "部" : "项" }}</span
         ><button
           :disabled="library.busy || queryChanged || !library.hasMore"
-          @click="library.load(library.page + 1)"
+          @click="library.loadPage(library.page + 1)"
         >
           下一页<AppIcon name="next" />
         </button>
@@ -352,10 +377,34 @@ onBeforeUnmount(() => {
 }
 @media (min-width: 1100px) {
   .library-page > .page-title {
-    margin-bottom: var(--space-5);
+    margin-bottom: var(--space-4);
+  }
+  .library-page .page-intro {
+    flex: 1;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-1) var(--space-3);
+  }
+  .library-page .page-intro .section-label {
+    flex-basis: 100%;
+    max-width: none;
+    margin: 0;
+  }
+  .library-page .page-intro h1 {
+    flex: 0 0 auto;
+  }
+  .library-page .page-intro > p:last-child {
+    flex: 1 1 24rem;
+  }
+  .library-page > .page-title > .button {
+    flex-shrink: 0;
   }
   .library-page > .page-stack {
-    gap: var(--space-4);
+    gap: var(--space-3);
+  }
+  .library-toolbar {
+    padding: var(--space-2) var(--space-3);
   }
   .library-results-summary {
     display: flex;

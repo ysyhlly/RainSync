@@ -635,3 +635,23 @@ async fn revoked_library_access_is_a_failure_instead_of_an_empty_library() {
         }
     }
 }
+
+#[tokio::test]
+async fn library_scan_keeps_explicit_series_fields_without_host_paths() {
+    for kind in ["jellyfin", "emby"] {
+        let (base, task) = upstream(vec![(200, json!({"TotalRecordCount":1,"Items":[{
+            "Id":"episode-id","Name":"Episode title","Type":"Episode",
+            "SeriesId":"series-id","SeriesName":"Explicit Series",
+            "SeasonId":"season-id","SeasonName":"Season 2","ParentIndexNumber":2,"IndexNumber":3,
+            "Path":"/host/private/secret/video.mkv","ServerUrl":"https://private.invalid/token"
+        }]}))]).await;
+        let items = list(kind, &config(&base)).await.unwrap();
+        assert_eq!(items[0].metadata["SeriesName"], "Explicit Series");
+        assert_eq!(items[0].metadata["SeasonId"], "season-id");
+        assert_eq!(items[0].metadata["ParentIndexNumber"], 2);
+        assert_eq!(items[0].metadata["IndexNumber"], 3);
+        assert!(items[0].metadata.get("Path").is_none());
+        assert!(items[0].metadata.get("ServerUrl").is_none());
+        task.await.unwrap();
+    }
+}

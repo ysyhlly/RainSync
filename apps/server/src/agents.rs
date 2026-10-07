@@ -110,15 +110,89 @@ pub async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     }).collect())))
 }
 
+fn validated_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 120 || name.chars().any(char::is_control) {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid_agent_name"));
+    }
+    Ok(name)
+}
+
+// Hold role/login authority before any device or policy locks; repeat before commit
+// because wall-clock expiry can pass while a settings request is waiting.
+pub(super) async fn lock_settings_admin(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: &User,
+    h: &HeaderMap,
+) -> Result<()> {
+    let login = media_authorization::login_hash(h)?;
+    let role: Option<bool> = sqlx::query_scalar("SELECT admin FROM users WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM account_exits WHERE user_id=$1) FOR SHARE")
+        .bind(user.id).fetch_optional(&mut **tx).await?;
+    if role != Some(true) {
+        return Err(err(StatusCode::FORBIDDEN, "admin_required"));
+    }
+    let live: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>clock_timestamp() FOR SHARE")
+        .bind(login).bind(user.id).fetch_optional(&mut **tx).await?;
+    if live.is_none() {
+        return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Settings {
+    name: String,
+    expected_name: String,
+}
+
+pub async fn update(
+    State(app): State<App>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Settings>,
+) -> Result<Json<Value>> {
+    let user = auth(&app, &h, true).await?;
+    admin(&user)?;
+    let name = validated_name(&body.name)?;
+    let mut tx = app.db.begin().await?;
+    lock_settings_admin(&mut tx, &user, &h).await?;
+    // Serialize with revocation, policy edits and initial source creation.
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT name FROM agents WHERE id=$1 AND NOT revoked FOR NO KEY UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let current = current.ok_or_else(|| err(StatusCode::NOT_FOUND, "invalid_agent"))?;
+    if current != body.expected_name {
+        return Err(err(StatusCode::CONFLICT, "agent_settings_conflict"));
+    }
+    sqlx::query("UPDATE agents SET name=$2 WHERE id=$1")
+        .bind(id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    // Keep the existing source identity, encrypted configuration and media index.
+    sqlx::query("UPDATE sources SET name=$2 WHERE id=$1 AND kind='agent'")
+        .bind(id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    lock_settings_admin(&mut tx, &user, &h).await?;
+    tx.commit().await?;
+    Ok(Json(json!({"id":id,"name":name})))
+}
+
 pub async fn create(
     State(app): State<App>,
     h: HeaderMap,
     Json(body): Json<rooms::Name>,
 ) -> Result<Json<Value>> {
     admin(&auth(&app, &h, true).await?)?;
+    let name = validated_name(&body.name)?;
     let id = Uuid::new_v4();
     let code = token();
-    sqlx::query("INSERT INTO agents(id,name,pair_hash,pair_expires_at) VALUES($1,$2,$3,now()+interval '10 minutes')").bind(id).bind(body.name).bind(hash(&code)).execute(&app.db).await?;
+    sqlx::query("INSERT INTO agents(id,name,pair_hash,pair_expires_at) VALUES($1,$2,$3,now()+interval '10 minutes')").bind(id).bind(name).bind(hash(&code)).execute(&app.db).await?;
     Ok(Json(json!({"id":id,"pair_code":code})))
 }
 #[derive(Deserialize)]
@@ -309,11 +383,19 @@ async fn ingest_index(
         headers: Default::default(),
     };
     let encrypted = app.encrypt(&serde_json::to_value(config)?)?;
-    sqlx::query("INSERT INTO sources VALUES($1,'NAS Agent','agent',$2) ON CONFLICT(id) DO NOTHING")
+    let mut source_tx = app.db.begin().await?;
+    let name: String =
+        sqlx::query_scalar("SELECT name FROM agents WHERE id=$1 AND NOT revoked FOR NO KEY UPDATE")
+            .bind(id)
+            .fetch_one(&mut *source_tx)
+            .await?;
+    sqlx::query("INSERT INTO sources(id,name,kind,config_encrypted) VALUES($1,$2,'agent',$3) ON CONFLICT(id) DO NOTHING")
         .bind(id)
+        .bind(name)
         .bind(encrypted)
-        .execute(&app.db)
+        .execute(&mut *source_tx)
         .await?;
+    source_tx.commit().await?;
     loop {
         let Some(first) = pages.recv().await else {
             return Ok(());
@@ -407,7 +489,21 @@ async fn ingest_index(
 
 #[cfg(test)]
 mod tests {
-    use super::source_version_status;
+    use super::{source_version_status, validated_name};
+
+    #[test]
+    fn device_names_are_trimmed_and_bounded_without_control_characters() {
+        assert_eq!(validated_name("  合成 NAS  ").unwrap(), "合成 NAS");
+        assert!(validated_name(&"设".repeat(120)).is_ok());
+        for invalid in [
+            "".to_owned(),
+            "  ".to_owned(),
+            "a\nb".to_owned(),
+            "x".repeat(121),
+        ] {
+            assert!(validated_name(&invalid).is_err());
+        }
+    }
 
     #[test]
     fn version_readiness_requires_a_committed_version_for_every_available_item() {

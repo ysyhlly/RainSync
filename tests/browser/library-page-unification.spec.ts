@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { appFixture } from "./fixtures/application";
+import { appFixture, openFixtureSource } from "./fixtures/application";
 
 async function privateLibraryFixture(page: Page) {
   const app = await appFixture(page);
@@ -141,6 +141,7 @@ test("empty media search offers a working reset without changing room selection"
 }) => {
   const app = await appFixture(page, { admin: false });
   await page.goto("/library");
+  await openFixtureSource(page);
   await expect(page.locator(".media-card")).toHaveCount(24);
   await page.getByLabel("搜索影片").fill("未收录的影片");
   await page.getByLabel("搜索影片").press("Enter");

@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { appFixture } from "./fixtures/application";
+import { appFixture, openFixtureSource } from "./fixtures/application";
 
 async function contentFixture(page: Page) {
   const app = await appFixture(page);
@@ -46,6 +46,37 @@ async function contentFixture(page: Page) {
       library.revision = String(Number(library.revision) + 1);
     }
     return route.fulfill({ json: library });
+  });
+  await page.route("**/api/v1/media/browse?**", (route) => {
+    const url = new URL(route.request().url());
+    const libraryId = url.searchParams.get("library_id");
+    if (!libraryId) return route.fallback();
+    const node = url.searchParams.get("node");
+    const items = app.media.slice(0, 5);
+    return route.fulfill({
+      json: {
+        node,
+        breadcrumbs: [
+          { id: null, name: "全部片源" },
+          ...(node
+            ? [{ id: `${libraryId}-source`, name: "私人测试片源" }]
+            : []),
+        ],
+        entries: node
+          ? items.map((media) => ({ type: "media", media }))
+          : [
+              {
+                type: "source",
+                id: `${libraryId}-source`,
+                name: "私人测试片源",
+                kind: "http",
+                media_count: items.length,
+              },
+            ],
+        total_media: items.length,
+        next_cursor: null,
+      },
+    });
   });
   await page.route("**/api/v1/admin/registration-invites**", (route) => {
     const url = new URL(route.request().url());
@@ -101,6 +132,7 @@ for (const viewport of [
     const app = await contentFixture(page);
     await page.setViewportSize(viewport);
     await page.goto("/library");
+    await openFixtureSource(page);
     await expect(page.locator(".media-card")).toHaveCount(24);
     const cards = await page.locator(".media-card").evaluateAll((items) =>
       items.map((item) => {
@@ -108,6 +140,14 @@ for (const viewport of [
         return { x, y, width, height };
       }),
     );
+    const pageHeading = (await page
+      .locator(".library-page .page-intro h1")
+      .boundingBox())!;
+    const kicker = (await page
+      .locator(".library-page .page-intro .section-label")
+      .boundingBox())!;
+    expect(Math.abs(pageHeading.x - kicker.x)).toBeLessThan(1);
+    expect(Math.abs(pageHeading.x - cards[0].x)).toBeLessThan(1);
     expect(cards[0].y).toBeLessThan(350);
     expect(cards[0].width).toBeGreaterThanOrEqual(256);
     expect(
@@ -137,6 +177,10 @@ for (const viewport of [
     expect(play!.height).toBeGreaterThanOrEqual(44);
     await fits(page, viewport.width);
     expect(app.errors).toEqual([]);
+    await page.screenshot({
+      path: info.outputPath(`shared-library-density-${viewport.width}.png`),
+      animations: "disabled",
+    });
   });
 
   test(`private library shows films beside bounded management at ${viewport.width}px`, async ({
@@ -146,7 +190,14 @@ for (const viewport of [
     const app = await contentFixture(page);
     await page.setViewportSize(viewport);
     await page.goto("/libraries");
-    const rows = page.locator(".private-media-list > .data-row");
+    await expect(
+      page.getByRole("button", { name: "打开片源 私人测试片源", exact: true }),
+    ).toBeVisible();
+    // Enter the real source before applying the original film-density limits.
+    await page
+      .getByRole("button", { name: "打开片源 私人测试片源", exact: true })
+      .click();
+    const rows = page.locator(".library-content .media-card");
     await expect(rows).toHaveCount(5);
     const management = (await page
       .locator(".library-management")
@@ -171,6 +222,10 @@ for (const viewport of [
       expect((await form.boundingBox())!.width).toBeLessThanOrEqual(832);
     await fits(page, viewport.width);
     expect(app.errors).toEqual([]);
+    await page.screenshot({
+      path: info.outputPath(`private-library-density-${viewport.width}.png`),
+      animations: "disabled",
+    });
   });
 
   test(`invite filter and refresh share a baseline at ${viewport.width}px`, async ({
@@ -227,9 +282,15 @@ test("desktop management layout preserves selection, revisioned rename and film 
     page.getByRole("heading", { name: "没有找到匹配影片" }),
   ).toBeVisible();
   await page.getByRole("button", { name: "清除搜索", exact: true }).click();
-  await expect(page.locator(".private-media-list > .data-row")).toHaveCount(5);
+  await expect(
+    page.getByRole("button", { name: "打开片源 私人测试片源", exact: true }),
+  ).toBeVisible();
   await page
-    .locator(".private-media-list")
+    .getByRole("button", { name: "打开片源 私人测试片源", exact: true })
+    .click();
+  await expect(page.locator(".media-card")).toHaveCount(5);
+  await page
+    .locator(".media-card")
     .getByRole("button", { name: "选择分享", exact: true })
     .first()
     .click();
@@ -263,13 +324,17 @@ test("content pages remain stacked and overflow-free on mobile", async ({
   const app = await contentFixture(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/libraries");
-  await expect(page.locator(".private-media-list > .data-row")).toHaveCount(5);
+  await page
+    .getByRole("button", { name: "打开片源 私人测试片源", exact: true })
+    .click();
+  await expect(page.locator(".media-card")).toHaveCount(5);
   const management = (await page.locator(".library-management").boundingBox())!;
   const content = (await page.locator(".library-content").boundingBox())!;
   expect(content.y).toBeGreaterThanOrEqual(management.y + management.height);
   await fits(page, 390);
   for (const path of ["/library", "/admin/registration-invites"]) {
     await page.goto(path);
+    if (path === "/library") await openFixtureSource(page);
     await expect(
       page.locator(".media-card, .invite-card").first(),
     ).toBeVisible();

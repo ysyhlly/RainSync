@@ -8,6 +8,17 @@ use media_core::distributed_compute::{
 use std::path::{Path as FsPath, PathBuf};
 
 const MAX_SOURCE_BYTES: i64 = 16 * 1024 * 1024 * 1024;
+const MAX_POLICY_SLOTS: i32 = 4;
+const MIN_POLICY_OUTPUT_BYTES: i64 = 1048576;
+const MAX_POLICY_OUTPUT_BYTES: i64 = 1073741824;
+
+fn total_output_budget_bytes() -> i64 {
+    std::env::var("RAINSYNC_COMPUTE_TOTAL_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n >= MIN_POLICY_OUTPUT_BYTES)
+        .unwrap_or(MAX_POLICY_OUTPUT_BYTES)
+}
 
 fn valid_capabilities(capabilities: &[String]) -> bool {
     !capabilities.is_empty()
@@ -117,6 +128,7 @@ pub struct Policy {
     enabled: bool,
     slots: i32,
     output_budget_bytes: i64,
+    expected_revision: Option<i64>,
 }
 pub async fn policy(
     State(app): State<App>,
@@ -124,32 +136,55 @@ pub async fn policy(
     Path(id): Path<Uuid>,
     Json(b): Json<Policy>,
 ) -> Result<Json<Value>> {
-    enabled()?;
-    admin(&auth(&app, &h, true).await?)?;
-    if !(1..=4).contains(&b.slots) || !(1048576..=1073741824).contains(&b.output_budget_bytes) {
+    let user = auth(&app, &h, true).await?;
+    admin(&user)?;
+    // Revoking permission/resetting a policy must work even when computation is disabled globally.
+    if b.enabled {
+        enabled()?;
+    }
+    if !(1..=MAX_POLICY_SLOTS).contains(&b.slots)
+        || !(MIN_POLICY_OUTPUT_BYTES..=MAX_POLICY_OUTPUT_BYTES).contains(&b.output_budget_bytes)
+        || b.expected_revision.is_some_and(|revision| revision < 0)
+    {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_compute_policy"));
     }
     let mut tx = app.db.begin().await?;
-    let valid: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE id=$1 AND NOT revoked)")
+    agents::lock_settings_admin(&mut tx, &user, &h).await?;
+    let valid: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM agents WHERE id=$1 AND NOT revoked FOR NO KEY UPDATE")
             .bind(id)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
-    if !valid {
+    if valid.is_none() {
         return Err(err(StatusCode::NOT_FOUND, "invalid_agent"));
     }
-    sqlx::query("INSERT INTO distributed_compute_policy(agent_id,enabled,slots,output_budget_bytes) VALUES($1,$2,$3,$4) ON CONFLICT(agent_id) DO UPDATE SET enabled=$2,slots=$3,output_budget_bytes=$4,revision=distributed_compute_policy.revision+1").bind(id).bind(b.enabled).bind(b.slots).bind(b.output_budget_bytes).execute(&mut *tx).await?;
+    let current: i64 = sqlx::query_scalar(
+        "SELECT revision FROM distributed_compute_policy WHERE agent_id=$1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(0);
+    if b.expected_revision
+        .is_some_and(|expected| expected != current)
+    {
+        return Err(err(StatusCode::CONFLICT, "compute_policy_conflict"));
+    }
+    let revision: i64 = sqlx::query_scalar("INSERT INTO distributed_compute_policy(agent_id,enabled,slots,output_budget_bytes) VALUES($1,$2,$3,$4) ON CONFLICT(agent_id) DO UPDATE SET enabled=$2,slots=$3,output_budget_bytes=$4,revision=distributed_compute_policy.revision+1 RETURNING revision").bind(id).bind(b.enabled).bind(b.slots).bind(b.output_budget_bytes).fetch_one(&mut *tx).await?;
     if !b.enabled {
         sqlx::query("UPDATE distributed_compute_jobs SET status='cancelled',error='compute_policy_revoked' WHERE owner_agent=$1 AND status IN('queued','running')").bind(id).execute(&mut *tx).await?;
     }
+    agents::lock_settings_admin(&mut tx, &user, &h).await?;
     tx.commit().await?;
-    Ok(Json(json!({"ok":true})))
+    Ok(Json(
+        json!({"ok":true,"enabled":b.enabled,"slots":b.slots,"output_budget_bytes":b.output_budget_bytes,"revision":revision}),
+    ))
 }
 pub async fn nodes(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     admin(&auth(&app, &h, false).await?)?;
-    let rows=sqlx::query("SELECT a.id,a.name,p.enabled,p.slots,p.output_budget_bytes,n.capabilities,n.self_test,n.heartbeat_at::text,COALESCE(n.heartbeat_at>clock_timestamp()-interval '12 seconds',false) AND NOT a.revoked AS healthy,(SELECT count(*) FROM distributed_compute_jobs j WHERE j.owner_agent=a.id AND j.status='running' AND j.lease_until>clock_timestamp()) AS running FROM agents a LEFT JOIN distributed_compute_policy p ON p.agent_id=a.id LEFT JOIN distributed_compute_nodes n ON n.agent_id=a.id ORDER BY a.name,a.id").fetch_all(&app.db).await?;
+    let rows=sqlx::query("SELECT a.id,a.name,a.revoked,p.enabled,p.slots,p.output_budget_bytes,p.revision,n.capabilities,n.self_test,n.heartbeat_at::text,COALESCE(n.heartbeat_at>clock_timestamp()-interval '12 seconds',false) AND NOT a.revoked AS healthy,(SELECT count(*) FROM distributed_compute_jobs j WHERE j.owner_agent=a.id AND j.status='running' AND j.lease_until>clock_timestamp()) AS running FROM agents a LEFT JOIN distributed_compute_policy p ON p.agent_id=a.id LEFT JOIN distributed_compute_nodes n ON n.agent_id=a.id ORDER BY a.name,a.id").fetch_all(&app.db).await?;
     Ok(Json(
-        json!({"enabled":enabled().is_ok(),"nodes":rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"enabled":r.get::<Option<bool>,_>("enabled").unwrap_or(false),"slots":r.get::<Option<i32>,_>("slots"),"output_budget_bytes":r.get::<Option<i64>,_>("output_budget_bytes"),"capabilities":r.get::<Option<Vec<String>>,_>("capabilities"),"self_test":r.get::<Option<Value>,_>("self_test"),"heartbeat_at":r.get::<Option<String>,_>("heartbeat_at"),"healthy":r.get::<bool,_>("healthy"),"running":r.get::<i64,_>("running")})).collect::<Vec<_>>()}),
+        json!({"enabled":enabled().is_ok(),"limits":{"min_slots":1,"max_slots":MAX_POLICY_SLOTS,"min_output_budget_bytes":MIN_POLICY_OUTPUT_BYTES,"max_output_budget_bytes":MAX_POLICY_OUTPUT_BYTES,"total_output_budget_bytes":total_output_budget_bytes()},"nodes":rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"revoked":r.get::<bool,_>("revoked"),"revision":r.get::<Option<i64>,_>("revision").unwrap_or(0),"enabled":!r.get::<bool,_>("revoked") && r.get::<Option<bool>,_>("enabled").unwrap_or(false),"slots":r.get::<Option<i32>,_>("slots"),"output_budget_bytes":r.get::<Option<i64>,_>("output_budget_bytes"),"capabilities":r.get::<Option<Vec<String>>,_>("capabilities"),"self_test":r.get::<Option<Value>,_>("self_test"),"heartbeat_at":r.get::<Option<String>,_>("heartbeat_at"),"healthy":r.get::<bool,_>("healthy"),"running":r.get::<i64,_>("running")})).collect::<Vec<_>>()}),
     ))
 }
 #[derive(Deserialize)]
@@ -655,11 +690,7 @@ pub async fn upload(
     )
     .fetch_one(&mut *tx)
     .await?;
-    let total_limit = std::env::var("RAINSYNC_COMPUTE_TOTAL_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .filter(|n| *n >= 1048576)
-        .unwrap_or(1073741824);
+    let total_limit = total_output_budget_bytes();
     if total + body.len() as i64 > total_limit {
         return Err(err(
             StatusCode::PAYLOAD_TOO_LARGE,

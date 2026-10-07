@@ -405,6 +405,8 @@ it("the actual private-library queue guard accepts a delegated queue permission 
     useRoomRuntime: () => r,
     useRoute: () => ({ query: {} }),
     privateLibraryApi,
+    LibraryBrowser: {},
+    SourceSettingsDialog: {},
     Notice: {},
     QueueFeedback: {},
     AppDialog: {},
