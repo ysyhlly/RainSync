@@ -41,7 +41,9 @@ const target = resolve(process.env.CARGO_TARGET_DIR ?? "target", "debug");
 for (const name of ["rainsync-server", "rainsync-media-worker"]) {
   assert.ok(
     binding.binaries.some(
-      (binary) => resolve(binary.path) === resolve(target, name),
+      (binary) =>
+        resolve(binary.path) ===
+        resolve(target, name + (process.platform === "win32" ? ".exe" : "")),
     ),
     `Binding describes executed ${name}`,
   );

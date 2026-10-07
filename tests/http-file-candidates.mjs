@@ -46,7 +46,9 @@ const target = resolve(process.env.CARGO_TARGET_DIR ?? "target", "debug");
 for (const name of ["rainsync-server", "rainsync-media-worker"]) {
   assert.ok(
     binding.binaries.some(
-      (binary) => resolve(binary.path) === resolve(target, name),
+      (binary) =>
+        resolve(binary.path) ===
+        resolve(target, name + (process.platform === "win32" ? ".exe" : "")),
     ),
     `Binding describes executed ${name}`,
   );
@@ -270,6 +272,9 @@ try {
         const record = {
           entry: entry.label,
           method: request.method,
+          range: request.headers.range ?? null,
+          status: null,
+          served_body_length: 0,
           conditional: request.headers["if-match"] !== undefined,
           phase: entry.phase,
           authorization_matches:
@@ -308,11 +313,13 @@ try {
         if (entry.hold) await entry.hold.promise;
         if (request.destroyed || response.destroyed) return;
         if (entry.failureStatus) {
+          record.status = entry.failureStatus;
           response.writeHead(entry.failureStatus);
           response.end();
           return;
         }
         if (entry.failure) {
+          record.status = 503;
           response.writeHead(503);
           response.end();
           return;
@@ -348,6 +355,7 @@ try {
           request.headers["if-match"] &&
           request.headers["if-match"] !== etag
         ) {
+          record.status = 412;
           response.writeHead(412, headers);
           response.end();
           return;
@@ -363,6 +371,7 @@ try {
           start = Number(range[1]);
           end = range[2] ? Math.min(Number(range[2]), end) : end;
           if (start >= bytes.length || end < start) {
+            record.status = 416;
             response.writeHead(416, {
               ...headers,
               "content-range": `bytes */${bytes.length}`,
@@ -376,6 +385,9 @@ try {
         }
         if (!entry.unknownLength)
           headers["content-length"] = String(end - start + 1);
+        record.status = status;
+        record.served_body_length =
+          request.method === "HEAD" ? 0 : end - start + 1;
         response.writeHead(status, headers);
         response.end(
           request.method === "HEAD"
@@ -525,7 +537,7 @@ try {
         ),
       );
     await check(
-      "legacy and explicit direct retain unprobed HTTP behavior",
+      "legacy candidates avoid origin I/O and explicit direct performs bounded transport classification without codec jobs",
       async () => {
         const g = await seed("legacy direct"),
           before = g.entry.seen;
@@ -537,21 +549,83 @@ try {
         assert.equal(legacy.binding, null);
         assert.equal(legacy.http_file_capabilities_version, undefined);
         assert.equal(g.entry.seen, before);
+        const beforeClassification = report.requests.length;
         const p = await g.client.request("/playback-sessions", "POST", {
           ...g.request,
           idempotency_key: randomUUID(),
           mode: "direct",
         });
-        assert.equal(
-          g.entry.seen,
-          before,
-          "Explicit direct prepare does not force preflight",
+        assert.equal(g.entry.seen - before, 3);
+        assert.deepEqual(
+          report.requests.slice(beforeClassification).map((record) => ({
+            method: record.method,
+            range: record.range,
+            status: record.status,
+            served_body_length: record.served_body_length,
+            conditional: record.conditional,
+            authorization_matches: record.authorization_matches,
+            phase: record.phase,
+          })),
+          [
+            {
+              method: "HEAD",
+              range: null,
+              status: 200,
+              served_body_length: 0,
+              conditional: false,
+              authorization_matches: true,
+              phase: "setup",
+            },
+            {
+              method: "GET",
+              range: "bytes=0-1023",
+              status: 206,
+              served_body_length: 1024,
+              conditional: true,
+              authorization_matches: true,
+              phase: "setup",
+            },
+            {
+              method: "GET",
+              range: "bytes=0-511",
+              status: 206,
+              served_body_length: 512,
+              conditional: true,
+              authorization_matches: true,
+              phase: "setup",
+            },
+          ],
+          "Only ordered authorized HEAD and bounded conditional prefix reads classify this representation",
         );
+        assert.equal(p.delivery_mode, "direct");
+        assert.equal(p.transport, "progressive");
+        assert.equal(
+          p.decision_reason,
+          "http_requested_direct_legacy_transport_policy",
+          "Transport classification cannot become authorized codec probe evidence",
+        );
+        assert.equal(
+          f.sql(
+            `SELECT count(*) FROM media_jobs WHERE session_id=${quote(p.session_id)}`,
+          ),
+          "0",
+        );
+        assert.equal(
+          f.sql(
+            `SELECT count(*) FROM media_executions WHERE session_id=${quote(p.session_id)} AND kind='job'`,
+          ),
+          "0",
+        );
+        assert.equal(report.unexpected_origin_requests, 0);
         await stop(g, p);
         await drained(g);
         return {
-          preflight_origin_requests: 0,
-          ordinary_direct_origin_requests: 0,
+          legacy_candidates_origin_requests: 0,
+          direct_transport_classification_requests: 3,
+          direct_transport_classification_body_bytes: 1536,
+          codec_probe_evidence: false,
+          media_jobs: 0,
+          job_executions: 0,
         };
       },
     );

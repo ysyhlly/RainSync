@@ -34,6 +34,7 @@ async function verifyBinding() {
 }
 await verifyBinding();
 const tests = [];
+const upstreamFailures = [];
 let owned;
 let result = "failed";
 let reportRoot;
@@ -44,7 +45,9 @@ try {
     const admin = fixture.client();
     await admin.login();
     await fixture.makeClip("movie.mp4", { pictureSeconds: 2 });
-    execFileSync("ffmpeg", ["-v", "error", "-nostdin", "-i", resolve(fixture.root, "movie.mp4"), "-c", "copy", "-hls_segment_type", "fmp4", "-hls_time", "1", "-hls_segment_filename", resolve(fixture.root, "segment%d.m4s"), resolve(fixture.root, "variant.m3u8")], { timeout: 10000, windowsHide: true });
+    // Relative HLS paths share one owned cwd, including FFmpeg's implicit init.mp4.
+    execFileSync("ffmpeg", ["-v", "error", "-nostdin", "-i", "movie.mp4", "-c", "copy", "-hls_segment_type", "fmp4", "-hls_time", "1", "-hls_segment_filename", "segment%d.m4s", "variant.m3u8"], { cwd: fixture.root, timeout: 10000, windowsHide: true });
+    await readFile(resolve(fixture.root, "init.mp4"));
     const playlist = await readFile(resolve(fixture.root, "variant.m3u8"));
     const video = await readFile(resolve(fixture.root, "movie.mp4"));
     const requests = [];
@@ -56,7 +59,14 @@ try {
     await new Promise((done) => foreign.listen(0, "127.0.0.1", done));
     const foreignOrigin = `http://127.0.0.1:${foreign.address().port}`;
     const mpd = `<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" minBufferTime="PT1S" mediaPresentationDuration="PT2S"><Period duration="PT2S"><AdaptationSet mimeType="video/mp4"><Representation id="v" bandwidth="100000" codecs="avc1.64001e" width="640" height="360"><BaseURL>${foreignOrigin}/video.mp4</BaseURL><SegmentBase><Initialization range="0-100"/></SegmentBase></Representation></AdaptationSet></Period></MPD>`;
-    const upstream = createServer(async (request, response) => {
+    const upstream = createServer((request, response) => {
+      void respondUpstream(request, response).catch((error) => {
+        upstreamFailures.push(error);
+        if (!response.headersSent) response.statusCode = 500;
+        response.end();
+      });
+    });
+    async function respondUpstream(request, response) {
       const path = new URL(request.url, "http://fixture").pathname;
       requests.push({ path, method: request.method, range: request.headers.range ?? null });
       assert.equal(request.headers.authorization, "Bearer c-fixture");
@@ -85,7 +95,7 @@ try {
         response.statusCode = 404;
         response.end();
       }
-    });
+    }
     await new Promise((done) => upstream.listen(0, "127.0.0.1", done));
     const origin = `http://127.0.0.1:${upstream.address().port}`;
     try {
@@ -103,7 +113,9 @@ try {
         await admin.request(`/sources/${source.id}/test`, "POST");
         const id = fixture.sql(`SELECT id FROM media_items WHERE source_id='${source.id}'`);
         await admin.request("/media/previews", "POST", { media_ids: [id] });
-        await fixture.waitForPreview(id, status, 60000);
+        try { await fixture.waitForPreview(id, status, 60000); }
+        catch (error) { throw upstreamFailures[0] ?? error; }
+        if (upstreamFailures.length) throw upstreamFailures[0];
         assert.equal(foreignHits, 0, "decoder or proxy requested an ungranted origin");
         tests.push({ path, expected: status, result: "passed" });
         console.log(`PASS ${path}: ${status}; foreign requests=0`);
@@ -126,7 +138,7 @@ try {
     const workerClosed = await verifyClosedPort(Number(new URL(owned.workerOrigin).port));
     assert.equal(verifyPidAbsent(owned.workerPid), true, "owned Worker stopped");
     assert.equal(workerClosed, true, "owned Worker listener closed");
-    await writeFile(resolve(reportRoot, "report.json"), JSON.stringify({ schema_version: 1, result, binding_file: bindingFile, binding_sha256: digest(await readFile(bindingFile)), test_sha256: testDigest, tests, cleanup: { ...cleanup, worker_pid_absent: true, worker_port_closed: workerClosed }, limitations: ["isolated native FFmpeg HTTP fixtures, not product/device or final long-run acceptance", "shared delivery policy/DNS/decoder sandbox are outside this lane's authorized wiring"] }, null, 2) + "\n");
+    await writeFile(resolve(reportRoot, "report.json"), JSON.stringify({ schema_version: 1, result, binding_file: bindingFile, binding_sha256: digest(await readFile(bindingFile)), test_sha256: testDigest, tests, upstream_failures: upstreamFailures.map(error => ({ name: error.name, message: error.message })), cleanup: { ...cleanup, worker_pid_absent: true, worker_port_closed: workerClosed }, limitations: ["isolated native FFmpeg HTTP fixtures, not product/device or final long-run acceptance", "shared delivery policy/DNS/decoder sandbox are outside this lane's authorized wiring"] }, null, 2) + "\n");
     console.log(`Evidence: ${resolve(reportRoot, "report.json")}`);
   }
 }

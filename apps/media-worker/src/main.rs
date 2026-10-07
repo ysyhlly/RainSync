@@ -779,6 +779,10 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 };
                 let dir = persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt);
                 child_process::blocking({ let dir=dir.clone(); move || std::fs::create_dir_all(dir) }).await?.map_err(cache::write_error)?;
+                // Use one absolute attempt directory for argument construction
+                // and child cwd. Relative CACHE_ROOT must not be joined twice,
+                // and FFmpeg's default fMP4 init belongs to this owned output.
+                let dir = std::path::absolute(dir).map_err(cache::write_error)?;
                 let audio_index = spec["audio_index"].as_u64().map(u32::try_from).transpose()?;
                 let advanced = if native {Some(native_platform_transcode::prepare(&app,&claim,&dir.join("index.m3u8"),input_failure.token()).await?)} else {advanced_media::prepare_scoped(&app, &claim, &input, &dir.join("index.m3u8"), audio_index).await?};
                 let mut args = if let Some(advanced) = &advanced {
@@ -796,7 +800,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 let confirmed_until = confirmation?
                     .filter(|until| *until > tokio::time::Instant::now())
                     .ok_or_else(|| anyhow::anyhow!("lease_lost_before_spawn"))?;
-                Ok::<_, anyhow::Error>((args, confirmed_until, decoder_input, advanced, local_input))
+                Ok::<_, anyhow::Error>((args, confirmed_until, decoder_input, advanced, local_input, dir))
             };
             let prepared = tokio::select! {
                 biased;
@@ -806,12 +810,12 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             let mut execution_stopped = true;
             let mut diagnostic_failure = None;
             let mut result = async {
-                let (args, confirmed_until, input, advanced, _local_input) = prepared?;
+                let (args, confirmed_until, input, advanced, _local_input, directory) = prepared?;
                 anyhow::ensure!(!*stop.borrow(), "worker_shutdown");
                 let mut command = tokio::process::Command::new("ffmpeg");
         media_core::input_policy::clean_environment(&mut command);
                 if claim.spec["kind"]==persistence::native_platform_transcode::KIND {native_platform_transcode::clean_native_environment(&mut command);}
-                command.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+                command.current_dir(directory).args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
                 if let Some(advanced) = &advanced {
                     advanced.install(&mut command)?;
                     output_decoder.configure_advanced(advanced.recipe.clone()).await?;
