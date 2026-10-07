@@ -262,6 +262,30 @@ fn metadata_is_hls(metadata: &Value) -> bool {
                 .any(|name| name.trim().eq_ignore_ascii_case("hls"))
         })
 }
+fn declared_http_transport(headers: &HeaderMap) -> Option<&'static str> {
+    let mut values = headers.get_all(header::CONTENT_TYPE).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let mime = value.split(';').next()?.trim().to_ascii_lowercase();
+    if matches!(
+        mime.as_str(),
+        "application/vnd.apple.mpegurl"
+            | "application/x-mpegurl"
+            | "audio/mpegurl"
+            | "audio/x-mpegurl"
+    ) {
+        return Some("hls");
+    }
+    let (kind, subtype) = mime.split_once('/')?;
+    let token = !subtype.is_empty()
+        && subtype
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte));
+    (token && (matches!(kind, "video" | "audio") || mime == "application/mp4"))
+        .then_some("progressive")
+}
 async fn guard_scan_config(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: Uuid,
@@ -1049,27 +1073,77 @@ pub(crate) async fn prepare_playback(
             } else {
                 "probe"
             };
-            let mut request = reqwest::Client::new()
-                .get(format!("{base}/media-delivery/{id}/{endpoint}"))
-                .query(&[("token", &t)])
-                .timeout(
-                    if resource["http_owned_large_response_version"] == 1
-                        || resource["http_finite_hls_version"] == 1
-                    {
-                        reservation
-                            .prepare_until
-                            .saturating_duration_since(tokio::time::Instant::now())
+            let client = reqwest::Client::new();
+            let url = format!("{base}/media-delivery/{id}/{endpoint}");
+            let timeout = if resource["http_owned_large_response_version"] == 1
+                || resource["http_finite_hls_version"] == 1
+            {
+                reservation
+                    .prepare_until
+                    .saturating_duration_since(tokio::time::Instant::now())
+            } else {
+                std::time::Duration::from_secs(35)
+            };
+            // Header classification and a necessary prefix read share the
+            // original budget; a HEAD never buys an extra preparation window.
+            let deadline = (tokio::time::Instant::now() + timeout)
+                .min(reservation.prepare_until);
+            let request = client
+                .request(
+                    if direct_transport_only {
+                        reqwest::Method::HEAD
                     } else {
-                        std::time::Duration::from_secs(35)
+                        reqwest::Method::GET
                     },
-                );
-            if direct_transport_only {
-                request = request.header(header::RANGE, "bytes=0-511");
-            }
-            let response = request
+                    &url,
+                )
+                .query(&[("token", &t)])
+                .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            let mut response = request
                 .send()
                 .await
                 .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_probe_failed"))?;
+            if direct_transport_only {
+                let transport = declared_http_transport(response.headers());
+                // This fresh direct preparation grant has no seeded identity. A
+                // successful Worker HEAD creates a pin only for reliable typed
+                // metadata, and never consumes a body. Keep body sniffing for
+                // every pinned source, even if its MIME claims ordinary video.
+                let pinned: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM playback_http_representations h WHERE h.session_id=p.id) FROM playback_sessions p WHERE p.id=$1 AND p.user_id=$2 AND p.media_id=$3 AND p.room_id=$4 AND p.generation=$5 AND p.lifecycle_epoch=$6 AND p.viewer_id IS NOT DISTINCT FROM $7 AND p.plan_generation IS NOT DISTINCT FROM $8 AND NOT p.stopped AND p.expires_at>clock_timestamp() AND playback_source_allowed(p.media_id,p.resource,p.id)",
+                )
+                .bind(id)
+                .bind(u.id)
+                .bind(media)
+                .bind(body.room_id)
+                .bind(i64::from(body.media_generation))
+                .bind(reservation.lifecycle_epoch)
+                .bind(reservation.viewer_id)
+                .bind(reservation.plan_generation.map(i64::from))
+                .fetch_optional(&app.db)
+                .await?
+                .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
+                let header_only = response.status().is_success()
+                    && !pinned
+                    && transport.is_some();
+                if !header_only
+                    && (response.status().is_success()
+                        || matches!(
+                            response.status(),
+                            StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+                        ))
+                {
+                    drop(response);
+                    response = client
+                        .get(&url)
+                        .query(&[("token", &t)])
+                        .header(header::RANGE, "bytes=0-511")
+                        .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                        .send()
+                        .await
+                        .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_probe_failed"))?;
+                }
+            }
             if matches!(
                 response.status(),
                 StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY | StatusCode::BAD_GATEWAY
@@ -1110,28 +1184,11 @@ pub(crate) async fn prepare_playback(
                 return Err(err(StatusCode::BAD_GATEWAY, "source_probe_failed"));
             }
             if direct_transport_only {
-                let content_type = response
-                    .headers()
-                    .get(header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("")
-                    .split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_ascii_lowercase();
                 let mut metadata = meta.clone();
-                metadata["rainsync_http_transport"] = json!(if matches!(
-                    content_type.as_str(),
-                    "application/vnd.apple.mpegurl"
-                        | "application/x-mpegurl"
-                        | "audio/mpegurl"
-                        | "audio/x-mpegurl"
-                ) {
-                    "hls"
-                } else {
-                    "progressive"
-                });
+                // Opaque responses reach this point only after the authorized
+                // Worker prefix path succeeds under its stable identity guard.
+                metadata["rainsync_http_transport"] =
+                    json!(declared_http_transport(response.headers()).unwrap_or("progressive"));
                 return Ok(metadata);
             }
             response
@@ -2169,7 +2226,8 @@ pub async fn renew(
 
 #[cfg(test)]
 mod upstream_subtitle_label_tests {
-    use super::{metadata_is_hls, upstream_track_title};
+    use super::{declared_http_transport, metadata_is_hls, upstream_track_title};
+    use axum::http::{HeaderMap, HeaderValue, header};
     use serde_json::{Value, json};
 
     #[test]
@@ -2183,6 +2241,35 @@ mod upstream_subtitle_label_tests {
         assert!(!metadata_is_hls(
             &json!({"format":{"format_name":"mov,mp4"}})
         ));
+    }
+
+    #[test]
+    fn declared_media_mime_separates_hls_from_audio_and_opaque_bodies() {
+        for (mime, transport) in [
+            ("application/vnd.apple.mpegurl", Some("hls")),
+            ("APPLICATION/X-MPEGURL; charset=utf-8", Some("hls")),
+            ("audio/mpegurl", Some("hls")),
+            ("audio/x-mpegurl; charset=utf-8", Some("hls")),
+            ("video/mp4", Some("progressive")),
+            ("video/webm; codecs=vp9", Some("progressive")),
+            ("audio/mp4", Some("progressive")),
+            ("application/mp4", Some("progressive")),
+            ("application/octet-stream", None),
+            ("text/plain", None),
+            ("application/json", None),
+            ("video/", None),
+            ("video/mp4 invalid", None),
+            ("", None),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+            assert_eq!(declared_http_transport(&headers), transport, "{mime}");
+        }
+        assert_eq!(declared_http_transport(&HeaderMap::new()), None);
+        let mut ambiguous = HeaderMap::new();
+        ambiguous.append(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+        ambiguous.append(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        assert_eq!(declared_http_transport(&ambiguous), None);
     }
 
     #[test]
