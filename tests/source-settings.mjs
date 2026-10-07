@@ -5,7 +5,7 @@ import { createDecipheriv, createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { isolatedServer } from "./fixtures/server.mjs";
+import { isolatedServer, delay } from "./fixtures/server.mjs";
 import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 
 const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
@@ -27,8 +27,43 @@ const upstream = createServer(async (_request, response) => {
 await new Promise((done) => upstream.listen(0, "127.0.0.1", done));
 const upstreamOrigin = `http://127.0.0.1:${upstream.address().port}`;
 const checks = [];
+const requests = [];
+let lockEvidence;
+let owned, failure;
 try {
   await isolatedServer("source-settings", async (f) => {
+    owned = f;
+    const makeClient = f.client.bind(f);
+    f.client = () => {
+      const client = makeClient();
+      const raw = client.raw.bind(client);
+      client.raw = async (path, options = {}) => {
+        const stage = {
+          index: requests.length + 1,
+          method: options.method ?? "GET",
+          route: path.replace(
+            /[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}/gi,
+            "<id>",
+          ),
+          state: "pending",
+        };
+        requests.push(stage);
+        try {
+          const response = await raw(path, options);
+          stage.state = "complete";
+          stage.status = response.status;
+          return response;
+        } catch (error) {
+          stage.state = "failed";
+          stage.error = error.name;
+          throw new Error(
+            `Source settings request ${stage.index}: ${stage.method} ${stage.route} (${error.name})`,
+            { cause: error },
+          );
+        }
+      };
+      return client;
+    };
     const admin = f.client();
     const me = await admin.login();
     const ciphertext = (id) =>
@@ -346,7 +381,10 @@ try {
     await admin.request(
       `/sources/${local.id}`,
       "PATCH",
-      { expected_revision: localDetail.revision, config: { root: "/etc" } },
+      {
+        expected_revision: localDetail.revision,
+        config: { root: resolve(f.root, "..") },
+      },
       403,
     );
     localDetail = await admin.request(`/sources/${local.id}`, "PATCH", {
@@ -415,38 +453,120 @@ try {
     const pending = admin.raw(`/sources/${delayed.id}/test`, {
       method: "POST",
     });
-    await Promise.race([
-      scanReached,
-      new Promise((_, reject) =>
-        setTimeout(() => reject(Error("provider scan did not arrive")), 10000),
-      ),
-    ]);
-    const delayedDetail = await admin.request(`/sources/${delayed.id}`);
-    await admin.request(`/sources/${delayed.id}`, "PATCH", {
-      expected_revision: delayedDetail.revision,
-      config: { token: "new-token" },
-    });
-    releaseScan();
-    const late = await pending;
-    assert.equal(late.status, 409);
-    assert.equal(
-      f.sql(
-        `SELECT count(*) FROM media_items WHERE source_id=${quote(delayed.id)}`,
-      ),
-      "0",
-    );
+    // This deferred request is asserted below; retain rejection until that await.
+    pending.catch(() => {});
+    let scanTimer;
+    let edit;
+    try {
+      try {
+        await Promise.race([
+          scanReached,
+          new Promise((_, reject) => {
+            scanTimer = setTimeout(
+              () => reject(Error("provider scan did not arrive")),
+              10000,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(scanTimer);
+      }
+      const delayedDetail = await admin.request(`/sources/${delayed.id}`);
+      edit = admin.request(`/sources/${delayed.id}`, "PATCH", {
+        expected_revision: delayedDetail.revision,
+        config: { token: "new-token" },
+      });
+      // Both deferred outcomes are asserted; attach handlers before lock waits.
+      edit.catch(() => {});
+      const lockDeadline = Date.now() + 2000;
+      while (Date.now() < lockDeadline) {
+        lockEvidence = JSON.parse(
+          f.sql(
+            "SELECT COALESCE(json_agg(json_build_object('writer_pid',w.pid,'blocker_pid',b.pid,'writer_operation',split_part(w.query,' ',1),'blocker_operation',split_part(b.query,' ',1))),'[]'::json) FROM pg_stat_activity w CROSS JOIN LATERAL unnest(pg_blocking_pids(w.pid)) blocker(pid) JOIN pg_stat_activity b ON b.pid=blocker.pid WHERE w.datname=current_database() AND w.wait_event_type='Lock' AND b.state='idle in transaction' AND EXISTS(SELECT 1 FROM pg_locks l WHERE l.pid=b.pid AND l.relation='sources'::regclass AND l.mode='RowShareLock' AND l.granted)",
+          ),
+        );
+        if (lockEvidence.length === 1) break;
+        await delay(20);
+      }
+      assert.equal(
+        lockEvidence.length,
+        1,
+        "Config writer waits on the held provider source guard",
+      );
+      assert.equal(
+        f.sql(
+          `SELECT count(*) FROM media_items WHERE source_id=${quote(delayed.id)}`,
+        ),
+        "0",
+        "No scan publication while provider response is held",
+      );
+      releaseScan();
+      await edit;
+      const late = await pending;
+      assert.equal(late.status, 409);
+      await late.arrayBuffer();
+      assert.equal(
+        f.sql(
+          `SELECT count(*) FROM media_items WHERE source_id=${quote(delayed.id)}`,
+        ),
+        "0",
+      );
+    } finally {
+      clearTimeout(scanTimer);
+      releaseScan?.();
+      await Promise.allSettled([pending, edit].filter(Boolean));
+    }
     checks.push(
       "in-flight pre-edit provider scan cannot publish stale results after save",
     );
 
     await writeFile(
       resolve(f.root, "source-settings-results.json"),
-      JSON.stringify({ result: "passed", checks }, null, 2),
+      JSON.stringify(
+        { result: "passed", checks, requests, lock_evidence: lockEvidence },
+        null,
+        2,
+      ),
     );
     console.log(JSON.stringify({ result: "passed", checks, root: f.root }));
   });
+} catch (error) {
+  failure = error;
+  console.error(
+    JSON.stringify({
+      fixture: "source-settings",
+      requests,
+      completed_checks: checks,
+      lock_evidence: lockEvidence,
+    }),
+  );
+  throw error;
 } finally {
   releaseScan?.();
   upstream.closeAllConnections();
   await new Promise((done) => upstream.close(done));
+  if (owned) {
+    const cleanup = await owned.verifyStopped();
+    await writeFile(
+      resolve(
+        owned.root,
+        failure
+          ? "source-settings-failure.json"
+          : "source-settings-results.json",
+      ),
+      JSON.stringify(
+        {
+          result: failure ? "failed" : "passed",
+          checks,
+          requests,
+          completed_checks: checks,
+          lock_evidence: lockEvidence,
+          cleanup,
+          error: failure?.stack,
+        },
+        null,
+        2,
+      ),
+    );
+  }
 }
