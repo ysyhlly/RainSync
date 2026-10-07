@@ -1536,12 +1536,13 @@ try {
             const seen = await held.query(
               `SELECT last_seen::text FROM agents WHERE id=${quote(identity.id)}`,
             );
+            peer.send({ type: "HEARTBEAT" });
             await until(
               async () =>
                 (await held.query(
                   `SELECT last_seen::text FROM agents WHERE id=${quote(identity.id)}`,
                 )) !== seen,
-              "Ordinary Agent tick leaves room for receiver dispatch",
+              "Authenticated incoming heartbeat refreshes Agent activity before receiver dispatch",
               2000,
               5,
             );
