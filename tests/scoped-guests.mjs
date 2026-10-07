@@ -229,7 +229,62 @@ try {
         body: "A temporary hello",
         client_message_id: randomUUID(),
       });
-      assert.equal((await socket.next("CHAT")).body, "A temporary hello");
+      const guestMessage = await socket.next("CHAT");
+      assert.equal(guestMessage.body, "A temporary hello");
+      const accountSocket = await connect(admin);
+      await accountSocket.next("SNAPSHOT");
+      accountSocket.send({
+        type: "CHAT",
+        body: "A registered reply",
+        client_message_id: randomUUID(),
+      });
+      const accountMessage = await accountSocket.next("CHAT");
+      assert.equal(accountMessage.body, "A registered reply");
+      assert.equal((await socket.next("CHAT")).id, accountMessage.id);
+      const historyFields = ({ id, user_id, body, display_name }) => ({
+        id,
+        user_id,
+        body,
+        display_name,
+      });
+      const expectedHistory = [
+        {
+          id: guestMessage.id,
+          user_id: identity.id,
+          body: "A temporary hello",
+          display_name: identity.display_name,
+        },
+        {
+          id: accountMessage.id,
+          user_id: owner.id,
+          body: "A registered reply",
+          display_name: accountMessage.display_name,
+        },
+      ];
+      // Exercise every history query for both admitted account and guest
+      // callers. Default history must retain guest display names without
+      // making joined room/identity/timestamp columns ambiguous.
+      for (const reader of [admin, guest]) {
+        const path = `/rooms/${room.id}/messages`;
+        assert.deepEqual(
+          (await reader.request(path)).map(historyFields),
+          expectedHistory,
+        );
+        assert.deepEqual(
+          (await reader.request(`${path}?after=${guestMessage.id}`)).map(
+            historyFields,
+          ),
+          expectedHistory.slice(1),
+        );
+        assert.deepEqual(
+          (
+            await reader.request(
+              `${path}?check_ids=${accountMessage.id},${guestMessage.id}`,
+            )
+          ).map(historyFields),
+          expectedHistory,
+        );
+      }
       const wrong = await connect(guest, other.id);
       await wrong.next("ERROR");
       const nonce = randomBytes(12),
@@ -396,7 +451,7 @@ try {
       await enter(f.client(), "0".repeat(64), 429);
       result = "passed";
       console.log(
-        "PASS: guest defaults/invite consumption/live-account preservation, HTTP denylist, exact current media, WS read/chat/no control, public playback negotiation/preparation/readiness/stop, Worker bytes/global off-on revocation, stale-cookie logout/login, room disable/expiry/kick and entry rate limit",
+        "PASS: guest defaults/invite consumption/live-account preservation, HTTP denylist, account/guest default/cursor/ID history, exact current media, WS read/chat/no control, public playback negotiation/preparation/readiness/stop, Worker bytes/global off-on revocation, stale-cookie logout/login, room disable/expiry/kick and entry rate limit",
       );
     } finally {
       for (const ws of sockets) ws.terminate();
