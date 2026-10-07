@@ -146,7 +146,7 @@ pub(super) async fn admit(
     session: Uuid,
     query: &TokenQuery,
 ) -> Result<(Authority, Grant, Arc<Runtime>)> {
-    let user = auth(app, headers, false).await?;
+    let user = auth_viewer(app, headers, false).await?;
     if !hex64(&query.token) {
         return Err(invalid());
     }

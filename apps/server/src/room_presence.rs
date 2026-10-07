@@ -236,7 +236,7 @@ impl Runtime {
                 }
                 let result = tokio::time::timeout(Duration::from_secs(2), database_checks::text(
                     &app.db,
-                    sqlx::query_scalar("SELECT COALESCE(jsonb_agg(jsonb_build_object('user_id',user_id,'session_hash',token_hash)), '[]'::jsonb)::text FROM (SELECT s.user_id,s.token_hash FROM sessions s JOIN room_members m ON m.user_id=s.user_id WHERE m.room_id=$1 AND s.token_hash=ANY($2) AND s.expires_at>now() FOR KEY SHARE OF s,m) admitted_presence")
+                    sqlx::query_scalar("SELECT COALESCE(jsonb_agg(jsonb_build_object('user_id',user_id,'session_hash',token_hash)), '[]'::jsonb)::text FROM (SELECT s.user_id,s.token_hash FROM sessions s JOIN room_members m ON m.user_id=s.user_id WHERE m.room_id=$1 AND s.token_hash=ANY($2) AND s.expires_at>clock_timestamp() AND playback_login_allowed(s.user_id,s.token_hash) AND (guest_is_account(s.user_id) OR guest_room_allowed(s.user_id,$1)) FOR KEY SHARE OF s,m) admitted_presence")
                         .bind(self.room).bind(hashes),
                     1500,
                 )).await;

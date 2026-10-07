@@ -23,7 +23,11 @@ async fn gate<'a>(
     manage: bool,
     active: bool,
 ) -> Result<(Transaction<'a, Postgres>, Gate)> {
-    let user = auth(app, h, write).await?;
+    let user = if manage {
+        auth(app, h, write).await?
+    } else {
+        auth_viewer(app, h, write).await?
+    };
     let mut tx = app.db.begin().await?;
     sqlx::query("SET LOCAL statement_timeout='3s'")
         .execute(&mut *tx)
@@ -92,8 +96,11 @@ async fn gate<'a>(
     Ok((tx, gate))
 }
 async fn commit(mut tx: Transaction<'_, Postgres>, gate: &Gate) -> Result<()> {
-    let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>clock_timestamp())")
-        .bind(&gate.login).bind(gate.user).fetch_one(&mut *tx).await?;
+    let valid: bool = sqlx::query_scalar("SELECT playback_login_allowed($2,$1)")
+        .bind(&gate.login)
+        .bind(gate.user)
+        .fetch_one(&mut *tx)
+        .await?;
     if !valid {
         return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
     }

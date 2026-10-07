@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
+import { guestRoomPath } from "../features/auth/guest-session";
 import { useSession } from "../features/auth/session.store";
 import { useRoomRuntime } from "../features/rooms/room-runtime";
 import { useAction } from "../shared/use-action";
@@ -28,6 +29,8 @@ const session = useSession(),
 watch(
   () => session.user,
   (user) => {
+    const home = guestRoomPath(user);
+    if (home && route.path !== home) void router.replace(home);
     if (!user && session.loaded && !route.meta.public && !session.startupError)
       void router.replace(
         authenticationLocation("/login", route.fullPath, session.expired),
@@ -113,11 +116,16 @@ async function retry() {
     <aside v-if="session.user" class="sidebar">
       <RouterLink class="brand" to="/rooms">RainSync</RouterLink>
       <AnimatedNavigation
+        v-if="!session.user.guest"
         :variant="inRoom ? 'room' : 'sidebar'"
         :admin="session.user.admin"
       />
+      <RouterLink v-else :to="guestRoomPath(session.user)!" class="button"
+        >返回受邀房间</RouterLink
+      >
       <div class="sidebar-account">
         <RouterLink
+          v-if="!session.user.guest"
           to="/account/profile"
           class="profile-link"
           aria-label="个人资料"
@@ -128,7 +136,14 @@ async function retry() {
             ><b>{{ session.user.display_name }}</b
             ><small>个人资料</small></span
           ></RouterLink
-        ><button
+        >
+        <div v-else class="profile-link">
+          <UserAvatar :name="session.user.display_name" :size="36" /><span
+            ><b>{{ session.user.display_name }}</b
+            ><small>受限访客 · 仅当前房间</small></span
+          >
+        </div>
+        <button
           class="icon-button"
           aria-label="退出登录"
           :disabled="busy"
@@ -140,11 +155,15 @@ async function retry() {
     </aside>
     <header v-if="session.user" class="mobile-header">
       <RouterLink class="brand" to="/rooms">RainSync</RouterLink
-      ><RouterLink to="/account/profile" aria-label="个人资料"
+      ><RouterLink
+        v-if="!session.user.guest"
+        to="/account/profile"
+        aria-label="个人资料"
         ><UserAvatar
           :name="session.user.display_name"
           :url="session.user.avatar_url"
           :size="36" /></RouterLink
+      ><span v-else class="helper">受限访客</span
       ><button class="icon-button" aria-label="退出登录" @click="run(logout)">
         <AppIcon name="logout" />
       </button>
@@ -185,7 +204,11 @@ async function retry() {
           (session.user || route.meta.public)
         "
         ><nav
-          v-if="session.user?.admin && route.path.startsWith('/admin')"
+          v-if="
+            session.user?.admin &&
+            !session.user.guest &&
+            route.path.startsWith('/admin')
+          "
           class="mobile-admin-nav"
           aria-label="管理导航"
         >
@@ -217,7 +240,7 @@ async function retry() {
       />
     </main>
     <AnimatedNavigation
-      v-if="session.user"
+      v-if="session.user && !session.user.guest"
       variant="bottom"
       :admin="session.user.admin"
     />

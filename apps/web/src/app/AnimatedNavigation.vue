@@ -34,7 +34,7 @@ const selected = computed(() => {
   const item = adminNavigation.find((item) => item.to === adminPath);
   return item
     ? props.variant !== "sidebar"
-      ? "/admin/sources"
+      ? "/admin/settings"
       : item.to
     : null;
 });
@@ -108,8 +108,8 @@ const indicatorStyle = computed(() =>
     </div>
     <RouterLink
       v-else-if="admin"
-      to="/admin/sources"
-      :aria-current="selected === '/admin/sources' ? 'page' : undefined"
+      to="/admin/settings"
+      :aria-current="selected === '/admin/settings' ? 'page' : undefined"
       ><AppIcon name="settings" />管理</RouterLink
     >
   </nav>

@@ -192,11 +192,19 @@ await isolatedMediaStack("stream-revocation", async (f) => {
         );
         const url = `${f.workerOrigin}/media-delivery/${id}/source?token=${token}`;
         const ranged = revoke === "membership" || revoke === "expiry";
+        const initialRequestAt = Date.now();
         const state = start(url, ranged);
         await until(() => state.response, `${label}: initial headers`);
         if (state.response.statusCode !== (ranged ? 206 : 200)) {
           // Failure-only authorization evidence never prints credentials/resources.
           const diagnostic = { case: label, status: state.response.statusCode, error_code: "UNPARSEABLE" };
+          diagnostic.initial_headers_ms = Date.now() - initialRequestAt;
+          const failedUpstream = upstreams.get(`${id}.mp4`);
+          diagnostic.upstream = {
+            observed: Boolean(failedUpstream),
+            closed: failedUpstream?.closed ?? null,
+            bytes: failedUpstream?.bytes ?? null,
+          };
           try {
             let body = "";
             await new Promise(done => {

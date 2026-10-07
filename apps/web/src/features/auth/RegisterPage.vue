@@ -2,6 +2,7 @@
 import { computed, ref, watch, onBeforeUnmount, nextTick } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useSession } from "./session.store";
+import { useRegistrationPolicy } from "./registration-policy";
 import { RequestFailure } from "../../errors";
 import { validateAccount } from "./account-rules";
 import Notice from "../../shared/ui/Notice.vue";
@@ -22,6 +23,23 @@ const session = useSession(),
   uncertain = ref(false),
   expires = ref<number>(),
   retrySeconds = ref(0);
+const {
+  policy,
+  loading: policyLoading,
+  error: policyError,
+  reload: reloadPolicy,
+} = useRegistrationPolicy(session);
+const registrationMode = computed(() => policy.value?.registration_mode);
+watch(
+  registrationMode,
+  (mode, before) => {
+    if (mode === before) return;
+    step.value = mode === "open" ? 2 : 1;
+    expires.value = undefined;
+    code.value = password.value = confirm.value = "";
+  },
+  { flush: "sync" },
+);
 const fieldError = ref<{ field: string; message: string } | null>(null);
 watch([code, username, nickname, password, confirm], (values, previous) => {
   if (!fieldError.value) return;
@@ -77,7 +95,13 @@ function failure(e: unknown) {
   }
 }
 async function validate() {
-  if (busy.value || retrySeconds.value) return;
+  if (
+    busy.value ||
+    retrySeconds.value ||
+    policyLoading.value ||
+    registrationMode.value !== "invite_only"
+  )
+    return;
   busy.value = true;
   error.value = "";
   fieldError.value = null;
@@ -95,6 +119,8 @@ async function validate() {
   } catch (e) {
     if (!alive) return;
     failure(e);
+    if (e instanceof RequestFailure && e.code === "REGISTRATION_CLOSED")
+      await reloadPolicy();
     if (
       e instanceof RequestFailure &&
       e.code === "REGISTRATION_INVITE_INVALID"
@@ -107,7 +133,8 @@ async function validate() {
   }
 }
 async function changeInvite() {
-  if (busy.value || uncertain.value) return;
+  if (busy.value || uncertain.value || registrationMode.value !== "invite_only")
+    return;
   step.value = 1;
   password.value = "";
   confirm.value = "";
@@ -137,7 +164,14 @@ async function confirmSession() {
   }
 }
 async function register() {
-  if (busy.value || retrySeconds.value || uncertain.value) return;
+  if (
+    busy.value ||
+    retrySeconds.value ||
+    uncertain.value ||
+    policyLoading.value ||
+    !["open", "invite_only"].includes(registrationMode.value ?? "")
+  )
+    return;
   error.value = "";
   fieldError.value = null;
   const invalid = validateAccount(
@@ -161,7 +195,9 @@ async function register() {
   try {
     await session.register(
       {
-        code: code.value,
+        ...(registrationMode.value === "invite_only"
+          ? { code: code.value }
+          : {}),
         username: username.value,
         password: password.value,
         display_name: nickname.value,
@@ -174,10 +210,14 @@ async function register() {
     if (!alive) return;
     if (e instanceof RequestFailure) {
       failure(e);
-      if (e.code === "USERNAME_TAKEN") {
+      if (e.code === "REGISTRATION_CLOSED") {
+        password.value = confirm.value = "";
+        await reloadPolicy();
+      } else if (e.code === "USERNAME_TAKEN") {
         fieldError.value = { field: "username", message: error.value };
         await focus("register-username");
       } else if (e.code === "REGISTRATION_INVITE_INVALID") {
+        await reloadPolicy();
         step.value = 1;
         password.value = "";
         confirm.value = "";
@@ -227,8 +267,19 @@ async function recover() {
     </div>
     <div class="registration-panel">
       <aside class="registration-steps">
-        <h1 id="registration-title">邀请码注册</h1>
-        <ol aria-label="注册步骤">
+        <h1 id="registration-title">
+          {{
+            registrationMode === "open"
+              ? "创建账号"
+              : registrationMode === "closed"
+                ? "注册已关闭"
+                : "账号注册"
+          }}
+        </h1>
+        <ol
+          v-if="registrationMode === 'invite_only' && !policyLoading"
+          aria-label="注册步骤"
+        >
           <li
             :class="{ current: step === 1 }"
             :aria-current="step === 1 ? 'step' : undefined"
@@ -249,9 +300,35 @@ async function recover() {
             <div>设置账号<small>注册普通观看账号</small></div>
           </li>
         </ol>
+        <p v-else-if="registrationMode === 'open'" class="helper">
+          设置普通观看账号，注册成功后自动登录。
+        </p>
       </aside>
       <div class="registration-form">
-        <form v-if="step === 1" :aria-busy="busy" @submit.prevent="validate">
+        <p
+          v-if="policyLoading"
+          class="loading-state loading-state--inline"
+          role="status"
+        >
+          正在读取注册方式…
+        </p>
+        <div v-else-if="policyError">
+          <Notice :message="policyError" error /><button @click="reloadPolicy">
+            重试读取注册方式
+          </button>
+        </div>
+        <div v-else-if="registrationMode === 'closed'" class="page-stack">
+          <h2>当前暂停新账号注册</h2>
+          <p class="helper">已有账号仍可登录。若需要访问，请联系站点管理员。</p>
+          <RouterLink class="button primary" :to="loginLocation"
+            >返回登录</RouterLink
+          >
+        </div>
+        <form
+          v-else-if="step === 1 && registrationMode === 'invite_only'"
+          :aria-busy="busy"
+          @submit.prevent="validate"
+        >
           <header class="auth-step-heading">
             <p class="page-eyebrow">第 1 步，共 2 步</p>
             <h2>验证邀请码</h2>
@@ -286,17 +363,28 @@ async function recover() {
             <AppIcon name="next" />
           </button>
         </form>
-        <form v-else :aria-busy="busy" @submit.prevent="register">
+        <form
+          v-else-if="
+            registrationMode === 'open' || registrationMode === 'invite_only'
+          "
+          :aria-busy="busy"
+          @submit.prevent="register"
+        >
           <header class="auth-step-heading">
-            <p class="page-eyebrow">第 2 步，共 2 步</p>
+            <p v-if="registrationMode === 'invite_only'" class="page-eyebrow">
+              第 2 步，共 2 步
+            </p>
             <h2>设置账号</h2>
-            <p class="helper">
+            <p v-if="registrationMode === 'invite_only'" class="helper">
               邀请码已验证，有效期至
               {{
                 expires
                   ? new Date(expires).toLocaleString("zh-CN")
                   : "服务端指定时间"
               }}；最终以提交时状态为准。
+            </p>
+            <p v-else class="helper">
+              当前开放自行注册，无需注册邀请码。注册方式以提交时的服务器设置为准。
             </p>
           </header>
           <div class="form-field">
@@ -409,7 +497,7 @@ async function recover() {
             {{ busy ? "正在确认…" : "使用刚设置的账号登录确认" }}
           </button>
           <button
-            v-if="!uncertain"
+            v-if="!uncertain && registrationMode === 'invite_only'"
             type="button"
             class="text-button"
             :disabled="busy"
@@ -419,7 +507,9 @@ async function recover() {
           </button>
         </form>
         <div class="registration-context">
-          <p class="helper">注册邀请码与房间邀请相互独立。</p>
+          <p v-if="registrationMode === 'invite_only'" class="helper">
+            注册邀请码与房间邀请相互独立。
+          </p>
           <p v-if="returnTo.startsWith('/rooms/')" class="helper">
             注册后返回房间页面，请确认后再加入房间。
           </p>

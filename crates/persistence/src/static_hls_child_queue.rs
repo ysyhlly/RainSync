@@ -163,6 +163,9 @@ pub async fn enqueue(
         prepared.check_before_commit(tx).await?;
         return Ok(Admission::Existing);
     }
+    let limit =
+        crate::admin_settings::effective(&mut *tx, crate::admin_settings::Limit::MediaQueue, limit)
+            .await?;
     let active: i64 = sqlx::query_scalar(CAPACITY).fetch_one(&mut **tx).await?;
     if active >= limit {
         return Ok(Admission::Full);

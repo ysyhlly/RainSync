@@ -363,7 +363,13 @@ pub async fn begin_authenticated(
     }
     let active: i64 = sqlx::query_scalar("SELECT count(*) FROM (SELECT id FROM playback_sessions WHERE user_id=$1 AND NOT stopped AND expires_at>now() UNION SELECT session_id FROM playback_requests WHERE user_id=$1 AND status='pending' AND lease_until>now()) active")
         .bind(user).fetch_one(&mut *tx).await?;
-    if active >= app.session_limit {
+    let session_limit = persistence::admin_settings::effective(
+        &mut tx,
+        persistence::admin_settings::Limit::PlaybackSessions,
+        app.session_limit,
+    )
+    .await?;
+    if active >= session_limit {
         // Keep stale-attempt cleanup even if other live sessions fill quota.
         // Do not publish a new high-water without its request identity. A
         // quota rejection must remain safely retryable with the same intent.
@@ -662,7 +668,7 @@ pub async fn cancel(
     h: HeaderMap,
     Path(key): Path<Uuid>,
 ) -> Result<Json<Value>> {
-    let user = auth(&app, &h, true).await?;
+    let user = auth_viewer(&app, &h, true).await?;
     let login_hash = media_authorization::login_hash(&h)?;
     // Resolve the room before taking the per-user quota lock. If a concurrent
     // reservation appeared in that gap, retry without ever inverting room→user.

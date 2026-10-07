@@ -3,6 +3,7 @@ mod account_exit_cleanup;
 mod account_rules;
 mod account_security;
 mod admin_bootstrap;
+mod admin_settings;
 mod advanced_playback;
 mod agent_drain;
 mod agent_metrics;
@@ -15,6 +16,7 @@ mod database_checks;
 mod distributed_compute;
 mod distributed_playback;
 mod finite_hls;
+mod guests;
 mod health;
 mod http_representation;
 mod limits;
@@ -185,6 +187,9 @@ impl From<anyhow::Error> for Error {
 impl From<sqlx::Error> for Error {
     fn from(error: sqlx::Error) -> Self {
         if let sqlx::Error::Database(ref db) = error {
+            if db.message() == "guest_restricted" {
+                return err(StatusCode::FORBIDDEN, "guest_restricted");
+            }
             if db.message() == "account_inactive" {
                 return err(StatusCode::FORBIDDEN, "account_inactive");
             }
@@ -231,8 +236,23 @@ fn origin(app: &App, h: &HeaderMap) -> Result<()> {
     Ok(())
 }
 async fn auth(app: &App, h: &HeaderMap, write: bool) -> Result<User> {
+    auth_with_guests(app, h, write, false).await
+}
+/// Only explicit room-viewer handlers may opt in. New endpoints fail closed.
+async fn auth_viewer(app: &App, h: &HeaderMap, write: bool) -> Result<User> {
+    auth_with_guests(app, h, write, true).await
+}
+async fn auth_with_guests(
+    app: &App,
+    h: &HeaderMap,
+    write: bool,
+    allow_guest: bool,
+) -> Result<User> {
     let token = cookie(h).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "login_required"))?;
-    let row=sqlx::query("SELECT u.id,u.admin,s.csrf FROM sessions s JOIN users u ON u.id=s.user_id WHERE token_hash=$1 AND expires_at>clock_timestamp() AND NOT EXISTS(SELECT 1 FROM account_exits e WHERE e.user_id=u.id)").bind(hash(&token)).fetch_optional(&app.db).await?.ok_or_else(||err(StatusCode::UNAUTHORIZED,"session_expired"))?;
+    let row=sqlx::query("SELECT u.id,u.admin,s.csrf,u.principal_kind FROM sessions s JOIN users u ON u.id=s.user_id WHERE token_hash=$1 AND expires_at>clock_timestamp() AND playback_login_allowed(u.id,s.token_hash) AND NOT EXISTS(SELECT 1 FROM account_exits e WHERE e.user_id=u.id)").bind(hash(&token)).fetch_optional(&app.db).await?.ok_or_else(||err(StatusCode::UNAUTHORIZED,"session_expired"))?;
+    if !allow_guest && row.get::<String, _>("principal_kind") == "guest" {
+        return Err(err(StatusCode::FORBIDDEN, "guest_restricted"));
+    }
     if write {
         origin(app, h)?;
         if h.get("x-csrf-token").and_then(|v| v.to_str().ok())
@@ -248,7 +268,7 @@ async fn auth(app: &App, h: &HeaderMap, write: bool) -> Result<User> {
 }
 async fn member(app: &App, user: &User, room: Uuid) -> Result<()> {
     let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2)",
+        "SELECT EXISTS(SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2 AND (guest_is_account($2) OR guest_room_allowed($2,$1)))",
     )
     .bind(room)
     .bind(user.id)
@@ -273,11 +293,17 @@ struct Login {
 }
 async fn login(State(app): State<App>, h: HeaderMap, Json(body): Json<Login>) -> Result<Response> {
     origin(&app, &h)?;
+    if let Some(current) = cookie(&h) {
+        let guest:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>clock_timestamp() AND u.principal_kind='guest')").bind(hash(&current)).fetch_one(&app.db).await?;
+        if guest {
+            return Err(err(StatusCode::CONFLICT, "already_authenticated"));
+        }
+    }
     if body.username.len() > 80 || body.password.len() > 1024 {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_credentials"));
     }
     login_attempt(&app.db, &body.username).await?;
-    let row = sqlx::query("SELECT id,password_hash FROM users WHERE username=$1 AND NOT EXISTS(SELECT 1 FROM account_exits e WHERE e.user_id=users.id)")
+    let row = sqlx::query("SELECT id,password_hash FROM users WHERE username=$1 AND principal_kind='account' AND NOT EXISTS(SELECT 1 FROM account_exits e WHERE e.user_id=users.id)")
         .bind(&body.username)
         .fetch_optional(&app.db)
         .await?
@@ -337,7 +363,7 @@ async fn login_attempt(db: &PgPool, username: &str) -> Result<()> {
     Ok(())
 }
 async fn me(State(app): State<App>, h: HeaderMap) -> Result<Response> {
-    let u = auth(&app, &h, false).await?;
+    let u = auth_viewer(&app, &h, false).await?;
     let mut value = profile::value(&app, u.id).await?;
     let csrf: String = sqlx::query_scalar("SELECT csrf FROM sessions WHERE token_hash=$1")
         .bind(hash(&cookie(&h).unwrap()))
@@ -345,14 +371,22 @@ async fn me(State(app): State<App>, h: HeaderMap) -> Result<Response> {
         .await?;
     value["admin"] = json!(u.admin);
     value["csrf"] = json!(csrf);
+    guests::add_identity(&app, u.id, &mut value).await?;
     Ok(registration::private_json(StatusCode::OK, value))
 }
 async fn logout(State(app): State<App>, h: HeaderMap) -> Result<Response> {
-    auth(&app, &h, true).await?;
-    sqlx::query("DELETE FROM sessions WHERE token_hash=$1")
-        .bind(hash(&cookie(&h).unwrap()))
-        .execute(&app.db)
-        .await?;
+    origin(&app, &h)?;
+    match auth_viewer(&app, &h, true).await {
+        Ok(_) => {}
+        Err(error) if error.0 == StatusCode::UNAUTHORIZED => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(session) = cookie(&h) {
+        sqlx::query("DELETE FROM sessions WHERE token_hash=$1")
+            .bind(hash(&session))
+            .execute(&app.db)
+            .await?;
+    }
     Ok((
         [(
             header::SET_COOKIE,
@@ -391,7 +425,7 @@ async fn users(
 }
 async fn ws(State(app): State<App>, h: HeaderMap, upgrade: WebSocketUpgrade) -> Result<Response> {
     origin(&app, &h)?;
-    let user = auth(&app, &h, false).await?;
+    let user = auth_viewer(&app, &h, false).await?;
     let session_hash = hash(&cookie(&h).unwrap());
     Ok(upgrade
         .max_message_size(16384)
@@ -667,7 +701,8 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
                     "DELETE FROM chat_messages WHERE created_at<now()-interval '7 days'",
                     "DELETE FROM room_reactions WHERE expires_at<now()",
                     "DELETE FROM room_reaction_receipts WHERE created_at<now()-interval '48 hours'",
-                    "DELETE FROM sessions WHERE expires_at<now()",
+                    "DELETE FROM sessions WHERE token_hash IN(SELECT token_hash FROM sessions WHERE expires_at<clock_timestamp() LIMIT 1000)",
+                    "UPDATE guest_principals SET revoked_at=clock_timestamp(),display_name='游客' WHERE user_id IN(SELECT user_id FROM guest_principals WHERE revoked_at IS NULL AND expires_at<=clock_timestamp() LIMIT 1000)",
                     "DELETE FROM playback_http_representations WHERE (session_id,target_sha256) IN (SELECT h.session_id,h.target_sha256 FROM playback_http_representations h JOIN playback_sessions p ON p.id=h.session_id WHERE p.stopped AND p.expires_at<clock_timestamp()-interval '48 hours' AND NOT EXISTS(SELECT 1 FROM playback_preparations prep WHERE prep.session_id=p.id AND prep.drained_at IS NULL) LIMIT 1000)",
                     "DELETE FROM login_attempts WHERE window_started<=now()-interval '60 seconds'",
                     "DELETE FROM account_rate_limits WHERE expires_at<=clock_timestamp()",
@@ -694,6 +729,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     }
     tokio::spawn(room_cleanup::run(app.clone()));
     let _account_exit_cleanup = account_exit_cleanup::Maintenance::start(app.clone());
+    let _guest_cleanup = guests::Maintenance::start(app.clone());
     let mut platform_renewal =
         media_authority.then(|| platform_accounts::maintenance::Maintenance::start(app.clone()));
     let preparations = app.preparations.clone();
@@ -703,6 +739,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     let platform_oauth_exchanges = app.platform_oauth_exchanges.clone();
     let native_transcode_delivery = app.native_transcode_delivery.clone();
     let router = Router::new()
+        .route(
+            "/api/v1/admin/settings",
+            get(admin_settings::get).patch(admin_settings::change),
+        )
         .route("/api/v1/admin/plugins", get(plugins::catalog))
         .route("/api/v1/admin/plugins/audit", get(plugins::audit))
         .route(
@@ -808,6 +848,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         )
         .route("/api/v1/auth/login", post(login))
         .route(
+            "/api/v1/auth/registration-policy",
+            get(admin_settings::registration_policy),
+        )
+        .route(
             "/api/v1/auth/registration-invites/validate",
             post(registration_auth::validate),
         )
@@ -835,6 +879,11 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route(
             "/api/v1/admin/registration-invites/{id}",
             delete(registration::revoke),
+        )
+        .route("/api/v1/rooms/{id}/guest-session", post(guests::enter))
+        .route(
+            "/api/v1/rooms/{id}/guest-access",
+            get(guests::access).put(guests::set_access),
         )
         .route("/api/v1/rooms", get(rooms::list).post(rooms::create))
         .route("/api/v1/rooms/{id}/permissions", get(rooms::permissions))

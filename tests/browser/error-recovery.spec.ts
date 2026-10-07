@@ -253,6 +253,10 @@ test("short zoomed viewport keeps the source title above the empty room mini pla
     .filter({ visible: true })
     .first()
     .click();
+  await expect(
+    page.getByRole("heading", { name: "管理员设置", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: /片源管理 编辑片源/ }).click();
   const mini = page.locator(".mini-player");
   await expect(mini).toBeVisible();
   await expect(mini).toHaveClass(/mini-collapsed/);

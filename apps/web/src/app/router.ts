@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory } from "vue-router";
+import { guestRoomPath } from "../features/auth/guest-session";
 import { useSession } from "../features/auth/session.store";
 import LoginPage from "../features/auth/LoginPage.vue";
 import RegisterPage from "../features/auth/RegisterPage.vue";
@@ -13,6 +14,7 @@ import SourcesPage from "../features/admin/SourcesPage.vue";
 import AgentsPage from "../features/admin/AgentsPage.vue";
 import RegistrationInvitesPage from "../features/admin/RegistrationInvitesPage.vue";
 import CreateUserPage from "../features/admin/CreateUserPage.vue";
+import AdminSettingsPage from "../features/admin/AdminSettingsPage.vue";
 import { authenticationLocation, safeRedirect } from "./navigation";
 export function createApplicationRouter(base = "/") {
   const router = createRouter({
@@ -22,7 +24,7 @@ export function createApplicationRouter(base = "/") {
       {
         path: "/register",
         component: RegisterPage,
-        meta: { public: true, title: "邀请码注册" },
+        meta: { public: true, title: "账号注册" },
       },
       {
         path: "/account/profile",
@@ -41,9 +43,22 @@ export function createApplicationRouter(base = "/") {
         meta: { title: "观影", room: true },
       },
       { path: "/library", component: LibraryPage, meta: { title: "媒体库" } },
-      { path: "/libraries", component: PrivateLibrariesPage, meta: { title: "私有媒体库" } },
-      { path: "/admin/plugins", component: PluginsPage, meta: { title: "插件管理", requiresAdmin: true } },
-      { path: "/admin", redirect: "/admin/sources" },
+      {
+        path: "/libraries",
+        component: PrivateLibrariesPage,
+        meta: { title: "私有媒体库" },
+      },
+      {
+        path: "/admin/plugins",
+        component: PluginsPage,
+        meta: { title: "插件管理", requiresAdmin: true },
+      },
+      { path: "/admin", redirect: "/admin/settings" },
+      {
+        path: "/admin/settings",
+        component: AdminSettingsPage,
+        meta: { title: "管理员设置", requiresAdmin: true },
+      },
       {
         path: "/admin/sources",
         component: SourcesPage,
@@ -80,6 +95,8 @@ export function createApplicationRouter(base = "/") {
     if (session.startupError) return true;
     if (!session.user && !to.meta.public)
       return authenticationLocation("/login", to.fullPath, session.expired);
+    const guestHome = guestRoomPath(session.user);
+    if (guestHome && to.path !== guestHome) return guestHome;
     if (session.user && to.meta.public) return safeRedirect(to.query.redirect);
     if (to.path.startsWith("/admin") && !session.user?.admin)
       return { path: "/rooms", query: { notice: "admin-required" } };

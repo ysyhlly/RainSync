@@ -19,6 +19,7 @@ import type {
   RoomInviteRecord,
 } from "../../shared/api/types";
 import RoomAccessPanel from "./RoomAccessPanel.vue";
+import RoomGuestAccess from "./RoomGuestAccess.vue";
 import { roomPermissionOptions } from "./room-permissions";
 import { useAction } from "../../shared/use-action";
 import DistributedComputePanel from "../playback/DistributedComputePanel.vue";
@@ -193,7 +194,7 @@ const ownershipOpen = ref(false),
   selectedOwner = ref("");
 const ownerOptions = computed(() =>
   members.value
-    .filter((member) => member.id !== r.room?.owner_id)
+    .filter((member) => member.id !== r.room?.owner_id && !member.guest)
     .map((member) => ({
       value: member.id,
       label: `${member.display_name} (@${member.username})`,
@@ -263,8 +264,12 @@ async function revoke() {
   message.value = "此房间邀请已撤销";
 }
 async function leave() {
+  const guest = session.user?.guest;
   await r.leave();
-  await router.push("/rooms");
+  if (guest) {
+    await session.logout();
+    await router.push("/login");
+  } else await router.push("/rooms");
 }
 async function manageOwnership() {
   const id = r.room?.id;
@@ -340,7 +345,7 @@ async function transferOwnership() {
             >
               <AppIcon name="key" />邀请
             </button>
-            <button @click="managementOpen = true">
+            <button v-if="!session.user?.guest" @click="managementOpen = true">
               <AppIcon name="settings" />房间管理
             </button>
             <button :disabled="busy" @click="run(leave)">离开观看</button>
@@ -366,7 +371,10 @@ async function transferOwnership() {
       <p v-if="r.room?.lifecycle === 'closing'" class="notice" role="status">
         正在停止播放和清理媒体任务，完成后才会关闭。历史记录仍可查看。
       </p>
-      <PendingMediaSelection class="room-pending-selection" />
+      <PendingMediaSelection
+        v-if="!session.user?.guest"
+        class="room-pending-selection"
+      />
       <RoomLayoutCanvas
         ref="layoutCanvas"
         :layout="layout"
@@ -603,6 +611,7 @@ async function transferOwnership() {
           归档房间
         </button>
         <RoomAccessPanel />
+        <RoomGuestAccess />
       </div>
       <DistributedComputePanel
         v-if="managementOpen && r.room && r.state && r.roomActive"

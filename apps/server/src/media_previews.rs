@@ -80,7 +80,7 @@ pub async fn image(
     Path(id): Path<Uuid>,
     axum::extract::Query(q): axum::extract::Query<ImageQuery>,
 ) -> Result<Response> {
-    let user = auth(&app, &h, false).await?;
+    let user = auth_viewer(&app, &h, false).await?;
     let mut tx = app.db.begin().await?;
     // Keep authorization valid through the read, including NAS revocation.
     let source: Option<Uuid> =

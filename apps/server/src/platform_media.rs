@@ -214,7 +214,7 @@ pub async fn prepare(
         return native_live::prepare(State(app), headers, Json(body)).await;
     }
     validate_request(&body)?;
-    let user = auth(&app, &headers, true).await?;
+    let user = auth_viewer(&app, &headers, true).await?;
     member(&app, &user, body.room_id).await?;
     let login = media_authorization::login_hash(&headers)?;
     let owner = app.preparations.admit().ok_or_else(|| {
@@ -236,7 +236,7 @@ pub async fn prepare_compatibility(
     Json(body): Json<protocol::PlaybackRequest>,
 ) -> Result<Json<Value>> {
     validate_contract(&body, true)?;
-    let user = auth(&app, &headers, true).await?;
+    let user = auth_viewer(&app, &headers, true).await?;
     member(&app, &user, body.room_id).await?;
     let login = media_authorization::login_hash(&headers)?;
     let owner = app.preparations.admit().ok_or_else(|| {

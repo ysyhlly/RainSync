@@ -162,7 +162,7 @@ pub async fn observe(
     Path(id): Path<Uuid>,
     Json(sample): Json<protocol::PlaybackObservation>,
 ) -> Result<Json<protocol::PlaybackObservationReceipt>> {
-    let user = auth(&app, &h, true).await?;
+    let user = auth_viewer(&app, &h, true).await?;
     let mut tx = app.db.begin().await?;
     let grant = lock_grant(&mut tx, id, user.id, &media_authorization::login_hash(&h)?)
         .await?

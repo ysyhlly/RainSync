@@ -177,7 +177,7 @@ pub async fn candidates(
     headers: HeaderMap,
     Json(body): Json<protocol::UpstreamProfileCandidateRequest>,
 ) -> Result<Json<protocol::UpstreamProfileCandidateSet>> {
-    let user = auth(&app, &headers, true).await?;
+    let user = auth_viewer(&app, &headers, true).await?;
     member(&app, &user, body.room_id).await?;
     if !matches!(body.profile_version, 1 | 2) {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_request"));

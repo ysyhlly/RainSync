@@ -1,3 +1,8 @@
+import {
+  guestRoomPath,
+  parseGuestInvitation,
+} from "../apps/web/src/features/auth/guest-session";
+import { ref } from "vue";
 import { afterEach, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { mountSetup } from "./helpers/mount-setup";
@@ -7,7 +12,10 @@ import {
 } from "../apps/web/src/app/navigation";
 import { useSession } from "../apps/web/src/features/auth/session.store";
 import { useAction } from "../apps/web/src/shared/use-action";
-import { validateAccount } from "../apps/web/src/features/auth/account-rules";
+import {
+  validateAccount,
+  validateNickname,
+} from "../apps/web/src/features/auth/account-rules";
 import { RequestFailure } from "../apps/web/src/errors";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -50,7 +58,16 @@ it("login and registration retain the same safe destination and expiry explanati
   const route = { query: { redirect: target, notice: "session-expired" } };
   const replace = vi.fn();
   const shared = {
+    guestRoomPath,
+    parseGuestInvitation,
+    validateNickname,
     useSession,
+    useRegistrationPolicy: () => ({
+      policy: ref({ registration_mode: "invite_only", guests_enabled: false }),
+      loading: ref(false),
+      error: ref(""),
+      reload: vi.fn(),
+    }),
     useRouter: () => ({ replace }),
     useRoute: () => route,
     safeRedirect,

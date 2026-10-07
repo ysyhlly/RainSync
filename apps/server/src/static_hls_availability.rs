@@ -43,7 +43,7 @@ pub(crate) async fn endpoint(
     headers: HeaderMap,
     Json(body): Json<Request>,
 ) -> Result<impl IntoResponse> {
-    let user = auth(&app, &headers, true).await?;
+    let user = auth_viewer(&app, &headers, true).await?;
     member(&app, &user, body.room_id).await?;
     if body.version != 1 || body.room_id.is_nil() {
         return Err(err(
@@ -67,7 +67,7 @@ pub(crate) async fn endpoint(
     // A delayed capability response cannot advertise the previous login, room,
     // lifecycle, media or source generation. This is still only availability:
     // prepare independently freezes and verifies its own complete authority.
-    let current = auth(&app, &headers, true).await?;
+    let current = auth_viewer(&app, &headers, true).await?;
     member(&app, &current, body.room_id).await?;
     if current.id != user.id
         || cookie(&headers).map(|value| hash(&value)) != login

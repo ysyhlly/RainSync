@@ -208,7 +208,7 @@ test("browser Back closes quota editing without a mutation or a trapped overlay"
   });
   await dialog.getByLabel("单任务产物上限（MiB）").fill("512");
   await page.goBack();
-  await expect(page).toHaveURL(isMobile ? /\/admin\/sources$/ : /\/rooms$/);
+  await expect(page).toHaveURL(isMobile ? /\/admin\/settings$/ : /\/rooms$/);
   await expect(dialog).not.toBeVisible();
   expect(writes).toBe(0);
   await page.getByRole("link", { name: "NAS 设备", exact: true }).click();

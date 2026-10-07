@@ -35,7 +35,7 @@ async fn admit(
     session: Uuid,
     query: &TokenQuery,
 ) -> Result<(Authority, Grant)> {
-    let user = auth(app, headers, false).await?;
+    let user = auth_viewer(app, headers, false).await?;
     if query.token.len() != 64 || !query.token.bytes().all(|v| v.is_ascii_hexdigit()) {
         return Err(invalid());
     }
@@ -62,7 +62,7 @@ pub(super) async fn admit_compatibility(
     session: Uuid,
     token: &str,
 ) -> Result<(Authority, Grant)> {
-    let user = auth(app, headers, false).await?;
+    let user = auth_viewer(app, headers, false).await?;
     if token.len() != 64 || !token.bytes().all(|v| v.is_ascii_hexdigit()) {
         return Err(invalid());
     }

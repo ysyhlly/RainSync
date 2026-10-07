@@ -5,7 +5,7 @@ pub(crate) async fn is_live_request(
     headers: &HeaderMap,
     body: &protocol::PlaybackRequest,
 ) -> Result<bool> {
-    let user = auth(app, headers, true).await?;
+    let user = auth_viewer(app, headers, true).await?;
     member(app, &user, body.room_id).await?;
     // Inspect the authoritative current selection, regardless of the supplied
     // generation. A stale client can never route a live row into finite VOD.
@@ -71,7 +71,7 @@ pub(crate) async fn prepare(
     Json(body): Json<protocol::PlaybackRequest>,
 ) -> Result<Json<Value>> {
     validate(&body)?;
-    let user = auth(&app, &headers, true).await?;
+    let user = auth_viewer(&app, &headers, true).await?;
     member(&app, &user, body.room_id).await?;
     let login = media_authorization::login_hash(&headers)?;
     let owner = app.preparations.admit().ok_or_else(|| {

@@ -186,7 +186,7 @@ pub async fn candidates(
     h: HeaderMap,
     Json(body): Json<PlaybackCandidateRequest>,
 ) -> Result<Json<PlaybackCandidateSet>> {
-    let user = auth(&app, &h, true).await?;
+    let user = auth_viewer(&app, &h, true).await?;
     member(&app, &user, body.room_id).await?;
     if !body.position_ms.is_finite() || body.position_ms < 0.0 {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_position"));

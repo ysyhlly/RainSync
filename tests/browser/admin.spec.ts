@@ -383,6 +383,10 @@ test("admin navigation preserves the persistent video and room connection", asyn
     .filter({ visible: true })
     .first();
   await nav.click();
+  await expect(
+    page.getByRole("heading", { name: "管理员设置", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: /片源管理 编辑片源/ }).click();
   await expect(page.getByRole("heading", { name: "片源管理" })).toBeVisible();
   for (const label of ["NAS 设备", "账号与注册"]) {
     await page

@@ -12,11 +12,11 @@ pub async fn members(
     h: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Response> {
-    let user = auth(&app, &h, false).await?;
+    let user = auth_viewer(&app, &h, false).await?;
     if !user.admin {
         member(&app, &user, id).await?;
     }
-    let rows = sqlx::query("SELECT u.id,u.username,COALESCE(p.display_name,u.username) AS display_name FROM room_members m JOIN users u ON u.id=m.user_id LEFT JOIN user_profiles p ON p.user_id=u.id WHERE m.room_id=$1 AND account_active(u.id) ORDER BY u.username,u.id")
+    let rows = sqlx::query("SELECT u.id,u.username,COALESCE(g.display_name,p.display_name,u.username) AS display_name,u.principal_kind FROM room_members m JOIN users u ON u.id=m.user_id LEFT JOIN guest_principals g ON g.user_id=u.id LEFT JOIN user_profiles p ON p.user_id=u.id WHERE m.room_id=$1 AND account_active(u.id) ORDER BY u.username,u.id")
         .bind(id).fetch_all(&app.db).await?;
     Ok(media_titles::private_json(Value::Array(
         rows.iter()
@@ -25,6 +25,7 @@ pub async fn members(
                     "id": row.get::<Uuid,_>("id"),
                     "username": row.get::<String,_>("username"),
                     "display_name": row.get::<String,_>("display_name"),
+                    "guest": row.get::<String,_>("principal_kind")=="guest",
                 })
             })
             .collect(),

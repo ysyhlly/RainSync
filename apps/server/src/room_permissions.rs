@@ -24,7 +24,7 @@ impl Grant {
     }
 }
 
-pub(super) async fn owner_authority<'a>(
+pub(crate) async fn owner_authority<'a>(
     app: &'a App,
     h: &HeaderMap,
     room: Uuid,
@@ -71,7 +71,7 @@ pub async fn permissions(
     h: HeaderMap,
     Path(room): Path<Uuid>,
 ) -> Result<Response> {
-    let user = auth(&app, &h, false).await?;
+    let user = auth_viewer(&app, &h, false).await?;
     if !user.admin {
         member(&app, &user, room).await?;
     }

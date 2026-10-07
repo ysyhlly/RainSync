@@ -30,6 +30,9 @@ pub enum ErrorCode {
     ComputePolicyConflict,
     InvalidAgentName,
     AgentSettingsConflict,
+    InvalidAdminSettings,
+    SettingsRevisionConflict,
+    RegistrationClosed,
     InvalidComputeCapability,
     ComputeNotAuthorized,
     InvalidComputeSource,
@@ -476,6 +479,11 @@ impl ErrorCode {
             Self::P2pTargetUnavailable => "P2P 参与者不可用",
             Self::P2pRoomPeerBudgetExceeded => "房间 P2P 参与者已达上限",
 
+            Self::RegistrationClosed => "此实例已关闭自主注册，请联系管理员",
+            Self::InvalidAdminSettings => {
+                "设置项无效，请检查访问模式、开关及 1 到 10000 的整数上限"
+            }
+            Self::SettingsRevisionConflict => "管理员设置已被更新，请重新加载后核对并保存",
             Self::PrivateLibrariesDisabled => "私人库创建与分享未开启，请联系管理员",
             Self::LibraryInvalid => "媒体库字段或期限无效，请检查后重试",
             Self::LibraryNotFound => "媒体库不存在或当前账号无权访问",

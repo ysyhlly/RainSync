@@ -1,3 +1,8 @@
+import {
+  guestRoomPath,
+  parseGuestInvitation,
+} from "../apps/web/src/features/auth/guest-session";
+import { ref } from "vue";
 import { afterEach, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { nextTick, shallowRef } from "vue";
@@ -36,7 +41,19 @@ function auth(file: "LoginPage" | "RegisterPage") {
   const page = mountSetup(
     new URL(`../apps/web/src/features/auth/${file}.vue`, import.meta.url),
     {
+      guestRoomPath,
+      parseGuestInvitation,
+      validateNickname,
       useSession,
+      useRegistrationPolicy: () => ({
+        policy: ref({
+          registration_mode: "invite_only",
+          guests_enabled: false,
+        }),
+        loading: ref(false),
+        error: ref(""),
+        reload: vi.fn(),
+      }),
       useAction,
       useRouter: () => ({ replace }),
       useRoute: () => ({
@@ -158,9 +175,20 @@ async function profile() {
     ),
     {
       shallowRef,
-      useSession,
-      useAction,
+      guestRoomPath,
+      parseGuestInvitation,
       validateNickname,
+      useSession,
+      useRegistrationPolicy: () => ({
+        policy: ref({
+          registration_mode: "invite_only",
+          guests_enabled: false,
+        }),
+        loading: ref(false),
+        error: ref(""),
+        reload: vi.fn(),
+      }),
+      useAction,
       RequestFailure,
       UserAvatar: {},
       Notice: {},

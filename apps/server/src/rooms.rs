@@ -93,7 +93,11 @@ async fn owned_snapshot(
         return Err(err(StatusCode::FORBIDDEN, "not_a_member"));
     }
     let lifecycle: String = row.get("lifecycle");
-    let control_epoch = if lifecycle == "active" {
+    let registered: bool = sqlx::query_scalar("SELECT guest_is_account($1)")
+        .bind(user)
+        .fetch_one(&mut *tx)
+        .await?;
+    let control_epoch = if lifecycle == "active" && registered {
         let id = Uuid::new_v4();
         let expires_at_ms: i64 = sqlx::query_scalar("INSERT INTO control_epochs(id,user_id,room_id) VALUES($1,$2,$3) RETURNING floor(extract(epoch FROM expires_at)*1000)::bigint")
             .bind(id).bind(user).bind(room).fetch_one(&mut *tx).await?;
@@ -132,7 +136,7 @@ async fn socket_membership(
         database_checks::boolean(
             &app.db,
             sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2)",
+                "SELECT EXISTS(SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2 AND (guest_is_account($2) OR guest_room_allowed($2,$1)))",
             )
             .bind(room)
             .bind(user),
@@ -156,12 +160,18 @@ async fn socket_access(
     socket_membership(app, room, user).await?;
     // Login authority is independent of optional presence negotiation. Legacy
     // sockets must not keep sending or receiving for the heartbeat interval.
-    match tokio::time::timeout(std::time::Duration::from_secs(2), database_checks::boolean(
-        &app.db,
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>clock_timestamp())")
-            .bind(session_hash).bind(user),
-        1500,
-    )).await {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        database_checks::boolean(
+            &app.db,
+            sqlx::query_scalar("SELECT playback_login_allowed($2,$1)")
+                .bind(session_hash)
+                .bind(user),
+            1500,
+        ),
+    )
+    .await
+    {
         Ok(Ok(true)) => Ok(()),
         Ok(Ok(false)) => Err("session_expired"),
         _ => Err("service_unavailable"),
@@ -384,7 +394,7 @@ fn control_error(error: anyhow::Error, fallback: &str) -> String {
 }
 
 pub async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
-    let u = auth(&app, &h, false).await?;
+    let u = auth_viewer(&app, &h, false).await?;
     let rows=sqlx::query("SELECT r.id,r.name,r.owner_id,r.lifecycle,r.lifecycle_epoch FROM rooms r JOIN room_members m ON m.room_id=r.id WHERE m.user_id=$1 ORDER BY r.created_at DESC").bind(u.id).fetch_all(&app.db).await?;
     Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"owner_id":r.get::<Uuid,_>("owner_id"),"lifecycle":r.get::<String,_>("lifecycle"),"lifecycle_epoch":r.get::<i64,_>("lifecycle_epoch")})).collect())))
 }
@@ -401,13 +411,11 @@ async fn creation_session_valid(
 ) -> Result<()> {
     // now() is fixed at transaction start and would accept a session that
     // expires while a concurrent creation holds the request-key lock.
-    let valid: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>clock_timestamp())",
-    )
-    .bind(session_hash)
-    .bind(user)
-    .fetch_one(&mut **tx)
-    .await?;
+    let valid: bool = sqlx::query_scalar("SELECT playback_login_allowed($2,$1)")
+        .bind(session_hash)
+        .bind(user)
+        .fetch_one(&mut **tx)
+        .await?;
     if !valid {
         return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
     }
@@ -598,9 +606,11 @@ async fn controller_admission<'a>(
     .bind(u.id)
     .fetch_optional(&mut *tx)
     .await?;
-    let valid: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>clock_timestamp())",
-    ).bind(&login_hash).bind(u.id).fetch_one(&mut *tx).await?;
+    let valid: bool = sqlx::query_scalar("SELECT playback_login_allowed($2,$1)")
+        .bind(&login_hash)
+        .bind(u.id)
+        .fetch_one(&mut *tx)
+        .await?;
     if !valid || csrf.is_none() || current_admin.is_none() {
         return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
     }
@@ -648,7 +658,7 @@ pub(crate) async fn commit_controller(
 #[path = "room_invites.rs"]
 mod invites_runtime;
 #[path = "room_permissions.rs"]
-mod permissions_runtime;
+pub(crate) mod permissions_runtime;
 pub use invites_runtime::{invite, join, list_invites, revoke_invite};
 pub use permissions_runtime::{kick, permissions, revoke_permissions, set_permissions};
 pub async fn playlist(
@@ -656,7 +666,7 @@ pub async fn playlist(
     h: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Response> {
-    let u = auth(&app, &h, false).await?;
+    let u = auth_viewer(&app, &h, false).await?;
     member(&app, &u, id).await?;
     let rows=sqlx::query(&format!("{} JOIN playlist_items q ON q.media_id=m.id WHERE {} AND q.room_id=$2 AND library_media_allowed($1,m.id,'play',$2) ORDER BY q.sort_order,q.id", media_titles::SELECT.replace("SELECT m.id,", "SELECT q.id AS playlist_id,q.sort_order AS queue_order,m.id,"), media_titles::VISIBLE)).bind(u.id).bind(id).fetch_all(&app.db).await?;
     let mut items: Vec<(i64, Uuid, Value)> = rows.iter().map(|r| {
@@ -667,14 +677,14 @@ pub async fn playlist(
         let item = r.get::<Uuid,_>("playlist_id");
         (r.get("queue_order"), item, json!({"id":item,"media_id":media["id"],"title":media["title"],"cover":media["cover"]}))
     }).collect();
-    let platform = sqlx::query("SELECT q.id,q.media_id,q.sort_order,e.title FROM playlist_items q JOIN room_platform_media e ON e.media_id=q.media_id AND e.room_id=q.room_id JOIN media_items m ON m.id=e.media_id WHERE q.room_id=$1 AND m.available AND m.source_id IS NULL")
-        .bind(id).fetch_all(&app.db).await?;
+    let platform = sqlx::query("SELECT q.id,q.media_id,q.sort_order,e.title FROM playlist_items q JOIN room_platform_media e ON e.media_id=q.media_id AND e.room_id=q.room_id JOIN media_items m ON m.id=e.media_id WHERE q.room_id=$1 AND m.available AND m.source_id IS NULL AND library_media_allowed($2,m.id,'play',$1)")
+        .bind(id).bind(u.id).fetch_all(&app.db).await?;
     items.extend(platform.iter().map(|r| {
         let item = r.get::<Uuid,_>("id");
         (r.get("sort_order"), item, json!({"id":item,"media_id":r.get::<Uuid,_>("media_id"),"title":r.get::<String,_>("title"),"kind":"native_platform","cover":{"state":"missing","revision":null,"url":null,"retry_after_ms":null}}))
     }));
     items.sort_by_key(|(order, id, _)| (*order, *id));
-    let current = auth(&app, &h, false).await?;
+    let current = auth_viewer(&app, &h, false).await?;
     member(&app, &current, id).await?;
     Ok(media_titles::private_json(Value::Array(
         items.into_iter().map(|(_, _, value)| value).collect(),
@@ -746,7 +756,7 @@ pub async fn messages(
     Path(id): Path<Uuid>,
     axum::extract::Query(cursor): axum::extract::Query<MessageCursor>,
 ) -> Result<Json<Value>> {
-    let u = auth(&app, &h, false).await?;
+    let u = auth_viewer(&app, &h, false).await?;
     member(&app, &u, id).await?;
     let rows = if let Some(ids) = cursor.check_ids {
         if cursor.after.is_some() || ids.len() > 3700 {
@@ -760,11 +770,11 @@ pub async fn messages(
         if ids.is_empty() || ids.len() > 100 {
             return Err(err(StatusCode::BAD_REQUEST, "invalid_request"));
         }
-        sqlx::query("SELECT c.id,CASE WHEN c.deleted_at IS NULL THEN c.body ELSE '' END AS body,c.deleted_at IS NOT NULL AS deleted,c.user_id,u.username,COALESCE(p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE c.room_id=$1 AND c.id=ANY($2) ORDER BY c.created_at,c.id").bind(id).bind(ids).fetch_all(&app.db).await?
+        sqlx::query("SELECT c.id,CASE WHEN c.deleted_at IS NULL THEN c.body ELSE '' END AS body,c.deleted_at IS NOT NULL AS deleted,c.user_id,u.username,COALESCE(g.display_name,p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN guest_principals g ON g.user_id=u.id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE c.room_id=$1 AND c.id=ANY($2) ORDER BY c.created_at,c.id").bind(id).bind(ids).fetch_all(&app.db).await?
     } else if let Some(after) = cursor.after {
-        sqlx::query("SELECT c.id,CASE WHEN c.deleted_at IS NULL THEN c.body ELSE '' END AS body,c.deleted_at IS NOT NULL AS deleted,c.user_id,u.username,COALESCE(p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE c.room_id=$1 AND (NOT EXISTS(SELECT 1 FROM chat_messages WHERE id=$2 AND room_id=$1) OR (c.created_at,c.id) > (SELECT created_at,id FROM chat_messages WHERE id=$2 AND room_id=$1)) ORDER BY c.created_at,c.id LIMIT 100").bind(id).bind(after).fetch_all(&app.db).await?
+        sqlx::query("SELECT c.id,CASE WHEN c.deleted_at IS NULL THEN c.body ELSE '' END AS body,c.deleted_at IS NOT NULL AS deleted,c.user_id,u.username,COALESCE(g.display_name,p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN guest_principals g ON g.user_id=u.id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE c.room_id=$1 AND (NOT EXISTS(SELECT 1 FROM chat_messages WHERE id=$2 AND room_id=$1) OR (c.created_at,c.id) > (SELECT created_at,id FROM chat_messages WHERE id=$2 AND room_id=$1)) ORDER BY c.created_at,c.id LIMIT 100").bind(id).bind(after).fetch_all(&app.db).await?
     } else {
-        sqlx::query("SELECT * FROM (SELECT c.id,CASE WHEN c.deleted_at IS NULL THEN c.body ELSE '' END AS body,c.deleted_at IS NOT NULL AS deleted,c.user_id,u.username,COALESCE(p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,c.created_at,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE room_id=$1 ORDER BY c.created_at DESC,c.id DESC LIMIT 100) history ORDER BY created_at,id").bind(id).fetch_all(&app.db).await?
+        sqlx::query("SELECT * FROM (SELECT c.id,CASE WHEN c.deleted_at IS NULL THEN c.body ELSE '' END AS body,c.deleted_at IS NOT NULL AS deleted,c.user_id,u.username,COALESCE(g.display_name,p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,c.created_at,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN guest_principals g ON g.user_id=u.id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE room_id=$1 ORDER BY c.created_at DESC,c.id DESC LIMIT 100) history ORDER BY created_at,id").bind(id).fetch_all(&app.db).await?
     };
     Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"body":r.get::<String,_>("body"),"user_id":r.get::<Uuid,_>("user_id"),"username":r.get::<String,_>("username"),"display_name":r.get::<String,_>("display_name"),"created_at":r.get::<i64,_>("created_at_ms"),"deleted":r.get::<bool,_>("deleted"),"avatar_url":avatars::url(r.get("user_id"),r.get("avatar_version"),r.get::<Option<String>,_>("avatar_content_type").is_some()),"avatar_version":r.get::<Option<Uuid>,_>("avatar_version")})).collect())))
 }
@@ -775,6 +785,7 @@ async fn persist_chat(
     user_id: Uuid,
     body: &str,
     client_message_id: Option<Uuid>,
+    session_hash: &str,
 ) -> std::result::Result<(Uuid, i64, bool, bool), &'static str> {
     let mut tx = db.begin().await.map_err(|_| "database_error")?;
     persistence::room_lifecycle::lock_active(&mut tx, room_id)
@@ -799,6 +810,12 @@ async fn persist_chat(
     if membership.is_none() {
         return Err("not_a_member");
     }
+    if !persistence::media_authorization::lock_login(&mut tx, user_id, session_hash)
+        .await
+        .map_err(|_| "database_error")?
+    {
+        return Err("session_expired");
+    }
     crate::timeline_chat::check_mute(&mut tx, room_id, user_id).await?;
     let inserted = sqlx::query(
         "INSERT INTO chat_messages(id,room_id,user_id,body,client_message_id,body_digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (room_id,user_id,client_message_id) DO NOTHING RETURNING id,floor(extract(epoch FROM created_at)*1000)::bigint AS created_at_ms",
@@ -813,6 +830,15 @@ async fn persist_chat(
     .await
     .map_err(|_| "database_error")?;
     if let Some(row) = inserted {
+        let live: bool = sqlx::query_scalar("SELECT playback_login_allowed($1,$2)")
+            .bind(user_id)
+            .bind(session_hash)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| "database_error")?;
+        if !live {
+            return Err("session_expired");
+        }
         tx.commit().await.map_err(|_| "database_error")?;
         return Ok((row.get("id"), row.get("created_at_ms"), false, false));
     }
@@ -835,6 +861,15 @@ async fn persist_chat(
         })
     {
         return Err("invalid_request");
+    }
+    let live: bool = sqlx::query_scalar("SELECT playback_login_allowed($1,$2)")
+        .bind(user_id)
+        .bind(session_hash)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| "database_error")?;
+    if !live {
+        return Err("session_expired");
     }
     tx.commit().await.map_err(|_| "database_error")?;
     Ok((
@@ -925,6 +960,13 @@ async fn socket_inner(
         v["presence_version"].as_u64() == Some(u64::from(protocol::PRESENCE_VERSION));
     let negotiated_control_metrics = v["control_recovery_metrics_version"].as_u64()
         == Some(u64::from(protocol::TRANSPORT_METRICS_VERSION));
+    let guest = match guests::is_guest(&app, user.id).await {
+        Ok(value) => value,
+        Err(_) => {
+            reject_socket(&mut out, "service_unavailable").await;
+            return;
+        }
+    };
     let mut control_metrics_slot = control_recovery_metrics::Slot::default();
     let mut control_metrics_pending = tokio::task::JoinSet::new();
     let mut events = handle.events.subscribe_with_presence(negotiated_presence);
@@ -1090,7 +1132,7 @@ async fn socket_inner(
                                 None => {reject_with_presence(&mut out, "invalid_request", presence_lease.as_ref()).await;continue},
                             },
                         };
-                        let (cid,created_at,replayed,deleted)=match persist_chat(&app.db,id,user.id,body,client_message_id).await {
+                        let (cid,created_at,replayed,deleted)=match persist_chat(&app.db,id,user.id,body,client_message_id,&session_hash).await {
                             Ok(result)=>result,
                             Err(reason)=>{reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;if reason=="not_a_member" {break};continue},
                         };
@@ -1103,6 +1145,7 @@ async fn socket_inner(
                         continue
                     }
                     _=>{
+                        if guest { reject_with_presence(&mut out, "guest_restricted", presence_lease.as_ref()).await; continue; }
                         let command_id = v["command_id"].as_str().and_then(|s|Uuid::parse_str(s).ok());
                         let Ok(command)=serde_json::from_value::<Command>(v)else{
                             let message = socket_error("invalid_request",command_id);
@@ -1139,7 +1182,7 @@ async fn socket_inner(
                 value["error"]["code"].as_str(),
                 Some("CONTROL_EPOCH_REQUIRED" | "CONTROL_EPOCH_EXPIRED")
             );
-        if renew_control {
+        if renew_control && !guest {
             if let Err(reason) = socket_access(&app, id, user.id, &session_hash).await {
                 reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;
                 break;

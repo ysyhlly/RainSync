@@ -43,6 +43,11 @@ pub async fn validate(
         60,
     )
     .await?;
+    if persistence::admin_settings::registration_mode(&mut *app.db.acquire().await?).await?
+        == "closed"
+    {
+        return Err(err(StatusCode::FORBIDDEN, "registration_closed"));
+    }
     let normalized = registration::normalize_code(&body.code).ok_or_else(invalid_invite)?;
     let row = sqlx::query("SELECT code_suffix,floor(extract(epoch FROM expires_at)*1000)::bigint AS expires_at,floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS server_time FROM registration_invites WHERE code_hash=$1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at>clock_timestamp()")
         .bind(registration::code_hash(&normalized)).fetch_optional(&app.db).await?.ok_or_else(invalid_invite)?;
@@ -55,7 +60,7 @@ pub async fn validate(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Register {
-    code: String,
+    code: Option<String>,
     username: String,
     password: String,
     display_name: Option<String>,
@@ -90,28 +95,55 @@ pub async fn register(
         display_name: body.display_name,
     };
     let display_name = account.validate()?;
-    let normalized = registration::normalize_code(&body.code).ok_or_else(invalid_invite)?;
-    let code_hash = registration::code_hash(&normalized);
-    let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM registration_invites WHERE code_hash=$1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at>clock_timestamp())")
-        .bind(&code_hash).fetch_one(&app.db).await?;
-    if !valid {
-        return Err(invalid_invite());
+    let mode =
+        persistence::admin_settings::registration_mode(&mut *app.db.acquire().await?).await?;
+    if mode == "closed" {
+        return Err(err(StatusCode::FORBIDDEN, "registration_closed"));
+    }
+    let code_hash = body
+        .code
+        .as_deref()
+        .and_then(registration::normalize_code)
+        .map(|code| registration::code_hash(&code));
+    if mode == "invite_only" {
+        let code = code_hash.as_deref().ok_or_else(invalid_invite)?;
+        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM registration_invites WHERE code_hash=$1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at>clock_timestamp())")
+            .bind(code).fetch_one(&app.db).await?;
+        if !valid {
+            return Err(invalid_invite());
+        }
     }
     let password_hash = account_security::password_hash(&app, account.password).await?;
     let mut tx = app.db.begin().await?;
-    let row = sqlx::query("SELECT id FROM registration_invites WHERE code_hash=$1 FOR UPDATE")
-        .bind(&code_hash)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(invalid_invite)?;
-    let invite: Uuid = row.get("id");
-    // Separate statement after FOR UPDATE: transaction now() and a pre-lock
-    // projection would incorrectly admit a code that expired during lock wait.
-    let valid: bool = sqlx::query_scalar("SELECT used_at IS NULL AND revoked_at IS NULL AND expires_at>clock_timestamp() FROM registration_invites WHERE id=$1")
-        .bind(invite).fetch_one(&mut *tx).await?;
-    if !valid {
-        return Err(invalid_invite());
-    }
+    // Hashing happens outside the transaction. Pin current access policy only
+    // for actual account issuance; reread after the row lock has waited. A
+    // concurrent close/invite-only change cannot be bypassed by an earlier form.
+    sqlx::query("SELECT singleton FROM admin_settings WHERE singleton FOR SHARE")
+        .fetch_one(&mut *tx)
+        .await?;
+    let mode = persistence::admin_settings::registration_mode(&mut tx).await?;
+    let invite = match mode.as_str() {
+        "closed" => return Err(err(StatusCode::FORBIDDEN, "registration_closed")),
+        "invite_only" => {
+            let code = code_hash.as_deref().ok_or_else(invalid_invite)?;
+            let row =
+                sqlx::query("SELECT id FROM registration_invites WHERE code_hash=$1 FOR UPDATE")
+                    .bind(code)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or_else(invalid_invite)?;
+            let invite: Uuid = row.get("id");
+            // Capture real clock after invitation waits, never transaction now().
+            let valid: bool = sqlx::query_scalar("SELECT used_at IS NULL AND revoked_at IS NULL AND expires_at>clock_timestamp() FROM registration_invites WHERE id=$1")
+                .bind(invite).fetch_one(&mut *tx).await?;
+            if !valid {
+                return Err(invalid_invite());
+            }
+            Some(invite)
+        }
+        "open" => None, // A real code-less account; never fabricate or consume an invite.
+        _ => return Err(err(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")),
+    };
     let id = Uuid::new_v4();
     let session = token();
     let csrf = token();
@@ -129,11 +161,15 @@ pub async fn register(
             .execute(&mut *tx)
             .await?;
     }
-    sqlx::query("UPDATE registration_invites SET used_by=$2,used_at=clock_timestamp() WHERE id=$1")
+    if let Some(invite) = invite {
+        sqlx::query(
+            "UPDATE registration_invites SET used_by=$2,used_at=clock_timestamp() WHERE id=$1",
+        )
         .bind(invite)
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    }
     sqlx::query("INSERT INTO sessions(token_hash,user_id,csrf,expires_at) VALUES($1,$2,$3,clock_timestamp()+interval '7 days')")
         .bind(hash(&session)).bind(id).bind(&csrf).execute(&mut *tx).await?;
     tx.commit().await?;

@@ -111,6 +111,19 @@ pub async fn claim_rate_limit(
     sqlx::query("LOCK TABLE account_rate_limits IN SHARE ROW EXCLUSIVE MODE")
         .execute(&mut **tx)
         .await?;
+    let setting = match scope {
+        "invite-validate" => Some(persistence::admin_settings::Limit::RegistrationValidate),
+        "register" => Some(persistence::admin_settings::Limit::RegistrationAttempts),
+        _ => None,
+    };
+    let limit = if let Some(setting) = setting {
+        persistence::admin_settings::effective(&mut *tx, setting, i64::from(limit)).await? as i32
+    } else {
+        limit
+    };
+    // A lower runtime limit must not erase attempts already spent in this
+    // window; a later increase must not recreate that spent allowance.
+    let ceiling = if setting.is_some() { 10001 } else { limit + 1 };
     sqlx::query("DELETE FROM account_rate_limits WHERE expires_at<=clock_timestamp()")
         .execute(&mut **tx)
         .await?;
@@ -119,8 +132,8 @@ pub async fn claim_rate_limit(
     if full {
         return Ok(Some(60));
     }
-    let row = sqlx::query("INSERT INTO account_rate_limits(scope,key_hash,window_started,expires_at,attempts) VALUES($1,$2,clock_timestamp(),clock_timestamp()+$3*interval '1 second',1) ON CONFLICT(scope,key_hash) DO UPDATE SET attempts=LEAST(account_rate_limits.attempts+1,$4+1) RETURNING attempts,ceil(extract(epoch FROM expires_at-clock_timestamp()))::bigint AS remaining")
-        .bind(scope).bind(key).bind(seconds).bind(limit).fetch_one(&mut **tx).await?;
+    let row = sqlx::query("INSERT INTO account_rate_limits(scope,key_hash,window_started,expires_at,attempts) VALUES($1,$2,clock_timestamp(),clock_timestamp()+$3*interval '1 second',1) ON CONFLICT(scope,key_hash) DO UPDATE SET attempts=LEAST(account_rate_limits.attempts+1,$4) RETURNING attempts,ceil(extract(epoch FROM expires_at-clock_timestamp()))::bigint AS remaining")
+        .bind(scope).bind(key).bind(seconds).bind(ceiling).fetch_one(&mut **tx).await?;
     Ok((row.get::<i32, _>("attempts") > limit).then(|| row.get("remaining")))
 }
 

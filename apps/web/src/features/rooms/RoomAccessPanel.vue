@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { useRoomRuntime } from "./room-runtime";
 import { useSession } from "../auth/session.store";
 import { useAction } from "../../shared/use-action";
@@ -21,6 +21,11 @@ const selected = ref(""),
   role = ref<"viewer" | "moderator">("viewer"),
   actions = ref<RoomPermission[]>([]),
   ttl = ref(24);
+const selectedGuest = computed(
+  () =>
+    members.value.find((member) => member.id === selected.value)?.guest ===
+    true,
+);
 let roomId = "";
 async function load() {
   const id = r.room?.id;
@@ -46,7 +51,7 @@ function select(id: string) {
   actions.value = grant?.active ? [...grant.permissions] : [];
 }
 async function save() {
-  if (roomId !== r.room?.id || !selected.value) return;
+  if (roomId !== r.room?.id || !selected.value || selectedGuest.value) return;
   await session.api(`/rooms/${roomId}/permissions/${selected.value}`, "PUT", {
     role: role.value,
     permissions: role.value === "moderator" ? actions.value : [],
@@ -93,11 +98,12 @@ async function kick() {
           :key="member.id"
           :value="member.id"
         >
-          {{ member.display_name }} (@{{ member.username }})
+          {{ member.display_name }}
+          {{ member.guest ? "（游客）" : `(@${member.username})` }}
         </option>
       </select></label
     >
-    <template v-if="selected && r.canManageRoom">
+    <template v-if="selected && r.canManageRoom && !selectedGuest">
       <label
         >角色<select v-model="role">
           <option value="viewer">观看者</option>
@@ -135,6 +141,9 @@ async function kick() {
         ><button :disabled="busy" @click="run(revoke)">撤销权限</button>
       </div>
     </template>
+    <p v-if="selectedGuest" class="helper">
+      游客固定为观看者，不能被授予房间权限或转为房主。
+    </p>
     <p v-if="selected">
       移出房间会终止此账户的所有房间连接和播放授权。有效邀请仍可再次加入；如需阻止再次加入，请同时撤销其邀请。
     </p>

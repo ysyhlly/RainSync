@@ -85,6 +85,7 @@ python3 tests/runtime-images.test.py
 
 ## 文档与许可证
 
+- [注册与游客访问](docs/GUEST_ACCESS.md)
 - [错误契约](docs/API_ERRORS.md)
 - [Bilibili 直播](docs/BILIBILI_LIVE.md) 与 [直播间控制](docs/BILIBILI_LIVE_ROOM_CONTROLS.md)
 - [媒体库扫描](docs/LIBRARY_SCANNING.md)

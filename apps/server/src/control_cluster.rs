@@ -385,7 +385,7 @@ async fn peer_socket(
         .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
         .ok_or_else(|| err(StatusCode::FORBIDDEN, "control_peer_rejected"))?
         .to_string();
-    let admin:Option<bool>=tokio::time::timeout(Duration::from_secs(2),sqlx::query_scalar("SELECT u.admin FROM sessions s JOIN users u ON u.id=s.user_id JOIN room_members m ON m.user_id=u.id AND m.room_id=$3 WHERE s.token_hash=$1 AND s.user_id=$2 AND s.expires_at>clock_timestamp()")
+    let admin:Option<bool>=tokio::time::timeout(Duration::from_secs(2),sqlx::query_scalar("SELECT u.admin FROM sessions s JOIN users u ON u.id=s.user_id JOIN room_members m ON m.user_id=u.id AND m.room_id=$3 WHERE s.token_hash=$1 AND s.user_id=$2 AND s.expires_at>clock_timestamp() AND playback_login_allowed(u.id,s.token_hash) AND (guest_is_account(u.id) OR guest_room_allowed(u.id,$3))")
         .bind(&session).bind(user_id).bind(room).fetch_optional(&app.db)).await
         .map_err(|_|err(StatusCode::SERVICE_UNAVAILABLE,"room_owner_unavailable"))??;
     let user = User {
@@ -415,6 +415,8 @@ fn room_path(path: &str) -> Option<Uuid> {
         || matches!(
             tail.as_str(),
             "join"
+                | "guest-session"
+                | "guest-access"
                 | "invites"
                 | "playlist"
                 | "messages"

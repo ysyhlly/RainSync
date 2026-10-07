@@ -370,6 +370,12 @@ pub async fn freeze(
     }
     let active: i64 = sqlx::query_scalar("SELECT count(*) FROM (SELECT id FROM playback_sessions WHERE user_id=$1 AND NOT stopped AND expires_at>clock_timestamp() UNION SELECT session_id FROM playback_requests WHERE user_id=$1 AND status='pending' AND lease_until>clock_timestamp()) active")
         .bind(uuid(&i.user_id)?).fetch_one(&mut *tx).await?;
+    let quota = crate::admin_settings::effective(
+        &mut tx,
+        crate::admin_settings::Limit::PlaybackSessions,
+        quota,
+    )
+    .await?;
     ensure!(active < quota, "too_many_playback_sessions");
     let n = sqlx::query("INSERT INTO playback_requests(user_id,idempotency_key,request_hash,session_id,owner_epoch,status,lease_until,expires_at,created_at,room_id,lifecycle_epoch,viewer_id,plan_generation,auth_login_hash,auth_membership_epoch,static_hls_input_version,static_hls_input_encrypted,static_hls_input_sha256,static_hls_operation_id,static_hls_root_expires_at,static_hls_prepare_expires_at,static_hls_media_id,static_hls_media_generation,static_hls_source_id,static_hls_source_revision,static_hls_source_generation,static_hls_worker_instance,static_hls_database_id) SELECT $1,$2,$3,$4,$5,'pending',to_timestamp($6::double precision/1000),to_timestamp($7::double precision/1000)+interval '48 hours',to_timestamp($7::double precision/1000),$8,$9,$10,$11,$12,$13,1,$14,$15,$16,to_timestamp($17::double precision/1000),to_timestamp($6::double precision/1000),$18,$19,$20,$21,$22,$23,$24 WHERE clock_timestamp()<to_timestamp($6::double precision/1000) AND clock_timestamp()<to_timestamp($17::double precision/1000) AND playback_origin_allowed($1,$8,$12,$13)")
         .bind(uuid(&i.user_id)?).bind(key).bind(&i.request_sha256).bind(uuid(&i.session_id)?)

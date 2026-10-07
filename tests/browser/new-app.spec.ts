@@ -207,9 +207,13 @@ test("returning to the library refreshes scanned media while retaining the searc
   await page.getByRole("button", { name: "搜索", exact: true }).click();
   await expect(page.getByText("没有找到匹配影片")).toBeVisible();
   await page
-    .getByRole("link", { name: /^(片源管理|管理)$/ })
+    .getByRole("link", { name: /^(管理员设置|管理)$/ })
     .filter({ visible: true })
     .click();
+  await expect(
+    page.getByRole("heading", { name: "管理员设置", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: /片源管理 编辑片源/ }).click();
   await expect(
     page.getByRole("heading", { name: "片源管理", exact: true }),
   ).toBeVisible();

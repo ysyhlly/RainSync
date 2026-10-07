@@ -35,6 +35,7 @@ export const watchNavigation = [
   { to: "/library", label: "媒体库", icon: "movie" },
 ] as const;
 export const adminNavigation = [
+  { to: "/admin/settings", label: "管理员设置", icon: "settings" },
   { to: "/admin/sources", label: "片源管理", icon: "movie" },
   { to: "/admin/agents", label: "NAS 设备", icon: "server" },
   { to: "/admin/plugins", label: "插件管理", icon: "server" },

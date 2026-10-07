@@ -46,10 +46,12 @@ pub async fn redeem(
         bail!("invalid_invite");
     }
     if epoch.is_none() {
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM room_members WHERE room_id=$1")
-            .bind(room)
-            .fetch_one(&mut **tx)
-            .await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM room_members WHERE room_id=$1 AND account_active(user_id)",
+        )
+        .bind(room)
+        .fetch_one(&mut **tx)
+        .await?;
         if count >= 10 {
             bail!("room_full");
         }

@@ -298,7 +298,7 @@ pub async fn playback(
                 "dedicated_platform_endpoint_required",
             ));
         }
-        let user = auth(&app, &h, true).await?;
+        let user = auth_viewer(&app, &h, true).await?;
         let login_hash = cookie(&h)
             .map(|value| hash(&value))
             .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "login_required"))?;
@@ -384,7 +384,7 @@ async fn start_playback(
             "dedicated_platform_endpoint_required",
         ));
     }
-    let u = auth(&app, &h, true).await?;
+    let u = auth_viewer(&app, &h, true).await?;
     static_hls_public::validate(&body)?;
     upstream_profiles::validate_request(&body, profile_endpoint)?;
     if body.http_file_fallback.is_some() {
@@ -1788,7 +1788,7 @@ pub async fn readiness(
     Path(id): Path<Uuid>,
     axum::extract::Query(query): axum::extract::Query<ReadinessQuery>,
 ) -> Result<Json<protocol::PlaybackReadiness>> {
-    let u = auth(&app, &h, false).await?;
+    let u = auth_viewer(&app, &h, false).await?;
     if query
         .relative_position_ms
         .is_some_and(|p| !p.is_finite() || p < 0.0)
@@ -1930,7 +1930,7 @@ pub async fn stop(
     Path(id): Path<Uuid>,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>> {
-    let u = auth(&app, &h, true).await?;
+    let u = auth_viewer(&app, &h, true).await?;
     let final_sample = if body.is_empty() {
         Ok(None)
     } else {
@@ -1999,7 +1999,7 @@ pub async fn renew(
     h: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
-    let u = auth(&app, &h, true).await?;
+    let u = auth_viewer(&app, &h, true).await?;
     let session = sqlx::query(
         "SELECT room_id,lifecycle_epoch,resource ? 'native_platform_context' AS native_platform FROM playback_sessions WHERE id=$1 AND user_id=$2",
     )

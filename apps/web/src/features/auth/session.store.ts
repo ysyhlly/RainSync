@@ -2,10 +2,12 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 import { createApiClient, StaleIdentity } from "../../shared/api/client";
 import type { Avatar, Identity, Profile } from "../../shared/api/types";
+import { guestRoomPath } from "./guest-session";
 import { RequestFailure } from "../../errors";
 
 type ServerIdentity = Pick<Identity, "id" | "username" | "admin" | "csrf"> &
-  Partial<Profile>;
+  Partial<Profile> &
+  Partial<Pick<Identity, "guest" | "guest_room_id" | "guest_expires_at">>;
 export const useSession = defineStore("session", () => {
   const user = ref<Identity | null>(null),
     epoch = ref(0),
@@ -88,7 +90,26 @@ export const useSession = defineStore("session", () => {
   function accept(value: ServerIdentity) {
     if (!value?.id || !value.username || typeof value.csrf !== "string")
       throw new TypeError("登录响应不完整，请重新登录");
-    if (value.id !== user.value?.id) {
+    if (value.guest !== undefined && typeof value.guest !== "boolean")
+      throw new TypeError("访客登录响应不完整，请重新进入");
+    if (
+      value.guest === true &&
+      (!guestRoomPath(value) ||
+        value.admin ||
+        !Number.isSafeInteger(value.guest_expires_at) ||
+        value.guest_expires_at! <= Date.now())
+    )
+      throw new TypeError("访客登录响应不完整或已过期，请重新进入");
+    if (
+      value.guest !== true &&
+      (value.guest_room_id != null || value.guest_expires_at != null)
+    )
+      throw new TypeError("登录身份类型不一致，请重新登录");
+    if (
+      value.id !== user.value?.id ||
+      !!value.guest !== !!user.value?.guest ||
+      value.guest_room_id !== user.value?.guest_room_id
+    ) {
       ++epoch.value;
       ++loadSerial;
     }
@@ -104,7 +125,12 @@ export const useSession = defineStore("session", () => {
   }
   async function readIdentity(
     signal?: AbortSignal,
-    expected?: { username: string; csrf: string; id?: string },
+    expected?: {
+      username: string;
+      csrf: string;
+      id?: string;
+      guestRoom?: string;
+    },
   ) {
     const serial = ++loadSerial;
     const profileAtStart = profileRevision;
@@ -120,7 +146,9 @@ export const useSession = defineStore("session", () => {
       expected &&
       (value.username !== expected.username ||
         value.csrf !== expected.csrf ||
-        (expected.id && value.id !== expected.id))
+        (expected.id && value.id !== expected.id) ||
+        (expected.guestRoom &&
+          (value.guest !== true || value.guest_room_id !== expected.guestRoom)))
     )
       throw new StaleIdentity();
     if (profileAtStart !== profileRevision && user.value?.id === value.id) {
@@ -151,7 +179,7 @@ export const useSession = defineStore("session", () => {
   }
   function register(
     input: {
-      code: string;
+      code?: string;
       username: string;
       password: string;
       display_name?: string;
@@ -171,6 +199,41 @@ export const useSession = defineStore("session", () => {
         username: input.username,
         csrf: result.csrf,
         id: result.id,
+      });
+    }, signal);
+  }
+  function guest(
+    roomId: string,
+    token: string,
+    displayName: string,
+    signal?: AbortSignal,
+  ) {
+    if (user.value || authentication)
+      return Promise.reject(
+        new Error(
+          "当前已有登录或正在登录，请先完成或退出该账号，再进入访客会话。",
+        ),
+      );
+    return authenticate(async (active) => {
+      if (user.value) throw new Error("当前已登录，请先退出该账号。");
+      clear();
+      const result = await api<ServerIdentity>(
+        `/rooms/${encodeURIComponent(roomId)}/guest-session`,
+        "POST",
+        {
+          token,
+          ...(displayName.trim() ? { display_name: displayName.trim() } : {}),
+        },
+        active,
+      );
+      active.throwIfAborted();
+      if (result.guest !== true || result.guest_room_id !== roomId)
+        throw new TypeError("访客会话范围不匹配，请重新确认登录状态。");
+      return readIdentity(active, {
+        username: result.username,
+        csrf: result.csrf,
+        id: result.id,
+        guestRoom: roomId,
       });
     }, signal);
   }
@@ -205,6 +268,7 @@ export const useSession = defineStore("session", () => {
     login,
     register,
     logout,
+    guest,
     updateProfile,
   };
 });

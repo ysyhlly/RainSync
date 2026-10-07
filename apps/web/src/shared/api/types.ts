@@ -14,6 +14,9 @@ export interface Profile extends Avatar {
 export interface Identity extends Profile {
   admin: boolean;
   csrf: string;
+  guest?: boolean;
+  guest_room_id?: string;
+  guest_expires_at?: number;
 }
 export type RoomLifecycle = "active" | "closing" | "closed" | "archived";
 export interface Room {
@@ -25,6 +28,7 @@ export interface Room {
   lifecycle_epoch?: number;
 }
 export interface RoomMember {
+  guest?: boolean;
   id: string;
   username: string;
   display_name: string;
@@ -144,7 +148,16 @@ export interface QueueItem {
   title: string;
   cover: MediaCover;
 }
-export type RoomPermission = "invite" | "kick" | "close" | "play" | "pause" | "seek" | "set_rate" | "change_media" | "queue";
+export type RoomPermission =
+  | "invite"
+  | "kick"
+  | "close"
+  | "play"
+  | "pause"
+  | "seek"
+  | "set_rate"
+  | "change_media"
+  | "queue";
 export interface RoomGrant {
   user_id: string;
   role: "viewer" | "moderator";
@@ -153,7 +166,11 @@ export interface RoomGrant {
   revoked: boolean;
   active: boolean;
 }
-export interface RoomPermissionSnapshot { owner_id: string; self_permissions: RoomPermission[]; members: RoomGrant[] }
+export interface RoomPermissionSnapshot {
+  owner_id: string;
+  self_permissions: RoomPermission[];
+  members: RoomGrant[];
+}
 export interface RoomInvitePolicy {
   expires_in_seconds: number;
   max_uses: number | null;
@@ -162,11 +179,23 @@ export interface RoomInvitePolicy {
   permissions: RoomPermission[];
   grant_expires_in_seconds: number | null;
 }
-export interface RoomInviteRecord extends Omit<RoomInvitation, "token"> { id: string; revoked: boolean; revoked_at?: number | null; expired: boolean; use_count: number }
+export interface RoomInviteRecord extends Omit<RoomInvitation, "token"> {
+  id: string;
+  revoked: boolean;
+  revoked_at?: number | null;
+  expired: boolean;
+  use_count: number;
+}
 export interface RoomInvitation {
-  room_id: string; token: string;
-  id?: string; expires_at?: number; max_uses?: number | null; use_count?: number;
-  invited_user_id?: string | null; role?: "viewer" | "moderator"; permissions?: RoomPermission[];
+  room_id: string;
+  token: string;
+  id?: string;
+  expires_at?: number;
+  max_uses?: number | null;
+  use_count?: number;
+  invited_user_id?: string | null;
+  role?: "viewer" | "moderator";
+  permissions?: RoomPermission[];
 }
 export type InviteStatus = "unused" | "used" | "expired" | "revoked";
 export interface RegistrationInvite {

@@ -222,6 +222,10 @@ async function setup(
     if (extra) return extra;
     const url = new URL(r.request().url()),
       path = url.pathname;
+    if (path.endsWith("/auth/registration-policy"))
+      return r.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     if (path.endsWith("/auth/me"))
       return r.fulfill({
         json: { id: "owner", username: "owner", csrf: "csrf", admin: false },

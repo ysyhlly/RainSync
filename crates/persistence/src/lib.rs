@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use protocol::{Command, RoomState};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use uuid::Uuid;
+pub mod admin_settings;
 pub mod cache;
 pub mod cache_budget;
 pub mod cache_outputs;

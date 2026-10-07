@@ -138,6 +138,9 @@ async fn enqueue_queue(
     {
         return Ok(false);
     }
+    let limit =
+        crate::admin_settings::effective(&mut *tx, crate::admin_settings::Limit::MediaQueue, limit)
+            .await?;
     let active: i64 = sqlx::query_scalar("SELECT count(*) FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id WHERE j.status IN ('queued','running') AND NOT p.stopped AND p.expires_at>clock_timestamp() AND playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch)")
         .fetch_one(&mut **tx).await?;
     if active >= limit {

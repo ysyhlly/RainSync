@@ -23,7 +23,7 @@ pub async fn status(
     h: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Response> {
-    let user = auth(&app, &h, false).await?;
+    let user = auth_viewer(&app, &h, false).await?;
     if !user.admin {
         member(&app, &user, id).await?;
     }

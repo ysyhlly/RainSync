@@ -152,7 +152,7 @@ pub(super) async fn admit(
             "native_other_live_provider_unavailable",
         ));
     }
-    let user = auth(app, headers, false).await?;
+    let user = auth_viewer(app, headers, false).await?;
     if !hex64(&query.token) {
         return Err(invalid());
     }

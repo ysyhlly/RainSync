@@ -722,7 +722,7 @@ pub(crate) async fn import_one_with_frozen(
 /// details are gated by this room's current membership, never the global cache.
 pub(crate) async fn scoped_read(app: &App, viewer: Uuid, room: Uuid, media: Uuid) -> Result<Value> {
     let allowed: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2)",
+        "SELECT EXISTS(SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2 AND (guest_is_account($2) OR guest_room_allowed($2,$1)))",
     )
     .bind(room)
     .bind(viewer)
@@ -731,14 +731,14 @@ pub(crate) async fn scoped_read(app: &App, viewer: Uuid, room: Uuid, media: Uuid
     if !allowed {
         return Err(err(StatusCode::FORBIDDEN, "not_a_member"));
     }
-    let row = sqlx::query("SELECT x.media_id,x.provider,x.content_id,x.part,x.title,x.duration_ms,x.resource_kind,x.ep_id,x.aid,x.cid,x.season_id,x.live_room_id,x.live_uid,x.live_broadcast_id,x.live_started_at,x.live_resource,x.canonical_url FROM room_platform_media x JOIN media_items m ON m.id=x.media_id JOIN room_members rm ON rm.room_id=x.room_id AND rm.user_id=$1 WHERE x.room_id=$2 AND x.media_id=$3 AND m.available")
+    let row = sqlx::query("SELECT x.media_id,x.provider,x.content_id,x.part,x.title,x.duration_ms,x.resource_kind,x.ep_id,x.aid,x.cid,x.season_id,x.live_room_id,x.live_uid,x.live_broadcast_id,x.live_started_at,x.live_resource,x.canonical_url FROM room_platform_media x JOIN media_items m ON m.id=x.media_id JOIN room_members rm ON rm.room_id=x.room_id AND rm.user_id=$1 WHERE x.room_id=$2 AND x.media_id=$3 AND m.available AND (guest_is_account($1) OR library_media_allowed($1,m.id,'play',$2))")
         .bind(viewer).bind(room).bind(media).fetch_optional(&app.db).await?;
     if let Some(row) = row {
         return Ok(dto(&row));
     }
     // Ordinary reads join sources and consequently cannot reveal native
     // placeholders belonging to another room.
-    let row=sqlx::query(&format!("{} WHERE {} AND m.id=$2 AND EXISTS(SELECT 1 FROM room_members WHERE room_id=$3 AND user_id=$1)",media_titles::SELECT,media_titles::VISIBLE))
+    let row=sqlx::query(&format!("{} WHERE {} AND m.id=$2 AND EXISTS(SELECT 1 FROM room_members WHERE room_id=$3 AND user_id=$1) AND (guest_is_account($1) OR library_media_allowed($1,m.id,'play',$3))",media_titles::SELECT,media_titles::VISIBLE))
         .bind(viewer).bind(media).bind(room).fetch_optional(&app.db).await?
         .ok_or_else(||err(StatusCode::NOT_FOUND,"media_not_found"))?;
     Ok(media_titles::media(&row))
@@ -748,7 +748,7 @@ pub async fn scoped_detail(
     h: HeaderMap,
     Path((room, media)): Path<(Uuid, Uuid)>,
 ) -> Result<Response> {
-    let user = auth(&app, &h, false).await?;
+    let user = auth_viewer(&app, &h, false).await?;
     Ok(media_titles::private_json(
         scoped_read(&app, user.id, room, media).await?,
     ))

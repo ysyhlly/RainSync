@@ -12,11 +12,11 @@ let fixture;
 try {
   await isolatedServer('distributed-compute-admission', async f => {
     fixture = f;
-    assert.equal(f.sql('SELECT max(version) FROM _sqlx_migrations'), '86');
+    assert.equal(f.sql('SELECT max(version) FROM _sqlx_migrations'), '88');
     assert.equal(f.sql('SELECT count(*) FROM _sqlx_migrations WHERE version=82 AND success'), '1');
     assert.equal(f.sql(`SELECT enabled||':'||slots||':'||output_budget_bytes FROM distributed_compute_policy WHERE agent_id='${legacyAgent}'`), 'false:1:67108864');
     assert.equal(f.sql(`SELECT array_to_string(capabilities,',') FROM distributed_compute_nodes WHERE agent_id='${legacyAgent}'`), recipes.slice(0, 2).join(','));
-    report.checks.push('SQLx upgrades immutable 1–81 schema through 86 including HD migration 82; legacy capabilities and disabled 1-slot/64-MiB policy remain unchanged');
+    report.checks.push('SQLx upgrades immutable 1–81 schema through 88 including HD migration 82; legacy capabilities and disabled 1-slot/64-MiB policy remain unchanged');
     const admin = f.client(); await admin.login();
     const created = await admin.request('/agents', 'POST', { name: 'owned HD admission node' });
     const agent = { id: created.id, ...(await admin.request('/agents/pair', 'POST', { code: created.pair_code })) };

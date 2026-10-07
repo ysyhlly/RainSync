@@ -1,6 +1,7 @@
 import type { Page, WebSocketRoute } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { mediaRecord, missingCover } from "./media";
+import { defaultAdminSettings } from "./admin-settings";
 export const appBase = "";
 export async function appFixture(
   page: Page,
@@ -58,6 +59,12 @@ export async function appFixture(
       url = new URL(request.url()),
       path = url.pathname.replace("/api/v1", "");
     let value: unknown = { ok: true };
+    if (path === "/admin/settings" && request.method() === "GET")
+      return route.fulfill({ json: defaultAdminSettings });
+    if (path === "/auth/registration-policy")
+      return route.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     if (path === "/auth/me")
       return route.fulfill({
         status: authenticated ? 200 : 401,

@@ -35,6 +35,10 @@ for (const predecessor of ["login", "register"]) {
       const name = (await request.allHeaders()).cookie?.match(
         /(?:^|; )probe_session=([^;]+)/,
       )?.[1];
+      if (path === "/auth/registration-policy")
+        return route.fulfill({
+          json: { registration_mode: "invite_only", guests_enabled: false },
+        });
       if (path === "/auth/login" || path === "/auth/register") {
         const submitted = request.postDataJSON().username;
         if (submitted === "alice") {

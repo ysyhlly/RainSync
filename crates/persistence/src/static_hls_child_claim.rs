@@ -419,6 +419,12 @@ pub async fn claim(
     ensure!(parent_live, "static_hls_child_parent_unavailable");
     let active: i64 = sqlx::query_scalar("SELECT count(*) FROM (SELECT id FROM playback_sessions WHERE user_id=$1 AND id<>$2 AND NOT stopped AND expires_at>clock_timestamp() UNION SELECT session_id FROM playback_requests WHERE user_id=$1 AND status='pending' AND lease_until>clock_timestamp()) active")
         .bind(user).bind(parent_session).fetch_one(&mut *tx).await?;
+    let quota = crate::admin_settings::effective(
+        &mut tx,
+        crate::admin_settings::Limit::PlaybackSessions,
+        quota,
+    )
+    .await?;
     ensure!(active < quota, "too_many_playback_sessions");
     // The unique parent reference is persisted before parent stop or high-water
     // changes. Root lifetime is copied, never restarted at child preparation.

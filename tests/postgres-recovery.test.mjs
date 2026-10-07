@@ -27,16 +27,16 @@ async function frozenControllerMigrations(directory) {
   const migrations = (await readdir(directory))
     .filter((name) => /^\d+_[^.]+\.sql$/.test(name))
     .sort();
-  // Keep this contract explicit when appending migrations. Versions 79-86 add room lifecycle, fixed HD recipes,
-  // source/plugin settings, media hierarchy, and private library tombstones.
+  // Keep this contract explicit when appending migrations. Versions 79-88 add room lifecycle, fixed HD recipes,
+  // source/plugin settings, media hierarchy, private library tombstones, and administrator admission overrides, and scoped guests.
   assert.equal(
     migrations.length,
-    85,
+    87,
     "test must explicitly track controller migration baseline",
   );
   assert.deepEqual(
     migrations.map((name) => Number(name.split("_")[0])),
-    Array.from({ length: 86 }, (_, index) => index + 1).filter(
+    Array.from({ length: 88 }, (_, index) => index + 1).filter(
       (version) => version !== 63,
     ),
     "test must explicitly track the frozen migration version set",
@@ -44,7 +44,7 @@ async function frozenControllerMigrations(directory) {
   return migrations;
 }
 
-test("frozen controller migration inventory is 1-86 with version 63 absent", async () => {
+test("frozen controller migration inventory is 1-88 with version 63 absent", async () => {
   // Validate the pinned baseline even when the native PostgreSQL drill is skipped.
   await frozenControllerMigrations(resolve("migrations"));
 });
@@ -289,7 +289,7 @@ test(
 );
 
 test(
-  "frozen RainSync 1-86 schema checksums survive an isolated empty-database recovery",
+  "frozen RainSync 1-88 schema checksums survive an isolated empty-database recovery",
   {
     skip: !process.env.RAINSYNC_NATIVE_POSTGRES_BIN
       ? "set RAINSYNC_NATIVE_POSTGRES_BIN for isolated PostgreSQL"
@@ -327,7 +327,7 @@ test(
       const baseline = await preflight(fixture.url, {
         migrationsDirectory: directory,
       });
-      assert.equal(baseline.migrations.at(-1).version, 86);
+      assert.equal(baseline.migrations.at(-1).version, 88);
       assert.deepEqual(baseline.candidate_migrations.pending_versions, []);
       await writeFile(keyFile, randomBytes(32), { mode: 0o600, flag: "wx" });
       const backupDirectory = resolve(root, "backup");

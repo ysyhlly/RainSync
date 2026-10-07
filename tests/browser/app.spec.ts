@@ -1,4 +1,5 @@
 import { mediaExtraResponse, mediaRecord } from "./fixtures/media";
+import { defaultAdminSettings } from "./fixtures/admin-settings";
 import { test, expect, type WebSocketRoute } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { navigate, roomPanel, showOptions } from "./fixtures/navigation";
@@ -46,6 +47,12 @@ test("room, library, invitation and settings are usable", async ({
     const extra = mediaExtraResponse(route, libraryMedia);
     if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
+    if (path === "/api/v1/admin/settings" && route.request().method() === "GET")
+      return route.fulfill({ json: defaultAdminSettings });
+    if (path.endsWith("/auth/registration-policy"))
+      return route.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     let body: unknown = [];
     if (path.endsWith("/auth/me"))
       body = { id: "owner", username: "雨声", admin: true, csrf: "test" };
@@ -175,6 +182,10 @@ test("room, library, invitation and settings are usable", async ({
     .getByRole("link", { name: /^(片源管理|管理)$/ })
     .filter({ visible: true })
     .click();
+  await expect(
+    page.getByRole("heading", { name: "管理员设置", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: /片源管理 编辑片源/ }).click();
   await page.getByRole("button", { name: "添加片源", exact: true }).click();
   await expect(page.getByRole("heading", { name: "添加片源" })).toBeVisible();
   await page.getByRole("button", { name: "关闭弹窗" }).click();
@@ -263,6 +274,10 @@ test("rejected WebSocket upgrade rechecks login and stops retrying", async ({
     const extra = mediaExtraResponse(route);
     if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/auth/registration-policy"))
+      return route.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     if (path.endsWith("/auth/me")) {
       return route.fulfill(
         expired
@@ -331,6 +346,10 @@ test("playback retries a lost HTTP response with the same operation key", async 
     const extra = mediaExtraResponse(route);
     if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/auth/registration-policy"))
+      return route.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     if (path.endsWith("/auth/me"))
       return route.fulfill({
         json: { id: "owner", username: "测试", admin: false, csrf: "test" },
@@ -521,6 +540,10 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
     const extra = mediaExtraResponse(route);
     if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/auth/registration-policy"))
+      return route.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     if (path.endsWith("/auth/me"))
       return route.fulfill({
         json: { id: "owner", username: "test", admin: false, csrf: "test" },
@@ -706,6 +729,10 @@ test("subtitle identity survives reload and resets on media change", async ({
     const extra = mediaExtraResponse(route);
     if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/auth/registration-policy"))
+      return route.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     if (path.endsWith("/auth/me"))
       return route.fulfill({
         json: { id: "owner", username: "test", admin: false, csrf: "test" },

@@ -17,6 +17,7 @@ Nginx 需包含 `deploy/nginx-playback.inc.conf` 并验证 Range `206`。
 诊断编号。日志/报告不含 Cookie、播放签名地址、密钥、原始片源凭据或真实用户数据。
 每日任务、异地副本、保留和真实恢复演练见 [备份运维](BACKUP_OPERATIONS.md)。
 计算节点、P2P、控制节点等启用与排空回退见 [高级功能](ADVANCED_FEATURES.md)。
+全局准入上限、恢复部署继承和生效边界见 [管理员设置](ADMIN_SETTINGS.md)。
 
 `tests/deployed-smoke.mjs`、远程媒体、`tests/upstream-real-contracts.mjs`、
 `tests/upstream-real-playback.mjs` 与 Jellyfin/Emby 脚本可能创建测试用户、房间、源、
