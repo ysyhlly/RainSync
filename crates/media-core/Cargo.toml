@@ -14,6 +14,12 @@ url = "2"
 http = "1"
 ipnet = "2"
 protocol.workspace = true
+
+[features]
+# Test-only: default the confinement root to the system temp dir when
+# MEDIA_ROOT is unset. Enabled only via dependents' dev-dependencies.
+test-media-root = []
+
 [dev-dependencies]
 uuid.workspace = true
 

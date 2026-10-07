@@ -182,6 +182,8 @@ async fn supervise_preview<T>(
 ) -> T {
     tokio::pin!(produce, renew);
     tokio::select! {
+        // A producer that already finished must win over a concurrent stop.
+        biased;
         result = &mut produce => result,
         _ = async {
             tokio::select! {

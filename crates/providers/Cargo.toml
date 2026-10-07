@@ -21,3 +21,6 @@ futures-util.workspace = true
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 brotli = "8"
+
+[dev-dependencies]
+media-core = { workspace = true, features = ["test-media-root"] }

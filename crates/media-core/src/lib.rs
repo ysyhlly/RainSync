@@ -74,10 +74,26 @@ pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(full)
 }
 
+/// The deployment media root. Unit tests build fixtures under the system
+/// temporary directory, so they default there when MEDIA_ROOT is unset.
+fn allowed_media_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("MEDIA_ROOT") {
+        return PathBuf::from(root);
+    }
+    #[cfg(any(test, feature = "test-media-root"))]
+    {
+        std::env::temp_dir()
+    }
+    #[cfg(not(any(test, feature = "test-media-root")))]
+    {
+        PathBuf::from("/media")
+    }
+}
+
 /// Local Server/Worker sources must remain within the deployment's media root
 /// at use time, even if a configured directory was replaced after admission.
 pub fn local_media_root(root: &Path) -> Result<PathBuf> {
-    let allowed = std::env::var("MEDIA_ROOT").unwrap_or_else(|_| "/media".into());
+    let allowed = allowed_media_root();
     confined_root(root, Path::new(&allowed))
 }
 
@@ -91,7 +107,7 @@ pub fn confined_root(root: &Path, allowed: &Path) -> Result<PathBuf> {
 pub fn safe_local_path(root: &Path, relative: &str) -> Result<PathBuf> {
     let root = local_media_root(root)?;
     let full = safe_path(&root, relative)?;
-    let allowed = std::env::var("MEDIA_ROOT").unwrap_or_else(|_| "/media".into());
+    let allowed = allowed_media_root();
     anyhow::ensure!(
         full.starts_with(Path::new(&allowed).canonicalize()?),
         "outside_media_root"
@@ -113,7 +129,7 @@ pub fn open_local_file(root: &Path, relative: &str) -> Result<std::fs::File> {
         options.share_mode(windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0);
     }
     let file = options.open(path)?;
-    let allowed = std::env::var("MEDIA_ROOT").unwrap_or_else(|_| "/media".into());
+    let allowed = allowed_media_root();
     let allowed = Path::new(&allowed).canonicalize()?;
     let actual = opened_file_path(&file)?;
     anyhow::ensure!(
@@ -151,7 +167,7 @@ pub fn open_local_directory(root: &Path, relative: &str) -> Result<std::fs::File
     }
     let directory = options.open(path)?;
     let actual = opened_file_path(&directory)?;
-    let allowed = std::env::var("MEDIA_ROOT").unwrap_or_else(|_| "/media".into());
+    let allowed = allowed_media_root();
     anyhow::ensure!(
         actual.starts_with(Path::new(&allowed).canonicalize()?)
             && actual.starts_with(source_root)
