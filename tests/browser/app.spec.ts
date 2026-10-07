@@ -645,7 +645,7 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
   );
   if (!isMobile && !(await page.evaluate(() => !!document.fullscreenElement))) {
     await page.locator("video").hover();
-    await page.getByRole("button", { name: "进入全屏", exact: true }).click();
+    await page.getByRole("button", { name: "仅视频全屏", exact: true }).click();
     await expect
       .poll(() =>
         page.evaluate(() =>
@@ -818,7 +818,7 @@ test("subtitle identity survives reload and resets on media change", async ({
     .toBeGreaterThanOrEqual(2);
   if (!isMobile) {
     await page.locator("video").hover();
-    await page.getByRole("button", { name: "进入全屏", exact: true }).click();
+    await page.getByRole("button", { name: "仅视频全屏", exact: true }).click();
     await expect
       .poll(() =>
         page.evaluate(() =>

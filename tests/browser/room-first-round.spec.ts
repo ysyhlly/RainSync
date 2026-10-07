@@ -74,7 +74,7 @@ test("viewers in an empty room receive the waiting explanation without selection
     page.getByText("等待有控制权限的成员选择影片，你可以先在聊天中交流。"),
   ).toBeVisible();
   await expect(
-    page.getByRole("link", { name: "选择影片", exact: true }),
+    page.getByRole("button", { name: "选择影片", exact: true }),
   ).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "粘贴平台链接", exact: true }),
@@ -202,11 +202,11 @@ test("a collapsed player retains local mute and full-screen controls name their 
   await page.getByRole("link", { name: "返回房间", exact: true }).click();
   if (!isMobile) {
     await page.locator("video").hover();
-    await page.getByRole("button", { name: "进入全屏", exact: true }).click();
+    await page.getByRole("button", { name: "仅视频全屏", exact: true }).click();
     await expect(
-      page.getByRole("button", { name: "退出全屏", exact: true }),
+      page.getByRole("button", { name: "退出仅视频全屏", exact: true }),
     ).toBeVisible();
-    await page.getByRole("button", { name: "退出全屏", exact: true }).click();
+    await page.getByRole("button", { name: "退出仅视频全屏", exact: true }).click();
   }
   await sameVideo(page);
   expect(app.connections()).toBe(1);

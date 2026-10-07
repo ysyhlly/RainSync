@@ -28,7 +28,15 @@ import {
   resizeWidget,
 } from "./layout-geometry";
 
-const props = defineProps<{ layout: LayoutDocument; editing: boolean }>();
+const props = withDefaults(
+  defineProps<{
+    layout: LayoutDocument;
+    editing: boolean;
+    viewing?: boolean;
+    chatVisible?: boolean;
+  }>(),
+  { viewing: false, chatVisible: true },
+);
 const emit = defineEmits<{
   move: [payload: { id: string; x: number; y: number }];
   resize: [payload: { id: string; w: number; h: number }];
@@ -84,16 +92,25 @@ const frames = computed(() =>
     );
   }),
 );
-const canvasStyle = computed<CSSProperties>(() => ({
-  ...(narrow.value
+function frameVisible(item: LayoutItem) {
+  return props.viewing
+    ? item.type === "player" || (item.type === "chat" && props.chatVisible)
+    : liveIds.value.has(item.id);
+}
+const canvasStyle = computed<CSSProperties>(() =>
+  props.viewing
     ? {}
     : {
-        height: `${Math.max(...props.layout.items.map((item) => item.y + item.h), 1) * metrics.value.rowHeight + (props.editing ? 48 : 0)}px`,
-      }),
-  "--room-layout-column-step": `${metrics.value.columnWidth + metrics.value.gap}px`,
-  "--room-layout-row-step": `${metrics.value.rowHeight}px`,
-  "--room-layout-gap": `${metrics.value.gap}px`,
-}));
+        ...(narrow.value
+          ? {}
+          : {
+              height: `${Math.max(...props.layout.items.map((item) => item.y + item.h), 1) * metrics.value.rowHeight + (props.editing ? 48 : 0)}px`,
+            }),
+        "--room-layout-column-step": `${metrics.value.columnWidth + metrics.value.gap}px`,
+        "--room-layout-row-step": `${metrics.value.rowHeight}px`,
+        "--room-layout-gap": `${metrics.value.gap}px`,
+      },
+);
 let observer: ResizeObserver | undefined;
 let ignoreClickUntil = 0;
 
@@ -113,6 +130,7 @@ function boxStyle(item: LayoutItem): CSSProperties {
   };
 }
 function frameStyle(item: LayoutItem): CSSProperties {
+  if (props.viewing) return {};
   if (!narrow.value) return boxStyle(item);
   if (item.type === "player")
     return { height: `${width.value / PLAYER_ASPECT_RATIO}px` };
@@ -504,7 +522,7 @@ defineExpose({ focusWidget, cancelGesture });
     >
       <RoomWidgetFrame
         v-for="item in frames"
-        v-show="liveIds.has(item.id)"
+        v-show="frameVisible(item)"
         :key="item.id"
         :item="item"
         :editing="editing"
@@ -516,7 +534,7 @@ defineExpose({ focusWidget, cancelGesture });
         @gesture="beginGesture"
         @step="step"
         @remove="remove"
-        ><slot name="widget" :item="item" :visible="liveIds.has(item.id)"
+        ><slot name="widget" :item="item" :visible="frameVisible(item)"
       /></RoomWidgetFrame>
       <div
         v-if="preview && gesture?.moved"

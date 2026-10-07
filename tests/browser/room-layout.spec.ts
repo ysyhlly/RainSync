@@ -165,7 +165,7 @@ test("empty room still offers every component and essential room actions", async
   await expectReachable(button(page, "离开观看"));
   await expectReachable(button(page, "房间管理"));
   await expect(
-    page.getByRole("link", { name: "选择影片", exact: true }),
+    page.getByRole("button", { name: "选择影片", exact: true }),
   ).toBeVisible();
   await button(page, "编辑布局").click();
   for (const type of widgetTypes.filter((type) => type !== "player"))
@@ -234,7 +234,7 @@ test("viewers can personalize locally without gaining room control permissions",
   await expect(widget(page, "chat")).toBeHidden();
   await expect(button(page, "邀请")).toHaveCount(0);
   await expect(
-    page.getByRole("link", { name: "选择影片", exact: true }),
+    page.getByRole("button", { name: "选择影片", exact: true }),
   ).toHaveCount(0);
   expect(app.writes).toEqual(writes);
   await expectPlaybackUnchanged(page, app, playback);
@@ -682,7 +682,7 @@ test("fullscreen exit restores the anchor rectangle without replacing or reloadi
   const playback = await rememberPlayback(page, app);
   await expectPlayerAligned(page);
   await page.locator("video").hover();
-  await button(page, "进入全屏").click();
+  await button(page, "仅视频全屏").click();
   await expect
     .poll(() =>
       page.evaluate(() =>
@@ -691,7 +691,7 @@ test("fullscreen exit restores the anchor rectangle without replacing or reloadi
     )
     .toBe(true);
   await expect(page.locator("video")).toHaveCSS("object-fit", "contain");
-  await button(page, "退出全屏").click();
+  await button(page, "退出仅视频全屏").click();
   await expect
     .poll(() => page.evaluate(() => document.fullscreenElement === null))
     .toBe(true);
@@ -708,7 +708,7 @@ test("fullscreen keeps unrelated room errors and dismissal reachable", async ({
   await enterLayoutRoom(page);
   const playback = await rememberPlayback(page, app);
   await page.locator("video").hover();
-  await button(page, "进入全屏").click();
+  await button(page, "仅视频全屏").click();
   await expect
     .poll(() => page.evaluate(() => !!document.fullscreenElement))
     .toBe(true);
@@ -734,7 +734,7 @@ test("fullscreen keeps unrelated room errors and dismissal reachable", async ({
   await notice.getByRole("button", { name: "关闭提示", exact: true }).click();
   await expect(notice).toHaveCount(0);
   await page.locator("video").hover();
-  await button(page, "退出全屏").click();
+  await button(page, "退出仅视频全屏").click();
   await expectPlayerAligned(page);
   await expectPlaybackUnchanged(page, app, playback);
 });

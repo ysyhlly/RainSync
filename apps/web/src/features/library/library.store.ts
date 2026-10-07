@@ -185,6 +185,8 @@ export function createLibraryState(
     refreshKey,
     load,
     browse,
+    // Temporary surfaces can discard and abort their own isolated snapshot.
+    reset,
     loadPage,
     refresh: () => loadPage(page.value),
     retry: () =>

@@ -42,6 +42,9 @@ function close() {
   if (props.busy || (props.canClose && !props.canClose())) return;
   beginClose(true);
 }
+// Child controls (for example a native search field) can request the same
+// guarded dismissal instead of bypassing animation, inertness or focus recovery.
+defineExpose({ close });
 function finishClose() {
   if (!closing.value) return;
   clearTimeout(closeTimer);

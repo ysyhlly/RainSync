@@ -150,8 +150,8 @@ function end() {
     /><slot /><button
       v-if="!mini"
       class="icon-button"
-      :aria-label="fullscreen ? '退出全屏' : '进入全屏'"
-      :title="fullscreen ? '退出全屏' : '进入全屏'"
+      :aria-label="fullscreen ? '退出仅视频全屏' : '仅视频全屏'"
+      :title="fullscreen ? '退出仅视频全屏' : '仅视频全屏'"
       @click="emit('fullscreen')"
     >
       <AppIcon :name="fullscreen ? 'minimize' : 'maximize'" />

@@ -45,7 +45,7 @@ test("compact controls fit narrow videos and retain volume and rate interactions
     const video = await page.locator(".video-frame").boundingBox();
     const controls = await page.locator(".player-chrome").boundingBox();
     expect(controls!.height).toBeLessThanOrEqual(100);
-    for (const label of ["播放选项", "进入全屏"]) {
+    for (const label of ["播放选项", "仅视频全屏"]) {
       const box = await page
         .getByRole("button", { name: label, exact: true })
         .boundingBox();

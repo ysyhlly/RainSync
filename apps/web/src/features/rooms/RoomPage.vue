@@ -1,5 +1,8 @@
 <script setup lang="ts">
 import QueueFeedback from "./QueueFeedback.vue";
+import RoomMediaPicker from "./RoomMediaPicker.vue";
+import RoomViewingToolbar from "./RoomViewingToolbar.vue";
+import { createRoomViewingMode } from "./room-viewing-mode";
 import {
   computed,
   ref,
@@ -8,7 +11,12 @@ import {
   onBeforeUnmount,
   onMounted,
 } from "vue";
-import { useRoute, useRouter } from "vue-router";
+import {
+  useRoute,
+  useRouter,
+  onBeforeRouteLeave,
+  onBeforeRouteUpdate,
+} from "vue-router";
 import { useSession } from "../auth/session.store";
 import { useRoomRuntime } from "./room-runtime";
 import { roomsApi } from "./rooms.api";
@@ -57,15 +65,79 @@ const inviteOpen = ref(false),
   revoking = ref(false),
   managementOpen = ref(false),
   platformOpen = ref(false),
-  catalogOpen = ref(false);
+  catalogOpen = ref(false),
+  mediaPickerOpen = ref(false);
+const canBrowseMedia = computed(
+  () =>
+    !!session.user &&
+    !session.user.guest &&
+    r.roomActive &&
+    (r.can("change_media") || r.can("queue")),
+);
+// Dismiss the temporary picker on Back without adding a synthetic history entry.
+function dismissMediaPicker() {
+  if (!mediaPickerOpen.value) return;
+  mediaPickerOpen.value = false;
+  return false;
+}
+onBeforeRouteLeave(dismissMediaPicker);
+onBeforeRouteUpdate(dismissMediaPicker);
+watch(
+  [() => session.epoch, () => r.room?.id, canBrowseMedia],
+  () => {
+    mediaPickerOpen.value = false;
+  },
+  { flush: "sync" },
+);
 const platformImport = ref<HTMLElement>();
 const layoutCanvas = ref<InstanceType<typeof RoomLayoutCanvas>>();
 const roomPage = ref<HTMLElement>();
+const viewing = createRoomViewingMode(document);
+const {
+  expanded: viewingExpanded,
+  mode: viewingMode,
+  chatVisible,
+  pending: viewingPending,
+  error: viewingError,
+} = viewing;
+// Route guards run after picker dismissal, so Back first closes the picker.
+onBeforeRouteLeave(() => {
+  void viewing.reset();
+});
+onBeforeRouteUpdate(() => {
+  void viewing.reset();
+});
+watch(
+  () => session.epoch,
+  () => {
+    void viewing.reset();
+  },
+);
+function viewingKey(event: KeyboardEvent) {
+  if (
+    event.key !== "Escape" ||
+    event.defaultPrevented ||
+    document.fullscreenElement ||
+    viewing.browser.value ||
+    document.querySelector("dialog[open]")
+  )
+    return;
+  if (viewing.webpage.value) {
+    event.preventDefault();
+    void viewing.toggleWebpage();
+  }
+}
+onMounted(() => document.addEventListener("keydown", viewingKey));
+onBeforeUnmount(() => {
+  document.removeEventListener("keydown", viewingKey);
+  void viewing.dispose();
+});
 const breakpoint = ref<LayoutBreakpoint>(
   window.innerWidth < NARROW_BREAKPOINT_PX ? "narrow" : "wide",
 );
 let widthObserver: ResizeObserver | undefined;
 function updateBreakpoint(width: number) {
+  if (viewingExpanded.value) return;
   const next: LayoutBreakpoint =
     width < NARROW_BREAKPOINT_PX ? "narrow" : "wide";
   if (next === breakpoint.value) return;
@@ -84,6 +156,18 @@ onMounted(() => {
   widthObserver.observe(roomPage.value);
 });
 onBeforeUnmount(() => widthObserver?.disconnect());
+let viewingScroll = { x: 0, y: 0 };
+watch(viewingExpanded, async (expanded) => {
+  if (expanded) viewingScroll = { x: window.scrollX, y: window.scrollY };
+  layoutCanvas.value?.cancelGesture();
+  if (!expanded) {
+    await nextTick();
+    if (roomPage.value) {
+      updateBreakpoint(roomPage.value.clientWidth);
+      window.scrollTo(viewingScroll.x, viewingScroll.y);
+    }
+  }
+});
 const {
   layout,
   editing,
@@ -295,7 +379,15 @@ async function transferOwnership() {
 }
 </script>
 <template>
-  <section ref="roomPage" class="room-content room-modular-page">
+  <section
+    ref="roomPage"
+    class="room-content room-modular-page"
+    :class="{
+      'room-viewing-expanded': viewingExpanded,
+      'room-viewing-with-chat': viewingExpanded && chatVisible,
+    }"
+    :data-viewing-mode="viewingMode"
+  >
     <Notice v-if="!inviteOpen && !managementOpen" :message="error" error />
     <Notice
       v-if="!ownershipOpen && !inviteOpen && !managementOpen"
@@ -307,7 +399,28 @@ async function transferOwnership() {
       <RouterLink class="button" to="/rooms">返回放映室</RouterLink>
     </div>
     <template v-else>
+      <RoomViewingToolbar
+        :mode="viewingMode"
+        :chat-visible="chatVisible"
+        :pending="viewingPending"
+        :editing="editing"
+        :title="r.state?.media_id ? r.currentTitle : (r.room?.name ?? '放映室')"
+        @webpage="viewing.toggleWebpage"
+        @browser="viewing.toggleBrowser"
+        @chat="viewing.toggleChat"
+      >
+        <button
+          v-if="viewingExpanded && canBrowseMedia"
+          type="button"
+          aria-haspopup="dialog"
+          @click="mediaPickerOpen = true"
+        >
+          <AppIcon name="movie" />选择影片
+        </button>
+      </RoomViewingToolbar>
+      <Notice :message="viewingError" error class="room-viewing-error" />
       <div
+        v-show="!viewingExpanded"
         class="room-command-bar"
         :class="{ 'room-command-bar--editing': editing }"
       >
@@ -325,12 +438,13 @@ async function transferOwnership() {
             >
           </div>
           <div class="button-row">
-            <RouterLink
-              v-if="r.can('change_media')"
-              class="button"
-              to="/library"
-              ><AppIcon name="movie" />选择影片</RouterLink
+            <button
+              v-if="canBrowseMedia"
+              aria-haspopup="dialog"
+              @click="mediaPickerOpen = true"
             >
+              <AppIcon name="movie" />选择影片
+            </button>
             <button
               v-if="r.can('queue') && r.roomActive"
               :disabled="!r.connected"
@@ -379,6 +493,8 @@ async function transferOwnership() {
         ref="layoutCanvas"
         :layout="layout"
         :editing="editing"
+        :viewing="viewingExpanded"
+        :chat-visible="chatVisible"
         @move="({ id, x, y }) => move(id, x, y)"
         @resize="({ id, w, h }) => resize(id, w, h)"
         @remove="remove"
@@ -472,8 +588,12 @@ async function transferOwnership() {
             <div class="queue-widget-heading">
               <span class="helper">{{ r.playlist.length }} 部待播</span>
               <div v-if="r.can('queue')" class="button-row">
-                <RouterLink class="button" to="/library"
-                  ><AppIcon name="plus" />添加影片</RouterLink
+                <button
+                  v-if="canBrowseMedia"
+                  aria-haspopup="dialog"
+                  @click="mediaPickerOpen = true"
+                >
+                  <AppIcon name="plus" />添加影片</button
                 ><button :disabled="!r.connected" @click="showPlatformImport">
                   平台链接
                 </button>
@@ -564,6 +684,7 @@ async function transferOwnership() {
         @locate="focusWidget"
       />
     </template>
+    <RoomMediaPicker v-model="mediaPickerOpen" />
     <AppDialog v-model="platformOpen" title="添加平台视频" drawer>
       <div ref="platformImport" class="room-platform-import">
         <PlatformMediaImport v-if="r.roomActive && r.can('queue')" />

@@ -1274,3 +1274,166 @@
     grid-template-columns: 84px minmax(0, 1fr) auto;
   }
 }
+
+/* Viewing modes are a temporary presentation of the same mounted widgets. */
+.room-viewing-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  min-width: 0;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--room-line);
+}
+.room-viewing-toolbar__title {
+  display: flex;
+  align-items: baseline;
+  flex: 1 1 180px;
+  gap: 10px;
+  min-width: 0;
+  font-size: 13px;
+}
+.room-viewing-toolbar__title strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.room-viewing-toolbar__title span {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.room-viewing-toolbar__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.room-viewing-toolbar button {
+  min-height: 38px;
+  padding: 7px 11px;
+  border-color: var(--room-line);
+  background: var(--surface-panel);
+  font-size: 13px;
+}
+.room-viewing-toolbar button[aria-pressed="true"] {
+  border-color: var(--border-control);
+  background: var(--accent-soft);
+}
+/* No imperative body styles/classes to leak after a route change. */
+html:has(.room-viewing-expanded),
+body:has(.room-viewing-expanded) {
+  overflow: hidden;
+}
+.app-layout:has(.room-viewing-expanded)
+  > :is(.sidebar, .mobile-header, .bottom-nav, .skip-link) {
+  display: none;
+}
+.app-layout.room-layout-active.authenticated
+  .workspace.watch-layout:has(.room-viewing-expanded) {
+  position: fixed;
+  z-index: 30;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  width: 100%;
+  max-width: none;
+  height: 100dvh;
+  margin: 0;
+  padding: 14px 18px;
+  overflow: hidden;
+  background: var(--surface-canvas);
+}
+.room-viewing-expanded {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  width: 100%;
+  min-height: 0;
+  padding: 0;
+}
+.room-viewing-expanded > .room-viewing-toolbar {
+  position: relative;
+  z-index: 4;
+  flex: 0 0 auto;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+}
+.room-viewing-expanded > .notice,
+.workspace:has(.room-viewing-expanded) > .global-notice {
+  flex: 0 1 auto;
+  max-height: 25dvh;
+  overflow: auto;
+}
+.room-viewing-expanded > .room-pending-selection {
+  display: none;
+}
+.room-viewing-expanded > .room-layout-workspace {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+.room-viewing-expanded .room-layout-canvas {
+  display: grid;
+  flex: 1 1 0;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  gap: 16px;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+}
+.room-viewing-expanded.room-viewing-with-chat .room-layout-canvas {
+  grid-template-columns: minmax(0, 1fr) clamp(300px, 25vw, 400px);
+}
+.room-viewing-expanded .room-widget {
+  position: relative;
+  width: auto;
+  height: 100%;
+  min-height: 0;
+}
+.room-viewing-expanded .room-widget[data-widget-type="player"] {
+  grid-column: 1;
+  grid-row: 1;
+}
+.room-viewing-expanded .room-widget[data-widget-type="chat"] {
+  grid-column: 2;
+  grid-row: 1;
+}
+.room-viewing-expanded
+  .room-widget[data-widget-type="player"]
+  > .room-widget__body {
+  container: viewing-player / size;
+  justify-content: center;
+}
+.room-viewing-expanded .room-player-anchor {
+  width: min(100cqw, calc(100cqh * 16 / 9));
+  height: auto;
+  aspect-ratio: 16 / 9;
+}
+@media (max-width: 767px) {
+  .app-layout.room-layout-active.authenticated
+    .workspace.watch-layout:has(.room-viewing-expanded) {
+    padding: 10px;
+  }
+  .room-viewing-toolbar button {
+    min-height: 44px;
+  }
+  .room-viewing-expanded .room-viewing-toolbar__title {
+    flex-basis: 100%;
+  }
+  .room-viewing-expanded.room-viewing-with-chat .room-layout-canvas {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(180px, 42%);
+    gap: 10px;
+  }
+  .room-viewing-expanded .room-widget[data-widget-type="chat"] {
+    grid-column: 1;
+    grid-row: 2;
+  }
+}
