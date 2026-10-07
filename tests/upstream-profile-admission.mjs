@@ -686,10 +686,11 @@ try {
         assert.equal(response.body.session_id, undefined);
         assert.equal(response.body.playback_url, undefined);
       };
-      const error = (response, status, code) => {
+      const error = (response, status, code, context = "response") => {
         noPlan(response);
-        assert.equal(response.status, status);
-        if (code) assert.equal(response.body.error?.code, code);
+        const message = `${context}: ${JSON.stringify(safeResponse(response))}`;
+        assert.equal(response.status, status, message);
+        if (code) assert.equal(response.body.error?.code, code, message);
       };
       async function setup(
         kind,
@@ -2113,9 +2114,25 @@ try {
                 );
               }
               const rejected = await prepare(subject, body);
-              error(rejected, 409, "STALE_CAPABILITY_REPORT");
-              assert.equal(count(subject), 1);
               record.rejections.push({ name, ...safeResponse(rejected) });
+              if (rejected.status !== 409 || rejected.body.error?.code !== "STALE_CAPABILITY_REPORT") {
+                // Observe only safe lifecycle facts after the rejection. Never
+                // retain resource, plan, checkpoint, binding or credentials.
+                record.replay_failure_state = {
+                  name,
+                  observed_at: new Date().toISOString(),
+                  request: requestRow(body.idempotency_key),
+                  reservation: ledger(id),
+                  session: read(
+                    `SELECT jsonb_build_object('stopped',stopped,'unexpired',expires_at>clock_timestamp(),'source_allowed',playback_source_allowed(media_id,resource,id)) FROM playback_sessions WHERE id=${quote(id)}`,
+                  ),
+                  account_policy: read(
+                    `SELECT jsonb_build_object('state',a.state,'reason',a.reason,'fresh',a.valid_until>clock_timestamp(),'generation_matches',a.generation=(p.resource->>'account_policy_generation')::bigint) FROM source_account_policies a JOIN playback_sessions p ON p.id=${quote(id)} WHERE a.source_id=${quote(subject.source.id)}`,
+                  ),
+                };
+              }
+              error(rejected, 409, "STALE_CAPABILITY_REPORT", name);
+              assert.equal(count(subject), 1, name);
             }
           } finally {
             restore();

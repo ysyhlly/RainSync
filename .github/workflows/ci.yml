@@ -86,3 +86,12 @@ jobs:
           path: ${{ runner.temp }}/rainsync-validation/server-readiness/*/report.json
           if-no-files-found: ignore
           retention-days: 7
+      - name: Retain upstream profile admission failure report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-profile-admission-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          # Only the controlled fixture's safe report, never databases or logs.
+          path: ${{ runner.temp }}/rainsync-validation/upstream-profile-admission/*/report.json
+          if-no-files-found: ignore
+          retention-days: 7
