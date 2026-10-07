@@ -478,7 +478,7 @@ mod playback_tests {
             command
                 .args([
                     "--exact",
-                    "tests::local_library_exceeding_ten_thousand_is_not_discarded",
+                    "playback_tests::local_library_exceeding_ten_thousand_is_not_discarded",
                     "--nocapture",
                     "--test-threads=1",
                 ])
