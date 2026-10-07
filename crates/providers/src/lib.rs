@@ -81,22 +81,29 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
     );
     match kind {
         "local" => {
-            let root = std::path::PathBuf::from(&config.root).canonicalize()?;
+            let root = media_core::local_media_root(std::path::Path::new(&config.root))?;
             tokio::task::spawn_blocking(move || {
-                let mut stack = vec![root.clone()];
+                let mut stack = vec![(
+                    media_core::open_local_directory(&root, "")?,
+                    std::path::PathBuf::new(),
+                )];
                 let mut items = vec![];
-                while let Some(dir) = stack.pop() {
-                    for entry in std::fs::read_dir(dir)? {
+                while let Some((directory, relative)) = stack.pop() {
+                    let input = media_core::local_process_input(&directory, &root.join(&relative))?;
+                    for entry in std::fs::read_dir(input)? {
                         let entry = entry?;
                         let ty = entry.file_type()?;
+                        let p = relative.join(entry.file_name());
                         if ty.is_symlink() {
                             continue;
                         };
                         if ty.is_dir() {
-                            stack.push(entry.path());
+                            stack.push((
+                                media_core::open_local_directory(&root, &p.to_string_lossy())?,
+                                p,
+                            ));
                             continue;
                         };
-                        let p = entry.path();
                         let ext = p
                             .extension()
                             .and_then(|x| x.to_str())
@@ -105,10 +112,7 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
                         if ["mp4", "mkv", "webm", "mov", "m4v"].contains(&ext.as_str()) {
                             items.push(Item {
                                 title: p.file_stem().unwrap().to_string_lossy().into(),
-                                resource: p
-                                    .strip_prefix(&root)?
-                                    .to_string_lossy()
-                                    .replace('\\', "/"),
+                                resource: p.to_string_lossy().replace('\\', "/"),
                                 duration_ms: None,
                                 metadata: json!({}),
                             });
@@ -132,6 +136,50 @@ pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> 
         "emby" => emby::list_items(config).await,
         "s3" => s3::list_items(config).await,
         _ => bail!("source_requires_agent_index"),
+    }
+}
+
+/// Hold the integrator's current-source fence for each browsing request.
+pub async fn list_items_guarded<G, F, Fut>(
+    kind: &str,
+    config: &SourceConfig,
+    mut guard: F,
+) -> Result<Vec<Item>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<G>>,
+{
+    match kind {
+        "jellyfin" | "emby" => {
+            upstream_common::list_guarded(
+                config,
+                upstream_headers(kind, config, "rainsync-library-scan")?,
+                guard,
+            )
+            .await
+        }
+        _ => {
+            let _guard = guard().await?;
+            list_items(kind, config).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod guarded_scan_tests {
+    #[tokio::test]
+    async fn changed_source_fence_rejects_before_opening_the_next_request() {
+        let config: super::SourceConfig = serde_json::from_value(serde_json::json!({
+            "url":"http://127.0.0.1:1", "token":"test-only", "user_id":"test-only"
+        }))
+        .unwrap();
+        for kind in ["http", "jellyfin", "emby"] {
+            let result = super::list_items_guarded(kind, &config, || {
+                std::future::ready(Err::<(), _>(anyhow::anyhow!("source_changed")))
+            })
+            .await;
+            assert_eq!(result.unwrap_err().to_string(), "source_changed");
+        }
     }
 }
 

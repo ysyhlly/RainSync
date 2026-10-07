@@ -3,6 +3,16 @@ use super::*;
 use media_core::static_hls::{CaptureEvidence, PublicationLease};
 use sha2::{Digest, Sha256};
 
+/// COMMIT was sent, so retry requires observing the same original row first.
+#[derive(Debug)]
+pub struct PublicationCommitUncertain;
+impl std::fmt::Display for PublicationCommitUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("static_hls_publication_commit_uncertain")
+    }
+}
+impl std::error::Error for PublicationCommitUncertain {}
+
 /// A prepared, encrypted immutable reply, retaining its actual graph witness.
 /// This is an internal storage boundary, not the public playback response DTO.
 pub struct ParentPublication {
@@ -141,8 +151,13 @@ impl PersistedPendingCapturePermit {
             .bind(self.permit.session).bind(&publication.response).execute(&mut *tx).await?.rows_affected();
         ensure!(changed == 1, "static_hls_parent_publication_unconfirmed");
         publication.witness.live_evidence()?;
-        tx.commit().await?;
-        publication.witness.live_evidence()?;
+        tx.commit()
+            .await
+            .map_err(|error| anyhow::Error::new(error).context(PublicationCommitUncertain))?;
+        publication
+            .witness
+            .live_evidence()
+            .map_err(|error| error.context(PublicationCommitUncertain))?;
         Ok(Some(publication.response))
     }
 

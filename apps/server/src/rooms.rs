@@ -293,28 +293,8 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                 let reducer_time_ms = app.now();
                 // The final reduction belongs to the transaction, with the
                 // current role and exact originating login held through commit.
-                let mut media_id = match req.command.action {
-                    protocol::Action::ChangeMedia { media_id } => Some(media_id),
-                    _ => state.media_id,
-                };
-                if state.live.is_some() && matches!(req.command.action, protocol::Action::EndMedia { .. }) {
-                    return Err("native_live_end_unsupported".to_string());
-                }
-                if matches!(req.command.action, protocol::Action::EndMedia { .. }) {
-                    let mut ids: Vec<Uuid> = sqlx::query_scalar("SELECT q.media_id FROM playlist_items q WHERE q.room_id=$1 AND room_media_allowed(q.room_id,q.media_id) ORDER BY q.sort_order,q.id")
-                        .bind(id).fetch_all(&app.db).await.map_err(|_| "database_error")?;
-                    // Legacy playlists may contain duplicates. Without an item cursor,
-                    // repeated media must not trap advancement at its first occurrence.
-                    let mut seen = std::collections::HashSet::new();
-                    ids.retain(|media| seen.insert(*media));
-                    if !ids.is_empty() {
-                        let index = ids.iter().position(|media| Some(*media) == state.media_id);
-                        media_id = Some(ids[index.map_or(0, |i| (i + 1) % ids.len())]);
-                    }
-                }
                 let mut resolved_media = None;
-                if matches!(req.command.action, protocol::Action::ChangeMedia { .. } | protocol::Action::EndMedia { .. }) {
-                    let media_id = media_id.ok_or("no_media")?;
+                if let protocol::Action::ChangeMedia { media_id } = req.command.action {
                     let duration = sqlx::query(
                         "SELECT CASE WHEN m.source_id IS NULL THEN e.duration_ms ELSE m.duration_ms END AS duration_ms FROM media_items m LEFT JOIN room_platform_media e ON e.media_id=m.id AND e.room_id=$2 WHERE m.id=$1 AND room_media_allowed($2,m.id)",
                     )
@@ -797,7 +777,17 @@ pub async fn messages(
         .fetch_all(&app.db)
         .await?
     } else if let Some(after) = cursor.after {
-        sqlx::query(&format!("{} WHERE c.room_id=$1 AND (NOT EXISTS(SELECT 1 FROM chat_messages WHERE id=$2 AND room_id=$1) OR (c.created_at,c.id) > (SELECT created_at,id FROM chat_messages WHERE id=$2 AND room_id=$1)) ORDER BY c.created_at,c.id LIMIT 100", chat_message_select(false))).bind(id).bind(after).fetch_all(&app.db).await?
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat_messages WHERE id=$1 AND room_id=$2)",
+        )
+        .bind(after)
+        .bind(id)
+        .fetch_one(&app.db)
+        .await?;
+        if !exists {
+            return Err(err(StatusCode::BAD_REQUEST, "chat_cursor_not_found"));
+        }
+        sqlx::query(&format!("{} WHERE c.room_id=$1 AND (c.created_at,c.id) > (SELECT created_at,id FROM chat_messages WHERE id=$2 AND room_id=$1) ORDER BY c.created_at,c.id LIMIT 100", chat_message_select(false))).bind(id).bind(after).fetch_all(&app.db).await?
     } else {
         sqlx::query(&format!("SELECT * FROM ({} WHERE c.room_id=$1 ORDER BY c.created_at DESC,c.id DESC LIMIT 100) history ORDER BY created_at,id", chat_message_select(true))).bind(id).fetch_all(&app.db).await?
     };

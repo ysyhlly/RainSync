@@ -67,6 +67,11 @@ pub async fn change(
         .execute(&mut *tx)
         .await?;
     // Migration 0024 invalidates previews once when config_encrypted changes.
+    sqlx::query("UPDATE source_scans SET generation=$2 WHERE source_id=$1")
+        .bind(id)
+        .bind(Uuid::new_v4())
+        .execute(&mut *tx)
+        .await?;
     admin_settings::finish(tx, &user, &login).await?;
     // Release the source lock before taking session/cleanup locks. Readers and
     // final publication are already fenced by the committed source revision.

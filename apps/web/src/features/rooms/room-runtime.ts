@@ -367,6 +367,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
   );
   async function enter(r: Room) {
     if (room.value?.id === r.id) {
+      if (playlistPending && !playlistLoaded.value) return playlistPending;
       await playlistPending?.catch(() => {});
       if (room.value?.id === r.id) await refreshPlaylist();
       return;
@@ -550,7 +551,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       if (!v.state && typeof v.control_epoch?.id === "string")
         controlEpoch = v.control_epoch.id;
       if (v.type === "PLAYLIST_CHANGED") {
-        if (v.room_id === selected) invalidatePlaylist();
+        if (v.room_id === undefined || v.room_id === selected) invalidatePlaylist();
         return;
       }
       if (v.type === "ROOM_PERMISSIONS_CHANGED") {

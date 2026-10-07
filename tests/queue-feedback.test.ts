@@ -348,7 +348,33 @@ it("retries a failed initial playlist fetch in the same room without replacing i
   expect(sockets).toHaveLength(1);
   expect(sockets[0].close).not.toHaveBeenCalled();
   await r.enter(room);
-  expect(reads).toBe(2);
+  expect(reads).toBe(3);
+});
+
+it("focus and foreground wake refresh the current queue through the existing coalescer", async () => {
+  const { runtime: r, api } = fixture();
+  let reads = 0;
+  api.mockImplementation(async path => path.endsWith("/playlist") ? rows([`queue-${++reads}`]) : []);
+  await r.refreshPlaylist();
+  window.dispatchEvent(new Event("focus"));
+  await vi.waitFor(() => expect(r.playlist).toEqual(rows(["queue-2"])));
+  Object.assign(document, { visibilityState: "hidden" });
+  document.dispatchEvent(new Event("visibilitychange"));
+  Object.assign(document, { visibilityState: "visible" });
+  document.dispatchEvent(new Event("visibilitychange"));
+  await vi.waitFor(() => expect(r.playlist).toEqual(rows(["queue-3"])));
+});
+
+it("returning to a loaded same room refreshes its queue and preserves its socket", async () => {
+  const { runtime: r, api, sockets } = fixture();
+  let reads = 0;
+  api.mockImplementation(async path => path.endsWith("/playlist") ? rows([`queue-${++reads}`]) : []);
+  queueConnection(r, sockets);
+  await r.refreshPlaylist();
+  await r.enter(room);
+  expect(r.playlist).toEqual(rows(["queue-2"]));
+  expect(sockets).toHaveLength(1);
+  expect(sockets[0].close).not.toHaveBeenCalled();
 });
 
 it("same-room entry shares its pending initial read", async () => {

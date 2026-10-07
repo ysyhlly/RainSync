@@ -115,9 +115,24 @@ pub async fn claim_with_limit(
     Ok(Some(attempt))
 }
 pub async fn renew(db: &PgPool, a: &Attempt) -> anyhow::Result<bool> {
+    let mut tx = db.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout='750ms'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout='1500ms'")
+        .execute(&mut *tx)
+        .await?;
+    // Lock first, then evaluate wall-clock expiry in a new statement. The
+    // initial UPDATE predicate can be evaluated before waiting for a row lock.
+    sqlx::query("SELECT media_id FROM media_previews WHERE media_id=$1 FOR UPDATE")
+        .bind(a.media_id)
+        .execute(&mut *tx)
+        .await?;
     let changed=sqlx::query(&format!("UPDATE media_previews p SET lease_until=clock_timestamp()+interval '15 seconds' FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=p.media_id AND p.media_id=$1 AND p.attempt_id=$2 AND p.owner_id=$3 AND p.status='running' AND p.lease_until>clock_timestamp() AND {VALID} AND {FRESH}"))
-        .bind(a.media_id).bind(a.attempt_id).bind(a.owner_id).execute(db).await?;
-    Ok(changed.rows_affected() == 1)
+        .bind(a.media_id).bind(a.attempt_id).bind(a.owner_id).execute(&mut *tx).await?;
+    let renewed = changed.rows_affected() == 1;
+    tx.commit().await?;
+    Ok(renewed)
 }
 pub async fn finish(
     db: &PgPool,
@@ -127,6 +142,12 @@ pub async fn finish(
     budget: i64,
 ) -> anyhow::Result<bool> {
     let mut tx = db.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout='750ms'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout='1500ms'")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(LOCK)
         .execute(&mut *tx)
@@ -142,6 +163,10 @@ pub async fn finish(
             .execute(&mut *tx)
             .await?;
     }
+    sqlx::query("SELECT media_id FROM media_previews WHERE media_id=$1 FOR UPDATE")
+        .bind(a.media_id)
+        .execute(&mut *tx)
+        .await?;
     let oversized = image.is_some_and(|(bytes, _)| bytes.len() as i64 > budget);
     let image = image.filter(|_| !oversized);
     let retry = retry && !oversized;

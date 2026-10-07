@@ -420,8 +420,8 @@ try {
   assert.equal(report.driver.physicalDisposalProven, true);
   assert.equal(report.driver.passed.length, 58);
   assert.equal(report.driver.preparation.complete, true);
-  assert.equal(report.driver.preparation.passed, 9);
-  assert.equal(Object.keys(report.driver.preparation.cases).length, 9);
+  assert.equal(report.driver.preparation.passed, 10);
+  assert.equal(Object.keys(report.driver.preparation.cases).length, 10);
   assert.equal(report.driver.preparation.cases["prepare-short-1500"].preparation_budget_ms, 1500);
   assert.equal(
     (

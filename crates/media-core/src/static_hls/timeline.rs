@@ -228,7 +228,10 @@ fn parse_playlist_mode(text: &str, source_metadata: bool) -> Result<Playlist> {
             pending_range = Some(raw.to_owned());
         } else if let Some(raw) = line.strip_prefix("#EXTINF:") {
             check(duration.is_none(), "duplicate_duration")?;
-            let raw = raw.strip_suffix(',').unwrap_or("");
+            let raw = raw
+                .split_once(',')
+                .map(|(duration, _)| duration)
+                .unwrap_or("");
             let valid = match raw.split_once('.') {
                 Some((whole, decimal)) => digits(whole) && digits(decimal) && decimal.len() <= 6,
                 None => digits(raw),
@@ -298,7 +301,7 @@ fn parse_playlist_mode(text: &str, source_metadata: bool) -> Result<Playlist> {
     check(
         segments
             .iter()
-            .all(|s| s.duration.ceil() <= f64::from(target.unwrap())),
+            .all(|s| s.duration.round() <= f64::from(target.unwrap())),
         "target_duration_mismatch",
     )?;
     let map = map.unwrap();
@@ -1742,6 +1745,22 @@ mod tests {
 
     fn rejects<T: std::fmt::Debug>(result: Result<T>, reason: &str) {
         assert!(result.unwrap_err().to_string().contains(reason));
+    }
+
+    #[test]
+    fn extinf_titles_and_nearest_integer_target_duration_are_valid() {
+        let source = manifest(&["10.1"], 0)
+            .replace("#EXT-X-TARGETDURATION:32", "#EXT-X-TARGETDURATION:10")
+            .replace("#EXTINF:10.1,", "#EXTINF:10.1,Segment one, title");
+        assert_eq!(parse_playlist(&source).unwrap().segments[0].duration, 10.1);
+        rejects(
+            parse_playlist(&source.replace("#EXTINF:10.1,", "#EXTINF:10.5,")),
+            "target_duration_mismatch",
+        );
+        rejects(
+            parse_playlist(&source.replace("10.1,Segment", "10.1Segment")),
+            "duration_format",
+        );
     }
 
     #[test]

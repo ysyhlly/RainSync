@@ -87,8 +87,8 @@ impl OwnedLocalInput {
             crate::file_version::valid_file_version(expected_version),
             "advanced_media_source_version_required"
         );
-        let path = crate::safe_path(root, resource)?;
-        let file = File::open(&path)?;
+        let path = crate::safe_local_path(root, resource)?;
+        let file = crate::open_local_file(root, resource)?;
         let snapshot = crate::file_version::snapshot_file(&file)?;
         ensure!(snapshot.version == expected_version, "source_changed");
         Ok(Self {
@@ -368,15 +368,26 @@ mod tests {
             std::fs::read(owner.decoder_path().unwrap()).unwrap(),
             b"original"
         );
-        std::fs::rename(&path, root.join("original.mkv")).unwrap();
-        std::fs::write(&path, b"replaced").unwrap();
-        assert!(owner.verify().is_err());
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            std::fs::read(owner.decoder_path().unwrap()).unwrap(),
-            b"original"
-        );
-        drop(owner);
+        #[cfg(windows)]
+        {
+            let error = std::fs::rename(&path, root.join("original.mkv")).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            owner.verify().unwrap();
+            drop(owner);
+            std::fs::rename(&path, root.join("original.mkv")).unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::rename(&path, root.join("original.mkv")).unwrap();
+            std::fs::write(&path, b"replaced").unwrap();
+            assert!(owner.verify().is_err());
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                std::fs::read(owner.decoder_path().unwrap()).unwrap(),
+                b"original"
+            );
+            drop(owner);
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

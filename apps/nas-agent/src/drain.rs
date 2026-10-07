@@ -1,4 +1,6 @@
-//! Receipts describe completed resource disposal, never merely cancelled futures.
+//! Receipts prove no remaining dispatch resource owners, including positively
+//! NeverStarted dispatches that opened no file or socket. This does not assert
+//! successful transfer; cancelling already-started blocking work is insufficient.
 use anyhow::{Context, Result};
 use std::{
     collections::BTreeSet,

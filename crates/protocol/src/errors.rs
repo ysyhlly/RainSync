@@ -186,6 +186,7 @@ pub enum ErrorCode {
     PlatformPlanRefreshRequired,
     DedicatedPlatformEndpointRequired,
     InvalidRequest,
+    ChatCursorNotFound,
     UnsupportedPlaybackMetricsVersion,
     InvalidPlaybackMetrics,
     PlaybackMetricsNotNegotiated,
@@ -748,6 +749,7 @@ impl ErrorCode {
             | Self::UpstreamDeviceProfileRequired => "设备没有兼容的播放方式",
             Self::InvalidAudioTrack => "所选音轨不可用",
             Self::NoMedia => "请先选择影片",
+            Self::ChatCursorNotFound => "聊天记录游标已失效，请重新加载最近消息",
             Self::SourceInUse => "此片源正在播放或准备播放，请先停止相关播放后再删除",
             Self::SourceManagedElsewhere => "此片源由 NAS 设备或所属媒体库管理，请到对应页面操作",
             Self::NotFound | Self::MediaNotFound | Self::NoMediaSource => {

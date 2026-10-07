@@ -46,6 +46,7 @@ pub(super) struct Registry(Arc<Owners>);
 #[derive(Default)]
 struct Owners {
     accepting: AtomicBool,
+    reaping: AtomicBool,
     entries: Mutex<HashMap<Uuid, Arc<Entry>>>,
     retired_controls: Mutex<HashMap<Uuid, RetiredControl>>,
 }
@@ -58,6 +59,8 @@ struct Entry {
     cancelled: AtomicBool,
     admitted: AtomicBool,
     admission_attempted: AtomicBool,
+    retired_without_capture: AtomicBool,
+    root_until_ms: u64,
     input_sha256: String,
     owner: OnceLock<Arc<PersistedPendingCapturePermit>>,
     control: OnceLock<CaptureControl>,
@@ -210,6 +213,48 @@ impl Registry {
     }
     pub(super) fn open(&self) {
         self.0.accepting.store(true, Ordering::SeqCst);
+        if !self.0.reaping.swap(true, Ordering::SeqCst) {
+            let weak = Arc::downgrade(&self.0);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let Some(owners) = weak.upgrade() else { break };
+                    let registry = Registry(owners);
+                    registry.reap().await;
+                    if !registry.0.accepting.load(Ordering::SeqCst) {
+                        registry.0.reaping.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            });
+        }
+    }
+    async fn reap(&self) {
+        let Ok(now) = now_ms() else {
+            return;
+        };
+        let mut entries = self.0.entries.lock().await;
+        let mut retired = self.0.retired_controls.lock().await;
+        retired.retain(|_, kept| kept.root_until_ms > now);
+        entries.retain(|operation, entry| {
+            if !entry.reclaimable() {
+                return true;
+            }
+            if let Some(control) = entry.control.get().filter(|_| entry.root_until_ms > now) {
+                if retired.len() >= 4096 && !retired.contains_key(operation) {
+                    return true;
+                }
+                retired.insert(
+                    *operation,
+                    RetiredControl {
+                        input_sha256: entry.input_sha256.clone(),
+                        root_until_ms: entry.root_until_ms,
+                        control: control.clone(),
+                    },
+                );
+            }
+            false
+        });
     }
     pub(super) async fn close(&self) {
         self.0.accepting.store(false, Ordering::SeqCst);
@@ -258,6 +303,7 @@ impl Registry {
     ) -> Result<OperationResult> {
         let identity = loaded.input.identity_statement();
         let operation = Uuid::parse_str(&identity.operation_id)?;
+        self.reap().await;
         let mut entries = self.0.entries.lock().await;
         if let Some(entry) = entries.get(&operation).cloned() {
             ensure!(
@@ -331,6 +377,18 @@ impl Registry {
                 },
             ));
         }
+        let terminal: Option<String> = sqlx::query_scalar("SELECT error_code FROM playback_requests WHERE session_id=$1 AND static_hls_input_sha256=$2 AND status='failed' AND error_code LIKE 'static_hls_operation_refused_%'")
+            .bind(Uuid::parse_str(&identity.session_id)?).bind(loaded.input.input_sha256())
+            .fetch_optional(&app.db).await?;
+        if let Some(reason) = terminal.and_then(|code| {
+            code.strip_prefix("static_hls_operation_refused_")
+                .and_then(|reason| serde_json::from_value::<Reason>(json!(reason)).ok())
+        }) {
+            return Ok(OperationResult::Refused {
+                capture_id: None,
+                reason,
+            });
+        }
         if action != Action::Create || !self.0.accepting.load(Ordering::SeqCst) {
             return Ok(OperationResult::Unknown {
                 capture_id: None,
@@ -349,6 +407,8 @@ impl Registry {
             cancelled: AtomicBool::new(false),
             admitted: AtomicBool::new(false),
             admission_attempted: AtomicBool::new(false),
+            retired_without_capture: AtomicBool::new(false),
+            root_until_ms: loaded.input.root_deadline_ms(),
             owner: OnceLock::new(),
             control: OnceLock::new(),
             state: Mutex::new(EntryState::Capture),
@@ -365,7 +425,7 @@ impl Registry {
         // HTTP receipt. Cancellation cannot drop a just-committed opaque permit.
         *entry.task.lock().await = Some(tokio::spawn(async move {
             let result = prepare_owned(&app, &loaded, &registry, &own, operation, rpc_until).await;
-            *own.state.lock().await = result.unwrap_or_else(|_| {
+            let state = result.unwrap_or_else(|_| {
                 if own.admission_attempted.load(Ordering::SeqCst) {
                     // A failed receipt is not evidence that COMMIT did not
                     // happen. Keep the operation and any original permit;
@@ -378,6 +438,29 @@ impl Registry {
                     }
                 }
             });
+            if let EntryState::Refused {
+                admitted: false,
+                reason,
+            } = &state
+            {
+                // Persist the terminal non-admission before freeing memory.
+                // Even a stale Create observation then cannot admit this UUID.
+                let code = format!(
+                    "static_hls_operation_refused_{}",
+                    serde_json::to_value(reason).unwrap().as_str().unwrap()
+                );
+                loop {
+                    if loaded.cancel(&app.db, 503, &code).await.is_ok() {
+                        own.retired_without_capture.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    if !registry.0.accepting.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+            *own.state.lock().await = state;
         }));
         Ok(OperationResult::Pending {
             capture_id: operation.to_string(),
@@ -447,15 +530,37 @@ impl Registry {
                     .unwrap(),
                 );
             }
-            *own.publication.lock().await = if matches!(result, Ok(true)) {
-                PublicationState::Committed
-            } else {
-                // A lost COMMIT acknowledgment is observed from the original
-                // runtime owner. Never start a replacement capture/publication.
-                PublicationState::Uncertain
-            };
+            *own.publication.lock().await = publication_outcome(&result);
         }));
         Ok(())
+    }
+}
+
+impl Entry {
+    fn reclaimable(&self) -> bool {
+        let finished = |task: &Mutex<Option<tokio::task::JoinHandle<()>>>| {
+            task.try_lock()
+                .is_ok_and(|task| task.as_ref().is_none_or(|task| task.is_finished()))
+        };
+        finished(&self.task)
+            && finished(&self.publication_task)
+            && (self.retired_without_capture.load(Ordering::SeqCst)
+                || self
+                    .control
+                    .get()
+                    .is_some_and(|control| control.disposal_state() == DisposalState::Disposed))
+    }
+}
+
+fn publication_outcome(result: &Result<bool>) -> PublicationState {
+    match result {
+        Ok(true) => PublicationState::Committed,
+        Err(error) if error.is::<pending::PublicationCommitUncertain>() => {
+            PublicationState::Uncertain
+        }
+        // No COMMIT was issued. The same verified owner may obtain a fresh
+        // publication witness and retry within its original deadline.
+        _ => PublicationState::Dormant,
     }
 }
 
@@ -624,9 +729,29 @@ async fn status(app: &App, entry: &Entry, operation: Uuid) -> Result<OperationRe
             at,
             audio,
         } => {
-            if snapshot.live_evidence().is_ok()
-                && owner.check().await.is_ok()
-                && snapshot.live_evidence().is_ok()
+            let live_before = snapshot.live_evidence().is_ok();
+            let authority = if live_before {
+                Some(owner.check().await)
+            } else {
+                None
+            };
+            let live_after = snapshot.live_evidence().is_ok();
+            #[cfg(all(test, target_os = "linux"))]
+            if (!live_before
+                || !authority.as_ref().is_some_and(|result| result.is_ok())
+                || !live_after)
+                && std::env::var("RAINSYNC_OWNED_TEST_RUN_ID").is_ok()
+            {
+                // Owned-fixture diagnostic only; preserve the actual original
+                // failure without altering unknown/expiry/disposal semantics.
+                let _ = std::fs::write(app.cache.join(format!("status-failure-{operation}.json")),
+                    serde_json::to_vec_pretty(&json!({"scope":"owned-fixture-only",
+                    "snapshot_before":live_before,"snapshot_after":live_after,
+                    "authority_error":authority.as_ref().and_then(|result|result.as_ref().err()).map(|error|error.to_string()),
+                    "capture_diagnostic":snapshot.diagnostic_failure(),
+                    "control_disposal":entry.control.get().map(|control|format!("{:?}",control.disposal_state()))})).unwrap());
+            }
+            if live_before && authority.as_ref().is_some_and(|result| result.is_ok()) && live_after
             {
                 let publication = entry.publication.lock().await;
                 if !matches!(*publication, PublicationState::Dormant) {
@@ -858,5 +983,79 @@ fn call_authority(action: Action, loaded: &LoadedOperation) -> CallAuthority<'_>
         })
     } else {
         CallAuthority::ObservationOnly
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn empty_entry() -> Entry {
+        Entry {
+            cancelled: AtomicBool::new(false),
+            admitted: AtomicBool::new(false),
+            admission_attempted: AtomicBool::new(false),
+            retired_without_capture: AtomicBool::new(false),
+            root_until_ms: 0,
+            input_sha256: String::new(),
+            owner: OnceLock::new(),
+            control: OnceLock::new(),
+            state: Mutex::new(EntryState::Unknown),
+            task: Mutex::new(None),
+            publication: Mutex::new(PublicationState::Dormant),
+            publication_task: Mutex::new(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn reaper_frees_retired_refusals_but_retains_unknown_admission_and_live_tasks() {
+        let registry = Registry::default();
+        let unknown = Arc::new(empty_entry());
+        let retired = Arc::new(empty_entry());
+        retired
+            .retired_without_capture
+            .store(true, Ordering::SeqCst);
+        let working = Arc::new(empty_entry());
+        working
+            .retired_without_capture
+            .store(true, Ordering::SeqCst);
+        let (send, receive) = tokio::sync::oneshot::channel::<()>();
+        *working.task.lock().await = Some(tokio::spawn(async {
+            let _ = receive.await;
+        }));
+        {
+            let mut entries = registry.0.entries.lock().await;
+            entries.insert(Uuid::from_u128(1), unknown);
+            entries.insert(Uuid::from_u128(2), retired);
+            entries.insert(Uuid::from_u128(3), working.clone());
+        }
+        registry.reap().await;
+        assert_eq!(registry.0.entries.lock().await.len(), 2);
+        send.send(()).unwrap();
+        working.task.lock().await.take().unwrap().await.unwrap();
+        registry.reap().await;
+        assert_eq!(registry.0.entries.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn only_commit_uncertainty_prevents_original_owner_publication_retry() {
+        assert!(matches!(
+            publication_outcome(&Err(anyhow::anyhow!("lock_timeout"))),
+            PublicationState::Dormant
+        ));
+        assert!(matches!(
+            publication_outcome(&Ok(false)),
+            PublicationState::Dormant
+        ));
+        assert!(matches!(
+            publication_outcome(&Err(anyhow::Error::new(
+                pending::PublicationCommitUncertain
+            ))),
+            PublicationState::Uncertain
+        ));
+        assert!(matches!(
+            publication_outcome(&Ok(true)),
+            PublicationState::Committed
+        ));
     }
 }

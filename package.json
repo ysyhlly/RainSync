@@ -10,6 +10,7 @@
     "build": "npm run build -w apps/web",
     "test": "vitest run",
     "test:backend-contracts": "node --test tests/backend-cleanup-contract.test.mjs",
+    "test:review-regressions": "node tests/login-admission-regressions.mjs && node tests/source-mutation-authority.mjs && node tests/playlist-chat-regressions.mjs && node tests/preview-lease-regressions.mjs && node tests/http-transport-classification.mjs",
     "test:accounts": "node tests/account-rules.mjs && node tests/registration-invites.mjs && node tests/registration.mjs && node tests/avatar-upload.mjs && node tests/platform-login-rate-limit.mjs",
     "test:e2e": "playwright test",
     "test:library-player-real": "node tests/library-player-real.mjs",

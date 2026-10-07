@@ -4,8 +4,9 @@ use super::{OwnedLocalInput, SubtitleKind};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::fs::File;
 use std::{
-    fs::File,
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
 };
@@ -69,7 +70,7 @@ fn associated(source: &str, index: u32, kind: SubtitleKind) -> Option<String> {
 }
 fn asset_path(root: &Path, resource: &str, directory: bool) -> Result<PathBuf> {
     ensure!(relative(resource), "advanced_asset_association_required");
-    let root = root.canonicalize()?;
+    let root = crate::local_media_root(root)?;
     let mut at = root.clone();
     for component in Path::new(resource).components() {
         at.push(component);
@@ -194,7 +195,8 @@ impl AssetCatalog {
                 Ok(p) => p,
                 Err(_) => return Ok(None),
             };
-            let f = File::open(path)?;
+            let _ = path;
+            let f = crate::open_local_file(root, &resource)?;
             let snap = crate::file_version::snapshot_file(&f)?;
             let bytes = f.metadata()?.len();
             ensure!(bytes > 0 && bytes <= max, "advanced_asset_bound");
@@ -213,8 +215,8 @@ impl AssetCatalog {
             if let Some(file) =
                 observe(associated(source, index, kind).unwrap(), MAX_SUBTITLE_BYTES)?
             {
-                let path = asset_path(root, &file.resource, false)?;
-                let mut reader = File::open(path)?;
+                asset_path(root, &file.resource, false)?;
+                let mut reader = crate::open_local_file(root, &file.resource)?;
                 let mut bytes = Vec::new();
                 std::io::Read::by_ref(&mut reader)
                     .take(MAX_SUBTITLE_BYTES + 1)
@@ -227,7 +229,8 @@ impl AssetCatalog {
         let mut fonts = Vec::new();
         let relative_dir = font_directory(source);
         if let Ok(path) = asset_path(root, &relative_dir.to_string_lossy(), true) {
-            for entry in std::fs::read_dir(path)? {
+            let directory = crate::open_local_directory(root, &relative_dir.to_string_lossy())?;
+            for entry in std::fs::read_dir(crate::local_process_input(&directory, &path)?)? {
                 let entry = entry?;
                 if !entry.file_type()?.is_file() {
                     continue;
@@ -245,7 +248,8 @@ impl AssetCatalog {
                 }
                 ensure!(fonts.len() < 64, "advanced_asset_bound");
                 if let Some(f) = observe(rel, MAX_FONT_BYTES)? {
-                    let mut file = File::open(asset_path(root, &f.resource, false)?)?;
+                    asset_path(root, &f.resource, false)?;
+                    let mut file = crate::open_local_file(root, &f.resource)?;
                     let mut magic = [0u8; 4];
                     if file.read_exact(&mut magic).is_ok()
                         && matches!(&magic, b"\x00\x01\x00\x00" | b"OTTO" | b"ttcf")

@@ -3,6 +3,7 @@ import { createPinia, setActivePinia } from "pinia";
 import { ref } from "vue";
 import { useRoomRuntime } from "../apps/web/src/features/rooms/room-runtime";
 import { useSession } from "../apps/web/src/features/auth/session.store";
+import { RequestFailure } from "../apps/web/src/errors";
 import type { Clock } from "../packages/sync-engine";
 
 const playback = vi.hoisted(() => ({
@@ -402,6 +403,109 @@ it("remote seek preserves an existing authentication error", async () => {
     });
     expect(s.runtime.error).toBe("登录已失效，请重新登录");
     expect(playback.apply).toHaveBeenLastCalledWith(true, true);
+  } finally {
+    s.runtime.$dispose();
+  }
+});
+
+it.each([["ACK", "EVENT"], ["EVENT", "ACK"]])("applies a committed seek once for %s then %s", async (first, second) => {
+  const s = await setup();
+  try {
+    const socket = s.sockets[0];
+    socket.onopen();
+    s.snapshot();
+    playback.apply.mockClear();
+    const event = { action: { type: "SEEK" }, state: { ...s.state, revision: 2, anchor_position_ms: 30000 } };
+    s.frame(socket, { ...event, type: first });
+    s.frame(socket, { ...event, type: second });
+    expect(playback.apply).toHaveBeenCalledOnce();
+    expect(playback.apply).toHaveBeenLastCalledWith(true, true);
+    s.frame(socket, { ...event, type: "EVENT", state: { ...event.state, revision: 3 } });
+    expect(playback.apply).toHaveBeenCalledTimes(2);
+  } finally {
+    s.runtime.$dispose();
+  }
+});
+
+it("equal revisions still apply refreshed control metadata and closing lifecycle", async () => {
+  const s = await setup();
+  try {
+    const socket = s.sockets[0];
+    socket.onopen();
+    s.snapshot();
+    playback.apply.mockClear();
+    s.frame(socket, { type: "ACK", state: s.state, control_epoch: { id: "new-control" } });
+    expect(playback.apply).not.toHaveBeenCalled();
+    s.runtime.send("PLAY");
+    expect(JSON.parse(socket.send.mock.calls.at(-1)[0])).toMatchObject({ type: "PLAY", control_epoch: "new-control" });
+    playback.reset.mockClear();
+    s.frame(socket, { type: "EVENT", state: s.state, lifecycle: "closed", lifecycle_epoch: 2, control_epoch: null });
+    expect(s.runtime.room?.lifecycle).toBe("closed");
+    expect(playback.reset).toHaveBeenCalledOnce();
+    expect(playback.apply).not.toHaveBeenCalled();
+  } finally {
+    s.runtime.$dispose();
+  }
+});
+
+it("equal revisions in a new clock epoch still apply snapshot metadata and recalibrate", async () => {
+  const s = await setup();
+  try {
+    const socket = s.sockets[0];
+    socket.onopen();
+    s.snapshot();
+    s.reply(socket, s.requests()[0]);
+    expect(s.clock.ready).toBe(true);
+    s.frame(socket, {
+      type: "SNAPSHOT", state: { ...s.state, clock_epoch: "next-clock" },
+      owner_id: "next-owner", control_epoch: { id: "next-control" },
+    });
+    expect(s.runtime.state?.clock_epoch).toBe("next-clock");
+    expect(s.runtime.room?.owner_id).toBe("next-owner");
+    expect(s.clock.ready).toBe(false);
+    s.reply(socket, s.requests().at(-1), "next-clock");
+    expect(s.clock.ready).toBe(true);
+  } finally {
+    s.runtime.$dispose();
+  }
+});
+
+
+it("a deleted chat cursor falls back once to latest history and deduplicates live messages", async () => {
+  const s = await setup();
+  try {
+    s.runtime.messages = [{ id: "deleted", body: "previous" } as any];
+    let latest!: (value: any) => void;
+    const api = vi.spyOn(s.session, "api").mockImplementation(async (path: string) => {
+      if (path.endsWith("?after=deleted")) throw new RequestFailure({ error: { code: "CHAT_CURSOR_NOT_FOUND" } });
+      if (path.endsWith("/messages")) return new Promise(resolve => latest = resolve);
+      return [] as any;
+    });
+    const socket = s.sockets[0];
+    socket.onopen();
+    await vi.advanceTimersByTimeAsync(0);
+    s.frame(socket, { type: "CHAT", id: "latest-99", body: "arrived live" });
+    latest(Array.from({ length: 100 }, (_, i) => ({ id: `latest-${i}`, body: "latest" })));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.mock.calls.filter(([path]) => path.includes("/messages") && !path.includes("check_ids="))).toHaveLength(2);
+    expect(s.runtime.messages).toHaveLength(101);
+    expect(s.runtime.messages.filter(m => m.id === "latest-99")).toHaveLength(1);
+    expect(s.runtime.messages.at(-1)?.body).toBe("arrived live");
+    expect(s.runtime.error).toBe("");
+  } finally {
+    s.runtime.$dispose();
+  }
+});
+
+it("a repeated full chat page cannot produce an infinite cursor cycle", async () => {
+  const s = await setup();
+  try {
+    const page = Array.from({ length: 100 }, (_, i) => ({ id: `message-${i}`, body: "message" }));
+    const api = vi.spyOn(s.session, "api").mockImplementation(async (path: string) => path.includes("/messages") && !path.includes("check_ids=") ? page : [] as any);
+    s.sockets[0].onopen();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.mock.calls.filter(([path]) => path.includes("/messages") && !path.includes("check_ids="))).toHaveLength(2);
+    expect(s.runtime.messages).toHaveLength(100);
   } finally {
     s.runtime.$dispose();
   }

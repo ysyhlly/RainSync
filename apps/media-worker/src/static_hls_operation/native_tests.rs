@@ -1204,8 +1204,59 @@ async fn owned_worker_operation_round_trip() -> Result<()> {
         .await?;
     ensure!(extra == 0, "quota refusal admitted capture");
     std::fs::remove_file(&quota_file)?;
+    let limited_operation = Uuid::parse_str(&limited.identity_statement().operation_id)?;
+    // Positively retired non-admission is persisted before memory is reclaimed.
+    // Explicitly collect it so this checks the durable tombstone replay path.
+    for _ in 0..50 {
+        app.static_hls_operations.reap().await;
+        if !app
+            .static_hls_operations
+            .0
+            .entries
+            .lock()
+            .await
+            .contains_key(&limited_operation)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    ensure!(
+        !app.static_hls_operations
+            .0
+            .entries
+            .lock()
+            .await
+            .contains_key(&limited_operation),
+        "non-admitted owner was not reclaimed"
+    );
+    let (_, limited_query) = reply(&client, &url, &app, &limited, Action::Query).await?;
     let (_, limited_cancel) = reply(&client, &url, &app, &limited, Action::Cancel).await?;
-    ensure!(limited_cancel["result"]["kind"] == "cancel_requested");
+    for observed in [&limited_query, &limited_cancel] {
+        ensure!(
+            observed["result"]["kind"] == "refused"
+                && observed["result"]["reason"] == "capacity"
+                && observed["result"]["capture_id"].is_null()
+        );
+    }
+    let (recreate_wire, _, mut recreate_probe) = envelope(&app, &limited, Action::Create).await?;
+    reject_wire(
+        &client,
+        &url,
+        recreate_wire,
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await?;
+    recreate_probe.remove_owned()?;
+    let after_refusal: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM static_hls_captures WHERE id=$1")
+            .bind(limited_operation)
+            .fetch_one(&db)
+            .await?;
+    ensure!(
+        after_refusal == 0 && reads.load(Ordering::SeqCst) == before,
+        "reclaimed refusal recreated a capture or read its source"
+    );
     let (_, cancelled) = reply(&client, &url, &app, &input, Action::Cancel).await?;
     ensure!(cancelled["result"]["kind"] == "cancel_requested");
     for cancelled_input in [&input, &limited] {
@@ -1219,8 +1270,22 @@ async fn owned_worker_operation_round_trip() -> Result<()> {
         .await?;
         ensure!(
             row.get::<String, _>("status") == "failed"
-                && row.get::<i16, _>("error_status") == 410
-                && row.get::<String, _>("error_code") == "static_hls_operation_cancelled"
+                && row.get::<i16, _>("error_status")
+                    == if cancelled_input.identity_statement().operation_id
+                        == limited.identity_statement().operation_id
+                    {
+                        503
+                    } else {
+                        410
+                    }
+                && row.get::<String, _>("error_code")
+                    == if cancelled_input.identity_statement().operation_id
+                        == limited.identity_statement().operation_id
+                    {
+                        "static_hls_operation_refused_capacity"
+                    } else {
+                        "static_hls_operation_cancelled"
+                    }
         );
     }
     let (revoked_wire, _, mut probe) = envelope(&app, &input, Action::Create).await?;

@@ -319,7 +319,7 @@ async fn prepare(
     // Without a reliable pinned validator, If-Range safely yields the full body.
     if !head
         && !matches!(kind, Some(Kind::Key | Kind::Playlist))
-        && !target.path().ends_with(".m3u8")
+        && !target.path().to_ascii_lowercase().ends_with(".m3u8")
         && !(kind.is_none() && q.execution.is_some())
         && !h.contains_key(header::IF_RANGE)
         && h.get_all(header::RANGE).iter().count() == 1
@@ -347,7 +347,7 @@ async fn prepare(
     }
     let headers = response.headers().clone();
     let declared = kind == Some(Kind::Playlist)
-        || final_target.path().ends_with(".m3u8")
+        || final_target.path().to_ascii_lowercase().ends_with(".m3u8")
         || headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -547,7 +547,7 @@ async fn prepare_pinned(
     let config = providers::resource_config(resource).map_err(failure)?;
     let mut previous = identity::load(&app.db, id, target.as_str()).await?;
     let mut declared = kind == Some(Kind::Playlist)
-        || target.path().ends_with(".m3u8")
+        || target.path().to_ascii_lowercase().ends_with(".m3u8")
         || previous
             .as_ref()
             .is_some_and(|state| state.class == Some(Class::Playlist));
@@ -600,8 +600,12 @@ async fn prepare_pinned(
         Range::From(0, Some(1023))
             .validate(status, response.headers())
             .map_err(failure)?;
-        declared |=
-            playlist_headers(response.headers()) || response.url().path().ends_with(".m3u8");
+        declared |= playlist_headers(response.headers())
+            || response
+                .url()
+                .path()
+                .to_ascii_lowercase()
+                .ends_with(".m3u8");
         let mut stream = metric_stream::wrap(
             response.bytes_stream(),
             &app.metrics,
@@ -739,7 +743,8 @@ async fn prepare_pinned(
             "source_seek_unsupported".into(),
         ));
     }
-    declared |= playlist_headers(&headers) || final_target.path().ends_with(".m3u8");
+    declared |=
+        playlist_headers(&headers) || final_target.path().to_ascii_lowercase().ends_with(".m3u8");
     if binary_only && declared {
         // Observe the class before refusing it. A seeded Binary mismatch is
         // durable even if the origin later reverts to its original response.

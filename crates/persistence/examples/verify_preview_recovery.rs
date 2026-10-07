@@ -165,6 +165,59 @@ async fn main() -> anyhow::Result<()> {
     assert!(claim_with_limit(&db, owner, 0).await.is_err());
     assert!(claim_with_limit(&db, owner, 4097).await.is_err());
     println!("PASS: invisible source and invalid limits cannot enter recovery");
+    sqlx::query("DELETE FROM media_previews WHERE media_id=$1")
+        .bind(unavailable)
+        .execute(&db)
+        .await?;
+    // Hold only the preview row, changing nothing while renew/finish begins.
+    // A fresh statement after lock acquisition must see actual expiry.
+    for publish in [false, true] {
+        let locked_id = media(&db, source).await?;
+        ids.push(locked_id);
+        assert!(enqueue(&db, &[locked_id], 1).await?);
+        let locked_attempt = claim_with_limit(&db, owner, 1).await?.unwrap();
+        assert_eq!(locked_attempt.media_id, locked_id);
+        sqlx::query("UPDATE media_previews SET lease_until=clock_timestamp()+interval '0.5 seconds' WHERE media_id=$1")
+            .bind(locked_id).execute(&db).await?;
+        let mut holder = db.begin().await?;
+        sqlx::query("SELECT media_id FROM media_previews WHERE media_id=$1 FOR UPDATE")
+            .bind(locked_id)
+            .execute(&mut *holder)
+            .await?;
+        let observed_db = db.clone();
+        let task = tokio::spawn(async move {
+            if publish {
+                finish(&observed_db, &locked_attempt, None, false, 1024).await
+            } else {
+                renew(&observed_db, &locked_attempt).await
+            }
+        });
+        let mut observed_wait = false;
+        for _ in 0..40 {
+            observed_wait = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT media_id FROM media_previews%')")
+                .fetch_one(&db).await?;
+            if observed_wait {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(observed_wait, "operation did not begin before expiry");
+        tokio::time::sleep(std::time::Duration::from_millis(525)).await;
+        holder.rollback().await?;
+        assert!(
+            !task.await??,
+            "row lock wait revived an expired preview owner"
+        );
+        // This synthetic scheduling fixture never starts a resource owner.
+        // Remove its expired queue row before the next one-slot admission.
+        sqlx::query("DELETE FROM media_previews WHERE media_id=$1")
+            .bind(locked_id)
+            .execute(&db)
+            .await?;
+    }
+    println!(
+        "PASS: observed renew and finish row-lock waits cross expiry without reviving or publishing the old owner"
+    );
     let final_receipts: (i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM media_executions),(SELECT count(*) FROM agent_transfer_runs)",
     )

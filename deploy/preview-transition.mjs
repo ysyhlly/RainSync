@@ -414,7 +414,7 @@ export async function rehearse({
         ];
         await playbackSmoke(f, admin, room, media, "direct", baselineChecks);
         if (!requireSourceAccess) {
-          assert.equal(f.sql("SELECT NOT EXISTS(SELECT 1 FROM sources WHERE kind NOT IN ('local','nas'))"),"t","default fixture exemption cannot cover HTTP/provider sources");
+          assert.equal(f.sql("SELECT NOT EXISTS(SELECT 1 FROM sources WHERE kind NOT IN ('local','agent'))"),"t","default fixture exemption cannot cover HTTP/provider sources");
           assert.equal(f.sql("SELECT NOT EXISTS(SELECT 1 FROM playback_http_representations WHERE identity->'metadata' ? 'final_target_sha256')"),"t","default fixture exemption cannot cover redirect identities");
         }
         const before = await preflight(f.env.DATABASE_URL, {

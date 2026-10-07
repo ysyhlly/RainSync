@@ -353,14 +353,27 @@ async fn delivery_response(
                 .into_response());
         }
         let sidecar = resource["subtitle_files"][index.to_string()].as_str();
-        let input = if resource["kind"] == "local" {
-            media_core::safe_path(
-                std::path::Path::new(resource["root"].as_str().unwrap_or("")),
-                sidecar.unwrap_or(resource["resource"].as_str().unwrap_or("")),
+        let local_input = if resource["kind"] == "local" {
+            Some(
+                media_core::open_local_file(
+                    std::path::Path::new(resource["root"].as_str().unwrap_or("")),
+                    sidecar.unwrap_or(resource["resource"].as_str().unwrap_or("")),
+                )
+                .map_err(failure)?,
+            )
+        } else {
+            None
+        };
+        let input = if let Some(file) = &local_input {
+            media_core::local_process_input(
+                file,
+                &media_core::safe_local_path(
+                    std::path::Path::new(resource["root"].as_str().unwrap_or("")),
+                    sidecar.unwrap_or(resource["resource"].as_str().unwrap_or("")),
+                )
+                .map_err(failure)?,
             )
             .map_err(failure)?
-            .to_string_lossy()
-            .into_owned()
         } else {
             source_url(id, &q.token).map_err(failure)?
         };
@@ -613,7 +626,12 @@ async fn delivery_response(
         return relay::fetch(&app, &resource, &h, head, input_failure, Some(id)).await;
     }
     if resource["kind"] == "local" {
-        let p = media_core::safe_path(
+        let p = media_core::safe_local_path(
+            std::path::Path::new(resource["root"].as_str().unwrap_or("")),
+            resource["resource"].as_str().unwrap_or(""),
+        )
+        .map_err(failure)?;
+        let file = media_core::open_local_file(
             std::path::Path::new(resource["root"].as_str().unwrap_or("")),
             resource["resource"].as_str().unwrap_or(""),
         )
@@ -623,7 +641,7 @@ async fn delivery_response(
             &h,
             head,
             None,
-            None,
+            Some(file),
             resource["source_version"].as_str().map(str::to_owned),
         )
         .await;
@@ -747,13 +765,17 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 cache::reserve_output(&app, &claim).await?;
                 let spec = &claim.spec;
                 source_version::verify(spec).await?;
+                let mut local_input = None;
                 let input = if native {let spec=persistence::native_platform_transcode::validate_spec(spec)?;native_platform_transcode::source_url(&claim,&spec.tracks[0].key,input_failure.token())?} else if let Some(ticket) = spec["input_ticket"].as_str() {
                     let ticket = decrypt(&app, ticket)?;
                     let token = ticket["token"].as_str().ok_or_else(|| anyhow::anyhow!("invalid_input_ticket"))?;
                     format!("{}&execution={}", source_url(claim.id, token)?, input_failure.token())
                 } else {
-                    let path = media_core::safe_path(std::path::Path::new(spec["root"].as_str().unwrap_or("")), spec["resource"].as_str().unwrap_or(""))?;
-                    path.to_str().ok_or_else(|| anyhow::anyhow!("path"))?.to_owned()
+                    let path = media_core::safe_local_path(std::path::Path::new(spec["root"].as_str().unwrap_or("")), spec["resource"].as_str().unwrap_or(""))?;
+                    let file = media_core::open_local_file(std::path::Path::new(spec["root"].as_str().unwrap_or("")),spec["resource"].as_str().unwrap_or(""))?;
+                    let input = media_core::local_process_input(&file, &path)?;
+                    local_input = Some(file);
+                    input
                 };
                 let dir = persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt);
                 child_process::blocking({ let dir=dir.clone(); move || std::fs::create_dir_all(dir) }).await?.map_err(cache::write_error)?;
@@ -774,7 +796,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
                 let confirmed_until = confirmation?
                     .filter(|until| *until > tokio::time::Instant::now())
                     .ok_or_else(|| anyhow::anyhow!("lease_lost_before_spawn"))?;
-                Ok::<_, anyhow::Error>((args, confirmed_until, decoder_input, advanced))
+                Ok::<_, anyhow::Error>((args, confirmed_until, decoder_input, advanced, local_input))
             };
             let prepared = tokio::select! {
                 biased;
@@ -784,7 +806,7 @@ async fn jobs(app: App, mut stop: tokio::sync::watch::Receiver<bool>) {
             let mut execution_stopped = true;
             let mut diagnostic_failure = None;
             let mut result = async {
-                let (args, confirmed_until, input, advanced) = prepared?;
+                let (args, confirmed_until, input, advanced, _local_input) = prepared?;
                 anyhow::ensure!(!*stop.borrow(), "worker_shutdown");
                 let mut command = tokio::process::Command::new("ffmpeg");
         media_core::input_policy::clean_environment(&mut command);

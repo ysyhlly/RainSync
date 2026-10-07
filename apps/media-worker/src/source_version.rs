@@ -46,8 +46,7 @@ pub async fn verify(spec: &Value) -> Result<()> {
     let resource = spec["resource"].as_str().unwrap_or("").to_owned();
     let expected = expected.to_owned();
     let current = media_core::child_process::blocking(move || -> Result<bool> {
-        let path = media_core::safe_path(&root, &resource)?;
-        let file = std::fs::File::open(path)?;
+        let file = media_core::open_local_file(&root, &resource)?;
         Ok(media_core::file_version::snapshot_file(&file)?.version == expected)
     })
     .await?;

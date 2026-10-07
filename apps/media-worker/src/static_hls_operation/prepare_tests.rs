@@ -159,6 +159,115 @@ pub(super) async fn exercise(
         )?;
         Ok(())
     };
+    save("prepare-precommit-retry", &cases)?;
+    let retry_input = seed(app, base).await?;
+    let identity = retry_input.identity_statement();
+    let operation = Uuid::parse_str(&identity.operation_id)?;
+    let session = Uuid::parse_str(&identity.session_id)?;
+    *fixtures.prepare_target.lock().await = Some(operation);
+    // A sequence advances despite transaction rollback. Fail only the first
+    // INSERT for this exact original capture/session, not any authority read.
+    sqlx::raw_sql(&format!(
+        r#"
+        CREATE SEQUENCE rainsync_owned_publication_fault_seq;
+        CREATE FUNCTION rainsync_owned_publication_fault() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.id='{session}'::uuid AND NEW.static_hls_capture_id='{operation}'::uuid
+                AND nextval('rainsync_owned_publication_fault_seq')=1 THEN
+                RAISE EXCEPTION 'owned precommit publication failure' USING ERRCODE='P0001';
+            END IF;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER rainsync_owned_publication_fault BEFORE INSERT ON playback_sessions
+            FOR EACH ROW EXECUTE FUNCTION rainsync_owned_publication_fault();
+    "#
+    ))
+    .execute(&app.db)
+    .await?;
+    let retry_before = reads.load(Ordering::SeqCst);
+    let retry_client = caller("prepare-normal")?;
+    let retained = retry_input.clone();
+    let retry = tokio::spawn(async move {
+        retry_client
+            .prepare_owned_parent(&retained, std::future::pending())
+            .await
+    });
+    let failure_file = app
+        .cache
+        .join(format!("publication-failure-{operation}.json"));
+    let failure: Value = tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            if let Ok(bytes) = std::fs::read(&failure_file) {
+                let value: Value = serde_json::from_slice(&bytes)?;
+                if value["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("owned precommit publication failure"))
+                {
+                    return Ok::<_, anyhow::Error>(value);
+                }
+            }
+            ensure!(
+                !retry.is_finished(),
+                "coordinator ended before exact controlled publication SQL failure"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("controlled original publication never reached its trigger")??;
+    let result = tokio::time::timeout(Duration::from_secs(20), retry).await??;
+    let attempts: i64 =
+        sqlx::query_scalar("SELECT last_value FROM rainsync_owned_publication_fault_seq")
+            .fetch_one(&app.db)
+            .await?;
+    let current = state(app, &retry_input).await?;
+    let retry_calls = counts(fixtures, &retry_input).await?;
+
+    let committed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM static_hls_captures c JOIN playback_sessions p ON p.id=c.session_id WHERE c.id=$1 AND c.session_id=$2 AND p.static_hls_capture_id=c.id AND c.publication_phase='published_parent' AND c.published_at IS NOT NULL)")
+        .bind(operation).bind(session).fetch_one(&app.db).await?;
+    // Keep the actual retry proof even if a separate legacy coordinator's
+    // post-publication confirmation later reports unknown. Unknown stays error.
+    cases.insert("prepare-precommit-retry".into(), json!({"attempts":attempts,
+        "actual_insert_committed":committed,"state":current,"calls":retry_calls,
+        "definite_precommit_failure":failure,"result_error":result.as_ref().err().map(|error|error.to_string()),
+        "source_reads":reads.load(Ordering::SeqCst)-retry_before}));
+    save("prepare-precommit-retry-observed", &cases)?;
+    sqlx::raw_sql("DROP TRIGGER rainsync_owned_publication_fault ON playback_sessions; DROP FUNCTION rainsync_owned_publication_fault(); DROP SEQUENCE rainsync_owned_publication_fault_seq;")
+        .execute(&app.db).await?;
+    ensure!(
+        failure["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("owned precommit publication failure")),
+        "did not observe the exact controlled pre-COMMIT SQL exception: {failure}"
+    );
+    ensure!(
+        attempts == 2 && committed && retry_calls[0] == 1 && retry_calls[2] == 2,
+        "same original owner did not retry its exact failed publication: attempts={attempts} committed={committed} calls={retry_calls:?}"
+    );
+    unchanged_deadlines(&retry_input, &current)?;
+    ensure!(current["captures"] == 1 && current["grants"] == 1);
+    let result = result?;
+    let ParentPreparation::Published { plan } = result else {
+        anyhow::bail!(
+            "same original owner did not return its published parent after definitive retry"
+        );
+    };
+    let plan: protocol::PlaybackPlan = serde_json::from_value(plan)?;
+    ensure!(plan.session_id == session);
+    let resource_count = app
+        .static_hls_operations
+        .original_snapshot(&retry_input)
+        .await?
+        .live_evidence()?
+        .inventory
+        .len();
+    ensure!(
+        reads.load(Ordering::SeqCst) - retry_before == resource_count * 3,
+        "retry repeated capture or skipped original witness validation"
+    );
+    normal.call(&retry_input, Action::Cancel).await?;
+    let closed = disposed(app, &normal, &retry_input).await?;
+    cases.get_mut("prepare-precommit-retry").unwrap()["after_disposal"] = closed;
     for mode in [
         "prepare-normal",
         "prepare-create-delay",
@@ -399,7 +508,7 @@ pub(super) async fn exercise(
     let unchanged = state(app, &input).await?;
     unchanged_deadlines(&input, &unchanged)?;
     ensure!(
-        unchanged["request_status"] == "pending"
+        unchanged["request_status"] == "failed"
             && unchanged["captures"] == 0
             && unchanged["grants"] == 0
             && reads.load(Ordering::SeqCst) == before
@@ -412,5 +521,5 @@ pub(super) async fn exercise(
     );
     drained_calls().await?;
     save("complete", &cases)?;
-    Ok(json!({"complete":true,"cases":cases,"passed":9,"public_hls_activated":false}))
+    Ok(json!({"complete":true,"cases":cases,"passed":10,"public_hls_activated":false}))
 }

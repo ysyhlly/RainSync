@@ -2042,7 +2042,9 @@ it("generation readiness from an invalidated clock cannot replace or restart the
       complete: true,
       available_until_ms: 120000,
     });
-    await expect(recovering).rejects.toThrow("播放准备已取消");
+    await expect(recovering).resolves.toBeUndefined();
+    expect(s.error.value).toBe("");
+    expect(s.runtime.preparation.value.phase).toBe("ready");
     expect(s.el.load).toHaveBeenCalledTimes(loads);
     expect(s.el.src).toBe(source);
     expect(s.seeks).not.toHaveBeenCalled();
@@ -2486,6 +2488,52 @@ it("halts convergence after an initially accepted base is later clamped", async 
     await vi.advanceTimersByTimeAsync(500);
     expect(s.error.value).toBe("");
     expect(s.el.currentTime).toBe(30);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("media replacement detaches the previous grant immediately while calibration is pending", async () => {
+  const s = setup();
+  try {
+    await s.prepare();
+    s.playing();
+    s.invalidate();
+    s.state.value = { ...s.state.value, media_id: "next", media_generation: 2 };
+    s.runtime.mediaChanged();
+    expect(s.el.paused).toBe(true);
+    expect(s.el.src).toBe("");
+    expect(s.runtime.sessionId.value).toBeNull();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.api).toHaveBeenCalledWith("/playback-sessions/session-1", "DELETE", undefined, expect.any(AbortSignal));
+    expect(playbackPosts(s)).toHaveLength(1);
+    s.clock.ready = true;
+    s.runtime.onClockReady();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(playbackPosts(s)).toHaveLength(2);
+    expect(playbackPosts(s)[1][2]).toMatchObject({ media_generation: 2 });
+    expect(s.error.value).toBe("");
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("clearing the current media closes the old session without requiring clock calibration", async () => {
+  const s = setup();
+  try {
+    await s.prepare();
+    s.invalidate();
+    s.state.value = { ...s.state.value, media_id: null as any, media_generation: 2 };
+    s.runtime.mediaChanged();
+    expect(s.el.src).toBe("");
+    expect(s.runtime.sessionId.value).toBeNull();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.api.mock.calls.some(([path, method]) => path === "/playback-sessions/session-1" && method === "DELETE")).toBe(true);
+    s.clock.ready = true;
+    s.runtime.onClockReady();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(playbackPosts(s)).toHaveLength(1);
+    expect(s.runtime.preparation.value.phase).toBe("idle");
   } finally {
     s.cleanup();
   }

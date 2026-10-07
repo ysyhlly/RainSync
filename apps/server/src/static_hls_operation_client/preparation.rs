@@ -81,7 +81,6 @@ impl Client {
             Ok(reply) => reply,
             Err(_) => self.call(input, Action::Query).await?,
         };
-        let mut publication_attempted = false;
         loop {
             let next = match reply.result() {
                 OperationResult::ChildQueued { .. } => {
@@ -103,12 +102,14 @@ impl Client {
                         observation: Box::new(reply),
                     });
                 }
-                OperationResult::Verified { .. } if !publication_attempted => {
-                    publication_attempted = true;
+                OperationResult::Verified { .. } => {
+                    // Verified is the original owner's definite idle publication
+                    // state. Retry that same owner after a pre-COMMIT failure;
+                    // Working remains Pending and uncertain COMMIT remains Unknown.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     Action::Publish
                 }
                 OperationResult::Pending { .. }
-                | OperationResult::Verified { .. }
                 | OperationResult::Refused {
                     capture_id: Some(_),
                     ..

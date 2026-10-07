@@ -24,6 +24,7 @@ pub mod room_cleanup;
 pub mod room_diagnostics;
 pub mod room_invites;
 pub mod room_lifecycle;
+mod room_media;
 pub mod room_node_leases;
 pub mod room_permissions;
 pub mod source_account_policy;
@@ -327,6 +328,11 @@ async fn commit_inner(
     // Compute both the committed state and its diagnostic with the same
     // admitted authorization, rather than accepting an optimistic reduction.
     let current: RoomState = serde_json::from_value(current)?;
+    let resolved_media = if matches!(command.action, protocol::Action::EndMedia { .. }) {
+        Some(room_media::resolve_end(&mut tx, &current).await?)
+    } else {
+        resolved_media
+    };
     // The selected immutable database identity decides room semantics. Client
     // flags only acknowledge support; they can never turn ordinary media live.
     let selected_live = match current.media_id {

@@ -148,11 +148,9 @@ test("chat history branches retain their filters, limits and opposite inner/oute
     "async fn persist_chat(",
   );
   assert.ok(history.includes("c.id=ANY($2) ORDER BY c.created_at,c.id"));
-  assert.ok(
-    history.includes(
-      "NOT EXISTS(SELECT 1 FROM chat_messages WHERE id=$2 AND room_id=$1) OR",
-    ),
-  );
+  assert.ok(history.includes("SELECT EXISTS(SELECT 1 FROM chat_messages WHERE id=$1 AND room_id=$2)"));
+  assert.ok(history.includes('"chat_cursor_not_found"'));
+  assert.ok(!history.includes("NOT EXISTS(SELECT 1 FROM chat_messages WHERE id=$2 AND room_id=$1) OR"));
   assert.ok(history.includes("ORDER BY c.created_at,c.id LIMIT 100"));
   assert.ok(
     history.includes(

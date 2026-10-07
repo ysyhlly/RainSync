@@ -57,7 +57,7 @@ const env = {
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 const sql = database.sql;
 const sqlProcess = database.sqlProcess;
-function assertError(value, code, response) {
+function assertError(value, code, response, retryAfterMs) {
   assert.equal(value.error.code, code);
   assert.equal(typeof value.error.message, "string");
   assert.ok(value.error.message.length > 0);
@@ -68,8 +68,8 @@ function assertError(value, code, response) {
   );
   assert.equal(
     value.error.retry_after_ms,
-    undefined,
-    "must not invent retry timing",
+    retryAfterMs,
+    "retry timing must match the supplied admission policy",
   );
   if (response) {
     assert.equal(response.headers.get("x-request-id"), value.error.request_id);
@@ -1307,11 +1307,9 @@ try {
   a.ws.close();
   b.ws.close();
   const loginBody = { username: "restart-limit-fixture", password: "wrong" };
-  const loginResults = await Promise.all(
-    Array.from({ length: 12 }, () =>
-      admin.request("/auth/login", "POST", loginBody, [401, 429]),
-    ),
-  );
+  sql("DELETE FROM login_attempts");
+  const loginResults = [];
+  for (let i = 0; i < 12; i++) loginResults.push(await admin.request("/auth/login", "POST", loginBody, [401, 429]));
   assert.equal(
     loginResults.filter((v) => v.error.code === "INVALID_CREDENTIALS").length,
     10,
@@ -1327,9 +1325,11 @@ try {
   assertError(
     await admin.request("/auth/login", "POST", loginBody, 429),
     "RATE_LIMITED",
+    undefined,
+    60000,
   );
   const loginHash = createHash("sha256")
-    .update(loginBody.username)
+    .update("login-source:127.0.0.1")
     .digest("hex");
   sql(
     `UPDATE login_attempts SET window_started=now()-interval '61 seconds' WHERE username_hash='${loginHash}'`,

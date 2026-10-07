@@ -931,19 +931,19 @@ async fn probe_local_policy(
     item: &str,
     metadata_only: bool,
 ) -> Result<(Value, String)> {
-    let path = media_core::safe_path(std::path::Path::new(root), item)?;
-    let file = std::fs::File::open(&path).map_err(anyhow::Error::from)?;
+    let path = media_core::safe_local_path(std::path::Path::new(root), item)?;
+    let file = media_core::open_local_file(std::path::Path::new(root), item)?;
     let before = media_core::file_version::snapshot_file(&file).map_err(anyhow::Error::from)?;
+    let input = media_core::local_process_input(&file, &path)?;
     let probe = if metadata_only {
-        media_core::advanced_media::probe_metadata(&path.to_string_lossy()).await
+        media_core::advanced_media::probe_metadata(&input).await
     } else {
-        media_core::probe(&path.to_string_lossy()).await
+        media_core::probe(&input).await
     };
     // Re-resolve the source-relative path too: an ancestor or symlink may have
     // changed while ffprobe used the previously canonicalized path.
     let unchanged = (|| -> anyhow::Result<bool> {
-        let current_path = media_core::safe_path(std::path::Path::new(root), item)?;
-        let current = std::fs::File::open(current_path)?;
+        let current = media_core::open_local_file(std::path::Path::new(root), item)?;
         Ok(media_core::file_version::snapshot_file(&file)? == before
             && media_core::file_version::snapshot_file(&current)? == before)
     })();
@@ -955,8 +955,7 @@ async fn probe_local_policy(
 }
 
 pub fn current_local_version(root: &str, item: &str) -> Result<String> {
-    let path = media_core::safe_path(std::path::Path::new(root), item)?;
-    let file = std::fs::File::open(path).map_err(anyhow::Error::from)?;
+    let file = media_core::open_local_file(std::path::Path::new(root), item)?;
     Ok(media_core::file_version::snapshot_file(&file)
         .map_err(anyhow::Error::from)?
         .version)

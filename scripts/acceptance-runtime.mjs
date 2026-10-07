@@ -40,6 +40,9 @@ export function redactEvidence(value, secrets = []) {
       text = text.split(secret).join("[REDACTED]");
     }
     return text
+      // Delivery authorization may appear in relative error URLs as well as
+      // complete URLs; hide the token path before generic URL cleanup.
+      .replace(/(\/media-delivery\/[^/\s<>"']+\/static-hls\/)[^/\s?#<>"']+/gi, "$1[REDACTED]")
       .replace(/\b(?:Bearer|Basic)\s+[^\s,;]+/gi, "[REDACTED-AUTH]")
       .replace(secretAssignment, "[REDACTED-SECRET]")
       .replace(/(?:https?|wss?|postgres(?:ql)?):\/\/[^\s<>"']+/gi, (raw) => {

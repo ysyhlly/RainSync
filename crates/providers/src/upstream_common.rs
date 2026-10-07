@@ -321,22 +321,46 @@ struct ScanLimits {
 pub async fn list(config: &SourceConfig, headers: BTreeMap<String, String>) -> Result<Vec<Item>> {
     list_with_limits(config, headers, LIBRARY_SCAN_LIMITS).await
 }
+pub(super) async fn list_guarded<G, F, Fut>(
+    config: &SourceConfig,
+    headers: BTreeMap<String, String>,
+    guard: F,
+) -> Result<Vec<Item>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<G>>,
+{
+    tokio::time::timeout(
+        LIBRARY_SCAN_LIMITS.timeout,
+        scan_library(config, headers, LIBRARY_SCAN_LIMITS, guard),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("library_scan_timeout"))?
+}
 
 async fn list_with_limits(
     config: &SourceConfig,
     headers: BTreeMap<String, String>,
     limits: ScanLimits,
 ) -> Result<Vec<Item>> {
-    tokio::time::timeout(limits.timeout, scan_library(config, headers, limits))
-        .await
-        .map_err(|_| anyhow::anyhow!("library_scan_timeout"))?
+    tokio::time::timeout(
+        limits.timeout,
+        scan_library(config, headers, limits, || std::future::ready(Ok(()))),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("library_scan_timeout"))?
 }
 
-async fn scan_library(
+async fn scan_library<G, F, Fut>(
     config: &SourceConfig,
     headers: BTreeMap<String, String>,
     limits: ScanLimits,
-) -> Result<Vec<Item>> {
+    mut guard: F,
+) -> Result<Vec<Item>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<G>>,
+{
     ensure!(
         !config.user_id.is_empty() && !config.token.is_empty(),
         "upstream_credentials_required"
@@ -347,6 +371,7 @@ async fn scan_library(
     let mut expected_total = None;
     let mut scanned_bytes = 0;
     loop {
+        let _guard = guard().await?;
         let start = items.len().to_string();
         let request = super::source_request(config, url.as_str(), reqwest::Method::GET, &headers)
             .await?

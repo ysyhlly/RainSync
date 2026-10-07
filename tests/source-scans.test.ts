@@ -131,3 +131,36 @@ it("scans three S3 sources without oversubscribing and makes partial-page result
   ).toBe(true);
   scans.$dispose();
 });
+
+it("identity switching permits a new batch and an old batch cannot clear its running state", async () => {
+  setActivePinia(createPinia());
+  const session = useSession(), scans = useSourceScans();
+  session.accept({ id: "a", username: "a", admin: true, csrf: "a" });
+  let finishOld!: (response: Response) => void;
+  let finishNew!: (response: Response) => void;
+  const fetch = vi.fn(async (url: string) => {
+    if (url.endsWith("/sources")) return Response.json([{ id: "local", name: "Local", kind: "local" }]);
+    if (url.endsWith("/agents")) return Response.json([]);
+    return new Promise<Response>(resolve => {
+      if (session.user?.id === "a") finishOld = resolve;
+      else finishNew = resolve;
+    });
+  });
+  vi.stubGlobal("fetch", fetch);
+  const old = scans.scanAll();
+  await vi.waitFor(() => expect(finishOld).toBeTypeOf("function"));
+  session.clear();
+  session.accept({ id: "b", username: "b", admin: true, csrf: "b" });
+  expect(scans.running).toBe(false);
+  const current = scans.scanAll();
+  await vi.waitFor(() => expect(finishNew).toBeTypeOf("function"));
+  finishOld(Response.json({ count: 1 }));
+  await old;
+  expect(scans.running).toBe(true);
+  expect(scans.results.local.busy).toBe(true);
+  finishNew(Response.json({ count: 7 }));
+  await current;
+  expect(scans.running).toBe(false);
+  expect(scans.results.local.message).toBe("本次扫描发现 7 部影片");
+  scans.$dispose();
+});

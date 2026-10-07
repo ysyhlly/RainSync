@@ -1015,6 +1015,18 @@ test("redaction covers nested source/encryption keys and DSNs across field-name 
   assert.equal(result.source_id, "public-source-id");
 });
 
+test("redaction removes static HLS path authorization from URLs and failures", () => {
+  const secret = "a".repeat(64);
+  for (const path of [`/media-delivery/session/static-hls/${secret}/index.m3u8`, `/media-delivery/session/static-hls/${secret}/segment-1.ts`]) {
+    for (const input of [path, `https://media.example${path}?token=second-secret#private`]) {
+      const result = JSON.stringify(redactEvidence({ message: input, error: Error(input) }));
+      assert.ok(!result.includes(secret), result);
+      assert.ok(!result.includes("second-secret"), result);
+      assert.ok(result.includes("static-hls/"), result);
+    }
+  }
+});
+
 test("redaction strips PostgreSQL and WebSocket URL credentials, query and fragments", () => {
   for (const scheme of [
     "postgres",

@@ -10,7 +10,7 @@ use media_core::static_hls::contracts::{
 };
 use media_core::static_hls::{CaptureOwnerIdentity, DisposalProof, ProcessDisposition};
 pub use native_completion::guard_unmarked_parent;
-pub use publication::ParentPublication;
+pub use publication::{ParentPublication, PublicationCommitUncertain};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::{Connection, PgPool, Postgres, Row, Transaction, postgres::PgRow};
@@ -1041,7 +1041,7 @@ async fn read_authority_remaining(
     }
     let remaining: Option<f64> = sqlx::query_scalar("SELECT extract(epoch FROM (CASE WHEN c.publication_phase='pending_parent' THEN LEAST(c.expires_at,r.lease_until,r.static_hls_prepare_expires_at) ELSE LEAST(c.expires_at,p.expires_at) END)-clock_timestamp())::float8 FROM static_hls_captures c JOIN playback_requests r ON r.session_id=c.session_id LEFT JOIN playback_sessions p ON p.id=c.session_id WHERE c.id=$1 AND c.owner_id=$2 AND c.session_id=$3 AND ((c.publication_phase='pending_parent' AND static_hls_pending_capture_authority_allowed(c.id)) OR (c.publication_phase='published_parent' AND static_hls_published_parent_authority_allowed(c.id)))")
         .bind(permit.capture).bind(permit.owner).bind(permit.session).fetch_optional(&mut *tx).await?;
-    let remaining = remaining.map(Duration::try_from_secs_f64).transpose()?;
+    let remaining = super::static_hls::authority_duration(remaining)?;
     // Preserve cancellation isolation while reusing only a successfully
     // observed, fully rolled-back authority connection.
     tx.rollback().await?;

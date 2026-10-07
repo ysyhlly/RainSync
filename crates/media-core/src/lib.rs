@@ -74,6 +74,295 @@ pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(full)
 }
 
+/// Local Server/Worker sources must remain within the deployment's media root
+/// at use time, even if a configured directory was replaced after admission.
+pub fn local_media_root(root: &Path) -> Result<PathBuf> {
+    let allowed = std::env::var("MEDIA_ROOT").unwrap_or_else(|_| "/media".into());
+    confined_root(root, Path::new(&allowed))
+}
+
+pub fn confined_root(root: &Path, allowed: &Path) -> Result<PathBuf> {
+    let allowed = allowed.canonicalize()?;
+    let root = root.canonicalize()?;
+    anyhow::ensure!(root.starts_with(allowed), "outside_media_root");
+    Ok(root)
+}
+
+pub fn safe_local_path(root: &Path, relative: &str) -> Result<PathBuf> {
+    let root = local_media_root(root)?;
+    let full = safe_path(&root, relative)?;
+    let allowed = std::env::var("MEDIA_ROOT").unwrap_or_else(|_| "/media".into());
+    anyhow::ensure!(
+        full.starts_with(Path::new(&allowed).canonicalize()?),
+        "outside_media_root"
+    );
+    Ok(full)
+}
+
+/// Validate the object actually opened, before any bytes are consumed. A path
+/// check alone cannot fence replacement of an ancestor between stat and open.
+pub fn open_local_file(root: &Path, relative: &str) -> Result<std::fs::File> {
+    let source_root = local_media_root(root)?;
+    let path = safe_local_path(root, relative)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Pin this object against mutation/removal while a child reads it.
+        options.share_mode(windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0);
+    }
+    let file = options.open(path)?;
+    let allowed = std::env::var("MEDIA_ROOT").unwrap_or_else(|_| "/media".into());
+    let allowed = Path::new(&allowed).canonicalize()?;
+    let actual = opened_file_path(&file)?;
+    anyhow::ensure!(
+        actual.starts_with(allowed)
+            && actual.starts_with(source_root)
+            && file.metadata()?.is_file(),
+        "outside_media_root"
+    );
+    Ok(file)
+}
+
+/// The scanner enumerates a retained directory object rather than reopening
+/// its pathname after validation. Empty relative denotes the source root.
+pub fn open_local_directory(root: &Path, relative: &str) -> Result<std::fs::File> {
+    let source_root = local_media_root(root)?;
+    let relative = Path::new(relative);
+    anyhow::ensure!(
+        !relative.is_absolute()
+            && relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "invalid_path"
+    );
+    let path = source_root.join(relative).canonicalize()?;
+    anyhow::ensure!(path.starts_with(&source_root), "outside_media_root");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ};
+        options
+            .share_mode(FILE_SHARE_READ.0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0);
+    }
+    let directory = options.open(path)?;
+    let actual = opened_file_path(&directory)?;
+    let allowed = std::env::var("MEDIA_ROOT").unwrap_or_else(|_| "/media".into());
+    anyhow::ensure!(
+        actual.starts_with(Path::new(&allowed).canonicalize()?)
+            && actual.starts_with(source_root)
+            && directory.metadata()?.is_dir(),
+        "outside_media_root"
+    );
+    Ok(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn opened_file_path(file: &std::fs::File) -> Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    Ok(std::fs::read_link(format!(
+        "/proc/self/fd/{}",
+        file.as_raw_fd()
+    ))?)
+}
+
+#[cfg(windows)]
+fn opened_file_path(file: &std::fs::File) -> Result<PathBuf> {
+    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW},
+    };
+    let mut buffer = vec![0u16; 32768];
+    let count = unsafe {
+        GetFinalPathNameByHandleW(
+            HANDLE(file.as_raw_handle()),
+            &mut buffer,
+            FILE_NAME_NORMALIZED,
+        )
+    };
+    anyhow::ensure!(
+        count > 0 && (count as usize) < buffer.len(),
+        "local_file_path_unavailable"
+    );
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(
+        &buffer[..count as usize],
+    )))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn opened_file_path(_file: &std::fs::File) -> Result<PathBuf> {
+    anyhow::bail!("local_file_handle_confinement_unsupported")
+}
+
+/// On Linux the child opens the retained original descriptor, so an ancestor
+/// replacement cannot redirect FFprobe/FFmpeg to a different filesystem tree.
+pub fn local_process_input(file: &std::fs::File, path: &Path) -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let _ = path;
+        Ok(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            file.as_raw_fd()
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Ok(opened_file_path(file)?.to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod confinement_tests {
+    #[test]
+    fn replacing_registered_root_with_symlink_cannot_escape_allowed_root() {
+        let base = std::env::temp_dir().join(format!("root-fence-{}", uuid::Uuid::new_v4()));
+        let allowed = base.join("media");
+        let source = allowed.join("source");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        assert!(super::confined_root(&source, &allowed).is_ok());
+        std::fs::remove_dir(&source).unwrap();
+        std::os::unix::fs::symlink(&outside, &source).unwrap();
+        assert!(super::confined_root(&source, &allowed).is_err());
+        std::fs::remove_file(&source).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scanner_directory_handle_survives_ancestor_swap_without_enumerating_outside() {
+        use std::{fs, path::PathBuf, process::Command};
+        if let Ok(base) = std::env::var("RAINSYNC_DIRECTORY_ROOT_CHILD_FIXTURE") {
+            let base = PathBuf::from(base);
+            let source = base.join("media/source");
+            let directory = super::open_local_directory(&source, "").unwrap();
+            let input = super::local_process_input(&directory, &source).unwrap();
+            fs::rename(&source, base.join("media/retired")).unwrap();
+            std::os::unix::fs::symlink(base.join("outside"), &source).unwrap();
+            let names: Vec<_> = fs::read_dir(input)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(names, [std::ffi::OsString::from("inside.mp4")]);
+            assert!(super::open_local_directory(&source, "").is_err());
+            let retired = base.join("media/retired");
+            std::os::unix::fs::symlink(base.join("outside"), retired.join("child")).unwrap();
+            assert!(super::open_local_directory(&retired, "child").is_err());
+            fs::remove_file(&source).unwrap();
+            fs::remove_file(retired.join("child")).unwrap();
+            return;
+        }
+        let temp = std::env::temp_dir();
+        let base = temp.join(format!("rainsync-directory-fence-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(base.join("media/source")).unwrap();
+        fs::create_dir(base.join("outside")).unwrap();
+        fs::write(base.join("media/source/inside.mp4"), b"inside").unwrap();
+        fs::write(base.join("outside/outside.mp4"), b"outside").unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "confinement_tests::scanner_directory_handle_survives_ancestor_swap_without_enumerating_outside", "--nocapture"])
+            .env("RAINSYNC_DIRECTORY_ROOT_CHILD_FIXTURE", &base).env("MEDIA_ROOT", base.join("media"))
+            .output().unwrap();
+        assert!(base.starts_with(temp));
+        fs::remove_dir_all(base).unwrap();
+        assert!(
+            output.status.success(),
+            "child scanner confinement fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_confinement_tests {
+    #[test]
+    fn registered_root_junction_replacement_is_rejected() {
+        use std::{fs, os::windows::process::CommandExt, path::PathBuf, process::Command};
+        if let Ok(base) = std::env::var("RAINSYNC_LOCAL_ROOT_CHILD_FIXTURE") {
+            let base = PathBuf::from(base);
+            let source = base.join("media/source");
+            let retired = base.join("media/retired");
+            let outside = base.join("outside");
+            let directory = super::open_local_directory(&source, "").unwrap();
+            let directory_input = super::local_process_input(&directory, &source).unwrap();
+            assert_eq!(fs::read_dir(directory_input).unwrap().count(), 1);
+            drop(directory);
+            let held = super::open_local_file(&source, "movie.mp4").unwrap();
+            let input = super::local_process_input(&held, &source.join("movie.mp4")).unwrap();
+            match fs::rename(&source, &retired) {
+                Ok(()) => {
+                    make_junction(&source, &outside);
+                    assert_eq!(
+                        fs::read(&input).unwrap(),
+                        b"inside",
+                        "retained process input was redirected by an ancestor swap"
+                    );
+                    assert!(super::open_local_file(&source, "movie.mp4").is_err());
+                    fs::remove_dir(&source).unwrap();
+                }
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert_eq!(fs::read(&input).unwrap(), b"inside");
+                    drop(held);
+                    fs::rename(&source, &retired).unwrap();
+                    make_junction(&source, &outside);
+                    assert!(super::open_local_file(&source, "movie.mp4").is_err());
+                    fs::remove_dir(&source).unwrap();
+                    return;
+                }
+            }
+            return;
+        }
+        let temp = std::env::temp_dir();
+        let base = temp.join(format!("rainsync-root-fence-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(base.join("media/source")).unwrap();
+        fs::create_dir(base.join("outside")).unwrap();
+        fs::write(base.join("media/source/movie.mp4"), b"inside").unwrap();
+        fs::write(base.join("outside/movie.mp4"), b"outside").unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "windows_confinement_tests::registered_root_junction_replacement_is_rejected",
+                "--nocapture",
+            ])
+            .env("RAINSYNC_LOCAL_ROOT_CHILD_FIXTURE", &base)
+            .env("MEDIA_ROOT", base.join("media"))
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(base.starts_with(temp));
+        fs::remove_dir_all(base).unwrap();
+        assert!(
+            output.status.success(),
+            "child confinement fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn make_junction(path: &std::path::Path, target: &std::path::Path) {
+        use std::{os::windows::process::CommandExt, process::Command};
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "New-Item -ItemType Junction -Path $env:RAINSYNC_FIXTURE_JUNCTION -Target $env:RAINSYNC_FIXTURE_TARGET -ErrorAction Stop | Out-Null"])
+            .env("RAINSYNC_FIXTURE_JUNCTION", path).env("RAINSYNC_FIXTURE_TARGET", target)
+            .creation_flags(0x08000000).output().unwrap();
+        assert!(
+            output.status.success(),
+            "junction fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 pub async fn probe(path: &str) -> Result<serde_json::Value> {
     probe_with_policy(path, false).await
 }

@@ -151,7 +151,7 @@ try {
     }
     function media() {
       const id = randomUUID();
-      f.sql(`INSERT INTO media_items(id,source_id,resource,title) VALUES(${quote(id)},${quote(privateSource.id)},'https://example.test/private.mp4','Synthetic title fixture')`);
+      f.sql(`INSERT INTO media_items(id,source_id,resource,title) VALUES(${quote(id)},${quote(privateSource.id)},${quote(`https://example.test/private/${id}.mp4`)},'Synthetic title fixture')`);
       return id;
     }
     const titleCount = id => f.sql(`SELECT count(*) FROM media_user_titles WHERE user_id=${quote(principal.id)} AND media_id=${quote(id)}`);

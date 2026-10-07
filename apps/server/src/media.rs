@@ -179,9 +179,23 @@ pub async fn scan(
     sqlx::query("INSERT INTO source_scans(source_id,generation) VALUES($1,$2) ON CONFLICT(source_id) DO UPDATE SET generation=EXCLUDED.generation")
         .bind(id).bind(generation).execute(&mut *tx).await?;
     tx.commit().await?;
-    let items = providers::list_items(&row.get::<String, _>("kind"), &config)
-        .await
-        .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_scan_failed"))?;
+    let kind: String = row.get("kind");
+    let encrypted: String = row.get("config_encrypted");
+    let items = providers::list_items_guarded(&kind, &config, || async {
+        let mut tx = app.db.begin().await?;
+        guard_scan_config(&mut tx, id, &kind, &encrypted)
+            .await
+            .map_err(|_| anyhow::anyhow!("source_scan_superseded"))?;
+        let current: Option<Uuid> =
+            sqlx::query_scalar("SELECT generation FROM source_scans WHERE source_id=$1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        anyhow::ensure!(current == Some(generation), "source_scan_superseded");
+        Ok(tx)
+    })
+    .await
+    .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_scan_failed"))?;
     let count = items.len();
     let resources: Vec<String> = items.iter().map(|i| i.resource.clone()).collect();
     let mut batch = Vec::with_capacity(32);
@@ -203,7 +217,9 @@ pub async fn scan(
                     .with_extension(ext)
                     .to_string_lossy()
                     .replace('\\', "/");
-                if media_core::safe_path(std::path::Path::new(&config.root), &relative).is_ok() {
+                if media_core::safe_local_path(std::path::Path::new(&config.root), &relative)
+                    .is_ok()
+                {
                     sidecars.insert((100000 + i).to_string(), json!(relative));
                 }
             }
@@ -214,11 +230,12 @@ pub async fn scan(
         }
         batch.push(item);
         if batch.len() == 32 {
-            save_scan_batch(&app, id, generation, &mut batch).await?;
+            save_scan_batch(&app, id, generation, &kind, &encrypted, &mut batch).await?;
         }
     }
-    save_scan_batch(&app, id, generation, &mut batch).await?;
+    save_scan_batch(&app, id, generation, &kind, &encrypted, &mut batch).await?;
     let mut tx = app.db.begin().await?;
+    guard_scan_config(&mut tx, id, &kind, &encrypted).await?;
     guard_scan(&mut tx, id, generation).await?;
     sqlx::query(
         "UPDATE media_items SET available=false WHERE source_id=$1 AND NOT(resource=ANY($2))",
@@ -232,6 +249,38 @@ pub async fn scan(
     }
     tx.commit().await?;
     Ok(Json(json!({"count":count})))
+}
+fn metadata_is_hls(metadata: &Value) -> bool {
+    if let Some(transport) = metadata["rainsync_http_transport"].as_str() {
+        return transport == "hls";
+    }
+    metadata["format"]["format_name"]
+        .as_str()
+        .is_some_and(|names| {
+            names
+                .split(',')
+                .any(|name| name.trim().eq_ignore_ascii_case("hls"))
+        })
+}
+async fn guard_scan_config(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+    kind: &str,
+    encrypted: &str,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT kind,config_encrypted FROM sources WHERE id=$1 AND deleted_at IS NULL FOR SHARE",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if !row.is_some_and(|row| {
+        row.get::<String, _>("kind") == kind
+            && row.get::<String, _>("config_encrypted") == encrypted
+    }) {
+        return Err(err(StatusCode::CONFLICT, "source_scan_failed"));
+    }
+    Ok(())
 }
 async fn guard_scan(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -259,9 +308,12 @@ async fn save_scan_batch(
     app: &App,
     id: Uuid,
     generation: Uuid,
+    kind: &str,
+    encrypted: &str,
     batch: &mut Vec<providers::Item>,
 ) -> Result<()> {
     let mut tx = app.db.begin().await?;
+    guard_scan_config(&mut tx, id, kind, encrypted).await?;
     guard_scan(&mut tx, id, generation).await?;
     for item in batch.drain(..) {
         sqlx::query("INSERT INTO media_items(id,source_id,title,resource,duration_ms,metadata) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,duration_ms=EXCLUDED.duration_ms,metadata=EXCLUDED.metadata,available=true").bind(Uuid::new_v4()).bind(id).bind(item.title).bind(item.resource).bind(item.duration_ms).bind(item.metadata).execute(&mut *tx).await?;
@@ -745,7 +797,11 @@ pub(crate) async fn prepare_playback(
             if s3.is_none() {
                 owned_http::select(body, &mut resource, continuation, reservation.session)?;
             }
-            if target.split('?').next().unwrap_or("").ends_with(".m3u8") {
+            if providers::validate_url(&target)?
+                .path()
+                .to_ascii_lowercase()
+                .ends_with(".m3u8")
+            {
                 transport = "hls";
             }
             if http_file.is_some_and(|authority| authority.candidate.is_some()) {
@@ -914,15 +970,29 @@ pub(crate) async fn prepare_playback(
     let id = reservation.session;
     let t = token();
     let mut timeline = 0.0;
-    if playback_plan::needs_preparation_probe(
-        &kind,
-        requested_mode,
-        selected.is_some(),
-        body.audio_index,
-        body.capabilities
+    let direct_transport_only = kind == "http"
+        && requested_mode == "direct"
+        && http_file.is_none()
+        && selected.is_none()
+        && body.advanced_playback.is_none()
+        && s3.is_none()
+        && resource["http_owned_large_response_version"] != 1
+        && resource["http_finite_hls_version"] != 1
+        && body
+            .capabilities
             .as_ref()
-            .is_none_or(|caps| caps.supports_progressive()),
-    ) {
+            .is_none_or(|caps| caps.supports_progressive());
+    if direct_transport_only
+        || playback_plan::needs_preparation_probe(
+            &kind,
+            requested_mode,
+            selected.is_some(),
+            body.audio_index,
+            body.capabilities
+                .as_ref()
+                .is_none_or(|caps| caps.supports_progressive()),
+        )
+    {
         // Auto HTTP/NAS must probe even when the provisional mode above is direct.
         // A short-lived session lets the worker probe through the same authorized relay as playback.
         let mut preparation = app.db.begin().await?;
@@ -974,8 +1044,13 @@ pub(crate) async fn prepare_playback(
         preparation.commit().await?;
         let probe: Result<Value> = async {
             let base = std::env::var("WORKER_URL").unwrap_or("http://127.0.0.1:8081".into());
-            let response = reqwest::Client::new()
-                .get(format!("{base}/media-delivery/{id}/probe"))
+            let endpoint = if direct_transport_only {
+                "source"
+            } else {
+                "probe"
+            };
+            let mut request = reqwest::Client::new()
+                .get(format!("{base}/media-delivery/{id}/{endpoint}"))
                 .query(&[("token", &t)])
                 .timeout(
                     if resource["http_owned_large_response_version"] == 1
@@ -987,7 +1062,11 @@ pub(crate) async fn prepare_playback(
                     } else {
                         std::time::Duration::from_secs(35)
                     },
-                )
+                );
+            if direct_transport_only {
+                request = request.header(header::RANGE, "bytes=0-511");
+            }
+            let response = request
                 .send()
                 .await
                 .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_probe_failed"))?;
@@ -1030,6 +1109,31 @@ pub(crate) async fn prepare_playback(
             if !response.status().is_success() {
                 return Err(err(StatusCode::BAD_GATEWAY, "source_probe_failed"));
             }
+            if direct_transport_only {
+                let content_type = response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                let mut metadata = meta.clone();
+                metadata["rainsync_http_transport"] = json!(if matches!(
+                    content_type.as_str(),
+                    "application/vnd.apple.mpegurl"
+                        | "application/x-mpegurl"
+                        | "audio/mpegurl"
+                        | "audio/x-mpegurl"
+                ) {
+                    "hls"
+                } else {
+                    "progressive"
+                });
+                return Ok(metadata);
+            }
             response
                 .json::<Value>()
                 .await
@@ -1066,6 +1170,7 @@ pub(crate) async fn prepare_playback(
                 None
             };
             meta = probe?;
+            if kind == "http" && metadata_is_hls(&meta) { transport = "hls"; }
             if let Some(prepared) = &s3 { prepared.attach_metadata(&mut meta)?; }
             advanced_playback::attach_remote_assets(&mut resource, &meta)?;
             if kind == "http" && body.candidate_report.is_some() {
@@ -1096,8 +1201,8 @@ pub(crate) async fn prepare_playback(
                     return Err(err(StatusCode::CONFLICT, "source_changed"));
                 }
             }
-            current_metadata = true;
-            probed = true;
+            current_metadata = !direct_transport_only;
+            probed = !direct_transport_only;
             if kind == "agent" {
                 meta["capability_source_version"] = json!(source_version);
             }
@@ -1106,7 +1211,7 @@ pub(crate) async fn prepare_playback(
                 .and_then(|v| v.parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v >= 0.0)
                 .map(|v| v * 1000.0);
-            let detected = if let Some(request)=&body.advanced_playback {advanced_playback::analyze(&meta,body.audio_index,body.position_ms,request)?;"transcode"} else if let Some(selection)=&selected {selection.candidate.delivery_mode.as_str()} else {media_core::compatible_mode(&meta, body.audio_index.is_some()).map_err(playback_capabilities::probe_error)?};
+            let detected = if direct_transport_only { "direct" } else if let Some(request)=&body.advanced_playback {advanced_playback::analyze(&meta,body.audio_index,body.position_ms,request)?;"transcode"} else if let Some(selection)=&selected {selection.candidate.delivery_mode.as_str()} else {media_core::compatible_mode(&meta, body.audio_index.is_some()).map_err(playback_capabilities::probe_error)?};
             if requested_mode == "auto" {
                 mode = detected;
             }
@@ -2064,8 +2169,21 @@ pub async fn renew(
 
 #[cfg(test)]
 mod upstream_subtitle_label_tests {
-    use super::upstream_track_title;
+    use super::{metadata_is_hls, upstream_track_title};
     use serde_json::{Value, json};
+
+    #[test]
+    fn detected_http_transport_uses_probe_content_even_without_a_suffix() {
+        assert!(metadata_is_hls(
+            &json!({"format":{"filename":"https://media.example/play?id=1", "format_name":"hls"}})
+        ));
+        assert!(metadata_is_hls(
+            &json!({"format":{"format_name":" HLS,other"}})
+        ));
+        assert!(!metadata_is_hls(
+            &json!({"format":{"format_name":"mov,mp4"}})
+        ));
+    }
 
     #[test]
     fn known_styled_text_subtitles_explain_the_webvtt_downgrade() {

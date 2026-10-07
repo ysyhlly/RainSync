@@ -263,12 +263,16 @@ pub async fn read(
     let resource = &grant.resource;
     let response = match resource["kind"].as_str().unwrap_or("") {
         "local" => {
-            let path = media_core::safe_path(
+            let path = media_core::safe_local_path(
                 std::path::Path::new(resource["root"].as_str().unwrap_or("")),
                 resource["resource"].as_str().unwrap_or(""),
             )
             .map_err(failure)?;
-            let file = std::fs::File::open(&path).map_err(failure)?;
+            let file = media_core::open_local_file(
+                std::path::Path::new(resource["root"].as_str().unwrap_or("")),
+                resource["resource"].as_str().unwrap_or(""),
+            )
+            .map_err(failure)?;
             let version = media_core::file_version::snapshot_file(&file).map_err(failure)?;
             if resource["read_version"] != version.version {
                 return Err((StatusCode::CONFLICT, "source_changed".into()));
@@ -421,7 +425,7 @@ async fn remote(
     let response_status = response.status();
     let response_headers = response.headers().clone();
     let mut playlist = registration.kind == Some(hls_manifest::Kind::Playlist)
-        || final_target.path().ends_with(".m3u8")
+        || final_target.path().to_ascii_lowercase().ends_with(".m3u8")
         || response
             .headers()
             .get(header::CONTENT_TYPE)
