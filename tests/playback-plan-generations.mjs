@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
 import { delay } from "./fixtures/server.mjs";
@@ -384,7 +384,7 @@ try {
       setMedia(capRoom.id);
       const capViewer = "00000000-0000-4000-8000-000000000001";
       f.sql(
-        `INSERT INTO playback_viewer_plans(user_id,room_id,viewer_id,plan_generation,auth_login_hash) SELECT '${identity.id}','${capRoom.id}',('00000000-0000-4000-8000-' || lpad(i::text,12,'0'))::uuid,1,'${testLoginHash(f,admin)}' FROM generate_series(1,1024) i`,
+        `INSERT INTO playback_viewer_plans(user_id,room_id,viewer_id,plan_generation,auth_login_hash) SELECT '${identity.id}','${capRoom.id}',('00000000-0000-4000-8000-' || lpad(i::text,12,'0'))::uuid,1,'${testLoginHash(f, admin)}' FROM generate_series(1,1024) i`,
       );
       const cappedKey = randomUUID(),
         cappedViewer = randomUUID();
@@ -444,13 +444,74 @@ try {
         f.sql(`SELECT metadata FROM media_items WHERE id='${media.id}'`),
       );
       const offers = [];
-      const peer = createServer((_request, response) => offers.push(response));
+      const sourceReads = [],
+        unknownRequests = [];
+      const video = await readFile(resolve(f.root, "generation.mp4"));
+      const peer = createServer((request, response) => {
+        const path = new URL(request.url, "http://owned-worker").pathname;
+        if (
+          /^\/media-delivery\/[0-9a-f-]{36}\/probe$/.test(path) &&
+          request.method === "GET"
+        ) {
+          // Only metadata probes participate in the controlled ordering race.
+          offers.push(response);
+          return;
+        }
+        if (
+          /^\/media-delivery\/[0-9a-f-]{36}\/source$/.test(path) &&
+          ["GET", "HEAD"].includes(request.method)
+        ) {
+          sourceReads.push({
+            method: request.method,
+            path,
+            range: request.headers.range ?? null,
+          });
+          response.setHeader("Content-Type", "video/mp4");
+          response.setHeader("Accept-Ranges", "bytes");
+          let start = 0,
+            end = video.length - 1;
+          const range = request.method === "GET" && request.headers.range;
+          if (range) {
+            const match = /^bytes=(\d+)-(\d*)$/.exec(range);
+            start = match ? Number(match[1]) : video.length;
+            end = match?.[2] ? Math.min(Number(match[2]), end) : end;
+            if (start > end) {
+              response.writeHead(416, {
+                "Content-Range": `bytes */${video.length}`,
+                "Content-Length": 0,
+              });
+              response.end();
+              return;
+            }
+            response.statusCode = 206;
+            response.setHeader(
+              "Content-Range",
+              `bytes ${start}-${end}/${video.length}`,
+            );
+          }
+          response.setHeader("Content-Length", end - start + 1);
+          response.end(
+            request.method === "HEAD"
+              ? undefined
+              : video.subarray(start, end + 1),
+          );
+          return;
+        }
+        // Never record raw query tokens or silently answer a new Worker route.
+        unknownRequests.push({
+          method: request.method,
+          path: `${path.split("/").slice(0, 2).join("/")}/…`,
+        });
+        response.writeHead(404);
+        response.end();
+      });
       await new Promise((resolve) => peer.listen(0, "127.0.0.1", resolve));
       const origin = `http://127.0.0.1:${peer.address().port}`;
       const respond = (response, status = 200) => {
         response.writeHead(status, { "Content-Type": "application/json" });
         response.end(JSON.stringify(metadata));
       };
+      let controlledPhase = "start controlled probe";
       try {
         await f.startServer({ WORKER_URL: origin });
         const delayedSource = await admin.request("/sources", "POST", {
@@ -483,6 +544,7 @@ try {
         });
         for (let i = 0; i < 100 && offers.length < 1; i++) await delay(30);
         assert.equal(offers.length, 1);
+        controlledPhase = "same-key pending replay";
         const pendingReplay = await admin.request(
           "/playback-sessions",
           "POST",
@@ -493,12 +555,25 @@ try {
         const oldSession = f.sql(
           `SELECT session_id FROM playback_requests WHERE idempotency_key='${delayedInput.idempotency_key}'`,
         );
+        controlledPhase = "direct successor classification";
         const newer = await admin.request("/playback-sessions", "POST", {
           ...delayedInput,
           mode: "direct",
           plan_generation: 2,
           idempotency_key: randomUUID(),
         });
+        assert.equal(
+          sourceReads.length,
+          1,
+          "direct classification is a source read, never a held metadata probe",
+        );
+        assert.equal(
+          offers.length,
+          1,
+          "the direct successor cannot enter the blocked probe queue",
+        );
+        assert.deepEqual(unknownRequests, []);
+        controlledPhase = "old probe completion after successor";
         respond(offers[0]);
         const lateResponse = await late;
         assert.equal(lateResponse.status, 409);
@@ -526,6 +601,7 @@ try {
           plan_generation: 3,
           idempotency_key: randomUUID(),
         };
+        controlledPhase = "same-key transient probe failure";
         const failed = admin.raw("/playback-sessions", {
           method: "POST",
           body: retryInput,
@@ -536,6 +612,7 @@ try {
         const failure = await failed;
         assert.equal(failure.status, 502);
         await failure.arrayBuffer();
+        controlledPhase = "same-key probe retry";
         const retried = admin.raw("/playback-sessions", {
           method: "POST",
           body: retryInput,
@@ -555,6 +632,11 @@ try {
         check(
           "same-key transient preparation retry keeps its generation and creates one current session",
         );
+        assert.deepEqual(unknownRequests, []);
+      } catch (cause) {
+        throw new Error(`Controlled Worker phase failed: ${controlledPhase}`, {
+          cause,
+        });
       } finally {
         peer.closeAllConnections();
         await new Promise((resolve) => peer.close(resolve));
