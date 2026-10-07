@@ -147,32 +147,6 @@ pub(crate) fn authority_duration(remaining: Option<f64>) -> Result<Option<Durati
         .transpose()
 }
 
-#[cfg(test)]
-mod authority_duration_tests {
-    #[test]
-    fn past_expiry_is_confirmed_zero_and_invalid_observation_is_unknown() {
-        for seconds in [-10.0, -0.001, 0.0] {
-            assert_eq!(
-                super::authority_duration(Some(seconds)).unwrap(),
-                Some(std::time::Duration::ZERO)
-            );
-        }
-        assert_eq!(super::authority_duration(None).unwrap(), None);
-        assert_eq!(
-            super::authority_duration(Some(1.5)).unwrap(),
-            Some(std::time::Duration::from_millis(1500))
-        );
-        for seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert_eq!(
-                super::authority_duration(Some(seconds))
-                    .unwrap_err()
-                    .to_string(),
-                "static_hls_authority_unknown"
-            );
-        }
-    }
-}
-
 /// The inventory is source-produced, encrypted and bounded. The scanner's byte
 /// and timeline proof is required by the caller; it is never a browser claim.
 pub async fn prove_verified(
@@ -323,5 +297,31 @@ impl media_core::static_hls::CapturePermit for PersistedCapturePermit {
             );
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod authority_duration_tests {
+    #[test]
+    fn past_expiry_is_confirmed_zero_and_invalid_observation_is_unknown() {
+        for seconds in [-10.0, -0.001, 0.0] {
+            assert_eq!(
+                super::authority_duration(Some(seconds)).unwrap(),
+                Some(std::time::Duration::ZERO)
+            );
+        }
+        assert_eq!(super::authority_duration(None).unwrap(), None);
+        assert_eq!(
+            super::authority_duration(Some(1.5)).unwrap(),
+            Some(std::time::Duration::from_millis(1500))
+        );
+        for seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                super::authority_duration(Some(seconds))
+                    .unwrap_err()
+                    .to_string(),
+                "static_hls_authority_unknown"
+            );
+        }
     }
 }
