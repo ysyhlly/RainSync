@@ -296,6 +296,14 @@ impl Receiver {
         Some((sample, Arc::clone(cursor), permit))
     }
 
+    /// Identity retirement may finish the report already owned by this socket.
+    /// Its original database deadline keeps running; no new report is admitted.
+    pub async fn finish_pending(&mut self) {
+        if self.pending.is_some() {
+            self.poll_pending().await;
+        }
+    }
+
     /// Join in the existing socket select. Cancelling this polling borrow
     /// retains ownership; dropping the receiver aborts its bounded task.
     pub async fn poll_pending(&mut self) {

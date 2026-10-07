@@ -53,7 +53,7 @@ test("anonymous JSON admission keeps Origin and exact MIME validation before acc
     section(
       source("guests"),
       "pub async fn enter(",
-      "account_security::rate_limit(",
+      "account_security::guest_rate_limit(",
     ),
     ["anonymous_json_request(&app, &h)?", "cookie(&h)"],
   );

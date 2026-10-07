@@ -111,6 +111,16 @@ export async function reviewRegressions({
       ws.once("open", r);
       ws.once("error", j);
     });
+    // A connected Agent sends heartbeats throughout its control lifetime,
+    // including while a separately ingested index is being published. Use a
+    // faster cadence than production to test the unchanged responsiveness bounds.
+    const heartbeat = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN)
+        ws.send(JSON.stringify({ type: "HEARTBEAT" }));
+    }, 1000);
+    const stopHeartbeat = () => clearInterval(heartbeat);
+    ws.once("close", stopHeartbeat);
+    ws.once("error", stopHeartbeat);
     async function wait(type) {
       for (let i = 0; i < 3000; i++) {
         const n = inbox.findIndex((v) => v.type === type);
@@ -129,7 +139,14 @@ export async function reviewRegressions({
           ),
       );
     }
-    return { ws, wait };
+    return {
+      ws,
+      wait,
+      terminate() {
+        stopHeartbeat();
+        ws.terminate();
+      },
+    };
   }
   let agent = await agentSocket();
   try {
@@ -144,43 +161,62 @@ export async function reviewRegressions({
     await pong;
     const snapshot = randomUUID();
     let encoded = 0;
-    for (
-      let offset = 0, sequence = 0;
-      offset < 10001;
-      offset += 128, sequence++
-    ) {
-      const items = Array.from(
-        { length: Math.min(128, 10001 - offset) },
-        (_, i) => ({
-          title: `item-${offset + i}`,
-          resource: `${"长路径/".repeat(20)}${offset + i}.mp4`,
-        }),
+    // Delay this owned source's one publication statement beyond the strict
+    // three-second bound. Only incoming heartbeats can keep last_seen fresh
+    // while the index task waits; outgoing INDEX_ACKs must never refresh it.
+    sql(`CREATE FUNCTION test_slow_index_publication() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF EXISTS(SELECT 1 FROM inserted_items WHERE source_id='${created.id}') THEN PERFORM pg_sleep(4); END IF; RETURN NULL; END $$;
+      CREATE TRIGGER test_slow_index_publication AFTER INSERT ON media_items REFERENCING NEW TABLE AS inserted_items FOR EACH STATEMENT EXECUTE FUNCTION test_slow_index_publication()`);
+    try {
+      let finalPageStartedAt;
+      for (
+        let offset = 0, sequence = 0;
+        offset < 10001;
+        offset += 128, sequence++
+      ) {
+        const items = Array.from(
+          { length: Math.min(128, 10001 - offset) },
+          (_, i) => ({
+            title: `item-${offset + i}`,
+            resource: `${"长路径/".repeat(20)}${offset + i}.mp4`,
+          }),
+        );
+        const final = offset + 128 >= 10001;
+        const frame = JSON.stringify({
+          type: "INDEX",
+          snapshot,
+          sequence,
+          final,
+          items,
+        });
+        encoded += Buffer.byteLength(frame);
+        assert.ok(Buffer.byteLength(frame) < 1024 * 1024);
+        if (final) finalPageStartedAt = performance.now();
+        agent.ws.send(frame);
+        assert.equal((await agent.wait("INDEX_ACK")).sequence, sequence);
+      }
+      assert.ok(
+        performance.now() - finalPageStartedAt >= 4000,
+        "the owned final-publication delay exceeds the heartbeat freshness bound",
       );
-      const frame = JSON.stringify({
-        type: "INDEX",
-        snapshot,
-        sequence,
-        final: offset + 128 >= 10001,
-        items,
-      });
-      encoded += Buffer.byteLength(frame);
-      assert.ok(Buffer.byteLength(frame) < 1024 * 1024);
-      agent.ws.send(frame);
-      assert.equal((await agent.wait("INDEX_ACK")).sequence, sequence);
+      assert.ok(encoded > 1024 * 1024);
+      assert.equal(
+        sql(
+          `SELECT count(*) FROM media_items WHERE source_id='${created.id}' AND available`,
+        ),
+        "10001",
+      );
+      assert.equal(
+        sql(
+          `SELECT now()-last_seen < interval '3 seconds' FROM agents WHERE id='${created.id}'`,
+        ),
+        "t",
+        "final index publication must not starve heartbeat",
+      );
+    } finally {
+      sql(
+        "DROP TRIGGER test_slow_index_publication ON media_items; DROP FUNCTION test_slow_index_publication()",
+      );
     }
-    assert.ok(encoded > 1024 * 1024);
-    assert.equal(
-      sql(
-        `SELECT count(*) FROM media_items WHERE source_id='${created.id}' AND available`,
-      ),
-      "10001",
-    );
-    assert.equal(
-      sql(
-        `SELECT now()-last_seen < interval '3 seconds' FROM agents WHERE id='${created.id}'`,
-      ),
-      "t",
-    );
     agent.ws.send(
       JSON.stringify({
         type: "INDEX",
@@ -191,7 +227,7 @@ export async function reviewRegressions({
       }),
     );
     await agent.wait("INDEX_ACK");
-    agent.ws.terminate();
+    agent.terminate();
     agent = await agentSocket();
     agent.ws.send(
       JSON.stringify({
@@ -220,12 +256,6 @@ export async function reviewRegressions({
     sql(`CREATE FUNCTION test_slow_claim() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.agent_id='${created.id}' AND NEW.claimed THEN PERFORM pg_sleep(1.2); END IF; RETURN NEW; END $$;
       CREATE TRIGGER test_slow_claim BEFORE UPDATE ON agent_transfers FOR EACH ROW EXECUTE FUNCTION test_slow_claim();
       INSERT INTO agent_transfers(id,token_hash,agent_id,request,expires_at) SELECT gen_random_uuid(),gen_random_uuid()::text,'${created.id}','{}',now()+interval '1 minute' FROM generate_series(1,16)`);
-    // Use a faster cadence than the production Agent so the unchanged five-second
-    // bound measures receive-loop responsiveness, not the heartbeat interval.
-    const heartbeat = setInterval(() => {
-      if (agent.ws.readyState === WebSocket.OPEN)
-        agent.ws.send(JSON.stringify({ type: "HEARTBEAT" }));
-    }, 1000);
     try {
       for (let n = 0; n < 16; n++) {
         await agent.wait("TRANSFER");
@@ -238,20 +268,19 @@ export async function reviewRegressions({
         );
       }
     } finally {
-      clearInterval(heartbeat);
       sql(
         "DROP TRIGGER test_slow_claim ON agent_transfers; DROP FUNCTION test_slow_claim()",
       );
     }
-    agent.ws.terminate();
     const closed = new Promise((r) => agent.ws.once("close", r));
+    agent.terminate();
     await closed;
     sql(
       `INSERT INTO agent_transfers(id,token_hash,agent_id,request,expires_at) SELECT gen_random_uuid(),gen_random_uuid()::text,'${created.id}','{}',now()+interval '1 minute' FROM generate_series(1,100)`,
     );
     agent = await agentSocket();
     await agent.wait("TRANSFER");
-    agent.ws.terminate();
+    agent.terminate();
     await delay(350);
     assert.ok(
       Number(
@@ -265,7 +294,7 @@ export async function reviewRegressions({
       "PASS: 10001-item multi-MiB paged index, Ping/Pong, live heartbeat, partial rollback, removal reconciliation and unsent transfers",
     );
   } finally {
-    agent.ws.terminate();
+    agent.terminate();
     await admin.request(`/agents/${created.id}`, "DELETE");
   }
 }

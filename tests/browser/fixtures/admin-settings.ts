@@ -1,6 +1,6 @@
 /** Bounded synthetic default for tests that enter the administrator landing. */
 export const defaultAdminSettings = {
-  revision: "0",
+  revision: "1",
   values: {
     playback_session_limit: 4,
     media_queue_limit: 24,

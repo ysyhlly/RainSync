@@ -1531,17 +1531,18 @@ try {
             if (mode === "connection")
               handoff = await lock(
                 f,
-                "LOCK TABLE agent_transfer_runs IN SHARE MODE; SAVEPOINT connection_handoff",
+                "SAVEPOINT connection_handoff",
               );
             const seen = await held.query(
               `SELECT last_seen::text FROM agents WHERE id=${quote(identity.id)}`,
             );
+            peer.send({ type: "HEARTBEAT" });
             await until(
               async () =>
                 (await held.query(
                   `SELECT last_seen::text FROM agents WHERE id=${quote(identity.id)}`,
                 )) !== seen,
-              "Ordinary Agent tick leaves room for receiver dispatch",
+              "Real incoming heartbeat recorded before receiver contention",
               2000,
               5,
             );
@@ -1559,7 +1560,7 @@ try {
                 async () =>
                   Number(
                     await held.query(
-                      "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='UPDATE agents SET advanced_assets_version=0,advanced_assets_connection=$2 WHERE id=$1 AND NOT revoked'",
+                      "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='UPDATE agents SET advanced_assets_version=0,advanced_assets_connection=$2,last_seen=clock_timestamp() WHERE id=$1 AND token_hash=$3 AND NOT revoked'",
                     ),
                   ) === 1,
                 "Replacement initialization queued first",
@@ -1584,8 +1585,6 @@ try {
               );
             }
             peer.send(packet(peer.connection, 1, completedTotals(77)));
-            if (mode === "connection")
-              peer.send({ type: "TRANSFER_DRAINED", id: randomUUID() });
             await until(
               async () =>
                 Number(
@@ -1597,18 +1596,11 @@ try {
               250,
               5,
             );
-            if (mode === "connection")
-              await until(
-                async () =>
-                  Number(
-                    await held.query(
-                      "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='UPDATE agent_transfer_runs SET agent_drained_at=COALESCE(agent_drained_at,clock_timestamp()) WHERE id=$1 AND agent_id=$2 AND dispatched_at IS NOT NULL'",
-                    ),
-                  ) === 1,
-                "Old socket task owns its queued receiver",
-                250,
-                5,
-              );
+            assert.equal(
+              peer.record.closed,
+              false,
+              "The queued receiver is owned while authorization waits",
+            );
             await held.finish();
             if (mode === "connection") {
               await handoffReady;
@@ -1623,11 +1615,19 @@ try {
                 250,
                 5,
               );
-              assert.equal(
-                peer.record.closed,
-                false,
-                "Old receiver remains owned through post-wait identity check",
-              );
+              if (peer.record.closed) {
+                const retired = await scrape();
+                assert.equal(
+                  metric(retired, "dropped_total", { reason: "stale" }),
+                  metric(before, "dropped_total", { reason: "stale" }) + 1,
+                  "A retired socket must have completed its queued identity fence",
+                );
+                assert.equal(
+                  metric(retired, "dropped_total", { reason: "unavailable" }),
+                  metric(before, "dropped_total", { reason: "unavailable" }),
+                  "Retirement cannot replace identity rejection with timeout",
+                );
+              }
               await handoff.query("ROLLBACK TO SAVEPOINT connection_handoff");
             }
             await until(async () => {
@@ -1655,12 +1655,6 @@ try {
               }
               return false;
             }, "Explicit queued-report invalidation rather than timeout");
-            if (mode === "connection")
-              assert.equal(
-                peer.record.closed,
-                false,
-                "Stale identity rejected before old socket cancellation",
-              );
             await stable(before, 1200);
             assert.equal(
               metric(await scrape(), "dropped_total", {

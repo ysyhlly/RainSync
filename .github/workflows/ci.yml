@@ -39,7 +39,7 @@ jobs:
       - run: cargo run -p protocol --example export -- --check
       - run: npm ci && npm test && npm run build
       - name: Verify deployment configuration contracts
-        run: node --test tests/deployment-settings.test.mjs
+        run: node --test tests/deployment-settings.test.mjs tests/backend-cleanup-contract.test.mjs
       - run: node tests/postgres-readiness.mjs
       - run: cargo build --workspace --bins --examples --locked && node tests/integration.mjs
       - run: npm run test:priority-remediation

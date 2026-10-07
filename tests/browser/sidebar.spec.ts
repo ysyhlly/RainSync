@@ -61,10 +61,16 @@ test("selection slides with a small rebound on both navigation layouts", async (
   await nav.getByRole("link", { name: label, exact: true }).click();
   await expect(
     page.getByRole("heading", {
-      name: isMobile ? "片源管理" : label,
+      name: isMobile ? "管理员设置" : label,
       exact: true,
     }),
   ).toBeVisible();
+  if (isMobile) {
+    await expect(page).toHaveURL(/\/admin\/settings$/);
+    await expect(page.locator("#setting-playback_session_limit")).toHaveValue(
+      "4",
+    );
+  }
   const endpoint = isMobile ? target!.x : target!.y;
   await expect
     .poll(() =>
