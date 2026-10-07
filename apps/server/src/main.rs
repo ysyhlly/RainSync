@@ -83,7 +83,7 @@ use argon2::{
 };
 use axum::{
     Json, Router,
-    extract::{Path, State, ws::WebSocketUpgrade},
+    extract::{ConnectInfo, Path, State, ws::WebSocketUpgrade},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -292,7 +292,12 @@ struct Login {
     username: String,
     password: String,
 }
-async fn login(State(app): State<App>, h: HeaderMap, Json(body): Json<Login>) -> Result<Response> {
+async fn login(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    h: HeaderMap,
+    Json(body): Json<Login>,
+) -> Result<Response> {
     origin(&app, &h)?;
     if let Some(current) = cookie(&h) {
         let guest:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>clock_timestamp() AND u.principal_kind='guest')").bind(hash(&current)).fetch_one(&app.db).await?;
@@ -303,18 +308,23 @@ async fn login(State(app): State<App>, h: HeaderMap, Json(body): Json<Login>) ->
     if body.username.len() > 80 || body.password.len() > 1024 {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_credentials"));
     }
-    login_attempt(&app.db, &body.username).await?;
+    let source = app.account_security.source(peer, &h).to_string();
+    account_security::login_admit(&app.db, &source).await?;
     let row = sqlx::query("SELECT id,password_hash FROM users WHERE username=$1 AND principal_kind='account' AND NOT EXISTS(SELECT 1 FROM account_exits e WHERE e.user_id=users.id)")
         .bind(&body.username)
         .fetch_optional(&app.db)
-        .await?
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid_credentials"))?;
-    let stored: String = row.get("password_hash");
-    let valid =
-        account_security::password_verify(&app.account_security, stored, body.password).await?;
+        .await?;
+    let valid = account_security::login_verify(
+        &app.account_security,
+        row.as_ref().map(|row| row.get("password_hash")),
+        body.password,
+    )
+    .await?;
     if !valid {
+        account_security::login_failed(&app.db, &source).await?;
         return Err(err(StatusCode::UNAUTHORIZED, "invalid_credentials"));
     }
+    let row = row.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid_credentials"))?;
     let t = token();
     let csrf = token();
     sqlx::query("INSERT INTO sessions VALUES($1,$2,$3,now()+interval '7 days')")
@@ -331,30 +341,6 @@ async fn login(State(app): State<App>, h: HeaderMap, Json(body): Json<Login>) ->
         Json(json!({"csrf":csrf})),
     )
         .into_response())
-}
-async fn login_attempt(db: &PgPool, username: &str) -> Result<()> {
-    let mut tx = db.begin().await?;
-    // Serialize only the small bounded bookkeeping transaction, never Argon2.
-    sqlx::query("LOCK TABLE login_attempts IN SHARE ROW EXCLUSIVE MODE")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM login_attempts WHERE window_started<=now()-interval '60 seconds'")
-        .execute(&mut *tx)
-        .await?;
-    let key = hash(username);
-    let full: bool = sqlx::query_scalar("SELECT (SELECT count(*) FROM login_attempts)>=1000 AND NOT EXISTS(SELECT 1 FROM login_attempts WHERE username_hash=$1)")
-        .bind(&key).fetch_one(&mut *tx).await?;
-    if full {
-        tx.commit().await?;
-        return Err(err(StatusCode::TOO_MANY_REQUESTS, "try_later"));
-    }
-    let attempts: i32 = sqlx::query_scalar("INSERT INTO login_attempts(username_hash,attempts) VALUES($1,1) ON CONFLICT(username_hash) DO UPDATE SET attempts=LEAST(login_attempts.attempts+1,11) RETURNING attempts")
-        .bind(key).fetch_one(&mut *tx).await?;
-    tx.commit().await?;
-    if attempts > 10 {
-        return Err(err(StatusCode::TOO_MANY_REQUESTS, "try_later"));
-    }
-    Ok(())
 }
 async fn me(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     let u = auth_viewer(&app, &h, false).await?;
@@ -384,7 +370,10 @@ async fn logout(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     Ok((
         [(
             header::SET_COOKIE,
-            "rainsync_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+            format!(
+                "rainsync_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+                if app.secure { "; Secure" } else { "" }
+            ),
         )],
         Json(json!({"ok":true})),
     )

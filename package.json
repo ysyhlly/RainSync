@@ -9,6 +9,7 @@
     "dev": "npm run dev -w apps/web",
     "build": "npm run build -w apps/web",
     "test": "vitest run",
+    "test:backend-contracts": "node --test tests/backend-cleanup-contract.test.mjs",
     "test:accounts": "node tests/account-rules.mjs && node tests/registration-invites.mjs && node tests/registration.mjs && node tests/avatar-upload.mjs && node tests/platform-login-rate-limit.mjs",
     "test:e2e": "playwright test",
     "test:library-player-real": "node tests/library-player-real.mjs",

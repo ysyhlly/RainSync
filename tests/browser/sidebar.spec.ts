@@ -59,9 +59,10 @@ test("selection slides with a small rebound on both navigation layouts", async (
     requestAnimationFrame(sample);
   }, isMobile);
   await nav.getByRole("link", { name: label, exact: true }).click();
+  await expect(page).toHaveURL(isMobile ? /\/admin\/settings$/ : /\/admin\/agents$/);
   await expect(
     page.getByRole("heading", {
-      name: isMobile ? "片源管理" : label,
+      name: isMobile ? "管理员设置" : label,
       exact: true,
     }),
   ).toBeVisible();

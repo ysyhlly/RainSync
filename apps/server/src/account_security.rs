@@ -4,6 +4,16 @@ use sqlx::{Postgres, Transaction};
 use std::net::{IpAddr, SocketAddr};
 use tokio::sync::Semaphore;
 
+// Initialize during server configuration so the first unknown username does
+// not take a different path. Login verification still uses the existing worker
+// and its shared permit; account-exit verification keeps its original API.
+static DUMMY_PASSWORD_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    Argon2::default()
+        .hash_password(token().as_bytes(), &SaltString::generate(&mut OsRng))
+        .expect("default Argon2 parameters are valid")
+        .to_string()
+});
+
 pub fn anonymous_json_request(app: &App, h: &HeaderMap) -> Result<()> {
     origin(app, h)?;
     if h.get(header::CONTENT_TYPE)
@@ -61,6 +71,7 @@ impl Security {
         }
     }
     pub fn configured() -> anyhow::Result<Self> {
+        std::sync::LazyLock::force(&DUMMY_PASSWORD_HASH);
         let trusted = std::env::var("TRUSTED_PROXY_CIDRS")
             .unwrap_or_default()
             .split(',')
@@ -244,6 +255,47 @@ pub async fn password_verify(
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "hash_failed"))
 }
 
+pub async fn login_verify(
+    security: &Security,
+    stored: Option<String>,
+    password: String,
+) -> Result<bool> {
+    let exists = stored.is_some();
+    let encoded = stored.unwrap_or_else(|| DUMMY_PASSWORD_HASH.clone());
+    let valid = password_verify(security, encoded, password).await?;
+    Ok(exists && valid)
+}
+
+/// Caller source is bounded and proxy-trusted; supplied usernames allocate no
+/// global bookkeeping slots. The legacy column now stores source-key digests.
+pub async fn login_admit(db: &PgPool, source: &str) -> Result<()> {
+    let attempts: Option<i32> = sqlx::query_scalar("SELECT attempts FROM login_attempts WHERE username_hash=$1 AND window_started>clock_timestamp()-interval '60 seconds'")
+        .bind(hash(&format!("login-source:{source}"))).fetch_optional(db).await?;
+    if attempts.is_some_and(|attempts| attempts >= 10) {
+        return Err(limited(60));
+    }
+    Ok(())
+}
+
+pub async fn login_failed(db: &PgPool, source: &str) -> Result<()> {
+    let key = hash(&format!("login-source:{source}"));
+    let mut tx = db.begin().await?;
+    sqlx::query("LOCK TABLE login_attempts IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM login_attempts WHERE window_started<=clock_timestamp()-interval '60 seconds'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM login_attempts WHERE username_hash=(SELECT username_hash FROM login_attempts ORDER BY window_started,username_hash LIMIT 1) AND (SELECT count(*) FROM login_attempts)>=1000 AND NOT EXISTS(SELECT 1 FROM login_attempts WHERE username_hash=$1)")
+        .bind(&key).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO login_attempts(username_hash,window_started,attempts) VALUES($1,clock_timestamp(),1) ON CONFLICT(username_hash) DO UPDATE SET attempts=LEAST(login_attempts.attempts+1,11)")
+        .bind(key).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 pub fn password_verification_worker(
     security: &Security,
     stored: String,
@@ -268,6 +320,23 @@ pub fn password_verification_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn unknown_accounts_use_the_same_bounded_verification_worker() {
+        let security = Security::for_test();
+        std::sync::LazyLock::force(&DUMMY_PASSWORD_HASH);
+        let held = security.hashes.clone().acquire_owned().await.unwrap();
+        assert!(matches!(
+            login_verify(&security, None, "password".into()).await,
+            Err(Error(StatusCode::TOO_MANY_REQUESTS, _, Some(1)))
+        ));
+        drop(held);
+        assert!(
+            !login_verify(&security, None, "password".into())
+                .await
+                .unwrap()
+        );
+        assert_eq!(security.hashes.available_permits(), 1);
+    }
     #[tokio::test]
     async fn verification_uses_the_shared_password_work_budget() {
         let security = Security {

@@ -38,6 +38,7 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo run -p protocol --example export -- --check
       - run: npm ci && npm test && npm run build
+      - run: npm run test:backend-contracts
       - name: Verify deployment configuration contracts
         run: node --test tests/deployment-settings.test.mjs
       - run: node tests/postgres-readiness.mjs

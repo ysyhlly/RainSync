@@ -89,14 +89,17 @@ pub async fn remove_source(
     h: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
-    admin(&auth(&app, &h, true).await?)?;
+    let user = auth(&app, &h, true).await?;
+    admin(&user)?;
     let mut tx = app.db.begin().await?;
+    let login = admin_settings::lock_admin(&mut tx, &user, &h, true).await?;
     let row = sqlx::query("SELECT kind,library_id FROM sources WHERE id=$1 FOR UPDATE")
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
     let Some(row) = row else {
         // A lost successful response can be retried without recreating state.
+        admin_settings::finish(tx, &user, &login).await?;
         return Ok(Json(json!({"ok":true,"id":id})));
     };
     if row.get::<Uuid, _>("library_id") != Uuid::from_u128(1)
@@ -140,7 +143,7 @@ pub async fn remove_source(
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
+    admin_settings::finish(tx, &user, &login).await?;
     Ok(Json(json!({"ok":true,"id":id})))
 }
 pub async fn scan(

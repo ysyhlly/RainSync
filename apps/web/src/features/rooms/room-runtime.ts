@@ -145,8 +145,12 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     () => playlist.value.map((item) => item.media_id).join(","),
     refreshMetadata,
   );
-  window.addEventListener("focus", refreshMetadata);
-  onScopeDispose(() => window.removeEventListener("focus", refreshMetadata));
+  function focus() {
+    refreshMetadata();
+    invalidatePlaylist();
+  }
+  window.addEventListener("focus", focus);
+  onScopeDispose(() => window.removeEventListener("focus", focus));
   const clock = new Clock();
   let socket: WebSocket | undefined,
     retry: ReturnType<typeof setTimeout> | undefined;
@@ -363,8 +367,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
   );
   async function enter(r: Room) {
     if (room.value?.id === r.id) {
-      if (playlistPending) return playlistPending;
-      if (!playlistLoaded.value || playlistError.value) await refreshPlaylist();
+      await playlistPending?.catch(() => {});
+      if (room.value?.id === r.id) await refreshPlaylist();
       return;
     }
     const cleanup = leave(),
@@ -382,10 +386,19 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     const before = [...messages.value];
     const recovered: Message[] = [];
     let after = before.at(-1)?.id;
+    const visited = new Set<string>();
     do {
-      const history = await session.api<Message[]>(
-        `/rooms/${id}/messages${after ? `?after=${after}` : ""}`,
-      );
+      let history: Message[];
+      let resetCursor = false;
+      try {
+        history = await session.api<Message[]>(
+          `/rooms/${id}/messages${after ? `?after=${encodeURIComponent(after)}` : ""}`,
+        );
+      } catch (failure) {
+        if (!after || !(failure instanceof RequestFailure) || failure.code !== "CHAT_CURSOR_NOT_FOUND") throw failure;
+        history = await session.api<Message[]>(`/rooms/${id}/messages`);
+        resetCursor = true;
+      }
       if (serial !== connectionSerial || room.value?.id !== id) return;
       for(const m of history)if(m.deleted)deletedMessages.add(m.id);
       recovered.push(...history);
@@ -394,8 +407,10 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           [...before, ...recovered, ...messages.value].map((m) => [m.id, m]),
         ).values(),
       ].slice(-2000).map(m=>deletedMessages.has(m.id)?{...m,body:"",deleted:true}:m);
-      if (history.length < 100) break;
+      if (resetCursor || history.length < 100) break;
       after = history.at(-1)?.id;
+      if (!after || visited.has(after)) break;
+      visited.add(after);
     } while (after);
     // Deletions during disconnection can affect messages before the forward
     // cursor. Revalidate only cached IDs in bounded same-room batches.
@@ -535,7 +550,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       if (!v.state && typeof v.control_epoch?.id === "string")
         controlEpoch = v.control_epoch.id;
       if (v.type === "PLAYLIST_CHANGED") {
-        invalidatePlaylist();
+        if (v.room_id === selected) invalidatePlaylist();
         return;
       }
       if (v.type === "ROOM_PERMISSIONS_CHANGED") {
@@ -629,6 +644,10 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           controlEpoch = undefined;
         else if (typeof v.control_epoch?.id === "string")
           controlEpoch = v.control_epoch.id;
+        const duplicateState =
+          v.type !== "SNAPSHOT" &&
+          old?.clock_epoch === next.clock_epoch &&
+          old.revision === next.revision;
         const needsCalibration =
           !snapshotReady || old?.clock_epoch !== next.clock_epoch;
         snapshotReady = true;
@@ -677,6 +696,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           if (wasActive || !old) void playback.reset().catch(() => {});
           return;
         }
+        if (duplicateState && wasActive) return;
         if (
           !wasActive ||
           !old ||
@@ -1065,12 +1085,16 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     visibility = document.visibilityState;
     if (previous !== visibility)
       lastClockCheck = { monotonic: performance.now(), wall: Date.now() };
-    if (previous === "hidden" && visibility === "visible") calibrateClock();
+    if (previous === "hidden" && visibility === "visible") {
+      calibrateClock();
+      invalidatePlaylist();
+    }
   }
   function pageShown(event: PageTransitionEvent) {
     if (event.persisted) {
       recovery.suspended();
       calibrateClock();
+      invalidatePlaylist();
     }
   }
   document.addEventListener("visibilitychange", wake);

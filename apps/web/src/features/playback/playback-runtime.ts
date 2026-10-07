@@ -1615,7 +1615,7 @@ export function createPlaybackRuntime(ctx: {
   ): Promise<void> | undefined {
     if (!roomIsActive()) return;
     const s = state.value;
-    if (!s?.media_id) return;
+    if (!s?.media_id) return reset();
     const liveScope = liveWindowScope();
     if (origin === "user_intent" || liveWindowRecovery?.scope !== liveScope)
       liveWindowRecovery = liveScope
@@ -2082,14 +2082,15 @@ export function createPlaybackRuntime(ctx: {
     pendingLoad = pending;
     recoveryPending = true;
     updateRecovery();
-    if (!clockUsable()) {
-      clockAction = "load";
-      return;
-    }
     const revision = clockRevision();
     const serial = ++loadSerial;
     try {
-      if (!continuation) await stopPlayback(metrics);
+      if (!continuation) {
+        const stopped = stopPlayback(metrics);
+        recoveryPending = true;
+        updateRecovery();
+        await stopped;
+      }
       await nextTick();
       if (
         serial !== loadSerial ||
@@ -3505,6 +3506,9 @@ export function createPlaybackRuntime(ctx: {
   async function applyState(force = false, userSeek = false) {
     try {
       await reconcileState(force, userSeek);
+    } catch (failure) {
+      // Clock recalibration and media replacement cancel readiness deliberately.
+      if (!(failure instanceof PlaybackCancelled)) throw failure;
     } finally {
       updateRecovery();
     }

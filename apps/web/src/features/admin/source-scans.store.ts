@@ -23,7 +23,9 @@ export const useSourceScans = defineStore("source-scans", () => {
       for (const key of Object.keys(results)) delete results[key];
       error.value = "";
       batch.value = false;
+      running.value = false;
     },
+    { flush: "sync" },
   );
   const labels: Record<string, string> = {
     offline: "NAS 设备离线，请连接后重试",
@@ -122,7 +124,7 @@ export const useSourceScans = defineStore("source-scans", () => {
         error.value =
           failure instanceof Error ? failure.message : String(failure);
     } finally {
-      running.value = false;
+      if (epoch === session.epoch) running.value = false;
     }
   }
   return { busy, running, batch, results, error, scan, scanAll };

@@ -28,8 +28,10 @@ pub async fn change(
     Path(id): Path<Uuid>,
     Json(body): Json<Change>,
 ) -> Result<Json<Value>> {
-    admin(&auth(&app, &headers, true).await?)?;
+    let user = auth(&app, &headers, true).await?;
+    admin(&user)?;
     let mut tx = app.db.begin().await?;
+    let login = admin_settings::lock_admin(&mut tx, &user, &headers, true).await?;
     let row = sqlx::query(
         "SELECT kind,config_encrypted,access_policy_revision FROM sources WHERE id=$1 FOR UPDATE",
     )
@@ -65,7 +67,7 @@ pub async fn change(
         .execute(&mut *tx)
         .await?;
     // Migration 0024 invalidates previews once when config_encrypted changes.
-    tx.commit().await?;
+    admin_settings::finish(tx, &user, &login).await?;
     // Release the source lock before taking session/cleanup locks. Readers and
     // final publication are already fenced by the committed source revision.
     // Reconciliation repeats this retirement if the HTTP waiter is interrupted.
