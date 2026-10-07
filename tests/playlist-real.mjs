@@ -76,6 +76,9 @@ await isolatedMediaStack(
         .getByRole("link", { name: "媒体库", exact: true })
         .click();
       await page
+        .getByRole("button", { name: "打开片源 loop fixture", exact: true })
+        .click();
+      await page
         .getByRole("button", { name: "播放 first", exact: true })
         .click();
       await expect

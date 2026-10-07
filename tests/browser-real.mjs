@@ -427,6 +427,9 @@ await isolatedServer(
         }),
       ).toBeVisible();
       await nav(admin, "媒体库");
+      await admin
+        .getByRole("button", { name: "打开片源 验收合成媒体", exact: true })
+        .click();
       const media = await json(adminContext, "/media");
       assert.equal(media.length, 2);
       for (const item of media)
@@ -672,7 +675,10 @@ await isolatedServer(
       );
       await nav(admin, "NAS 设备");
       await admin.getByRole("button", { name: "添加设备" }).click();
-      await admin.getByLabel("设备名称").fill("联调未配对设备");
+      await admin
+        .getByRole("dialog", { name: "添加NAS设备", exact: true })
+        .getByLabel("设备名称", { exact: true })
+        .fill("联调未配对设备");
       await admin.getByRole("button", { name: "生成配对码" }).click();
       await expect(admin.getByLabel("配对码", { exact: true })).not.toHaveValue(
         "",
