@@ -351,6 +351,9 @@ pub async fn connect(
                     Ok(())
                 }.await;
                 if result.is_err() { break }
+                // A slow claim must not leave catch-up ticks continuously ready:
+                // give queued control frames a turn before the next dispatch.
+                tick.reset();
             }
             message = input.next() => {
                 match message {

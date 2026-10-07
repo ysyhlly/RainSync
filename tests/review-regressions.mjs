@@ -215,11 +215,17 @@ export async function reviewRegressions({
       ),
       "0",
     );
-    // Slow each post-send claim to expose whether an entire transfer batch
-    // monopolizes the control loop. Observe liveness before each commit.
+    // Slow each pre-send claim to expose whether a transfer backlog monopolizes
+    // the control loop. Only real incoming traffic may advance last_seen.
     sql(`CREATE FUNCTION test_slow_claim() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.agent_id='${created.id}' AND NEW.claimed THEN PERFORM pg_sleep(1.2); END IF; RETURN NEW; END $$;
       CREATE TRIGGER test_slow_claim BEFORE UPDATE ON agent_transfers FOR EACH ROW EXECUTE FUNCTION test_slow_claim();
       INSERT INTO agent_transfers(id,token_hash,agent_id,request,expires_at) SELECT gen_random_uuid(),gen_random_uuid()::text,'${created.id}','{}',now()+interval '1 minute' FROM generate_series(1,16)`);
+    // Use a faster cadence than the production Agent so the unchanged five-second
+    // bound measures receive-loop responsiveness, not the heartbeat interval.
+    const heartbeat = setInterval(() => {
+      if (agent.ws.readyState === WebSocket.OPEN)
+        agent.ws.send(JSON.stringify({ type: "HEARTBEAT" }));
+    }, 1000);
     try {
       for (let n = 0; n < 16; n++) {
         await agent.wait("TRANSFER");
@@ -232,6 +238,7 @@ export async function reviewRegressions({
         );
       }
     } finally {
+      clearInterval(heartbeat);
       sql(
         "DROP TRIGGER test_slow_claim ON agent_transfers; DROP FUNCTION test_slow_claim()",
       );
