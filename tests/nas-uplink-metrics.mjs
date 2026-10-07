@@ -13,6 +13,12 @@ import WebSocket, { WebSocketServer } from "ws";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
 import { delay } from "./fixtures/server.mjs";
 import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
+import {
+  queuedMetricIdentityRaces,
+  zeroTotals,
+  completedTotals,
+  packet,
+} from "./fixtures/nas-metric-identity-races.mjs";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -76,6 +82,7 @@ const coordinatorInputs = await Promise.all(
   [
     "tests/nas-uplink-metrics.mjs",
     "tests/fixtures/server.mjs",
+    "tests/fixtures/nas-metric-identity-races.mjs",
     "tests/fixtures/media-stack.mjs",
     "tests/fixtures/postgres.mjs",
     "docs/TRANSPORT_METRICS_CONTRACT.md",
@@ -506,84 +513,6 @@ async function makeProxy(f) {
       http.closeAllConnections();
       await new Promise((done) => http.close(done));
       assert.equal(await verifyClosedPort(port), true);
-    },
-  };
-}
-function emptyOutcome() {
-  return {
-    transfers: 0,
-    bytes: 0,
-    duration_us: 0,
-    duration_buckets: Array(9).fill(0),
-  };
-}
-function zeroTotals() {
-  return {
-    admitted: 0,
-    dropped: 0,
-    active: 0,
-    body_seen: false,
-    body_bytes: 0,
-    complete: emptyOutcome(),
-    failed: emptyOutcome(),
-    cancelled: emptyOutcome(),
-  };
-}
-function completedTotals(bytes, transfers = 1) {
-  return {
-    ...zeroTotals(),
-    admitted: transfers,
-    body_seen: true,
-    body_bytes: bytes,
-    complete: {
-      transfers,
-      bytes,
-      duration_us: transfers * 1000,
-      duration_buckets: Array(9).fill(transfers),
-    },
-  };
-}
-const packet = (connection, seq, totals) => ({
-  type: "HEARTBEAT",
-  uplink_metrics: {
-    version: 1,
-    connection_id: connection,
-    seq,
-    totals,
-  },
-});
-async function lock(f, statement) {
-  const marker = `nas_metrics_lock_${randomUUID().replaceAll("-", "")}`;
-  const child = f.sqlProcess(undefined, { interactive: true });
-  let output = "";
-  child.stdout.on("data", (bytes) => {
-    output += bytes;
-  });
-  const query = async (statement, timeout = 250) => {
-    const complete = `nas_metrics_step_${randomUUID().replaceAll("-", "")}`;
-    const start = output.length;
-    child.stdin.write(
-      `SELECT pg_stat_clear_snapshot(); ${statement}; SELECT ${quote(complete)};\n`,
-    );
-    await until(
-      () => output.slice(start).includes(complete),
-      "Owned lock session statement",
-      timeout,
-      5,
-    );
-    return output.slice(start).split(complete)[0].trim().split("\n").at(-1);
-  };
-  await query(
-    `BEGIN; SET application_name=${quote(marker)}; ${statement}`,
-    10000,
-  );
-  return {
-    marker,
-    query,
-    async finish(commit = true) {
-      if (child.exitCode !== null) return child.done;
-      child.stdin.end(`${commit ? "COMMIT" : "ROLLBACK"};\n`);
-      await child.done;
     },
   };
 }
@@ -1516,188 +1445,23 @@ try {
     );
     await check(
       "token change and connection replacement invalidate queued reports without timeout",
-      async () => {
-        const variants = [];
-        for (const mode of ["connection", "token"]) {
-          const identity = await pair(`synthetic locked ${mode}`),
-            peer = await raw(identity),
-            before = await scrape();
-          await delay(1050);
-          const replacement = randomBytes(32).toString("hex");
-          // Start owned SQL sessions before the ordinary liveness window.
-          const held = await lock(f, "SELECT 1");
-          let handoff, handoffReady, newer, invalidation;
-          try {
-            const blockerPid = Number(
-              await held.query("SELECT pg_backend_pid()"),
-            );
-            assert.ok(Number.isSafeInteger(blockerPid) && blockerPid > 0);
-            if (mode === "connection")
-              handoff = await lock(
-                f,
-                "LOCK TABLE agent_transfer_runs IN SHARE MODE; SAVEPOINT connection_handoff",
-              );
-            const seen = await held.query(
-              `SELECT last_seen::text FROM agents WHERE id=${quote(identity.id)}`,
-            );
-            peer.send({ type: "HEARTBEAT" });
-            await until(
-              async () =>
-                (await held.query(
-                  `SELECT last_seen::text FROM agents WHERE id=${quote(identity.id)}`,
-                )) !== seen,
-              "Authenticated incoming heartbeat refreshes Agent activity before receiver dispatch",
-              2000,
-              5,
-            );
-            await held.query(
-              mode === "token"
-                ? `UPDATE agents SET token_hash=${quote(digest(replacement))} WHERE id=${quote(identity.id)}`
-                : `SELECT id FROM agents WHERE id=${quote(identity.id)} FOR UPDATE`,
-            );
-            if (mode === "connection") {
-              newer = await connect(
-                f.origin.replace("http:", "ws:") + "/api/v1/agents/ws",
-                { Authorization: `Bearer ${identity.token}` },
-              );
-              // The heartbeat finished before the owned Agent row lock, and
-              // neither the handoff row query nor queued reports have been sent.
-              // Replacement initialization must be its sole blocked activity.
-              await until(
-                async () =>
-                  Number(
-                    await held.query(
-                      `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND ${blockerPid}=ANY(pg_blocking_pids(pid))`,
-                    ),
-                  ) === 1,
-                "Replacement initialization is the sole waiter on the owned Agent lock before handoff",
-                250,
-                5,
-              );
-              handoffReady = handoff.query(
-                `SELECT id FROM agents WHERE id=${quote(identity.id)} FOR UPDATE`,
-                10000,
-              );
-              handoffReady.catch(() => {});
-              await until(
-                async () =>
-                  Number(
-                    await held.query(
-                      `SELECT count(*) FROM pg_stat_activity WHERE application_name=${quote(handoff.marker)} AND wait_event_type='Lock'`,
-                    ),
-                  ) === 1,
-                "Owned row handoff queued second",
-                250,
-                5,
-              );
-            }
-            peer.send(packet(peer.connection, 1, completedTotals(77)));
-            if (mode === "connection")
-              peer.send({ type: "TRANSFER_DRAINED", id: randomUUID() });
-            await until(
-              async () =>
-                Number(
-                  await held.query(
-                    "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='SELECT id FROM agents WHERE id=$1 AND token_hash=$2 AND NOT revoked FOR SHARE'",
-                  ),
-                ) > 0,
-              "Actual receiver Agent authorization lock wait",
-              250,
-              5,
-            );
-            if (mode === "connection")
-              await until(
-                async () =>
-                  Number(
-                    await held.query(
-                      "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='UPDATE agent_transfer_runs SET agent_drained_at=COALESCE(agent_drained_at,clock_timestamp()) WHERE id=$1 AND agent_id=$2 AND dispatched_at IS NOT NULL'",
-                    ),
-                  ) === 1,
-                "Old socket task owns its queued receiver",
-                250,
-                5,
-              );
-            await held.finish();
-            if (mode === "connection") {
-              await handoffReady;
-              await until(
-                async () => {
-                  const row = (await admin.request("/agents")).find(
-                    (row) => row.id === identity.id,
-                  );
-                  return row?.connected === true && row.drain_receipts === null;
-                },
-                "Replacement registry positively installed",
-                250,
-                5,
-              );
-              assert.equal(
-                peer.record.closed,
-                false,
-                "Old receiver remains owned through post-wait identity check",
-              );
-              await handoff.query("ROLLBACK TO SAVEPOINT connection_handoff");
-            }
-            await until(async () => {
-              const rows = await scrape();
-              assert.equal(
-                metric(rows, "dropped_total", { reason: "unavailable" }),
-                metric(before, "dropped_total", { reason: "unavailable" }),
-                "Authorization timeout cannot substitute for identity invalidation",
-              );
-              if (mode === "token") {
-                if (
-                  metric(rows, "dropped_total", { reason: "unauthorized" }) ===
-                  metric(before, "dropped_total", { reason: "unauthorized" }) +
-                    1
-                ) {
-                  invalidation = "post_wait_token_rejected";
-                  return true;
-                }
-              } else if (
-                metric(rows, "dropped_total", { reason: "stale" }) ===
-                metric(before, "dropped_total", { reason: "stale" }) + 1
-              ) {
-                invalidation = "post_wait_connection_rejected";
-                return true;
-              }
-              return false;
-            }, "Explicit queued-report invalidation rather than timeout");
-            if (mode === "connection")
-              assert.equal(
-                peer.record.closed,
-                false,
-                "Stale identity rejected before old socket cancellation",
-              );
-            await stable(before, 1200);
-            assert.equal(
-              metric(await scrape(), "dropped_total", {
-                reason: "unavailable",
-              }),
-              metric(before, "dropped_total", { reason: "unavailable" }),
-            );
-          } finally {
-            await Promise.all([held.finish(false), handoff?.finish(false)]);
-          }
-          if (newer) await newer.close();
-          if (!peer.record.closed) await peer.close();
-          const recovered = await raw({
-            ...identity,
-            token: mode === "token" ? replacement : identity.token,
-          });
-          await accept(recovered, 1, completedTotals(3), 3);
-          await recovered.close();
-          variants.push({
-            mode,
-            contended_agent_row: true,
-            invalidation,
-            authorization_timeouts: 0,
-            stale_report_credit: 0,
-            fresh_authorized_delta: 3,
-          });
-        }
-        return { synthetic: true, variants };
-      },
+      () =>
+        queuedMetricIdentityRaces({
+          f,
+          admin,
+          pair,
+          raw,
+          scrape,
+          stable,
+          accept,
+          metric,
+          packet,
+          completedTotals,
+          connectReplacement: (identity) =>
+            connect(f.origin.replace("http:", "ws:") + "/api/v1/agents/ws", {
+              Authorization: `Bearer ${identity.token}`,
+            }),
+        }),
     );
     await check(
       "public revocation denies live and new synthetic metric producers",

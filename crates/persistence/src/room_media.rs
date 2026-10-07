@@ -6,6 +6,9 @@ use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 fn next_media(ids: &[Uuid], current: Option<Uuid>) -> Option<Uuid> {
+    if ids.is_empty() {
+        return current;
+    }
     let index = ids.iter().position(|id| Some(*id) == current)?;
     ids.get((index + 1) % ids.len()).copied()
 }
@@ -36,12 +39,35 @@ pub(super) async fn resolve_end(
 mod tests {
     use super::*;
     #[test]
-    fn next_item_requires_a_current_anchor() {
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
+    fn empty_playlist_repeats_current_media_without_inventing_one() {
+        let a = Uuid::from_u128(1);
+        assert_eq!(next_media(&[], None), None);
+        assert_eq!(next_media(&[], Some(a)), Some(a));
+    }
+
+    #[test]
+    fn populated_playlist_requires_a_current_anchor() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        assert_eq!(next_media(&[a, b], None), None);
+        assert_eq!(next_media(&[b], Some(a)), None);
+    }
+
+    #[test]
+    fn one_item_playlist_repeats_its_current_media() {
+        let a = Uuid::from_u128(1);
+        assert_eq!(next_media(&[a], Some(a)), Some(a));
+    }
+
+    #[test]
+    fn next_item_follows_order_and_wraps_at_the_end() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let c = Uuid::from_u128(3);
         assert_eq!(next_media(&[a, b], Some(a)), Some(b));
         assert_eq!(next_media(&[a, b], Some(b)), Some(a));
-        assert_eq!(next_media(&[b], Some(a)), None);
-        assert_eq!(next_media(&[], Some(a)), None);
+        assert_eq!(next_media(&[a, b, c], Some(a)), Some(b));
+        assert_eq!(next_media(&[a, b, c], Some(b)), Some(c));
+        assert_eq!(next_media(&[a, b, c], Some(c)), Some(a));
     }
 }

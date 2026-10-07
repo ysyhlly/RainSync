@@ -47,6 +47,8 @@
 
 HLS 语法依据 [RFC 8216 EXTINF](https://datatracker.ietf.org/doc/html/rfc8216#section-4.3.2.1) 与 [TARGETDURATION](https://datatracker.ietf.org/doc/html/rfc8216#section-4.3.3.1)。
 
+2026-10-08 最新分支的 CI 复查补充：第 25 项拒绝的是非空队列缺失当前项的情况；空队列继续重复当前影片，保留原有播放行为。两条路径均在事务内重新检查媒体权限和可用性。HTTP 直连分类优先读取授权 HEAD 的明确 MIME；需要正文嗅探时仍使用受限 Range，避免提前消耗无版本源仅允许的一次正文。
+
 ## 已有新验证证据
 
 - 当前 Vue/Vitest：40 个文件、784 项通过；生产构建通过。
