@@ -78,3 +78,11 @@ jobs:
         run: RAINSYNC_PLAYWRIGHT_MODULE="$PWD/node_modules/@playwright/test/index.mjs" node --test tests/acceptance-browser.test.mjs
       - run: npm run test:browser-real
       - run: node tests/playlist-real.mjs
+      - name: Retain readiness failure report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-readiness-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rainsync-validation/server-readiness/*/report.json
+          if-no-files-found: ignore
+          retention-days: 7
