@@ -42,14 +42,13 @@ impl Registry {
     }
 }
 
+type SourceFuture<'a, T> =
+    Pin<Box<dyn Future<Output = std::result::Result<T, bilibili::Error>> + Send + 'a>>;
+
 pub(super) trait Source: Send {
     fn status(&self) -> StatusCode;
     fn headers(&self) -> &HeaderMap;
-    fn next<'a>(
-        &'a mut self,
-    ) -> Pin<
-        Box<dyn Future<Output = std::result::Result<Option<Vec<u8>>, bilibili::Error>> + Send + 'a>,
-    >;
+    fn next<'a>(&'a mut self) -> SourceFuture<'a, Option<Vec<u8>>>;
 }
 impl Source for MediaResponse {
     fn status(&self) -> StatusCode {
@@ -58,11 +57,7 @@ impl Source for MediaResponse {
     fn headers(&self) -> &HeaderMap {
         self.headers()
     }
-    fn next<'a>(
-        &'a mut self,
-    ) -> Pin<
-        Box<dyn Future<Output = std::result::Result<Option<Vec<u8>>, bilibili::Error>> + Send + 'a>,
-    > {
+    fn next<'a>(&'a mut self) -> SourceFuture<'a, Option<Vec<u8>>> {
         Box::pin(self.next_chunk())
     }
 }
@@ -75,20 +70,10 @@ pub(super) struct Request {
     pub deadline: Deadline,
 }
 pub(super) trait Transport: Send + Sync + 'static {
-    fn open<'a>(
-        &'a self,
-        request: &'a Request,
-    ) -> Pin<
-        Box<dyn Future<Output = std::result::Result<Box<dyn Source>, bilibili::Error>> + Send + 'a>,
-    >;
+    fn open<'a>(&'a self, request: &'a Request) -> SourceFuture<'a, Box<dyn Source>>;
 }
 impl Transport for providers::platform::http::PlatformHttp {
-    fn open<'a>(
-        &'a self,
-        request: &'a Request,
-    ) -> Pin<
-        Box<dyn Future<Output = std::result::Result<Box<dyn Source>, bilibili::Error>> + Send + 'a>,
-    > {
+    fn open<'a>(&'a self, request: &'a Request) -> SourceFuture<'a, Box<dyn Source>> {
         Box::pin(async move {
             self.media_request_for(
                 &request.provider,
