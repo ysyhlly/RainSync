@@ -75,21 +75,41 @@ unconfirmed scope shutdown is not redesigned here.
 | `native_platform_clear_ladder_v1` | `native_platform_hls_ladder_v1` | `Ladder::NativePlatform`; existing native ladder validator at entry | `native_platform_ladder::run`; original native ingress and ladder publication |
 | `static_hls_child` | `static_hls_v1` | Excluded from this claim path; generic marker guard still refuses it | Separate typed child dispatch/encoder registry, original permits/attempt proof; unchanged opt-in switch |
 | Other static-HLS stage-A/spec markers | `static_hls_v1` or malformed legacy data | Not dispatched here; existing static marker refusal and SQL queue fences | Original parent/child operation owners, not the generic scheduler |
-| Unknown non-null kind | Original legacy fallthrough | Retained by structural-only extraction; companion hardening must be reviewed separately | Original generic preparation and settlement |
+| Unknown non-null string or non-string kind | No supported producer/recipe | Separate hardening guard after all existing route/marker validators; fixed `media_job_kind_invalid` error | No input, directory, encoder or decoder work is started by decoding; original claimed-attempt settlement remains responsible for any claim-owned rows |
 | Preview attempts | Separate preview tables/queue | `previews::run`, unchanged configured concurrency/limit/revision/lease recovery | Existing preview input/process/receipt lifecycle |
 | Distributed compute recipes | Separate compute admission and attempt tables | Not a media-worker task-kind route | Existing independent compute authority, attempt budget and retention |
 
 The matrix describes dispatch, not permission. Actual owner/attempt/lease and
 source/session checks remain with the current persistence and execution owners.
 
-## Structural-only compatibility boundary
+## Kind hardening, separately reviewable
 
-This patch retains the old validator order and legacy fallthrough, including
-absent, null, unknown and non-string kind. Strict rejection of unsupported kinds
-is an independently reviewable companion patch, with before/after tests and a
-source/fixture compatibility audit. Apply both before claiming strict dispatch.
-No sparse legacy field is tightened and audio conversion keeps its old position.
-Runtime results below describe the final combination of both patches.
+The structural extraction retains the old validator order: native, owned HTTP,
+advanced markers, static markers, then unversioned legacy fields. Do not tighten
+legacy `root`, `resource`, ticket, start, transcode, mode or audio defaults here.
+The u64-to-u32 audio conversion remains after source validation and directory
+setup, so its error priority is unchanged.
+
+The separate guard closes the former generic fallthrough for unsupported string,
+number, boolean, array and object kinds, plus non-object specs. Mixed marked
+specs still return their original validator refusal first. The new refusal
+stores no untrusted input and logs no resource URL or credential.
+
+Compatibility audit used the current Server legacy producer in `media.rs`,
+media_queue's original enqueue contract, all worker/persistence test fixtures,
+and historical migrations 0001, 0043, 0047, 0048, 0056, 0057, 0060, 0062, 0065,
+0067 and 0068. Ordinary producers and old execution fixtures omit kind. The
+original SQL `COALESCE(spec->>'kind','')` also accepts JSON null, which is retained
+as an explicit compatibility case. No non-string kind producer or fixture was
+found. This is a source/fixture audit, not an inventory of a production database.
+
+The guard runs inside the same cancellable preparation future and before cache
+capacity/reservation, source verification, input-ticket decryption, local file
+opening, output directory creation or process spawn. An invalid claim still
+owns its claim-created output/execution ledger rows; the unchanged finalization
+path records failure and only acknowledges the original attempt after the
+decoder/scope have actually drained. No resource ownership is inferred from the
+parse failure itself.
 
 ## Verification inventory
 
@@ -98,8 +118,8 @@ claim interruption, unchanged returned identity/spec, empty/failure health,
 three-second timeout, one/two-second cadence, every supported single-output
 kind, all four ladder route tags and their closed validation, native absolute
 deadline preservation, sparse legacy/default parity, delayed audio overflow,
-marker error precedence, explicit null compatibility and credential-free typed
-diagnostics. Unknown-kind before/after coverage belongs to the companion patch.
+marker error precedence, explicit null compatibility, unknown-kind before/after
+behavior and credential-free typed diagnostics.
 
 The existing advanced-queue wiring test now follows the coordinator and typed
 decoder seam while retaining the pre-cache ordering assertions. These checks

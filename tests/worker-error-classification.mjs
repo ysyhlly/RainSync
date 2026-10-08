@@ -8,7 +8,7 @@ import {
   randomUUID,
 } from "node:crypto";
 import { createServer } from "node:http";
-import { readFile, writeFile } from "node:fs/promises";
+import { lstat, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
@@ -17,6 +17,7 @@ import { sourceMedia } from "./fixtures/source-grant.mjs";
 import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 import { delay } from "./fixtures/server.mjs";
 import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
+import { safeFailure } from "./fixtures/safe-failure.mjs";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 assert.ok(process.env.W03_BACKEND_BINDING, "Use a frozen native backend");
@@ -24,9 +25,14 @@ const binding = JSON.parse(await readFile(process.env.W03_BACKEND_BINDING));
 assert.equal(binding.result, "passed");
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const coordinator = await Promise.all(
-  ["tests/worker-error-classification.mjs", "tests/fixtures/playback-admission.mjs"].map(
-    async (path) => ({ path, sha256: sha(await readFile(resolve(repo, path))) }),
-  ),
+  [
+    "tests/worker-error-classification.mjs",
+    "tests/fixtures/playback-admission.mjs",
+    "tests/fixtures/safe-failure.mjs",
+  ].map(async (path) => ({
+    path,
+    sha256: sha(await readFile(resolve(repo, path))),
+  })),
 );
 const coordinatorSha = coordinator[0].sha256;
 async function verifyBinding() {
@@ -39,7 +45,11 @@ async function verifyBinding() {
   for (const item of binding.binaries)
     assert.equal(sha(await readFile(item.path)), item.sha256, item.name);
   for (const item of coordinator)
-    assert.equal(sha(await readFile(resolve(repo, item.path))), item.sha256, item.path);
+    assert.equal(
+      sha(await readFile(resolve(repo, item.path))),
+      item.sha256,
+      item.path,
+    );
 }
 await verifyBinding();
 const report = {
@@ -55,10 +65,12 @@ const report = {
 const quote = (v) => `'${String(v).replaceAll("'", "''")}'`;
 const json = (v) => `${quote(JSON.stringify(v))}::jsonb`;
 let fixture, origin, originPort, workerPid, roomSocket;
+let originRequests = 0;
 const connections = new Set();
 const secret = randomBytes(24).toString("hex");
 try {
   origin = createServer((req, res) => {
+    originRequests += 1;
     const status = Number(
       new URL(req.url, "http://fixture.invalid").pathname.slice(1),
     );
@@ -97,14 +109,31 @@ try {
     };
     await f.startWorker();
     workerPid = f.workerPid;
-    for (const [name, status, reason, httpStatus, attempts] of [
+    for (const [
+      name,
+      status,
+      reason,
+      httpStatus,
+      attempts,
+      kind,
+      label = name,
+    ] of [
       ["invalid.mp4", null, "media_input_invalid", 422, 1],
       ["denied-401", 401, "media_input_denied", 502, 1],
       ["denied-403", 403, "media_input_denied", 502, 1],
       ["missing", 404, "media_job_failed", 502, 1],
       ["unavailable", 503, "upstream_transport_retry_exhausted", 502, 3],
       ["valid.mp4", null, null, 200, 1],
+      ["valid.mp4", null, null, 200, 1, null, "legacy-null-kind"],
+      ["unknown-kind", 503, "media_job_failed", 502, 1, "future_recipe_v2"],
+      ["numeric-kind", 503, "media_job_failed", 502, 1, 7],
+      ["boolean-kind", 503, "media_job_failed", 502, 1, true],
+      ["array-kind", 503, "media_job_failed", 502, 1, []],
+      ["object-kind", 503, "media_job_failed", 502, 1, { private: secret }],
     ]) {
+      report.active_check = label;
+      const requestsBefore = originRequests;
+      const refusedKind = kind !== undefined && kind !== null;
       const id = randomUUID(),
         token = randomBytes(32).toString("hex");
       const resource = status
@@ -123,6 +152,7 @@ try {
         transcode: true,
         estimated_output_bytes: 1048576,
       };
+      if (kind !== undefined) spec.kind = kind;
       withPlaybackAdmission(
         f,
         { client: admin, user: identity.id, room: room.id, session: id },
@@ -184,21 +214,60 @@ try {
         `SELECT count(*) FROM cache_write_reservations WHERE job_id=${quote(id)}`,
         "0",
       );
+      if (refusedKind) {
+        assert.equal(
+          originRequests,
+          requestsBefore,
+          "invalid kind cannot start an input request",
+        );
+        await assert.rejects(
+          lstat(resolve(f.env.CACHE_ROOT, id)),
+          { code: "ENOENT" },
+          "invalid kind cannot create its encoder output directory",
+        );
+        assert.equal(
+          f.sql(
+            `SELECT count(*) FROM media_executions WHERE job_id=${quote(id)} AND kind='job' AND attempt=1 AND owner_id IS NOT NULL AND reaped_at IS NOT NULL`,
+          ),
+          "1",
+          "the original claim still receives exactly one drained-attempt receipt",
+        );
+        const logs = (await readdir(f.root)).filter((file) =>
+          /^child-\d+\.log$/.test(file),
+        );
+        for (const file of logs) {
+          const log = await readFile(resolve(f.root, file), "utf8");
+          assert.ok(
+            !log.includes(secret) &&
+              !log.includes(token) &&
+              !log.includes(spec.input_ticket),
+            "worker diagnostics must not expose private spec values",
+          );
+        }
+      }
       await delay(250);
       assert.equal(
         f.sql(`SELECT attempt FROM media_jobs WHERE id=${quote(id)}`),
         String(attempts),
       );
       report.checks.push({
-        name,
+        name: label,
         ...state,
         http_status: httpStatus,
         no_unreaped_execution: true,
         reservation_released: true,
+        ...(refusedKind
+          ? {
+              no_input_requested: true,
+              no_attempt_directory: true,
+              original_attempt_receipt: true,
+              private_diagnostics_redacted: true,
+            }
+          : {}),
       });
       await admin.request(`/playback-sessions/${id}`, "DELETE");
       console.log(
-        `PASS: ${name} -> ${reason ?? "succeeded"}; attempt ${attempts}; matching HTTP/readiness; drained`,
+        `PASS: ${label} -> ${reason ?? "succeeded"}; attempt ${attempts}; matching HTTP/readiness; drained`,
       );
     }
     await f.startServer({ WORKER_URL: f.workerOrigin });
@@ -227,6 +296,7 @@ try {
     const snapshot = await next("SNAPSHOT");
     let state = snapshot.state;
     for (const status of [401, 403]) {
+      report.active_check = `public-prepare-denied-${status}`;
       const media = sourceMedia(f, {
         kind: "http",
         url: `http://127.0.0.1:${originPort}/${status}?fixture=${secret}`,
@@ -284,15 +354,14 @@ try {
     }
     roomSocket.terminate();
     roomSocket = undefined;
+    report.active_check = "verify_binding";
     await verifyBinding();
   });
+  delete report.active_check;
   report.result = "passed";
 } catch (error) {
   report.result = "failed";
-  report.failure = String(error.stack ?? error).replaceAll(
-    secret,
-    "[redacted]",
-  );
+  report.failure = safeFailure(error);
   process.exitCode = 1;
 } finally {
   roomSocket?.terminate();
@@ -309,7 +378,7 @@ try {
       assert.equal(report.cleanup.origin_closed, true);
     } catch (error) {
       report.result = "failed";
-      report.cleanup_failure = String(error.message);
+      report.cleanup_failure = safeFailure(error);
       process.exitCode = 1;
     }
     const path = resolve(fixture.root, "report.json");

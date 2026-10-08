@@ -131,6 +131,7 @@ impl<'a> SingleOutput<'a> {
             }
         } else {
             static_hls_child_gate::reject_unsupported_claim(claim)?;
+            require_legacy_kind(spec)?;
             SingleKind::Legacy
         };
         Ok(Self(Decoded::Encoder(
@@ -177,6 +178,17 @@ impl<'a> SingleOutput<'a> {
             Decoded::Encoder(_, fields) => Ok(fields.audio_index.map(u32::try_from).transpose()?),
         }
     }
+}
+
+/// Separate hardening boundary, after the existing marker validators. The
+/// legacy SQL predicate treats absent and JSON-null kind alike; retain both.
+/// Unsupported strings and other JSON types must not select a generic recipe.
+fn require_legacy_kind(spec: &Value) -> Result<()> {
+    anyhow::ensure!(
+        spec.is_object() && spec.get("kind").is_none_or(Value::is_null),
+        UnsupportedKind
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -315,6 +327,35 @@ mod tests {
         let claim = claim(json!({"audio_index":u64::from(u32::MAX)+1}));
         let decoded = SingleOutput::decode(&claim).unwrap();
         assert!(decoded.audio_index().is_err());
+    }
+
+    #[test]
+    fn invalid_explicit_kinds_no_longer_fall_through_as_legacy() {
+        for kind in [
+            json!("future_recipe_v2"),
+            json!(""),
+            json!(7),
+            json!(true),
+            json!([]),
+            json!({"private":"fixture-secret"}),
+        ] {
+            let claim = claim(json!({"kind":kind,"input_ticket":"fixture-secret"}));
+            assert!(
+                legacy_preparation_gate(&claim).is_ok(),
+                "documents the old fallthrough"
+            );
+            let error = SingleOutput::decode(&claim).unwrap_err();
+            assert!(error.is::<UnsupportedKind>());
+            assert_eq!(error.to_string(), "media_job_kind_invalid");
+            assert!(!format!("{error:?}").contains("fixture-secret"));
+        }
+        for spec in [json!(null), json!(true), json!([]), json!("fixture-secret")] {
+            assert!(
+                SingleOutput::decode(&claim(spec))
+                    .unwrap_err()
+                    .is::<UnsupportedKind>()
+            );
+        }
     }
 
     #[test]
