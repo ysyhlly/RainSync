@@ -8,9 +8,30 @@ test('Bili refresh starts only with a fresh explicit QR consent and exact revisi
 test('shutdown stops admission, awaits the operation, and positively drains without aborting token rotation',()=>{assert.match(runner,/Ordering::Release/);assert.match(runner,/task\.await/);assert.doesNotMatch(runner,/\.abort\(/);assert.match(runner,/statement_timeout='5s'/);assert.match(runner,/timeout\(Duration::from_secs\(5\), app\.db\.begin\(\)\)/);assert.match(runner,/refresh_due_inner/);assert.match(runner,/platform_renewal_drain_failed/);});
 test('fixed provider transports omit challenge, fingerprint, and arbitrary target plumbing',()=>{const bili=read('crates/providers/src/platform/bilibili/renewal.rs'),http=read('crates/providers/src/platform/http/renewal_http.rs'),oauthHttp=read('crates/providers/src/platform/http/oauth_http.rs');assert.match(bili,/Oaep::new::<Sha256>/);assert.doesNotMatch(bili,/getbuvid|buvid3=|captcha.*send|msToken/);assert.match(http,/pinned_client/);assert.match(http,/is_redirection/);assert.match(oauthHttp,/pinned_client/);assert.doesNotMatch(oauthHttp,/header\(header::COOKIE/);});
 
-test('web callback keeps Strict cookies and uses authenticated CSRF claim behind callback-specific CSP',()=>{const main=read('apps/server/src/main.rs'),caddy=read('deploy/Caddyfile');assert.match(main,/SameSite=Strict/);assert.match(main,/oauth\/claim/);assert.match(oauth,/history\.replaceState/);assert.match(oauth,/x-csrf-token/);assert.match(oauth,/pub async fn claim/);assert.match(oauth,/auth\(&app, &headers, true\)/);assert.match(caddy,/@standard_security/);assert.match(caddy,/not path \/api\/v1\/platform-accounts\/douyin\/oauth\/callback \/api\/v1\/platform-accounts\/tiktok\/oauth\/callback/);});
+test('web callback keeps Strict cookies and uses authenticated CSRF claim behind callback-specific CSP',()=>{const main=read('apps/server/src/main.rs'),routes=read('apps/server/src/bootstrap/routes.rs'),caddy=read('deploy/Caddyfile');assert.match(main,/SameSite=Strict/);assert.match(routes,/oauth\/claim/);assert.match(oauth,/history\.replaceState/);assert.match(oauth,/x-csrf-token/);assert.match(oauth,/pub async fn claim/);assert.match(oauth,/auth\(&app, &headers, true\)/);assert.match(caddy,/@standard_security/);assert.match(caddy,/not path \/api\/v1\/platform-accounts\/douyin\/oauth\/callback \/api\/v1\/platform-accounts\/tiktok\/oauth\/callback/);});
 test('rotation owners reconcile issued results and never stop a whole runner for one account failure',()=>{const exchanges=read('apps/server/src/platform_accounts/exchanges.rs');assert.match(exchanges,/catch_unwind/);assert.match(exchanges,/unconfirmed/);assert.match(oauth,/exchange_owned/);assert.match(oauth,/persist_exchange/);assert.match(oauth,/publish_refresh/);assert.match(oauth,/actual\.storage_value\(\) == expected\.storage_value\(\)/);assert.match(renewal,/publish_bili/);assert.match(renewal,/actual_cookie\.expose_for_storage/);assert.match(runner,/let bili = renewal::refresh_due_inner/);assert.match(runner,/platform_renewal_pass_failed/);assert.doesNotMatch(runner,/refresh_due_inner\([^;]+\.await\?/);assert.match(runner,/platform_renewal_commit_unknown/);});
-test('expired consent cleanup and nav owner checks are exact, while startup checks new encrypted columns',()=>{assert.match(oauth,/WHERE id=\$1 AND user_id=\$2 AND provider=\$3 AND revision=\$4 AND consent_login_hash=\$5 AND auto_renew AND renewal_state='scheduled'/);assert.match(oauth,/authority_expired/);assert.equal((renewal.match(/\.check_login\(/g)||[]).length,2);const key=read('apps/server/src/source_key_check.rs');for(const field of ['platform_oauth_accounts','token_encrypted','platform_oauth_requests','secret_encrypted','platform_account_renewals','refresh_encrypted'])assert.ok(key.includes(field));assert.match(key,/to_regclass/);});
+test('expired consent cleanup and nav owner checks are exact, while startup checks new encrypted columns',()=>{
+ assert.match(oauth,/WHERE id=\$1 AND user_id=\$2 AND provider=\$3 AND revision=\$4 AND consent_login_hash=\$5 AND auto_renew AND renewal_state='scheduled'/);
+ assert.match(oauth,/authority_expired/);
+ assert.equal((renewal.match(/\.check_login\(/g)||[]).length,2);
+ const key=read('apps/server/src/source_key_check.rs');
+ // Production consumes this fixed inventory directly. Check its actual table /
+ // column pairs and predicates, rather than expecting copied names in Rust.
+ assert.match(key,/serde_json::from_str\(include_str!\("source-key-inventory\.json"\)\)/);
+ assert.match(key,/SELECT to_regclass\(\$1\) IS NOT NULL/);
+ assert.match(key,/SELECT \{column\} FROM \{table\} WHERE \{predicate\}/);
+ const inventory=JSON.parse(read('apps/server/src/source-key-inventory.json'));
+ assert.ok(Array.isArray(inventory));
+ for(const [table,column] of [
+  ['platform_oauth_accounts','token_encrypted'],
+  ['platform_oauth_requests','secret_encrypted'],
+  ['platform_account_renewals','refresh_encrypted'],
+ ]) {
+  const fields=inventory.filter(field=>field.table===table&&field.column===column);
+  assert.equal(fields.length,1,`exact startup inventory for ${table}.${column}`);
+  assert.equal(fields[0].predicate,`${column} IS NOT NULL`);
+ }
+});
 test('OAuth refresh rechecks live originating login after claim and before rotating admission',()=>{
  const refresh=oauth.slice(oauth.indexOf('async fn refresh_one('),oauth.indexOf('async fn retire_refresh('));
  const claim=refresh.indexOf("SET renewal_state='running'");

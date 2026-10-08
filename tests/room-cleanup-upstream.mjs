@@ -79,7 +79,7 @@ await isolatedServer("room-cleanup-upstream",async f=>{
     await until(()=>f.sql(`SELECT state FROM upstream_reservations WHERE id='${retained.plan.session_id}'`)==="closed","ledger stop positive even when marker write fails");
     assert.equal(f.sql(`SELECT resource ? 'upstream_closed' FROM playback_sessions WHERE id='${retained.plan.session_id}'`),"f");
     assert.equal((await view(retained.room.id)).lifecycle,"closing");
-    const main=await readFile("apps/server/src/main.rs","utf8");
+    const main=await readFile("apps/server/src/bootstrap/lifecycle.rs","utf8");
     const pruneLine=main.split("\n").find(line=>line.includes('"DELETE FROM upstream_reservations u WHERE'));
     const repairLine=main.split("\n").find(line=>line.includes('"UPDATE playback_sessions p SET stopped=true,resource=resource||'));
     const query=line=>JSON.parse(line.trim().replace(/,$/,""));

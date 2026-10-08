@@ -140,7 +140,7 @@ try {
     passed("forged ordinals/cutoffs, scope rewrites, grant relocation and counter mutation fail closed");
 
     const retained = f.sql("SELECT count(*) FROM agent_transfer_runs WHERE legacy_unconfirmed");
-    const main = await readFile("apps/server/src/main.rs", "utf8");
+    const main = await readFile("apps/server/src/bootstrap/lifecycle.rs", "utf8");
     const sweep = [...main.matchAll(/"((?:UPDATE agent_transfer_runs SET status='failed'|DELETE FROM agent_transfer_runs)[^"\n]*)"/g)].map(match => match[1]);
     assert.equal(sweep.length, 2);
     for (const sql of sweep) f.sql(sql);

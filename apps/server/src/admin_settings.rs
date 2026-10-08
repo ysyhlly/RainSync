@@ -129,53 +129,29 @@ fn projection(app: &App, row: &PgRow) -> Result<Value> {
     }))
 }
 
-// Same user-before-session lock order as existing administrator settings writes.
-// Hold both through commit; recheck real-clock expiry after settings-row waits.
+// Compatibility for callers whose existing use case still owns its transaction.
+// Source settings deliberately keeps its different local policy and lock contract.
 pub(crate) async fn lock_admin(
     tx: &mut Transaction<'_, Postgres>,
     user: &User,
     headers: &HeaderMap,
     write: bool,
 ) -> Result<String> {
-    let role: Option<bool> =
-        sqlx::query_scalar("SELECT admin FROM users WHERE id=$1 AND account_active(id) FOR SHARE")
-            .bind(user.id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    if role != Some(true) {
-        return Err(err(StatusCode::FORBIDDEN, "admin_required"));
-    }
-    let login = media_authorization::login_hash(headers)?;
-    let row = sqlx::query("SELECT csrf FROM sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>clock_timestamp() FOR SHARE")
-        .bind(&login).bind(user.id).fetch_optional(&mut **tx).await?
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "session_expired"))?;
-    if write
-        && headers.get("x-csrf-token").and_then(|v| v.to_str().ok())
-            != Some(row.get::<String, _>("csrf").as_str())
-    {
-        return Err(err(StatusCode::FORBIDDEN, "csrf_rejected"));
-    }
-    Ok(login)
+    identity::admin::lock_admin(tx, user.id, headers, write).await
 }
 pub(crate) async fn finish(tx: Transaction<'_, Postgres>, user: &User, login: &str) -> Result<()> {
-    let mut tx = tx;
-    let live: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.user_id=$2 AND s.expires_at>clock_timestamp() AND u.admin AND account_active(u.id))")
-        .bind(login).bind(user.id).fetch_one(&mut *tx).await?;
-    if !live {
-        return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
-    }
-    tx.commit().await?;
-    Ok(())
+    identity::admin::finish(tx, user.id, login).await
 }
 
 pub async fn get(State(app): State<App>, headers: HeaderMap) -> Result<Response> {
     let user = auth(&app, &headers, false).await?;
     admin(&user)?;
-    let mut tx = app.db.begin().await?;
-    let login = lock_admin(&mut tx, &user, &headers, false).await?;
-    let row = sqlx::query(SELECT).fetch_one(&mut *tx).await?;
+    let mut admission =
+        identity::admin::AdminTransaction::begin(&app.db, &user, &headers, false).await?;
+    let tx = admission.transaction();
+    let row = sqlx::query(SELECT).fetch_one(&mut **tx).await?;
     let value = projection(&app, &row)?;
-    finish(tx, &user, &login).await?;
+    admission.commit().await?;
     Ok(responses::ok_json(value))
 }
 
@@ -189,10 +165,11 @@ pub async fn change(
     let body: Change = serde_json::from_slice(&body).map_err(|_| invalid())?;
     let expected = revision(&body.expected_revision)?;
     validate(&body.changes)?;
-    let mut tx = app.db.begin().await?;
-    let login = lock_admin(&mut tx, &user, &headers, true).await?;
+    let mut admission =
+        identity::admin::AdminTransaction::begin(&app.db, &user, &headers, true).await?;
+    let tx = admission.transaction();
     let row = sqlx::query(&format!("{SELECT} FOR UPDATE"))
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
     if row.try_get::<i64, _>("revision")? != expected {
         return Err(err(StatusCode::CONFLICT, "settings_revision_conflict"));
@@ -210,16 +187,16 @@ pub async fn change(
             .ok_or_else(|| err(StatusCode::CONFLICT, "settings_revision_conflict"))?;
         let changed = sqlx::query("UPDATE admin_settings SET revision=$1,playback_session_limit=$2,media_queue_limit=$3,registration_validate_per_minute=$4,registration_per_ten_minutes=$5,registration_mode=$6,guests_enabled=$7,updated_at=clock_timestamp(),updated_by=$8 WHERE singleton AND revision=$9")
             .bind(revision).bind(next[0].as_i64()).bind(next[1].as_i64()).bind(next[2].as_i64()).bind(next[3].as_i64()).bind(next[4].as_str()).bind(next[5].as_bool()).bind(user.id).bind(expected)
-            .execute(&mut *tx).await?.rows_affected();
+            .execute(&mut **tx).await?.rows_affected();
         if changed != 1 {
             return Err(err(StatusCode::CONFLICT, "settings_revision_conflict"));
         }
-        sqlx::query(SELECT).fetch_one(&mut *tx).await?
+        sqlx::query(SELECT).fetch_one(&mut **tx).await?
     } else {
         row
     };
     let value = projection(&app, &row)?;
-    finish(tx, &user, &login).await?;
+    admission.commit().await?;
     Ok(responses::ok_json(value))
 }
 
