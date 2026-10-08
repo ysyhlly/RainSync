@@ -1,7 +1,11 @@
 //! Opt-in coordinator-owned DB and real loopback HTTP reads, never Bilibili.
 use super::*;
+use futures_util::StreamExt;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -382,4 +386,195 @@ async fn native_delivery_owner_http_fixture() {
         println!("PASS: native owned real-HTTP lifecycle case {}", case.name);
     }
     app.native_delivery_owners.drain().await.unwrap();
+}
+
+#[tokio::test]
+async fn fast_chunks_authorize_once_per_interval() {
+    let checks = AtomicUsize::new(0);
+    let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+    let (_stopped_tx, mut stopped) = tokio::sync::watch::channel(false);
+    let origin = tokio::time::Instant::now();
+    let millis = AtomicU64::new(0);
+    let now = || origin + Duration::from_millis(millis.load(Ordering::SeqCst));
+    let mut last_check = Some(now());
+    let authorize = || {
+        checks.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(Ok(()))
+    };
+    let sleep_for = |duration| tokio::time::sleep(duration);
+    for _ in 0..30 {
+        millis.fetch_add(20, Ordering::SeqCst);
+        let _: u8 = wait_with_auth(
+            &mut cancel,
+            &mut stopped,
+            std::future::ready(Ok(1)),
+            &mut last_check,
+            &authorize,
+            &now,
+            &sleep_for,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        checks.load(Ordering::SeqCst),
+        0,
+        "chunks inside the interval do not query"
+    );
+    millis.store(1_000, Ordering::SeqCst);
+    let _: u8 = wait_with_auth(
+        &mut cancel,
+        &mut stopped,
+        std::future::ready(Ok(1)),
+        &mut last_check,
+        &authorize,
+        &now,
+        &sleep_for,
+    )
+    .await
+    .unwrap();
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
+    let _: u8 = wait_with_auth(
+        &mut cancel,
+        &mut stopped,
+        std::future::ready(Ok(1)),
+        &mut last_check,
+        &authorize,
+        &now,
+        &sleep_for,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        checks.load(Ordering::SeqCst),
+        1,
+        "a second ready chunk in the new interval does not query again"
+    );
+}
+
+#[tokio::test]
+async fn pending_read_observes_revocation_when_the_interval_elapses() {
+    let checks = std::sync::Arc::new(AtomicUsize::new(0));
+    let allowed = std::sync::Arc::new(AtomicBool::new(true));
+    let parked = std::sync::Arc::new(AtomicBool::new(false));
+    let slept = std::sync::Arc::new(AtomicU64::new(0));
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let millis = std::sync::Arc::new(AtomicU64::new(0));
+    let seen = checks.clone();
+    let gate = allowed.clone();
+    let parked_sleep = parked.clone();
+    let slept_ms = slept.clone();
+    let wake = release.clone();
+    let clock = millis.clone();
+    let task = tokio::spawn(async move {
+        let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+        let (_stopped_tx, mut stopped) = tokio::sync::watch::channel(false);
+        let origin = tokio::time::Instant::now();
+        let now = move || origin + Duration::from_millis(clock.load(Ordering::SeqCst));
+        let mut last_check = Some(now());
+        let authorize = move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let open = gate.load(Ordering::SeqCst);
+            async move {
+                if open {
+                    Ok(())
+                } else {
+                    Err(super::super::invalid())
+                }
+            }
+        };
+        let sleep_for = move |duration: Duration| {
+            slept_ms.store(duration.as_millis() as u64, Ordering::SeqCst);
+            parked_sleep.store(true, Ordering::SeqCst);
+            let wake = wake.clone();
+            async move {
+                wake.notified().await;
+            }
+        };
+        let (_work_tx, work_rx) = tokio::sync::oneshot::channel::<Result<u8>>();
+        wait_with_auth(
+            &mut cancel,
+            &mut stopped,
+            async { work_rx.await.map_err(|_| super::super::invalid())? },
+            &mut last_check,
+            &authorize,
+            &now,
+            &sleep_for,
+        )
+        .await
+    });
+    for _ in 0..100 {
+        if parked.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        parked.load(Ordering::SeqCst),
+        "pending read waits for the interval"
+    );
+    assert_eq!(checks.load(Ordering::SeqCst), 0);
+    assert_eq!(slept.load(Ordering::SeqCst), 1_000);
+    allowed.store(false, Ordering::SeqCst);
+    millis.store(1_000, Ordering::SeqCst);
+    release.notify_one();
+    assert!(task.await.unwrap().is_err());
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn failed_authorization_interrupts_the_body_instead_of_eof() {
+    let checks = AtomicUsize::new(0);
+    let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+    let (_stopped_tx, mut stopped) = tokio::sync::watch::channel(false);
+    let mut last_check = None;
+    let authorize = || {
+        checks.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(Err(super::super::invalid()))
+    };
+    let now = || tokio::time::Instant::now();
+    let sleep_for = |duration| tokio::time::sleep(duration);
+    assert!(
+        wait_with_auth(
+            &mut cancel,
+            &mut stopped,
+            std::future::ready(Ok(vec![1u8])),
+            &mut last_check,
+            &authorize,
+            &now,
+            &sleep_for,
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let (cancel, _seen_cancel) = tokio::sync::watch::channel(false);
+    sender
+        .try_send(Ok(axum::body::Bytes::from_static(b"buffered")))
+        .unwrap();
+    let flag = interrupted.clone();
+    let deliver = tokio::spawn(async move {
+        interrupt_body(&sender, &flag);
+        drop(sender);
+    });
+    let mut body = OwnedBody {
+        receiver,
+        cancel,
+        interrupted,
+    };
+    assert_eq!(body.next().await.unwrap().unwrap().as_ref(), b"buffered");
+    let error = body
+        .next()
+        .await
+        .expect("authorization failure is a stream item, not EOF")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("native_platform_stream_interrupted")
+    );
+    deliver.await.unwrap();
 }

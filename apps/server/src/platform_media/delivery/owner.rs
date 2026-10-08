@@ -5,12 +5,17 @@ use futures_util::Stream;
 use sqlx::Acquire;
 use std::{
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 const LIMIT: usize = 128;
 const CHECK: Duration = Duration::from_secs(3);
+const AUTH_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) struct Registry {
     slots: Arc<Semaphore>,
@@ -96,11 +101,27 @@ pub(super) struct Head {
 pub(super) struct OwnedBody {
     receiver: mpsc::Receiver<std::result::Result<Bytes, std::io::Error>>,
     cancel: watch::Sender<bool>,
+    interrupted: Arc<AtomicBool>,
+}
+fn stream_interrupted() -> std::io::Error {
+    std::io::Error::other("native_platform_stream_interrupted")
 }
 impl Stream for OwnedBody {
     type Item = std::result::Result<Bytes, std::io::Error>;
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().receiver.poll_recv(context)
+        let body = self.get_mut();
+        match body.receiver.poll_recv(context) {
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            // A queued chunk is delivered first. Closing the sender after a
+            // failed authorization is one error, including when the channel was
+            // already full and the error item itself could not be queued.
+            // Later polls end the stream so a consumer cannot spin on the flag.
+            Poll::Ready(None) if body.interrupted.swap(false, Ordering::AcqRel) => {
+                Poll::Ready(Some(Err(stream_interrupted())))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 impl Drop for OwnedBody {
@@ -116,6 +137,71 @@ async fn scoped_check(app: &App, authority: &Authority) -> Result<()> {
     tokio::time::timeout(CHECK, check(app, authority))
         .await
         .map_err(|_| invalid())?
+}
+
+/// One in-flight authorization wait. Cancel and shutdown win. Work that is
+/// already ready returns immediately while the last successful check is still
+/// inside `AUTH_INTERVAL`. The first wait, and any later wait whose check is
+/// due, authorizes before yielding more data, so a fast source cannot skip the
+/// interval. A pending read or send also wakes the same check when the second
+/// elapses.
+async fn wait_with_auth<T, Work, Authorize, Check, Now, Sleep, Slept>(
+    cancel: &mut watch::Receiver<bool>,
+    stopped: &mut watch::Receiver<bool>,
+    work: Work,
+    last_check: &mut Option<tokio::time::Instant>,
+    authorize: &Authorize,
+    now: &Now,
+    sleep_for: &Sleep,
+) -> Result<T>
+where
+    Work: Future<Output = Result<T>>,
+    Authorize: Fn() -> Check,
+    Check: Future<Output = Result<()>>,
+    Now: Fn() -> tokio::time::Instant,
+    Sleep: Fn(Duration) -> Slept,
+    Slept: Future<Output = ()>,
+{
+    tokio::pin!(work);
+    loop {
+        if *cancel.borrow() || *stopped.borrow() {
+            return Err(invalid());
+        }
+        let due = match *last_check {
+            None => true,
+            Some(at) => now().saturating_duration_since(at) >= AUTH_INTERVAL,
+        };
+        if due {
+            tokio::select! {
+                biased;
+                _ = cancel.changed() => return Err(invalid()),
+                _ = stopped.changed() => return Err(invalid()),
+                result = authorize() => {
+                    result?;
+                    *last_check = Some(now());
+                }
+            }
+            continue;
+        }
+        let remaining = AUTH_INTERVAL.saturating_sub(now().saturating_duration_since(
+            last_check.expect("a fresh check is recorded before the timed wait"),
+        ));
+        tokio::select! {
+            biased;
+            _ = cancel.changed() => return Err(invalid()),
+            _ = stopped.changed() => return Err(invalid()),
+            result = &mut work => return result,
+            _ = sleep_for(remaining) => {}
+        }
+    }
+}
+
+fn realtime() -> tokio::time::Instant {
+    tokio::time::Instant::now()
+}
+
+fn real_sleep(duration: Duration) -> tokio::time::Sleep {
+    tokio::time::sleep(duration)
 }
 
 async fn register(app: &App, authority: &Authority, room: Uuid, id: Uuid) -> Result<()> {
@@ -184,74 +270,86 @@ async fn finish(app: &App, room: Uuid, id: Uuid, _permit: OwnedSemaphorePermit) 
     }
 }
 
-async fn open_scoped<T: Transport>(
+async fn open_scoped<T, Authorize, Check>(
     app: &App,
-    authority: &Authority,
     transport: &T,
     request: &Request,
     cancel: &mut watch::Receiver<bool>,
-) -> Result<Box<dyn Source>> {
+    last_check: &mut Option<tokio::time::Instant>,
+    authorize: &Authorize,
+) -> Result<Box<dyn Source>>
+where
+    T: Transport,
+    Authorize: Fn() -> Check,
+    Check: Future<Output = Result<()>>,
+{
     let mut stopped = app.native_delivery_owners.closing.subscribe();
-    if *cancel.borrow() || *stopped.borrow() {
-        return Err(invalid());
-    }
     let pending = transport.open(request);
-    tokio::pin!(pending);
-    loop {
-        tokio::select! {
-            biased;
-            _=cancel.changed()=>return Err(invalid()),
-            _=stopped.changed()=>return Err(invalid()),
-            result=&mut pending=>return result.map_err(provider_error),
-            _=tokio::time::sleep(Duration::from_secs(1))=>scoped_check(app,authority).await?,
-        }
-    }
+    wait_with_auth(
+        cancel,
+        &mut stopped,
+        async move { pending.await.map_err(provider_error) },
+        last_check,
+        authorize,
+        &realtime,
+        &real_sleep,
+    )
+    .await
 }
 
-async fn pump(
+async fn pump<Authorize, Check>(
     app: &App,
-    authority: &Authority,
     source: &mut dyn Source,
     sender: &mpsc::Sender<std::result::Result<Bytes, std::io::Error>>,
     cancel: &mut watch::Receiver<bool>,
-) -> Result<()> {
+    last_check: &mut Option<tokio::time::Instant>,
+    authorize: &Authorize,
+) -> Result<()>
+where
+    Authorize: Fn() -> Check,
+    Check: Future<Output = Result<()>>,
+{
     let mut stopped = app.native_delivery_owners.closing.subscribe();
     loop {
-        if *cancel.borrow() || *stopped.borrow() {
-            return Err(invalid());
-        }
-        let chunk = {
-            let pending = source.next();
-            tokio::pin!(pending);
-            loop {
-                tokio::select! {
-                    biased;
-                    _=cancel.changed()=>return Err(invalid()),
-                    _=stopped.changed()=>return Err(invalid()),
-                    result=&mut pending=>break result.map_err(provider_error)?,
-                    _=tokio::time::sleep(Duration::from_secs(1))=>scoped_check(app,authority).await?,
-                }
-            }
-        };
+        let chunk = wait_with_auth(
+            cancel,
+            &mut stopped,
+            async { source.next().await.map_err(provider_error) },
+            last_check,
+            authorize,
+            &realtime,
+            &real_sleep,
+        )
+        .await?;
         let Some(chunk) = chunk else {
             return Ok(());
         };
         if chunk.len() > 1024 * 1024 {
             return Err(upstream_invalid());
         }
-        scoped_check(app, authority).await?;
-        let pending = sender.send(Ok(Bytes::from(chunk)));
-        tokio::pin!(pending);
-        loop {
-            tokio::select! {
-                biased;
-                _=cancel.changed()=>return Err(invalid()),
-                _=stopped.changed()=>return Err(invalid()),
-                result=&mut pending=>{result.map_err(|_|invalid())?;break;},
-                _=tokio::time::sleep(Duration::from_secs(1))=>scoped_check(app,authority).await?,
-            }
-        }
+        let send = sender.send(Ok(Bytes::from(chunk)));
+        wait_with_auth(
+            cancel,
+            &mut stopped,
+            async move { send.await.map_err(|_| invalid()) },
+            last_check,
+            authorize,
+            &realtime,
+            &real_sleep,
+        )
+        .await?;
     }
+}
+
+fn interrupt_body(
+    sender: &mpsc::Sender<std::result::Result<Bytes, std::io::Error>>,
+    interrupted: &AtomicBool,
+) {
+    // Do not wait for capacity. A held body is the backpressure case, and the
+    // disposal receipt must still be written. The flag turns the later close
+    // into an error instead of a clean EOF.
+    interrupted.store(true, Ordering::Release);
+    let _ = sender.try_send(Err(stream_interrupted()));
 }
 
 pub(super) async fn start<T: Transport>(
@@ -278,9 +376,11 @@ pub(super) async fn start<T: Transport>(
     let (headers_tx, headers_rx) = oneshot::channel();
     let (sender, receiver) = mpsc::channel(1);
     let (cancel_tx, mut cancel) = watch::channel(false);
+    let interrupted = Arc::new(AtomicBool::new(false));
     let body = OwnedBody {
         receiver,
         cancel: cancel_tx,
+        interrupted: interrupted.clone(),
     };
     tokio::spawn(async move {
         let mut headers_tx = Some(headers_tx);
@@ -290,11 +390,21 @@ pub(super) async fn start<T: Transport>(
                 .unwrap_or_else(|_| Err(invalid()));
         let result = async {
             registration?;
+            // Admission, not the transfer poll. Later waits reuse this instant
+            // and do not query again until AUTH_INTERVAL has elapsed.
             scoped_check(&app, &authority).await?;
-            let mut source =
-                open_scoped(&app, &authority, &transport, &request, &mut cancel).await?;
+            let mut last_check = Some(tokio::time::Instant::now());
+            let authorize = || scoped_check(&app, &authority);
+            let mut source = open_scoped(
+                &app,
+                &transport,
+                &request,
+                &mut cancel,
+                &mut last_check,
+                &authorize,
+            )
+            .await?;
             let result = async {
-                scoped_check(&app, &authority).await?;
                 headers_tx
                     .take()
                     .ok_or_else(invalid)?
@@ -306,7 +416,15 @@ pub(super) async fn start<T: Transport>(
                 if request.method == Method::HEAD {
                     return Ok(());
                 }
-                pump(&app, &authority, source.as_mut(), &sender, &mut cancel).await
+                pump(
+                    &app,
+                    source.as_mut(),
+                    &sender,
+                    &mut cancel,
+                    &mut last_check,
+                    &authorize,
+                )
+                .await
             }
             .await;
             // No SQL ACK until both the raw request future above and every
@@ -319,9 +437,7 @@ pub(super) async fn start<T: Transport>(
             if let Some(headers) = headers_tx.take() {
                 let _ = headers.send(Err(error));
             }
-            let _ = sender.try_send(Err(std::io::Error::other(
-                "native_platform_stream_interrupted",
-            )));
+            interrupt_body(&sender, &interrupted);
         }
         drop(sender);
         finish(&app, room, id, permit).await;
