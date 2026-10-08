@@ -4,7 +4,7 @@ use super::*;
 use providers::platform::bilibili::pgc;
 
 pub(super) async fn resolve(
-    app: &App,
+    http: providers::platform::http::PlatformHttp,
     entry: &native_platform::Entry,
     account: &platform_accounts::FrozenAccount,
     max_height: Option<u32>,
@@ -15,7 +15,7 @@ pub(super) async fn resolve(
         .as_ref()
         .ok_or_else(|| err(StatusCode::GONE, "invalid_playback_session"))?;
     resolve_with_client(
-        &pgc::Client::new(app.platform_http, account.cookie().cloned()),
+        &pgc::Client::new(http, account.cookie().cloned()),
         &entry.resource(),
         identity,
         max_height,

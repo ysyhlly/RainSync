@@ -88,50 +88,76 @@ pub struct MediaRequest {
     s3_signer: Option<crate::s3::RequestSigner>,
 }
 
+/// Request-scoped controlled read capability. It does not accept metadata
+/// mutations or authorize a URL by itself; every request still passes through
+/// SourceAccess and every send rechecks DNS/CIDR and credential origin per hop.
+pub struct MediaRead<'a> {
+    config: &'a SourceConfig,
+}
+
+impl<'a> MediaRead<'a> {
+    pub fn new(config: &'a SourceConfig) -> Self {
+        Self { config }
+    }
+
+    pub async fn request(
+        &self,
+        target: &str,
+        method: Method,
+        headers: &BTreeMap<String, String>,
+    ) -> Result<MediaRequest> {
+        let config = self.config;
+        if !matches!(method, Method::GET | Method::HEAD) {
+            return Err(MediaRequestError::UnsupportedMethod);
+        }
+        crate::validate_source_headers(headers).map_err(|_| MediaRequestError::InvalidHeaders)?;
+        let access = SourceAccess::new(&config.url, config.access_policy.as_ref())?;
+        let target = access.authorize_url(target)?;
+        let s3_signer = config
+            .s3
+            .as_ref()
+            .map(|_| crate::s3::RequestSigner::new(config, &target, &method))
+            .transpose()
+            .map_err(|_| MediaRequestError::S3InvalidConfig)?;
+        // The signer owns credentials. Do not allow stale or caller-selected AWS
+        // authentication headers to shadow its fresh signature.
+        if s3_signer.is_some() && (!headers.is_empty()) {
+            return Err(MediaRequestError::InvalidHeaders);
+        }
+        let mut source_headers = HeaderMap::new();
+        for (name, value) in headers {
+            let mut value =
+                HeaderValue::from_str(value).map_err(|_| MediaRequestError::InvalidHeaders)?;
+            value.set_sensitive(true);
+            source_headers.insert(
+                HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| MediaRequestError::InvalidHeaders)?,
+                value,
+            );
+        }
+        Ok(MediaRequest {
+            access,
+            target,
+            method,
+            source_headers,
+            delivery_headers: HeaderMap::new(),
+            invalid_headers: false,
+            conditional_identity: None,
+            s3_signer,
+        })
+    }
+}
+
+/// Compatibility entry point for existing encrypted resource readers.
 pub async fn source_media_request(
     config: &SourceConfig,
     target: &str,
     method: Method,
     headers: &BTreeMap<String, String>,
 ) -> Result<MediaRequest> {
-    if !matches!(method, Method::GET | Method::HEAD) {
-        return Err(MediaRequestError::UnsupportedMethod);
-    }
-    crate::validate_source_headers(headers).map_err(|_| MediaRequestError::InvalidHeaders)?;
-    let access = SourceAccess::new(&config.url, config.access_policy.as_ref())?;
-    let target = access.authorize_url(target)?;
-    let s3_signer = config
-        .s3
-        .as_ref()
-        .map(|_| crate::s3::RequestSigner::new(config, &target, &method))
-        .transpose()
-        .map_err(|_| MediaRequestError::S3InvalidConfig)?;
-    // The signer owns credentials. Do not allow stale or caller-selected AWS
-    // authentication headers to shadow its fresh signature.
-    if s3_signer.is_some() && (!headers.is_empty()) {
-        return Err(MediaRequestError::InvalidHeaders);
-    }
-    let mut source_headers = HeaderMap::new();
-    for (name, value) in headers {
-        let mut value =
-            HeaderValue::from_str(value).map_err(|_| MediaRequestError::InvalidHeaders)?;
-        value.set_sensitive(true);
-        source_headers.insert(
-            HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| MediaRequestError::InvalidHeaders)?,
-            value,
-        );
-    }
-    Ok(MediaRequest {
-        access,
-        target,
-        method,
-        source_headers,
-        delivery_headers: HeaderMap::new(),
-        invalid_headers: false,
-        conditional_identity: None,
-        s3_signer,
-    })
+    MediaRead::new(config)
+        .request(target, method, headers)
+        .await
 }
 
 impl MediaRequest {

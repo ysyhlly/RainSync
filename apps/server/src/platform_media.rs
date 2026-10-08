@@ -1,7 +1,7 @@
 //! Native platform preparation is supervised and uses ordinary room authority.
 //! Every public URL is a RainSync grant; signed CDN addresses stay sealed.
 use crate::*;
-use providers::platform::bilibili::{self, Client};
+use providers::platform::bilibili;
 use tokio::time::{Duration, Instant as Deadline};
 pub(crate) mod bilibili_cache;
 mod bilibili_compatibility_probe;
@@ -17,9 +17,45 @@ pub(crate) use delivery::owner::Registry as NativeDeliveryRegistry;
 pub(crate) use delivery::{TextScope, admit_text, check_text};
 pub use delivery::{manifest, track};
 use descriptor::{Binding, Descriptor, Sealed, Transport};
-pub(crate) use resolver::resolve_progressive;
-pub(crate) use resolver::resolve_public_progressive;
-pub(crate) use resolver::resolve_youtube_with_account;
+// Compatibility adapters keep App at the application edge. The resolver
+// module itself cannot select accounts, read room SQL or access owner state.
+pub(crate) async fn resolve_progressive(
+    app: &App,
+    provider: &str,
+    resource: &str,
+    credential: Option<&providers::platform::short_video::Credential>,
+    deadline: Deadline,
+) -> Result<resolver::ResolvedProgressive> {
+    resolver::resolve_progressive(app.platform_http, provider, resource, credential, deadline).await
+}
+
+pub(crate) async fn resolve_public_progressive(
+    app: &App,
+    provider: &str,
+    resource: &str,
+    deadline: Deadline,
+) -> Result<resolver::ResolvedProgressive> {
+    resolver::resolve_public_progressive(app.platform_http, provider, resource, deadline).await
+}
+
+pub(crate) async fn resolve_youtube_with_account(
+    app: &App,
+    resource: &str,
+    mode: providers::platform::youtube::SelectionMode,
+    quality: providers::platform::youtube::QualityLimit,
+    credential: Option<&providers::platform::youtube::Credential>,
+    deadline: Deadline,
+) -> Result<providers::platform::youtube::ResolvedVideo> {
+    resolver::resolve_youtube_with_account(
+        &app.youtube,
+        resource,
+        mode,
+        quality,
+        credential,
+        deadline,
+    )
+    .await
+}
 
 #[derive(serde::Deserialize)]
 struct UpstreamCode {
@@ -436,7 +472,7 @@ async fn resolve_and_publish(
     let mut available_heights = vec![];
     let (descriptor, url_expires_at_ms) = if entry.course.is_some() {
         let (descriptor, expiry, heights) = course::resolve(
-            app,
+            app.platform_http,
             &entry,
             &account,
             Some(requested_height.limit().unwrap_or(1080)),
@@ -447,7 +483,7 @@ async fn resolve_and_publish(
         (descriptor, expiry)
     } else if entry.pgc.is_some() {
         let (descriptor, expiry, heights) = pgc::resolve(
-            app,
+            app.platform_http,
             &entry,
             &account,
             Some(requested_height.limit().unwrap_or(1080)),
@@ -457,32 +493,31 @@ async fn resolve_and_publish(
         available_heights = heights;
         (descriptor, expiry)
     } else if entry.provider == "bilibili" {
-        let signing_cache = app
+        let resolved = app
             .bilibili_signing_keys
-            .for_scope(
-                user.id,
-                login,
-                account.account_id(),
-                account.revision(),
+            .client_for_scope(
+                bilibili_cache::SigningScope {
+                    viewer: user.id,
+                    login_hash: login,
+                    account: account.account_id(),
+                    revision: account.revision(),
+                },
+                DiagnosticTransport(app.platform_http),
+                account.cookie(),
                 deadline,
             )
             .await
-            .map_err(provider_error)?;
-        let resolved = Client::with_wbi_cache(
-            DiagnosticTransport(app.platform_http),
-            account.cookie().cloned(),
-            signing_cache,
-        )
-        .resolve(
-            &entry.resource(),
-            // Discover only renditions this exact viewer's provider response
-            // admits. Auto keeps the existing 1080p ceiling; labels come
-            // from real compatible tracks rather than Bili quality names.
-            127,
-            deadline,
-        )
-        .await
-        .map_err(|error| provider_error_scoped(error, Some(account.cookie().is_some())))?;
+            .map_err(provider_error)?
+            .resolve(
+                &entry.resource(),
+                // Discover only renditions this exact viewer's provider response
+                // admits. Auto keeps the existing 1080p ceiling; labels come
+                // from real compatible tracks rather than Bili quality names.
+                127,
+                deadline,
+            )
+            .await
+            .map_err(|error| provider_error_scoped(error, Some(account.cookie().is_some())))?;
         if resolved.metadata.bvid != entry.content_id
             || resolved.metadata.part != entry.part
             || entry
@@ -511,7 +546,7 @@ async fn resolve_and_publish(
     } else if entry.provider == "youtube" {
         // One absolute budget covers extraction and both bounded byte probes.
         let resolved = resolver::resolve_youtube_with_account(
-            app,
+            &app.youtube,
             &entry.resource(),
             youtube_selection_mode(body),
             quality::youtube_limit(requested_height),

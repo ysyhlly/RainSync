@@ -1,13 +1,22 @@
 //! Bounded signing-key reuse across preparations. Each request still owns its
 //! exact Cookie and performs the usual account/login guards before and after
 //! provider work; this registry stores no authorization or playback result.
-use providers::platform::bilibili::WbiKeyCache;
+use providers::platform::bilibili::{Client, Cookie, Transport, WbiKeyCache};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{sync::Mutex, time::Instant};
 use uuid::Uuid;
 
 const CAPACITY: usize = 256;
 const LIFETIME: Duration = Duration::from_secs(1800);
+
+/// A cache partition, never evidence of current account or login authority.
+/// No cookies, media URLs, playback results or authorization verdicts are kept.
+pub(crate) struct SigningScope<'a> {
+    pub viewer: Uuid,
+    pub login_hash: &'a str,
+    pub account: Option<Uuid>,
+    pub revision: Option<i64>,
+}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Scope {
@@ -29,7 +38,29 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
-    pub(crate) async fn for_scope(
+    /// Build a fresh request client with the current frozen credential. Only
+    /// signing material is shared; a prior client's cookies/results cannot be
+    /// reused by a new preparation, even in the same signing-key partition.
+    pub(crate) async fn client_for_scope<T: Transport>(
+        &self,
+        scope: SigningScope<'_>,
+        transport: T,
+        cookie: Option<&Cookie>,
+        deadline: Instant,
+    ) -> Result<Client<T>, providers::platform::bilibili::Error> {
+        let keys = self
+            .for_scope(
+                scope.viewer,
+                scope.login_hash,
+                scope.account,
+                scope.revision,
+                deadline,
+            )
+            .await?;
+        Ok(Client::with_wbi_cache(transport, cookie.cloned(), keys))
+    }
+
+    async fn for_scope(
         &self,
         viewer: Uuid,
         login_hash: &str,
@@ -86,9 +117,85 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use providers::platform::bilibili::{ApiRequest, ApiResponse, Error};
+
+    #[derive(Clone, Default)]
+    struct CaptureCredentials(Arc<std::sync::Mutex<Vec<Option<String>>>>);
+
+    impl Transport for CaptureCredentials {
+        fn get<'a>(
+            &'a self,
+            request: ApiRequest,
+            _deadline: Instant,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ApiResponse, Error>> + Send + 'a>,
+        > {
+            self.0
+                .lock()
+                .unwrap()
+                .push(request.headers().get("Cookie").cloned());
+            Box::pin(async { Err(Error::Transport) })
+        }
+    }
 
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(2)
+    }
+
+    #[tokio::test]
+    async fn signing_partition_never_reuses_a_previous_preparation_credential_client() {
+        let registry = Registry::default();
+        let transport = CaptureCredentials::default();
+        let viewer = Uuid::new_v4();
+        let account = Uuid::new_v4();
+        let first = Cookie::from_header("SESSDATA=synthetic-first; DedeUserID=1").unwrap();
+        let second = Cookie::from_header("SESSDATA=synthetic-second; DedeUserID=1").unwrap();
+        for cookie in [Some(&first), Some(&second), None] {
+            let client = registry
+                .client_for_scope(
+                    SigningScope {
+                        viewer,
+                        login_hash: "synthetic-login",
+                        account: Some(account),
+                        revision: Some(1),
+                    },
+                    transport.clone(),
+                    cookie,
+                    deadline(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                client.nav(deadline()).await,
+                Err(Error::Transport)
+            ));
+        }
+        assert_eq!(
+            *transport.0.lock().unwrap(),
+            vec![
+                Some(first.expose_for_storage().to_owned()),
+                Some(second.expose_for_storage().to_owned()),
+                None,
+            ]
+        );
+        assert_eq!(registry.entries.lock().await.len(), 1);
+        assert!(matches!(
+            registry
+                .client_for_scope(
+                    SigningScope {
+                        viewer,
+                        login_hash: "synthetic-login",
+                        account: Some(account),
+                        revision: Some(1)
+                    },
+                    transport.clone(),
+                    Some(&first),
+                    Instant::now(),
+                )
+                .await,
+            Err(Error::Deadline)
+        ));
+        assert_eq!(transport.0.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

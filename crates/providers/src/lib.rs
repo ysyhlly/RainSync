@@ -1,4 +1,7 @@
 pub mod access_policy;
+pub mod capabilities;
+mod source_kind;
+pub use source_kind::{SourceKind, UpstreamKind};
 pub mod media_request;
 pub mod platform;
 pub mod source_access_contract;
@@ -74,69 +77,18 @@ pub fn upstream_url(base: &reqwest::Url, path: &str) -> Result<reqwest::Url> {
     Ok(url)
 }
 
+/// Legacy string boundary. Unknown kinds keep the existing index-only error.
 pub async fn list_items(kind: &str, config: &SourceConfig) -> Result<Vec<Item>> {
+    let kind = SourceKind::parse(kind);
+    // Preserve this validation before an unsupported-kind error.
     anyhow::ensure!(
-        kind == "s3" || config.s3.is_none(),
+        kind == Some(SourceKind::S3) || config.s3.is_none(),
         "s3_source_kind_mismatch"
     );
-    match kind {
-        "local" => {
-            let root = media_core::local_media_root(std::path::Path::new(&config.root))?;
-            tokio::task::spawn_blocking(move || {
-                let mut stack = vec![(
-                    media_core::open_local_directory(&root, "")?,
-                    std::path::PathBuf::new(),
-                )];
-                let mut items = vec![];
-                while let Some((directory, relative)) = stack.pop() {
-                    let input = media_core::local_process_input(&directory, &root.join(&relative))?;
-                    for entry in std::fs::read_dir(input)? {
-                        let entry = entry?;
-                        let ty = entry.file_type()?;
-                        let p = relative.join(entry.file_name());
-                        if ty.is_symlink() {
-                            continue;
-                        };
-                        if ty.is_dir() {
-                            stack.push((
-                                media_core::open_local_directory(&root, &p.to_string_lossy())?,
-                                p,
-                            ));
-                            continue;
-                        };
-                        let ext = p
-                            .extension()
-                            .and_then(|x| x.to_str())
-                            .unwrap_or("")
-                            .to_lowercase();
-                        if ["mp4", "mkv", "webm", "mov", "m4v"].contains(&ext.as_str()) {
-                            items.push(Item {
-                                title: p.file_stem().unwrap().to_string_lossy().into(),
-                                resource: p.to_string_lossy().replace('\\', "/"),
-                                duration_ms: None,
-                                metadata: json!({}),
-                            });
-                        }
-                    }
-                }
-                Ok(items)
-            })
-            .await?
-        }
-        "http" => {
-            validate_url(&config.url)?;
-            Ok(vec![Item {
-                title: "HTTP media".into(),
-                resource: config.url.clone(),
-                duration_ms: None,
-                metadata: json!({}),
-            }])
-        }
-        "jellyfin" => jellyfin::list_items(config).await,
-        "emby" => emby::list_items(config).await,
-        "s3" => s3::list_items(config).await,
-        _ => bail!("source_requires_agent_index"),
-    }
+    let browse = kind
+        .and_then(|kind| capabilities::Browse::new(kind, config))
+        .ok_or_else(|| anyhow::anyhow!("source_requires_agent_index"))?;
+    browse.list().await
 }
 
 /// Hold the integrator's current-source fence for each browsing request.
@@ -149,19 +101,15 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<G>>,
 {
-    match kind {
-        "jellyfin" | "emby" => {
-            upstream_common::list_guarded(
-                config,
-                upstream_headers(kind, config, "rainsync-library-scan")?,
-                guard,
-            )
-            .await
-        }
-        _ => {
-            let _guard = guard().await?;
-            list_items(kind, config).await
-        }
+    if let Some(browse) =
+        SourceKind::parse(kind).and_then(|kind| capabilities::Browse::new(kind, config))
+    {
+        browse.list_guarded(guard).await
+    } else {
+        // Unknown/agent kinds historically acquire the fence before reporting
+        // the index-only (or S3 mismatch) error. Keep that ordering too.
+        let _guard = guard().await?;
+        list_items(kind, config).await
     }
 }
 
@@ -214,11 +162,10 @@ pub async fn upstream_plan(
     options: &PlaybackOptions,
     device_id: &str,
 ) -> Result<Value> {
-    match kind {
-        "jellyfin" => jellyfin::upstream_plan(config, item, options, device_id).await,
-        "emby" => emby::upstream_plan(config, item, options, device_id).await,
-        _ => bail!("invalid_upstream_kind"),
-    }
+    let kind = UpstreamKind::parse(kind).ok_or_else(|| anyhow::anyhow!("invalid_upstream_kind"))?;
+    capabilities::UpstreamNegotiation::new(kind, config)
+        .plan(item, options, device_id)
+        .await
 }
 
 /// Discover an explicit audio track's source without allocating a play session.
@@ -229,13 +176,12 @@ pub async fn upstream_audio_source(
     audio_index: u32,
     device_id: &str,
 ) -> Result<String> {
-    upstream_common::audio_source(
-        config,
-        item,
-        audio_index,
-        upstream_headers(kind, config, device_id)?,
-    )
-    .await
+    // Device validation preceded provider dispatch in the legacy headers path.
+    validate_upstream_device(device_id)?;
+    let kind = UpstreamKind::parse(kind).ok_or_else(|| anyhow::anyhow!("invalid_upstream_kind"))?;
+    capabilities::UpstreamProbe::new(kind, config)
+        .audio_source(item, audio_index, device_id)
+        .await
 }
 
 /// Explicit profile recipe only. The caller owns the reservation and must
@@ -248,13 +194,10 @@ pub async fn upstream_profile_plan(
     metadata: &upstream_profiles::UpstreamProfileMetadata,
     device_id: &str,
 ) -> Result<Value> {
-    match kind {
-        "jellyfin" => {
-            jellyfin::upstream_profile_plan(config, item, options, metadata, device_id).await
-        }
-        "emby" => emby::upstream_profile_plan(config, item, options, metadata, device_id).await,
-        _ => bail!("invalid_upstream_kind"),
-    }
+    let kind = UpstreamKind::parse(kind).ok_or_else(|| anyhow::anyhow!("invalid_upstream_kind"))?;
+    capabilities::UpstreamNegotiation::new(kind, config)
+        .profile_plan(item, options, metadata, device_id)
+        .await
 }
 
 /// The same device identity must accompany negotiation, media/subtitle delivery
@@ -264,6 +207,37 @@ pub fn upstream_headers(
     config: &SourceConfig,
     device_id: &str,
 ) -> Result<std::collections::BTreeMap<String, String>> {
+    validate_upstream_device(device_id)?;
+    let kind = UpstreamKind::parse(kind).ok_or_else(|| anyhow::anyhow!("invalid_upstream_kind"))?;
+    let token = config.token.replace('\\', "\\\\").replace('"', "\\\"");
+    let prefix = match kind {
+        UpstreamKind::Jellyfin => "MediaBrowser",
+        UpstreamKind::Emby => "Emby",
+    };
+    let identity = format!(
+        "{prefix} Client=\"RainSync\", Device=\"Web\", DeviceId=\"{device_id}\", Version=\"0.1.0\", Token=\"{token}\""
+    );
+    let mut headers: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    headers.insert(
+        if kind == UpstreamKind::Jellyfin {
+            "Authorization"
+        } else {
+            "X-Emby-Authorization"
+        }
+        .into(),
+        identity,
+    );
+    if kind == UpstreamKind::Emby {
+        headers.insert("X-Emby-Token".into(), config.token.clone());
+    }
+    for (name, value) in &headers {
+        reqwest::header::HeaderName::from_bytes(name.as_bytes())?;
+        reqwest::header::HeaderValue::from_str(value)?;
+    }
+    Ok(headers)
+}
+
+fn validate_upstream_device(device_id: &str) -> Result<()> {
     anyhow::ensure!(
         !device_id.is_empty()
             && device_id.len() <= 128
@@ -272,33 +246,7 @@ pub fn upstream_headers(
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
         "invalid_upstream_device"
     );
-    let token = config.token.replace('\\', "\\\\").replace('"', "\\\"");
-    let prefix = match kind {
-        "jellyfin" => "MediaBrowser",
-        "emby" => "Emby",
-        _ => bail!("invalid_upstream_kind"),
-    };
-    let identity = format!(
-        "{prefix} Client=\"RainSync\", Device=\"Web\", DeviceId=\"{device_id}\", Version=\"0.1.0\", Token=\"{token}\""
-    );
-    let mut headers: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    headers.insert(
-        if kind == "jellyfin" {
-            "Authorization"
-        } else {
-            "X-Emby-Authorization"
-        }
-        .into(),
-        identity,
-    );
-    if kind == "emby" {
-        headers.insert("X-Emby-Token".into(), config.token.clone());
-    }
-    for (name, value) in &headers {
-        reqwest::header::HeaderName::from_bytes(name.as_bytes())?;
-        reqwest::header::HeaderValue::from_str(value)?;
-    }
-    Ok(headers)
+    Ok(())
 }
 
 /// Reject URLs naming another playback/device pair and encode both identifiers.

@@ -9,7 +9,7 @@
 //! https://dev.emby.media/reference/RestAPI/UserService/getUsersById.html
 
 use crate::{
-    SourceConfig,
+    SourceConfig, UpstreamKind,
     access_policy::{AccessError, Resolver, SourceAccess, SystemResolver},
     upstream_headers, validate_source_headers,
 };
@@ -118,9 +118,7 @@ async fn account_policy_with_resolver(
 ) -> Result<UpstreamAccountPolicy> {
     let deadline = tokio::time::Instant::now() + ACCOUNT_POLICY_TIMEOUT;
     let result = tokio::time::timeout_at(deadline, async {
-        if !matches!(kind, "jellyfin" | "emby") {
-            return Err(AccountPolicyError::UnsupportedProvider);
-        }
+        let kind = UpstreamKind::parse(kind).ok_or(AccountPolicyError::UnsupportedProvider)?;
         if config.user_id.is_empty()
             || config.user_id.len() > 512
             || config.user_id.trim() != config.user_id
@@ -130,7 +128,7 @@ async fn account_policy_with_resolver(
         {
             return Err(AccountPolicyError::InvalidConfiguration);
         }
-        let headers = upstream_headers(kind, config, "rainsync-account-policy")
+        let headers = upstream_headers(kind.as_str(), config, "rainsync-account-policy")
             .map_err(|_| AccountPolicyError::InvalidConfiguration)?;
         validate_source_headers(&headers).map_err(|_| AccountPolicyError::InvalidConfiguration)?;
         let access = SourceAccess::new(&config.url, config.access_policy.as_ref())

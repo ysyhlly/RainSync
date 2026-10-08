@@ -10,16 +10,17 @@ pub async fn targets(
     item: &str,
     metadata: &Value,
 ) -> Result<Targets> {
+    let kind = UpstreamKind::parse(kind);
     let base = validate_url(&format!("{}/", config.url.trim_end_matches('/')))?;
     let mut headers = config.headers.clone();
     headers.insert(
-        if kind == "jellyfin" {
+        if kind == Some(UpstreamKind::Jellyfin) {
             "Authorization"
         } else {
             "X-Emby-Token"
         }
         .into(),
-        if kind == "jellyfin" {
+        if kind == Some(UpstreamKind::Jellyfin) {
             format!("MediaBrowser Token=\"{}\"", config.token)
         } else {
             config.token.clone()

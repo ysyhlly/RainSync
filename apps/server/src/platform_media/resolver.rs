@@ -1,5 +1,8 @@
 //! Provider-scoped resolution. Credentials and signed URLs stay server-only.
-use super::*;
+use super::{Deadline, Descriptor};
+use crate::{Error, Result, err};
+use axum::http::StatusCode;
+use providers::platform::http::PlatformHttp;
 use providers::platform::{short_video, youtube};
 
 pub(crate) struct ResolvedProgressive {
@@ -16,18 +19,18 @@ pub(crate) struct ResolvedProgressive {
 }
 
 pub(crate) async fn resolve_public_progressive(
-    app: &App,
+    http: PlatformHttp,
     provider: &str,
     resource: &str,
     deadline: Deadline,
 ) -> Result<ResolvedProgressive> {
-    resolve_progressive(app, provider, resource, None, deadline).await
+    resolve_progressive(http, provider, resource, None, deadline).await
 }
 
 /// A connected caller account is used exactly once. Resolution failures never
 /// retry anonymously or borrow another viewer's credential.
 pub(crate) async fn resolve_progressive(
-    app: &App,
+    http: PlatformHttp,
     provider: &str,
     resource: &str,
     credential: Option<&short_video::Credential>,
@@ -41,7 +44,7 @@ pub(crate) async fn resolve_progressive(
             } else {
                 short_video::Platform::TikTok
             };
-            let resolver = short_video::Resolver::new(app.platform_http);
+            let resolver = short_video::Resolver::new(http);
             let result = match credential {
                 Some(credential) => {
                     resolver
@@ -98,7 +101,7 @@ pub(crate) async fn resolve_progressive(
 /// Shared import/preparation seam: account selection happens before resolution
 /// and a supplied viewer credential is never retried anonymously.
 pub(crate) async fn resolve_youtube_with_account(
-    app: &App,
+    resolver: &youtube::YoutubeResolver,
     resource: &str,
     mode: youtube::SelectionMode,
     quality: youtube::QualityLimit,
@@ -108,12 +111,12 @@ pub(crate) async fn resolve_youtube_with_account(
     let requested = youtube::parse_resource(resource).map_err(youtube_error)?;
     let resolved = match credential {
         Some(credential) => {
-            app.youtube
+            resolver
                 .resolve_authenticated_with_quality(resource, mode, quality, credential, deadline)
                 .await
         }
         None => {
-            app.youtube
+            resolver
                 .resolve_with_quality(resource, mode, quality, deadline)
                 .await
         }
