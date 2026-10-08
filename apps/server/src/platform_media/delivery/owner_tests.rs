@@ -51,11 +51,7 @@ impl Source for HttpSource {
     fn headers(&self) -> &HeaderMap {
         self.response.headers()
     }
-    fn next<'a>(
-        &'a mut self,
-    ) -> Pin<
-        Box<dyn Future<Output = std::result::Result<Option<Vec<u8>>, bilibili::Error>> + Send + 'a>,
-    > {
+    fn next<'a>(&'a mut self) -> SourceNext<'a> {
         Box::pin(async move {
             self.response
                 .chunk()
@@ -71,12 +67,7 @@ struct HttpFixture {
     flags: Flags,
 }
 impl Transport for HttpFixture {
-    fn open<'a>(
-        &'a self,
-        request: &'a Request,
-    ) -> Pin<
-        Box<dyn Future<Output = std::result::Result<Box<dyn Source>, bilibili::Error>> + Send + 'a>,
-    > {
+    fn open<'a>(&'a self, request: &'a Request) -> OpenedSource<'a> {
         Box::pin(async move {
             let _future = RequestGuard(self.flags.clone());
             self.flags.started.fetch_add(1, Ordering::SeqCst);

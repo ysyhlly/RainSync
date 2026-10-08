@@ -1,10 +1,9 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, watch } from "vue";
+import { computed, defineAsyncComponent, onBeforeUnmount, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { parseGuestInvitation } from "./guest-session";
 import { useSession } from "./session.store";
 import { useAction } from "../../shared/use-action";
-import LoginPage from "./LoginPage.vue";
 import Notice from "../../shared/ui/Notice.vue";
 import {
   rememberInvitation,
@@ -12,6 +11,7 @@ import {
   clearInvitation,
 } from "./invitation-intent";
 import { RequestFailure } from "../../errors";
+const LoginPage = defineAsyncComponent(() => import("./LoginPage.vue"));
 const route = useRoute(),
   router = useRouter(),
   session = useSession();

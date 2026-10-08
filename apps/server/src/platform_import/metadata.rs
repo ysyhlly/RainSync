@@ -91,13 +91,12 @@ pub(super) async fn enrich<T: bilibili::Transport + bilibili::cover::Transport +
                     .await
                     .ok()?
                     .ok()?;
-                let result = tokio::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(move || {
                     let _owner = permit;
                     validated_cover(response)
                 })
                 .await
-                .ok()?;
-                result
+                .ok()?
             }
             .await;
             if let Some(cover) = cover {
