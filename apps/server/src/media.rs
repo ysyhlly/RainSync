@@ -591,34 +591,19 @@ pub(crate) async fn prepare_playback(
     private_library::authorize_media(app, u.id, media, "play", Some(body.room_id)).await?;
     let row=sqlx::query("SELECT m.source_id,m.resource,m.duration_ms,m.metadata,m.s3_object_identity,m.source_version,s.kind,s.config_encrypted,s.access_policy_revision FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND m.available").bind(media).fetch_optional(&app.db).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "media_not_found"))?;
     let storage_kind: String = row.get("kind");
-    if body.finite_hls_version.is_some() && storage_kind != "http" {
-        return Err(err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "finite_hls_source_unsupported",
-        ));
-    }
-    let kind = if storage_kind == "s3" {
-        "http".to_owned()
-    } else {
-        storage_kind.clone()
-    };
-    if body.local_hls_ladder.is_some() && (kind != "local" || !cfg!(target_os = "linux")) {
-        return Err(err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "local_hls_ladder_source_required",
-        ));
-    }
-    if body.advanced_playback.is_some()
-        && (!matches!(kind.as_str(), "local" | "http" | "agent") || !cfg!(target_os = "linux"))
-    {
-        return Err(err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "advanced_local_source_required",
-        ));
-    }
-    if body.candidate_report.is_some() && !matches!(kind.as_str(), "local" | "agent" | "http") {
-        return Err(err(StatusCode::CONFLICT, "stale_capability_report"));
-    }
+    let source_route = playback::selection::source_route(
+        playback::facts::SourceFacts {
+            storage_kind: &storage_kind,
+            linux: cfg!(target_os = "linux"),
+        },
+        playback::selection::SourceIntent {
+            finite_hls: body.finite_hls_version.is_some(),
+            ladder: body.local_hls_ladder.is_some(),
+            advanced: body.advanced_playback.is_some(),
+            candidate_report: body.candidate_report.is_some(),
+        },
+    )?;
+    let kind = source_route.kind().to_owned();
     let config: SourceConfig =
         serde_json::from_value(app.decrypt(&row.get::<String, _>("config_encrypted"))?)
             .map_err(anyhow::Error::from)?;

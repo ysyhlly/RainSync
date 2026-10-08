@@ -1,7 +1,17 @@
 //! Facts from an already authorized source/plan, never new negotiation or access.
 use super::*;
-use protocol::{DecoderFallbackMode, PlaybackMediaRange};
+#[cfg(test)]
+use protocol::DecoderFallbackMode;
+use protocol::PlaybackMediaRange;
 use sqlx::postgres::PgRow;
+// Compatibility exports remain until the preparation adapter moves to playback.
+pub use crate::playback::facts::{
+    local_timeline_origin, mapped_audio, stream_index, upstream_audio,
+};
+pub use crate::playback::selection::{
+    decision_reason, legacy_mapped_fallbacks, local_fallbacks, needs_preparation_probe,
+    upstream_fallbacks,
+};
 
 // Readiness and replay share one permission/current-attempt snapshot. Queue
 // admission fixes job.id=session.id; a foreign or extra job cannot supply facts.
@@ -12,16 +22,6 @@ pub struct JobFacts {
     pub recorded: bool,
     pub pending_job_id: Option<Uuid>,
     pub seekable_media_ranges_ms: Option<Vec<PlaybackMediaRange>>,
-}
-
-/// The local recipe decodes/discards preroll at nonzero starts. A selected
-/// stream-copy route cannot claim that exact origin or silently change codec.
-pub fn local_timeline_origin(position_ms: f64, mode: &str) -> Option<f64> {
-    (position_ms.is_finite()
-        && position_ms >= 0.0
-        && (mode == "transcode"
-            || (matches!(mode, "remux" | "audio_transcode") && position_ms == 0.0)))
-        .then_some(position_ms)
 }
 
 /// Only the committed manifest is authoritative, not FFmpeg's private file.
@@ -225,125 +225,6 @@ pub async fn refresh(
     Ok(())
 }
 
-pub fn stream_index(stream: &Value) -> Option<u32> {
-    stream["index"].as_u64().and_then(|v| u32::try_from(v).ok())
-}
-
-/// DefaultAudioStreamIndex is evidence only for the current, unambiguous source
-/// and a unique Audio stream. Array order and item-list metadata are not proof.
-pub fn upstream_audio(info: &Value, requested: Option<u32>, mode: &str) -> Option<u32> {
-    let sources = info["MediaSources"].as_array()?;
-    if sources.len() != 1 {
-        return None;
-    }
-    let source = &sources[0];
-    let source_id = source["Id"].as_str()?;
-    if source_id.trim().is_empty()
-        || source_id.len() > 512
-        || source_id.chars().any(char::is_control)
-    {
-        return None;
-    }
-    let streams = source["MediaStreams"].as_array()?;
-    if mode == "direct" && streams.iter().filter(|s| s["Type"] == "Audio").count() != 1 {
-        return None;
-    }
-    let index = source["DefaultAudioStreamIndex"]
-        .as_u64()
-        .filter(|v| *v <= i32::MAX as u64)? as u32;
-    if requested.is_some_and(|v| v != index) {
-        return None;
-    }
-    (source["MediaStreams"]
-        .as_array()?
-        .iter()
-        .filter(|s| s["Type"] == "Audio" && s["Index"].as_u64() == Some(u64::from(index)))
-        .count()
-        == 1)
-        .then_some(index)
-}
-
-/// Generated local HLS explicitly maps 0:a:0 or the validated absolute index.
-/// Progressive multi-audio files leave track selection to the media element.
-pub fn mapped_audio(
-    meta: &Value,
-    requested: Option<u32>,
-    mode: &str,
-    current: bool,
-) -> Option<u32> {
-    if !current {
-        return None;
-    }
-    let audio: Vec<_> = meta["streams"]
-        .as_array()?
-        .iter()
-        .filter(|s| s["codec_type"] == "audio")
-        .collect();
-    if let Some(index) = requested {
-        return (mode != "direct"
-            && audio
-                .iter()
-                .filter(|s| stream_index(s) == Some(index))
-                .count()
-                == 1)
-            .then_some(index);
-    }
-    if mode == "direct" && audio.len() != 1 {
-        return None;
-    }
-    stream_index(audio.first()?)
-}
-
-pub fn local_fallbacks(
-    meta: &Value,
-    mode: &str,
-    position_ms: f64,
-    current: bool,
-    hls: bool,
-) -> Vec<DecoderFallbackMode> {
-    if !current || !hls || mode == "transcode" {
-        return vec![];
-    }
-    let known_video = meta["streams"].as_array().is_some_and(|streams| {
-        streams.iter().any(|s| {
-            s["codec_type"] == "video" && s["codec_name"].as_str().is_some_and(|v| !v.is_empty())
-        })
-    });
-    let Ok(compatible) = media_core::compatible_mode(meta, false) else {
-        return vec![];
-    };
-    if !known_video {
-        return vec![];
-    }
-    let mut modes = Vec::new();
-    if mode == "direct"
-        && compatible != "transcode"
-        && position_ms == 0.0
-        && !media_core::hls_needs_video_transform(meta)
-    {
-        modes.push(DecoderFallbackMode::Remux);
-    }
-    modes.push(DecoderFallbackMode::Transcode);
-    modes
-}
-
-/// Local, reliable HTTP and Agent jobs use the original first-video/default-
-/// audio recipe. A continuation hint must meet the same mapping proof as new
-/// admission, using this attempt's trustworthy source facts.
-pub fn legacy_mapped_fallbacks(
-    meta: &Value,
-    audio_index: Option<u32>,
-    mode: &str,
-    position_ms: f64,
-    current: bool,
-    hls: bool,
-) -> Vec<DecoderFallbackMode> {
-    if media_core::motion_video::legacy_mapping_equivalent(meta, audio_index).is_err() {
-        return vec![];
-    }
-    local_fallbacks(meta, mode, position_ms, current, hls)
-}
-
 /// Check the actual generated route after every negotiation path converges.
 /// Candidate discovery and continuation hints do not grant job admission.
 pub fn require_legacy_job_mapping(
@@ -364,86 +245,6 @@ pub fn require_legacy_job_mapping(
     }
     media_core::motion_video::legacy_mapping_equivalent(meta, audio_index)
         .map_err(playback_capabilities::probe_error)
-}
-
-/// Keep plain original-file direct behavior. Agent requests that can create a
-/// generated job, or report a bound candidate, reuse the existing relay probe;
-/// cached inventory cannot establish the current legacy stream mapping.
-pub fn needs_preparation_probe(
-    kind: &str,
-    requested_mode: &str,
-    selected: bool,
-    audio_index: Option<u32>,
-    progressive_supported: bool,
-) -> bool {
-    match kind {
-        "http" => requested_mode != "direct",
-        "agent" => {
-            requested_mode != "direct"
-                || selected
-                || audio_index.is_some()
-                || !progressive_supported
-        }
-        _ => false,
-    }
-}
-
-pub fn upstream_fallbacks(
-    info: &Value,
-    mode: &str,
-    hls: bool,
-    base: &str,
-) -> Vec<DecoderFallbackMode> {
-    let Some(sources) = info["MediaSources"].as_array().filter(|s| s.len() == 1) else {
-        return vec![];
-    };
-    let source = &sources[0];
-    let audio_known = upstream_audio(info, None, mode).is_some()
-        || source["MediaStreams"]
-            .as_array()
-            .is_some_and(|streams| streams.iter().all(|stream| stream["Type"] != "Audio"));
-    if !audio_known || mode != "direct" || !hls || source["SupportsTranscoding"] != true {
-        return vec![];
-    }
-    let route = source["TranscodingUrl"].as_str().filter(|v| !v.is_empty());
-    let valid = providers::validate_url(&format!("{}/", base.trim_end_matches('/')))
-        .ok()
-        .zip(route)
-        .is_some_and(|(base, route)| providers::upstream_url(&base, route).is_ok());
-    if valid {
-        vec![DecoderFallbackMode::Transcode]
-    } else {
-        vec![]
-    }
-}
-
-pub fn decision_reason(
-    kind: &str,
-    requested: &str,
-    mode: &str,
-    current_metadata: bool,
-    probed: bool,
-    candidate: Option<&str>,
-) -> String {
-    if let Some(candidate) = candidate {
-        return format!("actual_media_{candidate}");
-    }
-    if matches!(kind, "jellyfin" | "emby") {
-        return format!("{kind}_negotiated_{mode}");
-    }
-    let evidence = if probed {
-        "authorized_probe"
-    } else if current_metadata {
-        "source_version_matched_metadata"
-    } else {
-        "legacy_transport_policy"
-    };
-    let intent = if requested == "auto" {
-        "automatic"
-    } else {
-        "requested"
-    };
-    format!("{kind}_{intent}_{mode}_{evidence}")
 }
 
 #[cfg(test)]

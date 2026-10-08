@@ -40,6 +40,7 @@ mod owned_http;
 mod platform_accounts;
 mod platform_import;
 mod platform_media;
+mod playback;
 mod playback_capabilities;
 mod playback_metrics;
 mod playback_observations;
