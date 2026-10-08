@@ -23,7 +23,9 @@ export const useSourceScans = defineStore("source-scans", () => {
       for (const key of Object.keys(results)) delete results[key];
       error.value = "";
       batch.value = false;
+      running.value = false;
     },
+    { flush: "sync" },
   );
   const labels: Record<string, string> = {
     offline: "NAS 设备离线，请连接后重试",
@@ -44,7 +46,11 @@ export const useSourceScans = defineStore("source-scans", () => {
       failed: false,
     };
     try {
-      const value = await session.api<{ status?: string; count: number }>(
+      const value = await session.api<{
+        status?: string;
+        count: number;
+        has_more?: boolean;
+      }>(
         source.kind === "agent"
           ? `/agents/${source.id}/scan`
           : `/sources/${source.id}/test`,
@@ -53,14 +59,18 @@ export const useSourceScans = defineStore("source-scans", () => {
         AbortSignal.timeout(125000),
       );
       if (epoch !== session.epoch) return;
-      const failed = !!value.status && value.status !== "complete";
+      const failed =
+        !!value.status &&
+        !["complete", "completed", "running"].includes(value.status);
       results[source.id] = {
         name: source.name,
         busy: false,
         failed,
         message: failed
           ? (labels[value.status!] ?? "扫描未完成")
-          : `本次扫描发现 ${value.count} 部影片`,
+          : value.has_more
+            ? `已保存 ${value.count} 部影片的索引，点击检测继续下一页`
+            : `本次扫描发现 ${value.count} 部影片`,
       };
     } catch (failure) {
       if (epoch === session.epoch)
@@ -101,9 +111,10 @@ export const useSourceScans = defineStore("source-scans", () => {
           failed: false,
           message: "等待扫描",
         };
-      // At most three upstream scans; one failed source never cancels the others.
+      // Match the server’s two scan permits, including S3 page scans.
+      // One failed source never cancels the others.
       await Promise.all(
-        Array.from({ length: Math.min(3, queue.length) }, async () => {
+        Array.from({ length: Math.min(2, queue.length) }, async () => {
           while (queue.length && epoch === session.epoch)
             await scan(queue.shift()!);
         }),
@@ -113,7 +124,7 @@ export const useSourceScans = defineStore("source-scans", () => {
         error.value =
           failure instanceof Error ? failure.message : String(failure);
     } finally {
-      running.value = false;
+      if (epoch === session.epoch) running.value = false;
     }
   }
   return { busy, running, batch, results, error, scan, scanAll };

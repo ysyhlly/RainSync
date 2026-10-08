@@ -1,11 +1,12 @@
 import { test, expect } from "@playwright/test";
-import { appFixture } from "./fixtures/application";
+import { appFixture, openFixtureSource } from "./fixtures/application";
 import { navigate } from "./fixtures/navigation";
 test("rename conflict preserves draft; lost response is read back; clear restores shared title", async ({
   page,
 }) => {
   const app = await appFixture(page);
   await page.goto("/library");
+  await openFixtureSource(page);
   await page
     .getByRole("button", { name: "重命名 真实合成测试视频", exact: true })
     .click();
@@ -61,6 +62,7 @@ test("rename updates library and playing metadata without another media session"
     (window as any).__video = document.querySelector("video");
   });
   await navigate(page, "媒体库");
+  await openFixtureSource(page);
   await page
     .getByRole("button", { name: "重命名 真实合成测试视频", exact: true })
     .click();
@@ -79,7 +81,7 @@ test("rename updates library and playing metadata without another media session"
   await dialog.getByRole("button", { name: "关闭弹窗" }).click();
   await expect(page.locator(".media-card h2").first()).toHaveText("我的片名");
   await page.getByRole("link", { name: "返回房间" }).click();
-  await expect(page.locator(".room-information h2")).toBeVisible();
+  await expect(page.locator(".room-media-widget h2")).toBeVisible();
   expect(app.preparations()).toBe(1);
   expect(app.connections()).toBe(1);
   expect(
@@ -99,6 +101,7 @@ test("ordinary viewer sees only personal rename and preview batches contain visi
       batches.push(r.postDataJSON().media_ids);
   });
   await page.goto("/library");
+  await openFixtureSource(page);
   await page
     .getByRole("button", { name: "重命名 真实合成测试视频", exact: true })
     .click();

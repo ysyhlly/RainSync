@@ -1,0 +1,37 @@
+{
+  "code": 0,
+  "data": {
+    "season_id": 12345,
+    "title": "Synthetic authorized course",
+    "user_status": {
+      "payed": 0
+    },
+    "episodes": [
+      {
+        "id": 1,
+        "aid": 2,
+        "cid": 3,
+        "duration": 90,
+        "from": "pugv",
+        "ep_status": 0,
+        "episode_can_view": true,
+        "status": 2,
+        "playable": false,
+        "title": "Unrelated locked episode"
+      },
+      {
+        "id": 9007199254740993,
+        "aid": 9007199254740994,
+        "cid": 9007199254740995,
+        "duration": 90,
+        "from": "pugv",
+        "ep_status": 0,
+        "episode_can_view": true,
+        "status": 1,
+        "playable": true,
+        "title": "Selected full free episode",
+        "label": "全集试看"
+      }
+    ]
+  }
+}

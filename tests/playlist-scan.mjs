@@ -17,7 +17,11 @@ try {
   await isolatedMediaStack("playlist-scan", async (f) => {
     artifactRoot = f.root;
     fixture = f;
-    report.fixture = { id: f.id, container: f.databaseKind === "docker" ? f.container : null, postgres: f.postgresDiagnostics() };
+    report.fixture = {
+      id: f.id,
+      container: f.databaseKind === "docker" ? f.container : null,
+      postgres: f.postgresDiagnostics(),
+    };
     report.binaries = {};
     for (const binary of ["rainsync-server", "rainsync-nas-agent"]) {
       const bytes = await readFile(
@@ -136,6 +140,35 @@ try {
       await command("SEEK", { position_ms: 10000 });
       await command("END_MEDIA", { position_ms: 10000 });
       assert.equal(state.media_id, media[0].id);
+      // A nonempty queue cannot guess a successor after its current anchor was
+      // removed. This differs from the established empty-queue repeat below.
+      for (const item of await admin.request(`/rooms/${room.id}/playlist`))
+        if (item.media_id === state.media_id)
+          await admin.request(
+            `/rooms/${room.id}/playlist/${item.id}`,
+            "DELETE",
+          );
+      const withoutCurrent = await admin.request(`/rooms/${room.id}/playlist`);
+      assert.equal(withoutCurrent.length, 1);
+      assert.equal(withoutCurrent[0].media_id, media[1].id);
+      await command("SEEK", { position_ms: 10000 });
+      const missingAnchor = make("END_MEDIA", { position_ms: 10000 });
+      const beforeMissingAnchor = f.sql(
+        `SELECT state::text FROM room_snapshots WHERE room_id='${room.id}'`,
+      );
+      peer.send(missingAnchor);
+      const denied = await peer.next(
+        "ERROR",
+        (value) => value.command_id === missingAnchor.command_id,
+      );
+      assert.equal(denied.error.code, "NO_MEDIA");
+      assert.equal(
+        f.sql(
+          `SELECT state::text FROM room_snapshots WHERE room_id='${room.id}'`,
+        ),
+        beforeMissingAnchor,
+        "a missing current anchor cannot change playback, generation or revision",
+      );
       for (const item of await admin.request(`/rooms/${room.id}/playlist`))
         await admin.request(`/rooms/${room.id}/playlist/${item.id}`, "DELETE");
       await command("SEEK", { position_ms: 10000 });
@@ -146,7 +179,7 @@ try {
       await command("PLAY");
       assert.equal(state.anchor_position_ms, 0);
       console.log(
-        "PASS: play/enqueue atomic uniqueness, next, wrap, empty repeat, replay, stale/early completion",
+        "PASS: play/enqueue atomic uniqueness, next, wrap, missing-anchor refusal, empty repeat, replay, stale/early completion",
       );
       report.cases.push({
         name: "playlist_state_and_replay",
@@ -352,7 +385,14 @@ try {
   if (fixture.databaseKind === "docker") {
     report.cleanup.remaining_fixture_containers = execFileSync(
       "docker",
-      ["ps", "-a", "--filter", `name=${report.fixture.container}`, "--format", "{{.Names}}"],
+      [
+        "ps",
+        "-a",
+        "--filter",
+        `name=${report.fixture.container}`,
+        "--format",
+        "{{.Names}}",
+      ],
       { encoding: "utf8", timeout: 10000, windowsHide: true },
     ).trim();
     assert.equal(report.cleanup.remaining_fixture_containers, "");

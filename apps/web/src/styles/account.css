@@ -16,9 +16,10 @@
   width: 100%;
   max-width: 900px;
   border: 1px solid var(--border-subtle);
-  border-radius: 22px;
+  border-radius: var(--radius-panel);
   background: var(--surface-panel);
   overflow: hidden;
+  box-shadow: var(--shadow-panel);
 }
 .registration-steps {
   padding: 36px 28px;
@@ -117,7 +118,7 @@
   min-width: 0;
   background: var(--surface-muted);
   border: 1px solid var(--border-control);
-  border-radius: 12px;
+  border-radius: var(--radius-widget);
   overflow: hidden;
 }
 .crop-surface > canvas {

@@ -1,3 +1,5 @@
+import type { NativePlatformProvider } from "../../../../../packages/protocol";
+export type { NativePlatformProvider } from "../../../../../packages/protocol";
 /** REST DTOs checked against Server handlers; playback types remain generated. */
 export interface Avatar {
   avatar_url: string | null;
@@ -12,6 +14,9 @@ export interface Profile extends Avatar {
 export interface Identity extends Profile {
   admin: boolean;
   csrf: string;
+  guest?: boolean;
+  guest_room_id?: string;
+  guest_expires_at?: number;
 }
 export type RoomLifecycle = "active" | "closing" | "closed" | "archived";
 export interface Room {
@@ -23,15 +28,76 @@ export interface Room {
   lifecycle_epoch?: number;
 }
 export interface RoomMember {
+  guest?: boolean;
   id: string;
   username: string;
   display_name: string;
 }
+export type NativePlatformMedia =
+  | {
+      version: 1;
+      provider: NativePlatformProvider;
+      content_id: string;
+      part: number;
+    }
+  | {
+      version: 2;
+      provider: "bilibili";
+      content_id: string;
+      part: 1;
+      resource: {
+        kind: "bilibili_pgc";
+        ep_id: string;
+        cid: string;
+        season_id: string;
+      };
+    }
+  | {
+      version: 3;
+      provider: "bilibili";
+      content_id: string;
+      part: 1;
+      resource: {
+        kind: "bilibili_live";
+        room_id: string;
+        uid: string;
+        broadcast_id: string;
+      };
+    }
+  | {
+      version: 4;
+      provider: "bilibili";
+      content_id: string;
+      part: 1;
+      resource: {
+        kind: "bilibili_course";
+        ep_id: string;
+        aid: string;
+        cid: string;
+        season_id: string;
+      };
+    }
+  | {
+      version: 5;
+      provider: "youtube" | "douyin" | "tiktok";
+      content_id: string;
+      part: 1;
+      resource: {
+        kind: "other_live";
+        provider: "youtube" | "douyin" | "tiktok";
+        resource_id: string;
+        broadcaster_id: string;
+        started_at: number;
+        broadcast_id: string;
+        canonical_url: string;
+      };
+    };
 export interface Media {
   id: string;
   title: string;
   duration_ms: number | null;
   kind: string;
+  platform?: NativePlatformMedia;
   original_title: string;
   shared_title: string | null;
   shared_title_revision: string;
@@ -49,6 +115,7 @@ export interface Source {
   id: string;
   name: string;
   kind: string;
+  library_id?: string;
 }
 export interface Agent {
   id: string;
@@ -66,6 +133,7 @@ export interface Agent {
     "empty" | "ready" | "rescan_required" | "upgrade_required";
 }
 export interface Message extends Partial<Avatar> {
+  deleted?: boolean;
   id: string;
   user_id?: string;
   username: string;
@@ -80,9 +148,54 @@ export interface QueueItem {
   title: string;
   cover: MediaCover;
 }
+export type RoomPermission =
+  | "invite"
+  | "kick"
+  | "close"
+  | "play"
+  | "pause"
+  | "seek"
+  | "set_rate"
+  | "change_media"
+  | "queue";
+export interface RoomGrant {
+  user_id: string;
+  role: "viewer" | "moderator";
+  permissions: RoomPermission[];
+  expires_at: number | null;
+  revoked: boolean;
+  active: boolean;
+}
+export interface RoomPermissionSnapshot {
+  owner_id: string;
+  self_permissions: RoomPermission[];
+  members: RoomGrant[];
+}
+export interface RoomInvitePolicy {
+  expires_in_seconds: number;
+  max_uses: number | null;
+  invited_user_id: string | null;
+  role: "viewer" | "moderator";
+  permissions: RoomPermission[];
+  grant_expires_in_seconds: number | null;
+}
+export interface RoomInviteRecord extends Omit<RoomInvitation, "token"> {
+  id: string;
+  revoked: boolean;
+  revoked_at?: number | null;
+  expired: boolean;
+  use_count: number;
+}
 export interface RoomInvitation {
   room_id: string;
   token: string;
+  id?: string;
+  expires_at?: number;
+  max_uses?: number | null;
+  use_count?: number;
+  invited_user_id?: string | null;
+  role?: "viewer" | "moderator";
+  permissions?: RoomPermission[];
 }
 export type InviteStatus = "unused" | "used" | "expired" | "revoked";
 export interface RegistrationInvite {

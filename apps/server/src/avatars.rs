@@ -44,7 +44,7 @@ pub fn url(user: Uuid, version: Option<Uuid>, present: bool) -> Option<String> {
 }
 async fn metadata(app: &App, user: Uuid) -> Result<Response> {
     let value = profile::value(app, user).await?;
-    Ok(registration::private_json(
+    Ok(responses::private_json(
         StatusCode::OK,
         json!({"avatar_url":value["avatar_url"],"avatar_version":value["avatar_version"]}),
     ))
@@ -171,7 +171,11 @@ pub async fn read(
     Path(user): Path<Uuid>,
     Query(version): Query<Version>,
 ) -> Result<Response> {
-    auth(&app, &h, false).await?;
+    let viewer = auth_viewer(&app, &h, false).await?;
+    let allowed:bool=sqlx::query_scalar("SELECT guest_is_account($1) OR EXISTS(SELECT 1 FROM guest_principals g JOIN room_members m ON m.room_id=g.room_id WHERE g.user_id=$1 AND m.user_id=$2 AND guest_room_allowed($1,g.room_id))").bind(viewer.id).bind(user).fetch_one(&app.db).await?;
+    if !allowed {
+        return Err(err(StatusCode::NOT_FOUND, "not_found"));
+    }
     let bytes: Vec<u8> = sqlx::query_scalar(
         "SELECT content FROM user_avatars WHERE user_id=$1 AND version=$2 AND content IS NOT NULL",
     )

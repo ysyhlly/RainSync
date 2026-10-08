@@ -244,7 +244,9 @@ test("sources validate dynamic fields and keep scans scoped to each row", async 
   await first.getByRole("button", { name: "检测并扫描" }).click();
   await second.getByRole("button", { name: "检测并扫描" }).click();
   await expect(second.getByText("本次扫描发现 7 部影片")).toBeVisible();
-  await expect(first.getByRole("button")).toBeDisabled();
+  await expect(
+    first.getByRole("button", { name: "正在检测扫描…", exact: true }),
+  ).toBeDisabled();
   finishFirst();
   await expect(first.getByText("本次扫描发现 7 部影片")).toBeVisible();
   await expect(
@@ -262,6 +264,7 @@ test("sources validate dynamic fields and keep scans scoped to each row", async 
   await page
     .getByLabel("媒体或服务 URL")
     .fill("https://example.test/video.mp4");
+  await page.getByText("高级选项：请求头与外部字幕", { exact: true }).click();
   await page.getByLabel("请求头 JSON（可选）").fill('{"Authorization":3}');
   await page.getByRole("button", { name: "保存片源" }).click();
   await expect(page.getByRole("alert")).toContainText("请求头须为JSON对象");
@@ -309,9 +312,14 @@ test("NAS history is not claimed online; pairing and revoke preserve actual cont
   });
   await page.goto(appBase + "/admin/agents");
   await expect(page.locator(".admin-row")).toContainText("已配对记录");
-  await expect(page.locator(".admin-row")).toContainText("文件版本索引状态未知");
+  await expect(page.locator(".admin-row")).toContainText(
+    "文件版本索引状态未知",
+  );
   await page.getByRole("button", { name: "添加设备", exact: true }).click();
-  await page.getByLabel("设备名称").fill("第二设备");
+  await page
+    .getByRole("dialog", { name: "添加NAS设备", exact: true })
+    .getByLabel("设备名称", { exact: true })
+    .fill("第二设备");
   await page.getByRole("button", { name: "生成配对码" }).click();
   await expect(page.getByLabel("配对码", { exact: true })).toHaveValue(
     "PAIR-SYNTHETIC",
@@ -375,6 +383,10 @@ test("admin navigation preserves the persistent video and room connection", asyn
     .filter({ visible: true })
     .first();
   await nav.click();
+  await expect(
+    page.getByRole("heading", { name: "管理员设置", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: /片源管理 编辑片源/ }).click();
   await expect(page.getByRole("heading", { name: "片源管理" })).toBeVisible();
   for (const label of ["NAS 设备", "账号与注册"]) {
     await page

@@ -26,7 +26,13 @@ await isolatedServer("accounts", async (f) => {
   await newUser.request("/users", "POST", { username: "forbidden", password: "12345678" }, 403);
   assert.equal(f.sql("SELECT count(*) FROM users WHERE admin"), "1");
   assert.equal(f.sql("SELECT count(*) FROM user_profiles WHERE display_name='雨😀'"), "2");
-  assert.equal(f.sql("SELECT count(*) FROM information_schema.columns WHERE table_name='users'"), "4");
+  // Guest principals intentionally add one defensive account-kind column;
+  // normal account creation must preserve the original role/schema boundary.
+  assert.equal(
+    f.sql("SELECT string_agg(column_name,',' ORDER BY column_name) FROM information_schema.columns WHERE table_schema='public' AND table_name='users'"),
+    "admin,id,password_hash,principal_kind,username",
+  );
+  assert.equal(f.sql("SELECT count(*) FROM users WHERE principal_kind IS DISTINCT FROM 'account'"), "0");
   assert.equal(f.sql("SELECT count(*) FROM information_schema.columns WHERE table_name='sessions'"), "4");
   await f.startServer();
   assert.equal((await newUser.request("/auth/me")).id, first.id, "existing session survives migration and restart");

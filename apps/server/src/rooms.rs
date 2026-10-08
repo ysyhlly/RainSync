@@ -2,12 +2,23 @@ use super::*;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use protocol::{Command, PlaybackStatus, RoomState};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
+
+#[path = "room_delivery.rs"]
+mod delivery;
+
+#[path = "room_presence.rs"]
+mod presence_runtime;
+
+#[path = "room_client_status.rs"]
+mod client_status;
 
 #[derive(Clone)]
 pub struct Handle {
+    control_lease: Option<persistence::room_node_leases::Lease>,
     tx: mpsc::Sender<Request>,
-    events: broadcast::Sender<Value>,
+    events: delivery::Bus,
+    presence: presence_runtime::Runtime,
 }
 impl Handle {
     pub fn command_queue_depth(&self) -> usize {
@@ -18,9 +29,16 @@ impl Handle {
     }
 }
 struct Request {
-    user: User,
+    user_id: Uuid,
+    session_hash: String,
     command: Command,
     reply: oneshot::Sender<Value>,
+}
+
+pub(crate) async fn broadcast_timeline(app: &App, room: Uuid, value: Value) {
+    if let Some(handle) = app.rooms.lock().await.get(&room) {
+        let _ = handle.events.send(value);
+    }
 }
 
 pub async fn ownership_changed(app: &App, state: &RoomState, owner: Uuid, event_id: Uuid) {
@@ -64,8 +82,22 @@ async fn owned_snapshot(
         .bind(room)
         .fetch_one(&mut *tx)
         .await?;
+    let membership = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
+    )
+    .bind(room)
+    .bind(user)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if membership.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "not_a_member"));
+    }
     let lifecycle: String = row.get("lifecycle");
-    let control_epoch = if lifecycle == "active" {
+    let registered: bool = sqlx::query_scalar("SELECT guest_is_account($1)")
+        .bind(user)
+        .fetch_one(&mut *tx)
+        .await?;
+    let control_epoch = if lifecycle == "active" && registered {
         let id = Uuid::new_v4();
         let expires_at_ms: i64 = sqlx::query_scalar("INSERT INTO control_epochs(id,user_id,room_id) VALUES($1,$2,$3) RETURNING floor(extract(epoch FROM expires_at)*1000)::bigint")
             .bind(id).bind(user).bind(room).fetch_one(&mut *tx).await?;
@@ -90,6 +122,62 @@ fn socket_error(reason: &str, command_id: Option<Uuid>) -> Value {
     json!({"type":"ERROR", "command_id":command_id, "error":error})
 }
 
+async fn socket_membership(
+    app: &App,
+    room: Uuid,
+    user: Uuid,
+) -> std::result::Result<(), &'static str> {
+    // An admission read after a membership deletion commits cannot authorize a
+    // new frame. Release the read before any network write; a slow connection
+    // never holds a database/room lock while sending. Previously admitted bytes
+    // may already be in transport buffers and cannot be recalled.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        database_checks::boolean(
+            &app.db,
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2 AND (guest_is_account($2) OR guest_room_allowed($2,$1)))",
+            )
+            .bind(room)
+            .bind(user),
+            1500,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false)) => Err("not_a_member"),
+        _ => Err("service_unavailable"),
+    }
+}
+
+async fn socket_access(
+    app: &App,
+    room: Uuid,
+    user: Uuid,
+    session_hash: &str,
+) -> std::result::Result<(), &'static str> {
+    socket_membership(app, room, user).await?;
+    // Login authority is independent of optional presence negotiation. Legacy
+    // sockets must not keep sending or receiving for the heartbeat interval.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        database_checks::boolean(
+            &app.db,
+            sqlx::query_scalar("SELECT playback_login_allowed($2,$1)")
+                .bind(session_hash)
+                .bind(user),
+            1500,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false)) => Err("session_expired"),
+        _ => Err("service_unavailable"),
+    }
+}
+
 async fn reject_socket(
     out: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     reason: &str,
@@ -101,17 +189,38 @@ async fn reject_socket(
     .await;
 }
 
+async fn reject_with_presence(
+    out: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    reason: &str,
+    lease: Option<&presence_runtime::Lease>,
+) {
+    if matches!(
+        reason,
+        "not_a_member" | "session_expired" | "service_unavailable" | "rate_limited"
+    ) && let Some(lease) = lease
+    {
+        lease.revoke();
+    }
+    reject_socket(out, reason).await;
+}
+
 async fn handle(app: &App, id: Uuid) -> Result<Handle> {
     let mut map = app.rooms.lock().await;
     if let Some(h) = map.get(&id) {
         return Ok(h.clone());
     }
+    let control_lease = match &app.control_cluster {
+        Some(cluster) => Some(cluster.local_lease(id).await?),
+        None => None,
+    };
     let mut state = persistence::snapshot(&app.db, id).await?;
     let (tx, mut rx) = mpsc::channel::<Request>(128);
-    let (events, _) = broadcast::channel(128);
+    let events = delivery::Bus::new();
     let h = Handle {
+        control_lease: control_lease.clone(),
         tx,
         events: events.clone(),
+        presence: presence_runtime::Runtime::new(app, id, events.clone()),
     };
     map.insert(id, h.clone());
     let app = app.clone();
@@ -134,6 +243,8 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                 if req.command.room_id != id {
                     return Err("room_mismatch".to_string());
                 }
+                if let (Some(cluster),Some(lease))=(&app.control_cluster,&control_lease)
+                    && !cluster.owns(lease).await {return Err("service_unavailable".into())}
                 // REST management can replace ownership while this actor stays
                 // alive. The persisted snapshot is authoritative for every command.
                 state = persistence::snapshot(&app.db, id)
@@ -144,16 +255,20 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                 persistence::check_control_epoch(
                     &app.db,
                     id,
-                    req.user.id,
+                    req.user_id,
                     req.command.control_epoch,
                 )
                 .await
                 .map_err(|error| control_error(error, "database_error"))?;
                 if let Some(previous) =
-                    persistence::previous(&app.db, id, &req.command, req.user.id)
-                        .await
+                    match &control_lease {
+                        Some(lease)=>persistence::previous_fenced(&app.db,id,&req.command,req.user_id,&req.session_hash,lease).await,
+                        None=>persistence::previous(&app.db,id,&req.command,req.user_id).await,
+                    }
                         .map_err(|error| match error.to_string().as_str() {
+                            "room_owner_lost" => "service_unavailable".to_string(),
                             "room_not_active" => "room_not_active".to_string(),
+                            "not_a_member" => "not_a_member".to_string(),
                             "control_epoch_expired" => "control_epoch_expired".to_string(),
                             "control_epoch_required" => "control_epoch_required".to_string(),
                             "command_owned_by_another_user" => {
@@ -175,35 +290,32 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                         false,
                     ));
                 }
-                let mut next =
-                    room_core::reduce(&state, &req.command, req.user.id, req.user.admin, app.now())
-                        .map_err(String::from)?;
-                if matches!(req.command.action, protocol::Action::EndMedia { .. }) {
-                    let mut ids: Vec<Uuid> = sqlx::query_scalar(&format!("SELECT q.media_id FROM playlist_items q JOIN media_items m ON m.id=q.media_id JOIN sources s ON s.id=m.source_id WHERE q.room_id=$1 AND {} ORDER BY q.sort_order,q.id", media_titles::VISIBLE))
-                        .bind(id).fetch_all(&app.db).await.map_err(|_| "database_error")?;
-                    // Legacy playlists may contain duplicates. Without an item cursor,
-                    // repeated media must not trap advancement at its first occurrence.
-                    let mut seen = std::collections::HashSet::new();
-                    ids.retain(|media| seen.insert(*media));
-                    if !ids.is_empty() {
-                        let index = ids.iter().position(|media| Some(*media) == state.media_id);
-                        next.media_id = Some(ids[index.map_or(0, |i| (i + 1) % ids.len())]);
-                    }
-                }
-                if matches!(req.command.action, protocol::Action::ChangeMedia { .. } | protocol::Action::EndMedia { .. }) {
-                    let media_id = next.media_id.ok_or("no_media")?;
+                let reducer_time_ms = app.now();
+                // The final reduction belongs to the transaction, with the
+                // current role and exact originating login held through commit.
+                let mut resolved_media = None;
+                if let protocol::Action::ChangeMedia { media_id } = req.command.action {
                     let duration = sqlx::query(
-                        &format!("SELECT m.duration_ms FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND {}", media_titles::VISIBLE),
+                        "SELECT CASE WHEN m.source_id IS NULL THEN e.duration_ms ELSE m.duration_ms END AS duration_ms FROM media_items m LEFT JOIN room_platform_media e ON e.media_id=m.id AND e.room_id=$2 WHERE m.id=$1 AND room_media_allowed($2,m.id)",
                     )
                     .bind(media_id)
+                    .bind(id)
                     .fetch_optional(&app.db)
                     .await
                     .map_err(|_| "database_error".to_string())?
                     .ok_or("media_not_found")?;
-                    next.duration_ms = duration.get("duration_ms");
+                    let resolution = room_core::diagnostics::ResolvedMedia {
+                        media_id,
+                        duration_ms: duration.get("duration_ms"),
+                        live: persistence::native_live::selected_binding(&app.db, id, media_id)
+                            .await.map_err(|_| "media_resolution_mismatch".to_string())?,
+                    };
+                    resolved_media = Some(resolution);
                 }
-                persistence::commit(&app.db, &next, &req.command, req.user.id, state.revision)
-                    .await
+                let next = match &control_lease {
+                    Some(lease)=>persistence::commit_fenced(&app.db,&req.command,req.user_id,&req.session_hash,reducer_time_ms,resolved_media,lease).await,
+                    None=>persistence::commit(&app.db,&req.command,req.user_id,&req.session_hash,reducer_time_ms,resolved_media).await,
+                }
                     .map_err(|error| control_error(error, "commit_failed"))?;
                 state = next.clone();
                 Ok((next, true))
@@ -234,24 +346,62 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
 
 fn control_error(error: anyhow::Error, fallback: &str) -> String {
     match error.to_string().as_str() {
+        "room_owner_lost" | "room_owner_changed" => "service_unavailable".into(),
         "control_epoch_required" => "control_epoch_required".into(),
         "control_epoch_expired" => "control_epoch_expired".into(),
         "revision_conflict" => "revision_conflict".into(),
         "controller_required" => "controller_required".into(),
         "room_not_active" => "room_not_active".into(),
+        "not_a_member" => "not_a_member".into(),
+        "session_expired" => "session_expired".into(),
+        // Reducer validation now runs inside persistence's authority transaction.
+        reason @ ("protocol_version"
+        | "wrong_room"
+        | "stale_media"
+        | "no_media"
+        | "media_not_found"
+        | "invalid_position"
+        | "invalid_rate"
+        | "native_live_client_unsupported"
+        | "native_live_seek_unsupported"
+        | "native_live_rate_unsupported"
+        | "native_live_end_unsupported"
+        | "native_live_state_changed"
+        | "generation_overflow"
+        | "revision_overflow") => reason.into(),
         _ => fallback.into(),
     }
 }
 
 pub async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
-    let u = auth(&app, &h, false).await?;
+    let u = auth_viewer(&app, &h, false).await?;
     let rows=sqlx::query("SELECT r.id,r.name,r.owner_id,r.lifecycle,r.lifecycle_epoch FROM rooms r JOIN room_members m ON m.room_id=r.id WHERE m.user_id=$1 ORDER BY r.created_at DESC").bind(u.id).fetch_all(&app.db).await?;
     Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"owner_id":r.get::<Uuid,_>("owner_id"),"lifecycle":r.get::<String,_>("lifecycle"),"lifecycle_epoch":r.get::<i64,_>("lifecycle_epoch")})).collect())))
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Name {
     pub name: String,
 }
+
+async fn creation_session_valid(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: Uuid,
+    session_hash: &str,
+) -> Result<()> {
+    // now() is fixed at transaction start and would accept a session that
+    // expires while a concurrent creation holds the request-key lock.
+    let valid: bool = sqlx::query_scalar("SELECT playback_login_allowed($2,$1)")
+        .bind(session_hash)
+        .bind(user)
+        .fetch_one(&mut **tx)
+        .await?;
+    if !valid {
+        return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
+    }
+    Ok(())
+}
+
 pub async fn create(
     State(app): State<App>,
     h: HeaderMap,
@@ -261,7 +411,74 @@ pub async fn create(
     if body.name.trim().is_empty() || body.name.chars().count() > 120 {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_name"));
     }
+    let mut keys = h.get_all("idempotency-key").iter();
+    let request_key = keys
+        .next()
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .filter(|key| {
+                    !key.is_empty()
+                        && key.len() <= 128
+                        && key.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-')
+                        })
+                })
+                .ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid_idempotency_key"))
+        })
+        .transpose()?;
+    if keys.next().is_some() {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid_idempotency_key"));
+    }
     let id = Uuid::new_v4();
+    let mut tx = app.db.begin().await?;
+    // Coordinate with account exit and hold the exact authenticated session
+    // until commit; a prior auth check alone cannot authorize queued work.
+    sqlx::query("SELECT id FROM users WHERE id=$1 FOR SHARE")
+        .bind(u.id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "session_expired"))?;
+    let session_hash =
+        hash(&cookie(&h).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "login_required"))?);
+    sqlx::query("SELECT token_hash FROM sessions WHERE token_hash=$1 AND user_id=$2 AND csrf=$3 AND expires_at>clock_timestamp() FOR SHARE")
+        .bind(&session_hash)
+        .bind(u.id)
+        .bind(h.get("x-csrf-token").and_then(|v| v.to_str().ok()).unwrap_or_default())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "session_expired"))?;
+    if let Some(key) = request_key {
+        // PostgreSQL's unique-key conflict wait coordinates all Server nodes.
+        // A losing INSERT sees the committed row in the following statement
+        // (READ COMMITTED), rather than in the INSERT's earlier snapshot.
+        let claimed = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO room_creation_requests(user_id,request_key,name,room_id) VALUES($1,$2,$3,$4) ON CONFLICT (user_id,request_key) DO NOTHING RETURNING room_id",
+        )
+        .bind(u.id)
+        .bind(key)
+        .bind(&body.name)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if claimed.is_none() {
+            let result = sqlx::query(
+                "SELECT name,room_id FROM room_creation_requests WHERE user_id=$1 AND request_key=$2",
+            )
+            .bind(u.id)
+            .bind(key)
+            .fetch_one(&mut *tx)
+            .await?;
+            if result.get::<String, _>("name") != body.name {
+                return Err(err(StatusCode::CONFLICT, "idempotency_key_conflict"));
+            }
+            let original = result.get::<Uuid, _>("room_id");
+            creation_session_valid(&mut tx, u.id, &session_hash).await?;
+            tx.commit().await?;
+            return Ok(Json(json!({"id":original})));
+        }
+    }
     let state = RoomState {
         room_id: id,
         revision: 0,
@@ -273,16 +490,16 @@ pub async fn create(
         playback_rate: 1.0,
         controller_user_id: u.id,
         duration_ms: None,
+        live: None,
         clock_epoch: app.epoch,
     };
-    let mut tx = app.db.begin().await?;
     sqlx::query("INSERT INTO rooms(id,name,owner_id) VALUES($1,$2,$3)")
         .bind(id)
         .bind(body.name)
         .bind(u.id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO room_members VALUES($1,$2)")
+    sqlx::query("INSERT INTO room_members(room_id,user_id) VALUES($1,$2)")
         .bind(id)
         .bind(u.id)
         .execute(&mut *tx)
@@ -292,15 +509,42 @@ pub async fn create(
         .bind(serde_json::to_value(state).unwrap())
         .execute(&mut *tx)
         .await?;
+    creation_session_valid(&mut tx, u.id, &session_hash).await?;
     tx.commit().await?;
     Ok(Json(json!({"id":id})))
 }
-async fn controller<'a>(
+
+pub(crate) async fn controller<'a>(
     app: &'a App,
     h: &HeaderMap,
     id: Uuid,
 ) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
-    let u = auth(app, h, true).await?;
+    controller_for_permission(app, h, id, protocol::RoomPermission::Queue).await
+}
+pub(crate) async fn controller_for_permission<'a>(
+    app: &'a App,
+    h: &HeaderMap,
+    id: Uuid,
+    permission: protocol::RoomPermission,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
+    controller_admission(app, h, id, permission, true).await
+}
+pub(crate) async fn controller_read_for_permission<'a>(
+    app: &'a App,
+    h: &HeaderMap,
+    id: Uuid,
+    permission: protocol::RoomPermission,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
+    controller_admission(app, h, id, permission, false).await
+}
+async fn controller_admission<'a>(
+    app: &'a App,
+    h: &HeaderMap,
+    id: Uuid,
+    permission: protocol::RoomPermission,
+    write: bool,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
+    let u = auth(app, h, write).await?;
     member(app, &u, id).await?;
     let mut tx = app.db.begin().await?;
     // Same order as joining: room first, then snapshot/invitation.
@@ -313,88 +557,119 @@ async fn controller<'a>(
             .fetch_one(&mut *tx)
             .await?;
     let s: RoomState = serde_json::from_value(value).map_err(anyhow::Error::from)?;
-    if !u.admin && s.controller_user_id != u.id {
-        return Err(err(StatusCode::FORBIDDEN, "controller_required"));
+    // Keep room -> snapshot -> member ordering. The earlier fast check cannot
+    // authorize a mutation after membership is revoked while these locks wait.
+    let membership: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
+    )
+    .bind(id)
+    .bind(u.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if membership.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, "not_a_member"));
+    }
+    // Freeze current role and the exact authenticated login through commit.
+    // FOR SHARE, unlike KEY SHARE, also conflicts with non-key admin/expiry
+    // changes. Do not reacquire a pool connection via auth() while holding tx.
+    let current_admin: Option<bool> =
+        sqlx::query_scalar("SELECT admin FROM users WHERE id=$1 FOR SHARE")
+            .bind(u.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let login_hash =
+        hash(&cookie(h).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "login_required"))?);
+    let csrf: Option<String> = sqlx::query_scalar(
+        "SELECT csrf FROM sessions WHERE token_hash=$1 AND user_id=$2 FOR SHARE",
+    )
+    .bind(&login_hash)
+    .bind(u.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let valid: bool = sqlx::query_scalar("SELECT playback_login_allowed($2,$1)")
+        .bind(&login_hash)
+        .bind(u.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !valid || csrf.is_none() || current_admin.is_none() {
+        return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
+    }
+    // Browser same-origin GET requests do not need an Origin/CSRF header.
+    // Writes retain both the original origin gate and the locked login's CSRF.
+    if write && h.get("x-csrf-token").and_then(|value| value.to_str().ok()) != csrf.as_deref() {
+        return Err(err(StatusCode::FORBIDDEN, "csrf_rejected"));
+    }
+    let owner: Uuid = sqlx::query_scalar("SELECT owner_id FROM rooms WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if current_admin != Some(true) && s.controller_user_id != u.id && owner != u.id {
+        persistence::room_permissions::require(&mut tx, id, u.id, permission)
+            .await
+            .map_err(|_| err(StatusCode::FORBIDDEN, "controller_required"))?;
+        sqlx::query("SELECT set_config('rainsync.delegated_room',$1,true),set_config('rainsync.delegated_user',$2,true),set_config('rainsync.delegated_permission',$3,true)")
+            .bind(id.to_string()).bind(u.id.to_string()).bind(permission.as_str()).execute(&mut *tx).await?;
     };
     Ok(tx)
 }
-pub async fn invite(
-    State(app): State<App>,
-    h: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Value>> {
-    let mut tx = controller(&app, &h, id).await?;
-    let t = token();
-    sqlx::query("INSERT INTO invites VALUES($1,$2,now()+interval '24 hours',false)")
-        .bind(hash(&t))
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(Json(json!({"token":t,"room_id":id})))
-}
-pub async fn revoke_invite(
-    State(app): State<App>,
-    h: HeaderMap,
-    Path((id, t)): Path<(Uuid, String)>,
-) -> Result<Json<Value>> {
-    let mut tx = controller(&app, &h, id).await?;
-    sqlx::query("UPDATE invites SET revoked=true WHERE room_id=$1 AND token_hash=$2")
-        .bind(id)
-        .bind(hash(&t))
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(Json(json!({"ok":true})))
-}
-#[derive(Deserialize)]
-pub struct Join {
-    token: String,
-}
-pub async fn join(
-    State(app): State<App>,
-    h: HeaderMap,
-    Path(id): Path<Uuid>,
-    Json(body): Json<Join>,
-) -> Result<Json<Value>> {
-    let u = auth(&app, &h, true).await?;
-    let mut tx = app.db.begin().await?;
-    persistence::room_lifecycle::lock_active(&mut tx, id)
-        .await
-        .map_err(room_lifecycle::gate_error)?;
-    let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM invites WHERE room_id=$1 AND token_hash=$2 AND expires_at>now() AND NOT revoked)").bind(id).bind(hash(&body.token)).fetch_one(&mut *tx).await?;
+pub(crate) async fn commit_controller(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    h: &HeaderMap,
+) -> Result<()> {
+    // Row locks prevent revocation/role changes, not natural expiration while
+    // a later INSERT/DELETE waits. Recheck the exact login at final admission.
+    let login_hash =
+        hash(&cookie(h).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "login_required"))?);
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND expires_at>clock_timestamp())",
+    ).bind(login_hash).fetch_one(&mut *tx).await?;
     if !valid {
-        return Err(err(StatusCode::FORBIDDEN, "invalid_invite"));
+        return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
     }
-    let count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM room_members WHERE room_id=$1 AND user_id<>$2")
-            .bind(id)
-            .bind(u.id)
-            .fetch_one(&mut *tx)
-            .await?;
-    if count >= 10 {
-        return Err(err(StatusCode::CONFLICT, "room_full"));
+    let delegated: bool = sqlx::query_scalar("SELECT CASE WHEN NULLIF(current_setting('rainsync.delegated_room',true),'') IS NULL THEN true ELSE room_permission_allowed(current_setting('rainsync.delegated_room')::uuid,current_setting('rainsync.delegated_user')::uuid,current_setting('rainsync.delegated_permission')) END")
+        .fetch_one(&mut *tx).await?;
+    if !delegated {
+        return Err(err(StatusCode::FORBIDDEN, "controller_required"));
     }
-    sqlx::query("INSERT INTO room_members VALUES($1,$2) ON CONFLICT DO NOTHING")
-        .bind(id)
-        .bind(u.id)
-        .execute(&mut *tx)
-        .await?;
     tx.commit().await?;
-    Ok(Json(json!({"ok":true})))
+    Ok(())
 }
+
+#[path = "room_invites.rs"]
+mod invites_runtime;
+#[path = "room_permissions.rs"]
+pub(crate) mod permissions_runtime;
+pub(crate) use invites_runtime::redeem_error;
+pub use invites_runtime::{invite, join, list_invites, revoke_invite};
+pub use permissions_runtime::{kick, permissions, revoke_permissions, set_permissions};
 pub async fn playlist(
     State(app): State<App>,
     h: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Response> {
-    let u = auth(&app, &h, false).await?;
+    let u = auth_viewer(&app, &h, false).await?;
     member(&app, &u, id).await?;
-    let rows=sqlx::query(&format!("{} JOIN playlist_items q ON q.media_id=m.id WHERE {} AND q.room_id=$2 ORDER BY q.sort_order,q.id", media_titles::SELECT.replace("SELECT m.id,", "SELECT q.id AS playlist_id,m.id,"), media_titles::VISIBLE)).bind(u.id).bind(id).fetch_all(&app.db).await?;
-    Ok(media_titles::private_json(Value::Array(rows.iter().map(|r| {
-        let media = media_titles::media(r);
-        json!({"id":r.get::<Uuid,_>("playlist_id"),"media_id":media["id"],"title":media["title"],"cover":media["cover"]})
-    }).collect())))
+    let rows=sqlx::query(&format!("{} JOIN playlist_items q ON q.media_id=m.id WHERE {} AND q.room_id=$2 AND library_media_allowed($1,m.id,'play',$2) ORDER BY q.sort_order,q.id", media_titles::SELECT.replace("SELECT m.id,", "SELECT q.id AS playlist_id,q.sort_order AS queue_order,m.id,"), media_titles::VISIBLE)).bind(u.id).bind(id).fetch_all(&app.db).await?;
+    let mut items: Vec<(i64, Uuid, Value)> = rows.iter().map(|r| {
+        let mut media = media_titles::media(r);
+        if let Some(url) = media["cover"]["url"].as_str() {
+            media["cover"]["url"] = json!(format!("{url}{}room_id={id}", if url.contains('?') { "&" } else { "?" }));
+        }
+        let item = r.get::<Uuid,_>("playlist_id");
+        (r.get("queue_order"), item, json!({"id":item,"media_id":media["id"],"title":media["title"],"cover":media["cover"]}))
+    }).collect();
+    let platform = sqlx::query("SELECT q.id,q.media_id,q.sort_order,e.title FROM playlist_items q JOIN room_platform_media e ON e.media_id=q.media_id AND e.room_id=q.room_id JOIN media_items m ON m.id=e.media_id WHERE q.room_id=$1 AND m.available AND m.source_id IS NULL AND library_media_allowed($2,m.id,'play',$1)")
+        .bind(id).bind(u.id).fetch_all(&app.db).await?;
+    items.extend(platform.iter().map(|r| {
+        let item = r.get::<Uuid,_>("id");
+        (r.get("sort_order"), item, json!({"id":item,"media_id":r.get::<Uuid,_>("media_id"),"title":r.get::<String,_>("title"),"kind":"native_platform","cover":{"state":"missing","revision":null,"url":null,"retry_after_ms":null}}))
+    }));
+    items.sort_by_key(|(order, id, _)| (*order, *id));
+    let current = auth_viewer(&app, &h, false).await?;
+    member(&app, &current, id).await?;
+    Ok(responses::ok_json(Value::Array(
+        items.into_iter().map(|(_, _, value)| value).collect(),
+    )))
 }
 #[derive(Deserialize)]
 pub struct Add {
@@ -406,19 +681,37 @@ pub async fn add_playlist(
     Path(id): Path<Uuid>,
     Json(body): Json<Add>,
 ) -> Result<Json<Value>> {
+    let user = auth(&app, &h, true).await?;
     let mut tx = controller(&app, &h, id).await?;
-    if let Some(item) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM playlist_items WHERE room_id=$1 AND media_id=$2 ORDER BY sort_order,id LIMIT 1")
-        .bind(id).bind(body.media_id).fetch_optional(&mut *tx).await? {
-        return Ok(Json(json!({"id":item})));
-    }
-    let available: bool = sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND {})", media_titles::VISIBLE))
-        .bind(body.media_id).fetch_one(&mut *tx).await?;
+    sqlx::query("SELECT id FROM media_items WHERE id=$1 FOR SHARE")
+        .bind(body.media_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    sqlx::query("SELECT media_id FROM room_platform_media WHERE media_id=$1 FOR SHARE")
+        .bind(body.media_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let available: bool = sqlx::query_scalar(
+        "SELECT room_media_allowed($1,$2) AND library_media_allowed($3,$2,'play',$1)",
+    )
+    .bind(id)
+    .bind(body.media_id)
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await?;
     if !available {
         return Err(err(StatusCode::NOT_FOUND, "media_not_found"));
     }
+    if let Some(item) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM playlist_items WHERE room_id=$1 AND media_id=$2 ORDER BY sort_order,id LIMIT 1")
+        .bind(id).bind(body.media_id).fetch_optional(&mut *tx).await? {
+        commit_controller(tx, &h).await?;
+        return Ok(Json(json!({"id":item})));
+    }
     let item = Uuid::new_v4();
     sqlx::query("INSERT INTO playlist_items SELECT $1,$2,$3,COALESCE(max(sort_order),0)+1 FROM playlist_items WHERE room_id=$2").bind(item).bind(id).bind(body.media_id).execute(&mut *tx).await?;
-    tx.commit().await?;
+    commit_controller(tx, &h).await?;
+    // Invalidate only. Each viewer's REST read retains its own library filter.
+    broadcast_timeline(&app, id, json!({"type":"PLAYLIST_CHANGED"})).await;
     Ok(Json(json!({"id":item})))
 }
 pub async fn remove_playlist(
@@ -427,32 +720,78 @@ pub async fn remove_playlist(
     Path((id, item)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>> {
     let mut tx = controller(&app, &h, id).await?;
-    sqlx::query("DELETE FROM playlist_items WHERE room_id=$1 AND id=$2")
+    let removed = sqlx::query("DELETE FROM playlist_items WHERE room_id=$1 AND id=$2")
         .bind(id)
         .bind(item)
         .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
+        .await?
+        .rows_affected();
+    commit_controller(tx, &h).await?;
+    if removed > 0 {
+        broadcast_timeline(&app, id, json!({"type":"PLAYLIST_CHANGED"})).await;
+    }
     Ok(Json(json!({"ok":true})))
 }
 #[derive(Deserialize)]
 pub struct MessageCursor {
     after: Option<Uuid>,
+    check_ids: Option<String>,
 }
+fn chat_message_select(include_created_at: bool) -> String {
+    let created_at = if include_created_at {
+        "c.created_at,"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT c.id,CASE WHEN c.deleted_at IS NULL THEN c.body ELSE '' END AS body,c.deleted_at IS NOT NULL AS deleted,c.user_id,u.username,COALESCE(g.display_name,p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,{created_at}floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN guest_principals g ON g.user_id=u.id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id"
+    )
+}
+
 pub async fn messages(
     State(app): State<App>,
     h: HeaderMap,
     Path(id): Path<Uuid>,
     axum::extract::Query(cursor): axum::extract::Query<MessageCursor>,
 ) -> Result<Json<Value>> {
-    let u = auth(&app, &h, false).await?;
+    let u = auth_viewer(&app, &h, false).await?;
     member(&app, &u, id).await?;
-    let rows = if let Some(after) = cursor.after {
-        sqlx::query("SELECT c.id,c.body,c.user_id,u.username,COALESCE(p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE c.room_id=$1 AND (NOT EXISTS(SELECT 1 FROM chat_messages WHERE id=$2 AND room_id=$1) OR (c.created_at,c.id) > (SELECT created_at,id FROM chat_messages WHERE id=$2 AND room_id=$1)) ORDER BY c.created_at,c.id LIMIT 100").bind(id).bind(after).fetch_all(&app.db).await?
+    let rows = if let Some(ids) = cursor.check_ids {
+        if cursor.after.is_some() || ids.len() > 3700 {
+            return Err(err(StatusCode::BAD_REQUEST, "invalid_request"));
+        }
+        let ids: Vec<Uuid> = ids
+            .split(',')
+            .map(Uuid::parse_str)
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_request"))?;
+        if ids.is_empty() || ids.len() > 100 {
+            return Err(err(StatusCode::BAD_REQUEST, "invalid_request"));
+        }
+        sqlx::query(&format!(
+            "{} WHERE c.room_id=$1 AND c.id=ANY($2) ORDER BY c.created_at,c.id",
+            chat_message_select(false)
+        ))
+        .bind(id)
+        .bind(ids)
+        .fetch_all(&app.db)
+        .await?
+    } else if let Some(after) = cursor.after {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat_messages WHERE id=$1 AND room_id=$2)",
+        )
+        .bind(after)
+        .bind(id)
+        .fetch_one(&app.db)
+        .await?;
+        if !exists {
+            return Err(err(StatusCode::BAD_REQUEST, "chat_cursor_not_found"));
+        }
+        sqlx::query(&format!("{} WHERE c.room_id=$1 AND (c.created_at,c.id) > (SELECT created_at,id FROM chat_messages WHERE id=$2 AND room_id=$1) ORDER BY c.created_at,c.id LIMIT 100", chat_message_select(false))).bind(id).bind(after).fetch_all(&app.db).await?
     } else {
-        sqlx::query("SELECT * FROM (SELECT c.id,c.body,c.user_id,u.username,COALESCE(p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type,c.created_at,floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms FROM chat_messages c JOIN users u ON u.id=c.user_id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE room_id=$1 ORDER BY c.created_at DESC,c.id DESC LIMIT 100) history ORDER BY created_at,id").bind(id).fetch_all(&app.db).await?
+        sqlx::query(&format!("SELECT * FROM ({} WHERE c.room_id=$1 ORDER BY c.created_at DESC,c.id DESC LIMIT 100) history ORDER BY created_at,id", chat_message_select(true))).bind(id).fetch_all(&app.db).await?
     };
-    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"body":r.get::<String,_>("body"),"user_id":r.get::<Uuid,_>("user_id"),"username":r.get::<String,_>("username"),"display_name":r.get::<String,_>("display_name"),"created_at":r.get::<i64,_>("created_at_ms"),"avatar_url":avatars::url(r.get("user_id"),r.get("avatar_version"),r.get::<Option<String>,_>("avatar_content_type").is_some()),"avatar_version":r.get::<Option<Uuid>,_>("avatar_version")})).collect())))
+    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"body":r.get::<String,_>("body"),"user_id":r.get::<Uuid,_>("user_id"),"username":r.get::<String,_>("username"),"display_name":r.get::<String,_>("display_name"),"created_at":r.get::<i64,_>("created_at_ms"),"deleted":r.get::<bool,_>("deleted"),"avatar_url":avatars::url(r.get("user_id"),r.get("avatar_version"),r.get::<Option<String>,_>("avatar_content_type").is_some()),"avatar_version":r.get::<Option<Uuid>,_>("avatar_version")})).collect())))
 }
 
 async fn persist_chat(
@@ -461,7 +800,8 @@ async fn persist_chat(
     user_id: Uuid,
     body: &str,
     client_message_id: Option<Uuid>,
-) -> std::result::Result<(Uuid, bool), &'static str> {
+    session_hash: &str,
+) -> std::result::Result<(Uuid, i64, bool, bool), &'static str> {
     let mut tx = db.begin().await.map_err(|_| "database_error")?;
     persistence::room_lifecycle::lock_active(&mut tx, room_id)
         .await
@@ -472,40 +812,94 @@ async fn persist_chat(
                 "database_error"
             }
         })?;
-    let inserted = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO chat_messages(id,room_id,user_id,body,client_message_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT (room_id,user_id,client_message_id) DO NOTHING RETURNING id",
+    // JOIN is not a permanent grant. Hold the same membership key-share used
+    // by room management until the message commit, including idempotent replay.
+    let membership = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
+    )
+    .bind(room_id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| "database_error")?;
+    if membership.is_none() {
+        return Err("not_a_member");
+    }
+    if !persistence::media_authorization::lock_login(&mut tx, user_id, session_hash)
+        .await
+        .map_err(|_| "database_error")?
+    {
+        return Err("session_expired");
+    }
+    crate::timeline_chat::check_mute(&mut tx, room_id, user_id).await?;
+    let inserted = sqlx::query(
+        "INSERT INTO chat_messages(id,room_id,user_id,body,client_message_id,body_digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (room_id,user_id,client_message_id) DO NOTHING RETURNING id,floor(extract(epoch FROM created_at)*1000)::bigint AS created_at_ms",
     )
     .bind(Uuid::new_v4())
     .bind(room_id)
     .bind(user_id)
     .bind(body)
     .bind(client_message_id)
+    .bind(hash(body))
     .fetch_optional(&mut *tx)
     .await
     .map_err(|_| "database_error")?;
-    if let Some(id) = inserted {
-        tx.commit().await.map_err(|_| "database_error")?;
-        return Ok((id, false));
-    }
-    // The unique-index conflict waits for the concurrent insertion to commit.
-    // Read in a new statement so its committed row is visible at READ COMMITTED.
-    let existing = sqlx::query(
-        "SELECT id,body FROM chat_messages WHERE room_id=$1 AND user_id=$2 AND client_message_id=$3",
-    )
-    .bind(room_id)
-    .bind(user_id)
-    .bind(client_message_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|_| "database_error")?;
-    if existing.get::<String, _>("body") != body {
-        return Err("invalid_request");
+    let result = if let Some(row) = inserted {
+        (row.get("id"), row.get("created_at_ms"), false, false)
+    } else {
+        // The unique-index conflict waits for the concurrent insertion to commit.
+        // Read in a new statement so its committed row is visible at READ COMMITTED.
+        let existing = sqlx::query(
+            "SELECT id,body,body_digest,deleted_at IS NOT NULL AS deleted,floor(extract(epoch FROM created_at)*1000)::bigint AS created_at_ms FROM chat_messages WHERE room_id=$1 AND user_id=$2 AND client_message_id=$3",
+        )
+        .bind(room_id)
+        .bind(user_id)
+        .bind(client_message_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| "database_error")?;
+        if existing
+            .get::<Option<String>, _>("body_digest")
+            .as_deref()
+            .map_or(existing.get::<String, _>("body") != body, |digest| {
+                digest != hash(body)
+            })
+        {
+            return Err("invalid_request");
+        }
+        (
+            existing.get("id"),
+            existing.get("created_at_ms"),
+            true,
+            existing.get("deleted"),
+        )
+    };
+    let live: bool = sqlx::query_scalar("SELECT playback_login_allowed($1,$2)")
+        .bind(user_id)
+        .bind(session_hash)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| "database_error")?;
+    if !live {
+        return Err("session_expired");
     }
     tx.commit().await.map_err(|_| "database_error")?;
-    Ok((existing.get("id"), true))
+    Ok(result)
 }
 
 pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: String) {
+    socket_inner(app, user, socket, session_hash, false).await
+}
+pub async fn socket_on_owner(app: App, user: User, socket: WebSocket, session_hash: String) {
+    socket_inner(app, user, socket, session_hash, true).await
+}
+async fn socket_inner(
+    app: App,
+    user: User,
+    socket: WebSocket,
+    session_hash: String,
+    peer_routed: bool,
+) {
     let (mut out, mut input) = socket.split();
     let first = tokio::time::timeout(std::time::Duration::from_secs(10), input.next()).await;
     let Ok(Some(Ok(Message::Text(text)))) = first else {
@@ -527,17 +921,75 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
         reject_socket(&mut out, "not_a_member").await;
         return;
     };
-    let Ok(handle) = handle(&app, id).await else {
-        reject_socket(&mut out, "database_error").await;
+    if let Some(cluster) = &app.control_cluster {
+        match cluster.resolve(id).await {
+            Ok(route) if route.node != cluster.node() => {
+                if peer_routed {
+                    reject_socket(&mut out, "service_unavailable").await;
+                    return;
+                }
+                control_cluster::proxy_socket(
+                    cluster.clone(),
+                    route,
+                    user.id,
+                    session_hash,
+                    text.to_string(),
+                    out,
+                    input,
+                )
+                .await;
+                return;
+            }
+            Ok(_) => (),
+            Err(_) => {
+                reject_socket(&mut out, "service_unavailable").await;
+                return;
+            }
+        }
+    }
+    let room_handle = if app.control_cluster.is_some() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle(&app, id))
+            .await
+            .unwrap_or_else(|_| {
+                Err(err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "room_owner_unavailable",
+                ))
+            })
+    } else {
+        handle(&app, id).await
+    };
+    let Ok(handle) = room_handle else {
+        reject_socket(&mut out, "service_unavailable").await;
         return;
     };
-    let mut events = handle.events.subscribe();
-    let Ok((s, owner_id, lifecycle, lifecycle_epoch, control_epoch)) =
-        owned_snapshot(&app, id, user.id).await
-    else {
-        reject_socket(&mut out, "database_error").await;
-        return;
+    let negotiated_presence =
+        v["presence_version"].as_u64() == Some(u64::from(protocol::PRESENCE_VERSION));
+    let negotiated_control_metrics = v["control_recovery_metrics_version"].as_u64()
+        == Some(u64::from(protocol::TRANSPORT_METRICS_VERSION));
+    let guest = match guests::is_guest(&app, user.id).await {
+        Ok(value) => value,
+        Err(_) => {
+            reject_socket(&mut out, "service_unavailable").await;
+            return;
+        }
     };
+    let mut control_metrics_slot = control_recovery_metrics::Slot::default();
+    let mut control_metrics_pending = tokio::task::JoinSet::new();
+    let mut events = handle.events.subscribe_with_presence(negotiated_presence);
+    let (s, owner_id, lifecycle, lifecycle_epoch, control_epoch) =
+        match owned_snapshot(&app, id, user.id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let reason = if error.1 == "not_a_member" {
+                    "not_a_member"
+                } else {
+                    "database_error"
+                };
+                reject_socket(&mut out, reason).await;
+                return;
+            }
+        };
     let mut recovery = "snapshot";
     let mut missing = Vec::<Value>::new();
     if v["type"] == "RESUME"
@@ -552,83 +1004,212 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
             missing = rows.iter().map(|r| r.get("state")).collect();
         }
     }
-    if out
-        .send(Message::Text(
-            json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"recovery":recovery,"events":missing,"control_epoch":control_epoch,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .is_err()
-    {
+    if let Err(reason) = socket_access(&app, id, user.id, &session_hash).await {
+        reject_socket(&mut out, reason).await;
         return;
     }
+    let presence_lease = if negotiated_presence {
+        match handle.presence.register(user.id, &session_hash) {
+            Ok(lease) => Some(lease),
+            Err(_) => {
+                reject_socket(&mut out, "rate_limited").await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let mut initial = json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"recovery":recovery,"events":missing,"control_epoch":control_epoch,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch});
+    // The gateway peer has the same bounded message budget as a client. A large
+    // delta must fall back to the authoritative snapshot, not reconnect forever
+    // trying to transport the same oversized recovery frame.
+    if app.control_cluster.is_some() && initial.to_string().len() > 60 * 1024 {
+        initial["recovery"] = json!("snapshot");
+        initial["events"] = json!([]);
+    }
+    if negotiated_control_metrics {
+        initial["control_recovery_metrics_version"] = json!(protocol::TRANSPORT_METRICS_VERSION);
+    }
+    if let Some(lease) = &presence_lease {
+        match handle
+            .presence
+            .for_recipient(&app, user.id, &session_hash)
+            .await
+        {
+            Ok(Some(presence)) => {
+                initial["presence_connection_id"] = json!(lease.id);
+                initial["presence"] = json!(presence);
+            }
+            Ok(None) => {
+                reject_with_presence(&mut out, "service_unavailable", presence_lease.as_ref())
+                    .await;
+                return;
+            }
+            Err(reason) => {
+                reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;
+                return;
+            }
+        }
+        if lease.deadline().is_none() {
+            reject_with_presence(&mut out, "service_unavailable", presence_lease.as_ref()).await;
+            return;
+        }
+    }
+    if !matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            out.send(Message::Text(initial.to_string().into()))
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return;
+    }
+    let deadline = presence_lease
+        .as_ref()
+        .and_then(|lease| lease.deadline())
+        .unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(3600));
+    let lease_expiry = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+    tokio::pin!(lease_expiry);
+    let mut probes = std::collections::VecDeque::<Vec<u8>>::with_capacity(3);
+    let mut owner_heartbeat = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
     let mut last_seen = Instant::now();
     let mut window = Instant::now();
     let mut count = 0;
     loop {
         let mut value = tokio::select! {
-            _=heartbeat.tick()=>{
-                if last_seen.elapsed().as_secs()>45 {break};
-                let valid=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND expires_at>now())").bind(&session_hash).fetch_one(&app.db).await;
-                match valid {
-                    Ok(true) => {},
-                    Ok(false) => {reject_socket(&mut out,"session_expired").await;break},
-                    Err(_) => {reject_socket(&mut out,"service_unavailable").await;break},
-                }
-                let _=out.send(Message::Ping(Vec::new().into())).await;continue;
+            _=owner_heartbeat.tick(), if handle.control_lease.is_some()=>{
+                if let (Some(cluster),Some(lease))=(&app.control_cluster,&handle.control_lease)
+                    && !cluster.owns(lease).await {reject_with_presence(&mut out,"service_unavailable",presence_lease.as_ref()).await;break}
+                continue;
             }
-            event=events.recv()=>match event {Ok(v)=>v,Err(broadcast::error::RecvError::Lagged(_))=>{match owned_snapshot(&app,id,user.id).await{Ok((s,owner_id,lifecycle,lifecycle_epoch,control_epoch))=>json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch,"control_epoch":control_epoch}),Err(_)=>break}},Err(_)=>break},
+            _ = control_metrics_pending.join_next(), if !control_metrics_pending.is_empty() => { continue; },
+            _ = &mut lease_expiry, if negotiated_presence => { break; },
+            _=heartbeat.tick()=>{
+                if !negotiated_presence && last_seen.elapsed().as_secs()>45 {break};
+                if let Err(reason)=socket_access(&app,id,user.id,&session_hash).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
+                let payload = if negotiated_presence {
+                    let nonce = Uuid::new_v4().as_bytes().to_vec();
+                    if probes.len() == 3 { probes.pop_front(); }
+                    probes.push_back(nonce.clone());
+                    nonce
+                } else { Vec::new() };
+                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Ping(payload.into()))).await,Ok(Ok(()))) {break};continue;
+            }
+            event=events.recv()=>match event {Ok(v)=>v,Err(delivery::Lag::Control)=>{match owned_snapshot(&app,id,user.id).await{Ok((s,owner_id,lifecycle,lifecycle_epoch,control_epoch))=>json!({"type":"SNAPSHOT","state":s,"owner_id":owner_id,"lifecycle":lifecycle,"lifecycle_epoch":lifecycle_epoch,"control_epoch":control_epoch}),Err(_)=>break}},Err(delivery::Lag::Chat | delivery::Lag::Closed)=>break},
             message=input.next()=>{
-                let Some(Ok(message))=message else{break};last_seen=Instant::now();
-                let Message::Text(text)=message else{continue};
-                if window.elapsed().as_secs()>=1{window=Instant::now();count=0} count+=1;if count>30{reject_socket(&mut out,"rate_limited").await;break}
-                let Ok(v)=serde_json::from_str::<Value>(&text)else{reject_socket(&mut out,"invalid_request").await;continue};
+                let Some(Ok(message))=message else{break};
+                if let Message::Pong(payload) = &message {
+                    last_seen=Instant::now();
+                    if let Some(lease) = &presence_lease && let Some(index) = probes.iter().position(|probe| probe.as_slice() == payload.as_ref()) {
+                            probes.remove(index);
+                            if let Err(reason) = socket_access(&app,id,user.id,&session_hash).await { reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break; }
+                            if !lease.renew() { break; }
+                            if let Some(deadline) = lease.deadline() { lease_expiry.as_mut().reset(tokio::time::Instant::from_std(deadline)); }
+                    }
+                    continue;
+                }
+                let Message::Text(text)=message else{last_seen=Instant::now();continue};
+                if window.elapsed().as_secs()>=1{window=Instant::now();count=0} count+=1;if count>30{reject_with_presence(&mut out, "rate_limited", presence_lease.as_ref()).await;break}
+                let Ok(v)=serde_json::from_str::<Value>(&text)else{last_seen=Instant::now();reject_with_presence(&mut out, "invalid_request", presence_lease.as_ref()).await;continue};
+                if v["type"] == "CONTROL_RECOVERY_METRICS" {
+                    if let Some(task) = control_metrics_slot.begin(&app,id,user.id,&session_hash,negotiated_control_metrics,&text) {
+                        control_metrics_pending.spawn(task);
+                    }
+                    continue;
+                }
+                last_seen=Instant::now();
+                if let Err(reason)=socket_access(&app,id,user.id,&session_hash).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
                 match v["type"].as_str().unwrap_or("") {
                     "CLOCK_SYNC"=>{let t2=app.now();json!({"type":"CLOCK_SYNC_REPLY","t1":v["t1"],"t2":t2,"t3":app.now(),"clock_epoch":app.epoch})},
-                    "CLIENT_STATUS"=>{app.metrics.report(&v["status"]);let _=handle.events.send(json!({"type":"CLIENT_STATUS","user_id":user.id,"status":v["status"]}));continue},
+                    "CLIENT_STATUS"=>{
+                        if let Some(status)=client_status::prepare(&app,id,v["status"].clone()).await {
+                            app.metrics.report(&status);
+                            let _=handle.events.send(json!({"type":"CLIENT_STATUS","user_id":user.id,"status":status}));
+                        }
+                        continue
+                    },
                     "CHAT"=>{
-                        let Some(body)=v["body"].as_str().filter(|b|!b.trim().is_empty()&&b.chars().count()<=2000)else{reject_socket(&mut out,"invalid_request").await;continue};
+                        let Some(body)=v["body"].as_str().filter(|b|!b.trim().is_empty()&&b.chars().count()<=2000)else{reject_with_presence(&mut out, "invalid_request", presence_lease.as_ref()).await;continue};
                         let client_message_id = match v.get("client_message_id") {
                             None | Some(Value::Null) => None,
                             Some(value) => match value.as_str().and_then(|s| Uuid::parse_str(s).ok()) {
                                 Some(key) => Some(key),
-                                None => {reject_socket(&mut out,"invalid_request").await;continue},
+                                None => {reject_with_presence(&mut out, "invalid_request", presence_lease.as_ref()).await;continue},
                             },
                         };
-                        let (cid,replayed)=match persist_chat(&app.db,id,user.id,body,client_message_id).await {
+                        let (cid,created_at,replayed,deleted)=match persist_chat(&app.db,id,user.id,body,client_message_id,&session_hash).await {
                             Ok(result)=>result,
-                            Err(reason)=>{reject_socket(&mut out,reason).await;continue},
+                            Err(reason)=>{reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;if reason=="not_a_member" {break};continue},
                         };
-                        let identity=match profile::value(&app,user.id).await{Ok(value)=>value,Err(_)=>{reject_socket(&mut out,"database_error").await;break}};
-                        let reply=json!({"type":"CHAT","id":cid,"user_id":user.id,"username":identity["username"],"display_name":identity["display_name"],"avatar_url":identity["avatar_url"],"avatar_version":identity["avatar_version"],"body":body,"client_message_id":client_message_id});
+                        let identity=match profile::value(&app,user.id).await{Ok(value)=>value,Err(_)=>{reject_with_presence(&mut out, "database_error", presence_lease.as_ref()).await;break}};
+                        let reply=json!({"type":"CHAT","id":cid,"created_at":created_at,"user_id":user.id,"username":identity["username"],"display_name":identity["display_name"],"avatar_url":identity["avatar_url"],"avatar_version":identity["avatar_version"],"body":if deleted{""}else{body},"deleted":deleted,"client_message_id":client_message_id});
                         if replayed {
+                            if let Err(reason)=socket_access(&app,id,user.id,&session_hash).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};
                             if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Text(reply.to_string().into()))).await,Ok(Ok(()))) {break}
                         } else {let _=handle.events.send(reply);}
                         continue
                     }
                     _=>{
+                        if guest { reject_with_presence(&mut out, "guest_restricted", presence_lease.as_ref()).await; continue; }
                         let command_id = v["command_id"].as_str().and_then(|s|Uuid::parse_str(s).ok());
                         let Ok(command)=serde_json::from_value::<Command>(v)else{
                             let message = socket_error("invalid_request",command_id);
                             let _ = tokio::time::timeout(std::time::Duration::from_secs(5),out.send(Message::Text(message.to_string().into()))).await;
                             continue
                         };let(tx,rx)=oneshot::channel();
-                        if handle.tx.try_send(Request{user:user.clone(),command,reply:tx}).is_err(){socket_error("room_busy",command_id)}else{match rx.await{Ok(v)=>v,Err(_)=>break}}
+                        if handle.tx.try_send(Request{user_id:user.id,session_hash:session_hash.clone(),command,reply:tx}).is_err(){socket_error("room_busy",command_id)}else{match rx.await{Ok(v)=>v,Err(_)=>break}}
                     }
                 }
             }
         };
-        if (value["action"]["type"] == "TRANSFER_OWNERSHIP"
+        if value["type"] == "PRESENCE_SNAPSHOT" {
+            // Never send a cached watch value: its subjects may have been revoked
+            // or its epoch retired while this writer was awaiting other work.
+            match handle
+                .presence
+                .for_recipient(&app, user.id, &session_hash)
+                .await
+            {
+                Ok(Some(snapshot)) => {
+                    value = json!(snapshot);
+                    value["type"] = json!("PRESENCE_SNAPSHOT");
+                }
+                Ok(None) => continue,
+                Err(reason) => {
+                    reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;
+                    break;
+                }
+            }
+        }
+        let renew_control = value["action"]["type"] == "TRANSFER_OWNERSHIP"
             || (value["action"]["type"] == "ROOM_LIFECYCLE" && value["lifecycle"] == "active")
             || matches!(
                 value["error"]["code"].as_str(),
                 Some("CONTROL_EPOCH_REQUIRED" | "CONTROL_EPOCH_EXPIRED")
-            ))
-            && let Ok(epoch) = persistence::issue_control_epoch(&app.db, id, user.id).await
+            );
+        if renew_control && !guest {
+            if let Err(reason) = socket_access(&app, id, user.id, &session_hash).await {
+                reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;
+                break;
+            }
+            if let Ok(epoch) = persistence::issue_control_epoch(&app.db, id, user.id).await {
+                value["control_epoch"] = json!(epoch);
+            }
+        }
+        // Presence has just checked recipient and subjects in one final read.
+        if value["type"] != "PRESENCE_SNAPSHOT"
+            && let Err(reason) = socket_access(&app, id, user.id, &session_hash).await
         {
-            value["control_epoch"] = json!(epoch);
+            reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;
+            break;
+        }
+        if presence_lease
+            .as_ref()
+            .is_some_and(|lease| lease.deadline().is_none())
+        {
+            break;
         }
         if !matches!(
             tokio::time::timeout(
@@ -641,6 +1222,9 @@ pub async fn socket(app: App, user: User, socket: WebSocket, session_hash: Strin
             break;
         }
     }
+    // Abort optional owned authorization work before waiting on close transport.
+    drop(control_metrics_pending);
+    drop(presence_lease);
     // Do not drop a TCP socket with unread burst frames immediately after its
     // terminal ERROR. Complete the WebSocket close handshake so the peer can
     // receive that error instead of only observing an abnormal reset.

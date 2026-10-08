@@ -1,6 +1,7 @@
 import type { Page, WebSocketRoute } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { mediaRecord, missingCover } from "./media";
+import { defaultAdminSettings } from "./admin-settings";
 export const appBase = "";
 export async function appFixture(
   page: Page,
@@ -58,6 +59,14 @@ export async function appFixture(
       url = new URL(request.url()),
       path = url.pathname.replace("/api/v1", "");
     let value: unknown = { ok: true };
+    if (path === "/admin/settings" && request.method() === "GET")
+      return route.fulfill({ json: defaultAdminSettings });
+    if (path === "/libraries/issued-shares")
+      return route.fulfill({ json: { items: [], has_more: false } });
+    if (path === "/auth/registration-policy")
+      return route.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     if (path === "/auth/me")
       return route.fulfill({
         status: authenticated ? 200 : 401,
@@ -72,7 +81,33 @@ export async function appFixture(
       authenticated = false;
     } else if (path === "/rooms")
       value = request.method() === "POST" ? { id: "room" } : [room];
-    else if (path === "/media") {
+    else if (path === "/media/browse") {
+      searches.push(url.search);
+      const node = url.searchParams.get("node");
+      const offset = url.searchParams.has("after") ? 24 : 0;
+      value = {
+        node,
+        breadcrumbs: [
+          { id: null, name: "全部片源" },
+          ...(node ? [{ id: "fixture-source", name: "测试片源" }] : []),
+        ],
+        entries: node
+          ? media
+              .slice(offset, offset + 24)
+              .map((media) => ({ type: "media", media }))
+          : [
+              {
+                type: "source",
+                id: "fixture-source",
+                name: "测试片源",
+                kind: "local",
+                media_count: media.length,
+              },
+            ],
+        total_media: media.length,
+        next_cursor: node && offset + 24 < media.length ? "fixture-next" : null,
+      };
+    } else if (path === "/media") {
       searches.push(url.search);
       const query = url.searchParams.get("search") ?? "";
       const filtered = media.filter((x) => x.title.includes(query));
@@ -128,9 +163,18 @@ export async function appFixture(
         item.personal_title ?? item.shared_title ?? item.original_title,
       );
       value = item;
-    } else if (path.startsWith("/media/")) {
+    } else if (
+      path.startsWith("/media/") ||
+      /^\/rooms\/[^/]+\/media\/[^/]+$/.test(path)
+    ) {
       const item = media.find(
-        (m) => m.id === decodeURIComponent(path.split("/")[2]),
+        (m) =>
+          m.id ===
+          decodeURIComponent(
+            path.startsWith("/media/")
+              ? path.split("/")[2]
+              : path.split("/").at(-1)!,
+          ),
       );
       if (!item)
         return route.fulfill({
@@ -138,6 +182,66 @@ export async function appFixture(
           json: { error: { code: "MEDIA_NOT_FOUND", message: "未找到影片" } },
         });
       value = item;
+    } else if (/^\/rooms\/[^/]+\/compute$/.test(path))
+      value = {
+        enabled: false,
+        p2p_enabled: false,
+        jobs: [],
+        source_probe_ready: false,
+        source_audio_tracks: [],
+      };
+    else if (path.startsWith("/platform-accounts/")) {
+      const provider = path.split("/")[2];
+      const account = { id: null, provider, revision: null, state: "revoked" };
+      value = path.endsWith("/oauth")
+        ? {
+            ...account,
+            available: false,
+            missing_prerequisites: [
+              "approved_developer_application",
+              "server_client_key",
+              "server_client_secret_file",
+              "registered_https_callback",
+              "approved_identity_scope",
+            ],
+            authorization_kind: "official_oauth",
+            playback_session: false,
+            authorization_mode: "web",
+            scopes: [],
+            access_expires_at: null,
+            refresh_expires_at: null,
+            auto_renew: false,
+            renewal_state: "disabled",
+            next_refresh_at: null,
+          }
+        : path.endsWith("/renewal")
+          ? {
+              account,
+              method: "web_cookie_refresh",
+              supported: true,
+              enabled: false,
+              state: "disabled",
+              next_refresh_at: null,
+              enable_requires: "new_consented_qr_login",
+            }
+          : provider === "bilibili"
+            ? account
+            : {
+                ...account,
+                login_method:
+                  provider === "youtube"
+                    ? "netscape_cookie_import"
+                    : "cookie_import",
+                qr_available: false,
+                verification: "none",
+                credential_expires_at: null,
+                ...(provider === "youtube"
+                  ? {
+                      account_import_available: false,
+                      availability_reason: "server_opt_in_required",
+                    }
+                  : {}),
+              };
     } else if (path.endsWith("/playlist")) value = [];
     else if (path.endsWith("/messages")) value = [];
     else if (path.endsWith("/invites"))
@@ -146,6 +250,7 @@ export async function appFixture(
       preparations++;
       value = {
         session_id: "playback",
+        plan_generation: route.request().postDataJSON().plan_generation,
         media_id: "movie",
         media_generation: 1,
         delivery_mode: "direct",
@@ -184,6 +289,7 @@ export async function appFixture(
             t1: frame.t1,
             t2: frame.t1,
             t3: frame.t1,
+            clock_epoch: state.clock_epoch,
           }),
         );
       else if (frame.type === "CHAT")
@@ -228,4 +334,14 @@ export async function appFixture(
     preparations: () => preparations,
     socket: () => socket,
   };
+}
+
+// Card-action regressions enter the real source group introduced by hierarchy.
+export async function openFixtureSource(page: Page) {
+  await page.locator(".folder-card, .media-card").first().waitFor();
+  const source = page.getByRole("button", {
+    name: "打开片源 测试片源",
+    exact: true,
+  });
+  if (await source.count()) await source.click();
 }

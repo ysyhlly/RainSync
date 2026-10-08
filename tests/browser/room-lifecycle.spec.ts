@@ -39,17 +39,14 @@ test("close requires confirmation, preserves readonly history, and explicit reop
       Object.assign(app.room, { lifecycle, lifecycle_epoch });
       app.state.playback_status = "paused";
       app.state.revision++;
-      app
-        .socket()
-        ?.send(
-          JSON.stringify({
-            type: "EVENT",
-            ...view(),
-            action: { type: "ROOM_LIFECYCLE" },
-            control_epoch:
-              lifecycle === "active" ? { id: "new-control" } : null,
-          }),
-        );
+      app.socket()?.send(
+        JSON.stringify({
+          type: "EVENT",
+          ...view(),
+          action: { type: "ROOM_LIFECYCLE" },
+          control_epoch: lifecycle === "active" ? { id: "new-control" } : null,
+        }),
+      );
       await route.fulfill({ json: view() });
     });
   }
@@ -58,8 +55,7 @@ test("close requires confirmation, preserves readonly history, and explicit reop
     "src",
     "/fixture-video.mp4",
   );
-  if (info.project.name === "mobile")
-    await page.getByRole("tab", { name: "待播" }).click();
+  await page.getByRole("button", { name: "房间管理", exact: true }).click();
   await page.getByRole("button", { name: "关闭房间", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "关闭房间" })).toBeVisible();
   expect(changes).toEqual([]);
@@ -71,7 +67,9 @@ test("close requires confirmation, preserves readonly history, and explicit reop
     fullPage: true,
   });
   await page.getByRole("button", { name: "确认关闭房间", exact: true }).click();
-  await expect(page.getByText("房间正在关闭", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("dialog", { name: "房间管理", exact: true }),
+  ).toContainText("房间正在关闭");
   await expect(page.locator("video")).not.toHaveAttribute(
     "src",
     "/fixture-video.mp4",
@@ -80,8 +78,10 @@ test("close requires confirmation, preserves readonly history, and explicit reop
     page.getByRole("button", { name: "重新开放", exact: true }),
   ).toHaveCount(0);
   const count = app.preparations();
-  if (info.project.name === "mobile")
-    await page.getByRole("tab", { name: "聊天" }).click();
+  await page
+    .getByRole("dialog", { name: "房间管理", exact: true })
+    .getByRole("button", { name: "关闭弹窗" })
+    .click();
   await expect(page.getByText("保留的聊天记录", { exact: true })).toBeVisible();
   await expect(page.getByLabel("聊天消息", { exact: true })).toBeDisabled();
   expect(app.preparations()).toBe(count);
@@ -90,8 +90,7 @@ test("close requires confirmation, preserves readonly history, and explicit reop
   app
     .socket()
     ?.send(JSON.stringify({ type: "EVENT", ...view(), control_epoch: null }));
-  if (info.project.name === "mobile")
-    await page.getByRole("tab", { name: "待播" }).click();
+  await page.getByRole("button", { name: "房间管理", exact: true }).click();
   await expect(
     page.getByRole("button", { name: "重新开放", exact: true }),
   ).toBeVisible();
@@ -99,7 +98,9 @@ test("close requires confirmation, preserves readonly history, and explicit reop
   await page
     .getByRole("button", { name: "确认重新开放房间", exact: true })
     .click();
-  await expect(page.getByText("房间开放中", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("dialog", { name: "房间管理", exact: true }),
+  ).toContainText("房间开放中");
   expect(app.state.playback_status).toBe("paused");
   expect(changes).toEqual(["close", "reopen"]);
   expect(app.commands.filter((command) => command.type === "PLAY")).toEqual([]);

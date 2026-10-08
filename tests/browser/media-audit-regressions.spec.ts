@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { appFixture } from "./fixtures/application";
+import { appFixture, openFixtureSource } from "./fixtures/application";
 
 test("queue thumbnail image retry is reachable inside its compact bounds", async ({
   page,
@@ -24,16 +24,25 @@ test("queue thumbnail image retry is reachable inside its compact bounds", async
     return route.abort("failed");
   });
   await page.goto("/rooms/room");
-  if (isMobile)
-    await page.getByRole("tab", { name: "待播", exact: true }).click();
+  await expect(page.locator("#room-queue")).toBeVisible();
   const thumbnail = page.locator(".queue-row .media-thumbnail");
   const retry = thumbnail.getByRole("button", {
     name: "重新加载封面",
     exact: true,
   });
   await expect(retry).toBeVisible();
-  const outer = await thumbnail.boundingBox(),
-    inner = await retry.boundingBox();
+  // Compare the two rectangles in one browser task. Room/video startup can
+  // move the entire queue between separate awaited locator measurements.
+  const { outer, inner } = await thumbnail.evaluate((element) => {
+    const button = element.querySelector('button[aria-label="重新加载封面"]');
+    if (!(button instanceof HTMLButtonElement))
+      return { outer: null, inner: null };
+    const bounds = (node: Element) => {
+      const { x, y, width, height } = node.getBoundingClientRect();
+      return { x, y, width, height };
+    };
+    return { outer: bounds(element), inner: bounds(button) };
+  });
   expect(outer).not.toBeNull();
   expect(inner).not.toBeNull();
   expect(inner!.height).toBeGreaterThanOrEqual(44);
@@ -54,6 +63,7 @@ for (const scope of ["personal", "shared"] as const) {
   }) => {
     const app = await appFixture(page);
     await page.goto("/library");
+    await openFixtureSource(page);
     await page
       .getByRole("button", { name: "重命名 真实合成测试视频", exact: true })
       .click();
@@ -96,6 +106,7 @@ for (const scope of ["personal", "shared"] as const) {
       title: "opened title",
     });
     await page.goto("/library");
+    await openFixtureSource(page);
     await page
       .getByRole("button", { name: "重命名 opened title", exact: true })
       .click();
@@ -176,6 +187,7 @@ for (const recovery of ["focus", "manual"] as const) {
       });
     });
     await page.goto("/library");
+    await openFixtureSource(page);
     const card = page.locator(".media-card").first();
     await expect.poll(() => images).toBe(1);
     await expect(card.locator("img")).toHaveCount(0);
@@ -191,7 +203,9 @@ for (const recovery of ["focus", "manual"] as const) {
           .getByRole("button", { name: "重新加载封面", exact: true })
           .click();
       else {
-        const response = page.waitForResponse((r) => /\/media\?/.test(r.url()));
+        const response = page.waitForResponse((r) =>
+          /\/media\/browse\?/.test(r.url()),
+        );
         await page.evaluate(() => window.dispatchEvent(new Event("focus")));
         await response;
       }

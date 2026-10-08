@@ -1,0 +1,1439 @@
+/* Personal room layouts only. Geometry belongs to the model and canvas. */
+.workspace.watch-layout:has(.room-modular-page) {
+  position: relative;
+  display: block;
+}
+.room-modular-page {
+  --room-panel: var(--surface-panel);
+  --room-line: var(--border-subtle);
+  --room-muted: color-mix(in srgb, var(--accent-soft) 30%, transparent);
+  --room-radius: var(--radius-widget);
+  display: block;
+  min-width: 0;
+  padding-bottom: 24px;
+}
+.room-modular-page > .notice,
+.workspace.watch-layout:has(.room-modular-page) > .global-notice {
+  position: relative;
+  z-index: 7;
+  margin-bottom: 16px;
+}
+.room-permanent-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.room-permanent-actions :is(button, .button) {
+  background: transparent;
+  border-color: var(--room-line);
+}
+/* Editor controls stay separate from the quiet viewing canvas. */
+.room-layout-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  margin-bottom: 18px;
+  min-width: 0;
+}
+.room-layout-toolbar__intro {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+.room-layout-toolbar__intro :is(h2, strong) {
+  font-size: 15px;
+  font-weight: 650;
+}
+.room-layout-toolbar__intro p,
+.room-layout-toolbar__status {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.room-layout-toolbar__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.room-layout-toolbar__actions button {
+  min-height: 40px;
+  padding: 8px 12px;
+  border-color: var(--room-line);
+  font-size: 13px;
+}
+.room-layout-toolbar__actions .primary {
+  border-color: var(--border-control);
+}
+.room-layout-toolbar__status {
+  flex: 1 0 100%;
+}
+.room-layout-toolbar__status:empty {
+  display: none;
+}
+.room-layout-canvas {
+  position: relative;
+  min-width: 0;
+  /* No stacking context here: the stable player is a sibling in the app shell. */
+}
+.room-layout-canvas--editing {
+  border-radius: var(--room-radius);
+  outline: 1px dashed var(--border-subtle);
+  outline-offset: 8px;
+  background-image: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--border-control) 25%, transparent) 1px,
+    transparent 1px
+  );
+  background-size: var(--room-layout-column-step, 48px)
+    calc(var(--room-layout-row-step, 8px) * 2);
+}
+.room-widget {
+  position: absolute;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--room-line);
+  border-radius: var(--room-radius);
+  background: var(--room-panel);
+  box-shadow: 0 2px 7px rgb(48 36 31 / 0.025);
+  container: room-widget / inline-size;
+  /* Body scrolls; menus and editor controls can extend outside the tile. */
+  overflow: visible;
+}
+.room-widget__header {
+  position: relative;
+  z-index: 4;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 49px;
+  margin: 0 16px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--room-line);
+}
+.room-widget__title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.4;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+.room-widget__title svg {
+  width: 18px;
+  height: 18px;
+  color: var(--text-secondary);
+}
+.room-widget__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  min-width: 0;
+}
+.room-widget__body {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  padding: 16px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-subtle) transparent;
+  border-radius: 0 0 var(--room-radius) var(--room-radius);
+  overflow-wrap: anywhere;
+}
+.room-widget__body > .panel,
+.room-widget__body > div > .panel {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.room-widget:is(
+  [data-widget-type="room-info"],
+  [data-widget-type="media-info"],
+  [data-widget-type="player"]
+) {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+.room-widget:is([data-widget-type="room-info"], [data-widget-type="media-info"])
+  > .room-widget__body {
+  padding: 4px 8px;
+  border-radius: var(--room-radius);
+}
+.room-widget[data-widget-type="player"] {
+  pointer-events: none;
+}
+.room-widget[data-widget-type="player"] > .room-widget__body {
+  padding: 0;
+  overflow: visible;
+  border-radius: var(--room-radius);
+}
+.room-player-anchor {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  border-radius: var(--room-radius);
+}
+/* The video element is rendered once and moved to this anchor by the app shell. */
+.playback-host.modular-player:not(:fullscreen) {
+  position: absolute;
+  z-index: 2;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  container: room-player / inline-size;
+}
+.playback-host.modular-player:not(:fullscreen) .video-frame {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  aspect-ratio: auto;
+  border-radius: 12px;
+}
+.playback-host.modular-player:not(:fullscreen) video {
+  object-fit: contain;
+}
+.playback-host.modular-player.layout-editing:not(:fullscreen) {
+  pointer-events: none;
+}
+.room-layout-canvas--editing .room-widget {
+  border-color: var(--border-subtle);
+  outline: 1px dashed color-mix(in srgb, var(--border-control) 52%, transparent);
+  outline-offset: -1px;
+}
+.room-layout-canvas--editing .room-widget[data-widget-type="player"] {
+  z-index: 4;
+}
+.room-layout-canvas--editing
+  .room-widget:is(
+    [data-widget-type="player"],
+    [data-widget-type="room-info"],
+    [data-widget-type="media-info"]
+  )
+  > .room-widget__header {
+  position: absolute;
+  inset: 0 0 auto;
+  margin: 0;
+  min-height: 44px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px 10px 0 0;
+  background: var(--room-panel);
+  box-shadow: 0 3px 10px rgb(48 36 31 / 0.08);
+}
+.room-widget--selected {
+  z-index: 5;
+}
+.room-layout-canvas--editing .room-widget--selected,
+.room-layout-canvas--editing .room-widget:focus-within {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+.room-widget:has(.room-widget__position-tools:focus-within) {
+  z-index: 6;
+}
+.room-widget--dragging {
+  z-index: 6;
+  box-shadow: 0 12px 28px rgb(48 36 31 / 0.12);
+}
+.room-widget__drag-handle,
+.room-widget__actions button {
+  flex-shrink: 0;
+  min-width: 36px;
+  min-height: 36px;
+  padding: 7px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+}
+.room-widget__drag-handle {
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+.room-widget__drag-handle:active {
+  cursor: grabbing;
+}
+.room-widget__resize-handle {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 36px;
+  min-height: 36px;
+  padding: 5px;
+  border: 1px solid var(--border-control);
+  border-radius: 9px 0 11px 0;
+  color: var(--text-secondary);
+  background: var(--surface-panel);
+  cursor: nwse-resize;
+  touch-action: none;
+  user-select: none;
+}
+.room-widget[data-widget-type="player"]
+  :is(
+    .room-widget__header,
+    .room-widget__resize-handle,
+    .room-widget__position-tools
+  ) {
+  pointer-events: auto;
+}
+.room-layout-preview {
+  position: absolute;
+  z-index: 3;
+  border: 2px dashed var(--focus-ring);
+  border-radius: var(--room-radius);
+  background: color-mix(in srgb, var(--accent-soft) 55%, transparent);
+  pointer-events: none;
+}
+.room-layout-preview--invalid {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+}
+.room-widget__position-tools {
+  position: absolute;
+  z-index: 6;
+  inset: 48px 8px auto;
+  display: grid;
+  gap: 12px;
+  max-height: min(440px, 65dvh);
+  padding: 14px;
+  border: 1px solid var(--border-control);
+  border-radius: 10px;
+  color: var(--text-primary);
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-floating);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.room-widget__position-tools p {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.room-widget__position-tools :is(.button-row, [role="group"]) {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.room-widget__position-tools button {
+  min-width: 36px;
+  min-height: 36px;
+  padding: 7px 10px;
+  font-size: 12px;
+}
+.room-widget__position-form {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+.room-widget__position-form label {
+  gap: 4px;
+  font-size: 12px;
+}
+.room-widget__position-form input {
+  min-height: 36px;
+  padding: 6px 8px;
+  font-variant-numeric: tabular-nums;
+}
+.room-widget__position-form > :is(button, p) {
+  grid-column: 1 / -1;
+}
+/* Existing business components keep their data, state and action handlers. */
+.room-information-widget {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  min-width: 0;
+  min-height: 100%;
+}
+.room-information-widget h1 {
+  font-size: clamp(23px, 3cqi, 30px);
+  letter-spacing: -0.5px;
+}
+.room-information-widget p,
+.room-media-widget p {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+.room-media-widget {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+.room-media-widget h2 {
+  font-size: clamp(19px, 2.5cqi, 25px);
+  line-height: 1.4;
+}
+.room-media-widget .button-row {
+  gap: 8px;
+}
+.room-media-widget .button-row :is(button, .button) {
+  min-height: 36px;
+  padding: 7px 11px;
+  font-size: 12px;
+  border-color: var(--room-line);
+}
+.room-widget[data-widget-type="chat"] > .room-widget__body {
+  display: flex;
+  flex-direction: column;
+  padding-top: 8px;
+  overflow: auto;
+}
+.room-chat-widget,
+.room-chat-widget .chat-panel {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.room-chat-widget .chat-panel {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.room-chat-widget .chat-panel > header {
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+/* The frame supplies the heading, while the real connection status stays visible. */
+.room-chat-widget .chat-panel > header h2 {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.room-chat-widget .chat-log {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 80px;
+  padding-right: 4px;
+}
+.room-chat-widget .chat-message {
+  gap: 10px;
+  margin: 18px 0;
+}
+.room-chat-widget .chat-message p {
+  line-height: 1.65;
+}
+.room-chat-widget .chat-form {
+  flex: 0 0 auto;
+  gap: 4px;
+  margin-top: 10px;
+  padding: 4px;
+  border: 1px solid var(--room-line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-canvas) 40%, transparent);
+}
+.room-chat-widget .chat-form input {
+  min-width: 0;
+  padding: 8px;
+  border: 0;
+  background: transparent;
+  font-size: 14px;
+}
+.room-chat-widget .chat-form button {
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+}
+.room-chat-widget .chat-form :focus-visible {
+  outline-offset: 0;
+}
+.room-chat-widget .empty-chat {
+  display: grid;
+  place-items: center;
+  min-height: 140px;
+  height: 100%;
+  font-size: 13px;
+}
+.room-chat-widget .new-messages {
+  flex-shrink: 0;
+  min-height: 36px;
+  font-size: 12px;
+}
+.room-queue-widget {
+  min-width: 0;
+}
+.room-queue-widget .queue-add-actions {
+  gap: 8px;
+  margin: 0 0 12px;
+}
+.room-queue-widget .queue-add-actions :is(button, .button) {
+  min-height: 36px;
+  padding: 7px 11px;
+  border-color: var(--room-line);
+  font-size: 12px;
+}
+.room-queue-widget .queue-row {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr) auto auto;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 0;
+  border-color: var(--room-line);
+}
+.room-queue-widget .queue-row .media-thumbnail {
+  width: 100%;
+  border-radius: 7px;
+}
+.room-queue-widget .queue-row h3 {
+  font-size: 14px;
+  line-height: 1.45;
+}
+.room-queue-widget .queue-row > .icon-button {
+  min-width: 36px;
+  min-height: 36px;
+  padding: 7px;
+  background: transparent;
+  border-color: transparent;
+}
+.room-members-widget .presence-panel {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 13px;
+}
+.room-members-widget .presence-panel p {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.room-members-widget .presence-panel li {
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--room-line);
+}
+.room-members-widget .presence-panel li > span:last-child {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+/* Catalog previews describe component types, never invented room activity. */
+.room-widget-catalog {
+  min-width: 0;
+}
+.room-widget-catalog__intro {
+  color: var(--text-secondary);
+  font-size: 13px;
+  margin-bottom: 16px;
+}
+.room-widget-catalog__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr));
+  gap: 12px;
+}
+.room-widget-catalog__item {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  background: var(--surface-panel);
+  text-align: left;
+}
+.room-widget-catalog__preview {
+  display: grid;
+  place-items: center;
+  min-height: 70px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--accent-soft) 42%, transparent);
+}
+.room-widget-catalog__copy {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+.room-widget-catalog__copy strong {
+  font-size: 14px;
+}
+.room-widget-catalog__copy :is(p, small) {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  font-weight: 400;
+}
+/* Tile-width queries also adapt a small widget on a large desktop screen. */
+@container room-widget (max-width: 440px) {
+  .room-widget__header {
+    margin-inline: 12px;
+  }
+  .room-widget__body {
+    padding: 12px;
+  }
+  .room-widget__position-form {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .room-queue-widget .queue-row {
+    grid-template-columns: 68px minmax(0, 1fr) auto;
+    gap: 8px;
+  }
+  .room-queue-widget .queue-row > .icon-button:last-child {
+    grid-column: 3;
+  }
+  .room-queue-widget .queue-row > :is(h3, .media-thumbnail) {
+    grid-row: span 2;
+  }
+  .room-information-widget {
+    align-items: flex-start;
+    flex-direction: column;
+    justify-content: center;
+    gap: 5px;
+  }
+  .room-information-widget h1 {
+    font-size: 23px;
+  }
+}
+@container room-widget (max-width: 280px) {
+  .room-widget__title {
+    font-size: 13px;
+  }
+  .room-widget__title svg {
+    display: none;
+  }
+  .room-widget__header {
+    gap: 4px;
+    margin-inline: 8px;
+  }
+  .room-widget__body {
+    padding: 10px;
+  }
+  .room-widget__actions button,
+  .room-widget__drag-handle {
+    padding: 5px;
+  }
+  .room-queue-widget .queue-add-actions > * {
+    flex: 1 1 100%;
+  }
+  .room-chat-widget .chat-message {
+    gap: 7px;
+  }
+  .room-chat-widget .chat-message time {
+    display: block;
+    margin-left: 0;
+  }
+}
+@container room-player (max-width: 540px) {
+  .playback-host.modular-player:not(:fullscreen) .player-chrome {
+    padding: 0 5px 3px;
+  }
+  .playback-host.modular-player:not(:fullscreen) .playback-controls {
+    column-gap: 0;
+  }
+  .playback-host.modular-player:not(:fullscreen) .playback-time {
+    flex: 1 1 0;
+    min-width: 0;
+    font-size: 11px;
+    white-space: normal;
+    line-height: 1.3;
+  }
+  .playback-host.modular-player:not(:fullscreen) .rate-control {
+    flex-basis: 58px;
+    width: 58px;
+  }
+}
+.room-layout-canvas--narrow {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.room-layout-canvas--narrow .room-widget {
+  position: relative;
+  width: 100%;
+  flex: 0 0 auto;
+}
+.room-layout-canvas--narrow .room-widget[data-widget-type="chat"] {
+  min-height: 400px;
+}
+.room-layout-canvas--narrow
+  .room-widget[data-widget-type="player"]
+  .room-player-anchor {
+  aspect-ratio: 16 / 9;
+}
+.room-layout-canvas--narrow .room-widget__position-tools {
+  max-height: 55dvh;
+}
+.room-modular-page
+  :is(button, a, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 3px;
+}
+@media (max-width: 767px) {
+  .room-layout-toolbar {
+    align-items: flex-start;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .room-layout-toolbar__intro {
+    flex-basis: 100%;
+  }
+  .room-layout-toolbar__actions {
+    justify-content: flex-start;
+  }
+  .room-layout-toolbar__actions button {
+    min-height: 44px;
+  }
+  .room-permanent-actions {
+    justify-content: flex-start;
+  }
+  .room-widget__resize-handle {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .room-modular-page *,
+  .playback-host.modular-player {
+    scroll-behavior: auto !important;
+  }
+  .room-widget,
+  .room-layout-preview,
+  .room-widget__resize-handle,
+  .room-widget__drag-handle {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+@media (forced-colors: active) {
+  .room-widget,
+  .room-widget__position-tools,
+  .room-widget-catalog__item {
+    border-color: CanvasText;
+  }
+  .room-layout-canvas--editing .room-widget,
+  .room-layout-preview {
+    outline-color: Highlight;
+  }
+}
+
+/* The approved room composition has a light, horizontal desktop navigation. */
+@media (min-width: 768px) {
+  .room-layout-active .sidebar {
+    position: relative;
+    inset: auto;
+    width: 100%;
+    min-height: 68px;
+    flex-direction: row;
+    align-items: center;
+    gap: 24px;
+    padding: 0 32px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-subtle);
+    background: color-mix(in srgb, var(--surface-panel) 50%, transparent);
+  }
+  .room-layout-active .sidebar > .brand {
+    padding: 0 24px 0 0;
+    border-right: 1px solid var(--border-subtle);
+  }
+  .room-layout-active .sidebar nav {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+  }
+  .room-layout-active .sidebar nav a {
+    min-height: 68px;
+    gap: 6px;
+    padding: 12px 6px;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+  }
+  .room-layout-active .sidebar nav a > svg {
+    display: none;
+  }
+  .room-layout-active .sidebar nav a[aria-current="page"] {
+    border-bottom-color: var(--border-control);
+    color: var(--text-secondary);
+  }
+  .room-layout-active .sidebar .navigation-indicator {
+    display: none;
+  }
+  .room-layout-active .sidebar-account {
+    flex-wrap: nowrap;
+    gap: 12px;
+    margin: 0 0 0 auto;
+    padding: 0;
+    border: 0;
+  }
+  .room-layout-active .sidebar-account .profile-link {
+    gap: 8px;
+  }
+  .room-layout-active .sidebar-account .profile-link small {
+    display: none;
+  }
+  .room-layout-active .sidebar-account > button {
+    border-color: transparent;
+    background: transparent;
+  }
+  .room-layout-active.authenticated .workspace {
+    max-width: 1760px;
+    margin: 0 auto;
+    padding: 26px 32px 48px;
+  }
+}
+.room-permanent-status {
+  margin-right: auto;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.room-permanent-actions .button-row {
+  gap: 8px;
+}
+.room-permanent-actions :is(button, .button) {
+  min-height: 38px;
+  padding: 7px 11px;
+  font-size: 13px;
+}
+.room-layout-toolbar__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 14px;
+  font-weight: 650;
+}
+.room-layout-toolbar__status.error {
+  color: var(--danger);
+}
+.room-layout-help {
+  margin: 0 0 18px;
+}
+.room-widget__step-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.room-layout-preview {
+  z-index: 7;
+}
+.room-presence-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+.room-avatar-stack {
+  display: inline-flex;
+  flex: 0 0 auto;
+  padding-left: 5px;
+}
+.room-avatar-stack .user-avatar {
+  margin-left: -5px;
+  border: 2px solid var(--surface-canvas);
+}
+.room-media-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+}
+.room-media-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+.room-media-status::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.queue-widget-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.queue-widget-heading .button-row {
+  gap: 6px;
+}
+.queue-widget-heading :is(button, .button) {
+  min-height: 34px;
+  padding: 6px 9px;
+  font-size: 12px;
+  border-color: var(--room-line);
+}
+.room-members-widget .presence-panel--compact ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 18px;
+  margin: 12px 0;
+}
+.room-members-widget .presence-panel--compact li {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: 5px;
+  min-width: 48px;
+  max-width: 84px;
+  padding: 0;
+  border: 0;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+.room-members-widget .presence-panel--compact li > span:last-child {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+.room-members-widget .presence-caveat {
+  padding-top: 8px;
+  border-top: 1px solid var(--room-line);
+}
+.playback-host.modular-player.empty-room:not(:fullscreen) .video-frame {
+  padding: 0;
+}
+.playback-host.modular-player.empty-room:not(:fullscreen) .player-empty {
+  position: absolute;
+  inset: 0;
+  padding: 20px;
+  gap: 12px;
+  text-align: center;
+}
+.playback-host.modular-player:not(:fullscreen) > .subtitle-error {
+  position: absolute;
+  z-index: 4;
+  right: 12px;
+  bottom: 12px;
+  left: 12px;
+  max-height: 45%;
+  overflow: auto;
+  margin: 0;
+}
+.room-widget-catalog__item > button {
+  margin-top: auto;
+}
+@container room-widget (max-width: 440px) {
+  .room-presence-summary {
+    gap: 7px;
+    font-size: 12px;
+  }
+  .queue-widget-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+@media (max-width: 767px) {
+  .room-permanent-status {
+    flex-basis: 100%;
+  }
+  .room-permanent-actions :is(button, .button) {
+    min-height: 44px;
+  }
+}
+
+.room-layout-preview > span {
+  display: inline-block;
+  max-width: calc(100% - 16px);
+  margin: 8px;
+  padding: 5px 8px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+.room-layout-preview--invalid > span {
+  color: var(--danger);
+}
+
+/* Room actions and Edit share one quiet row when the layout is locked. */
+.room-command-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px 18px;
+  margin-bottom: 18px;
+}
+.room-command-bar > .room-permanent-actions {
+  flex: 1 1 580px;
+  margin-bottom: 0;
+}
+.room-command-bar > .room-layout-toolbar {
+  margin-bottom: 0;
+}
+.room-command-bar:not(.room-command-bar--editing) > .room-layout-toolbar {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+.room-command-bar:not(.room-command-bar--editing) .room-layout-toolbar__intro {
+  display: none;
+}
+.room-command-bar--editing > .room-layout-toolbar {
+  flex: 1 0 100%;
+  padding-top: 12px;
+  border-top: 1px solid var(--room-line);
+}
+.room-layout-feedback:not(:empty) {
+  position: sticky;
+  z-index: 8;
+  bottom: calc(var(--bottom-nav-height) + 12px + env(safe-area-inset-bottom));
+  width: fit-content;
+  max-width: 100%;
+  margin: 12px auto 0;
+  padding: 8px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  box-shadow: 0 3px 12px rgb(48 36 31 / 0.08);
+}
+.room-layout-feedback:empty {
+  display: none;
+}
+@media (max-width: 767px) {
+  .room-command-bar {
+    gap: 10px;
+  }
+  .room-command-bar:not(.room-command-bar--editing) > .room-layout-toolbar {
+    margin-left: 0;
+  }
+}
+
+/* Every route consumes the shared cream palette. Keep room geometry local. */
+.room-layout-active {
+  background: var(--surface-canvas);
+}
+
+/* Short information rows must remain readable underneath editing controls. */
+.room-layout-canvas--editing:not(.room-layout-canvas--narrow)
+  .room-widget:is(
+    [data-widget-type="room-info"],
+    [data-widget-type="media-info"]
+  )
+  > .room-widget__header {
+  inset: 0;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: var(--room-radius);
+  background: transparent;
+  box-shadow: none;
+  pointer-events: none;
+}
+.room-layout-canvas--editing:not(.room-layout-canvas--narrow)
+  .room-widget:is(
+    [data-widget-type="room-info"],
+    [data-widget-type="media-info"]
+  )
+  > .room-widget__header
+  .room-widget__title {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.room-layout-canvas--editing:not(.room-layout-canvas--narrow)
+  .room-widget:is(
+    [data-widget-type="room-info"],
+    [data-widget-type="media-info"]
+  )
+  > .room-widget__header
+  :is(button, .room-widget__actions) {
+  pointer-events: auto;
+}
+.room-layout-canvas--editing:not(.room-layout-canvas--narrow)
+  .room-widget:is(
+    [data-widget-type="room-info"],
+    [data-widget-type="media-info"]
+  )
+  > .room-widget__body {
+  padding-inline: 48px 88px;
+}
+.room-layout-canvas--editing.room-layout-canvas--narrow
+  .room-widget:is(
+    [data-widget-type="room-info"],
+    [data-widget-type="media-info"]
+  )
+  > .room-widget__header {
+  position: relative;
+  inset: auto;
+  flex: 0 0 auto;
+  border: 0;
+  border-bottom: 1px solid var(--room-line);
+  box-shadow: none;
+}
+.room-layout-canvas--editing.room-layout-canvas--narrow
+  .room-widget:is(
+    [data-widget-type="room-info"],
+    [data-widget-type="media-info"]
+  )
+  > .room-widget__body {
+  flex: 0 0 auto;
+  overflow: visible;
+  padding: 12px 12px 16px;
+}
+.room-layout-canvas--editing.room-layout-canvas--narrow
+  .room-widget[data-widget-type="player"] {
+  margin-top: 48px;
+}
+.room-layout-canvas--editing.room-layout-canvas--narrow
+  .room-widget[data-widget-type="player"]
+  > .room-widget__header {
+  top: -48px;
+  bottom: auto;
+  min-height: 46px;
+  border-radius: 10px 10px 0 0;
+}
+.room-modular-page
+  :is(button, a, input, select, textarea, summary, [tabindex]) {
+  scroll-margin-top: 20px;
+  scroll-margin-bottom: calc(
+    var(--bottom-nav-height) + 80px + env(safe-area-inset-bottom)
+  );
+}
+.room-widget {
+  scroll-margin-block: 24px
+    calc(var(--bottom-nav-height) + 88px + env(safe-area-inset-bottom));
+}
+
+/* Short rows put all edit actions beside one another, never over one another. */
+.room-layout-canvas--editing:not(.room-layout-canvas--narrow)
+  .room-widget:is(
+    [data-widget-type="room-info"],
+    [data-widget-type="media-info"]
+  )
+  .room-widget__actions {
+  padding-right: 44px;
+}
+.room-layout-canvas--editing:not(.room-layout-canvas--narrow)
+  .room-widget:is(
+    [data-widget-type="room-info"],
+    [data-widget-type="media-info"]
+  )
+  > .room-widget__resize-handle {
+  top: 50%;
+  right: 6px;
+  bottom: auto;
+  transform: translateY(-50%);
+  border: 0;
+  border-radius: 7px;
+  background: var(--surface-panel);
+}
+.room-layout-canvas--editing:not(.room-layout-canvas--narrow)
+  .room-widget:is(
+    [data-widget-type="room-info"],
+    [data-widget-type="media-info"]
+  )
+  > .room-widget__body {
+  padding-right: 132px;
+}
+
+/* Decorative borders must not subtract pixels from the exact-ratio screen. */
+.room-widget[data-widget-type="player"] {
+  border-width: 0;
+}
+.playback-host.modular-player:not(:fullscreen) .video-frame {
+  border: 0;
+  box-shadow: 0 0 0 1px var(--border-subtle);
+}
+
+/* A populated default queue shows one usable next item, not a clipped strip. */
+.room-layout-canvas:not(.room-layout-canvas--narrow):not(
+    .room-layout-canvas--editing
+  )
+  .room-widget[data-widget-type="queue"]
+  > .room-widget__header {
+  min-height: 38px;
+  padding-block: 6px;
+}
+.room-layout-canvas:not(.room-layout-canvas--narrow):not(
+    .room-layout-canvas--editing
+  )
+  .room-widget[data-widget-type="queue"]
+  > .room-widget__body {
+  padding: 8px 12px;
+}
+@container room-widget (min-width: 460px) {
+  .room-layout-canvas:not(.room-layout-canvas--narrow):not(
+      .room-layout-canvas--editing
+    )
+    .room-queue-widget:has(.queue-row) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 12px;
+    align-items: start;
+  }
+  .room-layout-canvas:not(.room-layout-canvas--narrow):not(
+      .room-layout-canvas--editing
+    )
+    .room-queue-widget:has(.queue-row)
+    .queue-widget-heading {
+    grid-column: 2;
+    grid-row: 1;
+    align-items: flex-end;
+    flex-direction: column;
+    gap: 4px;
+    margin: 0;
+  }
+  .room-layout-canvas:not(.room-layout-canvas--narrow):not(
+      .room-layout-canvas--editing
+    )
+    .room-queue-widget:has(.queue-row)
+    .queue-widget-heading
+    > .helper {
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .room-layout-canvas:not(.room-layout-canvas--narrow):not(
+      .room-layout-canvas--editing
+    )
+    .room-queue-widget:has(.queue-row)
+    .queue-widget-list {
+    grid-column: 1;
+    grid-row: 1;
+    min-width: 0;
+  }
+  .room-layout-canvas:not(.room-layout-canvas--narrow):not(
+      .room-layout-canvas--editing
+    )
+    .room-queue-widget:has(.queue-row)
+    .queue-row {
+    grid-template-columns: 64px minmax(0, 1fr) auto auto;
+    gap: 8px;
+    padding-block: 4px;
+  }
+  .room-layout-canvas:not(.room-layout-canvas--narrow):not(
+      .room-layout-canvas--editing
+    )
+    .room-queue-widget:has(.queue-row)
+    .queue-row:first-child {
+    border-top: 0;
+  }
+}
+
+/* Grid rows may round up; the inner media anchor must keep its own ratio. */
+.room-widget[data-widget-type="player"] > .room-widget__body {
+  display: flex;
+  align-items: center;
+}
+.room-player-anchor {
+  flex: 0 0 auto;
+  height: auto;
+  aspect-ratio: 16 / 9;
+}
+
+/* Keep the existing 44px failed-cover retry target and its thumbnail bounds. */
+@container room-widget (min-width: 460px) {
+  .room-layout-canvas:not(.room-layout-canvas--narrow):not(
+      .room-layout-canvas--editing
+    )
+    .room-queue-widget:has(.queue-row)
+    .queue-row:has(.media-thumbnail.image-failed) {
+    grid-template-columns: 84px minmax(0, 1fr) auto auto;
+  }
+}
+@container room-widget (max-width: 440px) {
+  .room-queue-widget .queue-row:has(.media-thumbnail.image-failed) {
+    grid-template-columns: 84px minmax(0, 1fr) auto;
+  }
+}
+
+/* Viewing modes are a temporary presentation of the same mounted widgets. */
+.room-viewing-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  min-width: 0;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--room-line);
+}
+.room-viewing-toolbar__title {
+  display: flex;
+  align-items: baseline;
+  flex: 1 1 180px;
+  gap: 10px;
+  min-width: 0;
+  font-size: 13px;
+}
+.room-viewing-toolbar__title strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.room-viewing-toolbar__title span {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.room-viewing-toolbar__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.room-viewing-toolbar button {
+  min-height: 38px;
+  padding: 7px 11px;
+  border-color: var(--room-line);
+  background: var(--surface-panel);
+  font-size: 13px;
+}
+.room-viewing-toolbar button[aria-pressed="true"] {
+  border-color: var(--border-control);
+  background: var(--accent-soft);
+}
+/* No imperative body styles/classes to leak after a route change. */
+html:has(.room-viewing-expanded),
+body:has(.room-viewing-expanded) {
+  overflow: hidden;
+}
+.app-layout:has(.room-viewing-expanded)
+  > :is(.sidebar, .mobile-header, .bottom-nav, .skip-link) {
+  display: none;
+}
+.app-layout.room-layout-active.authenticated
+  .workspace.watch-layout:has(.room-viewing-expanded) {
+  position: fixed;
+  z-index: 30;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  width: 100%;
+  max-width: none;
+  height: 100dvh;
+  margin: 0;
+  padding: 14px 18px;
+  overflow: hidden;
+  background: var(--surface-canvas);
+}
+.room-viewing-expanded {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  width: 100%;
+  min-height: 0;
+  padding: 0;
+}
+.room-viewing-expanded > .room-viewing-toolbar {
+  position: relative;
+  z-index: 4;
+  flex: 0 0 auto;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+}
+.room-viewing-expanded > .notice,
+.workspace:has(.room-viewing-expanded) > .global-notice {
+  flex: 0 1 auto;
+  max-height: 25dvh;
+  overflow: auto;
+}
+.room-viewing-expanded > .room-pending-selection {
+  display: none;
+}
+.room-viewing-expanded > .room-layout-workspace {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+.room-viewing-expanded .room-layout-canvas {
+  display: grid;
+  flex: 1 1 0;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  gap: 16px;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+}
+.room-viewing-expanded.room-viewing-with-chat .room-layout-canvas {
+  grid-template-columns: minmax(0, 1fr) clamp(300px, 25vw, 400px);
+}
+.room-viewing-expanded .room-widget {
+  position: relative;
+  width: auto;
+  height: 100%;
+  min-height: 0;
+}
+.room-viewing-expanded .room-widget[data-widget-type="player"] {
+  grid-column: 1;
+  grid-row: 1;
+}
+.room-viewing-expanded .room-widget[data-widget-type="chat"] {
+  grid-column: 2;
+  grid-row: 1;
+}
+.room-viewing-expanded
+  .room-widget[data-widget-type="player"]
+  > .room-widget__body {
+  container: viewing-player / size;
+  justify-content: center;
+}
+.room-viewing-expanded .room-player-anchor {
+  width: min(100cqw, calc(100cqh * 16 / 9));
+  height: auto;
+  aspect-ratio: 16 / 9;
+}
+@media (max-width: 767px) {
+  .app-layout.room-layout-active.authenticated
+    .workspace.watch-layout:has(.room-viewing-expanded) {
+    padding: 10px;
+  }
+  .room-viewing-toolbar button {
+    min-height: 44px;
+  }
+  .room-viewing-expanded .room-viewing-toolbar__title {
+    flex-basis: 100%;
+  }
+  .room-viewing-expanded.room-viewing-with-chat .room-layout-canvas {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(180px, 42%);
+    gap: 10px;
+  }
+  .room-viewing-expanded .room-widget[data-widget-type="chat"] {
+    grid-column: 1;
+    grid-row: 2;
+  }
+}

@@ -2,13 +2,46 @@ use super::*;
 use axum::extract::ws::Message;
 use futures_util::{SinkExt, StreamExt};
 
+// The Agent sends a heartbeat every five seconds. Six missed intervals close
+// only that connection; indexed-content readiness remains a separate fact.
+const CONTROL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct Control {
-    connection: Uuid,
+    pub(super) connection: Uuid,
+    last_received: tokio::time::Instant,
     scans: tokio::sync::mpsc::Sender<Scan>,
     manual_scan: bool,
     source_versions: Option<bool>,
     drain_receipts: Option<bool>,
 }
+impl Control {
+    fn live_at(&self, now: tokio::time::Instant) -> bool {
+        now.saturating_duration_since(self.last_received) < CONTROL_IDLE_TIMEOUT
+            && !self.scans.is_closed()
+    }
+}
+
+// Persist only authenticated incoming activity, fenced to the current socket.
+// An older socket cannot refresh or overwrite a replacement connection.
+async fn record_control_activity(
+    app: &App,
+    id: Uuid,
+    connection: Uuid,
+) -> Option<tokio::time::Instant> {
+    let received = tokio::time::Instant::now();
+    let updated = sqlx::query("UPDATE agents SET last_seen=clock_timestamp() WHERE id=$1 AND advanced_assets_connection=$2 AND NOT revoked")
+        .bind(id).bind(connection).execute(&app.db).await.ok()?;
+    if updated.rows_affected() != 1 {
+        return None;
+    }
+    let mut controls = app.agent_controls.lock().await;
+    let control = controls
+        .get_mut(&id)
+        .filter(|control| control.connection == connection)?;
+    control.last_received = received;
+    Some(received)
+}
+
 struct Scan {
     id: Uuid,
     reply: tokio::sync::oneshot::Sender<&'static str>,
@@ -30,7 +63,10 @@ pub async fn scan(
     }
     let (reply, result) = tokio::sync::oneshot::channel();
     let controls = app.agent_controls.lock().await;
-    let Some(control) = controls.get(&id) else {
+    let Some(control) = controls
+        .get(&id)
+        .filter(|c| c.live_at(tokio::time::Instant::now()))
+    else {
         return Ok(Json(json!({"status":"offline"})));
     };
     if control
@@ -96,7 +132,7 @@ pub async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     Ok(Json(Value::Array(rows.iter().map(|r| {
         let id: Uuid = r.get("id");
         let revoked: bool = r.get("revoked");
-        let control = controls.get(&id).filter(|_| !revoked);
+        let control = controls.get(&id).filter(|c| !revoked && c.live_at(tokio::time::Instant::now()));
         let count: i64 = r.get("indexed_count");
         let unversioned_count: i64 = r.get("unversioned_count");
         let capable = control.and_then(|c| c.source_versions);
@@ -110,15 +146,89 @@ pub async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     }).collect())))
 }
 
+fn validated_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 120 || name.chars().any(char::is_control) {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid_agent_name"));
+    }
+    Ok(name)
+}
+
+// Hold role/login authority before any device or policy locks; repeat before commit
+// because wall-clock expiry can pass while a settings request is waiting.
+pub(super) async fn lock_settings_admin(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: &User,
+    h: &HeaderMap,
+) -> Result<()> {
+    let login = media_authorization::login_hash(h)?;
+    let role: Option<bool> = sqlx::query_scalar("SELECT admin FROM users WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM account_exits WHERE user_id=$1) FOR SHARE")
+        .bind(user.id).fetch_optional(&mut **tx).await?;
+    if role != Some(true) {
+        return Err(err(StatusCode::FORBIDDEN, "admin_required"));
+    }
+    let live: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>clock_timestamp() FOR SHARE")
+        .bind(login).bind(user.id).fetch_optional(&mut **tx).await?;
+    if live.is_none() {
+        return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Settings {
+    name: String,
+    expected_name: String,
+}
+
+pub async fn update(
+    State(app): State<App>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Settings>,
+) -> Result<Json<Value>> {
+    let user = auth(&app, &h, true).await?;
+    admin(&user)?;
+    let name = validated_name(&body.name)?;
+    let mut tx = app.db.begin().await?;
+    lock_settings_admin(&mut tx, &user, &h).await?;
+    // Serialize with revocation, policy edits and initial source creation.
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT name FROM agents WHERE id=$1 AND NOT revoked FOR NO KEY UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let current = current.ok_or_else(|| err(StatusCode::NOT_FOUND, "invalid_agent"))?;
+    if current != body.expected_name {
+        return Err(err(StatusCode::CONFLICT, "agent_settings_conflict"));
+    }
+    sqlx::query("UPDATE agents SET name=$2 WHERE id=$1")
+        .bind(id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    // Keep the existing source identity, encrypted configuration and media index.
+    sqlx::query("UPDATE sources SET name=$2 WHERE id=$1 AND kind='agent'")
+        .bind(id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    lock_settings_admin(&mut tx, &user, &h).await?;
+    tx.commit().await?;
+    Ok(Json(json!({"id":id,"name":name})))
+}
+
 pub async fn create(
     State(app): State<App>,
     h: HeaderMap,
     Json(body): Json<rooms::Name>,
 ) -> Result<Json<Value>> {
     admin(&auth(&app, &h, true).await?)?;
+    let name = validated_name(&body.name)?;
     let id = Uuid::new_v4();
     let code = token();
-    sqlx::query("INSERT INTO agents(id,name,pair_hash,pair_expires_at) VALUES($1,$2,$3,now()+interval '10 minutes')").bind(id).bind(body.name).bind(hash(&code)).execute(&app.db).await?;
+    sqlx::query("INSERT INTO agents(id,name,pair_hash,pair_expires_at) VALUES($1,$2,$3,now()+interval '10 minutes')").bind(id).bind(name).bind(hash(&code)).execute(&app.db).await?;
     Ok(Json(json!({"id":id,"pair_code":code})))
 }
 #[derive(Deserialize)]
@@ -153,9 +263,10 @@ pub async fn connect(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "agent_token_required"))?;
+    let token_hash = hash(t);
     let id: Option<Uuid> =
         sqlx::query_scalar("SELECT id FROM agents WHERE token_hash=$1 AND NOT revoked")
-            .bind(hash(t))
+            .bind(&token_hash)
             .fetch_optional(&app.db)
             .await?;
     let id = id.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid_agent"))?;
@@ -163,7 +274,19 @@ pub async fn connect(
         let (mut out, mut input) = socket.split();
         let connection = Uuid::new_v4();
         let (scan_tx, mut scans) = tokio::sync::mpsc::channel::<Scan>(1);
-        app.agent_controls.lock().await.insert(id, Control { connection, scans: scan_tx, manual_scan: false, source_versions: None, drain_receipts: None });
+        let mut last_received = tokio::time::Instant::now();
+        {
+            // Lock the agent before the control map, matching optional metrics.
+            // Commit the replacement identity while holding the map lock.
+            let Ok(mut tx) = app.db.begin().await else { return; };
+            let installed = sqlx::query("UPDATE agents SET advanced_assets_version=0,advanced_assets_connection=$2,last_seen=clock_timestamp() WHERE id=$1 AND token_hash=$3 AND NOT revoked")
+                .bind(id).bind(connection).bind(&token_hash).execute(&mut *tx).await;
+            if !matches!(installed, Ok(result) if result.rows_affected() == 1) { return; }
+            let mut controls = app.agent_controls.lock().await;
+            if tx.commit().await.is_err() { return; }
+            controls.insert(id, Control { connection, last_received, scans: scan_tx, manual_scan: false, source_versions: None, drain_receipts: None });
+        }
+        let mut uplink_metrics = crate::agent_metrics::Receiver::new(app.metrics.runtime.clone(), id, connection, token_hash);
         let mut supports_scan = false;
         let mut pending: Option<Scan> = None;
         let (pages, incoming) = tokio::sync::mpsc::channel(1);
@@ -176,6 +299,8 @@ pub async fn connect(
         });
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
         loop { tokio::select! {
+            _ = tokio::time::sleep_until(last_received + CONTROL_IDLE_TIMEOUT) => break,
+            _ = uplink_metrics.poll_pending() => {},
             request = scans.recv() => {
                 let Some(request) = request else { break };
                 if !supports_scan { let _ = request.reply.send("unsupported"); continue; }
@@ -205,7 +330,7 @@ pub async fn connect(
                 if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3), out.send(Message::Text(ack.to_string().into()))).await, Ok(Ok(()))) || failed { break }
             }
             _ = tick.tick() => {
-                let valid = sqlx::query("UPDATE agents SET last_seen=now() WHERE id=$1 AND NOT revoked RETURNING id").bind(id).fetch_optional(&app.db).await;
+                let valid = sqlx::query("SELECT id FROM agents WHERE id=$1 AND advanced_assets_connection=$2 AND NOT revoked").bind(id).bind(connection).fetch_optional(&app.db).await;
                 if !matches!(valid, Ok(Some(_))) { break }
                 // Lock only the next transfer; claimed means dispatch attempted, not peer receipt.
                 let result: anyhow::Result<()> = async {
@@ -226,12 +351,22 @@ pub async fn connect(
                     Ok(())
                 }.await;
                 if result.is_err() { break }
+                // A slow claim must not leave catch-up ticks continuously ready:
+                // give queued control frames a turn before the next dispatch.
+                tick.reset();
             }
             message = input.next() => {
                 match message {
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {},
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                        let Some(received) = record_control_activity(&app, id, connection).await else { break };
+                        last_received = received;
+                    },
                     Some(Ok(Message::Text(text))) => {
                         let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
+                        if matches!(value["type"].as_str(), Some("HELLO" | "HEARTBEAT" | "TRANSFER_DRAINED" | "SCAN_BUSY" | "INDEX" | "INDEX_ABORT")) {
+                            let Some(received) = record_control_activity(&app, id, connection).await else { break };
+                            last_received = received;
+                        }
                         if value["type"] == "TRANSFER_DRAINED" {
                             let Some(transfer) = value["id"].as_str().and_then(|value|Uuid::parse_str(value).ok()) else { continue };
                             // The authenticated control identity may only settle
@@ -245,15 +380,27 @@ pub async fn connect(
                             continue;
                         }
                         if value["type"] == "HELLO" {
+                            if sqlx::query("UPDATE agents SET advanced_assets_version=$3 WHERE id=$1 AND advanced_assets_connection=$2 AND NOT revoked").bind(id).bind(connection).bind(if value["advanced_assets_version"]==1 {1i16}else{0i16}).execute(&app.db).await.is_err() {break;}
                             supports_scan = value["manual_scan"] == true;
-                            let mut controls = app.agent_controls.lock().await;
-                            if let Some(control) = controls.get_mut(&id).filter(|c| c.connection == connection) {
-                                control.manual_scan = supports_scan;
-                                control.drain_receipts = Some(value["drain_receipts"] == true);
-                                // Absence is unknown: pre-capability Agents can still
-                                // prove support by committing a versioned snapshot.
-                                if value["source_versions"] == true { control.source_versions = Some(true); }
+                            let ready = {
+                                let mut controls = app.agent_controls.lock().await;
+                                if let Some(control) = controls.get_mut(&id).filter(|c| c.connection == connection) {
+                                    control.manual_scan = supports_scan;
+                                    control.drain_receipts = Some(value["drain_receipts"] == true);
+                                    // Absence is unknown: pre-capability Agents can still
+                                    // prove support by committing a versioned snapshot.
+                                    if value["source_versions"] == true { control.source_versions = Some(true); }
+                                    uplink_metrics.hello(&text, &value)
+                                } else { None }
+                            };
+                            // Optional negotiation never holds a database/control
+                            // lock during a WebSocket send or changes ordinary auth.
+                            if let Some(ready) = ready {
+                                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), out.send(Message::Text(ready.to_string().into()))).await;
                             }
+                        }
+                        if value["type"] == "HEARTBEAT" {
+                            uplink_metrics.heartbeat(&app, &text, &value);
                         }
                         if value["type"] == "SCAN_BUSY" && pending.as_ref().is_some_and(|p| value["snapshot"] == p.id.to_string()) {
                             let _ = pending.take().unwrap().reply.send("busy");
@@ -265,6 +412,8 @@ pub async fn connect(
                 }
             }
         }}
+        // Abort owned optional telemetry before any socket cleanup awaits.
+        drop(uplink_metrics);
         // Dropping the uncommitted snapshot rolls back partial/disconnected indexing.
         ingest.abort();
         let _ = ingest.await;
@@ -280,6 +429,9 @@ async fn ingest_index(
     acks: tokio::sync::mpsc::Sender<Value>,
 ) -> anyhow::Result<()> {
     let config = providers::SourceConfig {
+        s3: None,
+        advanced_assets: None,
+        access_policy: None,
         root: String::new(),
         url: String::new(),
         token: String::new(),
@@ -288,11 +440,19 @@ async fn ingest_index(
         headers: Default::default(),
     };
     let encrypted = app.encrypt(&serde_json::to_value(config)?)?;
-    sqlx::query("INSERT INTO sources VALUES($1,'NAS Agent','agent',$2) ON CONFLICT(id) DO NOTHING")
+    let mut source_tx = app.db.begin().await?;
+    let name: String =
+        sqlx::query_scalar("SELECT name FROM agents WHERE id=$1 AND NOT revoked FOR NO KEY UPDATE")
+            .bind(id)
+            .fetch_one(&mut *source_tx)
+            .await?;
+    sqlx::query("INSERT INTO sources(id,name,kind,config_encrypted) VALUES($1,$2,'agent',$3) ON CONFLICT(id) DO NOTHING")
         .bind(id)
+        .bind(name)
         .bind(encrypted)
-        .execute(&app.db)
+        .execute(&mut *source_tx)
         .await?;
+    source_tx.commit().await?;
     loop {
         let Some(first) = pages.recv().await else {
             return Ok(());
@@ -386,7 +546,45 @@ async fn ingest_index(
 
 #[cfg(test)]
 mod tests {
-    use super::source_version_status;
+    use super::{CONTROL_IDLE_TIMEOUT, Control, source_version_status, validated_name};
+
+    #[test]
+    fn online_state_uses_received_activity_and_a_live_current_channel() {
+        let (scans, receiver) = tokio::sync::mpsc::channel(1);
+        let received = tokio::time::Instant::now();
+        let mut control = Control {
+            connection: uuid::Uuid::new_v4(),
+            last_received: received,
+            scans,
+            manual_scan: false,
+            source_versions: Some(true),
+            drain_receipts: None,
+        };
+        assert!(control.live_at(received));
+        assert!(
+            control.live_at(received + CONTROL_IDLE_TIMEOUT - std::time::Duration::from_millis(1))
+        );
+        assert!(!control.live_at(received + CONTROL_IDLE_TIMEOUT));
+        control.last_received = received + std::time::Duration::from_secs(5);
+        assert!(control.live_at(received + CONTROL_IDLE_TIMEOUT));
+        assert_eq!(control.source_versions, Some(true));
+        drop(receiver);
+        assert!(!control.live_at(control.last_received));
+    }
+
+    #[test]
+    fn device_names_are_trimmed_and_bounded_without_control_characters() {
+        assert_eq!(validated_name("  合成 NAS  ").unwrap(), "合成 NAS");
+        assert!(validated_name(&"设".repeat(120)).is_ok());
+        for invalid in [
+            "".to_owned(),
+            "  ".to_owned(),
+            "a\nb".to_owned(),
+            "x".repeat(121),
+        ] {
+            assert!(validated_name(&invalid).is_err());
+        }
+    }
 
     #[test]
     fn version_readiness_requires_a_committed_version_for_every_available_item() {

@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UpstreamMeasuredOutput",
+  "type": "object",
+  "properties": {
+    "audio": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UpstreamMeasuredAudio"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "manifest_duration_ms": {
+      "type": "number",
+      "format": "double"
+    },
+    "measured_bytes": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "measured_segments": {
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
+    "plan_generation": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "process_tree_reaped": {
+      "type": "boolean"
+    },
+    "representation_sha256": {
+      "type": "string"
+    },
+    "route_sha256": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
+    "semantics": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "upstream_sid_sha256": {
+      "description": "SHA-256 identities avoid exposing provider session identifiers/URLs.",
+      "type": "string"
+    },
+    "video": {
+      "$ref": "#/$defs/UpstreamMeasuredVideo"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "semantics",
+    "session_id",
+    "upstream_sid_sha256",
+    "route_sha256",
+    "representation_sha256",
+    "measured_bytes",
+    "measured_segments",
+    "manifest_duration_ms",
+    "video",
+    "process_tree_reaped"
+  ],
+  "$defs": {
+    "UpstreamMeasuredAudio": {
+      "type": "object",
+      "properties": {
+        "channels": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "codec": {
+          "type": "string"
+        },
+        "decoded_frames": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "profile": {
+          "type": "string"
+        },
+        "sample_rate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "codec",
+        "profile",
+        "sample_rate",
+        "channels",
+        "decoded_frames"
+      ]
+    },
+    "UpstreamMeasuredVideo": {
+      "type": "object",
+      "properties": {
+        "codec": {
+          "type": "string"
+        },
+        "decoded_frames": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "frame_rate": {
+          "type": "number",
+          "format": "double"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pixel_format": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "codec",
+        "profile",
+        "width",
+        "height",
+        "pixel_format",
+        "frame_rate",
+        "decoded_frames"
+      ]
+    }
+  }
+}

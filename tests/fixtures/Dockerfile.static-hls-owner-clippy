@@ -1,0 +1,5 @@
+# Validation toolchain only; the base is the already built local media test image.
+ARG BUILD_IMAGE
+FROM ${BUILD_IMAGE}
+RUN rustup component add clippy --toolchain 1.98.1 \
+    && cargo clippy --version

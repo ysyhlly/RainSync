@@ -19,3 +19,10 @@ npm run build
 `tests/deployed-smoke.mjs`、远程媒体及 Jellyfin/Emby 验证脚本会修改测试实例的数据，只能针对独立开发实例运行；配置和前置条件见 [运维文档](docs/OPERATIONS.md)。
 
 不要提交 `.env`、Agent 凭据、媒体、数据库备份、日志或签名播放地址。修改共享协议后同时提交生成的 TypeScript/Schema。测试报告应写明样本、环境及未验证范围，不把模拟或短期结果描述为正式验收。
+
+交付或运维变更执行 `python3 tests/runtime-images.test.py`、
+`python3 tests/backup-schedule.test.py` 和对应 Node 契约检查。
+涉及启用模板或兼容边界时同步更新 [兼容矩阵](docs/COMPATIBILITY.md)、
+[启用/回退](docs/ADVANCED_FEATURES.md)、[当前决策](docs/DECISIONS.md) 与
+[变更记录](CHANGELOG.md)。文档链接须在源码分发中可读，审计报告缺失时说明范围，
+不要把说明文件重新包装成已通过报告。漏洞按 [安全报告](SECURITY.md) 私密反馈。

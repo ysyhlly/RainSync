@@ -1,6 +1,6 @@
+import { unusedPort } from "./fixtures/unused-port.mjs";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { createServer as netServer } from "node:net";
 import { createWriteStream } from "node:fs";
 import { copyFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -10,15 +10,7 @@ import { isolatedServer, delay } from "./fixtures/server.mjs";
 
 // Real isolated Server/PostgreSQL/Worker + Vue browser. No HTTP/WS route mocks.
 const entry = process.env.RAINSYNC_TEST_ENTRY ?? "";
-async function unusedPort() {
-  const s = netServer();
-  await new Promise((done, reject) =>
-    s.once("error", reject).listen(0, "127.0.0.1", done),
-  );
-  const port = s.address().port;
-  await new Promise((done) => s.close(done));
-  return port;
-}
+
 const vitePort = await unusedPort(),
   workerPort = await unusedPort(),
   origin = `http://127.0.0.1:${vitePort}`,
@@ -63,6 +55,7 @@ function observe(page) {
     errors: [],
     commands: [],
     plans: [],
+    metrics: [],
   };
   page.on("pageerror", (e) => stats.errors.push(e.message));
   page.on("websocket", (ws) => {
@@ -83,6 +76,21 @@ function observe(page) {
       stats.prepares++;
   });
   page.on("response", async (r) => {
+    const metricSession = new URL(r.url()).pathname.match(
+      /^\/api\/v1\/playback-sessions\/([0-9a-f-]{36})\/metrics$/,
+    );
+    if (metricSession && r.request().method() === "POST") {
+      try {
+        stats.metrics.push({
+          session: metricSession[1],
+          status: r.status(),
+          sample: r.request().postDataJSON(),
+          receipt: await r.json(),
+        });
+      } catch (error) {
+        stats.errors.push(`metrics response: ${error.message}`);
+      }
+    }
     if (
       new URL(r.url()).pathname === "/api/v1/playback-sessions" &&
       r.request().method() === "POST" &&
@@ -384,9 +392,12 @@ await isolatedServer(
           exact: true,
         }),
       ).toBeVisible();
-      await expect(admin.locator(".connection-status")).toHaveText("已连接");
+      await expect(admin.locator(".connection-status")).toHaveText("房间连接正常");
       await admin
-        .getByRole("button", { name: "房间邀请", exact: true })
+        .getByRole("button", { name: "邀请", exact: true })
+        .click();
+      await admin
+        .getByRole("button", { name: "生成邀请", exact: true })
         .click();
       const roomInvitation = JSON.parse(
         await admin.getByLabel("完整房间邀请").inputValue(),
@@ -408,6 +419,9 @@ await isolatedServer(
         }),
       ).toBeVisible();
       await nav(admin, "媒体库");
+      await admin
+        .getByRole("button", { name: "打开片源 验收合成媒体", exact: true })
+        .click();
       const media = await json(adminContext, "/media");
       assert.equal(media.length, 2);
       for (const item of media)
@@ -430,7 +444,7 @@ await isolatedServer(
       await expect(admin.locator(".queue-row")).toHaveCount(2);
       await admin.locator("video").hover();
       await expect(
-        admin.getByRole("button", { name: "暂停", exact: true }),
+        admin.getByRole("button", { name: "暂停房间播放", exact: true }),
       ).toBeEnabled();
       await expect
         .poll(() => admin.locator("video").evaluate((el) => el.currentTime), {
@@ -442,8 +456,90 @@ await isolatedServer(
           timeout: 20000,
         })
         .toBeGreaterThan(2);
+      evidence.clientReportedMetrics = [];
+      for (const [label, stats] of [
+        ["owner", as],
+        ["viewer", vs],
+      ]) {
+        await expect
+          .poll(
+            () =>
+              stats.metrics.some(
+                (m) => m.status === 200 && m.sample.first_frame,
+              ),
+            { timeout: 15000 },
+          )
+          .toBe(true);
+        const measurement = stats.metrics.find(
+          (m) => m.status === 200 && m.sample.first_frame,
+        );
+        const { sample, receipt, session } = measurement;
+        assert.equal(sample.version, 2);
+        assert.equal(Object.keys(sample.totals).length, 8);
+        assert.ok(
+          Object.values(sample.totals).every(
+            (v) => Number.isInteger(v) && v >= 0,
+          ),
+        );
+        assert.equal(
+          Object.values(sample.totals).reduce((sum, v) => sum + v, 0),
+          sample.elapsed_ms,
+        );
+        assert.ok(
+          sample.first_frame.elapsed_ms <=
+            sample.first_frame.confirmed_elapsed_ms,
+        );
+        assert.ok(sample.first_frame.confirmed_elapsed_ms <= sample.elapsed_ms);
+        assert.ok(
+          ["video_frame_callback", "playing_time_advance"].includes(
+            sample.first_frame.evidence,
+          ),
+        );
+        assert.deepEqual(Object.keys(sample.startup_phases).sort(), [
+          "loading_ms",
+          "preparation_ms",
+          "unobserved_ms",
+        ]);
+        assert.ok(
+          Object.values(sample.startup_phases).every(
+            (v) => Number.isInteger(v) && v >= 0 && v <= 604800000,
+          ),
+        );
+        assert.equal(
+          Object.values(sample.startup_phases).reduce((sum, v) => sum + v, 0),
+          sample.first_frame.confirmed_elapsed_ms,
+        );
+        assert.ok(Number.isInteger(sample.first_frame_plan_generation));
+        assert.ok(
+          sample.first_frame_plan_generation >= sample.meter_start_generation &&
+            sample.first_frame_plan_generation <= sample.plan_generation,
+        );
+        assert.deepEqual(receipt, {
+          session_id: session,
+          meter_start_generation: sample.meter_start_generation,
+          metrics_seq: sample.seq,
+          closed: sample.final,
+        });
+        const persisted = JSON.parse(
+          fixture.sql(
+            `SELECT g.metrics_payload::text FROM playback_sessions p JOIN playback_viewer_plans g ON g.user_id=p.user_id AND g.room_id=p.room_id AND g.viewer_id=p.viewer_id WHERE p.id='${session}'`,
+          ),
+        );
+        assert.ok(persisted.seq >= sample.seq);
+        assert.equal(persisted.version, 2);
+        assert.deepEqual(persisted.first_frame, sample.first_frame);
+        assert.deepEqual(persisted.startup_phases, sample.startup_phases);
+        assert.equal(
+          persisted.first_frame_plan_generation,
+          sample.first_frame_plan_generation,
+        );
+        evidence.clientReportedMetrics.push({ user: label, sample, receipt });
+      }
+      stage(
+        "actual browser presentation callbacks produce conserved v2 metrics, startup phases, and originating grants accepted and persisted by the real receiver for both users",
+      );
       await expect(
-        viewer.getByRole("button", { name: "暂停", exact: true }),
+        viewer.getByRole("button", { name: "暂停房间播放", exact: true }),
       ).toBeDisabled();
       await viewer.getByLabel("聊天消息").fill("真实用户昵称聊天");
       await viewer.getByRole("button", { name: "发送消息" }).click();
@@ -453,7 +549,7 @@ await isolatedServer(
       await expect(admin.locator(".chat-message b")).toHaveText(
         "独立昵称草稿🙂",
       );
-      await admin.getByRole("button", { name: "暂停", exact: true }).click();
+      await admin.getByRole("button", { name: "暂停房间播放", exact: true }).click();
       await expect
         .poll(() => viewer.locator("video").evaluate((el) => el.paused))
         .toBe(true);
@@ -464,7 +560,7 @@ await isolatedServer(
           timeout: 15000,
         })
         .toBeGreaterThan(19);
-      await admin.getByRole("button", { name: "播放", exact: true }).click();
+      await admin.getByRole("button", { name: "播放房间", exact: true }).click();
       await expect
         .poll(() => viewer.locator("video").evaluate((el) => el.paused))
         .toBe(false);
@@ -553,6 +649,7 @@ await isolatedServer(
         ).status(),
         403,
       );
+      await nav(admin, "管理");
       await nav(admin, "账号与注册");
       await admin
         .getByRole("link", { name: "手动创建账号", exact: true })
@@ -570,7 +667,10 @@ await isolatedServer(
       );
       await nav(admin, "NAS 设备");
       await admin.getByRole("button", { name: "添加设备" }).click();
-      await admin.getByLabel("设备名称").fill("联调未配对设备");
+      await admin
+        .getByRole("dialog", { name: "添加NAS设备", exact: true })
+        .getByLabel("设备名称", { exact: true })
+        .fill("联调未配对设备");
       await admin.getByRole("button", { name: "生成配对码" }).click();
       await expect(admin.getByLabel("配对码", { exact: true })).not.toHaveValue(
         "",
@@ -588,8 +688,11 @@ await isolatedServer(
         }),
       });
       await expect(revokedAgent).toHaveCount(1);
+      const revokedStatus = revokedAgent.locator(".status-badge");
+      await expect(revokedStatus).toBeVisible();
+      await expect(revokedStatus).toHaveText("已撤销");
       await expect(
-        revokedAgent.getByText(/^已撤销\s*· 最后联系：/),
+        revokedAgent.getByText("最后联系：暂无", { exact: true }),
       ).toBeVisible();
       await expect(
         revokedAgent.getByText("设备凭据已失效，无法继续读取片源", {

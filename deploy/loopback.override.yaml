@@ -1,0 +1,13 @@
+# Use only with compose.yaml and a distinct project name, behind an existing
+# HTTPS reverse proxy. Requires Docker Compose 2.24.4+ for !override.
+# docker compose -p rainsync-production -f compose.yaml \
+#   -f deploy/loopback.override.yaml --env-file /opt/rainsync/config/runtime.env ...
+services:
+  web:
+    ports: !override ["127.0.0.1:${RAINSYNC_LOOPBACK_PORT:-3080}:80"]
+    environment:
+      SITE_ADDRESS: ":80"
+  server:
+    stop_grace_period: 60s
+  worker:
+    stop_grace_period: 60s

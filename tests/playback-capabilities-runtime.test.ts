@@ -1,3 +1,11 @@
+vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
+  const { default: Hls } = await import("hls.js");
+  return {
+    getPlaybackMediaSource: () => Hls.getMediaSource(),
+    hasPlaybackMseApi: () => Hls.isMSESupported(),
+    supportsHlsPlayback: () => Hls.isSupported(),
+  };
+});
 import { afterEach, expect, it, vi } from "vitest";
 import { effectScope, ref } from "vue";
 import { createPlaybackRuntime } from "../apps/web/src/features/playback/playback-runtime";
@@ -74,6 +82,7 @@ function setup(
         ...(observe ? { observation_version: 1, observation_seq: 0 } : {}),
         media_id: "media",
         media_generation: 1,
+        plan_generation: body.plan_generation,
         delivery_mode: candidate?.delivery_mode ?? "remux",
         transport: candidate?.transport ?? "hls",
         selected_candidate_id: candidate?.id,
@@ -121,6 +130,7 @@ function setup(
     src: "",
     error: null,
     buffered: { length: 0 },
+    seekable: { length: 0 },
     currentTime: 0,
     playbackRate: 1,
     paused: true,
@@ -221,6 +231,10 @@ it("echoes server binding and retries only decoder failures within a three-route
     hls.errorHandler?.(undefined, { fatal: true, type: "mediaError" });
     await vi.advanceTimersByTimeAsync(0);
     expect(ctx.posts()).toHaveLength(3);
+    expect(ctx.posts().map((call) => call[2].plan_generation)).toEqual([
+      1, 2, 3,
+    ]);
+    expect(new Set(ctx.posts().map((call) => call[2].viewer_id)).size).toBe(1);
     expect(ctx.posts()[2][2].candidate_report.excluded_candidates).toEqual([
       "direct",
       "remux",
@@ -343,6 +357,7 @@ it("decoder fallback commits the old actual final sample before cancelling its k
     await vi.advanceTimersByTimeAsync(0);
     expect(ctx.posts()).toHaveLength(2);
     const finalIndex = ctx.api.mock.calls.indexOf(final!);
+    expect(ctx.posts().map((call) => call[2].plan_generation)).toEqual([1, 2]);
     const cancelIndex = ctx.api.mock.calls.findIndex(([path]) =>
       path.startsWith("/playback-requests/"),
     );
@@ -352,6 +367,178 @@ it("decoder fallback commits the old actual final sample before cancelling its k
     expect(ctx.posts()[1][2].candidate_report.excluded_candidates).toEqual([
       "direct",
     ]);
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+it("rapid audio changes discard a delayed older plan and its media callbacks", async () => {
+  const ctx = setup();
+  try {
+    const original = ctx.api.getMockImplementation()!;
+    let release!: () => void;
+    const delayed = new Promise<void>((done) => (release = done));
+    ctx.api.mockImplementation(async (path, method, body) => {
+      const result = await original(path, method, body);
+      if (path !== "/playback-sessions" || method !== "POST") return result;
+      if (body.plan_generation === 2) await delayed;
+      return {
+        ...result,
+        session_id: `generation-${body.plan_generation}`,
+        playback_url: `/generation-${body.plan_generation}.mp4`,
+      };
+    });
+    await ctx.runtime.loadMedia();
+    const oldMetadata = ctx.element.onloadedmetadata;
+    ctx.runtime.audioIndex.value = 1;
+    const older = ctx.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctx.posts()).toHaveLength(2);
+    ctx.runtime.audioIndex.value = 2;
+    await ctx.runtime.loadMedia();
+    expect(ctx.element.src).toBe("/generation-3.mp4");
+    release();
+    await older;
+    oldMetadata();
+    expect(ctx.element.src).toBe("/generation-3.mp4");
+    expect(ctx.runtime.sessionId.value).toBe("generation-3");
+    expect(ctx.posts().map((call) => call[2].plan_generation)).toEqual([
+      1, 2, 3,
+    ]);
+    expect(ctx.posts().map((call) => call[2].audio_index)).toEqual([
+      null,
+      1,
+      2,
+    ]);
+    expect(ctx.state.value.anchor_position_ms).toBe(5000);
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+it("a delayed readiness result cannot expose an older URL after a newer intent", async () => {
+  const ctx = setup();
+  try {
+    const original = ctx.api.getMockImplementation()!;
+    let release!: () => void;
+    const delayed = new Promise<void>((done) => (release = done));
+    ctx.api.mockImplementation(async (path, method, body) => {
+      if (method === "GET" && path.startsWith("/playback-sessions/")) {
+        const generation = Number(
+          new URL(path, "http://fixture").searchParams.get("plan_generation"),
+        );
+        if (generation === 1) await delayed;
+        return {
+          session_id: `generation-${generation}`,
+          plan_generation: generation,
+          status: "ready",
+          complete: true,
+        };
+      }
+      const result = await original(path, method, body);
+      return path === "/playback-sessions" && method === "POST"
+        ? {
+            ...result,
+            session_id: `generation-${body.plan_generation}`,
+            playback_url: `/generation-${body.plan_generation}.mp4`,
+            rebuild_on_seek: true,
+          }
+        : result;
+    });
+    const older = ctx.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctx.element.src).toBe("");
+    await ctx.runtime.loadMedia();
+    expect(ctx.element.src).toBe("/generation-2.mp4");
+    release();
+    await older;
+    expect(ctx.element.src).toBe("/generation-2.mp4");
+    expect(ctx.runtime.waiting.value).toBe(true);
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+it("a seek rebuild gets another plan generation without changing the room state", async () => {
+  const ctx = setup();
+  try {
+    const original = ctx.api.getMockImplementation()!;
+    ctx.api.mockImplementation(async (path, method, body) => {
+      if (method === "GET" && path.startsWith("/playback-sessions/")) {
+        const generation = Number(
+          new URL(path, "http://fixture").searchParams.get("plan_generation"),
+        );
+        return {
+          session_id: `generation-${generation}`,
+          plan_generation: generation,
+          status: "ready",
+          complete: true,
+        };
+      }
+      const result = await original(path, method, body);
+      return path === "/playback-sessions" && method === "POST"
+        ? {
+            ...result,
+            session_id: `generation-${body.plan_generation}`,
+            delivery_mode: "transcode",
+            timeline_origin_ms: 10000,
+            rebuild_on_seek: true,
+          }
+        : result;
+    });
+    const before = JSON.stringify(ctx.state.value);
+    await ctx.runtime.loadMedia();
+    await ctx.runtime.applyState(true, true);
+    expect(ctx.posts().map((call) => call[2].plan_generation)).toEqual([1, 2]);
+    expect(JSON.stringify(ctx.state.value)).toBe(before);
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+for (const outcome of ["resolve", "reject"] as const) {
+  it(`ignores a stale play() ${outcome} after replacing its plan`, async () => {
+    const ctx = setup();
+    try {
+      await ctx.runtime.loadMedia();
+      let resolve!: () => void, reject!: (failure: Error) => void;
+      ctx.element.play = vi.fn(
+        () =>
+          new Promise<void>((done, fail) => {
+            resolve = done;
+            reject = fail;
+          }),
+      );
+      ctx.state.value.playback_status = "playing";
+      const old = ctx.runtime.applyState();
+      await ctx.runtime.loadMedia();
+      ctx.runtime.blocked.value = outcome === "resolve";
+      if (outcome === "resolve") resolve();
+      else reject(new Error("old autoplay denied"));
+      await old;
+      expect(ctx.runtime.blocked.value).toBe(outcome === "resolve");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+}
+
+it("a stale explicit play rejection cannot become an error on the replacement plan", async () => {
+  const ctx = setup();
+  try {
+    await ctx.runtime.loadMedia();
+    let reject!: (failure: Error) => void;
+    ctx.element.play = vi.fn(
+      () =>
+        new Promise<void>((_done, fail) => {
+          reject = fail;
+        }),
+    );
+    const old = ctx.runtime.enablePlayback();
+    await ctx.runtime.loadMedia();
+    reject(new Error("old autoplay denied"));
+    await expect(old).resolves.toBeUndefined();
+    expect(ctx.runtime.blocked.value).toBe(false);
   } finally {
     ctx.cleanup();
   }
@@ -410,6 +597,7 @@ it("same-attempt generated growth resumes one Hls without reloading its source",
       if (method === "GET" && path.startsWith("/playback-sessions/"))
         return {
           session_id: "session",
+          plan_generation: 1,
           status: "ready",
           complete: false,
           available_until_ms: 30000,

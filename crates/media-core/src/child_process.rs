@@ -2,11 +2,20 @@
 //! cancels OS reaping or releases ownership of descendants.
 use std::{io, process::ExitStatus};
 use tokio::{
-    process::{ChildStdin, ChildStdout, Command},
+    process::{ChildStderr, ChildStdin, ChildStdout, Command},
     sync::watch,
 };
 
 type Outcome = Result<ExitStatus, (io::ErrorKind, String)>;
+
+/// Registered process-tree owners, not a descendant/process count or drain
+/// receipt. Zero owners does not prove cleanup succeeded; inspect the flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnerSnapshot {
+    pub active_owners: usize,
+    pub admission_closed: bool,
+    pub cleanup_failed: bool,
+}
 
 #[derive(Default)]
 struct Owners {
@@ -14,6 +23,7 @@ struct Owners {
     closing: bool,
     next_id: u64,
     active: std::collections::HashMap<u64, watch::Sender<bool>>,
+    asynchronous: Vec<watch::Receiver<bool>>,
     failure: Option<(io::ErrorKind, String)>,
 }
 
@@ -32,9 +42,22 @@ impl Default for Registry {
 }
 
 impl Registry {
+    fn owner_snapshot(&self) -> Option<OwnerSnapshot> {
+        let owners = self.owners.try_lock().ok()?;
+        Some(OwnerSnapshot {
+            active_owners: owners.active.len(),
+            admission_closed: owners.closing,
+            cleanup_failed: owners.failure.is_some(),
+        })
+    }
+
     fn set_owner_runtime(&self, runtime: tokio::runtime::Handle) -> io::Result<()> {
         let mut owners = self.owners.lock().expect("process registry lock");
-        if owners.runtime.is_some() || owners.next_id != 0 || owners.closing {
+        if owners.runtime.is_some()
+            || owners.next_id != 0
+            || !owners.asynchronous.is_empty()
+            || owners.closing
+        {
             return Err(io::Error::other("process owner runtime is already in use"));
         }
         owners.runtime = Some(runtime);
@@ -43,18 +66,30 @@ impl Registry {
 
     async fn shutdown(&self) -> io::Result<()> {
         let mut count = self.count.subscribe();
-        {
+        let asynchronous = {
             let mut owners = self.owners.lock().expect("process registry lock");
             owners.closing = true;
             for stop in owners.active.values() {
                 let _ = stop.send(true);
             }
-        }
+            owners.asynchronous.clone()
+        };
         while *count.borrow_and_update() != 0 {
             count
                 .changed()
                 .await
                 .map_err(|_| io::Error::other("process registry closed"))?;
+        }
+        // A process may exit before its pipe/cwd owner is scheduled again.
+        // Keep the owner reactor alive until those independently retained
+        // receipts finish, including imports with no resource-local Scope.
+        for mut completed in asynchronous {
+            while !*completed.borrow_and_update() {
+                completed
+                    .changed()
+                    .await
+                    .map_err(|_| io::Error::other("asynchronous owner stopped without receipt"))?;
+            }
         }
         match &self.owners.lock().expect("process registry lock").failure {
             Some((kind, message)) => Err(io::Error::new(*kind, message.clone())),
@@ -66,6 +101,12 @@ impl Registry {
 fn registry() -> std::sync::Arc<Registry> {
     static REGISTRY: std::sync::OnceLock<std::sync::Arc<Registry>> = std::sync::OnceLock::new();
     REGISTRY.get_or_init(Default::default).clone()
+}
+
+/// Observe the existing owner registry without waiting for its lock. Contended
+/// or poisoned state is unavailable, never an invented zero or drain receipt.
+pub fn owner_snapshot() -> Option<OwnerSnapshot> {
+    registry().owner_snapshot()
 }
 
 /// Permanently close process admission and wait for all owners, including those
@@ -156,6 +197,9 @@ pub struct Child {
     status: watch::Receiver<Option<Outcome>>,
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
+    /// Optional caller-owned diagnostics pipe. Callers that request it must
+    /// drain concurrently, bound retained data, and never expose raw secrets.
+    pub stderr: Option<ChildStderr>,
 }
 
 impl Child {
@@ -202,6 +246,7 @@ struct ScopeState {
     closing: bool,
     children: Vec<(watch::Sender<bool>, watch::Receiver<Option<Outcome>>)>,
     blocking: Vec<watch::Receiver<bool>>,
+    failure: Option<(io::ErrorKind, String)>,
 }
 
 tokio::task_local! { static PROCESS_SCOPE: Scope; }
@@ -213,6 +258,32 @@ impl Scope {
 
     pub async fn run<F: std::future::Future>(&self, work: F) -> F::Output {
         PROCESS_SCOPE.scope(self.clone(), work).await
+    }
+
+    /// Read only the original retained scope's real process-owner outcomes.
+    /// No externally supplied exit code, ID, count or timeout can substitute.
+    /// A single successful parent outcome was published only after that actual
+    /// managed owner positively reaped its entire descendant process tree.
+    pub(crate) fn require_successful_single_process_reap(&self) -> io::Result<()> {
+        let scope = self.0.lock().expect("process scope lock");
+        if !scope.closing
+            || scope.failure.is_some()
+            || scope.children.len() != 1
+            || scope.blocking.iter().any(|receipt| !*receipt.borrow())
+        {
+            return Err(io::Error::other(
+                "original single process scope not positively drained",
+            ));
+        }
+        let outcome = scope.children[0].1.borrow();
+        match &*outcome {
+            Some(Ok(status)) if status.success() => Ok(()),
+            Some(Ok(_)) => Err(io::Error::other("original managed process did not succeed")),
+            Some(Err((kind, message))) => Err(io::Error::new(*kind, message.clone())),
+            None => Err(io::Error::other(
+                "original managed process reaping remains unknown",
+            )),
+        }
     }
 
     /// A positive result proves every process tree admitted to this scope was
@@ -245,6 +316,9 @@ impl Scope {
                     .await
                     .map_err(|_| io::Error::other("process owner stopped without reaping"))?;
             }
+        }
+        if let Some((kind, message)) = &self.0.lock().expect("process scope lock").failure {
+            return Err(io::Error::new(*kind, message.clone()));
         }
         Ok(())
     }
@@ -297,6 +371,105 @@ where
         .map_err(|_| io::Error::other("blocking operation failed"))
 }
 
+/// Retain an asynchronous resource owner independently of its public waiter.
+/// Registration precedes task scheduling, and the captured process scope is
+/// explicitly inherited. A successful receipt follows disposal of the future
+/// and retained resources. Failed/panicked ownership prevents a positive scope
+/// drain, even when its public result receiver was cancelled.
+///
+/// Work arranges bounded cancellation itself. Return Ok after resource disposal
+/// even if ordinary extraction failed; return Err only if ownership/disposal
+/// failed. Managed process reaping remains a separate mandatory scope receipt.
+pub fn supervise<F>(work: F) -> io::Result<()>
+where
+    F: std::future::Future<Output = io::Result<()>> + Send + 'static,
+{
+    supervise_registered(work, registry())
+}
+
+fn supervise_registered<F>(work: F, registry: std::sync::Arc<Registry>) -> io::Result<()>
+where
+    F: std::future::Future<Output = io::Result<()>> + Send + 'static,
+{
+    struct Completed {
+        complete: watch::Sender<bool>,
+        scope: Option<Scope>,
+        registry: std::sync::Arc<Registry>,
+        outcome: Option<io::Result<()>>,
+    }
+    impl Drop for Completed {
+        fn drop(&mut self) {
+            let failure = match self.outcome.take() {
+                Some(Ok(())) => None,
+                Some(Err(error)) => Some((error.kind(), error.to_string())),
+                None => Some((
+                    io::ErrorKind::Interrupted,
+                    "asynchronous resource owner stopped without disposal receipt".into(),
+                )),
+            };
+            if let Some(failure) = failure {
+                if let Some(scope) = &self.scope {
+                    let mut state = scope.0.lock().expect("process scope lock");
+                    if state.failure.is_none() {
+                        state.failure = Some(failure.clone());
+                    }
+                }
+                let mut owners = self.registry.owners.lock().expect("process registry lock");
+                if owners.failure.is_none() {
+                    owners.failure = Some(failure);
+                }
+            }
+            self.complete.send_replace(true);
+        }
+    }
+    let scope = PROCESS_SCOPE.try_with(Clone::clone).ok();
+    // Same lock order as process admission: Scope, then global registry.
+    let mut state = scope
+        .as_ref()
+        .map(|scope| scope.0.lock().expect("process scope lock"));
+    if state.as_ref().is_some_and(|state| state.closing) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "process scope is closing",
+        ));
+    }
+    let (complete, completed) = watch::channel(false);
+    let runtime = {
+        let mut owners = registry.owners.lock().expect("process registry lock");
+        if owners.closing {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "media resource owners are shutting down",
+            ));
+        }
+        owners.asynchronous.retain(|receipt| !*receipt.borrow());
+        owners.asynchronous.push(completed.clone());
+        owners
+            .runtime
+            .clone()
+            .unwrap_or_else(tokio::runtime::Handle::current)
+    };
+    if let Some(state) = &mut state {
+        state.blocking.retain(|receipt| !*receipt.borrow());
+        state.blocking.push(completed);
+    }
+    drop(state);
+    let mut owner = Completed {
+        complete,
+        scope: scope.clone(),
+        registry,
+        outcome: None,
+    };
+    runtime.spawn(async move {
+        owner.outcome = Some(match scope {
+            Some(scope) => scope.run(work).await,
+            None => work.await,
+        });
+        drop(owner);
+    });
+    Ok(())
+}
+
 pub fn spawn(command: Command) -> io::Result<Child> {
     if let Ok(scope) = PROCESS_SCOPE.try_with(Clone::clone) {
         // Admission and shutdown serialize, including clones used concurrently.
@@ -338,6 +511,7 @@ fn spawn_registered(mut command: Command, registry: std::sync::Arc<Registry>) ->
     let mut child = platform::spawn(command)?;
     let stdin = platform::stdin(&mut child);
     let stdout = platform::stdout(&mut child);
+    let stderr = platform::stderr(&mut child);
     let (stop, receiver) = watch::channel(false);
     let (status, result) = watch::channel(None);
     let id = owners.next_id;
@@ -366,6 +540,7 @@ fn spawn_registered(mut command: Command, registry: std::sync::Arc<Registry>) ->
         status: result,
         stdin,
         stdout,
+        stderr,
     })
 }
 
@@ -452,6 +627,9 @@ mod platform {
     }
     pub fn stdout(tree: &mut Tree) -> Option<ChildStdout> {
         tree.child.stdout.take()
+    }
+    pub fn stderr(tree: &mut Tree) -> Option<ChildStderr> {
+        tree.child.stderr.take()
     }
 
     pub async fn reap(mut tree: Tree, mut stop: watch::Receiver<bool>) -> io::Result<ExitStatus> {
@@ -582,6 +760,9 @@ mod platform {
     pub fn stdout(tree: &mut Tree) -> Option<ChildStdout> {
         tree.child.stdout.take()
     }
+    pub fn stderr(tree: &mut Tree) -> Option<ChildStderr> {
+        tree.child.stderr.take()
+    }
 
     fn process_handles(job: HANDLE) -> io::Result<Vec<OwnedHandle>> {
         use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA};
@@ -684,6 +865,169 @@ mod tests {
     use super::*;
     use std::{path::PathBuf, process::Stdio, time::Duration};
 
+    #[tokio::test]
+    async fn supervised_scope_retains_owner_until_resources_are_disposed() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Resource(Arc<AtomicBool>);
+        impl Drop for Resource {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let disposed = Arc::new(AtomicBool::new(false));
+        let resource = Resource(disposed.clone());
+        let scope = Scope::new();
+        let registry = std::sync::Arc::new(Registry::default());
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (inherited, inherit) = tokio::sync::oneshot::channel();
+        scope
+            .run(async {
+                supervise_registered(
+                    async move {
+                        let _resource = resource;
+                        let _ = inherited.send(PROCESS_SCOPE.try_with(|_| true).unwrap_or(false));
+                        let _ = released.await;
+                        Ok(())
+                    },
+                    registry.clone(),
+                )
+                .unwrap();
+            })
+            .await;
+        assert!(inherit.await.unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), scope.shutdown())
+                .await
+                .is_err()
+        );
+        assert!(!disposed.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+        scope.shutdown().await.unwrap();
+        assert!(disposed.load(Ordering::SeqCst));
+        // A rejected admission creates no new owner and does not poison a
+        // successfully drained scope.
+        assert!(
+            scope
+                .run(async { supervise_registered(async { Ok(()) }, registry.clone()) })
+                .await
+                .is_err()
+        );
+        scope.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervised_scope_does_not_acknowledge_failed_or_panicked_disposal() {
+        let failed = Scope::new();
+        let failed_registry = std::sync::Arc::new(Registry::default());
+        failed
+            .run(async {
+                supervise_registered(
+                    async { Err(io::Error::other("fixture disposal failed")) },
+                    failed_registry.clone(),
+                )
+                .unwrap();
+            })
+            .await;
+        assert!(failed.shutdown().await.is_err());
+        assert!(failed.shutdown().await.is_err());
+        let panicked = Scope::new();
+        let panic_registry = std::sync::Arc::new(Registry::default());
+        panicked
+            .run(async {
+                supervise_registered(
+                    async { panic!("fixture asynchronous owner panicked") },
+                    panic_registry.clone(),
+                )
+                .unwrap();
+            })
+            .await;
+        assert!(panicked.shutdown().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn supervised_global_shutdown_retains_unscoped_disposal_and_failure() {
+        let registry = std::sync::Arc::new(Registry::default());
+        let (release, released) = tokio::sync::oneshot::channel();
+        supervise_registered(
+            async move {
+                let _ = released.await;
+                Ok(())
+            },
+            registry.clone(),
+        )
+        .unwrap();
+        assert_eq!(registry.owner_snapshot().unwrap().active_owners, 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), registry.shutdown())
+                .await
+                .is_err()
+        );
+        assert!(supervise_registered(async { Ok(()) }, registry.clone()).is_err());
+        release.send(()).unwrap();
+        registry.shutdown().await.unwrap();
+        let failed = std::sync::Arc::new(Registry::default());
+        supervise_registered(
+            async { Err(io::Error::other("fixture disposal failed")) },
+            failed.clone(),
+        )
+        .unwrap();
+        assert!(failed.shutdown().await.is_err());
+        assert!(failed.owner_snapshot().unwrap().cleanup_failed);
+    }
+
+    #[test]
+    fn owner_observation_is_nonblocking_and_poison_is_unavailable() {
+        let registry = std::sync::Arc::new(Registry::default());
+        assert_eq!(
+            registry.owner_snapshot(),
+            Some(OwnerSnapshot {
+                active_owners: 0,
+                admission_closed: false,
+                cleanup_failed: false,
+            })
+        );
+        let held = registry.owners.lock().unwrap();
+        assert_eq!(registry.owner_snapshot(), None);
+        drop(held);
+        let poisoned = registry.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _held = poisoned.owners.lock().unwrap();
+                panic!("poison observation fixture");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(registry.owner_snapshot(), None);
+    }
+
+    #[test]
+    fn zero_registrations_retains_cleanup_failure_and_admission_state() {
+        let registry = std::sync::Arc::new(Registry::default());
+        {
+            let mut owners = registry.owners.lock().unwrap();
+            owners.active.insert(0, watch::channel(false).0);
+            owners.closing = true;
+        }
+        assert_eq!(registry.owner_snapshot().unwrap().active_owners, 1);
+        drop(Registration {
+            registry: registry.clone(),
+            id: 0,
+            failure: Some((io::ErrorKind::Other, "fixture cleanup failure".into())),
+        });
+        assert_eq!(
+            registry.owner_snapshot(),
+            Some(OwnerSnapshot {
+                active_owners: 0,
+                admission_closed: true,
+                cleanup_failed: true,
+            })
+        );
+    }
+
     #[test]
     #[ignore = "process tree fixture launched by lifecycle tests"]
     #[allow(clippy::zombie_processes)] // Deliberately orphan a leaf to test production reaping.
@@ -755,6 +1099,36 @@ mod tests {
         fn exited(&self) -> bool {
             (unsafe { libc::kill(self.0, 0) }) != 0
                 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn successful_scope_receipt_requires_original_real_reap_and_success() {
+        let empty = Scope::new();
+        empty.shutdown().await.unwrap();
+        assert!(empty.require_successful_single_process_reap().is_err());
+        for (exit, accepted) in [(0, true), (7, false)] {
+            let scope = Scope::new();
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(format!("exit {exit}"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = scope.run(async { spawn(command).unwrap() }).await;
+            assert_eq!(child.wait().await.unwrap().code(), Some(exit));
+            assert!(
+                scope.require_successful_single_process_reap().is_err(),
+                "an observed exit alone cannot bypass original scope closure"
+            );
+            scope.shutdown().await.unwrap();
+            assert_eq!(
+                scope.require_successful_single_process_reap().is_ok(),
+                accepted,
+                "a reaped error exit is disposal evidence, not successful encoder completion"
+            );
         }
     }
 
@@ -938,6 +1312,14 @@ mod tests {
             ));
             roots.push(root);
         }
+        assert_eq!(
+            registry.owner_snapshot(),
+            Some(OwnerSnapshot {
+                active_owners: 2, // Two registered trees, each with a separate leaf.
+                admission_closed: false,
+                cleanup_failed: false,
+            })
+        );
         drop(children.pop());
         // Interrupting a shutdown waiter cannot reopen admission or discard owners.
         let mut shutdown = Box::pin(registry.shutdown());
@@ -947,6 +1329,7 @@ mod tests {
         })
         .await;
         drop(shutdown);
+        assert!(registry.owner_snapshot().unwrap().admission_closed);
         let error = spawn_registered(Command::new("must-never-be-launched"), registry.clone())
             .err()
             .unwrap();
@@ -958,6 +1341,14 @@ mod tests {
         assert!(witnesses.iter().all(Witness::exited));
         assert!(children[0].try_wait().unwrap().is_some());
         assert!(registry.owners.lock().unwrap().active.is_empty());
+        assert_eq!(
+            registry.owner_snapshot(),
+            Some(OwnerSnapshot {
+                active_owners: 0,
+                admission_closed: true,
+                cleanup_failed: false,
+            })
+        );
         registry.shutdown().await.unwrap();
         for root in roots {
             std::fs::remove_dir_all(root).unwrap();

@@ -5,6 +5,9 @@ node_modules
 .git
 .env
 .env.*
+**/.env
+**/.env.*
+**/runtime.env
 **/agent-credentials.json
 **/credentials.json
 .runtime

@@ -1,4 +1,5 @@
-import { mediaExtraResponse } from "./fixtures/media";
+import { mediaExtraResponse, mediaRecord } from "./fixtures/media";
+import { defaultAdminSettings } from "./fixtures/admin-settings";
 import { test, expect, type WebSocketRoute } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { navigate, roomPanel, showOptions } from "./fixtures/navigation";
@@ -24,36 +25,45 @@ test("room, library, invitation and settings are usable", async ({
   const commands: Record<string, unknown>[] = [];
   const firstEpoch = "11111111-1111-4111-8111-111111111111";
   const nextEpoch = "22222222-2222-4222-8222-222222222222";
+  const libraryMedia = [
+    { id: "movie", title: "山海之间", kind: "local", duration_ms: 5400000 },
+    {
+      id: "movie2",
+      title: "午夜列车",
+      kind: "jellyfin",
+      duration_ms: 6000000,
+    },
+    { id: "movie3", title: "夏日来信", kind: "http", duration_ms: 4800000 },
+    {
+      id: "movie4",
+      title: "云端漫步",
+      kind: "agent",
+      duration_ms: 4200000,
+    },
+  ].map(mediaRecord);
   await page.clock.install();
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/api/v1/**", async (route) => {
-    const extra = mediaExtraResponse(route);
+    const extra = mediaExtraResponse(route, libraryMedia);
     if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
+    if (path === "/api/v1/admin/settings" && route.request().method() === "GET")
+      return route.fulfill({ json: defaultAdminSettings });
+    if (path.endsWith("/auth/registration-policy"))
+      return route.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     let body: unknown = [];
     if (path.endsWith("/auth/me"))
       body = { id: "owner", username: "雨声", admin: true, csrf: "test" };
     else if (path === "/api/v1/rooms")
       body = [{ id: "room", name: "周末放映室", owner_id: "owner" }];
-    else if (path === "/api/v1/media")
-      body = [
-        { id: "movie", title: "山海之间", kind: "local", duration_ms: 5400000 },
-        {
-          id: "movie2",
-          title: "午夜列车",
-          kind: "jellyfin",
-          duration_ms: 6000000,
-        },
-        { id: "movie3", title: "夏日来信", kind: "http", duration_ms: 4800000 },
-        {
-          id: "movie4",
-          title: "云端漫步",
-          kind: "agent",
-          duration_ms: 4200000,
-        },
-      ];
+    else if (path === "/api/v1/media") body = libraryMedia;
     else if (path.endsWith("/invites"))
-      body = { room_id: "room", token: "invitation-test-token" };
+      body =
+        route.request().method() === "GET"
+          ? []
+          : { room_id: "room", token: "invitation-test-token" };
     await route.fulfill({ json: body });
   });
   await page.routeWebSocket("**/api/v1/ws", (ws) => {
@@ -130,8 +140,11 @@ test("room, library, invitation and settings are usable", async ({
     page.getByRole("heading", { name: "放映室", exact: true }),
   ).toBeVisible();
   await page.getByRole("button", { name: "进入房间", exact: true }).click();
-  await expect(page.locator(".connection-status")).toHaveText("已连接");
+  await expect(page.locator(".connection-status")).toHaveText("房间连接正常");
   await navigate(page, "媒体库");
+  await page
+    .getByRole("button", { name: "打开片源 回归测试片源", exact: true })
+    .click();
   await page
     .getByRole("button", { name: "播放 山海之间", exact: true })
     .click();
@@ -151,7 +164,8 @@ test("room, library, invitation and settings are usable", async ({
   await page.getByLabel("聊天消息").press("Enter");
   await expect(page.getByText("今晚一起看")).toBeVisible();
   await roomPanel(page, "待播");
-  await page.getByRole("button", { name: "房间邀请", exact: true }).click();
+  await page.getByRole("button", { name: "邀请", exact: true }).click();
+  await page.getByRole("button", { name: "生成邀请", exact: true }).click();
   await expect(page.getByLabel("完整房间邀请")).toHaveValue(
     /invitation-test-token/,
   );
@@ -168,6 +182,10 @@ test("room, library, invitation and settings are usable", async ({
     .getByRole("link", { name: /^(片源管理|管理)$/ })
     .filter({ visible: true })
     .click();
+  await expect(
+    page.getByRole("heading", { name: "管理员设置", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: /片源管理 编辑片源/ }).click();
   await page.getByRole("button", { name: "添加片源", exact: true }).click();
   await expect(page.getByRole("heading", { name: "添加片源" })).toBeVisible();
   await page.getByRole("button", { name: "关闭弹窗" }).click();
@@ -187,9 +205,13 @@ test("room, library, invitation and settings are usable", async ({
     }),
   );
   await roomPanel(page, "待播");
-  await page.getByRole("button", { name: "房间邀请", exact: true }).click();
+  await page.getByRole("button", { name: "邀请", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText("服务资源正忙");
   await expect(page.getByRole("alert")).toContainText(diagnostic);
+  await page
+    .getByRole("dialog", { name: "房间邀请", exact: true })
+    .getByRole("button", { name: "关闭弹窗" })
+    .click();
   await navigate(page, "媒体库");
   await page.getByRole("link", { name: "返回房间", exact: true }).click();
   await roomPanel(page, "聊天");
@@ -201,7 +223,7 @@ test("room, library, invitation and settings are usable", async ({
       }),
     );
     await expect(page.getByRole("alert")).toContainText("当前没有控制权限");
-    await expect(page.locator(".connection-status")).toHaveText("已连接");
+    await expect(page.locator(".connection-status")).toHaveText("房间连接正常");
     await page.getByLabel("聊天消息").fill(code);
     await page.getByLabel("聊天消息").press("Enter");
     await expect(page.getByText(code, { exact: true })).toBeVisible();
@@ -221,7 +243,7 @@ test("room, library, invitation and settings are usable", async ({
   await expect(page.locator(".connection-status")).toHaveText("正在重连");
   await page.clock.fastForward(10000);
   await expect.poll(() => connectionCount).toBe(2);
-  await expect(page.locator(".connection-status")).toHaveText("已连接");
+  await expect(page.locator(".connection-status")).toHaveText("房间连接正常");
   controlSocket!.send(
     JSON.stringify({
       type: "ERROR",
@@ -252,6 +274,10 @@ test("rejected WebSocket upgrade rechecks login and stops retrying", async ({
     const extra = mediaExtraResponse(route);
     if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/auth/registration-policy"))
+      return route.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     if (path.endsWith("/auth/me")) {
       return route.fulfill(
         expired
@@ -320,6 +346,10 @@ test("playback retries a lost HTTP response with the same operation key", async 
     const extra = mediaExtraResponse(route);
     if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/auth/registration-policy"))
+      return route.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     if (path.endsWith("/auth/me"))
       return route.fulfill({
         json: { id: "owner", username: "测试", admin: false, csrf: "test" },
@@ -379,6 +409,7 @@ test("playback retries a lost HTTP response with the same operation key", async 
       return route.fulfill({
         json: {
           session_id: "one-session",
+          plan_generation: route.request().postDataJSON().plan_generation,
           media_id: "movie",
           media_generation: 1,
           delivery_mode: "direct",
@@ -405,6 +436,7 @@ test("playback retries a lost HTTP response with the same operation key", async 
             t1: sample.t1,
             t2: sample.t1,
             t3: sample.t1,
+            clock_epoch: "epoch",
           }),
         );
       if (sample.type === "RESUME")
@@ -461,7 +493,9 @@ test("playback retries a lost HTTP response with the same operation key", async 
     .toEqual([abandoned]);
   await showOptions(page);
   await page.getByRole("button", { name: "重新加载", exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("清理暂不可用");
+  await expect(page.getByRole("alert")).toContainText("播放服务暂不可用");
+  await expect(page.getByRole("alert")).not.toContainText("清理暂不可用");
+  await expect(page.locator(".global-notice")).toHaveCount(0);
   expect(requests.length).toBe(7);
   loseResponses = false;
   cleanupOffline = false;
@@ -506,6 +540,10 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
     const extra = mediaExtraResponse(route);
     if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/auth/registration-policy"))
+      return route.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     if (path.endsWith("/auth/me"))
       return route.fulfill({
         json: { id: "owner", username: "test", admin: false, csrf: "test" },
@@ -540,6 +578,7 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
       return route.fulfill({
         json: {
           session_id: id,
+          plan_generation: body.plan_generation,
           media_id: "movie",
           media_generation: 1,
           delivery_mode: "direct",
@@ -569,6 +608,7 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
             t1: frame.t1,
             t2: frame.t1,
             t3: frame.t1,
+            clock_epoch: "epoch",
           }),
         );
       if (frame.type === "RESUME")
@@ -605,7 +645,7 @@ test("rapid audio switches preserve the newest plan while an old DELETE is delay
   );
   if (!isMobile && !(await page.evaluate(() => !!document.fullscreenElement))) {
     await page.locator("video").hover();
-    await page.getByRole("button", { name: "全屏", exact: true }).click();
+    await page.getByRole("button", { name: "仅视频全屏", exact: true }).click();
     await expect
       .poll(() =>
         page.evaluate(() =>
@@ -689,6 +729,10 @@ test("subtitle identity survives reload and resets on media change", async ({
     const extra = mediaExtraResponse(route);
     if (extra) return extra;
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/auth/registration-policy"))
+      return route.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     if (path.endsWith("/auth/me"))
       return route.fulfill({
         json: { id: "owner", username: "test", admin: false, csrf: "test" },
@@ -721,6 +765,7 @@ test("subtitle identity survives reload and resets on media change", async ({
       return route.fulfill({
         json: {
           session_id: `subtitle-${plans}`,
+          plan_generation: route.request().postDataJSON().plan_generation,
           media_id: state.media_id,
           media_generation: state.media_generation,
           delivery_mode: "direct",
@@ -748,6 +793,7 @@ test("subtitle identity survives reload and resets on media change", async ({
             t1: frame.t1,
             t2: frame.t1,
             t3: frame.t1,
+            clock_epoch: state.clock_epoch,
           }),
         );
       if (frame.type === "RESUME")
@@ -772,7 +818,7 @@ test("subtitle identity survives reload and resets on media change", async ({
     .toBeGreaterThanOrEqual(2);
   if (!isMobile) {
     await page.locator("video").hover();
-    await page.getByRole("button", { name: "全屏", exact: true }).click();
+    await page.getByRole("button", { name: "仅视频全屏", exact: true }).click();
     await expect
       .poll(() =>
         page.evaluate(() =>

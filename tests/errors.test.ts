@@ -52,3 +52,31 @@ it("command permission errors do not terminate the watching connection", () => {
     stopsReconnect(new RequestFailure({ error: { code: "NOT_A_MEMBER" } })),
   ).toBe(true);
 });
+
+it("explains locally detected stale playback plans without automatic retry", () => {
+  const failure = new RequestFailure({
+    error: { code: "STALE_PLAYBACK_PLAN" },
+  });
+  expect(failure.message).toContain("新的操作替代");
+  expect(failure.retryable).toBe(false);
+  expect(
+    new RequestFailure({ error: { code: "PLAYBACK_VIEWER_LIMIT_EXCEEDED" } })
+      .message,
+  ).toContain("现有播放器");
+});
+
+it("shows media failure guidance without treating upstream denial as logout", () => {
+  for (const code of [
+    "MEDIA_INPUT_INVALID",
+    "MEDIA_INPUT_DENIED",
+    "MEDIA_DECODER_UNAVAILABLE",
+    "MEDIA_ENCODER_UNAVAILABLE",
+  ]) {
+    const error = new RequestFailure({
+      error: { code, message: "请检查媒体或处理程序", retryable: false },
+    });
+    expect(error.message).toBe("请检查媒体或处理程序");
+    expect(error.retryable).toBe(false);
+    expect(stopsReconnect(error)).toBe(false);
+  }
+});

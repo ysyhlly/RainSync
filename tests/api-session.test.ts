@@ -4,7 +4,10 @@ import {
   createApiClient,
   StaleIdentity,
 } from "../apps/web/src/shared/api/client";
-import { useSession } from "../apps/web/src/features/auth/session.store";
+import {
+  RegistrationConfirmationRequired,
+  useSession,
+} from "../apps/web/src/features/auth/session.store";
 
 afterEach(() => vi.unstubAllGlobals());
 it("late auth refresh cannot revert separately saved nickname or avatar", async () => {
@@ -185,4 +188,52 @@ it("serializes cookie writes until an aborted earlier login has settled", async 
   expect(aborted).toBe(true);
   expect(requests).toEqual(["alice", "bob"]);
   expect(s.user?.username).toBe("bob");
+});
+
+it("retains the committed registration receipt when its separate identity read fails", async () => {
+  setActivePinia(createPinia());
+  const s = useSession();
+  const created = user("new-account");
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce(Response.json(created, { status: 201 }))
+    .mockResolvedValueOnce(
+      Response.json(
+        { error: { code: "SERVICE_UNAVAILABLE" } },
+        { status: 503 },
+      ),
+    )
+    .mockResolvedValueOnce(Response.json(created));
+  vi.stubGlobal("fetch", fetch);
+  const failure = await s
+    .register({ username: created.username, password: "password123" })
+    .catch((error) => error);
+  expect(failure).toBeInstanceOf(RegistrationConfirmationRequired);
+  expect(failure.receipt).toEqual({
+    id: created.id,
+    username: created.username,
+  });
+  expect(failure.cause).toMatchObject({ code: "SERVICE_UNAVAILABLE" });
+  expect(s.user).toBeNull();
+  await s.load();
+  expect(s.user?.id).toBe(created.id);
+  expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+    "/api/v1/auth/register",
+    "/api/v1/auth/me",
+    "/api/v1/auth/me",
+  ]);
+});
+
+it("keeps definitive signup rejection separate from post-commit confirmation", async () => {
+  setActivePinia(createPinia());
+  const s = useSession();
+  const fetch = vi.fn(async () =>
+    Response.json({ error: { code: "USERNAME_TAKEN" } }, { status: 409 }),
+  );
+  vi.stubGlobal("fetch", fetch);
+  await expect(
+    s.register({ username: "taken", password: "password123" }),
+  ).rejects.toMatchObject({ code: "USERNAME_TAKEN" });
+  expect(fetch).toHaveBeenCalledOnce();
+  expect(s.user).toBeNull();
 });

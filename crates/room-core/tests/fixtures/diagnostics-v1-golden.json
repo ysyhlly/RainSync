@@ -1,0 +1,439 @@
+{
+  "format_version": 1,
+  "reducer_version": "room-diagnostics/1",
+  "room_id": "00000000-0000-0000-0000-000000000001",
+  "captured_at_ms": 1800000000100,
+  "after_revision": 4,
+  "retained_from_revision": 5,
+  "snapshot": {
+    "room_id": "00000000-0000-0000-0000-000000000001",
+    "revision": 11,
+    "media_id": "00000000-0000-0000-0000-000000000002",
+    "media_generation": 3,
+    "playback_status": "playing",
+    "anchor_position_ms": 2300.0,
+    "anchor_server_time_ms": 900.0,
+    "playback_rate": 1.5,
+    "controller_user_id": "00000000-0000-0000-0000-000000000004",
+    "duration_ms": 10000.0,
+    "clock_epoch": "00000000-0000-0000-0000-000000000009"
+  },
+  "lifecycle": {
+    "state": "active",
+    "epoch": 0
+  },
+  "events": [
+    {
+      "revision": 5,
+      "recorded_at_ms": 1800000000000,
+      "after": {
+        "room_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 5,
+        "media_id": "00000000-0000-0000-0000-000000000002",
+        "media_generation": 3,
+        "playback_status": "paused",
+        "anchor_position_ms": 1200.0,
+        "anchor_server_time_ms": 300.0,
+        "playback_rate": 1.0,
+        "controller_user_id": "00000000-0000-0000-0000-000000000003",
+        "duration_ms": 10000.0,
+        "clock_epoch": "00000000-0000-0000-0000-000000000009"
+      },
+      "envelope": {
+        "schema_version": 1,
+        "reducer_version": "room-diagnostics/1",
+        "event_id": "00000000-0000-0000-0000-0000000000c8",
+        "actor_id": "00000000-0000-0000-0000-000000000003",
+        "actor_is_admin": false,
+        "before": {
+          "room_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 4,
+          "media_id": "00000000-0000-0000-0000-000000000002",
+          "media_generation": 3,
+          "playback_status": "playing",
+          "anchor_position_ms": 1000.0,
+          "anchor_server_time_ms": 100.0,
+          "playback_rate": 1.0,
+          "controller_user_id": "00000000-0000-0000-0000-000000000003",
+          "duration_ms": 10000.0,
+          "clock_epoch": "00000000-0000-0000-0000-000000000009"
+        },
+        "lifecycle_before": {
+          "state": "active",
+          "epoch": 0
+        },
+        "lifecycle_after": {
+          "state": "active",
+          "epoch": 0
+        },
+        "operation": {
+          "kind": "control",
+          "command": {
+            "protocol_version": 1,
+            "command_id": "00000000-0000-0000-0000-000000000064",
+            "expected_revision": 4,
+            "media_generation": 3,
+            "action": {
+              "type": "PAUSE"
+            }
+          },
+          "server_time_ms": 300.0
+        }
+      },
+      "unavailable": null
+    },
+    {
+      "revision": 6,
+      "recorded_at_ms": 1800000000001,
+      "after": {
+        "room_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 6,
+        "media_id": "00000000-0000-0000-0000-000000000002",
+        "media_generation": 3,
+        "playback_status": "paused",
+        "anchor_position_ms": 2000.0,
+        "anchor_server_time_ms": 400.0,
+        "playback_rate": 1.0,
+        "controller_user_id": "00000000-0000-0000-0000-000000000003",
+        "duration_ms": 10000.0,
+        "clock_epoch": "00000000-0000-0000-0000-000000000009"
+      },
+      "envelope": {
+        "schema_version": 1,
+        "reducer_version": "room-diagnostics/1",
+        "event_id": "00000000-0000-0000-0000-0000000000c9",
+        "actor_id": "00000000-0000-0000-0000-000000000003",
+        "actor_is_admin": false,
+        "before": {
+          "room_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 5,
+          "media_id": "00000000-0000-0000-0000-000000000002",
+          "media_generation": 3,
+          "playback_status": "paused",
+          "anchor_position_ms": 1200.0,
+          "anchor_server_time_ms": 300.0,
+          "playback_rate": 1.0,
+          "controller_user_id": "00000000-0000-0000-0000-000000000003",
+          "duration_ms": 10000.0,
+          "clock_epoch": "00000000-0000-0000-0000-000000000009"
+        },
+        "lifecycle_before": {
+          "state": "active",
+          "epoch": 0
+        },
+        "lifecycle_after": {
+          "state": "active",
+          "epoch": 0
+        },
+        "operation": {
+          "kind": "control",
+          "command": {
+            "protocol_version": 1,
+            "command_id": "00000000-0000-0000-0000-000000000065",
+            "expected_revision": 5,
+            "media_generation": 3,
+            "action": {
+              "type": "SEEK",
+              "payload": {
+                "position_ms": 2000.0
+              }
+            }
+          },
+          "server_time_ms": 400.0
+        }
+      },
+      "unavailable": null
+    },
+    {
+      "revision": 7,
+      "recorded_at_ms": 1800000000002,
+      "after": {
+        "room_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 7,
+        "media_id": "00000000-0000-0000-0000-000000000002",
+        "media_generation": 3,
+        "playback_status": "paused",
+        "anchor_position_ms": 2000.0,
+        "anchor_server_time_ms": 500.0,
+        "playback_rate": 1.5,
+        "controller_user_id": "00000000-0000-0000-0000-000000000003",
+        "duration_ms": 10000.0,
+        "clock_epoch": "00000000-0000-0000-0000-000000000009"
+      },
+      "envelope": {
+        "schema_version": 1,
+        "reducer_version": "room-diagnostics/1",
+        "event_id": "00000000-0000-0000-0000-0000000000ca",
+        "actor_id": "00000000-0000-0000-0000-000000000003",
+        "actor_is_admin": false,
+        "before": {
+          "room_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 6,
+          "media_id": "00000000-0000-0000-0000-000000000002",
+          "media_generation": 3,
+          "playback_status": "paused",
+          "anchor_position_ms": 2000.0,
+          "anchor_server_time_ms": 400.0,
+          "playback_rate": 1.0,
+          "controller_user_id": "00000000-0000-0000-0000-000000000003",
+          "duration_ms": 10000.0,
+          "clock_epoch": "00000000-0000-0000-0000-000000000009"
+        },
+        "lifecycle_before": {
+          "state": "active",
+          "epoch": 0
+        },
+        "lifecycle_after": {
+          "state": "active",
+          "epoch": 0
+        },
+        "operation": {
+          "kind": "control",
+          "command": {
+            "protocol_version": 1,
+            "command_id": "00000000-0000-0000-0000-000000000066",
+            "expected_revision": 6,
+            "media_generation": 3,
+            "action": {
+              "type": "SET_RATE",
+              "payload": {
+                "rate": 1.5
+              }
+            }
+          },
+          "server_time_ms": 500.0
+        }
+      },
+      "unavailable": null
+    },
+    {
+      "revision": 8,
+      "recorded_at_ms": 1800000000003,
+      "after": {
+        "room_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 8,
+        "media_id": "00000000-0000-0000-0000-000000000002",
+        "media_generation": 3,
+        "playback_status": "playing",
+        "anchor_position_ms": 2000.0,
+        "anchor_server_time_ms": 600.0,
+        "playback_rate": 1.5,
+        "controller_user_id": "00000000-0000-0000-0000-000000000003",
+        "duration_ms": 10000.0,
+        "clock_epoch": "00000000-0000-0000-0000-000000000009"
+      },
+      "envelope": {
+        "schema_version": 1,
+        "reducer_version": "room-diagnostics/1",
+        "event_id": "00000000-0000-0000-0000-0000000000cb",
+        "actor_id": "00000000-0000-0000-0000-000000000003",
+        "actor_is_admin": false,
+        "before": {
+          "room_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 7,
+          "media_id": "00000000-0000-0000-0000-000000000002",
+          "media_generation": 3,
+          "playback_status": "paused",
+          "anchor_position_ms": 2000.0,
+          "anchor_server_time_ms": 500.0,
+          "playback_rate": 1.5,
+          "controller_user_id": "00000000-0000-0000-0000-000000000003",
+          "duration_ms": 10000.0,
+          "clock_epoch": "00000000-0000-0000-0000-000000000009"
+        },
+        "lifecycle_before": {
+          "state": "active",
+          "epoch": 0
+        },
+        "lifecycle_after": {
+          "state": "active",
+          "epoch": 0
+        },
+        "operation": {
+          "kind": "control",
+          "command": {
+            "protocol_version": 1,
+            "command_id": "00000000-0000-0000-0000-000000000067",
+            "expected_revision": 7,
+            "media_generation": 3,
+            "action": {
+              "type": "PLAY"
+            }
+          },
+          "server_time_ms": 600.0
+        }
+      },
+      "unavailable": null
+    },
+    {
+      "revision": 9,
+      "recorded_at_ms": 1800000000004,
+      "after": {
+        "room_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 9,
+        "media_id": "00000000-0000-0000-0000-000000000002",
+        "media_generation": 3,
+        "playback_status": "paused",
+        "anchor_position_ms": 2300.0,
+        "anchor_server_time_ms": 800.0,
+        "playback_rate": 1.5,
+        "controller_user_id": "00000000-0000-0000-0000-000000000003",
+        "duration_ms": 10000.0,
+        "clock_epoch": "00000000-0000-0000-0000-000000000009"
+      },
+      "envelope": {
+        "schema_version": 1,
+        "reducer_version": "room-diagnostics/1",
+        "event_id": "00000000-0000-0000-0000-0000000000cc",
+        "actor_id": "00000000-0000-0000-0000-000000000003",
+        "actor_is_admin": false,
+        "before": {
+          "room_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 8,
+          "media_id": "00000000-0000-0000-0000-000000000002",
+          "media_generation": 3,
+          "playback_status": "playing",
+          "anchor_position_ms": 2000.0,
+          "anchor_server_time_ms": 600.0,
+          "playback_rate": 1.5,
+          "controller_user_id": "00000000-0000-0000-0000-000000000003",
+          "duration_ms": 10000.0,
+          "clock_epoch": "00000000-0000-0000-0000-000000000009"
+        },
+        "lifecycle_before": {
+          "state": "active",
+          "epoch": 0
+        },
+        "lifecycle_after": {
+          "state": "active",
+          "epoch": 0
+        },
+        "operation": {
+          "kind": "control",
+          "command": {
+            "protocol_version": 1,
+            "command_id": "00000000-0000-0000-0000-000000000068",
+            "expected_revision": 8,
+            "media_generation": 3,
+            "action": {
+              "type": "PAUSE"
+            }
+          },
+          "server_time_ms": 800.0
+        }
+      },
+      "unavailable": null
+    },
+    {
+      "revision": 10,
+      "recorded_at_ms": 1800000000005,
+      "after": {
+        "room_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 10,
+        "media_id": "00000000-0000-0000-0000-000000000002",
+        "media_generation": 3,
+        "playback_status": "paused",
+        "anchor_position_ms": 2300.0,
+        "anchor_server_time_ms": 800.0,
+        "playback_rate": 1.5,
+        "controller_user_id": "00000000-0000-0000-0000-000000000004",
+        "duration_ms": 10000.0,
+        "clock_epoch": "00000000-0000-0000-0000-000000000009"
+      },
+      "envelope": {
+        "schema_version": 1,
+        "reducer_version": "room-diagnostics/1",
+        "event_id": "00000000-0000-0000-0000-0000000000cd",
+        "actor_id": "00000000-0000-0000-0000-000000000003",
+        "actor_is_admin": false,
+        "before": {
+          "room_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 9,
+          "media_id": "00000000-0000-0000-0000-000000000002",
+          "media_generation": 3,
+          "playback_status": "paused",
+          "anchor_position_ms": 2300.0,
+          "anchor_server_time_ms": 800.0,
+          "playback_rate": 1.5,
+          "controller_user_id": "00000000-0000-0000-0000-000000000003",
+          "duration_ms": 10000.0,
+          "clock_epoch": "00000000-0000-0000-0000-000000000009"
+        },
+        "lifecycle_before": {
+          "state": "active",
+          "epoch": 0
+        },
+        "lifecycle_after": {
+          "state": "active",
+          "epoch": 0
+        },
+        "operation": {
+          "kind": "ownership",
+          "expected_revision": 9,
+          "controller_user_id": "00000000-0000-0000-0000-000000000004"
+        }
+      },
+      "unavailable": null
+    },
+    {
+      "revision": 11,
+      "recorded_at_ms": 1800000000006,
+      "after": {
+        "room_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 11,
+        "media_id": "00000000-0000-0000-0000-000000000002",
+        "media_generation": 3,
+        "playback_status": "playing",
+        "anchor_position_ms": 2300.0,
+        "anchor_server_time_ms": 900.0,
+        "playback_rate": 1.5,
+        "controller_user_id": "00000000-0000-0000-0000-000000000004",
+        "duration_ms": 10000.0,
+        "clock_epoch": "00000000-0000-0000-0000-000000000009"
+      },
+      "envelope": {
+        "schema_version": 1,
+        "reducer_version": "room-diagnostics/1",
+        "event_id": "00000000-0000-0000-0000-0000000000ce",
+        "actor_id": "00000000-0000-0000-0000-000000000004",
+        "actor_is_admin": false,
+        "before": {
+          "room_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 10,
+          "media_id": "00000000-0000-0000-0000-000000000002",
+          "media_generation": 3,
+          "playback_status": "paused",
+          "anchor_position_ms": 2300.0,
+          "anchor_server_time_ms": 800.0,
+          "playback_rate": 1.5,
+          "controller_user_id": "00000000-0000-0000-0000-000000000004",
+          "duration_ms": 10000.0,
+          "clock_epoch": "00000000-0000-0000-0000-000000000009"
+        },
+        "lifecycle_before": {
+          "state": "active",
+          "epoch": 0
+        },
+        "lifecycle_after": {
+          "state": "active",
+          "epoch": 0
+        },
+        "operation": {
+          "kind": "control",
+          "command": {
+            "protocol_version": 1,
+            "command_id": "00000000-0000-0000-0000-00000000006a",
+            "expected_revision": 10,
+            "media_generation": 3,
+            "action": {
+              "type": "PLAY"
+            }
+          },
+          "server_time_ms": 900.0
+        }
+      },
+      "unavailable": null
+    }
+  ],
+  "truncated": false
+}

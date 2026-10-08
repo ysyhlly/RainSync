@@ -1,4 +1,4 @@
-import { mediaExtraResponse } from "./fixtures/media";
+import { mediaExtraResponse, mediaRecord } from "./fixtures/media";
 import { readFileSync } from "node:fs";
 import { test, expect, type Page, type WebSocketRoute } from "@playwright/test";
 import { navigate, chooseRoom, showOptions } from "./fixtures/navigation";
@@ -26,7 +26,70 @@ test("library navigation requests bounded pages and searches beyond the current 
       })),
     });
   });
+  const browseQueries: URLSearchParams[] = [];
+  await page.route("**/api/v1/media/browse?*", (route) => {
+    const q = new URL(route.request().url()).searchParams;
+    browseQueries.push(q);
+    const node = q.get("node"),
+      start = q.get("after") ? Number(q.get("after")!.split("-")[1]) + 1 : 0,
+      limit = Number(q.get("limit")),
+      rows = Array.from({ length: Math.min(limit, 150 - start) }, (_, n) =>
+        mediaRecord({
+          id: `item-${start + n}`,
+          title: `entry-${start + n}`,
+          kind: "http",
+        }),
+      );
+    return route.fulfill({
+      json: {
+        node,
+        breadcrumbs: [
+          { id: null, name: "全部片源" },
+          ...(node ? [{ id: "source", name: "分页测试片源" }] : []),
+          ...(node === "folder" ? [{ id: "folder", name: "分页目录" }] : []),
+        ],
+        entries: !node
+          ? [
+              {
+                type: "source",
+                id: "source",
+                name: "分页测试片源",
+                kind: "http",
+                media_count: 150,
+              },
+            ]
+          : node === "source"
+            ? [
+                {
+                  type: "folder",
+                  id: "folder",
+                  name: "分页目录",
+                  media_count: 150,
+                },
+              ]
+            : rows.map((media) => ({ type: "media", media })),
+        total_media: 150,
+        next_cursor:
+          node === "folder" && start + limit < 150 ? rows.at(-1)!.id : null,
+      },
+    });
+  });
   await navigate(page, "媒体库");
+  await page
+    .getByRole("button", { name: "打开片源 分页测试片源", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "打开目录 分页目录", exact: true })
+    .click();
+  await expect(page.locator(".media-card")).toHaveCount(24);
+  await page.getByRole("button", { name: "下一页", exact: true }).click();
+  await expect(page.locator(".media-card")).toHaveCount(24);
+  expect(browseQueries.at(-1)!.get("after")).toBe("item-23");
+  await page.getByRole("button", { name: "上一页", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "播放 entry-0", exact: true }),
+  ).toBeVisible();
+  expect(browseQueries.every((q) => q.get("limit") === "24")).toBe(true);
   await page.getByLabel("搜索影片").fill("entry");
   await page.getByLabel("搜索影片").press("Enter");
   await expect(page.locator(".media-card")).toHaveCount(24);
@@ -48,29 +111,94 @@ async function setup(
   page: Page,
   opts: {
     holdClock?: boolean;
+    deterministicClock?: boolean;
     holdRoom?: boolean;
     validMedia?: boolean;
     nativeHls?: boolean;
     holdReady?: boolean;
     playbackUrl?: string;
+    anchorServerTimeMs?: number;
+    playbackStatus?: "playing" | "paused";
   } = {},
 ) {
-  await page.clock.install();
-  await page.addInitScript(() => {
-    Object.defineProperty(HTMLMediaElement.prototype, "readyState", {
-      get: () => 4,
-    });
-    Object.defineProperty(HTMLMediaElement.prototype, "duration", {
-      get: () => 3600,
-    });
-    HTMLMediaElement.prototype.play = async function () {};
-    HTMLMediaElement.prototype.pause = function () {};
-  });
+  if (opts.deterministicClock) {
+    const start = new Date("2026-10-05T12:00:00Z");
+    await page.clock.install({ time: start });
+    await page.clock.pauseAt(new Date(start.getTime() + 1000));
+  } else await page.clock.install();
+  await page.addInitScript(
+    ({ validMedia }) => {
+      const playing = new WeakSet<HTMLMediaElement>();
+      // These component fixtures already simulate readiness, duration and play.
+      // Keep their time ranges and frame callbacks consistent with that model;
+      // real decode and presentation are verified by the separate NAS/browser soak.
+      Object.defineProperty(HTMLMediaElement.prototype, "readyState", {
+        get: () => 4,
+      });
+      Object.defineProperty(HTMLMediaElement.prototype, "duration", {
+        get: () => 3600,
+      });
+      HTMLMediaElement.prototype.play = async function () {
+        playing.add(this);
+      };
+      HTMLMediaElement.prototype.pause = function () {
+        playing.delete(this);
+      };
+      HTMLVideoElement.prototype.requestVideoFrameCallback = function (
+        callback,
+      ) {
+        const element = this;
+        const frame = () => {
+          if (playing.has(element) || !element.paused) {
+            timers.delete(id);
+            callback(performance.now(), {
+              presentationTime: performance.now(),
+              mediaTime: element.currentTime,
+            } as VideoFrameCallbackMetadata);
+          } else timers.set(id, setTimeout(frame, 100));
+        };
+        const id = ++serial;
+        timers.set(id, setTimeout(frame, 100));
+        return id;
+      };
+      let serial = 0;
+      const timers = new Map<number, ReturnType<typeof setTimeout>>();
+      HTMLVideoElement.prototype.cancelVideoFrameCallback = (id) => {
+        clearTimeout(timers.get(id));
+        timers.delete(id);
+      };
+      if (validMedia) {
+        const positions = new WeakMap<HTMLMediaElement, number>();
+        Object.defineProperties(HTMLMediaElement.prototype, {
+          currentTime: {
+            configurable: true,
+            get() {
+              return positions.get(this) ?? 0;
+            },
+            set(value) {
+              positions.set(this, value);
+            },
+          },
+          seekable: {
+            configurable: true,
+            get: () => ({ length: 1, start: () => 0, end: () => 3600 }),
+          },
+          buffered: {
+            configurable: true,
+            get: () => ({ length: 1, start: () => 0, end: () => 3600 }),
+          },
+        });
+      }
+    },
+    { validMedia: opts.validMedia === true },
+  );
   const frames: any[] = [],
     preparations: any[] = [],
+    planGenerations = new Map<string, number>(),
     sockets: WebSocketRoute[] = [];
   let replyClock = !opts.holdClock,
     clockFrame: any;
+  const clockEpoch = "epoch";
   let releaseHistory: (() => void) | undefined,
     releasePlaylist: (() => void) | undefined;
   let renewal: (() => void) | undefined,
@@ -94,6 +222,10 @@ async function setup(
     if (extra) return extra;
     const url = new URL(r.request().url()),
       path = url.pathname;
+    if (path.endsWith("/auth/registration-policy"))
+      return r.fulfill({
+        json: { registration_mode: "invite_only", guests_enabled: false },
+      });
     if (path.endsWith("/auth/me"))
       return r.fulfill({
         json: { id: "owner", username: "owner", csrf: "csrf", admin: false },
@@ -126,9 +258,14 @@ async function setup(
     }
     if (path.endsWith("/playback-sessions")) {
       preparations.push(r.request().postDataJSON());
+      planGenerations.set(
+        `session-${preparations.length}`,
+        preparations.at(-1).plan_generation,
+      );
       return r.fulfill({
         json: {
           session_id: `session-${preparations.length}`,
+          plan_generation: preparations.at(-1).plan_generation,
           media_id: "movie",
           media_generation: 1,
           delivery_mode: "direct",
@@ -152,6 +289,7 @@ async function setup(
       return r.fulfill({
         json: {
           session_id: path.split("/").at(-1),
+          plan_generation: planGenerations.get(path.split("/").at(-1)!),
           status: mediaReady ? "ready" : "preparing",
           complete: false,
         },
@@ -190,13 +328,13 @@ async function setup(
               revision: 1,
               media_id: "movie",
               media_generation: 1,
-              playback_status: "playing",
+              playback_status: opts.playbackStatus ?? "playing",
               anchor_position_ms: 0,
-              anchor_server_time_ms: 200000,
+              anchor_server_time_ms: opts.anchorServerTimeMs ?? 200000,
               playback_rate: 1,
               controller_user_id: "owner",
               duration_ms: 3600000,
-              clock_epoch: "epoch",
+              clock_epoch: clockEpoch,
             },
           }),
         );
@@ -209,32 +347,45 @@ async function setup(
               t1: v.t1,
               t2: 2000000,
               t3: 2000000,
+              clock_epoch: clockEpoch,
             }),
           );
       }
     });
   });
   await page.goto("/rooms/a");
-  await expect(page.locator(".connection-status")).toHaveText("已连接");
+  await expect(page.locator(".connection-status")).toHaveText("房间连接正常");
   await expect.poll(() => clockFrame?.type).toBe("CLOCK_SYNC");
+  const heldClockFrame = clockFrame;
   return {
     frames,
     preparations,
+    planGenerations,
     sockets,
     history,
     readinessReads: () => readinessReads,
     releaseReady() {
       mediaReady = true;
     },
-    releaseClock() {
-      replyClock = true;
+    replyHeldClock() {
       sockets.at(-1)!.send(
         JSON.stringify({
           type: "CLOCK_SYNC_REPLY",
-          t1: clockFrame.t1,
+          t1: heldClockFrame.t1,
           t2: 2000000,
           t3: 2000000,
+          clock_epoch: clockEpoch,
         }),
+      );
+    },
+    async releaseClock() {
+      replyClock = true;
+      // Solicit a fresh round through the real bfcache wake path. A held reply
+      // can expire while fixture setup runs and must not bypass the pending TTL.
+      await page.evaluate(() =>
+        window.dispatchEvent(
+          new PageTransitionEvent("pageshow", { persisted: true }),
+        ),
       );
     },
     releaseRoom() {
@@ -267,13 +418,22 @@ test("does not load unpublished media or allocate a second session while waiting
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
-test("playing snapshot waits for clock; visibility preserves offset and dragging survives ticks", async ({
+test("playing snapshot rejects expired clock replies; a fresh wake unlocks playback and visible-only events preserve it", async ({
   page,
 }) => {
   const h = await setup(page, { holdClock: true });
-  await page.clock.fastForward(1000);
+  await page.clock.runFor(6000);
   expect(h.preparations).toHaveLength(0);
-  h.releaseClock();
+  await expect(page.locator(".playback-host [role=status]")).toHaveText(
+    "正在重新校准房间时间…",
+  );
+  h.replyHeldClock();
+  await page.clock.runFor(100);
+  expect(h.preparations).toHaveLength(0);
+  await expect(page.locator(".playback-host [role=status]")).toHaveText(
+    "正在重新校准房间时间…",
+  );
+  await h.releaseClock();
   await expect.poll(() => h.preparations.length).toBe(1);
   expect(h.preparations[0].position_ms).toBeGreaterThan(1799000);
   await page
@@ -341,7 +501,7 @@ test("reconnect merges missed chat and an old renewal cannot fail the new plan",
   await expect.poll(() => h.preparations.length).toBe(2);
   h.releaseRenew();
   await expect(page.getByRole("alert")).not.toContainText("播放会话已失效");
-  await expect(page.locator(".room-information h1")).toHaveText("a");
+  await expect(page.locator(".room-information-widget h1")).toHaveText("a");
 });
 
 test("rejected chat retains input until its own acknowledgement", async ({
@@ -403,9 +563,11 @@ test("stale HLS attempt refetches entry manifest without a new playback session"
   let hlsPlans = 0;
   await page.route("**/api/v1/playback-sessions", async (r) => {
     hlsPlans++;
+    h.planGenerations.set("hls", r.request().postDataJSON().plan_generation);
     return r.fulfill({
       json: {
         session_id: "hls",
+        plan_generation: r.request().postDataJSON().plan_generation,
         media_id: "movie",
         media_generation: 1,
         delivery_mode: "transcode",
@@ -486,7 +648,7 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
             window.eventHls = this;
             window.eventHlsInitial ??= this;
             window.eventMediaSourceInitial ??= this.mediaSource;
-            window.eventHlsStats ??= { instances: 0, loads: [], detaches: 0, attaches: 0, starts: [], manifests: [], plays: 0, errors: [] };
+            window.eventHlsStats ??= { instances: 0, loads: [], detaches: 0, attaches: 0, starts: [], manifests: [], plays: 0, errors: [], recoverySequence: [] };
             window.eventHlsStats.instances++;
             this.timer = setInterval(() => { void this.refresh() }, 250);
           }
@@ -497,6 +659,7 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
               const response = await fetch(this.url);
               if (!response.ok) {
                 window.eventHlsStats.errors.push(response.status);
+                window.eventHlsStats.recoverySequence.push("error:" + response.status);
                 this.error?.(Hls.Events.ERROR, { fatal: true, response: { code: response.status }, details: 'manifestLoadError' });
                 return;
               }
@@ -515,6 +678,7 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
           }
           loadSource(url) {
             if (this.media && this.url) {
+              window.eventHlsStats.recoverySequence.push('recovery');
               const media = this.media;
               this.detachMedia();
               this.mediaSource = new MediaSource();
@@ -558,6 +722,9 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
   const h = await setup(page, {
     holdClock: true,
     nativeHls: true,
+    // A four-second headroom window must advance only through runFor; real
+    // elapsed time during network assertions can otherwise cause extra resumes.
+    deterministicClock: true,
     playbackUrl: "/media-delivery/session-1/attempt-1/index.m3u8?token=test",
   });
   let publishedUntil = 1802000;
@@ -571,6 +738,7 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
     return route.fulfill({
       json: {
         session_id: "session-1",
+        plan_generation: h.planGenerations.get("session-1"),
         status: position < publishedUntil ? "ready" : "preparing",
         available_until_ms: publishedUntil,
         complete: false,
@@ -615,7 +783,7 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
         paused: document.querySelector("video")!.paused,
       };
     });
-  h.releaseClock();
+  await h.releaseClock();
   await expect.poll(() => reads.length).toBe(1);
   await page.clock.runFor(1000);
   expect(await page.evaluate(() => (window as any).eventHls)).toBeUndefined();
@@ -647,7 +815,24 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
     await page.clock.runFor(1000);
     resumes++;
     await expect.poll(async () => (await stats()).starts.length).toBe(resumes);
+    // startLoad requests the refreshed EVENT manifest asynchronously. A paused
+    // browser clock must not advance playback against the previous short range
+    // before the real fetch has completed and the fixture has exposed its end.
+    await expect
+      .poll(async () => (await stats()).manifests.at(-1)?.end)
+      .toBe(publishedUntil / 1000);
     await page.clock.runFor(300);
+    await expect
+      .poll(async () => {
+        const value = await stats();
+        if (value.paused || value.current <= waitingRead.position / 1000)
+          await page.clock.runFor(100);
+        const progressed = await stats();
+        return (
+          !progressed.paused && progressed.current > waitingRead.position / 1000
+        );
+      })
+      .toBe(true);
     const after = await stats();
     expect(after.current).toBeGreaterThan(waitingRead.position / 1000);
     expect(after.paused).toBe(false);
@@ -678,12 +863,30 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
   expect((await stats()).sameMediaSource).toBe(false);
   await expect(page.getByRole("alert")).toHaveCount(0);
   manifestFailures = 3;
-  for (let failure = 2; failure <= 4; failure++) {
-    await page.clock.runFor(250);
-    await expect.poll(async () => (await stats()).errors.length).toBe(failure);
-  }
+  // The installed clock also advances while route responses and polling await.
+  // Consecutive errors can therefore cross an intermediate count between polls.
+  // Keep the burst and exact final sequence/budget assertions; do not require
+  // observing every transient count as if fetch completion were synchronous.
+  await page.clock.runFor(750);
+  await expect
+    .poll(async () => {
+      // HTTP completion can occur after runFor returns. Advance the paused
+      // clock until the next refresh runs, while retaining the exact retry budget.
+      if ((await stats()).errors.length < 4) await page.clock.runFor(250);
+      return (await stats()).errors;
+    })
+    .toEqual([409, 409, 409, 409]);
   const failed = await stats();
   expect(failed.errors).toEqual([409, 409, 409, 409]);
+  expect(failed.recoverySequence).toEqual([
+    "error:409",
+    "recovery",
+    "error:409",
+    "recovery",
+    "error:409",
+    "recovery",
+    "error:409",
+  ]);
   expect(failed.loads).toHaveLength(4);
   expect(failed.detaches).toBe(3);
   expect(failed.attaches).toBe(4);
@@ -695,17 +898,42 @@ test("same-attempt EVENT growth keeps its Hls and MediaSource while waiting for 
 test("room chooser without a selection preserves the current viewing connection", async ({
   page,
 }) => {
-  const h = await setup(page, { validMedia: true });
+  const h = await setup(page, {
+    validMedia: true,
+    anchorServerTimeMs: 2000000,
+  });
   await expect.poll(() => h.preparations.length).toBe(1);
   await navigate(page, "放映室");
   await expect(page.locator(".mini-player")).toBeVisible();
   await page.getByRole("link", { name: "返回房间", exact: true }).click();
-  await expect(page.locator(".room-information h1")).toHaveText("a");
+  await expect(page.locator(".room-information-widget h1")).toHaveText("a");
   await page.clock.fastForward(1000);
   expect(h.sockets).toHaveLength(1);
   expect(h.preparations).toHaveLength(1);
   await expect(page.locator("video")).toHaveAttribute("src", /empty-video/);
   await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("mini player keeps calibration visible until a fresh clock reply arrives", async ({
+  page,
+}, info) => {
+  const h = await setup(page, {
+    holdClock: true,
+    validMedia: true,
+    anchorServerTimeMs: 2000000,
+  });
+  await navigate(page, "放映室");
+  const mini = page.locator(".mini-player");
+  await expect(mini).toBeVisible();
+  const status = mini.getByRole("status");
+  await expect(status).toBeVisible();
+  await expect(status).toHaveText("正在重新校准房间时间…");
+  expect(h.preparations).toHaveLength(0);
+  await page.screenshot({ path: info.outputPath("mini-calibration.png") });
+  await h.releaseClock();
+  await expect.poll(() => h.preparations.length).toBe(1);
+  await expect(mini.locator("video")).toHaveAttribute("src", /empty-video/);
+  expect(h.sockets).toHaveLength(1);
 });
 
 test("native HLS recovery keeps room time and waits for a growing replacement playlist", async ({
@@ -807,6 +1035,7 @@ test("ending an incomplete generated prefix waits without advancing the room", a
     return r.fulfill({
       json: {
         session_id: "session-1",
+        plan_generation: h.planGenerations.get("session-1"),
         status: reads === 1 ? "ready" : "preparing",
         complete: false,
         available_until_ms: 10000,
@@ -850,6 +1079,7 @@ test("a growing output waits for the room position and resumes the same native s
     return r.fulfill({
       json: {
         session_id: "session-1",
+        plan_generation: h.planGenerations.get("session-1"),
         status: ready ? "ready" : "preparing",
         complete: false,
         available_until_ms: ready ? 1900000 : 10000,
@@ -929,6 +1159,7 @@ for (const action of [
         await route.fulfill({
           json: {
             session_id: "session-1",
+            plan_generation: h.planGenerations.get("session-1"),
             status: "ready",
             complete: false,
             available_until_ms: 3600000,
@@ -995,7 +1226,7 @@ for (const action of [
   });
 }
 
-test("teardown media errors are silent while an active unsupported resource is reported", async ({
+test("teardown media errors are silent while active ambiguous media support is reported", async ({
   page,
 }) => {
   await page.addInitScript(() => {
@@ -1006,7 +1237,10 @@ test("teardown media errors are silent while an active unsupported resource is r
       if (empty) queueMicrotask(() => this.dispatchEvent(new Event("error")));
     };
   });
-  const h = await setup(page, { validMedia: true });
+  const h = await setup(page, {
+    validMedia: true,
+    playbackStatus: "paused",
+  });
   await expect.poll(() => h.preparations.length).toBe(1);
   await expect(page.getByRole("alert")).toHaveCount(0);
   await showOptions(page);
@@ -1022,5 +1256,9 @@ test("teardown media errors are silent while an active unsupported resource is r
     Object.defineProperty(el, "error", { get: () => ({ code: 4 }) });
     el.dispatchEvent(new Event("error"));
   });
-  await expect(page.getByRole("alert")).toContainText("无法播放此格式");
+  await expect(page.getByRole("alert")).toContainText(
+    "媒体加载或格式支持状态未知，请检查连接后重新加载",
+  );
+  await page.clock.fastForward(500);
+  expect(h.preparations).toHaveLength(3);
 });

@@ -71,8 +71,33 @@ pub struct Attempt {
     pub generation: i64,
 }
 pub async fn claim(db: &PgPool, owner: Uuid) -> anyhow::Result<Option<Attempt>> {
+    claim_with_limit(db, owner, 128).await
+}
+
+pub async fn claim_with_limit(
+    db: &PgPool,
+    owner: Uuid,
+    limit: i64,
+) -> anyhow::Result<Option<Attempt>> {
+    anyhow::ensure!((1..=4096).contains(&limit), "invalid_preview_queue_limit");
     let mut tx = db.begin().await?;
-    sqlx::query("UPDATE media_previews SET status=CASE WHEN attempt>=3 THEN 'unavailable' ELSE 'queued' END,owner_id=NULL,lease_until=NULL,next_attempt_at=clock_timestamp()+CASE WHEN attempt>=3 THEN interval '60 seconds' ELSE interval '0 seconds' END,error_code='MEDIA_PREVIEW_UNAVAILABLE' WHERE status='running' AND lease_until<=clock_timestamp()").execute(&mut *tx).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(LOCK)
+        .execute(&mut *tx)
+        .await?;
+    // Expired work for a changed input retains its requested intent until there
+    // is capacity to rebuild it. A live old owner is never reclaimed here.
+    sqlx::query(&format!("UPDATE media_previews p SET status=CASE WHEN attempt>=3 THEN 'unavailable' ELSE 'queued' END,owner_id=NULL,lease_until=NULL,next_attempt_at=clock_timestamp()+CASE WHEN attempt>=3 THEN interval '60 seconds' ELSE interval '0 seconds' END,error_code='MEDIA_PREVIEW_UNAVAILABLE' WHERE status='running' AND lease_until<=clock_timestamp() AND NOT EXISTS(SELECT 1 FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=p.media_id AND p.source_generation<>m.preview_generation AND {VALID})")).execute(&mut *tx).await?;
+    let visible: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM media_previews p JOIN media_items m ON m.id=p.media_id JOIN sources s ON s.id=m.source_id WHERE p.status IN ('queued','running') AND {VALID} AND {FRESH}"))
+        .fetch_one(&mut *tx).await?;
+    if visible < limit {
+        // A source rescan can commit after enqueue. Keep that queued request
+        // useful without another POST, but do not resurrect all stale rows and
+        // bypass the bounded admission queue. Only the new input gets a fresh
+        // retry budget; request order is preserved and old UUIDs stay fenced.
+        sqlx::query(&format!("UPDATE media_previews p SET source_generation=m.preview_generation,recipe_version=2,result_revision=gen_random_uuid(),status='queued',attempt=0,attempt_id=NULL,owner_id=NULL,lease_until=NULL,next_attempt_at=clock_timestamp(),generated_at=NULL,image=NULL,image_sha256=NULL,error_code=NULL FROM media_items m WHERE m.id=p.media_id AND p.media_id=(SELECT old.media_id FROM media_previews old JOIN media_items m ON m.id=old.media_id JOIN sources s ON s.id=m.source_id WHERE old.source_generation<>m.preview_generation AND (old.status='queued' OR (old.status='running' AND old.lease_until<=clock_timestamp())) AND {VALID} ORDER BY old.requested_at,old.media_id FOR UPDATE OF old SKIP LOCKED LIMIT 1)"))
+            .execute(&mut *tx).await?;
+    }
     let row=sqlx::query(&format!("SELECT p.media_id,p.source_generation FROM media_previews p JOIN media_items m ON m.id=p.media_id JOIN sources s ON s.id=m.source_id WHERE p.status='queued' AND p.next_attempt_at<=clock_timestamp() AND {VALID} AND {FRESH} ORDER BY p.requested_at FOR UPDATE OF p SKIP LOCKED LIMIT 1")).fetch_optional(&mut *tx).await?;
     let Some(row) = row else {
         tx.commit().await?;
@@ -90,9 +115,24 @@ pub async fn claim(db: &PgPool, owner: Uuid) -> anyhow::Result<Option<Attempt>> 
     Ok(Some(attempt))
 }
 pub async fn renew(db: &PgPool, a: &Attempt) -> anyhow::Result<bool> {
+    let mut tx = db.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout='750ms'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout='1500ms'")
+        .execute(&mut *tx)
+        .await?;
+    // Lock first, then evaluate wall-clock expiry in a new statement. The
+    // initial UPDATE predicate can be evaluated before waiting for a row lock.
+    sqlx::query("SELECT media_id FROM media_previews WHERE media_id=$1 FOR UPDATE")
+        .bind(a.media_id)
+        .execute(&mut *tx)
+        .await?;
     let changed=sqlx::query(&format!("UPDATE media_previews p SET lease_until=clock_timestamp()+interval '15 seconds' FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=p.media_id AND p.media_id=$1 AND p.attempt_id=$2 AND p.owner_id=$3 AND p.status='running' AND p.lease_until>clock_timestamp() AND {VALID} AND {FRESH}"))
-        .bind(a.media_id).bind(a.attempt_id).bind(a.owner_id).execute(db).await?;
-    Ok(changed.rows_affected() == 1)
+        .bind(a.media_id).bind(a.attempt_id).bind(a.owner_id).execute(&mut *tx).await?;
+    let renewed = changed.rows_affected() == 1;
+    tx.commit().await?;
+    Ok(renewed)
 }
 pub async fn finish(
     db: &PgPool,
@@ -102,6 +142,12 @@ pub async fn finish(
     budget: i64,
 ) -> anyhow::Result<bool> {
     let mut tx = db.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout='750ms'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout='1500ms'")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(LOCK)
         .execute(&mut *tx)
@@ -117,6 +163,10 @@ pub async fn finish(
             .execute(&mut *tx)
             .await?;
     }
+    sqlx::query("SELECT media_id FROM media_previews WHERE media_id=$1 FOR UPDATE")
+        .bind(a.media_id)
+        .execute(&mut *tx)
+        .await?;
     let oversized = image.is_some_and(|(bytes, _)| bytes.len() as i64 > budget);
     let image = image.filter(|_| !oversized);
     let retry = retry && !oversized;

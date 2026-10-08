@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { appFixture, appBase } from "./fixtures/application";
+import { appFixture, appBase, openFixtureSource } from "./fixtures/application";
 
 test("new entry keeps one video and connection through library navigation and same-room return", async ({
   page,
@@ -51,10 +51,11 @@ test("library pages use bounded cursors and server search without invented metad
 }) => {
   const app = await appFixture(page);
   await page.goto(appBase + "/library");
+  await openFixtureSource(page);
   await expect(page.locator(".media-card")).toHaveCount(24);
   await page.getByRole("button", { name: "下一页" }).click();
   await expect(page.locator(".media-card")).toHaveCount(6);
-  expect(app.searches.some((s) => s.includes("after=movie-23"))).toBe(true);
+  expect(app.searches.some((s) => s.includes("after=fixture-next"))).toBe(true);
   await page.getByLabel("搜索影片").fill("测试影片 29");
   await page.getByLabel("搜索影片").press("Enter");
   await expect(page.locator(".media-card")).toHaveCount(1);
@@ -98,6 +99,7 @@ test("beige tokens, media ratio, dialogs and required widths remain usable", asy
     page.getByRole("button", { name: "创建房间", exact: true }),
   ).toBeFocused();
   await page.goto(appBase + "/library");
+  await openFixtureSource(page);
   for (const width of [360, 390, 768, 1024, 1440, 1920]) {
     await page.setViewportSize({ width, height: 900 });
     expect(
@@ -121,7 +123,7 @@ test("beige tokens, media ratio, dialogs and required widths remain usable", asy
         .trim()
         .toUpperCase(),
     ),
-  ).toBe("#FFF4D5");
+  ).toBe("#F5F0E6");
   expect(
     await page.evaluate(() =>
       getComputedStyle(document.documentElement)
@@ -129,7 +131,7 @@ test("beige tokens, media ratio, dialogs and required widths remain usable", asy
         .trim()
         .toUpperCase(),
     ),
-  ).toBe("#D2B49C");
+  ).toBe("#D7BDA5");
   await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
   expect(
     await page.evaluate(
@@ -205,9 +207,13 @@ test("returning to the library refreshes scanned media while retaining the searc
   await page.getByRole("button", { name: "搜索", exact: true }).click();
   await expect(page.getByText("没有找到匹配影片")).toBeVisible();
   await page
-    .getByRole("link", { name: /^(片源管理|管理)$/ })
+    .getByRole("link", { name: /^(管理员设置|管理)$/ })
     .filter({ visible: true })
     .click();
+  await expect(
+    page.getByRole("heading", { name: "管理员设置", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: /片源管理 编辑片源/ }).click();
   await expect(
     page.getByRole("heading", { name: "片源管理", exact: true }),
   ).toBeVisible();

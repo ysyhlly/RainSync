@@ -1,9 +1,13 @@
+// Historical account/profile rollout fixture (0019→0022), not current release evidence.
+import { requireHistoricalCompatibility } from "./fixtures/historical-compatibility.mjs";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isolatedServer } from "./fixtures/server.mjs";
 import { png } from "./fixtures/png.mjs";
+
+await requireHistoricalCompatibility();
 
 const manifest=JSON.parse(await readFile(resolve(process.env.RAINSYNC_ARTIFACT_DIR,"compatibility/latest.json"),"utf8"));
 const binary=resolve(manifest.baselineTarget,"debug",`rainsync-server${process.platform==="win32"?".exe":""}`);
@@ -33,5 +37,5 @@ await isolatedServer("upgrade",async(f)=>{
   assert.deepEqual(await created.request("/rooms"),[]);
   await created.request(`/rooms/${room.id}/join`,"POST",{token:roomInvite.token});
   assert.equal((await created.request("/rooms"))[0].id,room.id);
-  console.log("PASS: actual untouched baseline starts at migration 0019, issues legacy sessions and room invitations; latest Server applies 0020/0021/0022 without changing old checksums/users/credentials/membership, then supports nickname/avatar/registration independently");
+  console.log("PASS: actual untouched baseline starts at migration 0019, issues legacy sessions and room invitations; historical 0022 Server applies 0020/0021/0022 without changing old checksums/users/credentials/membership, then supports nickname/avatar/registration independently");
 },{binary,env:{ADMIN_USERNAME:"旧管理员",ADMIN_PASSWORD:"旧密码12345678"}});

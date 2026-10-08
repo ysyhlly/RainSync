@@ -1,0 +1,62 @@
+import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+const read = (path: string) => readFileSync(resolve(process.cwd(), path), "utf8");
+
+describe("dedicated local HLS ladder runtime boundary", () => {
+  it("keeps older queues and scalar publication proofs separate", () => {
+    const queue = read("crates/persistence/src/media_jobs.rs");
+    expect(queue.replace(/\s+/g, "")).toContain("j.logical_queue='local_hls_ladder_v1' AND local_hls_ladder_job_spec_valid(j.spec) AND local_hls_ladder_session_allowed(j.session_id)".replace(/\s+/g, ""));
+    expect(queue.replace(/\s+/g, "")).toContain("claimed.logical_queue='local_hls_ladder_v1' AND local_hls_ladder_job_spec_valid(claimed.spec) AND local_hls_ladder_session_allowed(claimed.session_id)".replace(/\s+/g, ""));
+    expect(queue.replace(/\s+/g, "")).toContain("const LEGACY_QUEUE".replace(/\s+/g, ""));
+    expect(queue.replace(/\s+/g, "")).toContain("rainsync.local_hls_ladder_recipe".replace(/\s+/g, ""));
+    const scalar = read("crates/persistence/src/media_outputs.rs");
+    expect(scalar.replace(/\s+/g, "")).toContain("validation_version=3".replace(/\s+/g, ""));
+    expect(scalar).not.toContain("validation_version=5");
+    const migration = read("migrations/0057_local_hls_ladder.sql");
+    expect(migration.replace(/\s+/g, "")).toContain("local_hls_ladder_no_reclassification".replace(/\s+/g, ""));
+    expect(migration.replace(/\s+/g, "")).toContain("local_hls_ladder_session_immutable".replace(/\s+/g, ""));
+    expect(migration.replace(/\s+/g, "")).toContain("local_hls_ladder_file_immutable".replace(/\s+/g, ""));
+    expect(migration.replace(/\s+/g, "")).toContain("local_hls_ladder_output_contract_required".replace(/\s+/g, ""));
+    expect(migration.replace(/\s+/g, "")).toContain("rainsync.local_hls_ladder_reader".replace(/\s+/g, ""));
+  });
+  it("binds publications to every rendition and a qualified common prefix", () => {
+    const runtime = read("apps/media-worker/src/local_hls_ladder.rs");
+    expect(runtime.replace(/\s+/g, "")).toContain("qualify_rendition".replace(/\s+/g, ""));
+    expect(runtime.replace(/\s+/g, "")).toContain("qualified.refresh_playlist".replace(/\s+/g, ""));
+    expect(runtime.replace(/\s+/g, "")).toContain("qualified.append_fragment".replace(/\s+/g, ""));
+    expect(runtime.replace(/\s+/g, "")).toContain("qualified.available_through()+1".replace(/\s+/g, ""));
+    expect(runtime.replace(/\s+/g, "")).toContain("rung.decoder.verify".replace(/\s+/g, ""));
+    expect(runtime.replace(/\s+/g, "")).toContain("rung.decoder.stop().await?".replace(/\s+/g, ""));
+    expect(runtime.replace(/\s+/g, "")).toContain("outputs::open_verified".replace(/\s+/g, ""));
+    expect(runtime.replace(/\s+/g, "")).toContain("local_hls_ladder_encoder_reap_required".replace(/\s+/g, ""));
+    expect(runtime.replace(/\s+/g, "")).toContain("local_hls_ladder_truncated_output".replace(/\s+/g, ""));
+    expect(runtime.replace(/\s+/g, "")).toContain("finalize_fenced".replace(/\s+/g, ""));
+    expect(runtime).not.toContain("var_stream_map");
+    const persistent = read("crates/persistence/src/local_hls_ladder.rs");
+    expect(persistent.replace(/\s+/g, "")).toContain("published_output_changed".replace(/\s+/g, ""));
+    expect(persistent.replace(/\s+/g, "")).toContain("snapshot.segment_count".replace(/\s+/g, ""));
+    expect(persistent.replace(/\s+/g, "")).toContain("hls_ladder_job_allowed(id)".replace(/\s+/g, ""));
+    expect(persistent.replace(/\s+/g, "")).toContain("validation_version=5".replace(/\s+/g, ""));
+  });
+  it("routes every child through one closed token and attempt fence", () => {
+    const delivery = read("apps/media-worker/src/local_hls_ladder_read.rs");
+    expect(delivery.replace(/\s+/g, "")).toContain("Resource::parse(&path)".replace(/\s+/g, ""));
+    expect(delivery.replace(/\s+/g, "")).toContain("playback_access::protect_local_hls_ladder".replace(/\s+/g, ""));
+    expect(delivery.replace(/\s+/g, "")).toContain("source_version::verify(&encrypted)".replace(/\s+/g, ""));
+    expect(delivery.replace(/\s+/g, "")).toContain("resource!=Resource::Master && q.attempt.is_none()".replace(/\s+/g, ""));
+    expect(delivery.replace(/\s+/g, "")).toContain("index<snapshot.segment_count as usize".replace(/\s+/g, ""));
+    expect(delivery.replace(/\s+/g, "")).toContain("/ladder/{path}?token={}&attempt={attempt}".replace(/\s+/g, ""));
+    expect(delivery.replace(/\s+/g, "")).toContain("Some(proof)".replace(/\s+/g, ""));
+    const access = read("apps/media-worker/src/playback_access.rs");
+    expect(access.replace(/\s+/g, "")).toContain("p.auth_login_hash=$3".replace(/\s+/g, ""));
+    expect(access.replace(/\s+/g, "")).toContain("login.token_hash=p.auth_login_hash AND login.user_id=p.user_id".replace(/\s+/g, ""));
+    expect(access.replace(/\s+/g, "")).toContain("login.expires_at>clock_timestamp()".replace(/\s+/g, ""));
+    expect(access.replace(/\s+/g, "")).toContain("j.attempt=$4".replace(/\s+/g, ""));
+    expect(access.replace(/\s+/g, "")).toContain("local_hls_ladder_session_allowed(p.id)".replace(/\s+/g, ""));
+    const main = read("apps/media-worker/src/main.rs");
+    expect(main.replace(/\s+/g, "")).toContain("/media-delivery/{id}/ladder/{*path}".replace(/\s+/g, ""));
+    expect(main.replace(/\s+/g, "")).toContain("dedicated_ladder_endpoint_required".replace(/\s+/g, ""));
+    expect(main.replace(/\s+/g, "")).toContain("local_hls_ladder::run".replace(/\s+/g, ""));
+  });
+});

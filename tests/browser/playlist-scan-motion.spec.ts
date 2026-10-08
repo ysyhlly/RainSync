@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { appFixture } from "./fixtures/application";
+import { appFixture, openFixtureSource } from "./fixtures/application";
 
 test("bulk scans include offline NAS and preserve successful source results", async ({
   page,
@@ -26,6 +26,7 @@ test("bulk scans include offline NAS and preserve successful source results", as
     await route.fulfill({ json: { status: "offline" } });
   });
   await page.goto("/library");
+  await openFixtureSource(page);
   await page.getByRole("button", { name: "扫描所有片源" }).click();
   await expect(page.locator(".scan-results")).toContainText(
     "本次扫描发现 3 部影片",
@@ -41,6 +42,7 @@ test("viewer cannot see scan-all and library retains queue button", async ({
 }) => {
   await appFixture(page, { admin: false });
   await page.goto("/library");
+  await openFixtureSource(page);
   await expect(page.getByRole("button", { name: "扫描所有片源" })).toHaveCount(
     0,
   );
@@ -58,12 +60,18 @@ test("drawer stays modal during closing then restores focus", async ({
   await trigger.click();
   const dialog = page.getByRole("dialog", { name: "添加片源" });
   await expect(dialog).toBeVisible();
-  await page.evaluate(() => {
+  const closing = await page.evaluate(async () => {
     const dialog = document.querySelector<HTMLDialogElement>("dialog[open]")!;
     (dialog.querySelector("button") as HTMLButtonElement).click();
+    // Sample both facts after Vue's update, in one browser turn. Separate
+    // protocol round trips can outlive the short closing animation.
+    await Promise.resolve();
+    return {
+      closing: dialog.classList.contains("closing"),
+      modal: dialog.open,
+    };
   });
-  await expect(dialog).toHaveClass(/closing/);
-  expect(await dialog.evaluate((el: HTMLDialogElement) => el.open)).toBe(true);
+  expect(closing).toEqual({ closing: true, modal: true });
   await expect(dialog).toBeHidden();
   await expect(trigger).toBeFocused();
   await trigger.click();

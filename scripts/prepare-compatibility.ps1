@@ -3,6 +3,15 @@ param(
     [string]$Baseline = '13262053eb5f949a7e9dea6f2a11d2e1cbe7ce6e'
 )
 $ErrorActionPreference = 'Stop'
+# Historical profile/account rollout only. A current candidate must use the
+# source-bound isolated rehearsal documented in docs/COMPATIBILITY.md.
+if ($env:RAINSYNC_HISTORICAL_COMPATIBILITY -ne '0019-0022') {
+    throw 'Historical 0019->0022 fixture only. Use deploy/preview-transition.mjs and tests/current-baseline-upgrade.test.mjs for current candidates.'
+}
+$versions = Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot '../migrations') -Filter '*.sql' | ForEach-Object { [int]($_.Name.Split('_')[0]) }
+if (($versions | Measure-Object -Maximum).Maximum -ne 22) {
+    throw 'Use the frozen 0022 candidate checkout for this historical fixture. Never weaken SQLx migration guards.'
+}
 if ($Baseline -notmatch '^[0-9a-f]{40}$') { throw 'A complete baseline commit SHA is required.' }
 . (Join-Path $PSScriptRoot 'validation-env.ps1') -ArtifactRoot $ArtifactRoot
 $project = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))

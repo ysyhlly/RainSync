@@ -1,8 +1,10 @@
+import { sourceMedia } from "./fixtures/source-grant.mjs";
 import assert from "node:assert/strict";
 import { randomUUID, randomBytes, createCipheriv, createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { readFile, readdir } from "node:fs/promises";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 import { delay } from "./fixtures/server.mjs";
 
 const quote = value => `'${String(value).replaceAll("'", "''")}'`;
@@ -11,14 +13,22 @@ async function until(check, description, timeout = 30000) {
   while (Date.now() < end) { if (await check()) return; await delay(50); }
   throw Error(`deadline: ${description}`);
 }
-async function childrenOf(parent) {
+async function childrenOf(parent, job) {
   const children=[];
   for (const pid of await readdir("/proc")) {
     if (!/^\d+$/.test(pid)) continue;
     try {
       const stat=await readFile(`/proc/${pid}/stat`,"utf8");
       const fields=stat.slice(stat.lastIndexOf(")")+2).split(" ");
-      if (Number(fields[1])===parent) children.push(Number(pid));
+      if (Number(fields[1])!==parent) continue;
+      const args=(await readFile(`/proc/${pid}/cmdline`,"utf8")).split("\0");
+      const owned=args.some(argument=>{
+        let path=argument;
+        try { path=new URL(argument).pathname; } catch {}
+        return path.split(/[\\/]/).includes(job);
+      });
+      // Readiness tool children are unrelated to this job's resource custody.
+      if (owned) children.push(Number(pid));
     } catch {}
   }
   return children;
@@ -35,6 +45,7 @@ await isolatedMediaStack("room-cleanup", async f => {
   const upstream=createServer((req,res)=>{
     if(req.url==="/source") { sourceRequests++; res.writeHead(200,{"Content-Type":"video/mp4","Content-Length":1024*1024*1024}); res.flushHeaders(); return; }
     req.resume();
+    if(req.url==="/Users/fixture") {res.writeHead(200,{"Content-Type":"application/json"}).end(JSON.stringify({Id:"fixture",Policy:{IsDisabled:false,EnableMediaPlayback:true}}));return;}
     if(req.url.startsWith("/Items/") && req.url.endsWith("/PlaybackInfo")) {
       const reply=()=>res.writeHead(200,{"Content-Type":"application/json"}).end(JSON.stringify({PlaySessionId:randomUUID(),MediaSources:[{Id:"fixture",SupportsDirectPlay:true,MediaStreams:[],RunTimeTicks:300000000}]}));
       if(negotiation==="defer") releaseNegotiation=reply;
@@ -53,18 +64,18 @@ await isolatedMediaStack("room-cleanup", async f => {
   const lifecycle=id=>client.request(`/rooms/${id}/lifecycle`);
   const close=async id=>{ const current=await lifecycle(id); return client.request(`/rooms/${id}/close`,"POST",{expected_revision:current.state.revision}); };
   const waitClosed=async id=>until(async()=> (await lifecycle(id)).lifecycle==="closed","room cleanup completed");
-  const seed=(id,room,resource)=>{
+  const seed=(id,room,resource,{key=randomUUID(),reservation=""}={})=>{
     const token=randomBytes(24).toString("hex");
-    f.sql(`INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${user.id}','${room}',0,'${createHash("sha256").update(token).digest("hex")}',${quote(JSON.stringify({encrypted:encrypt(resource)}))},now()+interval '1 hour')`);
+    const media=resource.kind==="agent"?"NULL":quote(sourceMedia(f,resource));
+    withPlaybackAdmission(f, { client, user: user.id, room, session: id, key }, `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES(${media},'${id}','${user.id}','${room}',0,'${createHash("sha256").update(token).digest("hex")}',${quote(JSON.stringify({encrypted:encrypt(resource)}))},now()+interval '1 hour'); ${reservation}`);
     return token;
   };
   let paused=false;
   try {
     await f.startWorker();
-    const external=await room("upstream retry across restart"), session=randomUUID();
+    const external=await room("upstream retry across restart"), session=randomUUID(), key=randomUUID();
     const resource={kind:"jellyfin",upstream_base:remote,upstream_item:"fixture",upstream_session:randomUUID(),headers:{},transport:"progressive"};
-    seed(session,external.id,resource);
-    f.sql(`INSERT INTO upstream_reservations(id,user_id,request_key,owner_epoch,room_id,media_id,source_id,generation,kind,device_id,origin_key,scope_encrypted,play_session_id,state,negotiation,lifecycle_epoch,play_method,start_reported) VALUES('${session}','${user.id}','${randomUUID()}','${randomUUID()}','${external.id}','${randomUUID()}','${randomUUID()}',0,'jellyfin','fixture-${session}','fixture-origin',${quote(encrypt({config:{url:remote,token:"fixture",user_id:"fixture"},item:"fixture"}))},'${resource.upstream_session}','active','received',0,'DirectPlay',true)`);
+    seed(session,external.id,resource,{key,reservation:`INSERT INTO upstream_reservations(id,user_id,request_key,owner_epoch,room_id,media_id,source_id,generation,kind,device_id,origin_key,scope_encrypted,play_session_id,state,negotiation,lifecycle_epoch,play_method,start_reported) VALUES('${session}','${user.id}','${key}','${randomUUID()}','${external.id}','${randomUUID()}','${randomUUID()}',0,'jellyfin','fixture-${session}','fixture-origin',${quote(encrypt({config:{url:remote,token:"fixture",user_id:"fixture"},item:"fixture"}))},'${resource.upstream_session}','active','received',0,'DirectPlay',true)`});
     assert.equal((await close(external.id)).lifecycle,"closing");
     await until(()=>stops>0,"first upstream stop failure");
     await until(async()=>Boolean((await lifecycle(external.id)).cleanup?.last_error),"observable cleanup failure");
@@ -145,7 +156,7 @@ await isolatedMediaStack("room-cleanup", async f => {
     const token=seed(job,local.id,{kind:"http",url:`${remote}/source`,headers:{},transport:"progressive"});
     f.sql(`INSERT INTO media_jobs(id,session_id,status,spec) VALUES('${job}','${job}','queued',${quote(JSON.stringify({input_ticket:encrypt({token}),transcode:true,start_seconds:0,estimated_output_bytes:65536}))})`);
     await until(()=>sourceRequests>0,"actual FFmpeg waiting on HTTP source");
-    const processes=await childrenOf(f.workerPid);
+    const processes=await childrenOf(f.workerPid,job);
     assert.ok(processes.length>0,"real FFmpeg child must exist");
     assert.equal(f.sql(`SELECT count(*) FROM media_executions WHERE job_id='${job}' AND reaped_at IS NULL`),"1");
     process.kill(f.workerPid,"SIGSTOP"); paused=true;

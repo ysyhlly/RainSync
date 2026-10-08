@@ -1,4 +1,8 @@
 {$SITE_ADDRESS:localhost} {
+    # Purpose-separated Worker ingress is service-private, not browser API.
+    handle /api/v1/internal/native-platform-input/* {
+        respond 404
+    }
     handle /api/* {
         reverse_proxy server:8080
     }
@@ -13,8 +17,19 @@
         try_files {path} /index.html
         file_server
     }
+    # The callback is a same-origin nonce-script bridge. Preserve its stricter,
+    # per-response CSP instead of intersecting it with the static-app policy.
+    @standard_security {
+        not path /api/v1/platform-accounts/douyin/oauth/callback /api/v1/platform-accounts/tiktok/oauth/callback
+    }
+    header @standard_security Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; worker-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+    @oauth_callback path /api/v1/platform-accounts/douyin/oauth/callback /api/v1/platform-accounts/tiktok/oauth/callback
+    header @oauth_callback {
+        Cache-Control no-store
+        # Errors get a closed default; successful bridge responses keep nonce CSP.
+        ?Content-Security-Policy "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+    }
     header {
-        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; worker-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
         X-Content-Type-Options nosniff
         Referrer-Policy no-referrer
         X-Frame-Options DENY

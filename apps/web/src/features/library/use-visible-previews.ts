@@ -37,24 +37,32 @@ export function useVisiblePreviews(
     const signal = controller.signal;
     try {
       for (const id of visible)
-        if (catalog.records[id]?.cover.status === "ready") requested.delete(id);
+        if (catalog.records[id]?.cover.status === "ready") {
+          requested.delete(id);
+          began.delete(id);
+          retryAt.delete(id);
+          stalled.value.delete(id);
+        }
       const fresh = [...visible]
         .filter(
           (id) =>
             !requested.has(id) &&
+            !stalled.value.has(id) &&
+            Date.now() >= (retryAt.get(id) ?? 0) &&
             catalog.records[id]?.cover.status === "missing",
         )
         .slice(0, 24);
       if (fresh.length) {
         fresh.forEach((id) => {
           requested.add(id);
-          began.set(id, Date.now());
+          if (!began.has(id)) began.set(id, Date.now());
         });
         await catalog.requestPreviews(fresh, signal);
       }
       const pending = [...visible].filter(
         (id) =>
-          ["queued", "running"].includes(catalog.records[id]?.cover.status) &&
+          (["queued", "running"].includes(catalog.records[id]?.cover.status) ||
+            (requested.has(id) && catalog.records[id]?.cover.status === "missing")) &&
           !stalled.value.has(id),
       );
       for (const id of pending) {
@@ -91,11 +99,9 @@ export function useVisiblePreviews(
         [...visible].some(
           (id) =>
             !stalled.value.has(id) &&
-            ((catalog.records[id]?.cover.status === "missing" &&
-              !requested.has(id)) ||
-              ["queued", "running"].includes(
-                catalog.records[id]?.cover.status,
-              )),
+            ["missing", "queued", "running"].includes(
+              catalog.records[id]?.cover.status,
+            ),
         )
       )
         schedule(2000);
@@ -145,14 +151,16 @@ export function useVisiblePreviews(
   return {
     stalled,
     retry(id: string) {
+      const signal = controller.signal;
       stalled.value.delete(id);
       requested.add(id);
       began.set(id, Date.now());
+      retryAt.delete(id);
       void catalog
-        .requestPreviews([id], controller.signal)
-        .then(() => schedule())
+        .requestPreviews([id], signal)
+        .then(() => { if (!signal.aborted) schedule(); })
         .catch(() => {
-          stalled.value.add(id);
+          if (alive && !signal.aborted) stalled.value.add(id);
         });
     },
   };

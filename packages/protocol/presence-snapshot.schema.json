@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PresenceSnapshot",
+  "description": "A full replacement, not a delta. Sequence gaps are valid. Compare sequences\nonly within this presence epoch and room; never use room control revision.",
+  "type": "object",
+  "properties": {
+    "members": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PresenceMember"
+      }
+    },
+    "presence_epoch": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "presence_seq": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "room_id": {
+      "type": "string",
+      "format": "uuid"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "room_id",
+    "presence_epoch",
+    "presence_seq",
+    "members"
+  ],
+  "$defs": {
+    "PresenceMember": {
+      "type": "object",
+      "properties": {
+        "connection_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "user_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "user_id",
+        "connection_count"
+      ]
+    }
+  }
+}

@@ -9,3 +9,15 @@ serde_json.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 media-core.workspace = true
+sha2 = "0.10"
+hmac = "0.12"
+quick-xml = { version = "0.38", features = ["serialize"] }
+md-5 = "0.10"
+
+rsa = { version = "0.9.10", features = ["sha2"] }
+rand = "0.8"
+
+futures-util.workspace = true
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+brotli = "8"

@@ -1,0 +1,32 @@
+name: rainsync-compute-agent
+services:
+  compute:
+    image: ${RAINSYNC_IMAGE:?Set the exact matching backend image ID or digest}
+    command: ["rainsync-compute-node"]
+    environment:
+      RAINSYNC_NAS_COMPUTE_ENABLED: ${RAINSYNC_NAS_COMPUTE_ENABLED:-0}
+      SERVER_URL: ${SERVER_URL:?Set the HTTPS or loopback Server origin}
+      AGENT_CREDENTIAL_FILE: /state/credentials.json
+      COMPUTE_MEDIA_ROOT: /media
+      COMPUTE_OUTPUT_ROOT: /compute-output
+    volumes:
+      - type: bind
+        source: ${MEDIA_PATH:?Set the existing Agent media directory}
+        target: /media
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: agent_state
+        target: /state
+        read_only: true
+      - type: bind
+        source: ${COMPUTE_OUTPUT_PATH:?Set a prepared separate output directory}
+        target: /compute-output
+        bind:
+          create_host_path: false
+    restart: unless-stopped
+volumes:
+  agent_state:
+    external: true
+    name: ${RAINSYNC_AGENT_STATE_VOLUME:?Set the already-paired Agent state volume name}

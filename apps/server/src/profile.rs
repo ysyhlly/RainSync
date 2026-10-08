@@ -1,7 +1,7 @@
 use crate::*;
 
 pub async fn value(app: &App, id: Uuid) -> Result<Value> {
-    let row = sqlx::query("SELECT u.username,p.display_name AS custom_display_name,COALESCE(p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE u.id=$1")
+    let row = sqlx::query("SELECT u.username,p.display_name AS custom_display_name,COALESCE(g.display_name,p.display_name,u.username) AS display_name,a.version AS avatar_version,a.content_type AS avatar_content_type FROM users u LEFT JOIN guest_principals g ON g.user_id=u.id LEFT JOIN user_profiles p ON p.user_id=u.id LEFT JOIN user_avatars a ON a.user_id=u.id WHERE u.id=$1")
         .bind(id).fetch_one(&app.db).await?;
     Ok(
         json!({"id":id,"username":row.get::<String,_>("username"),"display_name":row.get::<String,_>("display_name"),
@@ -10,7 +10,7 @@ pub async fn value(app: &App, id: Uuid) -> Result<Value> {
 }
 pub async fn get_profile(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     let user = auth(&app, &h, false).await?;
-    Ok(registration::private_json(
+    Ok(responses::private_json(
         StatusCode::OK,
         value(&app, user.id).await?,
     ))
@@ -37,7 +37,7 @@ pub async fn update(
             .execute(&app.db)
             .await?;
     }
-    Ok(registration::private_json(
+    Ok(responses::private_json(
         StatusCode::OK,
         value(&app, user.id).await?,
     ))

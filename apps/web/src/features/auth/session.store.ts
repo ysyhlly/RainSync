@@ -2,10 +2,23 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 import { createApiClient, StaleIdentity } from "../../shared/api/client";
 import type { Avatar, Identity, Profile } from "../../shared/api/types";
+import { guestRoomPath } from "./guest-session";
 import { RequestFailure } from "../../errors";
 
 type ServerIdentity = Pick<Identity, "id" | "username" | "admin" | "csrf"> &
-  Partial<Profile>;
+  Partial<Profile> &
+  Partial<Pick<Identity, "guest" | "guest_room_id" | "guest_expires_at">>;
+export class RegistrationConfirmationRequired extends Error {
+  constructor(
+    readonly receipt: Pick<Identity, "id" | "username">,
+    cause: unknown,
+  ) {
+    super("账号已创建，登录状态尚未确认，请使用刚设置的账号登录确认", {
+      cause,
+    });
+    this.name = "RegistrationConfirmationRequired";
+  }
+}
 export const useSession = defineStore("session", () => {
   const user = ref<Identity | null>(null),
     epoch = ref(0),
@@ -13,6 +26,7 @@ export const useSession = defineStore("session", () => {
   let loadSerial = 0,
     profileRevision = 0;
   const startupError = ref("");
+  const expired = ref(false);
   let restoring: Promise<void> | undefined;
   let authentication: Promise<unknown> | undefined;
   let authenticationController: AbortController | undefined;
@@ -31,7 +45,10 @@ export const useSession = defineStore("session", () => {
       ...(external ? [external] : []),
     ]);
     const work = Promise.resolve().then(async () => {
-      await previous?.catch(() => {});
+      await previous?.catch(() => {
+        // Its original caller owns the error; only the cookie-ordering barrier
+        // is awaited here so a rejected predecessor cannot block a new login.
+      });
       signal.throwIfAborted();
       return action(signal);
     });
@@ -75,14 +92,38 @@ export const useSession = defineStore("session", () => {
     ++loadSerial;
     user.value = null;
     loaded.value = true;
+    expired.value = false;
   }
   function invalidate(failure: RequestFailure) {
-    if (["LOGIN_REQUIRED", "SESSION_EXPIRED"].includes(failure.code)) clear();
+    if (["LOGIN_REQUIRED", "SESSION_EXPIRED"].includes(failure.code)) {
+      const hadIdentity = !!user.value;
+      clear();
+      expired.value = hadIdentity || failure.code === "SESSION_EXPIRED";
+    }
   }
   function accept(value: ServerIdentity) {
     if (!value?.id || !value.username || typeof value.csrf !== "string")
       throw new TypeError("登录响应不完整，请重新登录");
-    if (value.id !== user.value?.id) {
+    if (value.guest !== undefined && typeof value.guest !== "boolean")
+      throw new TypeError("访客登录响应不完整，请重新进入");
+    if (
+      value.guest === true &&
+      (!guestRoomPath(value) ||
+        value.admin ||
+        !Number.isSafeInteger(value.guest_expires_at) ||
+        value.guest_expires_at! <= Date.now())
+    )
+      throw new TypeError("访客登录响应不完整或已过期，请重新进入");
+    if (
+      value.guest !== true &&
+      (value.guest_room_id != null || value.guest_expires_at != null)
+    )
+      throw new TypeError("登录身份类型不一致，请重新登录");
+    if (
+      value.id !== user.value?.id ||
+      !!value.guest !== !!user.value?.guest ||
+      value.guest_room_id !== user.value?.guest_room_id
+    ) {
       ++epoch.value;
       ++loadSerial;
     }
@@ -94,10 +135,16 @@ export const useSession = defineStore("session", () => {
       avatar_version: value.avatar_version ?? null,
     };
     loaded.value = true;
+    expired.value = false;
   }
   async function readIdentity(
     signal?: AbortSignal,
-    expected?: { username: string; csrf: string; id?: string },
+    expected?: {
+      username: string;
+      csrf: string;
+      id?: string;
+      guestRoom?: string;
+    },
   ) {
     const serial = ++loadSerial;
     const profileAtStart = profileRevision;
@@ -113,7 +160,9 @@ export const useSession = defineStore("session", () => {
       expected &&
       (value.username !== expected.username ||
         value.csrf !== expected.csrf ||
-        (expected.id && value.id !== expected.id))
+        (expected.id && value.id !== expected.id) ||
+        (expected.guestRoom &&
+          (value.guest !== true || value.guest_room_id !== expected.guestRoom)))
     )
       throw new StaleIdentity();
     if (profileAtStart !== profileRevision && user.value?.id === value.id) {
@@ -126,7 +175,11 @@ export const useSession = defineStore("session", () => {
     return user.value!;
   }
   async function load() {
-    while (authentication) await authentication.catch(() => {});
+    while (authentication)
+      await authentication.catch(() => {
+        // Waiting for authentication to settle does not retry or acknowledge it.
+        // The mutation's own caller reports failure before this fresh identity read.
+      });
     return readIdentity();
   }
   function login(username: string, password: string, signal?: AbortSignal) {
@@ -144,7 +197,7 @@ export const useSession = defineStore("session", () => {
   }
   function register(
     input: {
-      code: string;
+      code?: string;
       username: string;
       password: string;
       display_name?: string;
@@ -159,11 +212,57 @@ export const useSession = defineStore("session", () => {
         input,
         active,
       );
+      if (!result?.id || result.username !== input.username)
+        throw new TypeError("注册响应不完整，请先确认账号创建结果");
+      try {
+        active.throwIfAborted();
+        return await readIdentity(active, {
+          username: input.username,
+          csrf: result.csrf,
+          id: result.id,
+        });
+      } catch (cause) {
+        // A failed identity read cannot turn a committed signup back into a
+        // safely retryable creation. Keep its identity receipt without logging in.
+        throw new RegistrationConfirmationRequired(
+          { id: result.id, username: result.username },
+          cause,
+        );
+      }
+    }, signal);
+  }
+  function guest(
+    roomId: string,
+    token: string,
+    displayName: string,
+    signal?: AbortSignal,
+  ) {
+    if (user.value || authentication)
+      return Promise.reject(
+        new Error(
+          "当前已有登录或正在登录，请先完成或退出该账号，再进入访客会话。",
+        ),
+      );
+    return authenticate(async (active) => {
+      if (user.value) throw new Error("当前已登录，请先退出该账号。");
+      clear();
+      const result = await api<ServerIdentity>(
+        `/rooms/${encodeURIComponent(roomId)}/guest-session`,
+        "POST",
+        {
+          token,
+          ...(displayName.trim() ? { display_name: displayName.trim() } : {}),
+        },
+        active,
+      );
       active.throwIfAborted();
+      if (result.guest !== true || result.guest_room_id !== roomId)
+        throw new TypeError("访客会话范围不匹配，请重新确认登录状态。");
       return readIdentity(active, {
-        username: input.username,
+        username: result.username,
         csrf: result.csrf,
         id: result.id,
+        guestRoom: roomId,
       });
     }, signal);
   }
@@ -185,6 +284,7 @@ export const useSession = defineStore("session", () => {
   }
   return {
     startupError,
+    expired,
     restore,
     user,
     epoch,
@@ -197,6 +297,7 @@ export const useSession = defineStore("session", () => {
     login,
     register,
     logout,
+    guest,
     updateProfile,
   };
 });

@@ -59,9 +59,10 @@ test("selection slides with a small rebound on both navigation layouts", async (
     requestAnimationFrame(sample);
   }, isMobile);
   await nav.getByRole("link", { name: label, exact: true }).click();
+  await expect(page).toHaveURL(isMobile ? /\/admin\/settings$/ : /\/admin\/agents$/);
   await expect(
     page.getByRole("heading", {
-      name: isMobile ? "片源管理" : label,
+      name: isMobile ? "管理员设置" : label,
       exact: true,
     }),
   ).toBeVisible();
@@ -99,7 +100,19 @@ test("selection follows detail routes, profile return and viewport changes", asy
 }) => {
   await appFixture(page);
   await page.goto("/rooms/room");
-  await aligned(navigation(page, isMobile), "放映室");
+  if (isMobile) await aligned(navigation(page, true), "放映室");
+  else {
+    // The room uses the approved horizontal header with an active underline.
+    const room = navigation(page, false).getByRole("link", {
+      name: "放映室",
+      exact: true,
+    });
+    await expect(room).toHaveAttribute("aria-current", "page");
+    await expect(room).toBeVisible();
+    await expect(room).toHaveCSS("border-bottom-width", "2px");
+    await expect(room).toHaveCSS("border-bottom-style", "solid");
+    await expect(room).not.toHaveCSS("border-bottom-color", "rgba(0, 0, 0, 0)");
+  }
   await page.goto("/admin/users");
   await aligned(navigation(page, isMobile), isMobile ? "管理" : "账号与注册");
   for (const width of [390, 1200, 390]) {

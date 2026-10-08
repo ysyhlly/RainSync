@@ -3,6 +3,7 @@ import {
   PlaybackRequests,
   PlaybackCancelled,
   PlaybackTimeout,
+  PlaybackViewerOriginRequired,
   requestPlayback,
   waitPlaybackReady,
 } from "../apps/web/src/playback-request";
@@ -194,6 +195,10 @@ it("does not retry authorization, conflicts or exhausted preparation", async () 
     "PLAYBACK_REQUEST_RETRY_EXHAUSTED",
     "CACHE_READ_ONLY",
     "CACHE_PERMISSION_DENIED",
+    "MEDIA_INPUT_INVALID",
+    "MEDIA_INPUT_DENIED",
+    "MEDIA_DECODER_UNAVAILABLE",
+    "MEDIA_ENCODER_UNAVAILABLE",
   ]) {
     const error = new RequestFailure({ error: { code, retryable: true } });
     const send = vi.fn().mockRejectedValue(error);
@@ -539,3 +544,44 @@ for (const transport of ["lost", "timeout"]) {
     expect(vi.getTimerCount()).toBe(0);
   });
 }
+
+it("dedicated first-attempt origin rejection forgets only its uncreated key without cancellation", async () => {
+  const send = vi
+    .fn()
+    .mockRejectedValue(
+      new RequestFailure({
+        error: { code: "PLAYBACK_VIEWER_ORIGIN_REQUIRED" },
+      }),
+    );
+  const cancel = vi.fn();
+  const saved = storage();
+  const requests = new PlaybackRequests(send, cancel, saved, "viewer-origin");
+  await expect(
+    requests.prepare({ ...input, idempotency_key: "fresh-key" }),
+  ).rejects.toBeInstanceOf(PlaybackViewerOriginRequired);
+  expect(send).toHaveBeenCalledTimes(1);
+  expect(cancel).not.toHaveBeenCalled();
+  expect(JSON.parse(saved.getItem("viewer-origin")!)).toEqual([]);
+});
+it.each([
+  new TypeError("lost ACK"),
+  new PlaybackTimeout(),
+  new RequestFailure({ error: { code: "PLAYBACK_REQUEST_IN_PROGRESS" } }),
+])(
+  "origin rejection after an uncertain/pending attempt is never rotation authority: %s",
+  async (first) => {
+    vi.useFakeTimers();
+    const rejected = new RequestFailure({
+      error: { code: "PLAYBACK_VIEWER_ORIGIN_REQUIRED" },
+    });
+    const send = vi
+      .fn()
+      .mockRejectedValueOnce(first)
+      .mockRejectedValueOnce(rejected);
+    const pending = expect(requestPlayback(send, input)).rejects.toBe(rejected);
+    await vi.advanceTimersByTimeAsync(1000);
+    await pending;
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[0][0]).toBe(send.mock.calls[1][0]);
+  },
+);

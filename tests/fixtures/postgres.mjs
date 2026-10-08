@@ -1,21 +1,13 @@
+import { unusedPort } from "./unused-port.mjs";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
-import { createConnection, createServer } from "node:net";
+import { createConnection } from "node:net";
 import { resolve } from "node:path";
 
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
-async function unusedPort() {
-  const listener = createServer();
-  await new Promise((done, reject) =>
-    listener.once("error", reject).listen(0, "127.0.0.1", done),
-  );
-  const port = listener.address().port;
-  await new Promise((done) => listener.close(done));
-  return port;
-}
 
 export async function verifyClosedPort(port) {
   return new Promise((done, reject) => {
@@ -51,6 +43,8 @@ export function isolatedPostgres({
   password = randomBytes(24).toString("hex"),
 }) {
   const native = process.env.RAINSYNC_NATIVE_POSTGRES_BIN;
+  const nativeBinary = (name) =>
+    resolve(native, name + (process.platform === "win32" ? ".exe" : ""));
   const container = native ? null : `rainsync-${name}-${id.slice(0, 8)}`;
   const database = native ? `rainsync_${id.replaceAll("-", "")}` : "rainsync";
   const children = new Set();
@@ -110,7 +104,7 @@ export function isolatedPostgres({
   ];
   const sql = (query, db = database) =>
     native
-      ? execFileSync(resolve(native, "psql"), sqlArgs(query, db), {
+      ? execFileSync(nativeBinary("psql"), sqlArgs(query, db), {
           ...execOptions,
           env: pgEnv(),
         }).trim()
@@ -148,7 +142,7 @@ export function isolatedPostgres({
         if (initialized) {
           try {
             execFileSync(
-              resolve(native, "pg_ctl"),
+              nativeBinary("pg_ctl"),
               ["-D", resolve(root, "postgres"), "status"],
               execOptions,
             );
@@ -207,7 +201,7 @@ export function isolatedPostgres({
     },
     sqlProcess(query, { interactive = false } = {}) {
       const child = native
-        ? spawn(resolve(native, "psql"), sqlArgs(query), {
+        ? spawn(nativeBinary("psql"), sqlArgs(query), {
             env: pgEnv(),
             windowsHide: true,
             stdio: [interactive ? "pipe" : "ignore", "pipe", "pipe"],
@@ -246,7 +240,7 @@ export function isolatedPostgres({
         });
         try {
           execFileSync(
-            resolve(native, "initdb"),
+            nativeBinary("initdb"),
             [
               "-D",
               data,
@@ -265,9 +259,9 @@ export function isolatedPostgres({
           await unlink(passwordFile);
         }
         diagnostic.native = {
-          binary: resolve(native, "postgres"),
+          binary: nativeBinary("postgres"),
           binary_sha256: createHash("sha256")
-            .update(await readFile(resolve(native, "postgres")))
+            .update(await readFile(nativeBinary("postgres")))
             .digest("hex"),
           data_directory: data,
           pid: null,
@@ -278,7 +272,7 @@ export function isolatedPostgres({
         };
         log = createWriteStream(resolve(root, "postgres.log"));
         postgres = spawn(
-          resolve(native, "postgres"),
+          nativeBinary("postgres"),
           ["-D", data, "-h", "127.0.0.1", "-p", String(port), "-k", ""],
           { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
         );
@@ -381,7 +375,7 @@ export function isolatedPostgres({
       ]) {
         if (native)
           execFileSync(
-            resolve(native, command),
+            nativeBinary(command),
             [...connectionArgs(), ...args],
             { ...execOptions, env: pgEnv(), timeout: 120000 },
           );

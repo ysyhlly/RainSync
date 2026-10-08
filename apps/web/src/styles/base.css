@@ -8,12 +8,9 @@ html {
 body {
   margin: 0;
   color: var(--text-primary);
-  font:
-    15px/1.6 system-ui,
-    -apple-system,
-    "Segoe UI",
-    "Microsoft YaHei",
-    sans-serif;
+  font: var(--font-size-base)/1.6 var(--font-sans);
+  background: var(--surface-canvas);
+  -webkit-font-smoothing: antialiased;
 }
 button,
 input,
@@ -35,7 +32,7 @@ button,
   align-items: center;
   justify-content: center;
   gap: 8px;
-  min-height: 44px;
+  min-height: var(--control-height);
   padding: 9px 16px;
   background: var(--surface-panel);
   border: 1px solid var(--border-control);
@@ -46,8 +43,8 @@ button,
   line-height: 1.4;
   white-space: normal;
 }
-button:hover,
-.button:hover {
+button:hover:not(:disabled),
+.button:hover:not([aria-disabled="true"]) {
   background: var(--accent-soft);
 }
 button:disabled {
@@ -59,8 +56,8 @@ button:disabled {
   color: var(--text-on-accent);
   border-color: var(--border-control);
 }
-.primary:hover {
-  background: var(--accent-soft);
+.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
   color: var(--text-primary);
 }
 .danger {
@@ -98,13 +95,13 @@ p {
   margin: 0;
 }
 h1 {
-  font-size: 32px;
+  font-size: var(--font-size-3xl);
   line-height: 1.25;
   letter-spacing: -0.6px;
   overflow-wrap: anywhere;
 }
 h2 {
-  font-size: 20px;
+  font-size: var(--font-size-xl);
   line-height: 1.4;
 }
 h3 {
@@ -116,7 +113,7 @@ p {
 }
 small,
 .helper {
-  font-size: 13px;
+  font-size: var(--font-size-sm);
   color: var(--text-secondary);
 }
 label {
@@ -133,7 +130,7 @@ input:not([type="range"]):not([type="checkbox"]):not([type="radio"]),
 textarea,
 select {
   width: 100%;
-  min-height: 44px;
+  min-height: var(--control-height);
   border: 1px solid var(--border-control);
   border-radius: var(--radius-control);
   padding: 10px 12px;
@@ -186,7 +183,7 @@ input:disabled {
 }
 summary {
   cursor: pointer;
-  min-height: 44px;
+  min-height: var(--control-height);
   padding: 10px 0;
   font-weight: 600;
 }
@@ -236,7 +233,7 @@ summary {
 .notice {
   padding: 12px 16px;
   border: 1px solid var(--border-control);
-  border-radius: 12px;
+  border-radius: var(--radius-widget);
   background: var(--surface-panel);
   margin: 8px 0;
   line-height: 1.6;
@@ -255,8 +252,9 @@ summary {
   border: 1px solid var(--border-subtle);
   background: var(--surface-panel);
   border-radius: var(--radius-panel);
-  padding: 24px;
+  padding: var(--space-6);
   min-width: 0;
+  box-shadow: var(--shadow-panel);
 }
 .panel > header {
   display: flex;
@@ -339,7 +337,7 @@ summary {
 .confirm-panel {
   padding: 16px;
   border: 1px solid var(--danger);
-  border-radius: 12px;
+  border-radius: var(--radius-widget);
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
@@ -353,10 +351,13 @@ summary {
   gap: 8px;
 }
 .password-field button {
-  font-size: 13px;
+  flex-shrink: 0;
+  white-space: nowrap;
+  min-width: 64px;
+  font-size: var(--font-size-sm);
 }
 .section-label {
-  font-size: 13px;
+  font-size: var(--font-size-sm);
   color: var(--text-secondary);
   margin-bottom: 8px;
 }
@@ -372,10 +373,11 @@ summary {
 .auth-panel {
   background: var(--surface-panel);
   border: 1px solid var(--border-subtle);
-  border-radius: 22px;
+  border-radius: var(--radius-panel);
   padding: 40px;
   width: 100%;
   max-width: 450px;
+  box-shadow: var(--shadow-panel);
 }
 .auth-panel > p {
   margin: 12px 0 28px;
@@ -392,4 +394,49 @@ summary {
   min-height: 70dvh;
   display: grid;
   place-items: center;
+}
+
+/* Shared form semantics, visible focus, and native disabled states. */
+input[aria-invalid="true"],
+textarea[aria-invalid="true"],
+.select-trigger[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+input:disabled,
+textarea:disabled,
+select:disabled {
+  cursor: not-allowed;
+  background: var(--surface-muted);
+}
+input[type="checkbox"],
+input[type="radio"] {
+  flex-shrink: 0;
+}
+label:has(> input[type="checkbox"]),
+label:has(> input[type="radio"]) {
+  min-height: var(--control-height);
+  align-items: center;
+}
+.password-field > input {
+  flex: 1 1 0;
+}
+.notice.success {
+  color: var(--success);
+  border-color: var(--success);
+  background: var(--success-soft);
+}
+.notice.warning {
+  color: var(--warning);
+  border-color: var(--warning);
+  background: var(--warning-soft);
+}
+.notice.error {
+  background: var(--danger-soft);
+}
+button.danger:hover:not(:disabled),
+.button.danger:hover {
+  background: var(--danger-soft);
+}
+.notice :is(button, .button) {
+  color: var(--text-primary);
 }

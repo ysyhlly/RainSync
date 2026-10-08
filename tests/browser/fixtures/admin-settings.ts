@@ -1,0 +1,51 @@
+/** Bounded synthetic default for tests that enter the administrator landing. */
+export const defaultAdminSettings = {
+  revision: "0",
+  values: {
+    playback_session_limit: 4,
+    media_queue_limit: 24,
+    registration_validate_per_minute: 60,
+    registration_per_ten_minutes: 10,
+    registration_mode: "invite_only",
+    guests_enabled: false,
+  },
+  defaults: {
+    playback_session_limit: 4,
+    media_queue_limit: 24,
+    registration_validate_per_minute: 60,
+    registration_per_ten_minutes: 10,
+    registration_mode: "invite_only",
+    guests_enabled: false,
+  },
+  overrides: {
+    playback_session_limit: null,
+    media_queue_limit: null,
+    registration_validate_per_minute: null,
+    registration_per_ten_minutes: null,
+    registration_mode: null,
+    guests_enabled: null,
+  },
+  origins: {
+    playback_session_limit: "deployment",
+    media_queue_limit: "deployment",
+    registration_validate_per_minute: "deployment",
+    registration_per_ten_minutes: "deployment",
+    registration_mode: "deployment",
+    guests_enabled: "deployment",
+  },
+  bounds: { min: 1, max: 10000 },
+  deployment: {
+    private_libraries_enabled: true,
+    nas_compute_enabled: false,
+    p2p_enabled: false,
+    other_live_enabled: false,
+    preview: {
+      concurrency: 2,
+      timeout_seconds: 30,
+      cache_bytes: 104857600,
+      queue_limit: 128,
+      input_bytes: 10485760,
+    },
+  },
+  updated_at: null,
+};

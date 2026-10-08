@@ -5,7 +5,8 @@ use axum::{
     response::Response,
 };
 use futures_util::StreamExt;
-use sqlx::{Acquire, PgPool, Postgres, pool::PoolConnection};
+use persistence::media_executions::DeliveryReader;
+use sqlx::{Acquire, PgPool, Postgres, Row, pool::PoolConnection};
 use std::{
     future::Future,
     io,
@@ -23,6 +24,117 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_AUTH_AGE: Duration = Duration::from_secs(5);
 const CHUNK_BYTES: usize = 64 * 1024;
 
+#[derive(Clone, PartialEq, Eq)]
+struct AccountIdentity {
+    source: Uuid,
+    revision: i64,
+    generation: i64,
+    observer: Uuid,
+}
+
+struct AccountEvidence {
+    identity: AccountIdentity,
+    sequence: i64,
+    remaining: Duration,
+}
+
+struct Authorization {
+    allowed: bool,
+    account: Option<AccountEvidence>,
+}
+
+impl From<bool> for Authorization {
+    fn from(allowed: bool) -> Self {
+        Self {
+            allowed,
+            account: None,
+        }
+    }
+}
+
+struct ConfirmedAccount {
+    identity: AccountIdentity,
+    sequence: i64,
+    deadline: Instant,
+}
+
+struct Confirmation {
+    checked_at: Instant,
+    account: Option<ConfirmedAccount>,
+}
+
+/// Preparation, its final header check, and body delivery retain the same
+/// observation deadline. Re-reading unchanged positive evidence cannot grant
+/// another five seconds, even if the database wall clock stops advancing.
+#[derive(Clone)]
+struct AuthState(Arc<Mutex<Confirmation>>);
+
+impl From<Instant> for AuthState {
+    fn from(checked_at: Instant) -> Self {
+        Self(Arc::new(Mutex::new(Confirmation {
+            checked_at,
+            account: None,
+        })))
+    }
+}
+
+impl AuthState {
+    fn deadline(&self, max_age: Duration) -> Instant {
+        let state = self.0.lock().expect("authorization confirmation");
+        let deadline = state.checked_at + max_age;
+        state
+            .account
+            .as_ref()
+            .map_or(deadline, |account| deadline.min(account.deadline))
+    }
+
+    fn confirm(&self, authorization: Authorization, began: Instant) -> Result<(), Denied> {
+        if !authorization.allowed {
+            return Err(Denied::Revoked);
+        }
+        let mut state = self.0.lock().expect("authorization confirmation");
+        let now = Instant::now();
+        if state
+            .account
+            .as_ref()
+            .is_some_and(|account| account.deadline <= now)
+        {
+            return Err(Denied::Unavailable);
+        }
+        if let Some(evidence) = authorization.account {
+            // Account evidence is never useful for more than the observer's
+            // positive TTL; charge the whole query/commit round trip to it.
+            let deadline = began + evidence.remaining.min(MAX_AUTH_AGE);
+            if deadline <= now {
+                return Err(Denied::Unavailable);
+            }
+            match state.account.as_mut() {
+                Some(account) if account.identity != evidence.identity => {
+                    return Err(Denied::Revoked);
+                }
+                Some(account) if account.sequence == evidence.sequence => {
+                    account.deadline = account.deadline.min(deadline);
+                }
+                Some(account) if account.sequence > evidence.sequence => {
+                    // A concurrent final-header check may return an older
+                    // observation after the preparation monitor saw a new one.
+                }
+                _ => {
+                    state.account = Some(ConfirmedAccount {
+                        identity: evidence.identity,
+                        sequence: evidence.sequence,
+                        deadline,
+                    });
+                }
+            }
+        } else if state.account.is_some() {
+            return Err(Denied::Revoked);
+        }
+        state.checked_at = state.checked_at.max(began);
+        Ok(())
+    }
+}
+
 /// HTTP connections may outlive the server's drain deadline. Own admission,
 /// source cancellation and receipt persistence separately from those waiters.
 #[derive(Clone, Default)]
@@ -34,6 +146,7 @@ struct OwnerState {
     active: usize,
 }
 struct Owners {
+    readiness: Option<crate::readiness::Runtime>,
     state: Mutex<OwnerState>,
     count: watch::Sender<usize>,
     stop: watch::Sender<bool>,
@@ -41,6 +154,7 @@ struct Owners {
 impl Default for Owners {
     fn default() -> Self {
         Self {
+            readiness: None,
             state: Default::default(),
             count: watch::channel(0).0,
             stop: watch::channel(false).0,
@@ -63,6 +177,12 @@ impl Drop for Admission {
     }
 }
 impl Registry {
+    pub fn with_readiness(readiness: crate::readiness::Runtime) -> Self {
+        Self(Arc::new(Owners {
+            readiness: Some(readiness),
+            ..Owners::default()
+        }))
+    }
     fn admit(&self) -> Option<Admission> {
         let mut state = self.0.state.lock().expect("delivery owner registry");
         if state.closing {
@@ -115,7 +235,12 @@ impl Drop for AuthorizationConnection {
     }
 }
 
-async fn authorized(pool: &PgPool, id: Uuid, token_hash: &str) -> anyhow::Result<bool> {
+async fn authorized(
+    pool: &PgPool,
+    id: Uuid,
+    token_hash: &str,
+    reader: DeliveryReader,
+) -> anyhow::Result<Authorization> {
     let mut connection = AuthorizationConnection(Some(pool.acquire().await?));
     let mut tx = connection
         .0
@@ -129,11 +254,135 @@ async fn authorized(pool: &PgPool, id: Uuid, token_hash: &str) -> anyhow::Result
     sqlx::query("SET LOCAL statement_timeout = '2500ms'")
         .execute(&mut *tx)
         .await?;
-    let allowed = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN rooms r ON r.id=p.room_id WHERE r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND p.id=$1 AND p.delivery_token_hash=$2 AND p.expires_at>clock_timestamp() AND NOT p.stopped AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id))")
-        .bind(id).bind(token_hash).fetch_one(&mut *tx).await?;
+    reader.configure(&mut tx).await?;
+    let row = sqlx::query("SELECT src.id AS source_id,src.kind,src.access_policy_revision,a.generation,a.observer_epoch,a.observation_seq,EXTRACT(EPOCH FROM(a.valid_until-clock_timestamp()))::double precision AS account_remaining FROM playback_sessions p JOIN room_snapshots s ON s.room_id=p.room_id JOIN rooms r ON r.id=p.room_id JOIN media_items mi ON mi.id=p.media_id JOIN sources src ON src.id=mi.source_id LEFT JOIN source_account_policies a ON a.source_id=src.id AND src.kind IN('jellyfin','emby') WHERE r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch AND p.id=$1 AND p.delivery_token_hash=$2 AND p.expires_at>clock_timestamp() AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource,p.id) AND (s.state->>'media_generation')::bigint=p.generation AND EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id) AND (NOT $3 OR EXISTS(SELECT 1 FROM static_hls_captures c WHERE c.id=p.static_hls_capture_id AND c.session_id=p.id AND c.publication_phase='published_parent' AND static_hls_published_parent_authority_allowed(c.id)))")
+        .bind(id).bind(token_hash).bind(reader == DeliveryReader::StaticHlsParent).fetch_optional(&mut *tx).await?;
     tx.commit().await?;
     drop(connection.0.take());
-    Ok(allowed)
+    let Some(row) = row else {
+        return Ok(false.into());
+    };
+    let account = if matches!(row.get::<String, _>("kind").as_str(), "jellyfin" | "emby") {
+        let remaining = Duration::try_from_secs_f64(row.try_get("account_remaining")?)?;
+        anyhow::ensure!(!remaining.is_zero(), "account_policy_expired");
+        Some(AccountEvidence {
+            identity: AccountIdentity {
+                source: row.try_get("source_id")?,
+                revision: row.try_get("access_policy_revision")?,
+                generation: row.try_get("generation")?,
+                observer: row.try_get("observer_epoch")?,
+            },
+            sequence: row.try_get("observation_seq")?,
+            remaining,
+        })
+    } else {
+        None
+    };
+    Ok(Authorization {
+        allowed: true,
+        account,
+    })
+}
+
+/// Exact child comparison metadata is paired with the retained physical output.
+/// Neither a token nor a database row can create this boundary's output owner.
+#[derive(Clone)]
+pub(super) struct ChildBoundary {
+    pub(super) loaded: Arc<persistence::static_hls_child_read::PublishedChildRead>,
+    pub(super) output: Arc<media_core::static_hls::child_output_validation::PublishedChildOutput>,
+}
+
+/// Original browser login plus one immutable current-attempt delivery fence.
+/// The master may discover an attempt; every child arrives already pinned.
+#[derive(Clone)]
+pub(super) struct LadderBoundary {
+    login_hash: String,
+    attempt: Arc<Mutex<Option<i64>>>,
+}
+impl LadderBoundary {
+    pub(super) fn new(login_hash: String, attempt: Option<i64>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            login_hash.len() == 64
+                && login_hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && attempt.is_none_or(|n| n > 0),
+            "invalid_ladder_caller"
+        );
+        Ok(Self {
+            login_hash,
+            attempt: Arc::new(Mutex::new(attempt)),
+        })
+    }
+    pub(super) fn require_original_login(&self, original: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.login_hash == original,
+            "ladder_original_login_required"
+        );
+        Ok(())
+    }
+    pub(super) fn bind_attempt(&self, attempt: i64) -> anyhow::Result<()> {
+        let mut expected = self
+            .attempt
+            .lock()
+            .map_err(|_| anyhow::anyhow!("invalid_ladder_attempt"))?;
+        anyhow::ensure!(
+            attempt > 0 && expected.is_none_or(|n| n == attempt),
+            "stale_ladder_attempt"
+        );
+        *expected = Some(attempt);
+        Ok(())
+    }
+}
+#[derive(Clone)]
+enum DeliveryBoundary {
+    Existing(DeliveryReader),
+    Ladder(LadderBoundary),
+    Child(ChildBoundary),
+    Native { attempt: i64, owner: Option<Uuid> },
+}
+
+async fn authorized_boundary(
+    pool: &PgPool,
+    id: Uuid,
+    token_hash: &str,
+    boundary: &DeliveryBoundary,
+) -> anyhow::Result<Authorization> {
+    match boundary {
+        DeliveryBoundary::Existing(reader) => authorized(pool, id, token_hash, *reader).await,
+        DeliveryBoundary::Native { attempt, owner } => {
+            let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions p JOIN media_jobs j ON j.id=p.id AND j.session_id=p.id WHERE p.id=$1 AND p.delivery_token_hash=$2 AND native_platform_transcode_session_allowed(p.id) AND j.attempt=$3 AND (($4::uuid IS NULL AND (j.status='succeeded' OR (j.status='running' AND j.lease_until>clock_timestamp()))) OR ($4::uuid IS NOT NULL AND j.owner_id=$4 AND j.status='running' AND j.lease_until>clock_timestamp())))")
+                .bind(id).bind(token_hash).bind(attempt).bind(owner).fetch_one(pool).await?;
+            Ok(allowed.into())
+        }
+        DeliveryBoundary::Ladder(ladder) => {
+            let attempt = *ladder
+                .attempt
+                .lock()
+                .map_err(|_| anyhow::anyhow!("invalid_ladder_attempt"))?;
+            let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions p JOIN media_jobs j ON j.id=p.id AND j.session_id=p.id JOIN sessions login ON login.token_hash=p.auth_login_hash AND login.user_id=p.user_id WHERE p.id=$1 AND p.delivery_token_hash=$2 AND p.auth_login_hash=$3 AND login.expires_at>clock_timestamp() AND local_hls_ladder_session_allowed(p.id) AND playback_source_allowed(p.media_id,p.resource,p.id) AND ($4::bigint IS NULL OR (j.attempt=$4 AND (j.status='succeeded' OR (j.status='running' AND j.lease_until>clock_timestamp())))))")
+                .bind(id).bind(token_hash).bind(&ladder.login_hash).bind(attempt).fetch_one(pool).await?;
+            Ok(allowed.into())
+        }
+        DeliveryBoundary::Child(child) => {
+            if !persistence::static_hls_child_read::authorized(pool, id, token_hash, &child.loaded)
+                .await?
+            {
+                return Ok(false.into());
+            }
+            child
+                .output
+                .require_same_frozen_input(child.loaded.input())?;
+            anyhow::ensure!(
+                child.output.identity() == child.loaded.output_identity(),
+                "static_hls_child_output_identity_changed"
+            );
+            // Includes the SAME original receipt, actual capture disposal and
+            // current ordered authority even while HTTP backpressure is idle.
+            child.output.check_read().await?;
+            Ok(true.into())
+        }
+    }
 }
 
 // This owner survives its HTTP waiter and only acknowledges after dropping the
@@ -143,6 +392,10 @@ struct Execution {
     id: Uuid,
     owner: Uuid,
     scope: media_core::child_process::Scope,
+    boundary: DeliveryBoundary,
+    // The uncertain child INSERT opened no source. Reconciliation serializes
+    // with that SAME original attempt before acknowledging positive absence.
+    unstarted_registration: bool,
     // Held through local disposal and its durable receipt, including admission
     // that commits after the HTTP waiter or Worker shutdown signal disappears.
     admission: Admission,
@@ -150,15 +403,51 @@ struct Execution {
 impl Execution {
     async fn finish(self) {
         if self.scope.shutdown().await.is_err() {
+            if let Some(readiness) = &self.admission.registry.0.readiness {
+                readiness.drain_failed();
+            }
             tracing::error!(execution = %self.id, "delivery process drain unconfirmed");
             return;
         }
         loop {
             if matches!(
-                tokio::time::timeout(
-                    CHECK_TIMEOUT,
-                    persistence::media_executions::acknowledge(&self.pool, self.id, self.owner)
-                )
+                tokio::time::timeout(CHECK_TIMEOUT, async {
+                    match &self.boundary {
+                        DeliveryBoundary::Ladder(_) | DeliveryBoundary::Native { .. } => {
+                            persistence::media_executions::acknowledge_with_reader(
+                                &self.pool,
+                                self.id,
+                                self.owner,
+                                DeliveryReader::Legacy,
+                            )
+                            .await
+                        }
+                        DeliveryBoundary::Existing(reader) => {
+                            persistence::media_executions::acknowledge_with_reader(
+                                &self.pool, self.id, self.owner, *reader,
+                            )
+                            .await
+                        }
+                        DeliveryBoundary::Child(child) if self.unstarted_registration => {
+                            persistence::static_hls_child_read::resolve_unstarted_delivery(
+                                &self.pool,
+                                self.id,
+                                self.owner,
+                                child.loaded.actual_worker(),
+                            )
+                            .await
+                        }
+                        DeliveryBoundary::Child(child) => {
+                            persistence::static_hls_child_read::acknowledge_delivery(
+                                &self.pool,
+                                self.id,
+                                self.owner,
+                                child.loaded.actual_worker(),
+                            )
+                            .await
+                        }
+                    }
+                })
                 .await,
                 Ok(Ok(()))
             ) {
@@ -169,13 +458,194 @@ impl Execution {
     }
 }
 
-pub async fn protect(
-    prepare: impl Future<Output = super::Result<Response>> + Send + 'static,
+pub async fn protect<Fut>(
+    prepare: impl FnOnce(bool) -> Fut + Send + 'static,
     pool: PgPool,
     id: Uuid,
     token_hash: String,
     registry: Registry,
-) -> super::Result<Response> {
+    input_cancel: crate::input_failure::Observation,
+    entry_candidate: bool,
+) -> super::Result<Response>
+where
+    Fut: Future<Output = super::Result<Response>> + Send + 'static,
+{
+    protect_with_reader(
+        prepare,
+        pool,
+        id,
+        token_hash,
+        registry,
+        input_cancel,
+        (entry_candidate, DeliveryReader::Legacy),
+    )
+    .await
+}
+
+pub async fn protect_static_hls<Fut>(
+    prepare: impl FnOnce(bool) -> Fut + Send + 'static,
+    pool: PgPool,
+    id: Uuid,
+    token_hash: String,
+    registry: Registry,
+    input_cancel: crate::input_failure::Observation,
+    entry_candidate: bool,
+) -> super::Result<Response>
+where
+    Fut: Future<Output = super::Result<Response>> + Send + 'static,
+{
+    protect_with_reader(
+        prepare,
+        pool,
+        id,
+        token_hash,
+        registry,
+        input_cancel,
+        (entry_candidate, DeliveryReader::StaticHlsParent),
+    )
+    .await
+}
+
+/// Reuse original receipt ownership, shutdown and independent backpressure
+/// monitor with a purpose-specific native attempt/lease authority predicate.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn protect_native_platform<Fut>(
+    prepare: impl FnOnce(bool) -> Fut + Send + 'static,
+    pool: PgPool,
+    id: Uuid,
+    token_hash: String,
+    registry: Registry,
+    input_cancel: crate::input_failure::Observation,
+    attempt: i64,
+    owner: Option<Uuid>,
+) -> super::Result<Response>
+where
+    Fut: Future<Output = super::Result<Response>> + Send + 'static,
+{
+    if attempt <= 0 {
+        return Err(Denied::Revoked.response());
+    }
+    protect_with_boundary(
+        prepare,
+        pool,
+        id,
+        token_hash,
+        registry,
+        input_cancel,
+        false,
+        DeliveryBoundary::Native { attempt, owner },
+    )
+    .await
+}
+
+async fn protect_with_reader<Fut>(
+    prepare: impl FnOnce(bool) -> Fut + Send + 'static,
+    pool: PgPool,
+    id: Uuid,
+    token_hash: String,
+    registry: Registry,
+    input_cancel: crate::input_failure::Observation,
+    options: (bool, DeliveryReader),
+) -> super::Result<Response>
+where
+    Fut: Future<Output = super::Result<Response>> + Send + 'static,
+{
+    let (entry_candidate, reader) = options;
+    protect_with_boundary(
+        prepare,
+        pool,
+        id,
+        token_hash,
+        registry,
+        input_cancel,
+        entry_candidate,
+        DeliveryBoundary::Existing(reader),
+    )
+    .await
+}
+
+/// Ladder-only browser delivery. Login, viewer and current attempt are checked
+/// before source work, at final headers and independently of body backpressure.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn protect_local_hls_ladder<Fut>(
+    prepare: impl FnOnce(bool) -> Fut + Send + 'static,
+    pool: PgPool,
+    id: Uuid,
+    token_hash: String,
+    registry: Registry,
+    input_cancel: crate::input_failure::Observation,
+    entry_candidate: bool,
+    ladder: LadderBoundary,
+) -> super::Result<Response>
+where
+    Fut: Future<Output = super::Result<Response>> + Send + 'static,
+{
+    let boundary = DeliveryBoundary::Ladder(ladder);
+    match tokio::time::timeout(
+        CHECK_TIMEOUT,
+        authorized_boundary(&pool, id, &token_hash, &boundary),
+    )
+    .await
+    {
+        Ok(Ok(authorization)) if authorization.allowed => {}
+        Ok(Ok(_)) => return Err(Denied::Revoked.response()),
+        _ => return Err(Denied::Unavailable.response()),
+    }
+    protect_with_boundary(
+        prepare,
+        pool,
+        id,
+        token_hash,
+        registry,
+        input_cancel,
+        entry_candidate,
+        boundary,
+    )
+    .await
+}
+
+/// Child-only delivery lifetime, preserving admission, source cancellation,
+/// final-header revalidation, independent backpressure checks and drain ACK.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn protect_static_hls_child<Fut>(
+    prepare: impl FnOnce(bool) -> Fut + Send + 'static,
+    pool: PgPool,
+    id: Uuid,
+    token_hash: String,
+    registry: Registry,
+    input_cancel: crate::input_failure::Observation,
+    child: ChildBoundary,
+) -> super::Result<Response>
+where
+    Fut: Future<Output = super::Result<Response>> + Send + 'static,
+{
+    protect_with_boundary(
+        prepare,
+        pool,
+        id,
+        token_hash,
+        registry,
+        input_cancel,
+        false,
+        DeliveryBoundary::Child(child),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn protect_with_boundary<Fut>(
+    prepare: impl FnOnce(bool) -> Fut + Send + 'static,
+    pool: PgPool,
+    id: Uuid,
+    token_hash: String,
+    registry: Registry,
+    input_cancel: crate::input_failure::Observation,
+    entry_candidate: bool,
+    boundary: DeliveryBoundary,
+) -> super::Result<Response>
+where
+    Fut: Future<Output = super::Result<Response>> + Send + 'static,
+{
     let admission = registry
         .admit()
         .ok_or_else(|| Denied::Unavailable.response())?;
@@ -184,48 +654,115 @@ pub async fn protect(
     // must be acknowledged, never left behind by a vanished HTTP waiter.
     tokio::spawn(async move {
         let owner = Uuid::new_v4();
-        let registered =
-            persistence::media_executions::begin_delivery(&pool, id, &token_hash, owner).await;
-        let execution_id = match registered {
+        let child_execution = Uuid::new_v4();
+        let registered = match &boundary {
+            DeliveryBoundary::Ladder(_) | DeliveryBoundary::Native { .. } => {
+                persistence::media_executions::begin_delivery_with_reader(
+                    &pool,
+                    id,
+                    &token_hash,
+                    owner,
+                    entry_candidate,
+                    DeliveryReader::Legacy,
+                )
+                .await
+            }
+            DeliveryBoundary::Existing(reader) => {
+                persistence::media_executions::begin_delivery_with_reader(
+                    &pool,
+                    id,
+                    &token_hash,
+                    owner,
+                    entry_candidate,
+                    *reader,
+                )
+                .await
+            }
+            DeliveryBoundary::Child(child) => {
+                persistence::static_hls_child_read::begin_delivery(
+                    &pool,
+                    id,
+                    &token_hash,
+                    child_execution,
+                    owner,
+                    &child.loaded,
+                )
+                .await
+            }
+        };
+        let registered = match registered {
             Ok(Some(id)) => id,
             Ok(None) => {
                 let _ = sender.send(Err(Denied::Revoked.response()));
+                if matches!(&boundary, DeliveryBoundary::Child(_)) {
+                    Execution {
+                        pool,
+                        id: child_execution,
+                        owner,
+                        scope: media_core::child_process::Scope::new(),
+                        boundary,
+                        unstarted_registration: true,
+                        admission,
+                    }
+                    .finish()
+                    .await;
+                }
                 return;
             }
             Err(_) => {
                 let _ = sender.send(Err(Denied::Unavailable.response()));
+                if matches!(&boundary, DeliveryBoundary::Child(_)) {
+                    Execution {
+                        pool,
+                        id: child_execution,
+                        owner,
+                        scope: media_core::child_process::Scope::new(),
+                        boundary,
+                        unstarted_registration: true,
+                        admission,
+                    }
+                    .finish()
+                    .await;
+                }
                 return;
             }
         };
         let scope = media_core::child_process::Scope::new();
         let execution = Execution {
             pool: pool.clone(),
-            id: execution_id,
+            id: registered.execution_id,
             owner,
             scope: scope.clone(),
+            boundary: boundary.clone(),
+            unstarted_registration: false,
             admission,
         };
         let result = tokio::select! {
             biased;
             _ = shutdown(Some(registry.0.stop.subscribe())) => Some(Err(Denied::Unavailable.response())),
             _ = sender.closed() => None,
-            result = scope.run(prepare_response(prepare, pool.clone(), id, token_hash.clone())) => Some(result),
+            _ = input_cancel.stopped() => Some(Err(Denied::Unavailable.response())),
+            result = scope.run(prepare_response(prepare(registered.first_output_entry), pool.clone(), id, token_hash.clone(), boundary.clone())) => Some(result),
         };
         match result {
-            Some(Ok((response, checked_at))) => {
+            Some(Ok((response, confirmed))) => {
                 let (parts, body) = response.into_parts();
                 let body = guarded_body(
                     body,
                     move || {
                         let pool = pool.clone();
                         let token_hash = token_hash.clone();
-                        async move { authorized(&pool, id, &token_hash).await }
+                        let boundary = boundary.clone();
+                        async move { authorized_boundary(&pool, id, &token_hash, &boundary).await }
                     },
-                    checked_at,
+                    confirmed,
                     CHECK_INTERVAL,
                     CHECK_TIMEOUT,
                     MAX_AUTH_AGE,
-                    Some(execution),
+                    SourceOwners {
+                        execution: Some(execution),
+                        input_cancel,
+                    },
                 );
                 // If the waiter vanished, dropping this body signals its owner;
                 // the body producer still drains/acknowledges independently.
@@ -249,37 +786,58 @@ async fn prepare_response(
     pool: PgPool,
     id: Uuid,
     token_hash: String,
-) -> super::Result<(Response, Instant)> {
+    boundary: DeliveryBoundary,
+) -> super::Result<(Response, AuthState)> {
     // Header waits and bounded playlist/subtitle buffering also own a source.
     // Revocation must cancel these futures before any response body exists.
     let checker = || {
         let pool = pool.clone();
         let token_hash = token_hash.clone();
-        async move { authorized(&pool, id, &token_hash).await }
+        let boundary = boundary.clone();
+        async move { authorized_boundary(&pool, id, &token_hash, &boundary).await }
     };
+    // Seed the account deadline before opening any source. The ledger grants
+    // admission, but does not transfer an observer's remaining TTL to us.
+    let began = Instant::now();
+    let confirmed = AuthState::from(began);
+    match tokio::time::timeout(CHECK_TIMEOUT, checker()).await {
+        Ok(Ok(authorization)) => confirmed
+            .confirm(authorization, began)
+            .map_err(Denied::response)?,
+        _ => return Err(Denied::Unavailable.response()),
+    }
     let prepared = async {
         let response = prepare.await?;
         // Preparation can take time (e.g. waiting for an HLS output). Check
         // again before committing headers, while the preparation monitor still
         // owns its deadline and can drop this already-created response.
         let checked_at = Instant::now();
-        match tokio::time::timeout(CHECK_TIMEOUT, authorized(&pool, id, &token_hash)).await {
-            Ok(Ok(true)) => Ok((response, checked_at)),
-            Ok(Ok(false)) => Err(Denied::Revoked.response()),
+        match tokio::time::timeout(
+            CHECK_TIMEOUT,
+            authorized_boundary(&pool, id, &token_hash, &boundary),
+        )
+        .await
+        {
+            Ok(Ok(authorization)) => {
+                confirmed
+                    .confirm(authorization, checked_at)
+                    .map_err(Denied::response)?;
+                Ok((response, confirmed.clone()))
+            }
             _ => Err(Denied::Unavailable.response()),
         }
     };
-    let (response, checked_at) = tokio::select! {
+    let (response, confirmed) = tokio::select! {
         biased;
-        denied = monitor(checker, Instant::now(), CHECK_INTERVAL, CHECK_TIMEOUT, MAX_AUTH_AGE) => {
+        denied = monitor(checker, confirmed.clone(), CHECK_INTERVAL, CHECK_TIMEOUT, MAX_AUTH_AGE) => {
             return Err(denied.response());
         },
         response = prepared => response?,
     };
-    Ok((response, checked_at))
+    Ok((response, confirmed))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Denied {
     Revoked,
     Unavailable,
@@ -299,29 +857,35 @@ impl Denied {
     }
 }
 
-async fn monitor<F, C>(
+async fn monitor<F, C, A>(
     mut check: F,
-    mut confirmed_at: Instant,
+    confirmed: impl Into<AuthState>,
     interval: Duration,
     timeout: Duration,
     max_age: Duration,
 ) -> Denied
 where
     F: FnMut() -> C,
-    C: Future<Output = anyhow::Result<bool>>,
+    C: Future<Output = anyhow::Result<A>>,
+    A: Into<Authorization>,
 {
+    let confirmed = confirmed.into();
     loop {
-        tokio::time::sleep_until((Instant::now() + interval).min(confirmed_at + max_age)).await;
+        let deadline = confirmed.deadline(max_age);
+        tokio::time::sleep_until((Instant::now() + interval).min(deadline)).await;
         let began = Instant::now();
         // A delayed result cannot extend the lifetime of an older DB snapshot.
         let result = tokio::select! {
             biased;
-            _ = tokio::time::sleep_until(confirmed_at + max_age) => return Denied::Unavailable,
+            _ = tokio::time::sleep_until(confirmed.deadline(max_age)) => return Denied::Unavailable,
             result = tokio::time::timeout(timeout, check()) => result,
         };
         match result {
-            Ok(Ok(true)) => confirmed_at = began,
-            Ok(Ok(false)) => return Denied::Revoked,
+            Ok(Ok(authorization)) => {
+                if let Err(denied) = confirmed.confirm(authorization.into(), began) {
+                    return denied;
+                }
+            }
             _ => return Denied::Unavailable,
         }
     }
@@ -336,19 +900,31 @@ struct Delivery {
     ended: bool,
 }
 
-fn guarded_body<F, C>(
+#[derive(Default)]
+struct SourceOwners {
+    execution: Option<Execution>,
+    input_cancel: crate::input_failure::Observation,
+}
+
+fn guarded_body<F, C, A>(
     body: Body,
     check: F,
-    checked_at: Instant,
+    confirmed: impl Into<AuthState>,
     interval: Duration,
     timeout: Duration,
     max_age: Duration,
-    execution: Option<Execution>,
+    owners: SourceOwners,
 ) -> Body
 where
     F: FnMut() -> C + Send + 'static,
-    C: Future<Output = anyhow::Result<bool>> + Send,
+    C: Future<Output = anyhow::Result<A>> + Send,
+    A: Into<Authorization> + Send,
 {
+    let confirmed = confirmed.into();
+    let SourceOwners {
+        execution,
+        input_cancel,
+    } = owners;
     // One queued 64-KiB chunk. The source's own buffers and kernel/browser
     // buffers are separate; already delivered bytes cannot be recalled.
     let (send, chunks) = mpsc::channel(1);
@@ -363,9 +939,14 @@ where
                     Ok(mut bytes) => {
                         while !bytes.is_empty() {
                             let length = bytes.len().min(CHUNK_BYTES);
-                            if output.send(Ok(bytes.split_to(length))).await.is_err() {
+                            if output
+                                .send(Ok(Bytes::copy_from_slice(&bytes[..length])))
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
+                            bytes = bytes.slice(length..);
                         }
                     }
                     Err(error) => {
@@ -386,7 +967,8 @@ where
             biased;
             _ = shutdown(stop) => { let _ = revoke.send(true); },
             _ = send.closed() => {},
-            _ = monitor(check, checked_at, interval, timeout, max_age) => { let _ = revoke.send(true); },
+            _ = input_cancel.stopped() => { let _ = revoke.send(true); },
+            _ = monitor(check, confirmed, interval, timeout, max_age) => { let _ = revoke.send(true); },
             _ = scope.run(forward) => {},
         }
         // The select drops `forward` and its source before any drain ACK.
@@ -435,6 +1017,154 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    fn identity() -> AccountIdentity {
+        AccountIdentity {
+            source: Uuid::nil(),
+            revision: 1,
+            generation: 2,
+            observer: Uuid::nil(),
+        }
+    }
+
+    fn positive(sequence: i64, remaining: Duration) -> Authorization {
+        Authorization {
+            allowed: true,
+            account: Some(AccountEvidence {
+                identity: identity(),
+                sequence,
+                remaining,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_observation_keeps_its_first_monotonic_deadline() {
+        let now = Instant::now();
+        let confirmed = AuthState::from(now);
+        confirmed
+            .confirm(
+                positive(1, Duration::from_secs(2)),
+                now - Duration::from_secs(1),
+            )
+            .unwrap();
+        let deadline = confirmed.deadline(MAX_AUTH_AGE);
+        // A frozen or regressed DB clock can report the same remaining TTL.
+        confirmed
+            .confirm(positive(1, Duration::from_secs(2)), now)
+            .unwrap();
+        assert_eq!(confirmed.deadline(MAX_AUTH_AGE), deadline);
+        // A fresh response for the same observation can conservatively shorten it.
+        confirmed
+            .confirm(positive(1, Duration::from_millis(500)), now)
+            .unwrap();
+        assert_eq!(
+            confirmed.deadline(MAX_AUTH_AGE),
+            now + Duration::from_millis(500)
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_newer_observation_refreshes_the_account_deadline() {
+        let now = Instant::now();
+        let confirmed = AuthState::from(now);
+        confirmed
+            .confirm(
+                positive(1, Duration::from_secs(2)),
+                now - Duration::from_secs(1),
+            )
+            .unwrap();
+        confirmed
+            .confirm(positive(2, Duration::from_secs(2)), now)
+            .unwrap();
+        let refreshed = now + Duration::from_secs(2);
+        assert_eq!(confirmed.deadline(MAX_AUTH_AGE), refreshed);
+        confirmed
+            .confirm(positive(1, Duration::from_secs(4)), now)
+            .unwrap();
+        assert_eq!(confirmed.deadline(MAX_AUTH_AGE), refreshed);
+        let mut changed = positive(3, Duration::from_secs(4));
+        changed.account.as_mut().unwrap().identity.generation += 1;
+        assert_eq!(confirmed.confirm(changed, now), Err(Denied::Revoked));
+    }
+
+    #[tokio::test]
+    async fn elapsed_account_evidence_cannot_be_revived_by_final_headers() {
+        let now = Instant::now();
+        let confirmed = AuthState(Arc::new(Mutex::new(Confirmation {
+            checked_at: now,
+            account: Some(ConfirmedAccount {
+                identity: identity(),
+                sequence: 1,
+                deadline: now - Duration::from_millis(1),
+            }),
+        })));
+        assert_eq!(
+            confirmed.confirm(positive(2, MAX_AUTH_AGE), now),
+            Err(Denied::Unavailable)
+        );
+        let delayed = AuthState::from(now);
+        assert_eq!(
+            delayed.confirm(
+                positive(1, Duration::from_millis(10)),
+                now - Duration::from_millis(20)
+            ),
+            Err(Denied::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_and_body_share_a_frozen_observation_deadline() {
+        let now = Instant::now();
+        let prepared = AuthState::from(now);
+        prepared
+            .confirm(positive(1, Duration::from_millis(80)), now)
+            .unwrap();
+        let deadline = prepared.deadline(MAX_AUTH_AGE);
+        // Simulate the final header check reporting the unchanged positive row.
+        let body_confirmation = prepared.clone();
+        body_confirmation
+            .confirm(positive(1, MAX_AUTH_AGE), Instant::now())
+            .unwrap();
+        assert_eq!(body_confirmation.deadline(MAX_AUTH_AGE), deadline);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let body = guarded_body(
+            source(dropped.clone()),
+            || async { Ok(positive(1, MAX_AUTH_AGE)) },
+            body_confirmation,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            MAX_AUTH_AGE,
+            SourceOwners::default(),
+        );
+        tokio::time::timeout(Duration::from_millis(250), released(&dropped))
+            .await
+            .expect("unchanged DB evidence cannot keep a backpressured source alive");
+        assert!(body.into_data_stream().next().await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn account_deadline_cancels_a_hung_authorization_query() {
+        let now = Instant::now();
+        let confirmed = AuthState::from(now);
+        confirmed
+            .confirm(positive(1, Duration::from_millis(40)), now)
+            .unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let body = guarded_body(
+            source(dropped.clone()),
+            std::future::pending::<anyhow::Result<Authorization>>,
+            confirmed,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            MAX_AUTH_AGE,
+            SourceOwners::default(),
+        );
+        tokio::time::timeout(Duration::from_millis(250), released(&dropped))
+            .await
+            .expect("the account deadline wins over a stalled DB check");
+        assert!(body.into_data_stream().next().await.unwrap().is_err());
+    }
+
     #[tokio::test]
     async fn shutdown_fences_new_admission_and_waits_for_late_owner() {
         let registry = Registry::default();
@@ -471,6 +1201,27 @@ mod tests {
             |guard| async { Some((Ok::<_, io::Error>(Bytes::from(vec![0; CHUNK_BYTES])), guard)) },
         ))
     }
+    #[tokio::test]
+    async fn cancelled_execution_drops_retained_source_independently_of_body_polling() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cancel = crate::input_failure::Observation::default();
+        let _retained = guarded_body(
+            source(dropped.clone()),
+            || async { Ok(true) },
+            Instant::now(),
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+            Duration::from_secs(20),
+            SourceOwners {
+                execution: None,
+                input_cancel: cancel.clone(),
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!dropped.load(Ordering::SeqCst));
+        cancel.stop();
+        released(&dropped).await;
+    }
     fn test_body(
         body: Body,
         check: impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<bool>> + Send>>
@@ -484,7 +1235,7 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(20),
             Duration::from_millis(30),
-            None,
+            SourceOwners::default(),
         )
     }
     async fn released(dropped: &AtomicBool) {
@@ -537,5 +1288,22 @@ mod tests {
         });
         let bytes = axum::body::to_bytes(body, 1024).await.unwrap();
         assert_eq!(bytes.as_ref(), b"small media body");
+    }
+}
+
+#[cfg(test)]
+mod ladder_boundary_tests {
+    use super::*;
+    #[test]
+    fn attempt_discovery_is_one_way_and_current_children_never_rebind() {
+        let boundary = LadderBoundary::new("a".repeat(64), None).unwrap();
+        boundary.bind_attempt(2).unwrap();
+        boundary.bind_attempt(2).unwrap();
+        assert!(boundary.bind_attempt(3).is_err());
+        let child = LadderBoundary::new("b".repeat(64), Some(2)).unwrap();
+        assert!(child.bind_attempt(1).is_err());
+        assert!(boundary.require_original_login(&"a".repeat(64)).is_ok());
+        assert!(child.require_original_login(&"a".repeat(64)).is_err());
+        assert!(LadderBoundary::new("a".repeat(64), Some(0)).is_err());
     }
 }

@@ -1,0 +1,48 @@
+# Use after compose.yaml, before deploy/loopback.override.yaml.
+# Requires Docker Compose 2.24.4+; images must be verified local sha256 IDs.
+services:
+  db:
+    image: ${RAINSYNC_POSTGRES_IMAGE:?Set the verified imported PostgreSQL image ID}
+    pull_policy: never
+    volumes: !override
+      - type: bind
+        source: ${RAINSYNC_DATABASE_PATH:?Set the prepared /opt/rainsync database directory}
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+  server:
+    build: !reset null
+    image: ${RAINSYNC_BACKEND_IMAGE:?Set the verified imported backend image ID}
+    pull_policy: never
+    volumes: !override
+      - type: bind
+        source: ${MEDIA_PATH:?Set the prepared media directory}
+        target: /media
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RAINSYNC_CACHE_PATH:?Set the prepared /opt/rainsync cache directory}
+        target: /cache
+        bind:
+          create_host_path: false
+  worker:
+    build: !reset null
+    image: ${RAINSYNC_BACKEND_IMAGE:?Set the verified imported backend image ID}
+    pull_policy: never
+    volumes: !override
+      - type: bind
+        source: ${MEDIA_PATH:?Set the prepared media directory}
+        target: /media
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RAINSYNC_CACHE_PATH:?Set the prepared /opt/rainsync cache directory}
+        target: /cache
+        bind:
+          create_host_path: false
+  web:
+    build: !reset null
+    image: ${RAINSYNC_WEB_IMAGE:?Set the verified imported web image ID}
+    pull_policy: never

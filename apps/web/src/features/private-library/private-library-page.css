@@ -1,0 +1,148 @@
+.private-library-page .library-workspace {
+  display: grid;
+  gap: var(--space-6);
+  min-width: 0;
+}
+.private-library-page .library-management,
+.private-library-page .library-content {
+  align-content: start;
+}
+.private-library-page .library-create {
+  display: grid;
+  grid-template-columns: minmax(10rem, auto) minmax(0, 1fr) auto;
+  align-items: end;
+  gap: var(--space-5);
+}
+.private-library-page .library-tabs {
+  margin-top: var(--space-4);
+}
+.private-library-page .library-tabs button {
+  overflow-wrap: anywhere;
+}
+.private-library-page .library-inline-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-4);
+  align-items: end;
+}
+.private-library-page .section-heading + .library-inline-form {
+  margin-top: var(--space-5);
+}
+.private-library-page .library-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+  align-items: end;
+}
+.private-library-page .library-wide {
+  grid-column: 1 / -1;
+}
+.private-library-page .permission-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3) var(--space-5);
+  margin-top: var(--space-2);
+}
+.private-library-page .permission-fields label {
+  flex-direction: row;
+  align-items: center;
+  min-height: var(--control-height);
+}
+.private-library-page .library-details > form,
+.private-library-page .library-details > ul,
+.private-library-page .library-details > p {
+  margin-top: var(--space-4);
+}
+.private-library-page .private-media-list {
+  margin: 0;
+}
+.private-library-page .data-row__body strong {
+  overflow-wrap: anywhere;
+}
+@media (min-width: 1100px) {
+  .private-library-page > .page-title {
+    margin-bottom: var(--space-5);
+  }
+  .private-library-page .library-workspace {
+    grid-template-columns: minmax(17rem, 20rem) minmax(0, 1fr);
+    align-items: start;
+  }
+  .private-library-page .library-management,
+  .private-library-page .library-content,
+  .private-library-page .library-content > .page-stack {
+    gap: var(--space-4);
+  }
+  .private-library-page .library-management .surface-card {
+    padding: var(--space-4);
+  }
+  .private-library-page .library-management .section-heading {
+    display: grid;
+    gap: var(--space-2);
+    margin: 0;
+  }
+  .private-library-page .library-management .section-heading__copy {
+    gap: var(--space-1);
+  }
+  .private-library-page .library-management .section-heading__copy h2 {
+    overflow-wrap: anywhere;
+  }
+  .private-library-page .library-management .button-row {
+    gap: var(--space-2);
+  }
+  .private-library-page .library-create,
+  .private-library-page .library-summary .library-inline-form {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-3);
+  }
+  .private-library-page .library-create > button,
+  .private-library-page .library-summary .library-inline-form > button {
+    justify-self: start;
+    margin: 0;
+  }
+  .private-library-page .library-tabs {
+    display: grid;
+    gap: var(--space-1);
+    margin-top: var(--space-3);
+  }
+  .private-library-page .library-tabs button {
+    justify-content: flex-start;
+    text-align: left;
+  }
+  .private-library-page .library-content .section-heading {
+    margin-bottom: 0;
+  }
+  .private-library-page .library-content .library-form-grid,
+  .private-library-page .library-content .library-inline-form {
+    width: 100%;
+    max-width: 52rem;
+  }
+  .private-library-page
+    .library-content
+    .section-heading
+    + .library-inline-form {
+    margin-top: 0;
+  }
+  .private-library-page .library-media .private-media-list {
+    padding: 0;
+    list-style: none;
+  }
+}
+@media (max-width: 767px) {
+  .private-library-page .library-workspace {
+    gap: var(--space-5);
+  }
+}
+@media (max-width: 700px) {
+  .private-library-page .library-create,
+  .private-library-page .library-form-grid,
+  .private-library-page .library-inline-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .private-library-page .library-create > button,
+  .private-library-page .library-inline-form > button {
+    justify-self: start;
+  }
+  .private-library-page .private-media-list .data-row__actions {
+    flex-basis: 100%;
+  }
+}

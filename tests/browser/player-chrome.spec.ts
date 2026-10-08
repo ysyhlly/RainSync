@@ -6,7 +6,7 @@ test("information is outside clean video and hover or touch reveals controls", a
 }) => {
   await appFixture(page);
   await page.goto("/rooms/room");
-  const info = page.locator(".room-information");
+  const info = page.locator(".room-media-widget");
   await expect(info).toContainText("真实合成测试视频");
   const chrome = page.locator(".player-chrome");
   await expect(chrome).toHaveCSS("opacity", "0");
@@ -43,7 +43,7 @@ test("real fullscreen has exactly two idle seconds, locked menus and persistent 
     (window as any).__video = document.querySelector("video");
   });
   await page.locator("video").hover();
-  await page.getByRole("button", { name: "全屏", exact: true }).click();
+  await page.getByRole("button", { name: "仅视频全屏", exact: true }).click();
   await expect
     .poll(() =>
       page.evaluate(() =>
@@ -102,7 +102,7 @@ test("unsupported fullscreen reports the limitation without replacing the video"
   );
   if (isMobile) await page.locator("video").tap({ position: { x: 20, y: 20 } });
   else await page.locator("video").hover();
-  await page.getByRole("button", { name: "全屏", exact: true }).click();
+  await page.getByRole("button", { name: "仅视频全屏", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText(
     "此设备不支持标准播放器全屏",
   );

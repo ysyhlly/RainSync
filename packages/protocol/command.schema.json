@@ -20,6 +20,16 @@
       "format": "uint32",
       "minimum": 0
     },
+    "live_version": {
+      "description": "Old clients must opt in before controlling or selecting live media.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1
+    },
     "media_generation": {
       "type": "integer",
       "format": "uint32",

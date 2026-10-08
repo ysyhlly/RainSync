@@ -1,34 +1,27 @@
 import { test, expect } from "@playwright/test";
 import { appFixture } from "./fixtures/application";
 
-test("room tabs only switch panels on narrow screens and preserve selection across resize", async ({
+test("independent room widgets remain visible and preserve chat drafts across resize", async ({
   page,
 }) => {
   await appFixture(page);
   await page.setViewportSize({ width: 1366, height: 900 });
   await page.goto("/rooms/room");
-  const tabs = page.getByRole("tablist", { name: "房间面板" });
-  await expect(tabs).toBeHidden();
   await expect(page.locator("#room-chat")).toBeVisible();
   await page
     .getByRole("textbox", { name: "聊天消息", exact: true })
     .fill("保留的聊天草稿");
   await expect(page.locator("#room-queue")).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(tabs).toBeVisible();
   await expect(page.locator("#room-chat")).toBeVisible();
-  await page.getByRole("tab", { name: "待播", exact: true }).click();
-  await expect(page.locator("#room-chat")).toBeHidden();
+  await expect(page.locator("#room-chat")).toBeVisible();
   await expect(page.locator("#room-queue")).toBeVisible();
   await page.setViewportSize({ width: 1366, height: 900 });
-  await expect(tabs).toBeHidden();
   await expect(page.locator("#room-chat")).toBeVisible();
   await expect(page.locator("#room-queue")).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(
-    page.getByRole("tab", { name: "待播", exact: true }),
-  ).toHaveAttribute("aria-selected", "true");
-  await page.getByRole("tab", { name: "聊天", exact: true }).click();
+  await expect(page.locator("#room-chat")).toBeVisible();
+  await expect(page.locator("#room-queue")).toBeVisible();
   await expect(
     page.getByRole("textbox", { name: "聊天消息", exact: true }),
   ).toHaveValue("保留的聊天草稿");
@@ -52,7 +45,7 @@ test("compact controls fit narrow videos and retain volume and rate interactions
     const video = await page.locator(".video-frame").boundingBox();
     const controls = await page.locator(".player-chrome").boundingBox();
     expect(controls!.height).toBeLessThanOrEqual(100);
-    for (const label of ["播放选项", "全屏"]) {
+    for (const label of ["播放选项", "仅视频全屏"]) {
       const box = await page
         .getByRole("button", { name: label, exact: true })
         .boundingBox();
@@ -66,10 +59,10 @@ test("compact controls fit narrow videos and retain volume and rate interactions
       path: testInfo.outputPath(`overlay-${width}.png`),
     });
   }
-  const mute = page.getByRole("button", { name: "静音", exact: true });
+  const mute = page.getByRole("button", { name: "本机静音", exact: true });
   if (isMobile) await mute.focus();
   else await mute.hover();
-  const volume = page.getByRole("slider", { name: "音量", exact: true });
+  const volume = page.getByRole("slider", { name: "本机音量", exact: true });
   await expect(volume).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("overlay-volume.png") });
   await volume.focus();
@@ -130,7 +123,7 @@ test("video controls leave the picture transparent and fit a compact bottom stri
   const controls = await chrome.boundingBox();
   expect(controls!.height).toBeLessThanOrEqual(100);
   const seek = await page
-    .getByRole("slider", { name: "播放进度" })
+    .getByRole("slider", { name: "房间播放进度" })
     .boundingBox();
   const play = await page.locator(".control-play").boundingBox();
   expect(seek!.y + seek!.height).toBeLessThanOrEqual(play!.y + 1);

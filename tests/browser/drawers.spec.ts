@@ -23,3 +23,40 @@ test("drawer dismisses only an outside primary press and release", async ({
   await expect(dialog).toBeHidden();
   await expect(trigger).toBeFocused();
 });
+
+test("mobile drawer spans the viewport while desktop keeps its bounded width", async ({
+  page,
+}, info) => {
+  await appFixture(page);
+  await page.goto("/admin/sources");
+  for (const width of [390, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.getByRole("button", { name: "添加片源", exact: true }).click();
+    const drawer = page.getByRole("dialog", { name: "添加片源", exact: true });
+    await expect(drawer).toBeVisible();
+    await expect
+      .poll(async () => {
+        const rect = await drawer.boundingBox();
+        return rect ? Math.round(rect.width) : 0;
+      })
+      .toBe(width === 390 ? 390 : 440);
+    await expect
+      .poll(async () => {
+        const rect = await drawer.boundingBox();
+        return rect ? Math.round(rect.x + rect.width) : 0;
+      })
+      .toBe(width);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+    await page.screenshot({
+      path: info.outputPath(`drawer-bounds-${width}.png`),
+      animations: "disabled",
+    });
+    await page.keyboard.press("Escape");
+    await expect(drawer).toBeHidden();
+    await expect(
+      page.getByRole("button", { name: "添加片源", exact: true }),
+    ).toBeFocused();
+  }
+});

@@ -3,6 +3,10 @@ use super::*;
 use persistence::room_cleanup::Task;
 
 async fn finish(app: &App, task: &Task) -> anyhow::Result<Option<(protocol::RoomState, Uuid)>> {
+    let control_lease = match &app.control_cluster {
+        Some(cluster) => Some(cluster.local_lease(task.room).await?),
+        None => None,
+    };
     let mut tx = app.db.begin().await?;
     let room =
         sqlx::query("SELECT lifecycle,lifecycle_epoch FROM rooms WHERE id=$1 FOR NO KEY UPDATE")
@@ -19,6 +23,9 @@ async fn finish(app: &App, task: &Task) -> anyhow::Result<Option<(protocol::Room
     if !owns {
         return Ok(None);
     }
+    if !distributed_compute::room_drained(&mut tx, task.room).await? {
+        anyhow::bail!("distributed_compute_drain_unconfirmed");
+    }
     if let Some(reason) = persistence::room_cleanup::blocker(&mut tx, task).await? {
         anyhow::bail!(reason);
     }
@@ -28,6 +35,10 @@ async fn finish(app: &App, task: &Task) -> anyhow::Result<Option<(protocol::Room
             .fetch_one(&mut *tx)
             .await?,
     )?;
+    if let Some(lease) = &control_lease {
+        persistence::room_node_leases::guard(&mut tx, lease).await?;
+    }
+    let before = state.clone();
     state.revision = state
         .revision
         .checked_add(1)
@@ -43,16 +54,26 @@ async fn finish(app: &App, task: &Task) -> anyhow::Result<Option<(protocol::Room
         .bind(&value)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO room_events(room_id,revision,state) VALUES($1,$2,$3)")
-        .bind(task.room)
-        .bind(i64::from(state.revision))
-        .bind(&value)
-        .execute(&mut *tx)
-        .await?;
+    let diagnostic = persistence::room_diagnostics::envelope(
+        event,
+        before,
+        None,
+        persistence::room_diagnostics::lifecycle("closing", task.epoch)?,
+        persistence::room_diagnostics::lifecycle("closed", task.epoch)?,
+        room_core::diagnostics::Operation::Lifecycle {
+            transition: room_core::diagnostics::LifecycleTransition::Closed,
+            expected_revision: state.revision - 1,
+            server_time_ms: None,
+        },
+    );
+    persistence::room_diagnostics::append(&mut tx, &state, diagnostic).await?;
     sqlx::query("INSERT INTO room_lifecycle_events(id,room_id,previous_lifecycle,lifecycle,lifecycle_epoch,revision) VALUES($1,$2,'closing','closed',$3,$4)")
         .bind(event).bind(task.room).bind(task.epoch).bind(i64::from(state.revision)).execute(&mut *tx).await?;
     sqlx::query("UPDATE room_cleanup_tasks SET completed_at=clock_timestamp(),last_error=NULL,lease_owner=NULL,lease_until=NULL WHERE room_id=$1 AND lifecycle_epoch=$2 AND lease_owner=$3")
         .bind(task.room).bind(task.epoch).bind(task.owner).execute(&mut *tx).await?;
+    if let Some(lease) = &control_lease {
+        persistence::room_node_leases::guard(&mut tx, lease).await?;
+    }
     tx.commit().await?;
     Ok(Some((state, event)))
 }
@@ -78,6 +99,12 @@ pub async fn run(app: App) {
                             "playback_preparation_drain_unconfirmed"
                         }
                         "media_execution_drain_unconfirmed" => "media_execution_drain_unconfirmed",
+                        "distributed_compute_drain_unconfirmed" => {
+                            "distributed_compute_drain_unconfirmed"
+                        }
+                        "static_hls_capture_drain_unconfirmed" => {
+                            "static_hls_capture_drain_unconfirmed"
+                        }
                         "agent_transfer_drain_unconfirmed" => "agent_transfer_drain_unconfirmed",
                         "upstream_cleanup_failed" => "upstream_cleanup_failed",
                         "legacy_upstream_cleanup_unconfirmed" => {

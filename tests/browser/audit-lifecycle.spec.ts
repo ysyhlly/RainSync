@@ -55,9 +55,11 @@ test("failed logout is reported even when playback cancellation also fails", asy
     "src",
     "/fixture-video.mp4",
   );
-  await page.route("**/api/v1/playback-requests/*", (r) =>
-    r.abort("connectionfailed"),
-  );
+  let cleanupAttempts = 0;
+  await page.route("**/api/v1/playback-requests/*", (r) => {
+    cleanupAttempts++;
+    return r.abort("connectionfailed");
+  });
   let attempts = 0;
   await page.route("**/api/v1/auth/logout", (r) => {
     attempts++;
@@ -70,7 +72,13 @@ test("failed logout is reported even when playback cancellation also fails", asy
     .getByRole("button", { name: "退出登录" })
     .filter({ visible: true })
     .click();
-  await expect(page.getByRole("alert")).toContainText("注销暂不可用");
+  await expect(
+    page.getByRole("alert").filter({ hasText: "注销暂不可用" }),
+  ).toHaveCount(1);
+  await expect(
+    page.locator(".frontend-notice").getByRole("alert"),
+  ).toContainText("网络连接中断");
+  await expect.poll(() => cleanupAttempts).toBeGreaterThan(0);
   expect(attempts).toBe(1);
   await expect(
     page.getByRole("button", { name: "退出登录" }).filter({ visible: true }),

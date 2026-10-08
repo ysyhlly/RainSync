@@ -724,8 +724,13 @@ try {
           ].includes(kind)
         ? "source_version_required"
         : undefined;
+    const executionError = ["denied", "nas_denied"].includes(kind)
+      ? "media_input_denied"
+      : kind === "malformed"
+        ? "media_input_invalid"
+        : "media_job_failed";
     if (expected === "failed" && !kind.endsWith("exhausted"))
-      assert.equal(state.error, sourceError ?? "media_job_failed");
+      assert.equal(state.error, sourceError ?? executionError);
     const entry =
       workerBase + `/media-delivery/${id}/index.m3u8?token=${token}`;
     const response = await fetch(entry);
@@ -757,7 +762,14 @@ try {
         "published output actually decodes video frames",
       );
     } else {
-      assert.equal(response.status, sourceError ? 409 : 502);
+      assert.equal(
+        response.status,
+        sourceError
+          ? 409
+          : executionError === "media_input_invalid"
+            ? 422
+            : 502,
+      );
       const error = await response.json();
       assert.equal(
         error.error.code,
@@ -765,7 +777,7 @@ try {
           ? sourceError.toUpperCase()
           : kind.endsWith("exhausted")
             ? "MEDIA_JOB_RETRY_EXHAUSTED"
-            : "MEDIA_JOB_FAILED",
+            : executionError.toUpperCase(),
       );
       assert.equal(error.error.retryable, false);
       if (sourceError) {

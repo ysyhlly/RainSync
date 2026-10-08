@@ -10,7 +10,12 @@ pub async fn run(app: App, settings: Settings, mut stop: tokio::sync::watch::Rec
             break;
         }
         while tasks.len() < settings.concurrency {
-            match media_previews::claim(&app.db, owner).await {
+            let claimed = tokio::select! {
+                _ = process::stopped(&mut stop) => break,
+                result = tokio::time::timeout(Duration::from_secs(2), media_previews::claim_with_limit(&app.db, owner, settings.queue_limit)) =>
+                    result.unwrap_or_else(|_| Err(anyhow::anyhow!("preview_claim_timeout"))),
+            };
+            match claimed {
                 Ok(Some(a)) => {
                     let app = app.clone();
                     let settings = settings.clone();
@@ -35,12 +40,11 @@ async fn resource(app: &App, a: &Attempt) -> anyhow::Result<(Value, Vec<String>)
         serde_json::from_value(decrypt(app, &row.get::<String, _>("config_encrypted"))?)?;
     let kind: String = row.get("kind");
     let item: String = row.get("resource");
-    let mut resource = json!({"kind":kind,"resource":item,"root":config.root,"url":config.url,"headers":config.headers});
+    let mut resource = json!({"kind":kind,"resource":item,"root":config.root,"url":config.url,"headers":config.headers,"source_url":config.url,"access_policy":config.access_policy});
     let mut posters = vec![];
     match kind.as_str() {
         "local" => {
-            let path = media_core::safe_path(std::path::Path::new(&config.root), &item)?;
-            let file = std::fs::File::open(path)?;
+            let file = media_core::open_local_file(std::path::Path::new(&config.root), &item)?;
             resource["read_version"] =
                 json!(media_core::file_version::snapshot_file(&file)?.version);
         }
@@ -77,7 +81,11 @@ async fn execute(
         result = tokio::time::timeout_at(deadline, resource(&app, &a)) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("preview_timeout"))),
     };
     let Ok((resource, posters)) = result else {
-        let _ = media_previews::finish(&app.db, &a, None, true, settings.cache_bytes).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            media_previews::finish(&app.db, &a, None, true, settings.cache_bytes),
+        )
+        .await;
         return;
     };
     let (cancel, receiver) = tokio::sync::watch::channel(false);
@@ -99,7 +107,15 @@ async fn execute(
             let key = grant.target(target.clone());
             let url = preview_input::url(a.attempt_id, key)?;
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match media_core::preview::generate(&url, poster, remaining, receiver.clone()).await {
+            match media_core::preview::generate(
+                &url,
+                poster,
+                !matches!(resource["kind"].as_str(), Some("local" | "agent")),
+                remaining,
+                receiver.clone(),
+            )
+            .await
+            {
                 Ok(bytes) => return Ok(bytes),
                 Err(_) if poster => continue,
                 Err(e) => return Err(e),
@@ -107,26 +123,31 @@ async fn execute(
         }
         anyhow::bail!("preview_unavailable")
     };
-    tokio::pin!(produce);
     let mut renewal = tokio::time::interval(Duration::from_secs(5));
-    let result = loop {
-        tokio::select! {
-            result=&mut produce=>break result,
-            _=process::stopped(&mut stop)=>{lifecycle.stop();break produce.await},
-            _=tokio::time::sleep_until(deadline)=>{lifecycle.stop();break produce.await},
-            _=renewal.tick()=>{if !matches!(media_previews::renew(&app.db,&a).await,Ok(true)){lifecycle.stop();break produce.await}},
+    // Keep renewal inside a future polled by the supervisor. Database lock or
+    // pool waits must never suspend timeout, shutdown or FFmpeg supervision.
+    let renew = async {
+        loop {
+            renewal.tick().await;
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(2), media_previews::renew(&app.db, &a))
+                    .await,
+                Ok(Ok(true))
+            ) {
+                break;
+            }
         }
     };
+    let result = supervise_preview(produce, renew, deadline, &mut stop, || lifecycle.stop()).await;
     lifecycle.stop();
     // Check the actual reading-side file again; host/container stat identities
     // differ, so a server-side stamp is not presented as a content hash.
     let unchanged = if resource["kind"] == "local" {
-        media_core::safe_path(
+        media_core::open_local_file(
             std::path::Path::new(resource["root"].as_str().unwrap_or("")),
             resource["resource"].as_str().unwrap_or(""),
         )
         .ok()
-        .and_then(|p| std::fs::File::open(p).ok())
         .and_then(|f| media_core::file_version::snapshot_file(&f).ok())
         .is_some_and(|v| resource["read_version"] == v.version)
     } else {
@@ -134,16 +155,102 @@ async fn execute(
     };
     let image = result.ok().filter(|_| unchanged && !*stop.borrow());
     let digest = image.as_ref().map(|v| hex::encode(Sha256::digest(v)));
-    if media_previews::finish(
-        &app.db,
-        &a,
-        image.as_deref().zip(digest.as_deref()),
-        image.is_none(),
-        settings.cache_bytes,
-    )
-    .await
-    .is_err()
-    {
+    if !matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            media_previews::finish(
+                &app.db,
+                &a,
+                image.as_deref().zip(digest.as_deref()),
+                image.is_none(),
+                settings.cache_bytes,
+            )
+        )
+        .await,
+        Ok(Ok(_))
+    ) {
         tracing::warn!("preview publication failed")
+    }
+}
+
+async fn supervise_preview<T>(
+    produce: impl std::future::Future<Output = T>,
+    renew: impl std::future::Future<Output = ()>,
+    deadline: tokio::time::Instant,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+    cancel: impl FnOnce(),
+) -> T {
+    tokio::pin!(produce, renew);
+    tokio::select! {
+        result = &mut produce => result,
+        _ = async {
+            tokio::select! {
+                _ = process::stopped(stop) => (),
+                _ = tokio::time::sleep_until(deadline) => (),
+                _ = &mut renew => (),
+            }
+        } => { cancel(); produce.await },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_database_observation_does_not_block_producer_deadline_or_stop() {
+        for shutdown in [false, true] {
+            let began = tokio::time::Instant::now();
+            let (cancel, mut producer_stop) = tokio::sync::watch::channel(false);
+            let (stop, mut stopped) = tokio::sync::watch::channel(false);
+            let produce = async move {
+                producer_stop.changed().await.unwrap();
+                assert!(*producer_stop.borrow());
+                "drained"
+            };
+            let supervised = tokio::spawn(async move {
+                supervise_preview(
+                    produce,
+                    std::future::pending(),
+                    began + Duration::from_millis(20),
+                    &mut stopped,
+                    || {
+                        cancel.send_replace(true);
+                    },
+                )
+                .await
+            });
+            tokio::task::yield_now().await;
+            assert!(!supervised.is_finished());
+            assert_eq!(tokio::time::Instant::now(), began);
+            if shutdown {
+                stop.send_replace(true);
+            } else {
+                tokio::time::advance(Duration::from_millis(20)).await;
+            }
+            assert_eq!(supervised.await.unwrap(), "drained");
+            assert_eq!(
+                tokio::time::Instant::now(),
+                if shutdown {
+                    began
+                } else {
+                    began + Duration::from_millis(20)
+                }
+            );
+            drop(stop);
+        }
+        // Sender closure is a real shutdown signal. Keep the sender alive so
+        // this successful-producer case has no competing cancellation branch.
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        let result = supervise_preview(
+            std::future::ready("produced"),
+            std::future::pending(),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &mut stopped,
+            || panic!("successful producer cannot be interrupted by a pending DB wait"),
+        )
+        .await;
+        assert_eq!(result, "produced");
+        drop(stop);
     }
 }

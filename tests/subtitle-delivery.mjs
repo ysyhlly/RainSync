@@ -37,7 +37,7 @@ export async function subtitleDelivery({ plan, worker, sql, key, setBody }) {
     encrypt.getAuthTag(),
   ]).toString("base64");
   sql(
-    `UPDATE playback_sessions SET resource=jsonb_build_object('encrypted','${encrypted}') WHERE id='${plan.session_id}'`,
+    `UPDATE playback_sessions SET resource=resource||jsonb_build_object('encrypted','${encrypted}') WHERE id='${plan.session_id}'`,
   );
   response = await fetch(url);
   assert.equal(response.status, 200);

@@ -304,9 +304,9 @@ onBeforeUnmount(() => {
 });
 </script>
 <template>
-  <section class="page">
+  <section class="page registration-invites-page">
     <div class="page-title">
-      <div>
+      <div class="page-intro">
         <p class="section-label">管理</p>
         <h1>账号与注册</h1>
         <p>每个邀请码仅可注册一个普通账号。注册成功后自动登录。</p>
@@ -316,7 +316,7 @@ onBeforeUnmount(() => {
       </button>
     </div>
     <AccountTabs />
-    <div class="admin-filters">
+    <div class="admin-filters toolbar">
       <label
         >状态<AppSelect
           v-model="status"
@@ -329,22 +329,35 @@ onBeforeUnmount(() => {
       </button>
     </div>
     <Notice :message="error" error />
-    <p v-if="loading" role="status">正在加载邀请码…</p>
+    <p v-if="loading" class="loading-state loading-state--inline" role="status">
+      正在加载邀请码…
+    </p>
     <div
       v-if="loaded && !loading && !error && !rows.length"
-      class="empty-state"
+      class="empty-state surface-card"
     >
-      <AppIcon name="key" :size="40" />
+      <span class="empty-state__icon"><AppIcon name="key" :size="28" /></span>
       <h2>{{ status === "all" ? "暂无注册邀请码" : "没有符合筛选的记录" }}</h2>
       <p>注册邀请码与放映室邀请相互独立。</p>
     </div>
     <div class="invite-list" :aria-busy="loading">
-      <article v-for="row in rows" :key="row.id" class="invite-card">
+      <article
+        v-for="row in rows"
+        :key="row.id"
+        class="invite-card surface-card"
+      >
         <header>
           <h2>尾号 {{ row.code_suffix }}</h2>
-          <span class="status-tag" :data-status="row.status">{{
-            labels[row.status]
-          }}</span>
+          <span
+            class="status-tag status-badge"
+            :class="{
+              'status-badge--success': row.status === 'unused',
+              'status-badge--warning': row.status === 'expired',
+              'status-badge--danger': row.status === 'revoked',
+            }"
+            :data-status="row.status"
+            >{{ labels[row.status] }}</span
+          >
         </header>
         <p v-if="row.note">{{ row.note }}</p>
         <dl>
@@ -491,3 +504,18 @@ onBeforeUnmount(() => {
     >
   </section>
 </template>
+
+<style scoped>
+.registration-invites-page > .admin-filters {
+  align-items: flex-end;
+}
+@media (min-width: 1100px) {
+  .registration-invites-page > .page-title {
+    margin-bottom: var(--space-5);
+  }
+  .registration-invites-page > :deep(.section-tabs),
+  .registration-invites-page > .admin-filters {
+    margin-bottom: var(--space-4);
+  }
+}
+</style>

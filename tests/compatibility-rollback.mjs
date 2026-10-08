@@ -1,3 +1,5 @@
+// Historical account/profile rollout fixture (0019→0022), not current release evidence.
+import { requireHistoricalCompatibility } from "./fixtures/historical-compatibility.mjs";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -5,6 +7,8 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isolatedServer } from "./fixtures/server.mjs";
 import { png } from "./fixtures/png.mjs";
+
+await requireHistoricalCompatibility();
 
 const manifest=JSON.parse(await readFile(resolve(process.env.RAINSYNC_ARTIFACT_DIR,"compatibility/latest.json"),"utf8"));
 const binary=resolve(manifest.target,"debug",`rainsync-server${process.platform==="win32"?".exe":""}`);

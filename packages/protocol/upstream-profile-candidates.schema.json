@@ -1,0 +1,351 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UpstreamProfileCandidateSet",
+  "type": "object",
+  "properties": {
+    "binding": {
+      "description": "Binding and profile are either both present or both absent.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "decision_reason": {
+      "type": "string"
+    },
+    "profile": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UpstreamTranscodeProfileEnvelope"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "profile_version": {
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "profile_version",
+    "decision_reason"
+  ],
+  "$defs": {
+    "AudioCapabilityConfiguration": {
+      "type": "object",
+      "properties": {
+        "bitrate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "channels": {
+          "type": "string"
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "samplerate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "content_type",
+        "channels",
+        "bitrate",
+        "samplerate"
+      ]
+    },
+    "DolbyVisionConfiguration": {
+      "description": "Freshly probed single-layer Dolby Vision facts, not a device guarantee.",
+      "type": "object",
+      "properties": {
+        "codec": {
+          "type": "string"
+        },
+        "compatibility_id": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "level": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "profile": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "level",
+        "compatibility_id",
+        "codec"
+      ]
+    },
+    "UpstreamAudioProfileBounds": {
+      "type": "object",
+      "properties": {
+        "codec": {
+          "description": "AAC is requested. A particular AAC profile is not promised by this field.",
+          "type": "string"
+        },
+        "max_bitrate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_channels": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "requested_sample_rate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "codec",
+        "max_channels",
+        "requested_sample_rate",
+        "max_bitrate"
+      ]
+    },
+    "UpstreamAudioRateContract": {
+      "description": "A discrete allowed set, separate from the requested rate and measured output.",
+      "type": "object",
+      "properties": {
+        "allowed_sample_rates": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "mse_samples": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AudioCapabilityConfiguration"
+          }
+        },
+        "source_sample_rate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "allowed_sample_rates",
+        "source_sample_rate",
+        "mse_samples"
+      ]
+    },
+    "UpstreamProfileProbeSample": {
+      "description": "A finite browser estimate for MSE after HLS transmuxing, not measured output.",
+      "type": "object",
+      "properties": {
+        "audio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AudioCapabilityConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "video": {
+          "$ref": "#/$defs/VideoCapabilityConfiguration"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "video"
+      ]
+    },
+    "UpstreamProfileSemantics": {
+      "description": "Advisory output recipe, deliberately separate from exact media candidates.",
+      "type": "string",
+      "enum": [
+        "upstream_transcode_profile_envelope"
+      ]
+    },
+    "UpstreamTranscodeProfileEnvelope": {
+      "type": "object",
+      "properties": {
+        "audio_rate_contract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpstreamAudioRateContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "configuration_semantics": {
+          "$ref": "#/$defs/UpstreamProfileSemantics"
+        },
+        "container": {
+          "type": "string"
+        },
+        "mse_sample": {
+          "$ref": "#/$defs/UpstreamProfileProbeSample"
+        },
+        "profile_id": {
+          "type": "string"
+        },
+        "profile_version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "requested_audio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpstreamAudioProfileBounds"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "requested_video": {
+          "$ref": "#/$defs/UpstreamVideoProfileBounds"
+        },
+        "transport": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile_version",
+        "profile_id",
+        "configuration_semantics",
+        "transport",
+        "container",
+        "requested_video",
+        "mse_sample"
+      ]
+    },
+    "UpstreamVideoProfileBounds": {
+      "type": "object",
+      "properties": {
+        "codec": {
+          "type": "string"
+        },
+        "max_bitrate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_framerate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_level": {
+          "type": "string"
+        },
+        "max_width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "profile": {
+          "type": "string"
+        },
+        "requested_bit_depth": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "requested_range": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "codec",
+        "profile",
+        "max_level",
+        "max_width",
+        "max_height",
+        "max_framerate",
+        "max_bitrate",
+        "requested_bit_depth",
+        "requested_range"
+      ]
+    },
+    "VideoCapabilityConfiguration": {
+      "type": "object",
+      "properties": {
+        "bitrate": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "dolby_vision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DolbyVisionConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "framerate": {
+          "type": "number",
+          "format": "double"
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "content_type",
+        "width",
+        "height",
+        "bitrate",
+        "framerate"
+      ]
+    }
+  }
+}

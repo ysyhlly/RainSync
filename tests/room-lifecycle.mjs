@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 import { isolatedServer, delay } from "./fixtures/server.mjs";
+import { sourceMedia } from "./fixtures/source-grant.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 
 await isolatedServer("room-lifecycle", async f => {
   const admin = f.client();
@@ -16,8 +18,8 @@ await isolatedServer("room-lifecycle", async f => {
   const room = await owner.client.request("/rooms", "POST", { name: "lifecycle fixture" });
   const invite = await owner.client.request(`/rooms/${room.id}/invites`, "POST");
   await viewer.client.request(`/rooms/${room.id}/join`, "POST", { token: invite.token });
-  const source = randomUUID(), media = randomUUID(), playback = randomUUID(), execution = randomUUID(), key = randomUUID();
-  f.sql(`INSERT INTO sources(id,name,kind,config_encrypted) VALUES('${source}','lifecycle source','local','fixture'); INSERT INTO media_items(id,source_id,title,resource,duration_ms) VALUES('${media}','${source}','lifecycle media','fixture',1)`);
+  const media = sourceMedia(f, { kind: "local", root: f.root, resource: "fixture" }), playback = randomUUID(), execution = randomUUID(), key = randomUUID();
+  f.sql(`UPDATE media_items SET duration_ms=1 WHERE id='${media}'`);
   const sockets = new Set();
   async function connect(client) {
     const ws = new WebSocket(f.origin.replace("http", "ws") + "/api/v1/ws", { headers: { Origin: f.origin, Cookie: client.cookie } });
@@ -41,6 +43,7 @@ await isolatedServer("room-lifecycle", async f => {
   }
   const status = () => owner.client.request(`/rooms/${room.id}/lifecycle`);
   const mutation = (client, action, revision, expected = 200) => client.request(`/rooms/${room.id}/${action}`, "POST", { expected_revision: revision }, expected);
+  const transfer = (client, owner_id, revision, expected = 200) => client.request(`/rooms/${room.id}/owner`, "POST", { owner_id, expected_revision: revision }, expected);
   const command = (state, epoch, type = "PLAY", payload) => ({ protocol_version: 1, room_id: room.id, command_id: randomUUID(), control_epoch: epoch, expected_revision: state.revision, media_generation: state.media_generation, type, payload });
   try {
     const a = await connect(owner.client), b = await connect(owner.client);
@@ -61,7 +64,9 @@ await isolatedServer("room-lifecycle", async f => {
     // Reverse ordering: PLAY commits before management takes the room lock.
     // Its newer revision must turn the stale close into a visible conflict.
     const winningTag = `lifecycle-play-first-${randomUUID()}`;
-    const winningLock = f.sqlProcess(`BEGIN; SELECT room_id FROM room_snapshots WHERE room_id='${room.id}' FOR UPDATE; SELECT pg_sleep(2) /* ${winningTag} */; COMMIT;`);
+    // FOR SHARE lets the new replay membership gate finish, then blocks the
+    // final FOR UPDATE commit. Observe that exact boundary before racing close.
+    const winningLock = f.sqlProcess(`BEGIN; SELECT room_id FROM room_snapshots WHERE room_id='${room.id}' FOR SHARE; SELECT pg_sleep(2) /* ${winningTag} */; COMMIT;`);
     await f.waitForSql(`SELECT count(*) FROM pg_stat_activity WHERE wait_event='PgSleep' AND query LIKE '%${winningTag}%'`, "1");
     const winningPlay = command(state, a.snapshot.control_epoch.id);
     a.send(winningPlay);
@@ -71,7 +76,7 @@ await isolatedServer("room-lifecycle", async f => {
     state = (await a.next("ACK", value => value.command_id === winningPlay.command_id)).state;
     assert.equal((await staleClose).error.code, "REVISION_CONFLICT");
     assert.equal((await status()).lifecycle, "active");
-    f.sql(`INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES('${playback}','${viewer.identity.id}','${room.id}','${media}',${state.media_generation},'lifecycle-grant','{"upstream_closed":true}',now()+interval '1 hour'); INSERT INTO media_executions(id,session_id,kind,owner_id) VALUES('${execution}','${playback}','delivery','${randomUUID()}'); INSERT INTO playback_requests(user_id,idempotency_key,request_hash,session_id,owner_epoch,status,response_encrypted,lease_until,expires_at,room_id,lifecycle_epoch) VALUES('${viewer.identity.id}','${key}','lifecycle-digest','${playback}','${randomUUID()}','completed','fixture',now()+interval '1 minute',now()+interval '1 day','${room.id}',0)`);
+    withPlaybackAdmission(f, { client: viewer.client, user: viewer.identity.id, room: room.id, session: playback, key }, `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES('${playback}','${viewer.identity.id}','${room.id}','${media}',${state.media_generation},'lifecycle-grant','{"upstream_closed":true}',now()+interval '1 hour'); INSERT INTO media_executions(id,session_id,kind,owner_id) VALUES('${execution}','${playback}','delivery','${randomUUID()}')`);
     // The close owns the room lock and is waiting for the snapshot. An already
     // connected controller queues behind it and must not PLAY after revocation.
     const lockTag = `lifecycle-lock-${randomUUID()}`;
@@ -79,6 +84,10 @@ await isolatedServer("room-lifecycle", async f => {
     await f.waitForSql(`SELECT count(*) FROM pg_stat_activity WHERE wait_event='PgSleep' AND query LIKE '%${lockTag}%'`, "1");
     const closing = mutation(owner.client, "close", state.revision);
     await f.waitForSql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT state FROM room_snapshots%FOR UPDATE%'", "1");
+    // A transfer admitted before close commits must observe the lifecycle
+    // after waiting for the same room lock, even with the new revision.
+    const queuedTransfer = transfer(owner.client, viewer.identity.id, state.revision + 1, 409);
+    await f.waitForSql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT owner_id FROM rooms%FOR NO KEY UPDATE%'", "1");
     const play = command(state, a.snapshot.control_epoch.id);
     a.send(play);
     await lock.done;
@@ -86,6 +95,7 @@ await isolatedServer("room-lifecycle", async f => {
     assert.equal(closedRequest.lifecycle, "closing");
     assert.equal(closedRequest.lifecycle_epoch, 1);
     assert.equal(closedRequest.state.playback_status, "paused");
+    assert.equal((await queuedTransfer).error.code, "ROOM_NOT_ACTIVE");
     assert.equal((await a.next("ERROR", value => value.command_id === play.command_id)).error.code, "ROOM_NOT_ACTIVE");
     for (const socket of [a, b]) {
       const changed = await socket.next("EVENT", value => value.event_id === closedRequest.event_id);
@@ -100,6 +110,11 @@ await isolatedServer("room-lifecycle", async f => {
     assert.equal((await outsider.client.request(`/rooms/${room.id}/join`, "POST", { token: invite.token }, 409)).error.code, "ROOM_NOT_ACTIVE");
     assert.equal((await owner.client.request(`/rooms/${room.id}/playlist`, "POST", { media_id: media }, 409)).error.code, "ROOM_NOT_ACTIVE");
     assert.equal((await owner.client.request(`/rooms/${room.id}/owner`, "POST", { owner_id: viewer.identity.id, expected_revision: closedRequest.state.revision }, 409)).error.code, "ROOM_NOT_ACTIVE");
+    assert.equal((await transfer(admin, viewer.identity.id, closedRequest.state.revision, 409)).error.code, "ROOM_NOT_ACTIVE");
+    const afterRejectedTransfers = await status();
+    assert.equal(afterRejectedTransfers.owner_id, owner.identity.id);
+    assert.deepEqual(afterRejectedTransfers.state, closedRequest.state, "closing transfer rejection cannot change the snapshot");
+    assert.equal(f.sql(`SELECT count(*) FROM room_ownership_events WHERE room_id='${room.id}'`), "0");
     a.send({ type: "CHAT", body: "forbidden while closing" });
     assert.equal((await a.next("ERROR", value => !value.command_id)).error.code, "ROOM_NOT_ACTIVE");
     assert.equal((await viewer.client.request(`/rooms/${room.id}/messages`))[0].body, "retained history");
@@ -120,7 +135,17 @@ await isolatedServer("room-lifecycle", async f => {
     await f.waitForSql(`SELECT lifecycle FROM rooms WHERE id='${room.id}'`, "closed", 15000);
     const settled = await status();
     assert.equal(settled.cleanup.completed, true);
-    const reopened = await mutation(owner.client, "reopen", settled.state.revision);
+    // Closing is transitional: once cleanup settles, ownership can move
+    // without reopening the room or issuing fresh control credentials.
+    const closedTransfer = await transfer(owner.client, viewer.identity.id, settled.state.revision);
+    assert.deepEqual(closedTransfer.state, { ...settled.state, revision: settled.state.revision + 1, controller_user_id: viewer.identity.id });
+    const afterClosedTransfer = await status();
+    assert.equal(afterClosedTransfer.owner_id, viewer.identity.id);
+    assert.equal(afterClosedTransfer.lifecycle, "closed");
+    assert.equal(afterClosedTransfer.lifecycle_epoch, settled.lifecycle_epoch);
+    assert.equal(f.sql(`SELECT count(*) FROM control_epochs WHERE room_id='${room.id}'`), "0");
+    const restoredOwner = await transfer(viewer.client, owner.identity.id, closedTransfer.state.revision);
+    const reopened = await mutation(owner.client, "reopen", restoredOwner.state.revision);
     assert.equal(reopened.lifecycle, "active");
     assert.equal(reopened.lifecycle_epoch, 2);
     assert.equal(reopened.state.playback_status, "paused");
@@ -147,7 +172,15 @@ await isolatedServer("room-lifecycle", async f => {
     assert.equal((await viewer.client.request(`/rooms/${room.id}/messages`)).length, 1);
     assert.equal((await viewer.client.request(`/rooms/${room.id}/playlist`)).length, 1);
     assert.equal(f.sql(`SELECT count(*) FROM room_lifecycle_events WHERE room_id='${room.id}'`), "6");
-    console.log("PASS: close/PLAY race, owner/admin/revision checks, natural END_MEDIA remains active, revoked multi-device controls/invites/grants, closing restart and owner receipt, paused new-epoch reopen, archived authorized readonly history");
+    const archivedTransfer = await transfer(admin, viewer.identity.id, archived.state.revision);
+    assert.deepEqual(archivedTransfer.state, { ...archived.state, revision: archived.state.revision + 1, controller_user_id: viewer.identity.id });
+    const afterArchivedTransfer = await status();
+    assert.equal(afterArchivedTransfer.owner_id, viewer.identity.id);
+    assert.equal(afterArchivedTransfer.lifecycle, "archived");
+    assert.equal(afterArchivedTransfer.lifecycle_epoch, archived.lifecycle_epoch);
+    assert.equal(f.sql(`SELECT count(*) FROM control_epochs WHERE room_id='${room.id}'`), "0");
+    assert.equal(f.sql(`SELECT count(*) FROM room_ownership_events WHERE room_id='${room.id}'`), "3");
+    console.log("PASS: close/PLAY/ownership races, closing owner/admin transfer rejection without side effects, closed/archived transfer preservation, owner/admin/revision checks, natural END_MEDIA remains active, revoked multi-device controls/invites/grants, closing restart and owner receipt, paused new-epoch reopen, archived authorized readonly history");
   } finally {
     for (const socket of sockets) socket.terminate();
   }

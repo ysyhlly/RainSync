@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use persistence::media_outputs::FileProof;
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -26,11 +26,21 @@ impl std::error::Error for Rejected {}
 struct State {
     child: Option<Child>,
     verified: bool,
+    advanced_recipe: Option<Arc<media_core::advanced_media::Recipe>>,
 }
 
 #[derive(Default)]
 pub struct Gate {
     state: Mutex<State>,
+}
+
+fn qualification_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    // Qualification children need immutable media pipes, never the service's
+    // database, encryption or administrator credentials. Apply the same policy
+    // to every gate, including native compatibility and ordinary local output.
+    media_core::input_policy::clean_environment(&mut command);
+    command
 }
 
 async fn reap(state: &mut State) -> Result<()> {
@@ -90,6 +100,20 @@ async fn decoded_frames(stdout: impl tokio::io::AsyncRead + Unpin) -> Result<()>
 }
 
 impl Gate {
+    /// Bind the expected fixed advanced recipe before the encoder starts. A
+    /// live or verified gate cannot be relabeled to a different recipe.
+    pub async fn configure_advanced(
+        &self,
+        recipe: Arc<media_core::advanced_media::Recipe>,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        ensure!(
+            state.child.is_none() && !state.verified && state.advanced_recipe.is_none(),
+            "advanced_media_output_gate_already_bound"
+        );
+        state.advanced_recipe = Some(recipe);
+        Ok(())
+    }
     /// The job owns this gate until cleanup. Cancelling this future leaves the
     /// child here, so the caller can explicitly kill/wait rather than orphan it.
     pub async fn verify(&self, directory: PathBuf, proofs: [FileProof; 2]) -> Result<()> {
@@ -99,6 +123,69 @@ impl Gate {
         }
         reap(&mut state).await?;
         let work = async {
+            if let Some(recipe) = state.advanced_recipe.clone() {
+                let probe_directory = directory.clone();
+                let probe_proofs = proofs.clone();
+                let (init, segment) = media_core::child_process::blocking(move || {
+                    Ok::<_, anyhow::Error>((
+                        outputs::open_verified(
+                            &probe_directory.join("init.mp4"),
+                            &probe_proofs[0],
+                        )?,
+                        outputs::open_verified(
+                            &probe_directory.join("index0.m4s"),
+                            &probe_proofs[1],
+                        )?,
+                    ))
+                })
+                .await??;
+                let mut command = qualification_command("ffprobe");
+                command
+                    .args([
+                        "-v",
+                        "error",
+                        "-protocol_whitelist",
+                        "pipe",
+                        "-f",
+                        "mp4",
+                        "-i",
+                        "pipe:0",
+                        "-show_streams",
+                        "-show_data",
+                        "-of",
+                        "json",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true);
+                #[cfg(windows)]
+                command.creation_flags(0x08000000);
+                state.child = Some(child_process::spawn(command)?);
+                let child = state.child.as_mut().unwrap();
+                let stdin = child.stdin.take().unwrap();
+                let stdout = child.stdout.take().unwrap();
+                let (_, bytes) =
+                    tokio::try_join!(feed_fragments(stdin, init, segment), async move {
+                        use tokio::io::AsyncReadExt;
+                        let mut bytes = Vec::new();
+                        stdout
+                            .take(2 * 1024 * 1024 + 1)
+                            .read_to_end(&mut bytes)
+                            .await?;
+                        ensure!(
+                            bytes.len() <= 2 * 1024 * 1024,
+                            "advanced_media_output_probe_too_large"
+                        );
+                        Ok::<_, anyhow::Error>(bytes)
+                    })?;
+                ensure!(
+                    child.wait().await?.success(),
+                    "advanced_media_output_probe_failed"
+                );
+                recipe.validate_output_probe(&serde_json::from_slice(&bytes)?)?;
+                reap(&mut state).await?;
+            }
             let (init, segment) = media_core::child_process::blocking(move || {
                 Ok::<_, anyhow::Error>((
                     outputs::open_verified(&directory.join("init.mp4"), &proofs[0])?,
@@ -106,7 +193,7 @@ impl Gate {
                 ))
             })
             .await??;
-            let mut command = Command::new("ffmpeg");
+            let mut command = qualification_command("ffmpeg");
             command
                 .args([
                     "-v",
@@ -143,29 +230,9 @@ impl Gate {
             command.creation_flags(0x08000000);
             state.child = Some(child_process::spawn(command)?);
             let child = state.child.as_mut().unwrap();
-            let mut stdin = child.stdin.take().unwrap();
+            let stdin = child.stdin.take().unwrap();
             let stdout = child.stdout.take().unwrap();
-            let feeding = async move {
-                use tokio::io::AsyncWriteExt;
-                for mut file in [init, segment] {
-                    loop {
-                        let (returned, bytes) = media_core::child_process::blocking(move || {
-                            let mut bytes = vec![0; 65536];
-                            let count = std::io::Read::read(&mut file, &mut bytes)?;
-                            bytes.truncate(count);
-                            Ok::<_, std::io::Error>((file, bytes))
-                        })
-                        .await??;
-                        file = returned;
-                        if bytes.is_empty() {
-                            break;
-                        }
-                        stdin.write_all(&bytes).await?;
-                    }
-                }
-                drop(stdin);
-                Ok::<_, anyhow::Error>(())
-            };
+            let feeding = feed_fragments(stdin, init, segment);
             tokio::try_join!(feeding, decoded_frames(stdout))?;
             ensure!(child.wait().await?.success(), "decode_failed");
             Ok::<_, anyhow::Error>(())
@@ -175,6 +242,10 @@ impl Gate {
         match result {
             Ok(Ok(())) => {
                 state.verified = true;
+                if let Some(recipe) = &state.advanced_recipe {
+                    tracing::info!(backend=?recipe.encoder().backend(), qualification=?media_core::advanced_media::RuntimeQualification::OutputValidated,
+                        "actual advanced media output headers and immutable first fragment passed validation");
+                }
                 Ok(())
             }
             Ok(Err(_)) => Err(Rejected.into()),
@@ -187,9 +258,55 @@ impl Gate {
     }
 }
 
+async fn feed_fragments(
+    mut stdin: tokio::process::ChildStdin,
+    init: std::fs::File,
+    segment: std::fs::File,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    for mut file in [init, segment] {
+        loop {
+            let (returned, bytes) = media_core::child_process::blocking(move || {
+                let mut bytes = vec![0; 65536];
+                let count = std::io::Read::read(&mut file, &mut bytes)?;
+                bytes.truncate(count);
+                Ok::<_, std::io::Error>((file, bytes))
+            })
+            .await??;
+            file = returned;
+            if bytes.is_empty() {
+                break;
+            }
+            stdin.write_all(&bytes).await?;
+        }
+    }
+    drop(stdin);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qualification_children_do_not_inherit_service_secrets() {
+        for program in ["ffprobe", "ffmpeg"] {
+            let command = qualification_command(program);
+            assert_eq!(command.as_std().get_program(), program);
+            for key in [
+                "DATABASE_URL",
+                "SOURCE_ENCRYPTION_KEY",
+                "ADMIN_PASSWORD",
+                "SERVER_INTERNAL_URL",
+            ] {
+                assert!(
+                    command
+                        .as_std()
+                        .get_envs()
+                        .any(|(name, value)| { name == key && value.is_none() })
+                );
+            }
+        }
+    }
     #[tokio::test]
     async fn headers_and_zero_frames_do_not_prove_decoding() {
         assert!(
@@ -209,5 +326,18 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn advanced_gate_cannot_be_rebound_after_recipe_configuration() {
+        let recipe = Arc::new(media_core::advanced_media::Recipe::from_probe(
+            &serde_json::json!({"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":1280,"height":720,"pix_fmt":"yuv420p","color_transfer":"bt709","disposition":{"attached_pic":0}}]}),
+            None, 0.0, &media_core::advanced_media::Request::default(),
+            media_core::advanced_media::EncoderSelection::software_recipe(),
+        ).unwrap());
+        let gate = Gate::default();
+        gate.configure_advanced(recipe.clone()).await.unwrap();
+        assert!(gate.configure_advanced(recipe).await.is_err());
+        gate.stop().await.unwrap();
     }
 }

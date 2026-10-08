@@ -165,6 +165,7 @@ const upstream = createServer((request, response) => {
         .writeHead(status, { "Content-Type": "application/json" })
         .end(JSON.stringify(value));
     };
+    if (path === "/Users/fixture-user") return json({Id:"fixture-user",Policy:{IsDisabled:false,EnableMediaPlayback:true}});
     if (path === "/Users/fixture-user/Items")
       return json({
         TotalRecordCount: 1,
@@ -1598,9 +1599,25 @@ try {
     },
   );
 } catch (error) {
+  const active = report.cases.findLast((c) => c.result === "running");
+  const firstLine = String(error?.message ?? "").split("\n", 1)[0];
+  const identityFailure =
+    /^compiled binary rainsync-(?:server|media-worker|nas-agent)$/.test(firstLine) ||
+    (Array.isArray(binding?.source) &&
+      binding.source.some(
+        (file) => typeof file?.path === "string" && firstLine === `compiled input ${file.path}`,
+      ));
+  const name = [
+    "Error", "AssertionError", "TypeError", "RangeError", "SyntaxError", "AbortError", "TimeoutError",
+  ].includes(error?.name) ? error.name : "Error";
+  const code = ["ERR_ASSERTION", "ENOENT", "EACCES", "EPERM"].includes(error?.code)
+    ? ` (${error.code})`
+    : "";
+  console.error(
+    `FAIL: ${active?.name ?? "backend preflight"}: ${name}${code}${identityFailure ? `; ${firstLine}` : ""}`,
+  );
   report.result = "failed";
   report.failures.push({ error: String(error.stack ?? error) });
-  const active = report.cases.findLast((c) => c.result === "running");
   if (active) {
     active.result = "failed";
     active.finished_at = new Date().toISOString();

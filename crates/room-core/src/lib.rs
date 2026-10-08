@@ -1,7 +1,14 @@
+pub mod diagnostics;
+pub mod replay;
+
 use protocol::{Action, Command, PlaybackStatus, RoomState, VERSION};
 use uuid::Uuid;
 
 pub fn position(state: &RoomState, now: f64) -> f64 {
+    if state.live.is_some() {
+        // An elapsed room clock is not a broadcast timeline.
+        return 0.0;
+    }
     let elapsed = if state.playback_status == PlaybackStatus::Playing {
         (now - state.anchor_server_time_ms).max(0.0) * state.playback_rate
     } else {
@@ -33,10 +40,26 @@ pub fn reduce(
     admin: bool,
     now: f64,
 ) -> Result<RoomState, &'static str> {
+    reduce_with_permission(state, command, actor, admin, None, now)
+}
+
+/// `permission` is an exact action admitted by the caller's durable authority gate.
+/// It is also retained in diagnostics so offline replay never labels a moderator admin.
+pub fn reduce_with_permission(
+    state: &RoomState,
+    command: &Command,
+    actor: Uuid,
+    admin: bool,
+    permission: Option<protocol::RoomPermission>,
+    now: f64,
+) -> Result<RoomState, &'static str> {
     if command.protocol_version != VERSION {
         return Err("protocol_version");
     }
-    if actor != state.controller_user_id && !admin {
+    if actor != state.controller_user_id
+        && !admin
+        && permission != Some(protocol::RoomPermission::for_action(&command.action))
+    {
         return Err("controller_required");
     }
     if command.room_id != state.room_id {
@@ -51,13 +74,25 @@ pub fn reduce(
     if state.media_id.is_none() && !matches!(command.action, Action::ChangeMedia { .. }) {
         return Err("no_media");
     }
+    if state.live.is_some() {
+        if command.live_version != Some(1) {
+            return Err("native_live_client_unsupported");
+        }
+        match command.action {
+            Action::Seek { .. } => return Err("native_live_seek_unsupported"),
+            Action::SetRate { rate } if rate != 1.0 => return Err("native_live_rate_unsupported"),
+            Action::EndMedia { .. } => return Err("native_live_end_unsupported"),
+            _ => {}
+        }
+    }
     let mut next = state.clone();
     next.anchor_position_ms = position(state, now);
     next.anchor_server_time_ms = now;
     match command.action {
         Action::Play => {
-            if state.playback_status == PlaybackStatus::Ended
-                || state.duration_ms.is_some_and(|d| position(state, now) >= d)
+            if state.live.is_none()
+                && (state.playback_status == PlaybackStatus::Ended
+                    || state.duration_ms.is_some_and(|d| position(state, now) >= d))
             {
                 next.anchor_position_ms = 0.0;
                 next.media_generation = next
@@ -104,6 +139,10 @@ pub fn reduce(
                 .ok_or("generation_overflow")?;
             next.anchor_position_ms = 0.0;
             next.duration_ms = None;
+            if state.live.is_some() {
+                next.playback_rate = 1.0;
+            }
+            next.live = None;
             next.playback_status = PlaybackStatus::Playing;
         }
     }
@@ -126,12 +165,14 @@ mod tests {
             playback_rate: 2.0,
             controller_user_id: Uuid::new_v4(),
             duration_ms: Some(10000.0),
+            live: None,
             clock_epoch: Uuid::new_v4(),
         };
         let c = Command {
             protocol_version: VERSION,
             room_id: s.room_id,
             command_id: Uuid::new_v4(),
+            live_version: None,
             control_epoch: None,
             expected_revision: 4,
             media_generation: 2,
@@ -168,6 +209,59 @@ mod tests {
             Err("revision_conflict")
         );
     }
+    #[test]
+    fn a_delegated_action_never_authorizes_another_action() {
+        let (state, mut command) = fixture();
+        let moderator = Uuid::new_v4();
+        assert!(
+            reduce_with_permission(
+                &state,
+                &command,
+                moderator,
+                false,
+                Some(protocol::RoomPermission::Pause),
+                600.0
+            )
+            .is_ok()
+        );
+        for permission in [
+            protocol::RoomPermission::Play,
+            protocol::RoomPermission::Seek,
+            protocol::RoomPermission::Queue,
+            protocol::RoomPermission::Invite,
+        ] {
+            assert_eq!(
+                reduce_with_permission(&state, &command, moderator, false, Some(permission), 600.0),
+                Err("controller_required")
+            );
+        }
+        command.action = Action::ChangeMedia {
+            media_id: Uuid::new_v4(),
+        };
+        assert_eq!(
+            reduce_with_permission(
+                &state,
+                &command,
+                moderator,
+                false,
+                Some(protocol::RoomPermission::Pause),
+                600.0
+            ),
+            Err("controller_required")
+        );
+        assert!(
+            reduce_with_permission(
+                &state,
+                &command,
+                moderator,
+                false,
+                Some(protocol::RoomPermission::ChangeMedia),
+                600.0
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn stale_generation_rejected() {
         let (s, mut c) = fixture();

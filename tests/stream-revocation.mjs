@@ -1,3 +1,4 @@
+import { sourceMedia } from "./fixtures/source-grant.mjs";
 import assert from "node:assert/strict";
 import {
   createCipheriv,
@@ -10,10 +11,12 @@ import { open, readdir, readlink, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import WebSocket from "ws";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 import { delay } from "./fixtures/server.mjs";
 
 const LIMIT_MS = 10000;
 const SIZE = 1024 * 1024 * 1024;
+const ETAG = '"stream-revocation-v1"';
 const selected = process.env.RAINSYNC_STREAM_CASE;
 const cases = [];
 async function until(check, label, timeout = LIMIT_MS) {
@@ -37,7 +40,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
   const upstreams = new Map();
   const upstream = createServer((req, res) => {
     const key = new URL(req.url, "http://fixture").pathname.slice(1);
-    const state = { closed: false, bytes: 0 };
+    const state = { closed: false, bytes: 0, range: req.headers.range };
     upstreams.set(key, state);
     let timer;
     res.on("close", () => {
@@ -65,16 +68,31 @@ await isolatedMediaStack("stream-revocation", async (f) => {
       return;
     }
     const ranged = Boolean(req.headers.range);
+    // Initial ranged delivery first classifies bytes 0-1023. The origin must
+    // honor that probe and pin the same representation for the long stream.
+    const range = ranged ? /^bytes=(\d+)-(\d+)$/.exec(req.headers.range) : null;
+    if (ranged) assert.ok(range, "fixture expects a single bounded byte range");
+    const start = ranged ? Number(range[1]) : 0;
+    const end = ranged ? Math.min(Number(range[2]), SIZE - 1) : SIZE - 1;
+    assert.ok(start <= end && start < SIZE, "fixture range is satisfiable");
+    if (req.headers["if-match"]) assert.equal(req.headers["if-match"], ETAG);
+    if (req.headers["if-range"]) assert.equal(req.headers["if-range"], ETAG);
+    let remaining = end - start + 1;
     res.writeHead(ranged ? 206 : 200, {
       "Content-Type": "video/mp4",
-      "Content-Length": SIZE,
+      "Content-Length": remaining,
       "Accept-Ranges": "bytes",
-      ...(ranged ? { "Content-Range": `bytes 0-${SIZE - 1}/${SIZE}` } : {}),
+      ETag: ETAG,
+      ...(ranged ? { "Content-Range": `bytes ${start}-${end}/${SIZE}` } : {}),
     });
+    if (req.method === "HEAD") return res.end();
     const send = () => {
       if (res.destroyed) return;
-      state.bytes += 65536;
-      const ready = res.write(Buffer.alloc(65536));
+      const length = Math.min(65536, remaining);
+      state.bytes += length;
+      remaining -= length;
+      const ready = res.write(Buffer.alloc(length));
+      if (!remaining) return res.end();
       // A genuinely slow remote source also tests pending .next(), not only
       // a source that always has a chunk ready. Stop before declaring EOF.
       if (ready) timer = setTimeout(send, 20);
@@ -101,6 +119,11 @@ await isolatedMediaStack("stream-revocation", async (f) => {
       cipher.getAuthTag(),
     ]).toString("base64");
   };
+  // These local/HTTP fixtures have no provider session or playback reporting.
+  // Match the production transport-only envelope; subtitle upstream_base is
+  // retained solely as a same-origin URL fence.
+  const transportOnlyEnvelope = (resource) =>
+    JSON.stringify({ encrypted: encrypt(resource), upstream_closed: true });
   async function openHandles() {
     if (process.platform !== "linux") return undefined;
     const paths = await readdir(`/proc/${f.workerPid}/fd`);
@@ -167,13 +190,55 @@ await isolatedMediaStack("stream-revocation", async (f) => {
           kind === "local"
             ? { kind, root: f.root, resource: "long.mp4" }
             : { kind, url: `${upstreamOrigin}/${id}.mp4`, headers: {} };
-        f.sql(
-          `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
+        withPlaybackAdmission(
+          f,
+          { client: admin, user: userId, room: room.id, session: id },
+          `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','${transportOnlyEnvelope(resource)}',now()+interval '1 hour')`,
         );
         const url = `${f.workerOrigin}/media-delivery/${id}/source?token=${token}`;
         const ranged = revoke === "membership" || revoke === "expiry";
+        const initialRequestAt = Date.now();
         const state = start(url, ranged);
         await until(() => state.response, `${label}: initial headers`);
+        if (state.response.statusCode !== (ranged ? 206 : 200)) {
+          // Failure-only authorization evidence never prints credentials/resources.
+          const diagnostic = { case: label, status: state.response.statusCode, error_code: "UNPARSEABLE" };
+          diagnostic.initial_headers_ms = Date.now() - initialRequestAt;
+          const failedUpstream = upstreams.get(`${id}.mp4`);
+          diagnostic.upstream = {
+            observed: Boolean(failedUpstream),
+            closed: failedUpstream?.closed ?? null,
+            bytes: failedUpstream?.bytes ?? null,
+          };
+          try {
+            let body = "";
+            await new Promise(done => {
+              const response = state.response;
+              const finish = () => { clearTimeout(timer); done(); };
+              const timer = setTimeout(() => { response.destroy(); finish(); }, 1000);
+              response.on("data", chunk => {
+                if (body.length < 8192) body += chunk.toString();
+              });
+              response.once("end", finish);
+              response.once("close", finish);
+              response.resume();
+            });
+            const value = JSON.parse(body);
+            diagnostic.error_code = /^[A-Z_]{1,80}$/.test(value?.error?.code ?? "")
+              ? value.error.code : "UNPARSEABLE";
+          } catch {
+            diagnostic.response_evidence_unavailable = true;
+          }
+          try {
+            const deliveryHash = createHash("sha256").update(token).digest("hex");
+            diagnostic.grant_predicates = JSON.parse(f.sql(
+              `SET statement_timeout='500ms'; SELECT json_build_object('token_matches',p.delivery_token_hash='${deliveryHash}','unexpired',p.expires_at>clock_timestamp(),'stopped',p.stopped,'source_allowed',COALESCE(playback_source_allowed(p.media_id,p.resource,p.id),false),'room_active',r.lifecycle='active','epoch_matches',r.lifecycle_epoch=p.lifecycle_epoch,'generation_matches',(snap.state->>'media_generation')::bigint=p.generation,'member_present',EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id),'origin_allowed',COALESCE(playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch),false),'media_present',mi.id IS NOT NULL,'media_available',COALESCE(mi.available,false),'source_present',src.id IS NOT NULL,'source_kind_matches',src.kind='${kind}','source_revision_matches',COALESCE((p.resource->>'source_policy_revision')::bigint,0)=src.access_policy_revision,'library_allowed',COALESCE(playback_library_session_allowed(p.id),false),'delivery_registered',EXISTS(SELECT 1 FROM media_executions e WHERE e.session_id=p.id AND e.kind='delivery'),'delivery_unreaped',EXISTS(SELECT 1 FROM media_executions e WHERE e.session_id=p.id AND e.kind='delivery' AND e.reaped_at IS NULL)) FROM playback_sessions p JOIN room_snapshots snap ON snap.room_id=p.room_id JOIN rooms r ON r.id=p.room_id LEFT JOIN media_items mi ON mi.id=p.media_id LEFT JOIN sources src ON src.id=mi.source_id WHERE p.id='${id}'`,
+            ).split("\n").at(-1) || "null");
+          } catch {
+            diagnostic.grant_evidence_unavailable = true;
+          }
+          console.error("Initial delivery authorization failure: " + JSON.stringify(diagnostic));
+        }
         assert.equal(state.response.statusCode, ranged ? 206 : 200);
         if (ranged)
           assert.equal(
@@ -182,6 +247,22 @@ await isolatedMediaStack("stream-revocation", async (f) => {
           );
         assert.equal(Number(state.response.headers["content-length"]), SIZE);
         await delay(250); // Fill downstream buffers before revoking.
+        const source = kind === "http" ? upstreams.get(`${id}.mp4`) : undefined;
+        if (kind === "http") {
+          assert.ok(source, `${label}: long upstream request admitted`);
+          assert.equal(
+            source.range,
+            ranged ? `bytes=0-${SIZE - 1}` : undefined,
+            "observe the delivery request rather than its classification probe",
+          );
+          assert.equal(
+            source.closed,
+            false,
+            "source is live before revocation",
+          );
+          assert.ok(source.bytes > 0 && source.bytes < SIZE);
+          assert.equal(state.response.headers.etag, ETAG);
+        }
         if (kind === "local" && process.platform === "linux")
           assert.ok((await openHandles()) > 0);
         let lock;
@@ -218,10 +299,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
             `${label}: local descriptor released`,
           );
         if (kind === "http")
-          await until(
-            () => upstreams.get(`${id}.mp4`)?.closed,
-            `${label}: upstream released`,
-          );
+          await until(() => source.closed, `${label}: upstream released`);
         const releasedMs = Date.now() - began;
         if (revoke !== "consumer-drop") {
           state.response.resume();
@@ -285,8 +363,10 @@ await isolatedMediaStack("stream-revocation", async (f) => {
             }
           : {}),
       };
-      f.sql(
-        `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
+      withPlaybackAdmission(
+        f,
+        { client: admin, user: userId, room: room.id, session: id },
+        `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','${transportOnlyEnvelope(resource)}',now()+interval '1 hour')`,
       );
       const path = mode === "subtitle" ? "subtitle-0.vtt" : "source";
       const url = `${f.workerOrigin}/media-delivery/${id}/${path}?token=${token}`;
@@ -355,12 +435,16 @@ await isolatedMediaStack("stream-revocation", async (f) => {
     if (!selected || selected === poolLabel) {
       const room = await admin.request("/rooms", "POST", { name: poolLabel });
       const streams = [];
+      const sessions = [];
       for (let i = 0; i < 12; i++) {
         const id = randomUUID(),
           token = randomBytes(32).toString("hex");
+        sessions.push(id);
         const resource = { kind: "local", root: f.root, resource: "long.mp4" };
-        f.sql(
-          `INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`,
+        withPlaybackAdmission(
+          f,
+          { client: admin, user: userId, room: room.id, session: id },
+          `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f, resource)}','${id}','${userId}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','${transportOnlyEnvelope(resource)}',now()+interval '1 hour')`,
         );
         streams.push(
           start(
@@ -374,6 +458,9 @@ await isolatedMediaStack("stream-revocation", async (f) => {
         `${poolLabel}: all headers`,
       );
       for (const state of streams) assert.equal(state.response.statusCode, 200);
+      const sessionList = sessions.map((id) => `'${id}'`).join(",");
+      const receiptOwners = () => f.sql(`SELECT COALESCE(jsonb_agg(jsonb_build_array(id,owner_id) ORDER BY id),'[]'::jsonb) FROM media_executions WHERE kind='delivery' AND session_id IN (${sessionList})`);
+      const originalOwners = receiptOwners();
       await delay(250);
       const began = Date.now();
       const lock = f.sqlProcess(
@@ -388,7 +475,7 @@ await isolatedMediaStack("stream-revocation", async (f) => {
       );
       const blockedChecks = Number(
         f.sql(
-          `SELECT count(*) FROM pg_stat_activity WHERE application_name='${workerApplication}' AND wait_event_type='Lock' AND query LIKE 'SELECT EXISTS(SELECT 1 FROM playback_sessions%'`,
+          `SELECT count(*) FROM pg_stat_activity WHERE application_name='${workerApplication}' AND wait_event_type='Lock' AND query LIKE 'SELECT src.id AS source_id,%' AND query LIKE '%p.delivery_token_hash=$2%' AND query LIKE '%playback_source_allowed(p.media_id,p.resource,p.id)%'`,
         ),
       );
       assert.ok(
@@ -449,14 +536,25 @@ await isolatedMediaStack("stream-revocation", async (f) => {
         "1",
         "unrelated pool request completes before the playback lock releases",
       );
+      assert.equal(
+        f.sql(`SELECT count(*) FROM media_executions WHERE kind='delivery' AND session_id IN (${sessionList}) AND reaped_at IS NULL`),
+        String(streams.length),
+        "blocked receipts retain unresolved ownership while pool slots recover",
+      );
       for (const state of streams) state.request.destroy();
       await lock.done;
+      await until(
+        () => f.sql(`SELECT count(*) FROM media_executions WHERE kind='delivery' AND session_id IN (${sessionList}) AND reaped_at>=created_at AND reaped_at<=clock_timestamp()`) === String(streams.length),
+        `${poolLabel}: original owners retry and positively acknowledge`,
+      );
+      assert.equal(receiptOwners(), originalOwners, "receipt retries retain the same original owners");
       cases.push({
         scenario: poolLabel,
         stream_count: streams.length,
         blocked_authorization_checks: blockedChecks,
         response_aborted_ms: abortedMs,
         unrelated_pool_request_ms: recoveryMs,
+        positively_acknowledged_original_receipts: streams.length,
       });
       console.log(
         `PASS ${poolLabel}: aborted=${abortedMs}ms; pool request=${recoveryMs}ms`,

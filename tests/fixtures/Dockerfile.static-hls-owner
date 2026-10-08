@@ -1,0 +1,13 @@
+# Local validation only. The runner binds and verifies both existing image IDs.
+ARG BUILD_IMAGE
+ARG MEDIA_IMAGE
+FROM ${MEDIA_IMAGE} AS media
+FROM ${BUILD_IMAGE}
+COPY --from=media /usr/bin/ffmpeg /usr/bin/ffprobe /usr/bin/
+COPY --from=media /usr/lib/x86_64-linux-gnu/ /opt/ffmpeg-libs/
+RUN printf '/opt/ffmpeg-libs\n/opt/ffmpeg-libs/pulseaudio\n/opt/ffmpeg-libs/blas\n/opt/ffmpeg-libs/lapack\n' > /etc/ld.so.conf.d/rainsync-media.conf \
+    && ldconfig \
+    && ln -s /opt/ffmpeg-libs/libsndio.so.7.0 /usr/lib/x86_64-linux-gnu/libsndio.so.7.0 \
+    && ffprobe -version \
+    && ffmpeg -version
+WORKDIR /workspace

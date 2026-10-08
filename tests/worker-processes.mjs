@@ -773,7 +773,7 @@ try {
     cipher.final(),
     cipher.getAuthTag(),
   ]).toString("base64");
-  sql(`UPDATE playback_sessions SET delivery_token_hash='${createHash("sha256").update(deliveryToken).digest("hex")}',resource=jsonb_build_object('encrypted','${encrypted}') WHERE id='${completed.id}'`);
+  sql(`UPDATE playback_sessions SET delivery_token_hash='${createHash("sha256").update(deliveryToken).digest("hex")}',resource=resource||jsonb_build_object('encrypted','${encrypted}') WHERE id='${completed.id}'`);
   const deliveryOrigin = `http://${docker("port", completed.worker, "8081/tcp")}`;
   const deliveryPath = `/media-delivery/${completed.id}/index.m3u8?token=${deliveryToken}`;
   const encoderPid = completed.pid.split("/")[2];

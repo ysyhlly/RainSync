@@ -19,7 +19,10 @@ services:
       DATABASE_URL: postgres://rainsync:${POSTGRES_PASSWORD}@db/rainsync
       SOURCE_ENCRYPTION_KEY: ${SOURCE_ENCRYPTION_KEY:?Set SOURCE_ENCRYPTION_KEY}
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:8088}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD}
+      MEDIA_ORIGIN: ${MEDIA_ORIGIN:-${PUBLIC_ORIGIN:-http://localhost:8088}}
+      AGENT_DATA_ORIGIN: ${AGENT_DATA_ORIGIN:-${PUBLIC_ORIGIN:-http://localhost:8088}}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       WORKER_URL: http://worker:8081
       MEDIA_ROOT: /media
       CACHE_ROOT: /cache
@@ -27,6 +30,7 @@ services:
       CACHE_UNKNOWN_OUTPUT_BYTES: ${CACHE_UNKNOWN_OUTPUT_BYTES:-2147483648}
       PLAYBACK_SESSION_LIMIT: ${PLAYBACK_SESSION_LIMIT:-2}
       MEDIA_QUEUE_LIMIT: ${MEDIA_QUEUE_LIMIT:-20}
+      STATIC_HLS_PARENT_PREPARE_ENABLED: ${STATIC_HLS_PARENT_PREPARE_ENABLED:-0}
       REGISTRATION_VALIDATE_PER_MINUTE: ${REGISTRATION_VALIDATE_PER_MINUTE:-30}
       REGISTRATION_PER_TEN_MINUTES: ${REGISTRATION_PER_TEN_MINUTES:-10}
       ACCOUNT_HASH_CONCURRENCY: ${ACCOUNT_HASH_CONCURRENCY:-2}
@@ -35,7 +39,7 @@ services:
       AVATAR_PROCESS_TIMEOUT_MS: ${AVATAR_PROCESS_TIMEOUT_MS:-5000}
       AVATAR_WRITES_PER_MINUTE: ${AVATAR_WRITES_PER_MINUTE:-10}
       RUST_LOG: info
-    volumes: ["${MEDIA_PATH:-./media}:/media:ro"]
+    volumes: ["${MEDIA_PATH:-./media}:/media:ro", "cache:/cache"]
     depends_on:
       db: { condition: service_healthy }
     restart: unless-stopped
@@ -43,7 +47,11 @@ services:
     image: rainsync-server:dev
     build: { context: ., dockerfile: deploy/Dockerfile }
     command: ["rainsync-media-worker"]
-    environment: *backend
+    environment:
+      <<: *backend
+      RAINSYNC_VIDEO_ENCODER: ${RAINSYNC_VIDEO_ENCODER:-software}
+      STATIC_HLS_CHILD_EXECUTION_ENABLED: ${STATIC_HLS_CHILD_EXECUTION_ENABLED:-0}
+      SERVER_INTERNAL_URL: http://server:8080
     volumes: ["${MEDIA_PATH:-./media}:/media:ro", "cache:/cache"]
     depends_on: [server]
     restart: unless-stopped

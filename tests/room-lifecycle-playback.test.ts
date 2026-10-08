@@ -1,3 +1,11 @@
+vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
+  const { default: Hls } = await import("hls.js");
+  return {
+    getPlaybackMediaSource: () => Hls.getMediaSource(),
+    hasPlaybackMseApi: () => Hls.isMSESupported(),
+    supportsHlsPlayback: () => Hls.isSupported(),
+  };
+});
 import { afterEach, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useRoomRuntime } from "../apps/web/src/features/rooms/room-runtime";
@@ -45,6 +53,7 @@ it("same-generation close and reopen destroys old URL, requires a fresh plan, an
         session_id: `session-${plans}`,
         media_id: "media",
         media_generation: 1,
+        plan_generation: JSON.parse(request.body as string).plan_generation,
         delivery_mode: "direct",
         transport: "progressive",
         playback_url: `/authorized-${plans}.mp4`,
@@ -106,7 +115,6 @@ it("same-generation close and reopen destroys old URL, requires a fresh plan, an
     socket.onopen();
     const frame = (value: unknown) =>
       socket.onmessage({ data: JSON.stringify(value) });
-    frame({ type: "CLOCK_SYNC_REPLY", t1: 0, t2: 0, t3: 0 });
     const state = {
       room_id: "room",
       revision: 1,
@@ -126,6 +134,16 @@ it("same-generation close and reopen destroys old URL, requires a fresh plan, an
       lifecycle: "active",
       lifecycle_epoch: 0,
       control_epoch: { id: "old" },
+    });
+    const sample = socket.send.mock.calls
+      .map(([data]: [string]) => JSON.parse(data))
+      .find((value: any) => value.type === "CLOCK_SYNC");
+    frame({
+      type: "CLOCK_SYNC_REPLY",
+      t1: sample.t1,
+      t2: 0,
+      t3: 0,
+      clock_epoch: "clock",
     });
     await vi.waitFor(() => expect(element.src).toBe("/authorized-1.mp4"));
     const staleMetadata = element.onloadedmetadata;

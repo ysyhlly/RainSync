@@ -1,10 +1,23 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import {
+  appendFile,
+  chmod,
+  mkdir,
+  readFile,
+  writeFile,
+} from "node:fs/promises";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { fetchOwnedEmbyMedia } from "./upstream-media-route.mjs";
+import {
+  ownedUpstreamStorage,
+  createOwnedUpstreamVolume,
+  verifyOwnedUpstreamVolume,
+  removeOwnedUpstreamVolume,
+} from "./upstream-storage.mjs";
 
 const execute = promisify(execFile);
 const definitions = {
@@ -48,6 +61,36 @@ const delay = (ms, signal) =>
     signal?.addEventListener("abort", stop, { once: true });
   });
 
+export function upstreamFixtureSampleSettings(h264ConstraintStress = false) {
+  assert.equal(typeof h264ConstraintStress, "boolean");
+  return {
+    h264_frame_rate: h264ConstraintStress ? 60 : 10,
+    h264_sample_rate: h264ConstraintStress ? 44100 : 48000,
+  };
+}
+
+export function upstreamProfileFixtureSampleSettings(
+  profileConstraintStress = false,
+) {
+  assert.equal(typeof profileConstraintStress, "boolean");
+  return {
+    ...upstreamFixtureSampleSettings(profileConstraintStress),
+    hevc_frame_rate: profileConstraintStress ? 60 : 10,
+    hevc_sample_rate: profileConstraintStress ? 44100 : 48000,
+  };
+}
+
+// Additional source facts are opt-in; existing real-policy fixtures retain their
+// original two-item setup and pagination contract.
+export function upstreamProfileAudioRateFixtures(enabled = false) {
+  assert.equal(typeof enabled, "boolean");
+  return enabled ? [
+    { title: "rainsync-h264-48k-stereo-aac", sample_rate: 48000, channels: 2, audio_codec: "aac" },
+    { title: "rainsync-h264-44k-stereo-ac3", sample_rate: 44100, channels: 2, audio_codec: "ac3" },
+    { title: "rainsync-h264-48k-stereo-ac3", sample_rate: 48000, channels: 2, audio_codec: "ac3" },
+  ] : [];
+}
+
 /**
  * An owned, disposable upstream. Credentials stay in this closure; metadata,
  * HTTP clients and addRainSyncSource are available only until the callback ends.
@@ -61,6 +104,13 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
   assert.ok(definition, "Supported fixture kind: jellyfin or emby");
   assert.equal(typeof run, "function");
   const durationSeconds = options.durationSeconds ?? 20;
+  const extraAudioFixtures = upstreamProfileAudioRateFixtures(options.profileAudioRateMatrix);
+  const sampleSettings = {
+    ...upstreamProfileFixtureSampleSettings(options.profileConstraintStress),
+    ...upstreamFixtureSampleSettings(
+      options.profileConstraintStress || options.h264ConstraintStress,
+    ),
+  };
   assert.ok(
     Number.isInteger(durationSeconds) &&
       durationSeconds >= 20 &&
@@ -86,11 +136,18 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
     scope: "Real upstream setup only; no actual playback compatibility claim",
     id,
     kind,
+    sample_settings: sampleSettings,
     root,
     image: definition.image,
     limits: { cpus: 1, memory_bytes: 1610612736, pids: 256 },
     started_at: new Date().toISOString(),
     source_sha256: await digest(new URL(import.meta.url)),
+    storage_helper_sha256: await digest(
+      new URL("./upstream-storage.mjs", import.meta.url),
+    ),
+    media_route_helper_sha256: await digest(
+      new URL("./upstream-media-route.mjs", import.meta.url),
+    ),
     checks: [],
     failures: [],
     cleanup: { container: false, network: false, volumes: [] },
@@ -164,6 +221,7 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
   };
   let containerId;
   let networkId;
+  const storage = ownedUpstreamStorage(kind, id);
   let volumeNames = [];
   let callbackResult;
   let originalError;
@@ -174,21 +232,35 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
   };
   try {
     await save();
-    const imageId = await docker(
-      "image",
-      "inspect",
-      definition.image,
-      "--format",
-      "{{.Id}}",
-    );
-    assert.equal(imageId, definition.image.split("@")[1]);
-    report.image_id = imageId;
-    const original = JSON.parse(
-      await readFile(
-        resolve(ffmpegRoot, "native-validation-report.json"),
-        "utf8",
+    const image = JSON.parse(
+      await docker(
+        "image",
+        "inspect",
+        definition.image,
+        "--format",
+        "{{json .}}",
       ),
     );
+    // The immutable registry manifest digest and the local image configuration
+    // ID identify different artifacts. Check the manifest through RepoDigests.
+    assert.ok(image.RepoDigests?.includes(definition.image));
+    assert.match(image.Id, /^sha256:[0-9a-f]{64}$/);
+    report.image_id = image.Id;
+    report.repo_digests = image.RepoDigests;
+    if (options.ffmpegBin !== undefined)
+      assert.ok(
+        isAbsolute(options.ffmpegBin),
+        "Use an explicit absolute local toolchain directory",
+      );
+    const original =
+      options.ffmpegBin === undefined
+        ? JSON.parse(
+            await readFile(
+              resolve(ffmpegRoot, "native-validation-report.json"),
+              "utf8",
+            ),
+          )
+        : null;
     report.ffmpeg = [];
     for (const tool of ["ffmpeg", "ffprobe"]) {
       const path = resolve(
@@ -196,17 +268,19 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
         `${tool}${process.platform === "win32" ? ".exe" : ""}`,
       );
       const sha256 = await digest(path);
-      assert.ok(JSON.stringify(original).toLowerCase().includes(sha256));
+      if (original)
+        assert.ok(JSON.stringify(original).toLowerCase().includes(sha256));
       const version = (await command(path, ["-version"])).split(/\r?\n/)[0];
-      assert.ok(version.includes("9.0.2"));
+      assert.ok(version.startsWith(`${tool} version `));
+      if (original) assert.ok(version.includes("9.0.2"));
       report.ffmpeg.push({ tool, path, sha256, version });
     }
-    report.archive_sha256 = original.download.expected_sha256;
+    if (original) report.archive_sha256 = original.download.expected_sha256;
+    report.toolchain_provenance = original
+      ? "verified fixed Windows archive"
+      : "explicit existing local executables; version and SHA-256 recorded; no archive claim";
     const media = resolve(root, "media");
-    const config = resolve(root, "config");
-    const cache = resolve(root, "cache");
-    for (const path of [media, config, cache])
-      await mkdir(path, { recursive: true });
+    await mkdir(media, { recursive: true });
     const clock = (seconds) =>
       `${String(Math.floor(seconds / 3600)).padStart(2, "0")}:${String(Math.floor(seconds / 60) % 60).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")},000`;
     const cues = [];
@@ -258,11 +332,11 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
         "-f",
         "lavfi",
         "-i",
-        "testsrc2=size=320x180:rate=10",
+        `testsrc2=size=320x180:rate=${sampleSettings.h264_frame_rate}`,
         "-f",
         "lavfi",
         "-i",
-        "sine=frequency=440:sample_rate=48000",
+        `sine=frequency=440:sample_rate=${sampleSettings.h264_sample_rate}`,
         "-t",
         String(durationSeconds),
         "-vf",
@@ -298,15 +372,15 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
         "-f",
         "lavfi",
         "-i",
-        "testsrc2=size=320x180:rate=10",
+        `testsrc2=size=320x180:rate=${sampleSettings.hevc_frame_rate}`,
         "-f",
         "lavfi",
         "-i",
-        "sine=frequency=440:sample_rate=48000",
+        `sine=frequency=440:sample_rate=${sampleSettings.hevc_sample_rate}`,
         "-f",
         "lavfi",
         "-i",
-        "sine=frequency=880:sample_rate=48000",
+        `sine=frequency=880:sample_rate=${sampleSettings.hevc_sample_rate}`,
         "-i",
         embeddedSubtitle,
         "-t",
@@ -353,11 +427,26 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
       ],
       { timeout: 60000, signal: control.signal },
     );
+    const sampleDefinitions = [
+      { path: h264, title: "rainsync-h264", codec: "h264", audios: 1, subtitles: 0,
+        sample_rate: sampleSettings.h264_sample_rate, frame_rate: sampleSettings.h264_frame_rate, audio_codec: "aac", channels: 1 },
+      { path: hevc, title: "rainsync-hevc", codec: "hevc", audios: 2, subtitles: 1,
+        sample_rate: sampleSettings.hevc_sample_rate, frame_rate: sampleSettings.hevc_frame_rate, audio_codec: "aac", channels: 1 },
+    ];
+    for (const input of extraAudioFixtures) {
+      const path = resolve(media, input.title + ".mkv");
+      await command(ffmpeg, [
+        ...common, "-i", h264, "-f", "lavfi", "-i", `sine=frequency=440:sample_rate=${input.sample_rate}`,
+        "-t", String(durationSeconds), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+        "-c:a", input.audio_codec, "-threads:a", "2", "-ac", String(input.channels),
+        "-ar", String(input.sample_rate), "-b:a", input.audio_codec === "ac3" ? "192k" : "128k", path,
+      ], { timeout: 60000, signal: control.signal });
+      sampleDefinitions.push({ ...input, path, codec: "h264", audios: 1, subtitles: 0,
+        frame_rate: sampleSettings.h264_frame_rate });
+    }
     report.samples = [];
-    for (const [path, codec, audios, subtitles] of [
-      [h264, "h264", 1, 0],
-      [hevc, "hevc", 2, 1],
-    ]) {
+    for (const { path, title, codec, audios, subtitles, sample_rate: sampleRate, frame_rate: frameRate,
+      audio_codec: audioCodec, channels } of sampleDefinitions) {
       const info = JSON.parse(
         await command(ffprobe, [
           "-v",
@@ -386,18 +475,42 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
         Number(info.format.duration) >= durationSeconds - 0.1 &&
           Number(info.format.duration) <= durationSeconds + 1,
       );
+      const video = info.streams.find(
+        (stream) => stream.codec_type === "video",
+      );
+      const [numerator, denominator] = video.avg_frame_rate
+        .split("/")
+        .map(Number);
+      assert.equal(numerator / denominator, frameRate);
+      for (const audio of info.streams.filter(
+        (stream) => stream.codec_type === "audio",
+      )) {
+        assert.equal(Number(audio.sample_rate), sampleRate);
+        assert.equal(audio.codec_name, audioCodec);
+        assert.equal(audio.channels, channels);
+      }
       report.samples.push({
         path,
+        title,
+        audio_codec: audioCodec,
+        audio_channels: channels,
         sha256: await digest(path),
         codec,
         audio_streams: audios,
         embedded_subtitles: subtitles,
         duration_seconds: Number(info.format.duration),
+        frame_rate: frameRate,
+        audio_sample_rate: sampleRate,
       });
     }
     report.subtitle_sha256 = await digest(
       resolve(media, "rainsync-h264.en.srt"),
     );
+    // A restrictive host umask must not hide these owned synthetic samples from
+    // Emby's non-root container user. Never widen the credential/config paths.
+    await chmod(media, 0o755);
+    for (const path of [...sampleDefinitions.map((sample) => sample.path), resolve(media, "rainsync-h264.en.srt")])
+      await chmod(path, 0o644);
     networkId = await docker(
       "network",
       "create",
@@ -405,6 +518,12 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
       `rainsync.fixture=${id}`,
       network,
     );
+    for (const volume of storage) {
+      await createOwnedUpstreamVolume(docker, volume, () => {
+        volumeNames.push(volume.name);
+      });
+      await verifyOwnedUpstreamVolume(docker, volume);
+    }
     containerId = await docker(
       "run",
       "--detach",
@@ -425,9 +544,9 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
       "--publish",
       "127.0.0.1::8096",
       "--mount",
-      `type=bind,source=${config},target=/config`,
+      `type=volume,source=${storage[0].name},target=/config`,
       "--mount",
-      `type=bind,source=${cache},target=/cache`,
+      `type=volume,source=${storage[1].name},target=/cache`,
       "--mount",
       `type=bind,source=${media},target=/media,readonly`,
       definition.image,
@@ -473,6 +592,7 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
     const password = randomBytes(24).toString("hex");
     secrets.add(username);
     secrets.add(password);
+    const ownedItems = new Map();
     function makeClient(
       deviceId = `fixture-${randomUUID()}`,
       token = "",
@@ -520,7 +640,31 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
           );
         }
       };
-      return { deviceId, userId, raw, api };
+      const rawMedia = async (
+        reference,
+        { parent, item, source, sid, master = false, timeout = 15000 },
+      ) => {
+        checkOpen();
+        assert.equal(
+          kind,
+          "emby",
+          "raw controller diagnostic is pinned to Emby",
+        );
+        return fetchOwnedEmbyMedia({
+          reference,
+          parent,
+          base,
+          item,
+          source,
+          sid,
+          master,
+          ownedItems,
+          headers: headers(),
+          signal: control.signal,
+          timeout,
+        });
+      };
+      return { deviceId, userId, raw, api, rawMedia };
     }
     const anonymous = makeClient();
     let info;
@@ -662,46 +806,42 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
     await admin.api("/Library/Refresh", "POST");
     const itemPath = (start = 0, limit = 10) =>
       `/Users/${admin.userId}/Items?Recursive=true&IncludeItemTypes=Video,Movie&Fields=MediaSources&SortBy=SortName&SortOrder=Ascending&StartIndex=${start}&Limit=${limit}&EnableTotalRecordCount=true`;
+    const itemCount = sampleDefinitions.length;
     let listing;
     for (let i = 0; i < 120; i++) {
       listing = await admin.api(itemPath());
       if (
-        listing.TotalRecordCount === 2 &&
-        listing.Items?.length === 2 &&
+        listing.TotalRecordCount === itemCount &&
+        listing.Items?.length === itemCount &&
         listing.Items.every((item) => item.MediaSources?.length)
       )
         break;
       await delay(500, control.signal);
     }
-    assert.equal(listing.TotalRecordCount, 2);
-    assert.equal(listing.Items.length, 2);
+    assert.equal(listing.TotalRecordCount, itemCount);
+    assert.equal(listing.Items.length, itemCount);
     assert.ok(
       listing.Items.every((item) => item.MediaSources?.length),
       "Real metadata/probe completed",
     );
-    const first = await admin.api(itemPath(0, 1));
-    const second = await admin.api(itemPath(1, 1));
-    const tail = await admin.api(itemPath(2, 1));
-    report.pagination = [first, second, tail].map((page, start) => ({
-      start_index: start,
-      limit: 1,
-      total_record_count: page.TotalRecordCount,
+    const pages = [];
+    for (let start = 0; start <= itemCount; start++) pages.push(await admin.api(itemPath(start, 1)));
+    report.pagination = pages.map((page, start) => ({
+      start_index: start, limit: 1, total_record_count: page.TotalRecordCount,
       item_ids: page.Items.map((item) => item.Id),
     }));
     await save();
-    for (const page of [first, second]) assert.equal(page.TotalRecordCount, 2);
-    // Fixed Emby 4.10 returns zero total for an empty beyond-end page;
-    // its two nonempty pages must still report the complete library count.
-    assert.equal(tail.TotalRecordCount, kind === "emby" ? 0 : 2);
-    assert.equal(first.Items.length, 1);
-    assert.equal(second.Items.length, 1);
+    const tail = pages.at(-1), nonempty = pages.slice(0, -1);
+    for (const page of nonempty) {
+      assert.equal(page.TotalRecordCount, itemCount);
+      assert.equal(page.Items.length, 1);
+    }
+    // Fixed Emby 4.10 returns zero total for an empty beyond-end page.
+    assert.equal(tail.TotalRecordCount, kind === "emby" ? 0 : itemCount);
     assert.equal(tail.Items.length, 0);
-    assert.notEqual(first.Items[0].Id, second.Items[0].Id);
-    assert.deepEqual(
-      [first.Items[0].Id, second.Items[0].Id].sort(),
-      listing.Items.map((item) => item.Id).sort(),
-    );
-    report.checks.push("two real items and complete Limit=1 pagination");
+    assert.deepEqual(nonempty.flatMap((page) => page.Items.map((item) => item.Id)).sort(),
+      listing.Items.map((item) => item.Id).sort());
+    report.checks.push(`${itemCount} real items and complete Limit=1 pagination`);
     const denied = await anonymous.raw(itemPath());
     assert.ok(
       [401, 403].includes(denied.status),
@@ -710,6 +850,11 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
     await denied.arrayBuffer();
     report.anonymous_status = denied.status;
     report.checks.push("authenticated metadata and unauthenticated denial");
+    for (const item of listing.Items)
+      ownedItems.set(
+        item.Id,
+        new Set((item.MediaSources ?? []).map((source) => source.Id)),
+      );
     report.items = listing.Items.map((item) => ({
       id: item.Id,
       name: item.Name,
@@ -748,7 +893,12 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
           false,
           "Real upstream policy is revoked",
         );
-        return { user_id: scope.userId, enable_media_playback: false };
+        return {
+          user_id: scope.userId,
+          before_enable_media_playback: current.Policy.EnableMediaPlayback,
+          enable_media_playback: checked.Policy.EnableMediaPlayback,
+          readback_verified: true,
+        };
       },
       items: listing.Items,
       addRainSyncSource: async (rainsyncClient, upstreamClient = admin) => {
@@ -834,8 +984,16 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
       report.cleanup.container = true;
       for (const volume of volumeNames) {
         assert.match(volume, /^[A-Za-z0-9_.-]+$/);
-        if (await inspect("volume", volume, "{{.Name}}"))
-          await docker("volume", "rm", volume);
+        if (await inspect("volume", volume, "{{.Name}}")) {
+          const owned = storage.find((entry) => entry.name === volume);
+          if (owned) await removeOwnedUpstreamVolume(docker, owned);
+          else {
+            // Only anonymous Docker-generated volumes discovered on this exact
+            // owner-verified container may use the legacy cleanup path.
+            assert.match(volume, /^[0-9a-f]{64}$/);
+            await docker("volume", "rm", volume);
+          }
+        }
         assert.equal(await inspect("volume", volume, "{{.Name}}"), null);
         report.cleanup.volumes.push({ name: volume, absent: true });
       }
@@ -862,7 +1020,24 @@ export async function isolatedUpstreamReal(kind, run, options = {}) {
         await digest(new URL(import.meta.url)),
         report.source_sha256,
       );
+      assert.equal(
+        await digest(new URL("./upstream-storage.mjs", import.meta.url)),
+        report.storage_helper_sha256,
+        "The owned storage helper did not change during the fixture",
+      );
+      assert.equal(
+        await digest(new URL("./upstream-media-route.mjs", import.meta.url)),
+        report.media_route_helper_sha256,
+        "The owned media route helper did not change during the fixture",
+      );
       report.source_unchanged = true;
+      for (const tool of report.ffmpeg ?? [])
+        assert.equal(
+          await digest(tool.path),
+          tool.sha256,
+          "The recorded toolchain did not change during the fixture",
+        );
+      report.toolchain_unchanged = true;
     });
     if (report.final_container_state?.oom_killed) {
       report.result = "failed";

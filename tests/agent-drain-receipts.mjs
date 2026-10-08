@@ -1,3 +1,4 @@
+import { sourceMedia } from "./fixtures/source-grant.mjs";
 import assert from "node:assert/strict";
 import { createCipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import { request } from "node:http";
@@ -6,6 +7,7 @@ import { open, readFile, readdir, readlink, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import WebSocket, { WebSocketServer } from "ws";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
+import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 import { delay } from "./fixtures/server.mjs";
 
 async function until(check, label, timeout = 15000) {
@@ -89,7 +91,7 @@ await isolatedMediaStack("agent-drain-receipts", async f => {
       const room = await admin.request("/rooms", "POST", { name: label });
       const session = randomUUID(), token = randomBytes(32).toString("hex");
       const resource = { kind: "agent", agent_id: agentId, resource: "long.mp4", source_version: sourceVersion };
-      f.sql(`INSERT INTO playback_sessions(id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${session}','${identity.id}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`);
+      withPlaybackAdmission(f, { client: admin, user: identity.id, room: room.id, session }, `INSERT INTO playback_sessions(media_id,id,user_id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${sourceMedia(f,resource)}','${session}','${identity.id}','${room.id}',0,'${createHash("sha256").update(token).digest("hex")}','{"encrypted":"${encrypt(resource)}"}',now()+interval '1 hour')`);
       const stream = startStream(`${f.workerOrigin}/media-delivery/${session}/source?token=${token}`);
       await until(() => stream.response, "real NAS response headers");
       assert.equal(stream.response.statusCode, 200);

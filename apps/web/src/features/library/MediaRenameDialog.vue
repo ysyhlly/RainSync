@@ -12,41 +12,47 @@ const catalog = useMediaCatalog(),
   personal = ref(""),
   shared = ref(""),
   busy = ref(false),
+  draftReady = ref(false),
   error = ref(""),
   message = ref("");
 // A draft's compare-and-swap version belongs to its loaded text, not the catalog.
 const revisions = { personal: "0", shared: "0" };
 const conflict = ref<{ scope: "personal" | "shared"; title: string | null }>();
 let serial = 0;
-watch(
-  () => [props.mediaId, session.epoch] as const,
-  async ([id]) => {
-    const n = ++serial;
-    error.value = "";
-    message.value = "";
-    conflict.value = undefined;
-    if (!id) return;
-    busy.value = true;
-    try {
-      const item = await catalog.ensure(id, true);
-      if (n === serial) {
-        personal.value = item.personal_title ?? "";
-        shared.value = item.shared_title ?? "";
-        revisions.personal = item.personal_title_revision;
-        revisions.shared = item.shared_title_revision;
-      }
-    } catch (e) {
-      if (n === serial) error.value = String(e);
-    } finally {
-      if (n === serial) busy.value = false;
-    }
-  },
-  { immediate: true },
-);
+async function loadDraft() {
+  const id = props.mediaId,
+    n = ++serial;
+  draftReady.value = false;
+  personal.value = "";
+  shared.value = "";
+  revisions.personal = revisions.shared = "0";
+  error.value = "";
+  message.value = "";
+  conflict.value = undefined;
+  busy.value = !!id;
+  if (!id) return;
+  try {
+    const item = await catalog.ensure(id, true);
+    if (n !== serial) return;
+    personal.value = item.personal_title ?? "";
+    shared.value = item.shared_title ?? "";
+    revisions.personal = item.personal_title_revision;
+    revisions.shared = item.shared_title_revision;
+    draftReady.value = true;
+  } catch (e) {
+    if (n === serial) error.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    if (n === serial) busy.value = false;
+  }
+}
+watch(() => [props.mediaId, session.epoch] as const, loadDraft, {
+  immediate: true,
+  flush: "sync",
+});
 async function save(scope: "personal" | "shared", clear = false) {
   const id = props.mediaId,
     item = id && catalog.records[id];
-  if (!id || !item || busy.value) return;
+  if (!id || !item || busy.value || !draftReady.value) return;
   const n = serial,
     epoch = session.epoch,
     title = clear
@@ -117,7 +123,7 @@ async function save(scope: "personal" | "shared", clear = false) {
     :busy="busy"
     @update:model-value="!$event && emit('close')"
   >
-    <template v-if="mediaId && catalog.records[mediaId]">
+    <template v-if="mediaId && draftReady && catalog.records[mediaId]">
       <p>原名：{{ catalog.records[mediaId].original_title }}</p>
       <p class="helper">个人名称优先于全站名称，仅影响显示，不修改片源文件。</p>
       <form @submit.prevent="save('personal')">
@@ -167,5 +173,8 @@ async function save(scope: "personal" | "shared", clear = false) {
       }}名称：{{ conflict.title ?? "未设置" }}
     </p>
     <Notice :message="error" error /><Notice :message="message" />
+    <button v-if="mediaId && !busy && !draftReady" @click="loadDraft">
+      重新读取名称
+    </button>
   </AppDialog>
 </template>

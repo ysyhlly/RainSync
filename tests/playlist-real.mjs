@@ -70,10 +70,13 @@ await isolatedMediaStack(
       await page.getByLabel("密码", { exact: true }).fill(f.password);
       await page.getByRole("button", { name: "登录", exact: true }).click();
       await page.getByRole("button", { name: "进入房间", exact: true }).click();
-      await expect(page.locator(".room-information")).toContainText("已连接");
+      await expect(page.locator(".connection-status")).toHaveText("房间连接正常");
       await page
         .locator(".sidebar")
         .getByRole("link", { name: "媒体库", exact: true })
+        .click();
+      await page
+        .getByRole("button", { name: "打开片源 loop fixture", exact: true })
         .click();
       await page
         .getByRole("button", { name: "播放 first", exact: true })

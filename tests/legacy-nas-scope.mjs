@@ -36,7 +36,7 @@ try {
   await isolatedServer("legacy-nas-scope", async f => {
     fixture = f;
     report.postgres = f.postgresDiagnostics();
-    assert.equal(f.sql("SELECT max(version) FROM _sqlx_migrations WHERE success"), "30");
+    assert.equal(f.sql("SELECT count(*) FROM _sqlx_migrations WHERE version=30 AND success"), "1");
     assert.equal(f.sql("SELECT ordinal FROM room_cleanup_birth_counter"), "1");
     assert.equal(f.sql(`SELECT count(*) FROM agent_transfer_runs WHERE id IN('${oldRuns.join("','")}') AND legacy_unconfirmed AND possible_room_cutoff=1 AND agent_drained_at IS NULL`), "3");
     const admin = f.client(); await admin.login();
@@ -129,11 +129,14 @@ try {
     ]) assert.throws(() => f.sql(sql), /database_assigned|immutable|counter_managed/);
     const session = randomUUID(), orphan = randomUUID();
     f.sql(`INSERT INTO playback_sessions(id,room_id,generation,delivery_token_hash,resource,expires_at) VALUES('${session}','${oldRoom}',0,'${session}','{}',now()),('${orphan}',NULL,0,'${orphan}','{}',now())`);
-    for (const sql of [
-      `UPDATE playback_sessions SET room_id='${fresh.id}' WHERE id='${session}'`,
-      `UPDATE playback_sessions SET room_id='${fresh.id}' WHERE id='${orphan}'`,
-      `UPDATE playback_sessions SET id='${randomUUID()}' WHERE id='${session}'`,
-    ]) assert.throws(() => f.sql(sql), /playback_room_identity_immutable/);
+    for (const [sql,error] of [
+      // The current login-origin guard runs before the legacy room guard.
+      [`UPDATE playback_sessions SET room_id='${fresh.id}' WHERE id='${session}'`, /media_login_origin_immutable/],
+      [`UPDATE playback_sessions SET room_id='${fresh.id}' WHERE id='${orphan}'`, /media_login_origin_immutable/],
+      [`UPDATE playback_sessions SET id='${randomUUID()}' WHERE id='${session}'`, /playback_room_identity_immutable/],
+    ]) assert.throws(() => f.sql(sql), error);
+    assert.equal(f.sql(`SELECT room_id FROM playback_sessions WHERE id='${session}'`), oldRoom);
+    assert.equal(f.sql(`SELECT room_id IS NULL FROM playback_sessions WHERE id='${orphan}'`), "t");
     passed("forged ordinals/cutoffs, scope rewrites, grant relocation and counter mutation fail closed");
 
     const retained = f.sql("SELECT count(*) FROM agent_transfer_runs WHERE legacy_unconfirmed");

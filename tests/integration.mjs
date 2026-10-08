@@ -1,10 +1,10 @@
-import { isolatedPostgres } from "./fixtures/postgres.mjs";
+import { isolatedPostgres, verifyClosedPort } from "./fixtures/postgres.mjs";
 import { reviewRegressions } from "./review-regressions.mjs";
 import { libraryScans } from "./library-scans.mjs";
 import { queueCapacity } from "./queue-capacity.mjs";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile, rename } from "node:fs/promises";
 import { resolve } from "node:path";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -27,8 +27,20 @@ const database = isolatedPostgres({ root, name: "integration", password });
 const children = [];
 const origin = "http://127.0.0.1:18080";
 const worker = "http://127.0.0.1:18081";
-const bytes = Buffer.from(Array.from({ length: 2048 }, (_, i) => i % 256));
-await writeFile(resolve(root, "fixture.mp4"), bytes);
+const fixturePath = resolve(root, "fixture.mp4");
+// New local plans probe current owned bytes, including both selectable tracks.
+execFileSync("ffmpeg", [
+  "-v", "error", "-nostdin", "-y",
+  "-f", "lavfi", "-i", "color=c=blue:s=128x72:r=25:d=20",
+  "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=20",
+  "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=20",
+  "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0",
+  "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-threads", "1",
+  "-c:a", "aac", "-b:a", "32k",
+  "-metadata:s:a:0", "language=eng", "-metadata:s:a:1", "language=jpn",
+  "-movflags", "+faststart", fixturePath,
+], { timeout: 30000, stdio: "inherit" });
+const bytes = await readFile(fixturePath);
 const env = {
   ...process.env,
   PLAYBACK_SESSION_LIMIT: "8",
@@ -38,16 +50,14 @@ const env = {
   PUBLIC_ORIGIN: origin,
   BIND: "127.0.0.1:18080",
   WORKER_BIND: "127.0.0.1:18081",
-  // Controlled probe response below; delivery tests still use the real worker.
-  WORKER_URL: "http://127.0.0.1:18082",
   MEDIA_ROOT: root,
-  CACHE_ROOT: resolve(root, "cache"),
+  CACHE_ROOT: `${root}-cache`,
   RUST_LOG: "warn",
 };
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 const sql = database.sql;
 const sqlProcess = database.sqlProcess;
-function assertError(value, code, response) {
+function assertError(value, code, response, retryAfterMs) {
   assert.equal(value.error.code, code);
   assert.equal(typeof value.error.message, "string");
   assert.ok(value.error.message.length > 0);
@@ -58,8 +68,8 @@ function assertError(value, code, response) {
   );
   assert.equal(
     value.error.retry_after_ms,
-    undefined,
-    "must not invent retry timing",
+    retryAfterMs,
+    "retry timing must match the supplied admission policy",
   );
   if (response) {
     assert.equal(response.headers.get("x-request-id"), value.error.request_id);
@@ -194,7 +204,18 @@ async function connect(client, room) {
   };
 }
 let mock;
+let mockOrigin;
+const mockRequests = [];
 try {
+  for (const port of [18080, 18081, 18084])
+    assert.ok(await verifyClosedPort(port), `fixture port ${port} is already in use`);
+  // Own the fixture listener before launching any client. A fixed port can
+  // collide with a developer's running service or send probes to that service.
+  mock = http.createServer((_request, response) => response.writeHead(503).end());
+  await new Promise((resolve, reject) =>
+    mock.once("error", reject).listen(0, "127.0.0.1", resolve));
+  mockOrigin = `http://127.0.0.1:${mock.address().port}`;
+  env.WORKER_URL = mockOrigin;
   await database.start();
   env.DATABASE_URL = database.url;
   let server = launch("rainsync-server");
@@ -527,21 +548,23 @@ try {
   const originalMetadata = sql(
     `SELECT metadata FROM media_items WHERE id='${state.media_id}'`,
   );
-  const rotatedMetadata = {
-    format: { format_name: "mov,mp4" },
-    streams: [
-      {
-        index: 0,
-        codec_type: "video",
-        codec_name: "h264",
-        pix_fmt: "yuv420p",
-        side_data_list: [{ side_data_type: "Display Matrix", rotation: 90 }],
-      },
-    ],
-  };
-  sql(
-    `UPDATE media_items SET metadata='${JSON.stringify(rotatedMetadata)}'::jsonb WHERE id='${state.media_id}'`,
-  );
+  const rotatedPath = resolve(root, "rotation-fixture.tmp");
+  const explicitRotation = execFileSync("ffmpeg", ["-hide_banner", "-h", "full"], {
+    timeout: 10000, encoding: "utf8", maxBuffer: 8 * 1024 * 1024,
+  }).includes("-display_rotation");
+  execFileSync("ffmpeg", [
+    "-v", "error", "-nostdin", "-y",
+    ...(explicitRotation ? ["-display_rotation:v:0", "90"] : []),
+    "-i", fixturePath, "-map", "0", "-c", "copy",
+    ...(explicitRotation ? [] : ["-metadata:s:v:0", "rotate=90"]),
+    "-f", "mp4", rotatedPath,
+  ], { timeout: 30000, stdio: "inherit" });
+  const rotatedMetadata = JSON.parse(execFileSync("ffprobe", [
+    "-v", "error", "-select_streams", "v:0", "-show_streams", "-of", "json", rotatedPath,
+  ], { timeout: 10000, encoding: "utf8" }));
+  assert.ok((rotatedMetadata.streams[0].side_data_list ?? []).some((entry) =>
+    entry.side_data_type === "Display Matrix" && entry.rotation === 90));
+  await rename(rotatedPath, fixturePath);
   try {
     for (const [mode, capabilities, expected] of [
       ["auto", null, "direct"],
@@ -572,6 +595,7 @@ try {
       );
     }
   } finally {
+    await writeFile(fixturePath, bytes);
     sql(
       `UPDATE media_items SET metadata='${originalMetadata.replaceAll("'", "''")}'::jsonb WHERE id='${state.media_id}'`,
     );
@@ -607,28 +631,51 @@ try {
   let r = await fetch(worker + plan.playback_url, {
     headers: { Range: "bytes=7-18" },
   });
+  if (r.status !== 206) {
+    // Failure-only evidence contains booleans and a normalized code, no tokens.
+    const diagnostic = { status: r.status, error_code: "UNPARSEABLE" };
+    try {
+      const value = await r.clone().json();
+      diagnostic.error_code = /^[A-Z_]{1,80}$/.test(value?.error?.code ?? "")
+        ? value.error.code : "UNPARSEABLE";
+    } catch {
+      diagnostic.response_evidence_unavailable = true;
+    }
+    try {
+      const deliveryToken = new URL(plan.playback_url, worker).searchParams.get("token");
+      const deliveryHash = createHash("sha256").update(deliveryToken ?? "").digest("hex");
+      diagnostic.grant_predicates = JSON.parse(sql(
+        `SET statement_timeout='500ms'; SELECT json_build_object('token_matches',p.delivery_token_hash='${deliveryHash}','unexpired',p.expires_at>clock_timestamp(),'stopped',p.stopped,'source_allowed',COALESCE(playback_source_allowed(p.media_id,p.resource,p.id),false),'room_active',r.lifecycle='active','epoch_matches',r.lifecycle_epoch=p.lifecycle_epoch,'generation_matches',(snap.state->>'media_generation')::bigint=p.generation,'member_present',EXISTS(SELECT 1 FROM room_members m WHERE m.room_id=p.room_id AND m.user_id=p.user_id),'origin_allowed',COALESCE(playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch),false),'media_present',mi.id IS NOT NULL,'media_available',COALESCE(mi.available,false),'source_present',src.id IS NOT NULL,'source_kind_local',src.kind='local','source_revision_matches',COALESCE((p.resource->>'source_policy_revision')::bigint,0)=src.access_policy_revision,'library_allowed',COALESCE(playback_library_session_allowed(p.id),false),'delivery_registered',EXISTS(SELECT 1 FROM media_executions e WHERE e.session_id=p.id AND e.kind='delivery'),'delivery_unreaped',EXISTS(SELECT 1 FROM media_executions e WHERE e.session_id=p.id AND e.kind='delivery' AND e.reaped_at IS NULL)) FROM playback_sessions p JOIN room_snapshots snap ON snap.room_id=p.room_id JOIN rooms r ON r.id=p.room_id LEFT JOIN media_items mi ON mi.id=p.media_id LEFT JOIN sources src ON src.id=mi.source_id WHERE p.id='${plan.session_id}'`,
+      ).split("\n").at(-1) || "null");
+    } catch {
+      diagnostic.grant_evidence_unavailable = true;
+    }
+    console.error("Direct Range authorization failure: " + JSON.stringify(diagnostic));
+  }
   assert.equal(r.status, 206);
   assert.deepEqual(Buffer.from(await r.arrayBuffer()), bytes.subarray(7, 19));
   r = await fetch(worker + plan.playback_url, {
     headers: { Range: "bytes=-0" },
   });
   assert.equal(r.status, 416);
-  assert.equal(r.headers.get("content-range"), "bytes */2048");
+  assert.equal(r.headers.get("content-range"), `bytes */${bytes.length}`);
   r = await fetch(worker + plan.playback_url, {
-    headers: { Range: "bytes=9999-" },
+    headers: { Range: `bytes=${bytes.length + 1}-` },
   });
   assert.equal(r.status, 416);
-  assert.equal(r.headers.get("content-range"), "bytes */2048");
+  assert.equal(r.headers.get("content-range"), `bytes */${bytes.length}`);
   assertError(await r.json(), "RANGE_NOT_SATISFIABLE", r);
   r = await fetch(worker + plan.playback_url, {
     method: "HEAD",
-    headers: { Range: "bytes=9999-" },
+    headers: { Range: `bytes=${bytes.length + 1}-` },
   });
-  assert.equal(r.status, 416);
-  assert.equal(r.headers.get("content-range"), "bytes */2048");
+  // RFC 9110 Range semantics apply to GET only; HEAD describes the full entity.
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get("content-range"), null);
+  assert.equal(r.headers.get("content-length"), String(bytes.length));
   assert.equal(await r.text(), "");
   r = await fetch(worker + plan.playback_url, { method: "HEAD" });
-  assert.equal(r.headers.get("content-length"), "2048");
+  assert.equal(r.headers.get("content-length"), String(bytes.length));
   await workerAttempts({
     readiness: (status = 200, position) =>
       friend.request(
@@ -721,17 +768,31 @@ try {
   let probeResponse;
   let probeMetadata;
   let probeCalls = 0;
-  mock = http
-    .createServer((req, res) => {
+  mock.removeAllListeners("request");
+  mock.on("request", (req, res) => {
+      mockRequests.push({ method: req.method, path: new URL(req.url, "http://fixture").pathname, headers: { ...req.headers } });
       if (
         req.url.startsWith("/media-delivery/") &&
         req.url.includes("/probe?")
       ) {
         probeCalls++;
         if (probeMetadata) {
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify(probeMetadata));
+          // Pin the same actual Binary grant through the real Worker before
+          // returning this fixture's controlled API-decision metadata.
+          void (async () => {
+            const pinned = await fetch(worker + req.url.replace("/probe?", "/source?"));
+            if (!pinned.ok) {
+              res.writeHead(pinned.status).end(await pinned.text());
+              return;
+            }
+            await pinned.arrayBuffer();
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify(probeMetadata));
+          })().catch(() => res.writeHead(502).end());
         } else probeResponse = res;
+      } else if (req.url === "/Users/test-user") {
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({Id:"test-user",Policy:{IsDisabled:false,EnableMediaPlayback:true}}));
       } else if (req.url.startsWith("/Users/test-user/Items")) {
         const kind = req.headers["x-emby-token"] ? "emby" : "jellyfin";
         assert.ok(
@@ -778,7 +839,7 @@ try {
                     ],
                   },
                 ],
-                PlaySessionId: "mock-session",
+                PlaySessionId: randomUUID(),
               }),
             ),
           1000,
@@ -794,6 +855,26 @@ try {
         upstreamReports.push(req.url);
         res.setHeader("Content-Type", "application/json");
         res.end("{}");
+      } else if (req.url === "/fixture.mp4") {
+        const etag = `"${createHash("sha256").update(bytes).digest("hex")}"`;
+        res.setHeader("ETag", etag);
+        res.setHeader("Content-Type", "video/mp4");
+        res.setHeader("Accept-Ranges", "bytes");
+        if (req.headers["if-match"] && req.headers["if-match"] !== etag) {
+          res.writeHead(412).end();
+          return;
+        }
+        const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? "");
+        const start = range ? Number(range[1]) : 0;
+        const end = range && range[2] ? Math.min(Number(range[2]), bytes.length - 1) : bytes.length - 1;
+        if (start >= bytes.length || end < start) {
+          res.setHeader("Content-Range", `bytes */${bytes.length}`);
+          res.writeHead(416).end();
+          return;
+        }
+        if (range) res.setHeader("Content-Range", `bytes ${start}-${end}/${bytes.length}`);
+        res.setHeader("Content-Length", String(end - start + 1));
+        res.writeHead(range ? 206 : 200).end(req.method === "HEAD" ? undefined : bytes.subarray(start, end + 1));
       } else if (req.url === "/index.m3u8") {
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
         res.end(
@@ -802,12 +883,11 @@ try {
       } else {
         res.end(bytes);
       }
-    })
-    .listen(18082, "127.0.0.1");
+    });
   const httpSource = await admin.request("/sources", "POST", {
     name: "HTTP",
     kind: "http",
-    config: { url: "http://127.0.0.1:18082/index.m3u8" },
+    config: { url: mockOrigin + "/index.m3u8" },
   });
   await admin.request(`/sources/${httpSource.id}/test`, "POST");
   const httpMedia = (await admin.request("/media")).find(
@@ -841,7 +921,7 @@ try {
   const forged = new URL(worker + segment);
   forged.searchParams.set(
     "url",
-    Buffer.from("http://127.0.0.1:18082/private").toString("base64url"),
+    Buffer.from(mockOrigin + "/private").toString("base64url"),
   );
   assert.equal((await fetch(forged)).status, 403);
   const probeRequest = {
@@ -891,6 +971,17 @@ try {
   console.log(
     "PASS: disconnected probe records failure and releases committed grant before lease expiry",
   );
+  const binarySource = await admin.request("/sources", "POST", {
+    name: "Owned HTTP Binary", kind: "http",
+    config: { url: mockOrigin + "/fixture.mp4" },
+  });
+  await admin.request(`/sources/${binarySource.id}/test`, "POST");
+  const binaryMedia = sql(`SELECT id FROM media_items WHERE source_id='${binarySource.id}'`);
+  a.ws.send(JSON.stringify({
+    ...command, command_id: randomUUID(), expected_revision: state.revision,
+    media_generation: state.media_generation, type: "CHANGE_MEDIA", payload: { media_id: binaryMedia },
+  }));
+  state = (await a.wait((v) => v.type === "ACK")).state;
   // Controlled probe metadata exercises the real API decision and grant cleanup.
   for (const [format, codec, expected] of [
     ["mov,mp4", "h264", "direct"],
@@ -900,11 +991,12 @@ try {
     probeMetadata = {
       format: { format_name: format, duration: "20" },
       streams: [
-        { codec_type: "video", codec_name: codec, pix_fmt: "yuv420p" },
-        { codec_type: "audio", codec_name: "aac" },
+        { index: 0, codec_type: "video", codec_name: codec, pix_fmt: "yuv420p", disposition: { attached_pic: 0 } },
+        { index: 1, codec_type: "audio", codec_name: "aac" },
       ],
     };
     const before = probeCalls;
+    const beforeRequests = mockRequests.length;
     const automatic = await admin.request("/playback-sessions", "POST", {
       room_id: room.id,
       media_generation: state.media_generation,
@@ -912,16 +1004,20 @@ try {
     });
     assert.equal(probeCalls, before + 1);
     assert.equal(automatic.delivery_mode, expected);
+    assert.ok(mockRequests.slice(beforeRequests).some((request) => request.path === "/fixture.mp4" && request.method === "GET"), "controlled probe consumes the actual owned Binary source");
+    assert.equal(sql(`SELECT count(*) FROM playback_http_representations WHERE session_id='${automatic.session_id}' AND identity->>'class'='binary' AND identity->'metadata'->>'etag'='"${createHash("sha256").update(bytes).digest("hex")}"'`), "1", "exact grant has one actual strong-validator Binary pin");
     await admin.request(`/playback-sessions/${automatic.session_id}`, "DELETE");
   }
   probeMetadata = undefined;
+  await writeFile(resolve(root, "mock-http-requests.json"), JSON.stringify(mockRequests, null, 2));
+  await writeFile(resolve(root, "fixture-paths.json"), JSON.stringify({ artifacts: root, media: env.MEDIA_ROOT, cache: env.CACHE_ROOT, retention: "owned fixture directories retained as evidence" }, null, 2));
   console.log("PASS: remote auto probes and selects direct/remux/transcode");
   for (const kind of ["jellyfin", "emby"]) {
     const source = await admin.request("/sources", "POST", {
       name: kind,
       kind,
       config: {
-        url: "http://127.0.0.1:18082",
+        url: mockOrigin,
         token: "mock-token",
         user_id: "test-user",
       },
@@ -1196,14 +1292,24 @@ try {
     state,
     sql,
   });
+  const localRestartRoom = await admin.request("/rooms", "POST", {name:"local restart compatibility"});
+  const localRestartSocket = await connect(admin, localRestartRoom.id);
+  const localSnapshot = (await localRestartSocket.wait(v=>v.type==="SNAPSHOT")).state;
+  localRestartSocket.ws.send(JSON.stringify({
+    protocol_version:1,room_id:localRestartRoom.id,command_id:randomUUID(),
+    control_epoch:localRestartSocket.controlEpoch,expected_revision:localSnapshot.revision,
+    media_generation:localSnapshot.media_generation,type:"CHANGE_MEDIA",payload:{media_id:media[0].id},
+  }));
+  const localRestartState=(await localRestartSocket.wait(v=>v.type==="ACK")).state;
+  const localPlaybackRestart=await preparePlaybackRestart({admin,room:localRestartRoom,state:localRestartState,sql});
+  assert.equal(localPlaybackRestart.accountBound,false);
+  localRestartSocket.ws.close();
   a.ws.close();
   b.ws.close();
   const loginBody = { username: "restart-limit-fixture", password: "wrong" };
-  const loginResults = await Promise.all(
-    Array.from({ length: 12 }, () =>
-      admin.request("/auth/login", "POST", loginBody, [401, 429]),
-    ),
-  );
+  sql("DELETE FROM login_attempts");
+  const loginResults = [];
+  for (let i = 0; i < 12; i++) loginResults.push(await admin.request("/auth/login", "POST", loginBody, [401, 429]));
   assert.equal(
     loginResults.filter((v) => v.error.code === "INVALID_CREDENTIALS").length,
     10,
@@ -1219,9 +1325,11 @@ try {
   assertError(
     await admin.request("/auth/login", "POST", loginBody, 429),
     "RATE_LIMITED",
+    undefined,
+    60000,
   );
   const loginHash = createHash("sha256")
-    .update(loginBody.username)
+    .update("login-source:127.0.0.1")
     .digest("hex");
   sql(
     `UPDATE login_attempts SET window_started=now()-interval '61 seconds' WHERE username_hash='${loginHash}'`,
@@ -1240,6 +1348,7 @@ try {
   assert.notEqual(recoveredState.clock_epoch, oldEpoch);
   assert.ok(recoveredState.revision > state.revision);
   await verifyPlaybackRestart({ admin, sql }, playbackRestart);
+  await verifyPlaybackRestart({ admin, sql }, localPlaybackRestart);
   recovered.ws.send(JSON.stringify(command));
   assert.deepEqual(
     (await recovered.wait((v) => v.type === "ACK")).state,
@@ -1339,4 +1448,5 @@ try {
   for (const child of children) child.kill();
   await delay(400);
   await database.stop();
+  await writeFile(resolve(root, "mock-http-requests.json"), JSON.stringify(mockRequests, null, 2));
 }

@@ -23,7 +23,11 @@ export async function outputCleanup({ id, cache, sql }) {
   const current = resolve(cache, id, "2", "index0.m4s");
   const saved = await readFile(current);
   const oldLease = randomUUID(), currentLease = randomUUID();
+  const writerReceipt = randomUUID(), writerOwner = randomUUID();
   try {
+    // This controlled old attempt starts no encoder, and its fixture-owned
+    // writes have completed. Lease expiry alone must never stand in for drain.
+    sql(`INSERT INTO media_executions(id,session_id,kind,job_id,attempt,owner_id,reaped_at) VALUES('${writerReceipt}','${id}','job','${id}',1,'${writerOwner}',clock_timestamp())`);
     sql(`INSERT INTO cache_read_leases(id,cache_id,attempt,expires_at) VALUES('${oldLease}','${id}',1,now()+interval '1 hour'),('${currentLease}','${id}',2,now()+interval '1 hour'); UPDATE media_outputs SET status='abandoned',cleanup_after=now() WHERE job_id='${id}' AND attempt=1`);
     await new Promise((r) => setTimeout(r, 6000));
     assert.equal(await missing(old), false, "an old response still pins its own files");
@@ -41,5 +45,6 @@ export async function outputCleanup({ id, cache, sql }) {
     console.log("PASS: independent old-attempt cleanup respects old readers, preserves active current output and revisits late writes");
   } finally {
     sql(`DELETE FROM cache_read_leases WHERE id IN ('${oldLease}','${currentLease}')`);
+    sql(`DELETE FROM media_executions WHERE id='${writerReceipt}' AND owner_id='${writerOwner}'`);
   }
 }

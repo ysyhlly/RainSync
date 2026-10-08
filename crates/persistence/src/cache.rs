@@ -109,8 +109,34 @@ pub async fn claim_eviction(pool: &PgPool, cache_id: Uuid) -> Result<Option<Uuid
     {
         return Ok(None);
     }
-    let protected: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions WHERE id=$1 AND NOT stopped AND expires_at>clock_timestamp()) OR EXISTS(SELECT 1 FROM media_jobs WHERE id=$1 AND status='running' AND lease_until>clock_timestamp()) OR EXISTS(SELECT 1 FROM cache_read_leases WHERE cache_id=$1 AND expires_at>clock_timestamp())")
-        .bind(cache_id).fetch_one(&mut *tx).await?;
+    // A claim already in flight must commit its execution record before this
+    // check. Claim holds the job lock and never needs the cache entry lock.
+    sqlx::query("SELECT id FROM media_jobs WHERE id=$1 FOR SHARE")
+        .bind(cache_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    // Cancellation, lease expiry and a newer attempt are scheduling facts, not
+    // process-exit evidence. Protect all attempts, including missing receipts.
+    let job_reaped = crate::cache_writers::reaped("j.id", "j.attempt", "j.owner_id");
+    let output_reaped = crate::cache_writers::reaped("o.job_id", "o.attempt", "o.owner_id");
+    let reservation_reaped = crate::cache_writers::reaped("r.job_id", "r.attempt", "r.owner_id");
+    // A child output has an independent directory/read owner after its encoder
+    // is reaped. Only its typed, positive output-disposal consumer may remove
+    // the reservation; generic eviction must not delete that owned directory.
+    let query = format!(
+        "SELECT EXISTS(SELECT 1 FROM playback_sessions WHERE id=$1 AND NOT stopped AND expires_at>clock_timestamp())
+        OR EXISTS(SELECT 1 FROM media_jobs j WHERE j.id=$1 AND (
+            (j.status='running' AND j.lease_until>clock_timestamp())
+            OR ((j.attempt>0 OR j.owner_id IS NOT NULL OR j.status='running') AND NOT {job_reaped})))
+        OR EXISTS(SELECT 1 FROM media_executions WHERE job_id=$1 AND reaped_at IS NULL)
+        OR EXISTS(SELECT 1 FROM media_outputs o WHERE o.job_id=$1 AND NOT {output_reaped})
+        OR EXISTS(SELECT 1 FROM cache_write_reservations r WHERE r.job_id=$1 AND (r.purpose='static_hls_child_output' OR NOT {reservation_reaped}))
+        OR EXISTS(SELECT 1 FROM cache_read_leases WHERE cache_id=$1 AND expires_at>clock_timestamp())"
+    );
+    let protected: bool = sqlx::query_scalar(&query)
+        .bind(cache_id)
+        .fetch_one(&mut *tx)
+        .await?;
     if protected {
         return Ok(None);
     }
