@@ -405,7 +405,11 @@ it.each(["SEEK", "PLAY"])(
     await vi.waitFor(() => expect(playback.sessionId).toBe("fixture-playback"));
     await vi.advanceTimersByTimeAsync(0);
     playback.roomError = "unrelated room failure";
-    playback.playbackError = "retained automatic playback notice";
+    // Exercise the public playback action instead of exposing its error writer
+    // through every room page solely for this fixture.
+    await playback.runPlayback(async () => {
+      throw Error("retained automatic playback notice");
+    });
     frame({
       type: "EVENT",
       action: { type: action },
@@ -413,14 +417,17 @@ it.each(["SEEK", "PLAY"])(
     });
     expect(element.play).toHaveBeenCalledOnce();
     expect(playback.roomBusy).toBe(false);
-    expect(playback.playbackBusy).toBe(action === "SEEK");
-    expect(playback.playbackError).toBe("retained automatic playback notice");
+    expect(playback.busy).toBe(action === "SEEK");
+    expect(playback.errorNotice).toMatchObject({
+      owner: "playback",
+      message: "retained automatic playback notice",
+    });
     pending.reject(Error("projection apply failed"));
     await vi.waitFor(() =>
-      expect(playback.playbackError).toBe("projection apply failed"),
+      expect(playback.error).toBe("projection apply failed"),
     );
     expect(playback.roomError).toBe("unrelated room failure");
     expect(playback.errorNotice?.owner).toBe("playback");
-    expect(playback.playbackBusy).toBe(false);
+    expect(playback.busy).toBe(false);
   },
 );
