@@ -6,6 +6,7 @@ import { createServer } from "node:http";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isolatedServer, delay } from "./fixtures/server.mjs";
+import { verifyPidAbsent } from "./fixtures/postgres.mjs";
 import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 
 const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
@@ -28,7 +29,7 @@ await new Promise((done) => upstream.listen(0, "127.0.0.1", done));
 const upstreamOrigin = `http://127.0.0.1:${upstream.address().port}`;
 const checks = [];
 const requests = [];
-let lockEvidence;
+let lockEvidence, barrierEvidence;
 let owned, failure;
 try {
   await isolatedServer("source-settings", async (f) => {
@@ -456,7 +457,39 @@ try {
     // This deferred request is asserted below; retain rejection until that await.
     pending.catch(() => {});
     let scanTimer;
-    let edit;
+    let edit,
+      barrier,
+      barrierMarker,
+      barrierReleased = false;
+    let delayedFailed = false,
+      delayedError;
+    async function releaseBarrier() {
+      if (!barrier || barrierReleased) return;
+      barrierReleased = true;
+      if (!barrier.stdin.destroyed && !barrier.stdin.writableEnded)
+        barrier.stdin.end("COMMIT;\n\\q\n");
+      await barrier.done;
+      assert.equal(
+        barrier.exitCode,
+        0,
+        "owned source barrier closed successfully",
+      );
+      assert.equal(barrier.signalCode, null);
+      assert.equal(verifyPidAbsent(barrier.pid), true);
+      await f.waitForSql(
+        `SELECT count(*) FROM pg_stat_activity WHERE application_name=${quote(barrierMarker)}`,
+        "0",
+        2000,
+      );
+      barrierEvidence.release = {
+        pid: barrier.pid,
+        exit_code: barrier.exitCode,
+        signal: barrier.signalCode,
+        observed_close: true,
+        pid_absent: true,
+        postgres_connection_absent: true,
+      };
+    }
     try {
       try {
         await Promise.race([
@@ -500,8 +533,89 @@ try {
         "0",
         "No scan publication while provider response is held",
       );
+      const writerPid = lockEvidence[0].writer_pid;
+      assert.equal(
+        f.sql(
+          `SELECT EXISTS(SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid WHERE a.pid=${writerPid} AND a.query='SELECT * FROM sources WHERE id=$1 FOR UPDATE' AND l.relation='sources'::regclass AND l.mode='RowShareLock' AND l.granted)`,
+        ),
+        "t",
+        "the exact config writer already owns its relation lock",
+      );
+      const previousGeneration = f.sql(
+        `SELECT generation::text FROM source_scans WHERE source_id=${quote(delayed.id)}`,
+      );
+      // Queue behind the admitted writer before releasing the provider guard.
+      // The writer can upgrade its existing relation lock; the next scan's
+      // fresh RowShareLock must wait behind this EXCLUSIVE table-lock request.
+      barrierMarker = `source_settings_barrier_${randomUUID().replaceAll("-", "")}`;
+      barrierEvidence = {
+        writer_pid: writerPid,
+        writer_relation_lock_owned: true,
+        barrier_queued_before_provider_release: false,
+      };
+      barrier = f.sqlProcess(undefined, { interactive: true });
+      barrier.stdout.resume();
+      barrier.stdin.write(
+        `SET application_name=${quote(barrierMarker)}; BEGIN; SET LOCAL statement_timeout='10s'; SET LOCAL idle_in_transaction_session_timeout='10s'; LOCK TABLE sources IN EXCLUSIVE MODE;\n`,
+      );
+      await f.waitForSql(
+        `SELECT count(*) FROM pg_stat_activity WHERE application_name=${quote(barrierMarker)}`,
+        "1",
+        2000,
+      );
+      const barrierPid = Number(
+        f.sql(
+          `SELECT pid FROM pg_stat_activity WHERE application_name=${quote(barrierMarker)}`,
+        ),
+      );
+      assert.ok(Number.isSafeInteger(barrierPid) && barrierPid > 0);
+      await f.waitForSql(
+        `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=${barrierPid} AND relation='sources'::regclass AND mode='ExclusiveLock' AND NOT granted)`,
+        "t",
+        2000,
+      );
+      Object.assign(barrierEvidence, {
+        barrier_backend_pid: barrierPid,
+        barrier_queued_before_provider_release: true,
+      });
       releaseScan();
+      await f.waitForSql(
+        `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=${barrierPid} AND relation='sources'::regclass AND mode='ExclusiveLock' AND granted)`,
+        "t",
+        2000,
+      );
       await edit;
+      assert.equal(
+        f.sql(
+          `SELECT settings_revision FROM sources WHERE id=${quote(delayed.id)}`,
+        ),
+        "2",
+        "source edit committed while next scan is held",
+      );
+      assert.equal(
+        f.sql(
+          `SELECT generation::text<>${quote(previousGeneration)} FROM source_scans WHERE source_id=${quote(delayed.id)}`,
+        ),
+        "t",
+        "committed edit changed the old scan generation",
+      );
+      assert.equal(
+        f.sql(
+          `SELECT count(*) FROM media_items WHERE source_id=${quote(delayed.id)}`,
+        ),
+        "0",
+        "no old item was published before the committed edit",
+      );
+      const waitingGuard = `SELECT count(*) FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid WHERE a.datname=current_database() AND a.query='SELECT kind,config_encrypted FROM sources WHERE id=$1 AND deleted_at IS NULL FOR SHARE' AND l.relation='sources'::regclass AND l.mode='RowShareLock' AND NOT l.granted AND ${barrierPid}=ANY(pg_blocking_pids(a.pid))`;
+      await f.waitForSql(waitingGuard, "1", 2000);
+      Object.assign(barrierEvidence, {
+        barrier_granted: true,
+        committed_settings_revision: 2,
+        old_scan_generation_changed: true,
+        item_count_before_release: 0,
+        exact_next_guard_waiting: true,
+      });
+      await releaseBarrier();
       const late = await pending;
       assert.equal(late.status, 409);
       await late.arrayBuffer();
@@ -511,10 +625,25 @@ try {
         ),
         "0",
       );
+    } catch (error) {
+      delayedFailed = true;
+      delayedError = error;
+      throw error;
     } finally {
       clearTimeout(scanTimer);
       releaseScan?.();
-      await Promise.allSettled([pending, edit].filter(Boolean));
+      try {
+        await releaseBarrier();
+      } catch (cleanupError) {
+        if (delayedFailed)
+          throw new AggregateError(
+            [delayedError, cleanupError],
+            "source settings assertion and barrier cleanup failed",
+          );
+        throw cleanupError;
+      } finally {
+        await Promise.allSettled([pending, edit].filter(Boolean));
+      }
     }
     checks.push(
       "in-flight pre-edit provider scan cannot publish stale results after save",
@@ -523,7 +652,13 @@ try {
     await writeFile(
       resolve(f.root, "source-settings-results.json"),
       JSON.stringify(
-        { result: "passed", checks, requests, lock_evidence: lockEvidence },
+        {
+          result: "passed",
+          checks,
+          requests,
+          lock_evidence: lockEvidence,
+          barrier_evidence: barrierEvidence,
+        },
         null,
         2,
       ),
@@ -538,6 +673,7 @@ try {
       requests,
       completed_checks: checks,
       lock_evidence: lockEvidence,
+      barrier_evidence: barrierEvidence,
     }),
   );
   throw error;
@@ -561,6 +697,7 @@ try {
           requests,
           completed_checks: checks,
           lock_evidence: lockEvidence,
+          barrier_evidence: barrierEvidence,
           cleanup,
           error: failure?.stack,
         },
