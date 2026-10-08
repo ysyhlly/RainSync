@@ -121,6 +121,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
       RAINSYNC_BUILD_JOBS: 2
+      RAINSYNC_FIXTURE_CLEANUP_REPORT: 1
     steps:
       - uses: actions/checkout@v4
         with:
@@ -167,7 +168,11 @@ jobs:
         if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
         timeout-minutes: 5
         run: timeout --signal=TERM --kill-after=45s 240s npm run test:source-change-commit
-      - name: Retain sanitized owner and source-commit evidence
+      - name: Verify atomic room commands, replay and final authority fences
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s npm run test:room-command-transactions
+      - name: Retain sanitized owner, transaction and source-commit evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -175,6 +180,7 @@ jobs:
           # No fixture request documents, databases, credentials or raw logs.
           path: |
             ${{ runner.temp }}/rainsync-owner-validation/artifacts/owner-gates/**/report.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/**/fixture-cleanup.json
             ${{ runner.temp }}/rainsync-owner-validation/artifacts/source-change-commit/**/report.json
             ${{ runner.temp }}/rainsync-owner-validation/runtime/**/backend-binding.json
           if-no-files-found: warn

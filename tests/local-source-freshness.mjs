@@ -56,6 +56,7 @@ const coordinator = await Promise.all(
   [
     "tests/local-source-freshness.mjs",
     "tests/fixtures/server.mjs",
+    "tests/fixtures/owned-probe-input.mjs",
     "tests/fixtures/media-stack.mjs",
     "tests/fixtures/postgres.mjs",
     "deploy/owned-process.mjs",
@@ -394,7 +395,8 @@ try {
     worker = null;
 
     // The shim runs the real ffprobe to completion, then waits for the test's
-    // release file. It changes no production code and never fabricates metadata.
+    // release file. Match the original Server-owned descriptor used on Linux,
+    // not merely its pathname. No metadata or production behavior is fabricated.
     const bin = resolve(f.root, "probe-bin"),
       gate = resolve(f.root, "probe-gate");
     await mkdir(bin);
@@ -404,7 +406,7 @@ try {
     }).trim();
     await writeFile(
       resolve(bin, "ffprobe"),
-      `#!/usr/bin/env node\nimport {spawnSync} from 'node:child_process';\nimport {existsSync,writeFileSync,unlinkSync} from 'node:fs';\nimport {join} from 'node:path';\nconst gate=${JSON.stringify(gate)}, target=${JSON.stringify(target)}, args=process.argv.slice(2);\nconst result=spawnSync(${JSON.stringify(realProbe)},args,{encoding:'buffer'});\nif(args.at(-1)===target && existsSync(join(gate,'arm'))){\n unlinkSync(join(gate,'arm')); writeFileSync(join(gate,'reached'),'real probe complete');\n while(!existsSync(join(gate,'release'))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);\n}\nif(result.stdout)process.stdout.write(result.stdout); if(result.stderr)process.stderr.write(result.stderr); process.exit(result.status??1);\n`,
+      `#!/usr/bin/env node\nimport {spawnSync} from 'node:child_process';\nimport {existsSync,writeFileSync,unlinkSync} from 'node:fs';\nimport {join} from 'node:path';\nimport {isOwnedProbeInput} from ${JSON.stringify(new URL("./fixtures/owned-probe-input.mjs", import.meta.url).href)};\nconst gate=${JSON.stringify(gate)}, target=${JSON.stringify(target)}, args=process.argv.slice(2);\nconst result=spawnSync(${JSON.stringify(realProbe)},args,{encoding:'buffer'});\nif(isOwnedProbeInput(args.at(-1),target) && existsSync(join(gate,'arm'))){\n unlinkSync(join(gate,'arm')); writeFileSync(join(gate,'reached'),'real probe complete');\n while(!existsSync(join(gate,'release'))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);\n}\nif(result.stdout)process.stdout.write(result.stdout); if(result.stderr)process.stderr.write(result.stderr); process.exit(result.status??1);\n`,
       { mode: 0o755 },
     );
     // An executable extensionless script is CommonJS to Node; use .mjs through

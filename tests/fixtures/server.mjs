@@ -2,7 +2,7 @@ import { unusedPort } from "./unused-port.mjs";
 import { reapOwnedChildren } from "../../deploy/owned-process.mjs";
 import { spawn, execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import {
   isolatedPostgres,
   verifyClosedPort,
@@ -13,6 +13,31 @@ import { resolve } from "node:path";
 import assert from "node:assert/strict";
 
 export const delay = (ms) => new Promise((done) => setTimeout(done, ms));
+
+// Opt-in evidence never replaces the original failure with a successful cleanup
+// receipt. Error objects stay local; only fixed categories enter the JSON report.
+export async function finishOwnedFixture({ primaryError, primaryFailed = primaryError !== undefined, cleanup, verifyStopped, save }) {
+  const errors = [], failures = [];
+  let receipt;
+  try { await cleanup(); }
+  catch (error) { errors.push(error); failures.push("cleanup_failed"); }
+  try { receipt = await verifyStopped(); }
+  catch (error) { errors.push(error); failures.push("cleanup_verification_failed"); }
+  const report = {
+    result: primaryFailed || errors.length ? "failed" : "passed",
+    test_outcome: primaryFailed ? "failed" : "passed",
+    cleanup_outcome: errors.length ? "failed" : "verified",
+    failures: [...(primaryFailed ? ["fixture_failed"] : []), ...failures],
+    cleanup: receipt ?? { completed: false },
+  };
+  try { await save(report); }
+  catch (error) { errors.push(error); }
+  if (errors.length)
+    throw new AggregateError([...(primaryFailed ? [primaryError] : []), ...errors],
+      "owned_fixture_cleanup_or_evidence_failed");
+  if (primaryFailed) throw primaryError;
+  return report;
+}
 
 
 export class Client {
@@ -254,6 +279,7 @@ export async function isolatedServer(name, run, options = {}) {
       throw new Error(`Fixture Server startup timed out; inspect ${root}`);
     },
   };
+  let primaryError, primaryFailed = false;
   try {
     options.signal?.throwIfAborted();
     await database.start();
@@ -277,18 +303,39 @@ export async function isolatedServer(name, run, options = {}) {
     await fixture.startServer({}, options.binary);
     options.signal?.throwIfAborted();
     await run(fixture);
+  } catch (error) {
+    primaryError = error;
+    primaryFailed = true;
   } finally {
-    let childCleanupError;
-    try {
-      await reapOwnedChildren(
-        [...children].map((child) => ({ child, closed: child.fixtureClosed })),
-      );
-    } catch (error) {
-      childCleanupError = error;
+    const reap = () => reapOwnedChildren(
+      [...children].map((child) => ({ child, closed: child.fixtureClosed })),
+    );
+    if (process.env.RAINSYNC_FIXTURE_CLEANUP_REPORT === "1") {
+      await finishOwnedFixture({
+        primaryError, primaryFailed,
+        cleanup: async () => {
+          const errors = [];
+          // Continue all owned cleanup phases even when an earlier phase fails.
+          for (const step of [reap, () => database.stop(),
+            ...streams.map((stream) => () => new Promise((done) => stream.end(done)))]) {
+            try { await step(); } catch (error) { errors.push(error); }
+          }
+          cleanupCompleted = errors.length === 0;
+          if (errors.length) throw new AggregateError(errors, "owned_fixture_cleanup_failed");
+        },
+        verifyStopped: () => fixture.verifyStopped(),
+        save: (report) => writeFile(resolve(root, "fixture-cleanup.json"),
+          JSON.stringify({ schema_version: 1, fixture_id: id, name,
+            finished_at: new Date().toISOString(), ...report }, null, 2) + "\n"),
+      });
+    } else {
+      let childCleanupError;
+      try { await reap(); } catch (error) { childCleanupError = error; }
+      await database.stop();
+      for (const stream of streams) await new Promise((done) => stream.end(done));
+      cleanupCompleted = true;
+      if (childCleanupError) throw childCleanupError;
     }
-    await database.stop();
-    for (const stream of streams) await new Promise((done) => stream.end(done));
-    cleanupCompleted = true;
-    if (childCleanupError) throw childCleanupError;
   }
+  if (primaryFailed) throw primaryError;
 }

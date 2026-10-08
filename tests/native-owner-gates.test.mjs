@@ -155,9 +155,9 @@ test("CI keeps owner/cleanup gates mandatory and retains only safe summaries", a
   for (const name of ["RAINSYNC_ARTIFACT_DIR", "RAINSYNC_RUNTIME_ROOT", "CARGO_TARGET_DIR"])
     assert.ok(ownerJob.includes(`echo "${name}=$RUNNER_TEMP/`),
       "Runner-local output paths must be assigned by a step through GITHUB_ENV");
-  for (const command of ["--owner-fixtures", "test:native-delivery-owner", "test:room-cleanup-native", "test:owner-gate-contracts"])
+  for (const command of ["--owner-fixtures", "test:native-delivery-owner", "test:room-cleanup-native", "test:room-command-transactions", "test:owner-gate-contracts"])
     assert.ok(ownerJob.includes(command), command);
-  for (const gate of ["test:native-delivery-owner", "test:room-cleanup-native"]) {
+  for (const gate of ["test:native-delivery-owner", "test:room-cleanup-native", "test:room-command-transactions"]) {
     const step = ownerJob.split(/(?=      - name:)/).find((text) => text.includes(`npm run ${gate}`));
     assert.match(step, /if: \$\{\{ !cancelled\(\) && steps\.binding\.outcome == 'success' \}\}/,
       "Independent gates must run after another gate fails, but never with an unbound backend");

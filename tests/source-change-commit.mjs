@@ -12,6 +12,11 @@ import {
   testLoginHash,
 } from "./fixtures/playback-admission.mjs";
 import { safeFailure } from "./fixtures/safe-failure.mjs";
+import {
+  changedStateSections,
+  createSourceChangeDiagnostics,
+  sourceChangeDeadline,
+} from "./fixtures/source-change-diagnostics.mjs";
 import { loadOwnerBinding } from "../scripts/native-owner-binding.mjs";
 import { withTerminationSignal } from "../deploy/owned-process.mjs";
 
@@ -73,6 +78,7 @@ const coordinator = await Promise.all(
     "tests/fixtures/unused-port.mjs",
     "tests/fixtures/playback-admission.mjs",
     "tests/fixtures/safe-failure.mjs",
+    "tests/fixtures/source-change-diagnostics.mjs",
     "deploy/owned-process.mjs",
   ].map(async (path) => ({
     path,
@@ -118,23 +124,34 @@ const save = () =>
     JSON.stringify(report, null, 2) + "\n",
   );
 let fixture, runSignal;
+const diagnostics = createSourceChangeDiagnostics();
+const retainFailure = (error) => {
+  report.failure ??= diagnostics.failure(error);
+};
 async function scenario(name, work) {
   runSignal.throwIfAborted();
   report.active_case = name;
+  diagnostics.at("case_setup");
   await save();
-  const evidence = await work();
+  let evidence;
+  try {
+    evidence = await work();
+  } catch (error) {
+    retainFailure(error);
+    throw error;
+  }
   runSignal.throwIfAborted();
   report.checks.push({ name, result: "passed", ...evidence });
   console.log(`PASS ${name}`);
   await save();
 }
-async function bounded(work, name, ms = 12000) {
+async function bounded(work, ms = 12000) {
   let timer;
   try {
     return await Promise.race([
       work,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(Error(`Deadline: ${name}`)), ms);
+        timer = setTimeout(() => reject(sourceChangeDeadline()), ms);
       }),
     ]);
   } finally {
@@ -142,6 +159,7 @@ async function bounded(work, name, ms = 12000) {
   }
 }
 async function hold(f, sql) {
+  diagnostics.at("sql_blocker_start");
   const marker = `source_change_${randomUUID().replaceAll("-", "")}`;
   const child = f.sqlProcess(undefined, { interactive: true });
   let output = "";
@@ -160,8 +178,9 @@ async function hold(f, sql) {
     `BEGIN; SET LOCAL statement_timeout='12s'; SET LOCAL idle_in_transaction_session_timeout='15s'; ${sql};\n\\echo ${marker}\n`,
   );
   try {
-    await bounded(ready, "SQL blocker admission");
+    await bounded(ready);
   } catch (error) {
+    retainFailure(error);
     child.stdin.end("ROLLBACK;\n\\q\n");
     throw error;
   }
@@ -169,25 +188,38 @@ async function hold(f, sql) {
   return async () => {
     if (released) return;
     released = true;
+    diagnostics.at("sql_blocker_release");
     child.stdin.end("COMMIT;\n\\q\n");
-    await bounded(child.done, "SQL blocker release");
+    await bounded(child.done);
   };
 }
-const waitBlocked = (f, prefix) =>
-  f.waitForSql(
+const waitBlocked = (f, prefix) => {
+  diagnostics.at("sql_lock_wait");
+  return f.waitForSql(
     `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE ${quote(`${prefix}%`)})`,
     "t",
     7000,
   );
+};
 async function response(work, expected) {
-  const result = await bounded(work, "source HTTP response");
-  const value = await result.json();
-  assert.equal(result.status, expected, `expected HTTP ${expected}`);
-  assert.doesNotMatch(
-    JSON.stringify(value),
-    /fixture_sql_failure|fixture-secret|never-echo/,
-  );
-  return value;
+  diagnostics.at("http_wait", { expected_status: expected });
+  try {
+    const result = await bounded(work);
+    const status = { expected_status: expected, actual_status: result.status };
+    diagnostics.at("http_body", status);
+    const value = await result.json();
+    diagnostics.at("http_status", status);
+    assert.equal(result.status, expected, `expected HTTP ${expected}`);
+    diagnostics.at("http_redaction", status);
+    assert.doesNotMatch(
+      JSON.stringify(value),
+      /fixture_sql_failure|fixture-secret|never-echo/,
+    );
+    return value;
+  } catch (error) {
+    retainFailure(error);
+    throw error;
+  }
 }
 
 try {
@@ -207,6 +239,7 @@ try {
             ? "SELECT kind,config_encrypted,access_policy_revision FROM sources"
             : "SELECT * FROM sources WHERE id=";
         async function target(label, playback = false) {
+          diagnostics.at("target_setup");
           const source = await admin.request("/sources", "POST", {
             name: label,
             kind: "http",
@@ -251,6 +284,21 @@ try {
       'scan',(SELECT to_jsonb(scan) FROM source_scans scan WHERE scan.source_id=s.id),
       'media',(SELECT to_jsonb(m) FROM media_items m WHERE m.id=${quote(value.media)})
     )::text,'UTF8')),'hex') FROM sources s WHERE s.id=${quote(value.id)}`);
+        // Additional diagnostic observations only. The original whole-state
+        // equality assertion below remains unchanged. Fingerprints stay local;
+        // a failure report contains only the names of changed fixed sections.
+        const stateSections = (value) =>
+          JSON.parse(
+            f.sql(`WITH observed AS (
+          SELECT jsonb_build_object(
+            'source',to_jsonb(s),
+            'snapshot',(SELECT to_jsonb(p) FROM source_access_policy_snapshots p WHERE p.source_id=s.id),
+            'scan',(SELECT to_jsonb(scan) FROM source_scans scan WHERE scan.source_id=s.id),
+            'media',(SELECT to_jsonb(m) FROM media_items m WHERE m.id=${quote(value.media)})
+          ) AS value FROM sources s WHERE s.id=${quote(value.id)}
+        ) SELECT jsonb_object_agg(part.key,encode(sha256(convert_to(part.value::text,'UTF8')),'hex'))
+          FROM observed,LATERAL jsonb_each(observed.value) part`),
+          );
         const mutate = (kind, value) =>
           kind === "policy"
             ? admin.raw(`/sources/${value.id}/access-policy`, {
@@ -307,7 +355,10 @@ try {
           const value = await target(
             `${kind} ${deferred ? "commit" : "precommit"} failure`,
           );
-          const before = state(value);
+          diagnostics.at("state_before");
+          const before = state(value),
+            beforeSections = stateSections(value);
+          diagnostics.at("fault_install");
           f.sql(`CREATE FUNCTION source_change_fixture_fail() RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN IF NEW.id=${quote(value.id)}::uuid THEN RAISE EXCEPTION 'fixture_sql_failure'; END IF; RETURN NEW; END $$;
         ${
@@ -316,18 +367,40 @@ try {
             : "CREATE TRIGGER source_change_fixture_fault BEFORE UPDATE ON sources"
         }
         FOR EACH ROW EXECUTE FUNCTION source_change_fixture_fail()`);
+          let primaryError,
+            primaryFailed = false;
           try {
             await response(mutate(kind, value), 500);
+            diagnostics.at("state_after");
+            const after = state(value),
+              afterSections = stateSections(value);
+            diagnostics.at("state_compare", {
+              changed_sections: changedStateSections(
+                beforeSections,
+                afterSections,
+              ),
+            });
             assert.equal(
-              state(value),
+              after,
               before,
               "unconfirmed/rejected transaction cannot produce a success receipt",
             );
+          } catch (error) {
+            primaryFailed = true;
+            primaryError = error;
+            retainFailure(error);
           } finally {
-            f.sql(
-              "DROP TRIGGER source_change_fixture_fault ON sources; DROP FUNCTION source_change_fixture_fail()",
-            );
+            diagnostics.at("fault_remove");
+            try {
+              f.sql(
+                "DROP TRIGGER source_change_fixture_fault ON sources; DROP FUNCTION source_change_fixture_fail()",
+              );
+            } catch (error) {
+              report.fault_cleanup_failure = diagnostics.failure(error);
+              if (!primaryFailed) throw error;
+            }
           }
+          if (primaryFailed) throw primaryError;
           return { committed: false, http_status: 500 };
         }
 
@@ -599,6 +672,7 @@ try {
             };
           },
         );
+        diagnostics.at("binding_verify");
         await verifyBinding();
       },
       {
@@ -615,21 +689,26 @@ try {
   delete report.active_case;
 } catch (error) {
   report.result = "failed";
+  retainFailure(error);
   report.error = safeFailure(error);
   process.exitCode = 1;
 } finally {
   if (fixture) {
+    diagnostics.at("fixture_cleanup");
     try {
       report.cleanup = await fixture.verifyStopped();
     } catch (error) {
+      report.cleanup_failure = diagnostics.failure(error);
       report.cleanup_error = safeFailure(error);
       report.result = "failed";
       process.exitCode = 1;
     }
   }
   try {
+    diagnostics.at("binding_verify");
     await verifyBinding();
   } catch (error) {
+    report.binding_failure = diagnostics.failure(error);
     report.binding_error = safeFailure(error);
     report.result = "failed";
     process.exitCode = 1;
