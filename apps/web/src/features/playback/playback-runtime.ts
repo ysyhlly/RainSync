@@ -1,5 +1,5 @@
 import { evaluatePlaybackRecovery } from "./playback-recovery-state";
-import { createPlaybackMaintenance } from "./playback-maintenance";
+import { createPlaybackSessionController, checkCandidateLifetime } from "./playback-session-controller";
 export type { PlaybackRecoveryState } from "./playback-runtime-types";
 import { createLiveWindowRecovery } from "./live-window-recovery";
 import { discoverPlaybackCandidates } from "./playback-candidate-discovery";
@@ -37,21 +37,16 @@ import {
 } from "../../../../../packages/player-core/dash";
 import {
   nativePlatformRequest,
-  validNativePlatformPlan,
   validNativeCompatibilityDeliveryUrl,
   nativePlatformPlaybackChoice,
   type NativePlatformPlaybackMode,
 } from "./native-platform-intent";
 import {
   advancedPlaybackRequest,
-  matchesAdvancedPlaybackPlan,
-  sameAdvancedPlaybackRequest,
   needsDolbyVisionToneMap,
 } from "./advanced-playback-intent";
 import {
   localHlsLadderRequest,
-  matchesLocalHlsLadderPlan,
-  sameLocalHlsLadderRequest,
   bindLocalHlsLevels,
   hasHlsLadder,
 } from "./local-hls-ladder-intent";
@@ -60,7 +55,6 @@ import { createP2PFragmentLoader } from "./room-p2p-loader";
 import {
   validDistributedIntent,
   sameDistributedIntent,
-  matchesDistributedPlaybackPlan,
 } from "./distributed-playback-intent";
 import { createPlatformTextRuntime } from "./platform-text-runtime";
 import {
@@ -75,18 +69,14 @@ import {
 } from "../rooms/platform-import";
 import {
   detectCapabilities,
-  PlaybackPlanGenerations,
-  matchesPlanGeneration,
   PlaybackRateSupport,
   availablePlaybackRanges,
   containsPlaybackPosition,
-  hasUsablePlaybackTimeline,
 } from "../../../../../packages/player-core";
 import { Corrector, target } from "../../../../../packages/sync-engine";
 import type {
   PlaybackPlan,
   PlaybackRequest,
-  PlaybackReadiness,
   PlaybackMetricsReceipt,
   NativePlatformMaxHeight,
   NativePlatformQualityOption,
@@ -104,8 +94,6 @@ import { StaleIdentity } from "../../shared/api/client";
 import { actionErrorMessage } from "../../shared/action-error";
 import {
   PlaybackCancelled,
-  PlaybackViewerOriginRequired,
-  PlaybackRequests,
   waitPlaybackReady,
 } from "../../playback-request";
 import { bindPlaybackObservations } from "./observation-binding";
@@ -140,9 +128,7 @@ import {
   type StaticHlsAvailability,
 } from "./static-hls-availability";
 
-const CANDIDATE_LIFETIME_MS = 5 * 60 * 1000;
 const candidateError = "播放候选无法安全使用，请重新加载播放";
-const candidateExpiredError = "播放候选已失效，请重新加载播放";
 
 export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   const { identity: viewer, api, timeline, commands = {} } = ctx;
@@ -242,7 +228,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         ])
       : undefined;
   const liveRecovery = createLiveWindowRecovery({
-    intent: () => activeIntent,
+    intent: () => readIntent(),
     terminalEnd: () => terminalEnd,
     scope: liveWindowScope,
     currentPlan: (p) => currentPlan(p),
@@ -364,7 +350,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     ladderLevelMap = undefined;
   }
   function selectLadderQuality(value: string) {
-    const p = plan;
+    const currentIntent = readIntent();
+    const p = readPlan();
     if (
       !p ||
       !hasHlsLadder(p) ||
@@ -372,8 +359,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       !hls ||
       !ladderManual.value ||
       !ladderLevelMap ||
-      !activeIntent ||
-      !candidateIntentCurrent(activeIntent)
+      !currentIntent ||
+      !candidateIntentCurrent(currentIntent)
     )
       return;
     const level = value === "auto" ? -1 : ladderLevelMap.get(value);
@@ -414,7 +401,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     confirm_current_network: boolean;
     upload_allowed: boolean;
   }) {
-    const p = plan;
+    const p = readPlan();
     if (
       !p ||
       !currentPlan(p) ||
@@ -459,8 +446,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     await beginLoad("user_intent");
   }
   const duration = ref(0),
-    position = ref(0),
-    sessionId = ref<string | null>(null);
+    position = ref(0);
   const recoveryState = ref<PlaybackRecoveryState>("idle");
   const preparation = ref<PlaybackPreparationState>({ phase: "idle" });
   const loadingStage = ref<PlaybackLoadingStage>("idle");
@@ -489,7 +475,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     loadingStage.value = "failed";
   }
   function failNativeCompatibility(p: PlaybackPlan, message: string) {
-    if (plan !== p || !p.native_platform?.compatibility) return;
+    if (readPlan() !== p || !p.native_platform?.compatibility) return;
     failedCompatibilityPlan = p;
     clearTimeout(nativeRefresh);
     nativeRefresh = undefined;
@@ -526,7 +512,6 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     confirmedBaseRate: number | undefined,
     rejectedBaseRate: number | undefined;
   let hls: Hls | undefined,
-    plan: PlaybackPlan | undefined,
     loadSerial = 0,
     clockAction: "load" | "apply" | undefined;
   let recoveringHls = false,
@@ -619,31 +604,51 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     pendingUserSeek ||= userSeek;
     clockAction ??= "apply";
   }
-  let planGenerations = new PlaybackPlanGenerations();
-  const currentPlan = (p: PlaybackPlan) =>
-    plan === p &&
-    planGenerations.current(p) &&
-    (!p.native_platform?.live ||
-      (!!state.value && liveRoomMatchesPlan(state.value, p)));
-  let playbackRequests: PlaybackRequests | undefined;
-  let playbackUser: string | undefined;
-  let playbackEpoch: number | undefined;
   let observations: ReturnType<typeof bindPlaybackObservations> | undefined;
   let staticChildState: StaticChildState | undefined;
   let staticBinding: StaticHlsPlanBinding | undefined;
-  let activeIntent: PlaybackIntent | undefined;
+  const sessionController = createPlaybackSessionController({
+    identity: viewer,
+    api,
+    timeline: { state, active: timeline.active },
+    storage: () => sessionStorage,
+    origin: () => location.origin,
+    intentCurrent: (intent) => candidateIntentCurrent(intent),
+    retryStaticChild: (binding) => staticChildState?.retry(binding),
+    prepared: (value) => {
+      preparation.value = applyPreparationSnapshot(preparation.value, {
+        generation: value.plan_generation!, sessionId: value.session_id,
+        deliveryMode: value.delivery_mode, phase: "preparing",
+      });
+    },
+    readiness: (value) => {
+      const snapshot = preparationReadinessSnapshot(value, preparation.value.deliveryMode);
+      if (snapshot) preparation.value = applyPreparationSnapshot(preparation.value, snapshot);
+    },
+  });
+  const {
+    plan: readPlan,
+    intent: readIntent,
+    sessionId,
+    currentPlan,
+    allocateIdempotencyKey,
+    nextPlan,
+    readReadiness,
+    stop: stopSessionRequests,
+  } = sessionController;
   let activeObservation: PlaybackObservationScope | undefined;
   function observationFor(intent: PlaybackIntent) {
-    return activeIntent === intent && activeObservation?.owner === intent.owner
+    return readIntent() === intent && activeObservation?.owner === intent.owner
       ? activeObservation
       : undefined;
   }
   function observationCurrent(scope: PlaybackObservationScope) {
+    const currentIntent = readIntent();
     return (
       activeObservation === scope &&
-      !!activeIntent &&
-      activeIntent.owner === scope.owner &&
-      intentCurrent(activeIntent)
+      !!currentIntent &&
+      currentIntent.owner === scope.owner &&
+      intentCurrent(currentIntent)
     );
   }
   function advanceIntentObservation(intent: PlaybackIntent) {
@@ -653,7 +658,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   let pendingLoad:
     | {
         playbackIntent: PlaybackIntent;
-        planIntent: ReturnType<PlaybackPlanGenerations["next"]>;
+        planIntent: ReturnType<typeof sessionController.nextPlan>;
         failed: string[];
         preparing: boolean;
         continuation?: PlaybackContinuation;
@@ -693,12 +698,13 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   const foreground = () =>
     typeof document === "undefined" || document.visibilityState !== "hidden";
   function refreshRecovery() {
+    const currentSession = readPlan(), currentIntent = readIntent();
     const ownTimeout =
       preparation.value.failure?.code === "PLAYBACK_RECOVERY_TIMEOUT";
     const next = evaluatePlaybackRecovery({
       state: state.value,
       element: video.value,
-      plan,
+      plan: currentSession,
       rates,
       active: roomIsActive(),
       foreground: foreground(),
@@ -710,10 +716,10 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       blocked: blocked.value,
       waiting: waiting.value,
       ownsPlan:
-        !!plan &&
-        currentPlan(plan) &&
-        !!activeIntent &&
-        intentCurrent(activeIntent),
+        !!currentSession &&
+        currentPlan(currentSession) &&
+        !!currentIntent &&
+        intentCurrent(currentIntent),
       ownsLoad: !!pendingLoad && intentCurrent(pendingLoad.playbackIntent),
       pending: recoveryPending || ownTimeout,
       previous: recoveryState.value,
@@ -763,7 +769,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   // a rate. Ordinary drift does not reopen an already completed recovery.
   const updateRecovery = () => bestEffort(refreshRecovery);
   const intentCurrent = (m: PlaybackIntent) =>
-    activeIntent === m &&
+    readIntent() === m &&
     roomIsActive() &&
     viewer.current().userId === m.user &&
     viewer.current().epoch === m.epoch &&
@@ -795,20 +801,6 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     m.candidateDiscovery = undefined;
     m.concreteCandidates = undefined;
   }
-  function checkCandidateLifetime(snapshot: CandidateDiscovery) {
-    const startedAt =
-      snapshot.upstream?.startedAt ?? snapshot.concrete?.startedAt;
-    if (startedAt === undefined) return;
-    const elapsed = performance.now() - startedAt;
-    // This conservative local limit never authorizes a binding. The server's
-    // original authority-clock expiry and current fences still decide prepare.
-    if (
-      !Number.isFinite(elapsed) ||
-      elapsed < 0 ||
-      elapsed >= CANDIDATE_LIFETIME_MS
-    )
-      throw new Error(candidateExpiredError);
-  }
   const metricState = () => ({
     foreground: foreground(),
     expectedPlaying: state.value?.playback_status === "playing",
@@ -826,10 +818,10 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     staticChildState?.close();
     staticChildState = undefined;
     staticBinding = undefined;
-    const m = activeIntent;
+    const m = readIntent();
     metricRuntime.offerFinalScope();
     if (m) invalidateCandidates(m);
-    activeIntent = undefined;
+    sessionController.clearIntent();
     activeObservation = undefined;
     startupDiagnostics.value = undefined;
     loadingStage.value = "idle";
@@ -850,7 +842,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       state.value?.playback_status,
     ],
     () => {
-      if (activeIntent && !intentCurrent(activeIntent)) finishIntent();
+      const intent = readIntent();
+      if (intent && !intentCurrent(intent)) finishIntent();
       else observeMetrics();
     },
     { flush: "sync" },
@@ -866,7 +859,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       nativePlaybackMode.value,
     ],
     () => {
-      if (activeIntent) invalidateCandidates(activeIntent);
+      const intent = readIntent();
+      if (intent) invalidateCandidates(intent);
     },
     { flush: "sync" },
   );
@@ -891,7 +885,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     p: PlaybackPlan,
     code = "NATIVE_LIVE_NOT_BROADCASTING",
   ) {
-    if (plan !== p || !p.native_platform?.live) return;
+    if (readPlan() !== p || !p.native_platform?.live) return;
     terminalEnd = true;
     liveRecovery.retire();
     clearTimeout(nativeRefresh);
@@ -909,11 +903,11 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     if (preparation.value.failure) preparation.value.failure.retryable = false;
   }
   async function completed() {
-    const p = plan,
+    const p = readPlan(),
       el = video.value,
       s = state.value;
     if (p?.native_platform?.live) {
-      if (el?.ended && plan === p) failNativeLive(p);
+      if (el?.ended && readPlan() === p) failNativeLive(p);
       return;
     }
     if (
@@ -969,216 +963,6 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       checkingEnd = false;
     }
   }
-  function requests() {
-    const user = viewer.current().userId!;
-    const epoch = viewer.current().epoch;
-    if (!playbackRequests || playbackUser !== user || playbackEpoch !== epoch) {
-      playbackUser = user;
-      playbackEpoch = epoch;
-      playbackRequests = new PlaybackRequests(
-        (body, signal) => {
-          if (viewer.current().epoch !== epoch) throw new StaleIdentity();
-          const provider = activeIntent?.nativeProvider;
-          if (Object.hasOwn(body, "static_hls_fallback")) {
-            const playbackIntent = activeIntent;
-            // Lost-response replay keeps the frozen child after parent detach,
-            // but a replacement source, input, Stop or logout closes its fence.
-            if (!playbackIntent || !candidateIntentCurrent(playbackIntent))
-              throw new PlaybackCancelled();
-            const replay = staticChildState?.retry({
-              room_id: body.room_id,
-              media_id: playbackIntent.mediaId,
-              media_generation: body.media_generation,
-              viewer_id: body.viewer_id ?? "",
-              plan_generation: body.plan_generation ?? 0,
-            });
-            if (!replay || JSON.stringify(body) !== replay.body)
-              throw new PlaybackCancelled();
-          }
-          if (body.upstream_profile_report) {
-            const snapshot = activeIntent?.concreteCandidates;
-            if (
-              !snapshot?.upstream ||
-              !candidateIntentCurrent(activeIntent!) ||
-              snapshot.upstream.report.binding !==
-                body.upstream_profile_report.binding
-            )
-              throw new PlaybackCancelled();
-            checkCandidateLifetime(snapshot);
-          }
-          if (body.local_hls_ladder) {
-            const playbackIntent = activeIntent,
-              snapshot = playbackIntent?.concreteCandidates;
-            if (
-              !playbackIntent ||
-              !candidateIntentCurrent(playbackIntent) ||
-              !snapshot?.concrete ||
-              !sameLocalHlsLadderRequest(
-                playbackIntent.ladder,
-                body.local_hls_ladder,
-              ) ||
-              snapshot.report?.binding !== body.candidate_report?.binding
-            )
-              throw new PlaybackCancelled();
-            checkCandidateLifetime(snapshot);
-          }
-          if (body.advanced_playback) {
-            const playbackIntent = activeIntent;
-            const snapshot = playbackIntent?.concreteCandidates;
-            if (
-              !playbackIntent ||
-              !candidateIntentCurrent(playbackIntent) ||
-              !snapshot?.concrete ||
-              !sameAdvancedPlaybackRequest(
-                playbackIntent.advanced,
-                body.advanced_playback,
-              ) ||
-              snapshot.report?.binding !== body.candidate_report?.binding
-            )
-              throw new PlaybackCancelled();
-            checkCandidateLifetime(snapshot);
-          }
-          return api<PlaybackPlan>(
-              body.distributed_compute
-                ? "/playback-sessions/distributed-compute"
-                : body.native_platform
-                  ? body.native_platform.compatibility
-                    ? "/playback-sessions/native-platform-compatibility"
-                    : "/playback-sessions/native-platform"
-                  : body.local_hls_ladder
-                    ? "/playback-sessions/local-hls-ladder"
-                    : body.advanced_playback
-                      ? "/playback-sessions/advanced-local"
-                      : body.upstream_profile_report
-                        ? "/playback-sessions/upstream-profile"
-                        : body.http_file_fallback
-                          ? "/playback-sessions/http-file-continuation"
-                          : "/playback-sessions",
-              "POST",
-              body.upstream_profile_report ? structuredClone(body) : body,
-              signal,
-            )
-            .then((result) => {
-              // Check before readiness arithmetic, subtitle binding, seeking or
-              // observations can consume an unproven/nonfinite scalar origin.
-              if (
-                body.native_platform
-                  ? !provider ||
-                    !validNativePlatformPlan(
-                      body,
-                      result,
-                      location.origin,
-                      provider,
-                      state.value?.live?.broadcast_id,
-                      activeIntent?.nativeCourse === true,
-                    )
-                  : !!result.native_platform ||
-                    result.transport === "dash" ||
-                    !hasUsablePlaybackTimeline(result)
-              )
-                throw new RequestFailure({
-                  error: { code: "UNSUPPORTED_TIMELINE" },
-                });
-              if (!matchesDistributedPlaybackPlan(body, result))
-                throw new RequestFailure({
-                  error: { code: "STALE_CAPABILITY_REPORT" },
-                });
-              if (
-                !matchesLocalHlsLadderPlan(
-                  body.local_hls_ladder,
-                  result,
-                  location.origin,
-                  activeIntent?.concreteCandidates?.concrete?.candidates
-                    .local_hls_ladder,
-                )
-              )
-                throw new RequestFailure({
-                  error: { code: "STALE_CAPABILITY_REPORT" },
-                });
-              if (!matchesAdvancedPlaybackPlan(body.advanced_playback, result))
-                throw new RequestFailure({
-                  error: { code: "STALE_CAPABILITY_REPORT" },
-                });
-              if (
-                !signal.aborted &&
-                roomIsActive() &&
-                matchesPlanGeneration(
-                  body.plan_generation,
-                  result.plan_generation,
-                ) &&
-                result.plan_generation !== undefined
-              )
-                preparation.value = applyPreparationSnapshot(
-                  preparation.value,
-                  {
-                    generation: result.plan_generation,
-                    sessionId: result.session_id,
-                    deliveryMode: result.delivery_mode,
-                    phase: "preparing",
-                  },
-                );
-              return result;
-            });
-        },
-        (key, signal) => {
-          if (viewer.current().epoch !== epoch) throw new StaleIdentity();
-          return api(
-            "/playback-requests/" + key,
-            "DELETE",
-            undefined,
-            signal,
-          );
-        },
-        sessionStorage,
-        `rainsync:playback:${user}`,
-        readReadiness,
-        () => (state.value?.playback_status === "playing" ? 4000 : 0),
-      );
-    }
-    return playbackRequests;
-  }
-  async function readReadiness(
-    id: string,
-    signal: AbortSignal,
-    relativePosition = 0,
-    planGeneration?: number,
-    currentRelativePosition?: () => number,
-  ): Promise<PlaybackReadiness> {
-    let readiness = await api<PlaybackReadiness>(
-      `/playback-sessions/${id}?relative_position_ms=${encodeURIComponent(relativePosition)}${planGeneration === undefined ? "" : `&plan_generation=${planGeneration}`}`,
-      "GET",
-      undefined,
-      signal,
-    );
-    if (
-      readiness.session_id !== id ||
-      !matchesPlanGeneration(planGeneration, readiness.plan_generation)
-    )
-      throw new RequestFailure({ error: { code: "STALE_PLAYBACK_PLAN" } });
-    // A running EVENT prefix needs one whole segment ahead of the room clock.
-    // Network time can consume that lead. Recheck the current target after the
-    // response, not only the position sent in the request. Complete/legacy
-    // responses and a paused room still need no forward lead.
-    if (
-      state.value?.playback_status === "playing" &&
-      readiness.status === "ready" &&
-      readiness.complete === false &&
-      readiness.available_until_ms != null &&
-      Number.isFinite(readiness.available_until_ms) &&
-      readiness.available_until_ms -
-        (currentRelativePosition?.() ?? relativePosition) <
-        4_000
-    ) {
-      readiness = { ...readiness, status: "preparing" };
-    }
-    const snapshot = preparationReadinessSnapshot(
-      readiness,
-      preparation.value.deliveryMode,
-    );
-    if (!signal.aborted && roomIsActive() && snapshot)
-      preparation.value = applyPreparationSnapshot(preparation.value, snapshot);
-    return readiness;
-  }
   function detachPlayback(
     preserveCandidates?: PlaybackIntent,
     child?: PlaybackContinuation["staticChild"],
@@ -1220,10 +1004,9 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     generationWaitFailed = false;
     generatedEnd = undefined;
     recoveringHls = false;
-    const old = plan;
-    plan = undefined;
+    const detachedSession = sessionController.retirePlan();
+    const old = detachedSession?.plan;
     playbackSummary.value = undefined;
-    sessionId.value = null;
     if (video.value) {
       video.value.onerror = null;
       video.value.onended = null;
@@ -1257,15 +1040,10 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     }
     // Capture and cancel this operation before the first asynchronous wait.
     // A late session DELETE must never call stop() on a newer preparation.
-    const previous = playbackRequests;
+    const previous = sessionController.captureRequests();
     const deletePrevious = async () => {
-      if (old)
-        await api(
-            `/playback-sessions/${old.session_id}`,
-            "DELETE",
-            finalObservation,
-            AbortSignal.timeout(5000),
-          )
+      if (detachedSession)
+        await detachedSession.stop(finalObservation)
           .catch((failure) => {
             if (!(failure instanceof StaleIdentity))
               console.warn("Playback grant cleanup could not be confirmed");
@@ -1283,7 +1061,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       previous
         ? previous.stop(beforeCleanup)
         : viewer.current().userId
-          ? requests().stop(beforeCleanup)
+          ? stopSessionRequests(beforeCleanup)
           : Promise.resolve()
     ).catch((e) => {
       if (!(e instanceof StaleIdentity)) throw e;
@@ -1327,11 +1105,12 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     nativeRefresh = undefined;
     dash?.destroy();
     dash = undefined;
+    const previousPlan = readPlan();
     if (
-      plan?.native_platform &&
-      (plan.transport === "progressive" ||
-        !!plan.native_platform.live ||
-        !!plan.native_platform.compatibility) &&
+      previousPlan?.native_platform &&
+      (previousPlan.transport === "progressive" ||
+        !!previousPlan.native_platform.live ||
+        !!previousPlan.native_platform.compatibility) &&
       video.value
     ) {
       // Retire the owned MP4 immediately, even if room-clock calibration delays
@@ -1340,7 +1119,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       video.value.onended = null;
       video.value.onloadedmetadata = null;
       video.value.onloadeddata = null;
-      if (plan.native_platform.live || plan.native_platform.compatibility) {
+      if (previousPlan.native_platform.live || previousPlan.native_platform.compatibility) {
         hls?.destroy();
         hls = undefined;
       }
@@ -1352,7 +1131,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     nativeProvider.value = undefined;
     ++loadSerial;
     clearNativeQuality();
-    const intent = planGenerations.next();
+    const intent = nextPlan();
     preparation.value = {
       phase: "preparing",
       generation: intent.plan_generation,
@@ -1389,7 +1168,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     );
     const m: PlaybackIntent = scope.intent;
     const observation = scope.observation;
-    activeIntent = m;
+    sessionController.adoptIntent(m);
     activeObservation = observation;
     rates?.reset();
     confirmedBaseRate = rejectedBaseRate = undefined;
@@ -1411,12 +1190,13 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     await beginLoad("user_intent");
   }
   async function selectNativeQuality(value: string | undefined) {
-    const p = plan;
+    const currentIntent = readIntent();
+    const p = readPlan();
     if (
       !p?.native_platform?.quality ||
       !currentPlan(p) ||
-      !activeIntent ||
-      !candidateIntentCurrent(activeIntent) ||
+      !currentIntent ||
+      !candidateIntentCurrent(currentIntent) ||
       qualityContext !== qualityScope() ||
       (value !== "auto" &&
         !nativeQualityOptions.value.some(
@@ -1434,7 +1214,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     failed: string[] = [],
     continuation?: PlaybackContinuation,
   ) {
-    const m = activeIntent;
+    const m = readIntent();
     if (!m || !candidateIntentCurrent(m)) return;
     if (m.distributed)
       throw new Error("此 NAS 产物解码失败，请使用 HTTP 重新加载或选择原片源");
@@ -1443,7 +1223,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       m.failedCandidates = [...new Set([...m.failedCandidates, ...failed])];
       failed = [...m.failedCandidates];
     }
-    const intent = planGenerations.next();
+    const intent = nextPlan();
     advanceIntentObservation(m);
     await loadAttempt(failed, intent, m, continuation);
   }
@@ -1474,7 +1254,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   }
   async function loadAttempt(
     failedCandidates: string[],
-    intent: ReturnType<PlaybackPlanGenerations["next"]>,
+    intent: ReturnType<typeof sessionController.nextPlan>,
     playbackIntent: PlaybackIntent,
     continuation?: PlaybackContinuation,
   ): Promise<void> {
@@ -1515,7 +1295,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         !video.value ||
         (continuation &&
           !continuation.staticChild &&
-          plan !== continuation.parent)
+          readPlan() !== continuation.parent)
       )
         return;
       recoveryPending = true;
@@ -1724,7 +1504,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       const request: PlaybackRequest = platform
         ? nativePlatformRequest({
             ...intent,
-            idempotency_key: requests().allocateIdempotencyKey(),
+            idempotency_key: allocateIdempotencyKey(),
             room_id: s.room_id,
             media_generation: s.media_generation,
             position_ms: target(state.value ?? s, clock.now()),
@@ -1760,7 +1540,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           ? staticReplay.intent.request
           : {
               ...intent,
-              idempotency_key: requests().allocateIdempotencyKey(),
+              idempotency_key: allocateIdempotencyKey(),
               room_id: s.room_id,
               media_generation: s.media_generation,
               mode: playbackIntent.distributed
@@ -1849,9 +1629,9 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       }
       let p: PlaybackPlan;
       if (continuation?.staticChild) {
-        if (plan !== continuation.parent) throw new PlaybackCancelled();
+        if (readPlan() !== continuation.parent) throw new PlaybackCancelled();
         const detached = detachPlayback(undefined, continuation.staticChild);
-        const preparing = requests().prepareStaticHlsChild(
+        const preparing = sessionController.prepareStaticHlsChild(
           continuation.staticChild.intent,
           detached.deletePrevious,
           currentPosition,
@@ -1864,7 +1644,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         // No await between detaching the old element and handing its cleanup
         // ownership to the request manager. Stop can then cancel the child key
         // immediately while the parent final DELETE is still pending.
-        if (plan !== continuation.parent) throw new PlaybackCancelled();
+        if (readPlan() !== continuation.parent) throw new PlaybackCancelled();
         const detached = detachPlayback();
         request.http_file_fallback = {
           parent_session_id: continuation.parent.session_id,
@@ -1872,7 +1652,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
             ? { final_observation: detached.finalObservation }
             : {}),
         };
-        const preparing = requests().prepareContinuation(
+        const preparing = sessionController.prepareContinuation(
           request,
           detached.deletePrevious,
           currentPosition,
@@ -1880,7 +1660,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         recoveryPending = true;
         updateRecovery();
         p = await preparing;
-      } else p = await requests().prepare(request, currentPosition);
+      } else p = await sessionController.prepare(request, currentPosition);
       if (
         serial !== loadSerial ||
         !candidateIntentCurrent(playbackIntent) ||
@@ -1889,13 +1669,15 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         video.value !== element ||
         state.value?.room_id !== s.room_id ||
         state.value?.media_generation !== s.media_generation ||
-        !planGenerations.current(p)
+        !sessionController.planGenerationCurrent(p)
       ) {
-        await api(`/playback-sessions/${p.session_id}`, "DELETE");
+        await sessionController.captureSessionStop(p, {
+          userId: playbackIntent.user, epoch: playbackIntent.epoch,
+        })();
         return;
       }
       if (platform && p.media_id !== playbackIntent.mediaId) {
-        await requests().stop();
+        await stopSessionRequests();
         throw Error("平台媒体响应身份不一致，请重新加载");
       }
       const grantedAt = performance.now();
@@ -1910,14 +1692,14 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
             discovered.upstream.candidates.profile!.audio_rate_contract
               ?.source_sample_rate)
       ) {
-        await requests().stop();
+        await stopSessionRequests();
         throw new Error(candidateError);
       }
       if (discovered.upstream && !supportsHlsPlayback()) {
-        await requests().stop();
+        await stopSessionRequests();
         throw new Error(candidateError);
       }
-      plan = p;
+      sessionController.adoptPlan(p, playbackIntent);
       distributedFacts.value = p.distributed_compute;
       advancedFacts.value = p.advanced_playback;
       ladderFacts.value = p.local_hls_ladder;
@@ -1968,7 +1750,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         pendingUserSeek = false;
         pendingForce = false;
       }
-      sessionId.value = p.session_id;
+      sessionController.publishSession(p);
       tracks.value = p.audio_tracks;
       subtitles.value = p.subtitle_tracks;
       if (!p.subtitle_tracks.some((t) => t.index === subtitleIndex.value))
@@ -2016,7 +1798,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
               state.value?.room_id === s.room_id &&
               state.value?.media_generation === p.media_generation,
             finalCurrent: () =>
-              plan === p &&
+              readPlan() === p &&
               video.value === el &&
               viewer.current().userId === user &&
               viewer.current().epoch === epoch,
@@ -2178,14 +1960,13 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           return false;
         const sample = bestEffort(() => observations?.captureFinal());
         let proposed: StaticHlsChildIntent | undefined;
-        const manager = requests();
-        const childIntent = planGenerations.nextWhen((intent) => {
+        const childIntent = sessionController.nextPlanWhen((intent) => {
           const proposal = childState!.propose({
             current: binding,
             failure: { binding, event },
             child: {
               ...intent,
-              idempotency_key: manager.allocateIdempotencyKey(),
+              idempotency_key: allocateIdempotencyKey(),
             },
             position_ms: target(state.value!, clock.now()),
             final_observation: sample ? { binding, sample } : null,
@@ -2875,16 +2656,13 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         return;
       waiting.value = false;
       pendingLoad = undefined;
+      // Only the controller's qualified pre-mutation rejection may rotate.
+      // This starts a new logical meter/intent; old packets and keys stay owned.
       if (
         !continuation &&
-        !playbackIntent.originRecoveryUsed &&
-        e instanceof PlaybackViewerOriginRequired
-      ) {
-        // Explicitly pre-mutation, first-attempt rejection only. This starts a
-        // new logical meter/intent; no metrics packet or old key is relabeled.
-        planGenerations = new PlaybackPlanGenerations();
+        sessionController.rotateViewerOrigin(e, playbackIntent)
+      )
         return beginLoad(playbackIntent.origin, true);
-      }
       if (
         continuation &&
         e instanceof RequestFailure &&
@@ -3065,8 +2843,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     if (!roomIsActive()) return;
     const s = state.value,
       el = video.value;
-    if (!s || !el || !plan) return;
-    const p = plan;
+    const p = readPlan();
+    if (!s || !el || !p) return;
     if (failedCompatibilityPlan === p) return;
     if (!currentPlan(p)) {
       if (p.native_platform?.live)
@@ -3250,7 +3028,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   }
   async function enablePlayback() {
     if (!roomIsActive()) return;
-    const p = plan,
+    const p = readPlan(),
       el = video.value;
     if (p && failedCompatibilityPlan === p) return;
     if (!clockUsable()) {
@@ -3317,17 +3095,18 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     if (!roomIsActive()) return;
     const s = state.value,
       el = video.value;
-    if (!s || !el || !plan) return;
-    if (failedCompatibilityPlan === plan) return;
-    if (plan.native_platform?.live) {
+    const p = readPlan();
+    if (!s || !el || !p) return;
+    if (failedCompatibilityPlan === p) return;
+    if (p.native_platform?.live) {
       position.value = duration.value = 0;
       corrector.reset();
-      if (!liveRoomMatchesPlan(s, plan)) {
-        failNativeLive(plan, "NATIVE_LIVE_STATE_CHANGED");
+      if (!liveRoomMatchesPlan(s, p)) {
+        failNativeLive(p, "NATIVE_LIVE_STATE_CHANGED");
         return;
       }
       if (el.ended) {
-        if (!terminalEnd) failNativeLive(plan);
+        if (!terminalEnd) failNativeLive(p);
         return;
       }
       if (
@@ -3338,7 +3117,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       return;
     }
     if (!dragging.value)
-      position.value = el.currentTime + plan.timeline_origin_ms / 1000;
+      position.value = el.currentTime + p.timeline_origin_ms / 1000;
     if (!usable || s.playback_status !== "playing") {
       corrector.reset();
       restoreBaseRate();
@@ -3356,13 +3135,13 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     }
     const expected = Math.min(
       generatedEnd ?? Infinity,
-      (target(s, clock.now()) - plan.timeline_origin_ms) / 1000,
+      (target(s, clock.now()) - p.timeline_origin_ms) / 1000,
     );
     const ranges = availablePlaybackRanges(el);
     if (!containsPlaybackPosition(ranges, expected)) {
       restoreBaseRate();
       corrector.reset();
-      if (plan.rebuild_on_seek) void runAutomaticApply(true);
+      if (p.rebuild_on_seek) void runAutomaticApply(true);
       return;
     }
     if (
@@ -3403,7 +3182,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     firstFrameDeadline?.sync();
     queueApply();
     if (pendingLoad && !pendingLoad.preparing) clockAction = "load";
-    recoveryPending = !!plan || !!pendingLoad;
+    recoveryPending = !!readPlan() || !!pendingLoad;
     updateRecovery();
   }
   function onClockReady() {
@@ -3504,7 +3283,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     rates = new PlaybackRateSupport(element);
     confirmedBaseRate = rejectedBaseRate = undefined;
     if (
-      !plan &&
+      !readPlan() &&
       pendingLoad &&
       !pendingLoad.preparing &&
       roomIsActive() &&
@@ -3591,17 +3370,11 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       },
       { flush: "sync" },
     );
-  const maintenance = createPlaybackMaintenance({
+  const maintenance = sessionController.startMaintenance({
     tick,
     observe: () => observations?.progress(),
     sample: sampleMetrics,
     visibilityChanged,
-    plan: () => plan,
-    active: roomIsActive,
-    currentPlan,
-    epoch: () => viewer.current().epoch,
-    renew: (current) =>
-      api(`/playback-sessions/${current.session_id}`, "POST"),
     reload: () => {
       void run(() => beginLoad("automatic_load") ?? Promise.resolve());
     },

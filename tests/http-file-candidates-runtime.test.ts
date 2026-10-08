@@ -1571,3 +1571,48 @@ for (const legacy of ["empty", "404"]) {
     }
   });
 }
+
+
+it("deferred old SID cleanup cannot use a replacement login", async () => {
+  const s = setup();
+  const calls: {
+    path: string;
+    method: string | undefined;
+    epoch: number;
+    user: string;
+  }[] = [];
+  try {
+    await s.runtime.loadMedia();
+    expect(s.prepares()).toHaveLength(1);
+    expect(s.runtime.sessionId.value).toBe("session-1");
+    const original = s.api.getMockImplementation()!;
+    s.api.mockImplementation(async (path, method, body) => {
+      calls.push({
+        path,
+        method,
+        epoch: s.session.epoch,
+        user: s.session.user.id,
+      });
+      return original(path, method, body);
+    });
+    // Final observations defer grant cleanup. Identity can change before that
+    // barrier settles; its old SID must not be sent through the new login.
+    const stopping = s.runtime.reset();
+    ++s.session.epoch;
+    s.session.user.id = "replacement-viewer";
+    await stopping;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.runtime.sessionId.value).toBeNull();
+    expect(
+      calls.filter(
+        (call) =>
+          call.method === "DELETE" &&
+          call.path === "/playback-sessions/session-1" &&
+          (call.epoch !== 1 || call.user !== "user"),
+      ),
+    ).toHaveLength(0);
+  } finally {
+    s.cleanup();
+    await vi.advanceTimersByTimeAsync(0);
+  }
+});

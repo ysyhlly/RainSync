@@ -39,6 +39,7 @@ const frontendInputs = [
   "apps/web/src/features/playback/playback-metrics.ts",
   "apps/web/src/features/playback/metrics-binding.ts",
   "apps/web/src/features/playback/playback-runtime.ts",
+  "apps/web/src/features/playback/playback-session-controller.ts",
   "apps/web/src/features/playback/playback-runtime-types.ts",
   "apps/web/src/features/playback/playback-scope.ts",
   "apps/web/src/features/playback/playback-metric-runtime.ts",
