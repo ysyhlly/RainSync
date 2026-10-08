@@ -1,3 +1,4 @@
+import { playbackTestContext } from "./helpers/playback-context";
 vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
   const { default: Hls } = await import("hls.js");
   return {
@@ -270,27 +271,21 @@ function setup(
   );
   const session = reactive({ user: { id: "user" }, epoch: 1, api });
   const connected = ref(true),
-    active = ref(true),
-    error = ref("");
+    active = ref(true);
   const clock = { ready: true, revision: 1, now: () => 0 };
   const scope = effectScope();
   const runtime = scope.run(() =>
-    createPlaybackRuntime({
-      session: session as any,
-      state: state as any,
-      connected,
-      active,
-      clock: clock as any,
-      error,
-      run: async (action) => {
-        try {
-          await action();
-        } catch (failure) {
-          error.value = String((failure as Error).message);
-        }
-      },
-    }),
+    createPlaybackRuntime(
+      playbackTestContext({
+        session: session as any,
+        state: state as any,
+        connected,
+        active,
+        clock: clock as any,
+      }),
+    ),
   )!;
+  const error = runtime.playbackError;
   runtime.attach(el);
   runtime.mode.value = options.mode ?? "transcode";
   const calls = (path: string) => api.mock.calls.filter(([p]) => p === path);

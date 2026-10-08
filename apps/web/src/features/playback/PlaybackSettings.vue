@@ -16,7 +16,7 @@ const panel = ref<HTMLElement>(),
   details = ref<HTMLDetailsElement>();
 function audioChanged(value: number | undefined) {
   r.audioIndex = value;
-  r.run(r.loadMedia);
+  r.runPlayback(r.loadMedia);
 }
 function subtitleChanged(value: number | undefined) {
   r.subtitleIndex = value;
@@ -171,7 +171,7 @@ onBeforeUnmount(() => {
               })),
             ]"
             @update:model-value="
-              (value) => r.run(() => r.selectNativeQuality(value))
+              (value) => r.runPlayback(() => r.selectNativeQuality(value))
             "
         /></label>
         <p
@@ -242,7 +242,7 @@ onBeforeUnmount(() => {
           YouTube 观众会话需由服务器单独启用，并在个人资料中导入自己的会话。
           保存会话不保证登录有效；私人、付费、年龄限制和 DRM 视频仍不受支持。
         </p>
-        <button :disabled="!r.state?.media_id" @click="r.run(r.loadMedia)">
+        <button :disabled="!r.state?.media_id" @click="r.runPlayback(r.loadMedia)">
           <AppIcon name="refresh" />重新加载
         </button>
         <PlaybackSelections

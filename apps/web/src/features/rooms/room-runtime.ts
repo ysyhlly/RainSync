@@ -1,4 +1,4 @@
-import { ref, shallowRef, computed, watch, onScopeDispose } from "vue";
+import { ref, shallowRef, computed, readonly, watch, onScopeDispose } from "vue";
 import { defineStore } from "pinia";
 import {
   Clock,
@@ -23,7 +23,7 @@ import { actionErrorMessage } from "../../shared/action-error";
 import { useMediaCatalog } from "../library/media-catalog.store";
 import { useSession } from "../auth/session.store";
 import { usePlatformAccount } from "../account/platform-account.store";
-import { createPlaybackRuntime } from "../playback/playback-runtime";
+import { createPlaybackIdentityPort, createViewingRuntime } from "../../app/viewing-runtime";
 import { lifecycleLabels } from "./room-lifecycle";
 import {
   isPlaybackController,
@@ -241,12 +241,25 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     () => lifecycleLabels[room.value?.lifecycle ?? "active"],
   );
   const cleanupError = ref("");
-  const playback = createPlaybackRuntime({
+  const viewing = createViewingRuntime({
     staticHlsFallback: true,
-    session,
-    state,
-    connected,
-    active: roomActive,
+    identity: createPlaybackIdentityPort(
+      () => ({ userId: session.user?.id, epoch: session.epoch }),
+      (failure) => session.invalidate(failure),
+    ),
+    api: (...args) => session.api(...args),
+    timeline: {
+      state: readonly(state),
+      connected: readonly(connected),
+      active: roomActive,
+      clock: Object.freeze({
+        get ready() { return clock.ready; },
+        get revision() { return clock.revision; },
+        now: () => clock.now(),
+      }),
+      checkClock: checkClockContinuity,
+    },
+    commands: { ended: (position_ms) => send("END_MEDIA", { position_ms }) },
     resolveMedia: (room, media) => catalog.ensureRoom(room, media),
     platformAccountChange: computed(() => platformAccount.change),
     youtubePlatformAccountChange: computed(() => platformAccount.youtubeChange),
@@ -263,13 +276,19 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           .map(([provider, value]) => [provider, value.id!]),
       ),
     ),
-    clock,
-    checkClock: checkClockContinuity,
+  }, {
     error,
-    run,
-    ended: (position_ms) => send("END_MEDIA", { position_ms }),
+    busy,
+    identityInvalidated: () => {
+      catalog.reset();
+      void leave().catch(reportCleanupFailure);
+    },
   });
-  const { video, position, waiting, blocked, applyState } = playback;
+  const playback = viewing.playback;
+  // The epoch is invalidated before session.user changes. Keep the original
+  // login-only notice clearing rule without scheduling another room cleanup.
+  watch(() => session.user?.id, (id) => { if (id) error.value = ""; }, { flush: "sync" });
+  const { video, position, waiting, blocked } = playback;
   const owner = computed(
     () => isPlaybackController(
       roomActive.value,
@@ -380,14 +399,6 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     chat.value = "";
     await playback.reset();
   }
-  watch(
-    () => session.user?.id,
-    (id) => {
-      catalog.reset();
-      if (id) error.value = "";
-      void leave().catch(reportCleanupFailure);
-    },
-  );
   async function enter(r: Room) {
     if (room.value?.id === r.id) {
       if (playlistPending && !playlistLoaded.value) return playlistPending;
@@ -730,14 +741,8 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
           playback.mediaChanged();
           if (v.type !== "SNAPSHOT") invalidatePlaylist();
         } else if (v.action?.type === "SEEK")
-          void run(() => applyState(true, true), true);
-        else {
-          const serial = roomSerial;
-          void applyState().catch((e) => {
-            if (serial === roomSerial && !(e instanceof PlaybackCancelled))
-              error.value = e instanceof Error ? e.message : String(e);
-          });
-        }
+          void playback.applyRoomState(true, true);
+        else void playback.applyRoomState();
       }
     };
   }
@@ -1163,8 +1168,12 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     chat,
     chatPending,
     chatFailed,
-    error,
-    busy,
+    error: viewing.error,
+    busy: viewing.busy,
+    errorNotice: viewing.errorNotice,
+    dismissError: viewing.dismissError,
+    roomError: error,
+    roomBusy: busy,
     owner,
     canManageRoom,
     can,

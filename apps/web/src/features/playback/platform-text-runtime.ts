@@ -1,7 +1,8 @@
 import { compileDanmakuCues } from "./advanced-danmaku-loader";
 import { ref, watch, onScopeDispose, type Ref } from "vue";
 import type { PlaybackPlan } from "../../../../../packages/protocol";
-import type { useSession } from "../auth/session.store";
+import type { ApiClient } from "../../shared/api/client";
+import type { PlaybackIdentityPort } from "./playback-runtime-types";
 import { RequestFailure } from "../../errors";
 import {
   platformTextBase,
@@ -16,7 +17,8 @@ import {
   type PlatformTextStatus,
 } from "./platform-text";
 export function createPlatformTextRuntime(ctx: {
-  session: ReturnType<typeof useSession>;
+  identity: PlaybackIdentityPort;
+  api: ApiClient;
   video: Ref<HTMLVideoElement | undefined>;
   /** Stable viewer/room/media/account identity, excluding grant and quality. */
   preferenceScope?: () => string | undefined;
@@ -45,7 +47,7 @@ export function createPlatformTextRuntime(ctx: {
       return undefined;
     return JSON.stringify([
       scope,
-      ctx.session.epoch,
+      ctx.identity.current().epoch,
       plan.media_id,
       plan.media_generation,
       plan.native_platform.provider,
@@ -298,14 +300,14 @@ export function createPlatformTextRuntime(ctx: {
       : 0;
     if (platformTextLive.value) observeNativeLiveCaptions(plan);
     const active = serial,
-      epoch = ctx.session.epoch,
+      epoch = ctx.identity.current().epoch,
       subtitleSelection = subtitleSerial,
       danmakuSelection = danmakuSerial;
     const controller = new AbortController();
     catalogRequest = controller;
     platformSubtitleStatus.value = platformDanmakuStatus.value = "loading";
     try {
-      const result = await ctx.session.api(
+      const result = await ctx.api(
         requestUrl("/catalog"),
         "GET",
         undefined,
@@ -313,7 +315,7 @@ export function createPlatformTextRuntime(ctx: {
       );
       if (
         serial !== active ||
-        ctx.session.epoch !== epoch ||
+        ctx.identity.current().epoch !== epoch ||
         controller.signal.aborted
       )
         return;
@@ -359,7 +361,7 @@ export function createPlatformTextRuntime(ctx: {
     } catch (error) {
       if (
         serial !== active ||
-        ctx.session.epoch !== epoch ||
+        ctx.identity.current().epoch !== epoch ||
         controller.signal.aborted
       )
         return;
@@ -377,7 +379,7 @@ export function createPlatformTextRuntime(ctx: {
   async function selectPlatformSubtitle(id: string | null) {
     const selection = ++subtitleSerial,
       active = serial,
-      epoch = ctx.session.epoch;
+      epoch = ctx.identity.current().epoch;
     subtitleRequest?.abort();
     clearTrack();
     platformSubtitleId.value = null;
@@ -415,7 +417,7 @@ export function createPlatformTextRuntime(ctx: {
       if (
         serial !== active ||
         subtitleSerial !== selection ||
-        ctx.session.epoch !== epoch ||
+        ctx.identity.current().epoch !== epoch ||
         controller.signal.aborted
       ) {
         await response.body?.cancel().catch(() => {
@@ -427,7 +429,7 @@ export function createPlatformTextRuntime(ctx: {
         const failure = new RequestFailure(
           await response.json().catch(() => null),
         );
-        if (ctx.session.epoch === epoch) ctx.session.invalidate(failure);
+        if (ctx.identity.current().epoch === epoch) ctx.identity.invalidate(failure);
         throw failure;
       }
       if (response.headers.get("Content-Type") !== "text/vtt; charset=utf-8")
@@ -458,7 +460,7 @@ export function createPlatformTextRuntime(ctx: {
       if (
         serial !== active ||
         subtitleSerial !== selection ||
-        ctx.session.epoch !== epoch ||
+        ctx.identity.current().epoch !== epoch ||
         controller.signal.aborted
       )
         return;
@@ -491,7 +493,7 @@ export function createPlatformTextRuntime(ctx: {
       if (
         serial !== active ||
         subtitleSerial !== selection ||
-        ctx.session.epoch !== epoch ||
+        ctx.identity.current().epoch !== epoch ||
         controller.signal.aborted
       )
         return;
@@ -546,7 +548,7 @@ export function createPlatformTextRuntime(ctx: {
       platformDanmakuStatus.value === "available";
     const selection = ++danmakuSerial,
       active = serial,
-      epoch = ctx.session.epoch;
+      epoch = ctx.identity.current().epoch;
     danmakuRequest?.abort();
     clearTimeout(danmakuTimer);
     platformDanmakuEnabled.value = false;
@@ -559,7 +561,7 @@ export function createPlatformTextRuntime(ctx: {
     const current = () =>
       serial === active &&
       danmakuSerial === selection &&
-      ctx.session.epoch === epoch &&
+      ctx.identity.current().epoch === epoch &&
       !controller.signal.aborted;
     let segment = -1;
     async function load() {
@@ -568,7 +570,7 @@ export function createPlatformTextRuntime(ctx: {
         const at = sourceTimeMs(),
           wanted = Math.floor(at / 360000);
         if (wanted !== segment) {
-          const value = await ctx.session.api(
+          const value = await ctx.api(
             requestUrl("/danmaku") + `&at_ms=${at}&rendering_version=3`,
             "GET",
             undefined,
@@ -661,7 +663,7 @@ export function createPlatformTextRuntime(ctx: {
   async function setPlatformLiveDanmaku(mode: "off" | "history" | "realtime") {
     const selection = ++danmakuSerial,
       active = serial,
-      epoch = ctx.session.epoch;
+      epoch = ctx.identity.current().epoch;
     danmakuRequest?.abort();
     clearTimeout(danmakuTimer);
     platformDanmakuEnabled.value = false;
@@ -680,13 +682,13 @@ export function createPlatformTextRuntime(ctx: {
     const current = () =>
       serial === active &&
       danmakuSerial === selection &&
-      ctx.session.epoch === epoch &&
+      ctx.identity.current().epoch === epoch &&
       !controller.signal.aborted;
     platformLiveDanmakuMode.value = mode;
     if (mode === "history") {
       async function poll() {
         try {
-          const value = await ctx.session.api(
+          const value = await ctx.api(
             requestUrl("/danmaku"),
             "GET",
             undefined,
@@ -729,7 +731,7 @@ export function createPlatformTextRuntime(ctx: {
         const failure = new RequestFailure(
           await response.json().catch(() => null),
         );
-        if (ctx.session.epoch === epoch) ctx.session.invalidate(failure);
+        if (ctx.identity.current().epoch === epoch) ctx.identity.invalidate(failure);
         throw failure;
       }
       if (
@@ -784,8 +786,8 @@ export function createPlatformTextRuntime(ctx: {
       }
     } catch (error) {
       if (!current()) return;
-      if (error instanceof RequestFailure && ctx.session.epoch === epoch)
-        ctx.session.invalidate(error);
+      if (error instanceof RequestFailure && ctx.identity.current().epoch === epoch)
+        ctx.identity.invalidate(error);
       platformDanmakuEnabled.value = false;
       platformDanmakuCues.value = [];
       platformLiveDanmakuMode.value = "off";
@@ -795,7 +797,8 @@ export function createPlatformTextRuntime(ctx: {
       );
     }
   }
-  watch(() => ctx.session.epoch, reset, { flush: "sync" });
+  const stopIdentity = ctx.identity.subscribeInvalidation(reset);
+  onScopeDispose(stopIdentity);
   if (ctx.preferenceScope) watch(ctx.preferenceScope, reset, { flush: "sync" });
   watch(
     ctx.video,

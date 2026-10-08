@@ -28,15 +28,16 @@ import type {
 } from "../../../../../packages/protocol";
 import type {
   PlaybackRuntimeContext,
+  RoomTimelinePort,
   MetricIntent,
   CandidateDiscovery,
 } from "./playback-runtime-types";
 import type { StaticHlsAvailability } from "./static-hls-availability";
 export interface CandidateDiscoveryPorts {
-  context: PlaybackRuntimeContext;
-  session: PlaybackRuntimeContext["session"];
-  state: PlaybackRuntimeContext["state"];
-  clock: PlaybackRuntimeContext["clock"];
+  staticHlsFallback?: boolean;
+  api: PlaybackRuntimeContext["api"];
+  state: RoomTimelinePort["state"];
+  clock: RoomTimelinePort["clock"];
   video: Ref<HTMLVideoElement | undefined>;
   current: (intent: MetricIntent) => boolean;
   advancedCapabilities: Ref<AdvancedPlaybackCapabilities | undefined>;
@@ -52,11 +53,11 @@ export function discoverPlaybackCandidates(
   element: HTMLVideoElement,
 ): Promise<CandidateDiscovery> {
   const {
-    session,
+    api,
     state,
     video,
     clock,
-    context: ctx,
+    staticHlsFallback,
     current: candidateIntentCurrent,
     advancedCapabilities,
     ladderCapabilities,
@@ -81,7 +82,7 @@ export function discoverPlaybackCandidates(
       const startedAt = performance.now();
       let candidateSet: PlaybackCandidateSet | undefined;
       try {
-        candidateSet = await session.api<PlaybackCandidateSet>(
+        candidateSet = await api<PlaybackCandidateSet>(
           "/playback-candidates",
           "POST",
           {
@@ -116,14 +117,14 @@ export function discoverPlaybackCandidates(
       if (!current()) throw new PlaybackCancelled();
       let staticHls: CandidateDiscovery["staticHls"];
       if (
-        ctx.staticHlsFallback === true &&
+        staticHlsFallback === true &&
         !metrics.advanced &&
         !metrics.ladder &&
         ["auto", "direct"].includes(metrics.mode)
       ) {
         let response: unknown;
         try {
-          response = await session.api(
+          response = await api(
             "/playback-static-hls-capabilities",
             "POST",
             {
@@ -233,7 +234,7 @@ export function discoverPlaybackCandidates(
         let upstreamSet: UpstreamProfileCandidateSet | undefined;
         let endpointAbsent = false;
         try {
-          upstreamSet = await session.api<UpstreamProfileCandidateSet>(
+          upstreamSet = await api<UpstreamProfileCandidateSet>(
             "/upstream-profile-candidates",
             "POST",
             {

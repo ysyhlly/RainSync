@@ -100,6 +100,7 @@ import type {
 } from "../../../../../packages/protocol";
 import { RequestFailure, isUnsupportedTimelineResponse } from "../../errors";
 import { StaleIdentity } from "../../shared/api/client";
+import { actionErrorMessage } from "../../shared/action-error";
 import {
   PlaybackCancelled,
   PlaybackViewerOriginRequired,
@@ -143,7 +144,58 @@ const candidateError = "播放候选无法安全使用，请重新加载播放";
 const candidateExpiredError = "播放候选已失效，请重新加载播放";
 
 export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
-  const { session, state, connected, clock, error, run } = ctx;
+  const { identity: viewer, api, timeline, commands = {} } = ctx;
+  const { state, connected, clock } = timeline;
+  const error = ref(""), busy = ref(false);
+  let actionSerial = 0, disposed = false;
+  const pendingActions = new Set<object>();
+  function invalidateActions() {
+    ++actionSerial;
+    pendingActions.clear();
+    busy.value = false;
+    error.value = "";
+  }
+  async function run(
+    action: () => Promise<unknown>,
+    options: { preserveError?: boolean; busy?: boolean } = {},
+  ) {
+    if (disposed) return;
+    const serial = ++actionSerial,
+      epoch = viewer.current().epoch,
+      room = state.value?.room_id,
+      token = {};
+    const tracksBusy = options.busy !== false;
+    if (tracksBusy) {
+      pendingActions.add(token);
+      busy.value = true;
+    }
+    if (!options.preserveError) error.value = "";
+    try {
+      await action();
+    } catch (failure) {
+      if (
+        !disposed &&
+        serial === actionSerial &&
+        epoch === viewer.current().epoch &&
+        room === state.value?.room_id &&
+        !(failure instanceof PlaybackCancelled) &&
+        !(failure instanceof StaleIdentity)
+      )
+        error.value = actionErrorMessage(failure);
+    } finally {
+      if (tracksBusy) {
+        pendingActions.delete(token);
+        if (!disposed) busy.value = pendingActions.size > 0;
+      }
+    }
+  }
+  const stopIdentityActions = viewer.subscribeInvalidation(invalidateActions);
+  watch(() => state.value?.room_id, invalidateActions, { flush: "sync" });
+  onScopeDispose(() => {
+    disposed = true;
+    stopIdentityActions();
+    invalidateActions();
+  });
   const accountRevision = (provider?: NativePlatformProvider) =>
     provider === "bilibili"
       ? (ctx.platformAccountChange?.value ?? 0)
@@ -157,7 +209,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     provider === "douyin" ||
     provider === "tiktok" ||
     provider === "youtube";
-  const roomIsActive = () => ctx.active?.value !== false;
+  const roomIsActive = () => timeline.active?.value !== false;
   const video = ref<HTMLVideoElement>(),
     waiting = ref(false),
     blocked = ref(false),
@@ -176,8 +228,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   const liveWindowScope = () =>
     roomIsActive() && validNativeLiveBinding(state.value?.live)
       ? JSON.stringify([
-          session.user?.id,
-          session.epoch,
+          viewer.current().userId,
+          viewer.current().epoch,
           state.value?.room_id,
           state.value?.media_id,
           state.value?.media_generation,
@@ -216,13 +268,14 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     probeExpiredNativeLiveWindow,
   } = liveRecovery;
   const platformText = createPlatformTextRuntime({
-    session,
+    identity: viewer,
+    api,
     video,
     preferenceScope: () =>
       roomIsActive() && state.value?.media_id
         ? JSON.stringify([
-            session.user?.id,
-            session.epoch,
+            viewer.current().userId,
+            viewer.current().epoch,
             state.value.room_id,
             state.value.media_id,
             state.value.media_generation,
@@ -257,8 +310,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   let qualityContext: string | undefined;
   const qualityScope = () =>
     JSON.stringify([
-      session.user?.id,
-      session.epoch,
+      viewer.current().userId,
+      viewer.current().epoch,
       state.value?.room_id,
       state.value?.media_id,
       state.value?.media_generation,
@@ -329,8 +382,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   }
   const advancedScope = () =>
     [
-      session.epoch,
-      session.user?.id,
+      viewer.current().epoch,
+      viewer.current().userId,
       state.value?.room_id,
       state.value?.media_id,
       state.value?.media_generation,
@@ -509,7 +562,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     failure.name === name;
   const clockRevision = () => clock.revision ?? 0;
   const clockUsable = () => {
-    ctx.checkClock?.();
+    timeline.checkClock?.();
     return (live.value || clock.ready) && connected.value && foreground();
   };
   const unsupportedRateError =
@@ -526,7 +579,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   function runAutomaticApply(force = false, userSeek = false) {
     const previousError = error.value;
     return run(async () => {
-      // The room's action runner clears errors for user actions. Automatic
+      // Playback's action runner clears its errors for user actions. Automatic
       // convergence must preserve unrelated authentication/media failures.
       if (
         previousError &&
@@ -535,6 +588,14 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       )
         error.value = previousError;
       await applyState(force, userSeek);
+    });
+  }
+  /** Apply an accepted room projection within playback's own status scope.
+   * Explicit seeks retain busy feedback; normal projection convergence does not. */
+  function applyRoomState(force = false, userSeek = false) {
+    return run(() => applyState(force, userSeek), {
+      preserveError: true,
+      busy: force && userSeek,
     });
   }
   function baseRate() {
@@ -589,7 +650,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       startupDiagnostics.value = value;
     },
     send: (binding, body, signal) =>
-      session.api<PlaybackMetricsReceipt>(
+      api<PlaybackMetricsReceipt>(
         `/playback-sessions/${binding.sessionId}/metrics`,
         "POST",
         body,
@@ -685,8 +746,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   const metricCurrent = (m: MetricIntent) =>
     metricIntent === m &&
     roomIsActive() &&
-    session.user?.id === m.user &&
-    session.epoch === m.epoch &&
+    viewer.current().userId === m.user &&
+    viewer.current().epoch === m.epoch &&
     (!usesPlatformAccount(m.nativeProvider) ||
       m.nativeCredentialMode === "anonymous" ||
       accountRevision(m.nativeProvider) === m.accountChange) &&
@@ -760,8 +821,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   // Accepted intent/visibility edges remain separate from observation-v1 flags.
   watch(
     () => [
-      session.epoch,
-      session.user?.id,
+      viewer.current().epoch,
+      viewer.current().userId,
       roomIsActive(),
       state.value?.room_id,
       state.value?.media_id,
@@ -878,7 +939,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         recoveryPending = false;
         updateRecovery();
         bestEffort(() => observations?.completed());
-        ctx.ended?.(el.currentTime * 1000 + p.timeline_origin_ms);
+        commands.ended?.(el.currentTime * 1000 + p.timeline_origin_ms);
       }
     } catch (failure) {
       if (currentPlan(p))
@@ -889,14 +950,14 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     }
   }
   function requests() {
-    const user = session.user!.id;
-    const epoch = session.epoch;
+    const user = viewer.current().userId!;
+    const epoch = viewer.current().epoch;
     if (!playbackRequests || playbackUser !== user || playbackEpoch !== epoch) {
       playbackUser = user;
       playbackEpoch = epoch;
       playbackRequests = new PlaybackRequests(
         (body, signal) => {
-          if (session.epoch !== epoch) throw new StaleIdentity();
+          if (viewer.current().epoch !== epoch) throw new StaleIdentity();
           const provider = metricIntent?.nativeProvider;
           if (Object.hasOwn(body, "static_hls_fallback")) {
             const metrics = metricIntent;
@@ -957,8 +1018,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
               throw new PlaybackCancelled();
             checkCandidateLifetime(snapshot);
           }
-          return session
-            .api<PlaybackPlan>(
+          return api<PlaybackPlan>(
               body.distributed_compute
                 ? "/playback-sessions/distributed-compute"
                 : body.native_platform
@@ -1041,8 +1101,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
             });
         },
         (key, signal) => {
-          if (session.epoch !== epoch) throw new StaleIdentity();
-          return session.api(
+          if (viewer.current().epoch !== epoch) throw new StaleIdentity();
+          return api(
             "/playback-requests/" + key,
             "DELETE",
             undefined,
@@ -1064,7 +1124,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     planGeneration?: number,
     currentRelativePosition?: () => number,
   ): Promise<PlaybackReadiness> {
-    let readiness = await session.api<PlaybackReadiness>(
+    let readiness = await api<PlaybackReadiness>(
       `/playback-sessions/${id}?relative_position_ms=${encodeURIComponent(relativePosition)}${planGeneration === undefined ? "" : `&plan_generation=${planGeneration}`}`,
       "GET",
       undefined,
@@ -1180,8 +1240,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     const previous = playbackRequests;
     const deletePrevious = async () => {
       if (old)
-        await session
-          .api(
+        await api(
             `/playback-sessions/${old.session_id}`,
             "DELETE",
             finalObservation,
@@ -1203,7 +1262,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     const cancellation = (
       previous
         ? previous.stop(beforeCleanup)
-        : session.user
+        : viewer.current().userId
           ? requests().stop(beforeCleanup)
           : Promise.resolve()
     ).catch((e) => {
@@ -1288,8 +1347,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       fence: { identity, generation: 1 },
       startGeneration: intent.plan_generation,
       origin,
-      user: session.user?.id,
-      epoch: session.epoch,
+      user: viewer.current().userId,
+      epoch: viewer.current().epoch,
       room: s.room_id,
       media: s.media_generation,
       mediaId: s.media_id,
@@ -1372,8 +1431,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   ): Promise<CandidateDiscovery> {
     return discoverPlaybackCandidates(
       {
-        context: ctx,
-        session,
+        staticHlsFallback: ctx.staticHlsFallback,
+        api,
         state,
         video,
         clock,
@@ -1445,7 +1504,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       }
       const element = video.value;
       metrics.element = element;
-      const identity = session.epoch;
+      const identity = viewer.current().epoch;
       waiting.value = true;
       const media = ctx.resolveMedia
         ? await ctx.resolveMedia(s.room_id, s.media_id!)
@@ -1626,7 +1685,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       if (
         serial !== loadSerial ||
         !candidateIntentCurrent(metrics) ||
-        session.epoch !== identity ||
+        viewer.current().epoch !== identity ||
         !roomIsActive() ||
         video.value !== element ||
         state.value?.room_id !== s.room_id ||
@@ -1803,13 +1862,13 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         serial !== loadSerial ||
         !candidateIntentCurrent(metrics) ||
         !roomIsActive() ||
-        session.epoch !== identity ||
+        viewer.current().epoch !== identity ||
         video.value !== element ||
         state.value?.room_id !== s.room_id ||
         state.value?.media_generation !== s.media_generation ||
         !planGenerations.current(p)
       ) {
-        await session.api(`/playback-sessions/${p.session_id}`, "DELETE");
+        await api(`/playback-sessions/${p.session_id}`, "DELETE");
         return;
       }
       if (platform && p.media_id !== metrics.mediaId) {
@@ -1918,8 +1977,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         return binding;
       };
       if (p.observation_version === 1) {
-        const user = session.user!.id;
-        const epoch = session.epoch;
+        const user = viewer.current().userId!;
+        const epoch = viewer.current().epoch;
         observations = bestEffort(() =>
           bindPlaybackObservations({
             element: el,
@@ -1929,18 +1988,18 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
               roomIsActive() &&
               serial === loadSerial &&
               video.value === el &&
-              session.user?.id === user &&
-              session.epoch === epoch &&
+              viewer.current().userId === user &&
+              viewer.current().epoch === epoch &&
               state.value?.room_id === s.room_id &&
               state.value?.media_generation === p.media_generation,
             finalCurrent: () =>
               plan === p &&
               video.value === el &&
-              session.user?.id === user &&
-              session.epoch === epoch,
+              viewer.current().userId === user &&
+              viewer.current().epoch === epoch,
             send: async (body, signal) => {
-              if (session.epoch !== epoch) throw new StaleIdentity();
-              await session.api(
+              if (viewer.current().epoch !== epoch) throw new StaleIdentity();
+              await api(
                 `/playback-sessions/${p.session_id}/observations`,
                 "POST",
                 body,
@@ -2014,8 +2073,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           serial === loadSerial &&
           currentPlan(p) &&
           roomIsActive() &&
-          session.user?.id === metrics.user &&
-          session.epoch === metrics.epoch &&
+          viewer.current().userId === metrics.user &&
+          viewer.current().epoch === metrics.epoch &&
           state.value?.room_id === metrics.room &&
           state.value?.media_generation === metrics.media &&
           state.value?.media_id === dataMediaId &&
@@ -2309,7 +2368,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       if (p.distributed_compute && Hls?.isSupported()) {
         const f = p.distributed_compute;
         const peer = new RoomP2PTransport(
-          session.api,
+          api,
           s.room_id,
           f.job_id,
           updatePeerStats,
@@ -3448,8 +3507,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       state.value?.media_id,
       state.value?.media_generation,
       state.value?.playback_status,
-      session.user?.id,
-      session.epoch,
+      viewer.current().userId,
+      viewer.current().epoch,
       connected.value,
       waiting.value,
       blocked.value,
@@ -3517,9 +3576,9 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     plan: () => plan,
     active: roomIsActive,
     currentPlan,
-    epoch: () => session.epoch,
+    epoch: () => viewer.current().epoch,
     renew: (current) =>
-      session.api(`/playback-sessions/${current.session_id}`, "POST"),
+      api(`/playback-sessions/${current.session_id}`, "POST"),
     reload: () => {
       void run(() => beginLoad("automatic_load") ?? Promise.resolve());
     },
@@ -3536,6 +3595,9 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     bestEffort(() => metricSender.stop());
   });
   return {
+    playbackError: error,
+    playbackBusy: busy,
+    runPlayback: run,
     video,
     distributedIntent,
     distributedFacts,
@@ -3604,6 +3666,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     recoveryLabel,
     loadMedia,
     applyState,
+    applyRoomState,
     enablePlayback,
     applySubtitles,
     reset,

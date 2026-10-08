@@ -1,3 +1,4 @@
+import { playbackTestContext } from "./helpers/playback-context";
 vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
   const { default: Hls } = await import("hls.js");
   return {
@@ -331,38 +332,32 @@ function setup(
     account = ref(0),
     shortAccounts = ref({ douyin: 0, tiktok: 0 }),
     youtubeAccount = ref(0),
-    shortIds = ref({ douyin: id(9), tiktok: id(10) }),
-    error = ref("");
+    shortIds = ref({ douyin: id(9), tiktok: id(10) });
   const clock = { ready: true, revision: 1, now: () => 10000 };
   const ended = vi.fn();
   const scope = effectScope();
   const runtime = scope.run(() =>
-    createPlaybackRuntime({
-      session: session as any,
-      ended,
-      state,
-      connected,
-      active,
-      clock: clock as any,
-      error,
-      resolveMedia: async () =>
-        options.deferMedia
-          ? new Promise((r) => (resolveMedia = r))
-          : selectedMedia,
-      platformAccountChange: account,
-      shortPlatformAccountChanges: shortAccounts,
-      shortPlatformAccountIds: options.ownAccount ? shortIds : undefined,
-      youtubePlatformAccountChange: youtubeAccount,
-      youtubePlatformAccountId: options.ownAccount ? ref(id(11)) : undefined,
-      run: async (action) => {
-        try {
-          await action();
-        } catch (e) {
-          error.value = String(e);
-        }
-      },
-    }),
+    createPlaybackRuntime(
+      playbackTestContext({
+        session: session as any,
+        ended,
+        state,
+        connected,
+        active,
+        clock: clock as any,
+        resolveMedia: async () =>
+          options.deferMedia
+            ? new Promise((r) => (resolveMedia = r))
+            : selectedMedia,
+        platformAccountChange: account,
+        shortPlatformAccountChanges: shortAccounts,
+        shortPlatformAccountIds: options.ownAccount ? shortIds : undefined,
+        youtubePlatformAccountChange: youtubeAccount,
+        youtubePlatformAccountId: options.ownAccount ? ref(id(11)) : undefined,
+      }),
+    ),
   )!;
+  const error = runtime.playbackError;
   const element: any = Object.assign(new EventTarget(), {
     canPlayType: (type: string) =>
       type.includes("mpegurl") && options.nativeHls !== undefined

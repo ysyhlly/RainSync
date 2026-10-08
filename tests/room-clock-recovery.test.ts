@@ -4,7 +4,7 @@ import { ref } from "vue";
 import { useRoomRuntime } from "../apps/web/src/features/rooms/room-runtime";
 import { useSession } from "../apps/web/src/features/auth/session.store";
 import { RequestFailure } from "../apps/web/src/errors";
-import type { Clock } from "../packages/sync-engine";
+import type { RoomTimelinePort } from "../apps/web/src/features/playback/playback-runtime-types";
 
 const playback = vi.hoisted(() => ({
   ctx: undefined as any,
@@ -18,12 +18,16 @@ vi.mock("../apps/web/src/features/playback/playback-runtime", () => ({
   createPlaybackRuntime: (ctx: any) => {
     playback.ctx = ctx;
     return {
+      playbackError: ref(""),
+      playbackBusy: ref(false),
+      runPlayback: async (action: () => Promise<unknown>) => { await action(); },
       video: ref(),
       position: ref(0),
       waiting: ref(false),
       blocked: ref(false),
       dragging: ref(false),
       applyState: playback.apply,
+      applyRoomState: (...args: Parameters<typeof playback.apply>) => playback.apply(...args),
       loadMedia: vi.fn(),
       reset: playback.reset,
       mediaChanged: playback.changed,
@@ -117,7 +121,7 @@ async function setup() {
   };
   const pageshow = (persisted: boolean) =>
     window.dispatchEvent(Object.assign(new Event("pageshow"), { persisted }));
-  const clock: Clock = playback.ctx.clock;
+  const clock: RoomTimelinePort["clock"] = playback.ctx.timeline.clock;
   return {
     runtime,
     session,
@@ -131,7 +135,7 @@ async function setup() {
     visible,
     pageshow,
     document,
-    check: playback.ctx.checkClock,
+    check: playback.ctx.timeline.checkClock,
   };
 }
 
@@ -181,7 +185,7 @@ it("fences each hidden-to-visible round and leaves harmless visibility events al
     s.visible("visible");
     const firstWake = s.requests().at(-1);
     expect(s.clock.ready).toBe(false);
-    expect(s.clock.offset).toBe(0);
+    expect(s.clock.now()).toBe(performance.now());
     s.reply(socket, old);
     expect(s.clock.ready).toBe(false);
     s.visible("hidden");

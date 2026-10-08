@@ -1,3 +1,4 @@
+import { playbackTestContext } from "./helpers/playback-context";
 import { expect, it, vi } from "vitest";
 import { effectScope, ref } from "vue";
 
@@ -81,15 +82,15 @@ it("loads HLS once only for HLS plans and fences late SDK resolution by reset, i
     const scope = effectScope();
     scopes.push(scope);
     const runtime = scope.run(() =>
-      createPlaybackRuntime({
-        session: session as any,
-        state: state as any,
-        connected: ref(true),
-        active: ref(true),
-        clock: { ready: true, revision: 0, now: () => 0 } as any,
-        error: ref(""),
-        run: (action) => action(),
-      }),
+      createPlaybackRuntime(
+        playbackTestContext({
+          session: session as any,
+          state: state as any,
+          connected: ref(true),
+          active: ref(true),
+          clock: { ready: true, revision: 0, now: () => 0 } as any,
+        }),
+      ),
     )!;
     const ranges = { length: 1, start: () => 0, end: () => 120 };
     const element: any = Object.assign(new EventTarget(), {

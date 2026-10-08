@@ -1,6 +1,6 @@
 import type { Ref } from "vue";
-import type { PlaybackPlan, RoomState } from "../../../../../packages/protocol";
-import type { MetricIntent } from "./playback-runtime-types";
+import type { PlaybackPlan } from "../../../../../packages/protocol";
+import type { MetricIntent, RoomTimelinePort } from "./playback-runtime-types";
 import { validNativeLiveDeliveryUrl } from "./native-live";
 import { ignoreBodyCancellation } from "./playback-runtime-utils";
 type LiveWindowBudget = {
@@ -21,8 +21,8 @@ export function createLiveWindowRecovery(ctx: {
   clearRefresh: () => void;
   needsEdge: () => void;
   error: Ref<string>;
-  connected: Ref<boolean>;
-  state: Ref<RoomState | null>;
+  connected: RoomTimelinePort["connected"];
+  state: RoomTimelinePort["state"];
   video: Ref<HTMLVideoElement | undefined>;
   foreground: () => boolean;
   fail: (plan: PlaybackPlan, code: string) => void;

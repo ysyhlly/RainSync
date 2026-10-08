@@ -462,7 +462,7 @@ onBeforeUnmount(() => {
       <button
         v-if="r.blocked && !layoutLocked"
         class="primary autoplay"
-        @click="r.run(r.enablePlayback)"
+        @click="r.runPlayback(r.enablePlayback)"
       >
         点击加入播放
       </button>
@@ -473,8 +473,8 @@ onBeforeUnmount(() => {
         :loading-stage="r.loadingStage"
         :diagnostics="r.startupDiagnostics"
         :can-retry="r.connected && r.roomActive"
-        @cancel="r.run(r.cancelPreparation)"
-        @retry="r.run(r.loadMedia)"
+        @cancel="r.runPlayback(r.cancelPreparation)"
+        @retry="r.runPlayback(r.loadMedia)"
       />
       <span
         v-if="
@@ -561,8 +561,8 @@ onBeforeUnmount(() => {
           :loading-stage="r.loadingStage"
           :diagnostics="r.startupDiagnostics"
           :can-retry="r.connected && r.roomActive"
-          @cancel="r.run(r.cancelPreparation)"
-          @retry="r.run(r.loadMedia)"
+          @cancel="r.runPlayback(r.cancelPreparation)"
+          @retry="r.runPlayback(r.loadMedia)"
         />
         <span
           v-else-if="

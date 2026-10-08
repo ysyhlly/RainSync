@@ -1,3 +1,4 @@
+import { playbackTestContext } from "./helpers/playback-context";
 vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
   const { default: Hls } = await import("hls.js");
   return {
@@ -99,10 +100,8 @@ function setup(
     ranges?: [number, number][];
     rebuild?: boolean;
     observationSeq?: number;
-    clearsError?: boolean;
     hls?: boolean;
     fileFallback?: boolean;
-    captureErrors?: boolean;
     candidateId?: string;
     deferAttach?: boolean;
   } = {},
@@ -183,32 +182,23 @@ function setup(
   );
   const session = { user: { id: "user" }, epoch: 1, api };
   const connected = ref(true),
-    error = ref(""),
     active = ref(true);
   const clock = { ready: true, revision: 0, time: 0, now: () => clock.time };
   const checkClock = vi.fn();
   const scope = effectScope();
   const runtime = scope.run(() =>
-    createPlaybackRuntime({
-      session: session as any,
-      state: state as any,
-      connected,
-      active,
-      clock: clock as any,
-      checkClock,
-      error,
-      run: async (action) => {
-        if (options.clearsError) error.value = "";
-        try {
-          await action();
-        } catch (failure) {
-          if (!options.captureErrors) throw failure;
-          error.value =
-            failure instanceof Error ? failure.message : String(failure);
-        }
-      },
-    }),
+    createPlaybackRuntime(
+      playbackTestContext({
+        session: session as any,
+        state: state as any,
+        connected,
+        active,
+        clock: clock as any,
+        checkClock,
+      }),
+    ),
   )!;
+  const error = runtime.playbackError;
   const ranges = intervals(options.ranges ?? [[0, 120]]);
   const el: any = Object.assign(new EventTarget(), {
     src: "",
@@ -1423,7 +1413,6 @@ it.each(["NOT_FOUND", "METHOD_NOT_ALLOWED"] as const)(
     const s = setup({
       fileFallback: true,
       observationSeq: 0,
-      captureErrors: true,
     });
     const original = s.api.getMockImplementation()!;
     s.api.mockImplementation(async (path, method, body) => {
@@ -1557,7 +1546,6 @@ it("an identity replacement cannot resume a deferred old file continuation", asy
   const s = setup({
     fileFallback: true,
     observationSeq: 0,
-    captureErrors: true,
   });
   try {
     await s.prepare();
@@ -1587,7 +1575,6 @@ it("a newer media intent cancels a claimed file continuation and ignores its lat
   const s = setup({
     fileFallback: true,
     observationSeq: 0,
-    captureErrors: true,
   });
   let release!: () => void;
   const held = new Promise<void>((resolve) => {
@@ -2273,7 +2260,6 @@ it("telemetry failures cannot block apply, Stop session deletion or key cancella
 it("rate rejection and renewed support preserve unrelated visible errors", async () => {
   const s = setup({
     rate: 1.5,
-    clearsError: true,
     acceptRate: (rate, actual) => (rate === 1 ? 1 : actual),
   });
   try {

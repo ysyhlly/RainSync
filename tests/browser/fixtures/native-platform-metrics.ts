@@ -1,6 +1,6 @@
-import { effectScope, ref } from "vue";
+import { effectScope, readonly, ref } from "vue";
 import { createPlaybackRuntime } from "../../../apps/web/src/features/playback/playback-runtime";
-import type { PlaybackRuntimeContext } from "../../../apps/web/src/features/playback/playback-runtime-types";
+import type { RoomState } from "../../../packages/protocol";
 import type { PlaybackMetricsSnapshot } from "../../../apps/web/src/features/playback/playback-metrics";
 
 export type NativeMetricsEvidence = {
@@ -30,8 +30,7 @@ export async function startNativeMetricsFixture(ids: {
   media: string;
   user: string;
 }): Promise<NativeMetricsFixture> {
-  const error = ref("");
-  const state = ref({
+  const state = ref<RoomState>({
     room_id: ids.room,
     media_id: ids.media,
     media_generation: 7,
@@ -40,6 +39,9 @@ export async function startNativeMetricsFixture(ids: {
     anchor_position_ms: 0,
     anchor_server_time_ms: 0,
     playback_rate: 1,
+    controller_user_id: ids.user,
+    duration_ms: 45_000,
+    clock_epoch: "native-metrics-fixture",
   });
   const responseReceipts: unknown[] = [];
   const session = {
@@ -68,16 +70,35 @@ export async function startNativeMetricsFixture(ids: {
   const scope = effectScope();
   const runtime = scope.run(() =>
     createPlaybackRuntime({
-      session,
-      state,
-      connected: ref(true),
-      active: ref(true),
-      clock: { ready: true, revision: 1, now: () => 0 },
-      error,
+      identity: {
+        current: () =>
+          Object.freeze({ userId: session.user.id, epoch: session.epoch }),
+        invalidate: () => {},
+        subscribeInvalidation: () => () => {},
+      },
+      api: session.api,
+      timeline: {
+        state: readonly(state),
+        connected: readonly(ref(true)),
+        active: readonly(ref(true)),
+        clock: { ready: true, revision: 1, now: () => 0 },
+      },
       resolveMedia: async () => ({
         id: ids.media,
         kind: "native_platform",
         title: "Clear local Bilibili route fixture",
+        duration_ms: 45_000,
+        original_title: "Clear local Bilibili route fixture",
+        shared_title: null,
+        shared_title_revision: "0",
+        personal_title: null,
+        personal_title_revision: "0",
+        cover: {
+          status: "missing",
+          revision: "0",
+          url: null,
+          retry_after_ms: null,
+        },
         platform: {
           version: 1,
           provider: "bilibili",
@@ -85,8 +106,7 @@ export async function startNativeMetricsFixture(ids: {
           part: 1,
         },
       }),
-      run: async (action: () => Promise<void>) => action(),
-    } as unknown as PlaybackRuntimeContext),
+    }),
   )!;
   const element = document.createElement("video");
   element.muted = true;
@@ -108,7 +128,7 @@ export async function startNativeMetricsFixture(ids: {
       local: runtime.startupDiagnostics.value,
       stage: runtime.loadingStage.value,
       session: runtime.sessionId.value,
-      error: error.value,
+      error: runtime.playbackError.value,
       frames: callbacks,
       responseReceipts,
       video: {

@@ -7,7 +7,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer as createViteServer } from "vite";
-import { effectScope, ref } from "vue";
+import { effectScope, ref, watch } from "vue";
 import WebSocket from "ws";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
 import { delay } from "./fixtures/server.mjs";
@@ -39,6 +39,11 @@ const frontendInputs = [
   "apps/web/src/features/playback/playback-metrics.ts",
   "apps/web/src/features/playback/metrics-binding.ts",
   "apps/web/src/features/playback/playback-runtime.ts",
+  "apps/web/src/features/playback/playback-runtime-types.ts",
+  "apps/web/src/features/playback/playback-candidate-discovery.ts",
+  "apps/web/src/features/playback/platform-text-runtime.ts",
+  "apps/web/src/features/playback/live-window-recovery.ts",
+  "apps/web/src/shared/action-error.ts",
   "apps/web/src/errors.ts",
   "apps/web/src/playback-request.ts",
   "tests/playback-metrics-wire.mjs",
@@ -370,28 +375,23 @@ try {
       "document",
       Object.assign(new EventTarget(), { visibilityState: "visible" }),
     );
-    const state = ref(roomController.state),
-      error = ref("");
+    const state = ref(roomController.state);
     const clock = { ready: true, now: () => state.value.anchor_server_time_ms };
     const video = syntheticVideo();
     scope = effectScope();
     const runtime = scope.run(() =>
       createPlaybackRuntime({
-        session: { user: identity, epoch: 1, api },
-        state,
-        clock,
-        connected: ref(true),
-        active: ref(true),
-        error,
-        run: async (action) => {
-          try {
-            await action();
-          } catch (failure) {
-            runErrors.push(failure);
-          }
+        identity: {
+          current: () => ({ userId: identity.id, epoch: 1 }),
+          invalidate: () => {},
+          subscribeInvalidation: () => () => {},
         },
+        api,
+        timeline: { state, clock, connected: ref(true), active: ref(true) },
       }),
     );
+    const error = runtime.playbackError;
+    scope.run(() => watch(error, (message) => { if (message) runErrors.push(message); }, { flush: "sync" }));
     runtime.attach(video.el);
     const before = await scrape();
     await runtime.loadMedia();

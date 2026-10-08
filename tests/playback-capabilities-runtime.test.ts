@@ -1,3 +1,4 @@
+import { playbackTestContext } from "./helpers/playback-context";
 vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
   const { default: Hls } = await import("hls.js");
   return {
@@ -108,15 +109,15 @@ function setup(
   const scope = effectScope();
   const active = ref(true);
   const runtime = scope.run(() =>
-    createPlaybackRuntime({
-      session: session as any,
-      state: state as any,
-      connected: ref(true),
-      active,
-      clock: { ready: true, now: () => 10000 } as any,
-      error: ref(""),
-      run: async (action) => action(),
-    }),
+    createPlaybackRuntime(
+      playbackTestContext({
+        session: session as any,
+        state: state as any,
+        connected: ref(true),
+        active,
+        clock: { ready: true, now: () => 10000 } as any,
+      }),
+    ),
   )!;
   const element: any = Object.assign(new EventTarget(), {
     canPlayType: () => "maybe",
