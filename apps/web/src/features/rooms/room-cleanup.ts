@@ -55,6 +55,7 @@ export function parseRoomCleanupStatus(value: unknown): RoomCleanupStatus {
     },
   };
 }
+const CLEANUP_FALLBACK = "尚待确认释放的资源";
 export function cleanupBlockerLabel(code: string): string {
   const labels: Record<string, string> = {
     playback_requests: "播放准备请求",
@@ -70,6 +71,20 @@ export function cleanupBlockerLabel(code: string): string {
     distributed: "分布式播放",
     preparation_owners: "准备任务资源",
     leases: "仍在使用的资源",
+    legacy_agent_drain_unconfirmed: "旧版传输任务尚未确认释放",
+    playback_preparation_drain_unconfirmed: "播放准备尚未确认释放",
+    media_execution_drain_unconfirmed: "媒体读取尚未确认释放",
+    static_hls_capture_drain_unconfirmed: "视频分片读取尚未确认释放",
+    agent_transfer_drain_unconfirmed: "媒体传输尚未确认释放",
+    upstream_operation_unconfirmed: "上游操作尚未确认结束",
+    upstream_cleanup_failed: "上游清理失败",
+    legacy_upstream_cleanup_unconfirmed: "上游播放会话尚未确认释放",
+    upstream_cleanup_pending: "上游播放会话正在释放",
+    playback_revocation_pending: "播放正在停止",
+    distributed_compute_drain_unconfirmed: "分布式播放尚未确认释放",
+    room_cleanup_locked: "清理任务正在等待房间锁",
+    room_cleanup_timeout: "清理检查超时",
+    room_cleanup_retry: "清理将自动重试",
   };
-  return labels[code] ?? "尚待确认释放的资源";
+  return labels[code] ?? CLEANUP_FALLBACK;
 }

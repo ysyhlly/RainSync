@@ -28,6 +28,7 @@ export function mountSetup(
     _mergeModels: Vue.mergeModels,
     ref: Vue.ref,
     computed: Vue.computed,
+    defineAsyncComponent: Vue.defineAsyncComponent,
     watch: Vue.watch,
     onMounted: Vue.onMounted,
     onBeforeUnmount: Vue.onBeforeUnmount,

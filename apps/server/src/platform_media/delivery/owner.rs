@@ -4,7 +4,6 @@ use super::*;
 use futures_util::Stream;
 use sqlx::Acquire;
 use std::{
-    future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -42,14 +41,15 @@ impl Registry {
     }
 }
 
+type SourceNext<'a> =
+    futures_util::future::BoxFuture<'a, std::result::Result<Option<Vec<u8>>, bilibili::Error>>;
+type OpenedSource<'a> =
+    futures_util::future::BoxFuture<'a, std::result::Result<Box<dyn Source>, bilibili::Error>>;
+
 pub(super) trait Source: Send {
     fn status(&self) -> StatusCode;
     fn headers(&self) -> &HeaderMap;
-    fn next<'a>(
-        &'a mut self,
-    ) -> Pin<
-        Box<dyn Future<Output = std::result::Result<Option<Vec<u8>>, bilibili::Error>> + Send + 'a>,
-    >;
+    fn next<'a>(&'a mut self) -> SourceNext<'a>;
 }
 impl Source for MediaResponse {
     fn status(&self) -> StatusCode {
@@ -58,11 +58,7 @@ impl Source for MediaResponse {
     fn headers(&self) -> &HeaderMap {
         self.headers()
     }
-    fn next<'a>(
-        &'a mut self,
-    ) -> Pin<
-        Box<dyn Future<Output = std::result::Result<Option<Vec<u8>>, bilibili::Error>> + Send + 'a>,
-    > {
+    fn next<'a>(&'a mut self) -> SourceNext<'a> {
         Box::pin(self.next_chunk())
     }
 }
@@ -75,20 +71,10 @@ pub(super) struct Request {
     pub deadline: Deadline,
 }
 pub(super) trait Transport: Send + Sync + 'static {
-    fn open<'a>(
-        &'a self,
-        request: &'a Request,
-    ) -> Pin<
-        Box<dyn Future<Output = std::result::Result<Box<dyn Source>, bilibili::Error>> + Send + 'a>,
-    >;
+    fn open<'a>(&'a self, request: &'a Request) -> OpenedSource<'a>;
 }
 impl Transport for providers::platform::http::PlatformHttp {
-    fn open<'a>(
-        &'a self,
-        request: &'a Request,
-    ) -> Pin<
-        Box<dyn Future<Output = std::result::Result<Box<dyn Source>, bilibili::Error>> + Send + 'a>,
-    > {
+    fn open<'a>(&'a self, request: &'a Request) -> OpenedSource<'a> {
         Box::pin(async move {
             self.media_request_for(
                 &request.provider,

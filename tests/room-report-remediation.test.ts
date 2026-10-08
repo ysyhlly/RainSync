@@ -128,6 +128,32 @@ it.each(["save", "revoke", "kick"])(
     expect(p.controls.busy.value).toBe(false);
   },
 );
+it("labels current cleanup blocker codes in Chinese and falls back for unknown codes", () => {
+  const fallback = "尚待确认释放的资源";
+  const current = [
+    "legacy_agent_drain_unconfirmed",
+    "playback_preparation_drain_unconfirmed",
+    "media_execution_drain_unconfirmed",
+    "static_hls_capture_drain_unconfirmed",
+    "agent_transfer_drain_unconfirmed",
+    "upstream_operation_unconfirmed",
+    "upstream_cleanup_failed",
+    "legacy_upstream_cleanup_unconfirmed",
+    "upstream_cleanup_pending",
+    "playback_revocation_pending",
+    "distributed_compute_drain_unconfirmed",
+    "room_cleanup_locked",
+    "room_cleanup_timeout",
+    "room_cleanup_retry",
+  ];
+  for (const code of current) {
+    const label = cleanupBlockerLabel(code);
+    expect(label).not.toBe(fallback);
+    expect(label).not.toBe(code);
+  }
+  expect(cleanupBlockerLabel("legacy_upstream")).toBe("上游播放会话");
+  expect(cleanupBlockerLabel("not_a_real_blocker")).toBe(fallback);
+});
 it("preserves an unconfirmed cleanup barrier and defaults legacy retry capability to disabled", () => {
   const status = parseRoomCleanupStatus({
     lifecycle: "closing",

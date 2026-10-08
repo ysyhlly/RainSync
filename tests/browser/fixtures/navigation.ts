@@ -29,8 +29,9 @@ export async function showOptions(page: Page) {
   await page
     .locator("video")
     .dispatchEvent("pointermove", { pointerType: "mouse" });
-  // Keyboard focus also reveals chrome on touch devices.
-  await page.locator(".playback-options summary").focus();
+  // Keyboard focus also reveals chrome on touch devices. The direct child
+  // is the options disclosure; startup timing is a nested summary.
+  await page.locator(".playback-options > summary").focus();
   await expect(page.locator(".playback-options")).toBeVisible();
   if (
     !(await page
