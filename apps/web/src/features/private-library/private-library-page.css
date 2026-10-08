@@ -1,3 +1,8 @@
+.private-library-page .page-intro {
+  display: grid;
+  align-content: start;
+  gap: var(--space-1);
+}
 .private-library-page .library-workspace {
   display: grid;
   gap: var(--space-6);

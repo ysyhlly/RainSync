@@ -9,6 +9,9 @@ import {
 } from "../apps/web/src/features/library/library.store";
 import { useMediaCatalog } from "../apps/web/src/features/library/media-catalog.store";
 import { formatTime } from "../apps/web/src/shared/use-action";
+import { libraryPageSummary } from "../apps/web/src/features/library/library-summary";
+import { mediaEpisodeLabel } from "../apps/web/src/features/library/media-label";
+import { prewarmNativeDash } from "../apps/web/src/features/playback/dash-prewarm";
 import { readFileSync } from "node:fs";
 import { parse } from "@vue/compiler-sfc";
 
@@ -52,6 +55,7 @@ async function picker(api = vi.fn().mockResolvedValue(page())) {
     queueReceipt: vi.fn().mockReturnValue(""),
     queuePendingCount: 0,
   });
+  const closed = vi.fn();
   const p = mountSetup(
     new URL(
       "../apps/web/src/features/rooms/RoomMediaPicker.vue",
@@ -64,6 +68,9 @@ async function picker(api = vi.fn().mockResolvedValue(page())) {
       createLibraryState,
       useMediaCatalog,
       formatTime,
+      libraryPageSummary,
+      mediaEpisodeLabel,
+      prewarmNativeDash,
       LibraryHierarchy: {},
       MediaThumbnail: {},
       QueueFeedback: {},
@@ -71,11 +78,11 @@ async function picker(api = vi.fn().mockResolvedValue(page())) {
       AppIcon: {},
       Notice: {},
     },
-    { modelValue: true },
+    { modelValue: true, "onUpdate:modelValue": closed },
   );
   cleanup.push(p.unmount);
   await nextTick();
-  return { ...p, c: p.controls, session, runtime, rights, api };
+  return { ...p, c: p.controls, session, runtime, rights, api, closed };
 }
 it("uses an isolated browser snapshot and leaves the library page's query and cursor untouched", async () => {
   const p = await picker();
@@ -217,6 +224,41 @@ it("reports unconfirmed play without replaying a command on timeout", async () =
   expect(p.c.pendingPlay.value).toBe("");
   expect(p.c.playReceipts.value[film.id]).toMatchObject({ error: true });
   expect(p.runtime.choose).toHaveBeenCalledTimes(1);
+});
+it("closes immediately on current room confirmation and stays open on an unconfirmed send", async () => {
+  const p = await picker();
+  await p.c.play(film.id);
+  expect(p.closed).not.toHaveBeenCalled();
+  p.runtime.state.media_id = film.id;
+  expect(p.closed).toHaveBeenCalledExactlyOnceWith(false);
+});
+it("a previous drawer's late play confirmation cannot close a reopened drawer", async () => {
+  const p = await picker();
+  let confirm!: (sent: boolean) => void;
+  p.runtime.choose.mockReturnValueOnce(
+    new Promise((resolve) => {
+      confirm = resolve;
+    }),
+  );
+  const old = p.c.play(film.id);
+  p.setProps({ modelValue: false });
+  await nextTick();
+  p.setProps({ modelValue: true });
+  await nextTick();
+  p.runtime.state.media_id = film.id;
+  confirm(true);
+  await old;
+  expect(p.closed).not.toHaveBeenCalled();
+});
+it("a rejected play request keeps its drawer open with a local error", async () => {
+  const p = await picker();
+  p.runtime.choose.mockRejectedValueOnce(new Error("请求失败"));
+  await p.c.play(film.id);
+  expect(p.closed).not.toHaveBeenCalled();
+  expect(p.c.playReceipts.value[film.id]).toEqual({
+    message: "请求失败",
+    error: true,
+  });
 });
 it("does not claim a failed send succeeded or act while disconnected", async () => {
   const p = await picker();

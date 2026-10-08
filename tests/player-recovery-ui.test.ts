@@ -109,7 +109,8 @@ async function renderPlayer(
     name:
       | "PlaybackHost.vue"
       | "PlaybackInformation.vue"
-      | "PlaybackPreparation.vue",
+      | "PlaybackPreparation.vue"
+      | "PlaybackStartupDiagnostics.vue",
   ) {
     const filename = resolve(playerDirectory, name);
     if (components.has(filename)) return components.get(filename)!;
@@ -161,6 +162,11 @@ async function renderPlayer(
           return { __esModule: true, default: load("PlaybackInformation.vue") };
         case "./PlaybackPreparation.vue":
           return { __esModule: true, default: load("PlaybackPreparation.vue") };
+        case "./PlaybackStartupDiagnostics.vue":
+          return {
+            __esModule: true,
+            default: load("PlaybackStartupDiagnostics.vue"),
+          };
         case "./playback-preparation":
           return { describePlaybackPreparation };
         case "./PlaybackControls.vue":
@@ -584,20 +590,47 @@ it("a moderator with only pause permission is described as able to control playb
   );
 });
 
-
-it.each(["preparing", "queued", "transcoding", "cancelling", "cancelled", "failed"] as const)(
+it.each([
+  "preparing",
+  "queued",
+  "transcoding",
+  "cancelling",
+  "cancelled",
+  "failed",
+] as const)(
   "collapsed mini keeps the shared %s preparation feedback outside playback controls",
   async (phase) => {
     const runtime = fixture(labels.catchingUp);
-    runtime.preparation = { phase, failure: phase === "failed" ? { message: "处理失败", retryable: true } : undefined };
-    const html = await renderPlayer(runtime, { full: false, shortViewport: true });
+    runtime.preparation = {
+      phase,
+      failure:
+        phase === "failed"
+          ? { message: "处理失败", retryable: true }
+          : undefined,
+    };
+    const html = await renderPlayer(runtime, {
+      full: false,
+      shortViewport: true,
+    });
     const tree = elements(html);
-    const announcements = tree.filter((element) => ["status", "alert"].includes(element.attributes.role));
+    const announcements = tree.filter((element) =>
+      ["status", "alert"].includes(element.attributes.role),
+    );
     expect(announcements).toHaveLength(1);
-    expect(announcements[0].text).toContain(describePlaybackPreparation(runtime.preparation).label);
-    expect(announcements[0].ancestors.some((element) => hasClass(element, "player-caption"))).toBe(true);
-    const buttons = tree.filter((element) => element.tag === "button").map((element) => element.text);
-    expect(buttons.includes("取消准备")).toBe(["preparing", "queued", "transcoding"].includes(phase));
+    expect(announcements[0].text).toContain(
+      describePlaybackPreparation(runtime.preparation).label,
+    );
+    expect(
+      announcements[0].ancestors.some((element) =>
+        hasClass(element, "player-caption"),
+      ),
+    ).toBe(true);
+    const buttons = tree
+      .filter((element) => element.tag === "button")
+      .map((element) => element.text);
+    expect(buttons.includes("取消准备")).toBe(
+      ["preparing", "queued", "transcoding"].includes(phase),
+    );
     expect(html).toContain("mini-collapsed");
     expect(tree.filter((element) => element.tag === "video")).toHaveLength(1);
   },
@@ -613,7 +646,9 @@ it("only a connected empty room without an active task uses the compact return p
   runtime.preparation = { phase: "cancelling" };
   tree = elements(await renderPlayer(runtime, { full: false }));
   expect(hasClass(tree[0], "empty-room")).toBe(false);
-  expect(tree.some((element) => element.text.includes("正在取消播放准备"))).toBe(true);
+  expect(
+    tree.some((element) => element.text.includes("正在取消播放准备")),
+  ).toBe(true);
   runtime.preparation = { phase: "idle" };
   runtime.connected = false;
   tree = elements(await renderPlayer(runtime, { full: false }));

@@ -12,7 +12,7 @@ const availabilityId = useId();
 const controlDescription = computed(() => {
   if (!r.state?.media_id) return "尚未选择影片，暂不能控制房间播放。";
   if (!r.connected) return "房间连接尚未就绪，暂不能控制房间播放。";
-  if (!r.can(r.state?.playback_status === 'playing' ? 'pause' : 'play'))
+  if (!r.can(r.state?.playback_status === "playing" ? "pause" : "play"))
     return "你可以观看影片；房间播放由有控制权限的成员操作。本机静音只影响自己。";
   return "播放、进度和倍速影响房间所有观众；音量和静音只影响本机。";
 });
@@ -68,12 +68,18 @@ function end() {
     <span :id="availabilityId" class="sr-only">{{ controlDescription }}</span>
     <button
       class="icon-button control-play"
-      :aria-label="r.state?.playback_status === 'playing' ? '暂停房间播放' : '播放房间'"
+      :aria-label="
+        r.state?.playback_status === 'playing' ? '暂停房间播放' : '播放房间'
+      "
       :aria-describedby="availabilityId"
       :title="
         localUnavailable ? '控制房间共同播放，本机播放尚未就绪' : undefined
       "
-      :disabled="!r.can(r.state?.playback_status === 'playing' ? 'pause' : 'play') || !r.connected || !r.state?.media_id"
+      :disabled="
+        !r.can(r.state?.playback_status === 'playing' ? 'pause' : 'play') ||
+        !r.connected ||
+        !r.state?.media_id
+      "
       @click="r.send(r.state?.playback_status === 'playing' ? 'PAUSE' : 'PLAY')"
     >
       <AppIcon
@@ -85,7 +91,15 @@ function end() {
       >{{
         durationKnown
           ? formatTime(r.position) + " / " + formatTime(r.duration)
-          : "时长未知"
+          : r.loadingStage &&
+              [
+                "preparing",
+                "initializing",
+                "loading_media",
+                "waiting_frame",
+              ].includes(r.loadingStage)
+            ? "正在读取时长…"
+            : "时长未知"
       }}<template v-if="localUnavailable"> · 房间控制</template></span
     ><input
       v-if="!r.live"

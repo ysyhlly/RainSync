@@ -1,10 +1,12 @@
 import { onScopeDispose, ref } from "vue";
 import { StaleIdentity } from "./api/client";
 import { actionErrorMessage } from "./action-error";
+import { useTransientMessage } from "./use-transient-message";
 export function useAction() {
   const busy = ref(false),
     error = ref(""),
     message = ref("");
+  const { dismiss: dismissMessage } = useTransientMessage(message);
   let serial = 0,
     active = true;
   onScopeDispose(() => {
@@ -30,7 +32,7 @@ export function useAction() {
       if (active && id === serial) busy.value = false;
     }
   }
-  return { busy, error, message, run };
+  return { busy, error, message, run, dismissMessage };
 }
 export function formatTime(seconds: number) {
   if (!Number.isFinite(seconds)) return "--:--";

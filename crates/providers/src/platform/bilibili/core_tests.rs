@@ -792,6 +792,203 @@ async fn bilibili_core_client_resolves_fixture_and_reuses_wbi_cache() {
 }
 
 #[tokio::test]
+async fn bilibili_core_signing_cache_is_reused_by_separate_preparation_clients() {
+    let fixture = FixtureTransport::new(vec![(Endpoint::Nav, bytes(nav_json()))]);
+    let cache = Arc::new(WbiKeyCache::default());
+    let first = Client::with_wbi_cache(fixture.clone(), Some(login_cookie()), cache.clone());
+    let second = Client::with_wbi_cache(fixture.clone(), Some(login_cookie()), cache);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (_, first_generation) = first.wbi_key(deadline, None).await.unwrap();
+    let (_, second_generation) = second.wbi_key(deadline, None).await.unwrap();
+    assert_eq!(first_generation, second_generation);
+    assert_eq!(*fixture.seen.lock().unwrap(), vec![Endpoint::Nav]);
+}
+
+#[tokio::test]
+async fn bilibili_core_expired_signing_key_refreshes_and_failure_does_not_poison_cache() {
+    let fixture = FixtureTransport::new(vec![
+        (Endpoint::Nav, bytes(nav_json())),
+        (Endpoint::Nav, bytes(json!({"code":-400}))),
+        (Endpoint::Nav, bytes(nav_json())),
+    ]);
+    let cache = Arc::new(WbiKeyCache::default());
+    let client = Client::with_wbi_cache(fixture.clone(), None, cache.clone());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (_, original_generation) = client.wbi_key(deadline, None).await.unwrap();
+    cache.state.lock().await.cached.as_mut().unwrap().expires = Instant::now();
+    assert_eq!(
+        client.wbi_key(deadline, None).await.unwrap_err(),
+        Error::Api(-400)
+    );
+    assert!(cache.state.lock().await.cached.is_none());
+    let (_, next_generation) = client.wbi_key(deadline, None).await.unwrap();
+    assert!(next_generation > original_generation);
+    assert_eq!(fixture.seen.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn bilibili_core_concurrent_stale_signatures_trigger_one_shared_refresh() {
+    let fixture = FixtureTransport::new(vec![
+        (Endpoint::Nav, bytes(nav_json())),
+        (Endpoint::Nav, bytes(nav_json())),
+    ]);
+    let cache = Arc::new(WbiKeyCache::default());
+    let first = Client::with_wbi_cache(fixture.clone(), None, cache.clone());
+    let second = Client::with_wbi_cache(fixture.clone(), None, cache);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (_, old_generation) = first.wbi_key(deadline, None).await.unwrap();
+    let (a, b) = tokio::join!(
+        first.wbi_key(deadline, Some(old_generation)),
+        second.wbi_key(deadline, Some(old_generation)),
+    );
+    let (_, a) = a.unwrap();
+    let (_, b) = b.unwrap();
+    assert_eq!(a, b);
+    assert!(a > old_generation);
+    assert_eq!(fixture.seen.lock().unwrap().len(), 2);
+}
+
+struct GatedNavTransport {
+    calls: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl Transport for Arc<GatedNavTransport> {
+    fn get<'a>(
+        &'a self,
+        request: ApiRequest,
+        _: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<ApiResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            assert_eq!(request.endpoint(), Endpoint::Nav);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(ApiResponse {
+                status: 200,
+                body: bytes(nav_json()),
+                set_cookie: vec![],
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn bilibili_core_concurrent_cache_misses_singleflight_and_waiters_keep_deadline() {
+    let transport = Arc::new(GatedNavTransport {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let cache = Arc::new(WbiKeyCache::default());
+    let first = Arc::new(Client::with_wbi_cache(
+        transport.clone(),
+        None,
+        cache.clone(),
+    ));
+    let second = Client::with_wbi_cache(transport.clone(), None, cache);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let running = tokio::spawn(async move { first.wbi_key(deadline, None).await });
+    tokio::time::timeout_at(deadline, transport.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.wbi_key(Instant::now(), None).await.unwrap_err(),
+        Error::Deadline
+    );
+    let waiting = second.wbi_key(deadline, None);
+    let releasing = async {
+        // Poll the waiter with the refresh still in flight.
+        tokio::task::yield_now().await;
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        transport.release.notify_one();
+    };
+    let (waited, ()) = tokio::join!(waiting, releasing);
+    let (_, a) = running.await.unwrap().unwrap();
+    let (_, b) = waited.unwrap();
+    assert_eq!(a, b);
+    assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+struct ParallelStartupTransport {
+    barrier: tokio::sync::Barrier,
+    completed: std::sync::atomic::AtomicUsize,
+    deadline: Instant,
+}
+
+impl Transport for ParallelStartupTransport {
+    fn get<'a>(
+        &'a self,
+        request: ApiRequest,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<ApiResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            assert_eq!(deadline, self.deadline);
+            let body = match request.endpoint() {
+                Endpoint::Nav | Endpoint::View => {
+                    // Neither endpoint can finish until both were started.
+                    // A serial view -> nav implementation hits the deadline.
+                    self.barrier.wait().await;
+                    self.completed
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if request.endpoint() == Endpoint::Nav {
+                        nav_json()
+                    } else {
+                        view_json()
+                    }
+                }
+                Endpoint::PlayUrl => {
+                    assert_eq!(self.completed.load(std::sync::atomic::Ordering::SeqCst), 2);
+                    let params = request
+                        .url()
+                        .query_pairs()
+                        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                        .collect::<BTreeMap<_, _>>();
+                    assert_eq!(params["cid"], CID);
+                    assert_eq!(params["bvid"], BV);
+                    assert_eq!(params["w_rid"].len(), 32);
+                    let expiry = unix_seconds().unwrap() + 7200;
+                    let mut play = play_json();
+                    play["data"]["dash"]["video"][0]["baseUrl"] = json!(format!(
+                        "https://cdn.bilivideo.com/video.m4s?deadline={expiry}"
+                    ));
+                    play["data"]["dash"]["video"][0]["backupUrl"] = json!([]);
+                    play["data"]["dash"]["audio"][0]["baseUrl"] = json!(format!(
+                        "https://cdn.bilivideo.com/audio.m4s?deadline={expiry}"
+                    ));
+                    play
+                }
+                _ => panic!("unexpected login/media request"),
+            };
+            Ok(ApiResponse {
+                status: 200,
+                body: bytes(body),
+                set_cookie: vec![],
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn bilibili_core_starts_view_and_signing_key_together_before_signed_playurl() {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let client = Client::new(
+        ParallelStartupTransport {
+            barrier: tokio::sync::Barrier::new(2),
+            completed: std::sync::atomic::AtomicUsize::new(0),
+            deadline,
+        },
+        None,
+    );
+    let resolved = client
+        .resolve(&format!("{BV}?p=2"), 80, deadline)
+        .await
+        .unwrap();
+    assert_eq!(resolved.metadata, metadata());
+}
+
+#[tokio::test]
 async fn bilibili_core_client_refresh_is_bounded_and_permission_is_not_retried() {
     let fixture = FixtureTransport::new(vec![
         (Endpoint::View, bytes(view_json())),

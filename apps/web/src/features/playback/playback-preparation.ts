@@ -160,7 +160,10 @@ export function playbackFailureOwnsNotice(
   );
 }
 
-export function describePlaybackPreparation(state: PlaybackPreparationState) {
+export function describePlaybackPreparation(
+  state: PlaybackPreparationState,
+  loadingStage?: string,
+) {
   const labels: Record<PlaybackPreparationPhase, [string, string]> = {
     idle: ["", ""],
     preparing: ["正在准备影片", "正在检查片源并等待播放资源。"],
@@ -171,6 +174,16 @@ export function describePlaybackPreparation(state: PlaybackPreparationState) {
     cancelled: ["播放准备已取消", "可重新发起本地播放。"],
     failed: ["播放失败", state.failure?.message ?? "请检查连接或片源后重试。"],
   };
+  if (state.phase === "ready") {
+    const stages: Record<string, [string, string]> = {
+      initializing: ["正在启动播放器", "正在加载播放组件，随后加载音视频。"],
+      loading_media: ["正在加载音视频", "资源已准备好，正在读取音视频数据。"],
+      waiting_frame: ["正在等待画面", "音视频数据已到达，正在等待首帧显示。"],
+      playing: ["画面已就绪", ""],
+    };
+    if (loadingStage && stages[loadingStage])
+      labels.ready = stages[loadingStage];
+  }
   const [label, detail] = labels[state.phase];
   return {
     label,

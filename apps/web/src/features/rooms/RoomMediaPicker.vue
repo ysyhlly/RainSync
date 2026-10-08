@@ -5,6 +5,9 @@ import { useRoomRuntime } from "./room-runtime";
 import { createLibraryState } from "../library/library.store";
 import { useMediaCatalog } from "../library/media-catalog.store";
 import LibraryHierarchy from "../library/LibraryHierarchy.vue";
+import { libraryPageSummary } from "../library/library-summary";
+import { mediaEpisodeLabel } from "../library/media-label";
+import { prewarmNativeDash } from "../playback/dash-prewarm";
 import MediaThumbnail from "../library/MediaThumbnail.vue";
 import QueueFeedback from "./QueueFeedback.vue";
 import AppDialog from "../../shared/ui/AppDialog.vue";
@@ -34,6 +37,14 @@ const visible = computed(() => props.modelValue && allowed.value);
 const items = computed(() =>
   browser.items.map((item) => catalog.records[item.id] ?? item),
 );
+function prewarmItem(id: string) {
+  if (!visible.value || !runtime.connected || !runtime.can("change_media"))
+    return;
+  void prewarmNativeDash(
+    items.value.find((item) => item.id === id),
+    runtime.nativePlaybackMode,
+  );
+}
 const queryChanged = computed(
   () =>
     search.value !== browser.query ||
@@ -70,9 +81,11 @@ function resetBrowser() {
   search.value = "";
   browser.reset();
 }
+let dialogContext = 0;
 watch(
   visible,
   (open) => {
+    ++dialogContext;
     resetBrowser();
     if (open) void browser.browse(null);
   },
@@ -85,10 +98,15 @@ const playReceipts = ref<Record<string, Receipt>>({}),
 const pendingPlay = ref("");
 let context = 0;
 let playTimer: ReturnType<typeof setTimeout> | undefined;
+let playDialogContext: number | undefined;
 function finishPlay(id: string, receipt: Receipt) {
   clearTimeout(playTimer);
   playReceipts.value[id] = receipt;
   pendingPlay.value = "";
+  const confirmedHere =
+    !receipt.error && visible.value && playDialogContext === dialogContext;
+  playDialogContext = undefined;
+  if (confirmedHere) close();
 }
 function invalidate() {
   ++context;
@@ -143,7 +161,9 @@ async function play(id: string) {
   )
     return;
   const stamp = context;
+  prewarmItem(id);
   pendingPlay.value = id;
+  playDialogContext = dialogContext;
   playReceipts.value[id] = { message: "正在发送播放请求…" };
   try {
     const sent = await runtime.choose(id);
@@ -309,6 +329,9 @@ onBeforeUnmount(() => {
           />
           <div class="picker-media-copy">
             <h3 :title="media.title">{{ media.title }}</h3>
+            <p v-if="mediaEpisodeLabel(media)" class="helper">
+              {{ mediaEpisodeLabel(media) }}
+            </p>
             <p class="helper">
               {{ media.kind }} ·
               {{
@@ -323,6 +346,8 @@ onBeforeUnmount(() => {
               v-if="runtime.can('change_media')"
               class="primary"
               :aria-label="'立即播放 ' + media.title"
+              @pointerenter="prewarmItem(media.id)"
+              @focus="prewarmItem(media.id)"
               :aria-busy="pendingPlay === media.id"
               :disabled="
                 !runtime.connected ||
@@ -385,7 +410,8 @@ onBeforeUnmount(() => {
           上一页
         </button>
         <span
-          >第 {{ browser.page + 1 }} 页 · 本页 {{ browser.entryCount }} 项</span
+          >第 {{ browser.page + 1 }} 页 · 本页
+          {{ libraryPageSummary(browser.folders, items.length) }}</span
         >
         <button
           :disabled="browser.busy || queryChanged || !browser.hasMore"

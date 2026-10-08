@@ -2,6 +2,9 @@
 import "../../styles/room-layout.css";
 import QueueFeedback from "./QueueFeedback.vue";
 import RoomMediaPicker from "./RoomMediaPicker.vue";
+import InvitationShare from "../auth/InvitationShare.vue";
+import RoomCleanupPanel from "./RoomCleanupPanel.vue";
+import { prewarmNativeDash } from "../playback/dash-prewarm";
 import RoomViewingToolbar from "./RoomViewingToolbar.vue";
 import { createRoomViewingMode } from "./room-viewing-mode";
 import {
@@ -159,6 +162,7 @@ onMounted(() => {
 onBeforeUnmount(() => widthObserver?.disconnect());
 let viewingScroll = { x: 0, y: 0 };
 watch(viewingExpanded, async (expanded) => {
+  message.value = "";
   if (expanded) viewingScroll = { x: window.scrollX, y: window.scrollY };
   layoutCanvas.value?.cancelGesture();
   if (!expanded) {
@@ -212,6 +216,25 @@ async function showPlatformImport() {
 const currentMedia = computed(() =>
   catalog.roomRecord(r.room?.id, r.state?.media_id ?? undefined),
 );
+function prewarmQueueItem(id: string) {
+  if (!r.roomActive || !r.connected || !r.can("change_media")) return;
+  void prewarmNativeDash(
+    catalog.roomRecord(r.room?.id, id),
+    r.nativePlaybackMode,
+  );
+}
+function chooseQueueItem(id: string) {
+  prewarmQueueItem(id);
+  return r.choose(id);
+}
+watch(
+  currentMedia,
+  (media) => {
+    if (r.roomActive && r.connected)
+      void prewarmNativeDash(media, r.nativePlaybackMode);
+  },
+  { immediate: true },
+);
 const currentDuration = computed(() =>
   r.duration > 0 ? r.duration : (currentMedia.value?.duration_ms ?? 0) / 1000,
 );
@@ -252,10 +275,18 @@ const inviteRole = ref<"viewer" | "moderator">("viewer"),
   grantTtl = ref(24);
 const invitations = ref<RoomInviteRecord[]>([]);
 async function loadInvites() {
-  const id = r.room?.id;
+  const id = r.room?.id,
+    epoch = session.epoch;
   if (!id) return;
-  const result = await session.api<RoomInviteRecord[]>(`/rooms/${id}/invites`);
-  if (r.room?.id === id) invitations.value = result;
+  try {
+    const result = await session.api<RoomInviteRecord[]>(
+      `/rooms/${id}/invites`,
+    );
+    if (alive && r.room?.id === id && session.epoch === epoch)
+      invitations.value = result;
+  } catch (e) {
+    if (alive && r.room?.id === id && session.epoch === epoch) throw e;
+  }
 }
 async function showInvites() {
   inviteOpen.value = true;
@@ -263,8 +294,15 @@ async function showInvites() {
 }
 async function revokeSaved(id: string) {
   if (!r.room) return;
-  await session.api(`/rooms/${r.room.id}/invites/${id}`, "DELETE");
-  await loadInvites();
+  const room = r.room.id,
+    epoch = session.epoch;
+  try {
+    await session.api(`/rooms/${room}/invites/${id}`, "DELETE");
+    if (alive && r.room?.id === room && session.epoch === epoch)
+      await loadInvites();
+  } catch (e) {
+    if (alive && r.room?.id === room && session.epoch === epoch) throw e;
+  }
 }
 const lifecycleAction = ref<"close" | "reopen" | "archive" | "">("");
 const lifecycleTitle = computed(
@@ -274,6 +312,7 @@ const lifecycleTitle = computed(
     ],
 );
 const ownershipOpen = ref(false),
+  ownershipLoading = ref(false),
   members = ref<RoomMember[]>([]),
   selectedOwner = ref("");
 const ownerOptions = computed(() =>
@@ -316,36 +355,58 @@ watch(
   { immediate: true },
 );
 async function generate() {
-  invite.value = await r.makeInvite({
-    expires_in_seconds: Math.round(inviteTtl.value * 3600),
-    max_uses: inviteUses.value > 0 ? inviteUses.value : null,
-    invited_user_id: invitedAccount.value.trim() || null,
-    role: r.canManageRoom ? inviteRole.value : "viewer",
-    permissions:
-      r.canManageRoom && inviteRole.value === "moderator"
-        ? invitePermissions.value
-        : [],
-    grant_expires_in_seconds:
-      grantTtl.value > 0 ? Math.round(grantTtl.value * 3600) : null,
-  });
-  await loadInvites();
-  inviteOpen.value = true;
-}
-async function copy() {
-  if (!invite.value) return;
+  const room = r.room?.id,
+    epoch = session.epoch;
+  if (!room || !r.roomActive || !r.can("invite")) return;
+  const current = () =>
+    alive &&
+    r.room?.id === room &&
+    session.epoch === epoch &&
+    r.roomActive &&
+    r.can("invite");
   try {
-    await navigator.clipboard.writeText(JSON.stringify(invite.value));
-    message.value = "房间邀请已复制";
-  } catch {
-    error.value = "复制失败，请选中文本手动复制。";
+    const result = await r.makeInvite({
+      expires_in_seconds: Math.round(inviteTtl.value * 3600),
+      max_uses: inviteUses.value > 0 ? inviteUses.value : null,
+      invited_user_id: invitedAccount.value.trim() || null,
+      role: r.canManageRoom ? inviteRole.value : "viewer",
+      permissions:
+        r.canManageRoom && inviteRole.value === "moderator"
+          ? invitePermissions.value
+          : [],
+      grant_expires_in_seconds:
+        grantTtl.value > 0 ? Math.round(grantTtl.value * 3600) : null,
+    });
+    if (!current()) return;
+    if (result.room_id !== room)
+      throw Error("邀请信息与当前房间不一致，请重新生成");
+    invite.value = result;
+    await loadInvites();
+    if (current()) inviteOpen.value = true;
+  } catch (e) {
+    if (current()) throw e;
   }
 }
 async function revoke() {
   if (!invite.value) return;
-  await r.revokeInvite(invite.value);
-  invite.value = null;
-  revoking.value = false;
-  message.value = "此房间邀请已撤销";
+  const revoked = invite.value,
+    room = r.room?.id,
+    epoch = session.epoch;
+  try {
+    await r.revokeInvite(revoked);
+    if (
+      !alive ||
+      r.room?.id !== room ||
+      session.epoch !== epoch ||
+      invite.value !== revoked
+    )
+      return;
+    invite.value = null;
+    revoking.value = false;
+    message.value = "此房间邀请已撤销";
+  } catch (e) {
+    if (alive && r.room?.id === room && session.epoch === epoch) throw e;
+  }
 }
 async function leave() {
   const guest = session.user?.guest;
@@ -358,11 +419,26 @@ async function leave() {
 async function manageOwnership() {
   const id = r.room?.id;
   if (!id) return;
-  const result = await api.members(id);
-  if (!alive || r.room?.id !== id) return;
-  members.value = result;
+  const epoch = session.epoch;
+  managementOpen.value = false;
+  members.value = [];
   selectedOwner.value = "";
   ownershipOpen.value = true;
+  ownershipLoading.value = true;
+  try {
+    const result = await api.members(id);
+    if (
+      !alive ||
+      r.room?.id !== id ||
+      session.epoch !== epoch ||
+      !ownershipOpen.value
+    )
+      return;
+    members.value = result;
+  } finally {
+    if (r.room?.id === id && session.epoch === epoch)
+      ownershipLoading.value = false;
+  }
 }
 async function changeLifecycle() {
   if (!lifecycleAction.value) return;
@@ -482,9 +558,7 @@ async function transferOwnership() {
         />
       </div>
       <Notice :message="r.cleanupError" error />
-      <p v-if="r.room?.lifecycle === 'closing'" class="notice" role="status">
-        正在停止播放和清理媒体任务，完成后才会关闭。历史记录仍可查看。
-      </p>
+      <RoomCleanupPanel v-if="r.room?.lifecycle === 'closing'" />
       <PendingMediaSelection
         v-if="!session.user?.guest"
         class="room-pending-selection"
@@ -524,7 +598,7 @@ async function transferOwnership() {
                 "
                 >{{
                   r.presence
-                    ? `${r.presence.members.length} 人已上报在线`
+                    ? `${r.presence.members.length} 人在线`
                     : "在线状态未知"
                 }}
                 ·
@@ -550,7 +624,9 @@ async function transferOwnership() {
             <div class="room-media-title">
               <h2>{{ r.state?.media_id ? r.currentTitle : "开始一起观看" }}</h2>
               <span v-if="r.state?.media_id" class="room-media-status">{{
-                r.state.playback_status === "playing" ? "正在播放" : "已暂停"
+                r.state.playback_status === "playing"
+                  ? "房间播放中"
+                  : "房间已暂停"
               }}</span>
             </div>
             <p v-if="r.state?.media_id" class="helper">
@@ -650,7 +726,9 @@ async function transferOwnership() {
                       item.title)
                   "
                   :disabled="!r.can('change_media') || !r.connected"
-                  @click="r.choose(item.media_id)"
+                  @pointerenter="prewarmQueueItem(item.media_id)"
+                  @focus="prewarmQueueItem(item.media_id)"
+                  @click="chooseQueueItem(item.media_id)"
                 >
                   <AppIcon name="play" />
                 </button>
@@ -690,7 +768,13 @@ async function transferOwnership() {
         <PlatformMediaImport v-if="r.roomActive && r.can('queue')" />
       </div>
     </AppDialog>
-    <AppDialog v-model="managementOpen" title="房间管理" drawer :busy="busy">
+    <AppDialog
+      v-model="managementOpen"
+      title="房间管理"
+      drawer
+      :busy="busy"
+      close-label="关闭房间管理"
+    >
       <p>
         房间{{ r.lifecycleLabel }}。{{
           r.roomActive
@@ -776,7 +860,7 @@ async function transferOwnership() {
         <label
           >授予角色<select v-model="inviteRole">
             <option value="viewer">观看者</option>
-            <option value="moderator">Moderator</option>
+            <option value="moderator">协管员</option>
           </select></label
         >
         <fieldset v-if="inviteRole === 'moderator'">
@@ -806,17 +890,10 @@ async function transferOwnership() {
       >
         生成邀请
       </button>
-      <label v-if="invite"
-        >完整房间邀请<textarea
-          readonly
-          :value="JSON.stringify(invite)"
-          @focus="($event.target as HTMLTextAreaElement).select()"
-        /></label
-      ><Notice :message="error" error /><Notice :message="message" />
+      <InvitationShare v-if="invite" :invitation="invite" />
+      <Notice :message="error" error /><Notice :message="message" />
       <div v-if="invite" class="button-row">
-        <button class="primary" @click="copy">
-          <AppIcon name="copy" />复制邀请</button
-        ><button class="danger" @click="revoking = true">撤销此邀请</button>
+        <button class="danger" @click="revoking = true">撤销此邀请</button>
       </div>
       <div v-if="revoking" class="confirm-panel">
         <p>撤销后此邀请无法继续加入房间，现有成员不受影响。</p>
@@ -827,7 +904,7 @@ async function transferOwnership() {
       <h3 v-if="invitations.length">已创建邀请</h3>
       <article v-for="item in invitations" :key="item.id">
         <p>
-          {{ item.role === "moderator" ? "Moderator" : "观看者" }} · 已使用
+          {{ item.role === "moderator" ? "协管员" : "观看者" }} · 已使用
           {{ item.use_count }} / {{ item.max_uses ?? "不限" }} ·
           {{ item.revoked ? "已撤销" : item.expired ? "已过期" : "有效" }}
         </p>
@@ -876,7 +953,14 @@ async function transferOwnership() {
         ><button :disabled="busy" @click="lifecycleAction = ''">取消</button>
       </div>
     </AppDialog>
-    <AppDialog v-model="ownershipOpen" title="转让房间" :busy="busy">
+    <AppDialog
+      v-model="ownershipOpen"
+      title="转让房间"
+      drawer
+      :busy="busy"
+      close-label="关闭转让房间"
+    >
+      <p v-if="ownershipLoading" role="status">正在加载可接任的成员…</p>
       <p>
         选择已加入房间的成员作为新房主。新房主将获得播放、邀请和待播列表管理权限；你仍可观看和聊天。
       </p>
@@ -888,9 +972,9 @@ async function transferOwnership() {
         :options="ownerOptions"
         label="新房主"
         placeholder="选择房间成员"
-        :disabled="busy || !r.canManageRoom"
+        :disabled="busy || ownershipLoading || !r.canManageRoom"
       />
-      <p v-if="!ownerOptions.length" class="helper">
+      <p v-if="!ownershipLoading && !ownerOptions.length" class="helper">
         请先邀请其他成员加入房间。
       </p>
       <Notice :message="error" error />

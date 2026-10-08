@@ -14,12 +14,14 @@ defineProps<{
   <section
     class="presence-panel"
     :class="{ 'presence-panel--compact': compact }"
-    aria-label="已上报在线状态的连接"
+    aria-label="房间在线情况"
   >
     <p v-if="!snapshot" role="status">在线状态不可用</p>
     <template v-else>
-      <p role="status">{{ snapshot.members.length }} 位成员已上报在线状态</p>
-      <p v-if="!compact">仅显示已上报在线状态的连接；其他成员的状态未知。</p>
+      <p role="status">{{ snapshot.members.length }} 位成员在线</p>
+      <p v-if="!compact" class="helper">
+        只显示最近有连接的成员，其他成员状态未知。
+      </p>
       <ul v-if="snapshot.members.length">
         <li v-for="member in snapshot.members" :key="member.userId">
           <UserAvatar
@@ -27,7 +29,7 @@ defineProps<{
             :name="names?.[member.userId] || '房间成员'"
             :size="40"
           />
-          <span
+          <span class="presence-name"
             >{{ names?.[member.userId] || "房间成员"
             }}{{ member.userId === selfId ? "（你）" : "" }}</span
           >
@@ -41,7 +43,7 @@ defineProps<{
         </li>
       </ul>
       <p v-if="compact" class="presence-caveat helper">
-        仅显示已上报状态的连接；其他成员状态未知
+        在线情况可能稍有延迟，其他成员状态未知。
       </p>
     </template>
   </section>
@@ -50,6 +52,8 @@ defineProps<{
 <style scoped>
 .presence-panel {
   font-size: 0.875rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 p {
   margin: 0 0 0.5rem;
@@ -62,7 +66,18 @@ ul {
 li {
   display: flex;
   justify-content: space-between;
-  gap: 1rem;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.75rem;
   padding: 0.25rem 0;
+  min-width: 0;
+}
+.presence-name {
+  flex: 1 1 7rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+li > span:last-child {
+  flex: 0 0 auto;
 }
 </style>

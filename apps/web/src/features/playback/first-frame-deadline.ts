@@ -26,6 +26,7 @@ export function createFirstFrameDeadline(ctx: {
   let remaining = FIRST_FRAME_TIMEOUT_MS;
   let startedAt = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
   function clear() {
     if (timer !== undefined) {
       const elapsed = now() - startedAt;
@@ -55,6 +56,9 @@ export function createFirstFrameDeadline(ctx: {
   }
   function sync() {
     if (!current() || !source) return;
+    // An exhausted route remains observed. The same attachment can present
+    // late without a new request; cancellation still retires its callbacks.
+    if (timedOut) return;
     if (ctx.suspended()) {
       clear();
       return;
@@ -67,7 +71,7 @@ export function createFirstFrameDeadline(ctx: {
       timer = undefined;
       if (!current() || source !== captured) return;
       if (ctx.suspended()) return;
-      stop();
+      timedOut = true;
       ctx.timeout();
     }, remaining);
   }

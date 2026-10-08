@@ -338,36 +338,57 @@ onBeforeUnmount(() => {
 <template>
   <section id="bilibili-account" class="panel platform-account-panel">
     <h3>Bilibili 账号</h3>
-    <p>
-      每位观众使用自己的账号权限。未连接时可尝试匿名播放，会员和地区限制仍由平台决定。
-    </p>
+    <p>连接自己的 Bilibili 账号，用于自己的观影请求。</p>
+    <details class="helper">
+      <summary>了解更多</summary>
+      <p>
+        每位观众使用自己的账号权限。未连接时可尝试匿名播放，会员和地区限制仍由平台决定。
+      </p>
+    </details>
     <p role="status">
       {{
         account.status?.state === "connected"
           ? "已保存扫码登录会话"
           : account.status?.state === "expired"
             ? "登录已过期"
-            : account.status
-              ? "未连接"
-              : "正在读取状态…"
+            : account.status?.state === "revoked" && account.status.id
+              ? "此服务器已解除连接，自动续期已停止"
+              : account.status
+                ? "未连接"
+                : "正在读取状态…"
       }}
     </p>
-    <p class="helper" role="status">
+    <p
+      v-if="account.status?.state === 'connected'"
+      class="helper"
+      role="status"
+    >
       {{ platformAccountCheckMessage(account.lastCheck) }}
     </p>
-    <p class="helper" role="status">
+    <p
+      v-if="account.status?.state === 'connected'"
+      class="helper"
+      role="status"
+    >
       {{
         renewalPhase === "loading"
           ? "正在确认自动续期状态…"
           : !currentRenewal
             ? "续期状态暂未确认，请刷新状态重试"
-            : account.status?.state === "revoked"
-              ? "此服务器已解除连接，自动续期已停止"
-              : currentRenewal.enabled
-                ? "已同意后台自动续期，仅在本次 RainSync 登录有效时运行"
-                : currentRenewal.state === "uncertain"
-                  ? "续期结果不确定，已停止继续刷新，请重新扫码确认"
-                  : "自动续期未启用；须在新的扫码登录时另外同意保留刷新令牌"
+            : currentRenewal.enabled
+              ? "已同意后台自动续期，仅在本次 RainSync 登录有效时运行"
+              : currentRenewal.state === "uncertain"
+                ? "续期结果不确定，已停止继续刷新，请重新扫码确认"
+                : "自动续期未启用；须在新的扫码登录时另外同意保留刷新令牌"
+      }}
+    </p>
+    <p v-else-if="account.status" class="helper">
+      {{
+        account.status.state === "expired"
+          ? "请重新扫码连接以恢复平台权限。"
+          : account.status.state === "revoked" && account.status.id
+            ? "需要时可以重新扫码连接。"
+            : "扫码连接后可使用自己的平台权限；当前未启用自动续期。"
       }}
     </p>
     <button
@@ -426,9 +447,12 @@ onBeforeUnmount(() => {
           type="checkbox"
         />我另外同意此服务器保存刷新令牌，自动续期自己的 Bilibili 会话</label
       >
-      <p class="helper">
-        默认不启用自动续期。平台必须在这次登录中返回刷新令牌才能启用；旧会话无法补造令牌。停止或解除连接会删除刷新材料并阻止后续请求，已发送的请求可能已经完成。续期更换会话后，旧播放授权会失效，需要重新播放
-      </p>
+      <details class="helper">
+        <summary>了解自动续期</summary>
+        <p>
+          默认不启用自动续期。平台必须在这次登录中返回刷新令牌才能启用；旧会话无法补造令牌。停止或解除连接会删除刷新材料并阻止后续请求，已发送的请求可能已经完成。续期更换会话后，旧播放授权会失效，需要重新播放
+        </p>
+      </details>
       <p v-if="login.phase === 'starting'" role="status">正在准备二维码…</p>
       <template
         v-if="

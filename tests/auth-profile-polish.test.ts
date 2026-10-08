@@ -21,6 +21,7 @@ import {
   validateNickname,
 } from "../apps/web/src/features/auth/account-rules";
 import { RequestFailure } from "../apps/web/src/errors";
+import { clearInvitation } from "../apps/web/src/features/auth/invitation-intent";
 
 const dispose: (() => void)[] = [];
 afterEach(() => {
@@ -45,6 +46,7 @@ function auth(file: "LoginPage" | "RegisterPage") {
     new URL(`../apps/web/src/features/auth/${file}.vue`, import.meta.url),
     {
       guestRoomPath,
+      clearInvitation,
       parseGuestInvitation,
       validateNickname,
       RegistrationConfirmationRequired,
@@ -115,6 +117,7 @@ it("login input changes clear a stale failure and leaving aborts the current att
 });
 it("an invalid invitation is linked to its field and clears when that field changes", async () => {
   const p = auth("RegisterPage");
+  p.controls.code.value = "RS-INVALID";
   p.session.api = vi.fn().mockRejectedValue(
     new RequestFailure({
       error: {

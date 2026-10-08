@@ -61,7 +61,8 @@ describe("room layout model", () => {
     expect(player.w).toBeGreaterThan(chat.w);
     expect(chat.x).toBe(player.w);
     expect(queue.y).toBeGreaterThan(player.y + player.h);
-    expect(queue.w).toBeLessThan(player.w);
+    expect(queue.w).toBe(player.w);
+    expect(members.h).toBe(14);
     expect(members.x).toBe(chat.x);
     expect(members.y).toBeGreaterThan(chat.y + chat.h);
   });

@@ -4,6 +4,9 @@ import { createLibraryState } from "./library.store";
 import { useMediaCatalog } from "./media-catalog.store";
 import { useVisiblePreviews } from "./use-visible-previews";
 import LibraryHierarchy from "./LibraryHierarchy.vue";
+import LibraryLoading from "./LibraryLoading.vue";
+import { libraryPageSummary } from "./library-summary";
+import { mediaEpisodeLabel } from "./media-label";
 import MediaThumbnail from "./MediaThumbnail.vue";
 import Notice from "../../shared/ui/Notice.vue";
 import { formatTime } from "../../shared/use-action";
@@ -38,7 +41,8 @@ defineExpose({ refresh: browser.refresh });
       :total-media="browser.loaded ? browser.totalMedia : undefined"
       @navigate="browser.browse($event)"
     />
-    <p v-if="browser.busy" role="status">正在加载目录…</p>
+    <LibraryLoading v-if="!browser.loaded && !browser.error" />
+    <p v-else-if="browser.busy" role="status">正在加载目录…</p>
     <Notice v-if="browser.error" :message="browser.error" error />
     <button
       v-if="browser.error"
@@ -74,6 +78,9 @@ defineExpose({ refresh: browser.refresh });
         />
         <div class="browser-media-copy">
           <h3 :title="media.title">{{ media.title }}</h3>
+          <p v-if="mediaEpisodeLabel(media)" class="helper">
+            {{ mediaEpisodeLabel(media) }}
+          </p>
           <p class="helper">
             {{ media.kind }} ·
             {{
@@ -100,7 +107,8 @@ defineExpose({ refresh: browser.refresh });
         上一页
       </button>
       <span
-        >第 {{ browser.page + 1 }} 页 · 本页 {{ browser.entryCount }} 项</span
+        >第 {{ browser.page + 1 }} 页 · 本页
+        {{ libraryPageSummary(browser.folders, items.length) }}</span
       >
       <button
         :disabled="browser.busy || !browser.hasMore"

@@ -103,6 +103,12 @@ async function validate() {
     registrationMode.value !== "invite_only"
   )
     return;
+  if (!code.value.trim()) {
+    error.value = "请填写注册邀请码。";
+    fieldError.value = { field: "code", message: error.value };
+    await focus("register-code");
+    return;
+  }
   busy.value = true;
   error.value = "";
   fieldError.value = null;
@@ -191,7 +197,7 @@ async function register() {
     return;
   }
   if (password.value !== confirm.value) {
-    error.value = "两次输入的密码不一致";
+    error.value = confirm.value ? "两次输入的密码不一致" : "请再次输入密码。";
     fieldError.value = { field: "confirm", message: error.value };
     await focus("register-confirm");
     return;
@@ -293,7 +299,12 @@ async function recover() {
       <RouterLink class="brand" to="/">RainSync</RouterLink>
       <RouterLink :to="loginLocation">返回登录</RouterLink>
     </div>
-    <div class="registration-panel">
+    <div
+      class="registration-panel"
+      :class="{
+        'registration-panel--simple': registrationMode !== 'invite_only',
+      }"
+    >
       <aside class="registration-steps">
         <h1 id="registration-title">
           {{
@@ -355,6 +366,7 @@ async function recover() {
         <form
           v-else-if="step === 1 && registrationMode === 'invite_only'"
           :aria-busy="busy"
+          novalidate
           @submit.prevent="validate"
         >
           <header class="auth-step-heading">
@@ -396,6 +408,7 @@ async function recover() {
             registrationMode === 'open' || registrationMode === 'invite_only'
           "
           :aria-busy="busy"
+          novalidate
           @submit.prevent="register"
         >
           <header class="auth-step-heading">
@@ -436,6 +449,14 @@ async function recover() {
             <p id="account-help" class="helper field-hint">
               唯一且注册后不可修改。支持字母、数字、_、- 和 .。
             </p>
+            <p
+              v-if="fieldError?.field === 'username'"
+              id="register-error"
+              class="field-error"
+              role="alert"
+            >
+              {{ fieldError.message }}
+            </p>
           </div>
           <div class="form-field">
             <label for="register-display_name">昵称（可选）</label>
@@ -452,7 +473,16 @@ async function recover() {
               "
             />
             <p id="nickname-help" class="helper field-hint">
-              最多50个字符，支持中文与Emoji，可以重复或稍后修改。留空显示登录账号。
+              最多 50 个字符，支持中文与
+              Emoji，可以重复或稍后修改。留空显示登录账号。
+            </p>
+            <p
+              v-if="fieldError?.field === 'display_name'"
+              id="register-error"
+              class="field-error"
+              role="alert"
+            >
+              {{ fieldError.message }}
             </p>
           </div>
           <div class="form-field">
@@ -483,7 +513,15 @@ async function recover() {
               </button>
             </div>
             <p id="password-help" class="helper field-hint">
-              至少8个英文字符、数字、英文符号或空格，不支持中文。空格将保留。
+              至少 8 个英文字符、数字、英文符号或空格，不支持中文。空格将保留。
+            </p>
+            <p
+              v-if="fieldError?.field === 'password'"
+              id="register-error"
+              class="field-error"
+              role="alert"
+            >
+              {{ fieldError.message }}
             </p>
           </div>
           <div class="form-field">
@@ -500,8 +538,20 @@ async function recover() {
                 fieldError?.field === 'confirm' ? 'register-error' : undefined
               "
             />
+            <p
+              v-if="fieldError?.field === 'confirm'"
+              id="register-error"
+              class="field-error"
+              role="alert"
+            >
+              {{ fieldError.message }}
+            </p>
           </div>
-          <Notice id="register-error" :message="error" error />
+          <Notice
+            id="register-server-error"
+            :message="fieldError ? '' : error"
+            error
+          />
           <button
             v-if="!uncertain"
             class="primary"

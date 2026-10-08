@@ -193,10 +193,7 @@ onBeforeUnmount(() => {
 <template>
   <section class="panel platform-account-panel">
     <h3>{{ label }} 账号会话</h3>
-    <p>
-      抖音与 TikTok
-      是独立平台，账号会话不能混用。每位观众只能使用自己导入的会话，会员、年龄和地区限制仍由平台决定。
-    </p>
+    <p>导入自己的 {{ label }} 网页会话，用于自己的观影请求。</p>
     <p role="status">
       {{
         status?.state === "connected"
@@ -208,9 +205,16 @@ onBeforeUnmount(() => {
               : "正在读取状态…"
       }}
     </p>
-    <p class="helper">
-      网页播放会话不提供直接扫码登录；下方的官方开放平台授权需要单独配置。导入成功只表示会话已加密保存，不能保证仍已登录或具有视频访问权限。
-    </p>
+    <details class="helper">
+      <summary>了解更多</summary>
+      <p>
+        抖音与 TikTok
+        是独立平台，账号会话不能混用。每位观众只能使用自己导入的会话，会员、年龄和地区限制仍由平台决定。
+      </p>
+      <p>
+        网页播放会话不提供直接扫码登录；下方的官方开放平台授权需要单独配置。导入成功只表示会话已加密保存，不能保证仍已登录或具有视频访问权限。
+      </p>
+    </details>
     <OfficialPlatformAccountPanel :provider="props.provider" />
     <div class="button-row">
       <button class="primary" :disabled="unlinkBusy" @click="showImport">

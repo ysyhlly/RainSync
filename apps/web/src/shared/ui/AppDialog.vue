@@ -7,6 +7,7 @@ const props = defineProps<{
   drawer?: boolean;
   busy?: boolean;
   canClose?: () => boolean;
+  closeLabel?: string;
 }>();
 const emit = defineEmits<{ "update:modelValue": [boolean] }>();
 const dialog = ref<HTMLDialogElement>(),
@@ -168,7 +169,7 @@ onBeforeUnmount(() => {
       <h2 :id="titleId" tabindex="-1">{{ title }}</h2>
       <button
         class="icon-button"
-        aria-label="关闭弹窗"
+        :aria-label="closeLabel || '关闭弹窗'"
         :disabled="busy"
         @click="close"
       >

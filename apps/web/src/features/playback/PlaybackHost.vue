@@ -192,7 +192,8 @@ const preparationVisible = computed(
     !(
       r.preparation.phase === "preparing" && r.recoveryState === "calibrating"
     ) &&
-    (r.preparation.phase !== "ready" || r.waiting),
+    (r.preparation.phase !== "ready" ||
+      (r.loadingStage ? r.loadingStage !== "playing" : r.waiting)),
 );
 watch(
   () => r.preparation?.phase,
@@ -459,22 +460,25 @@ onBeforeUnmount(() => {
         >
       </div>
       <button
-        v-if="r.blocked"
+        v-if="r.blocked && !layoutLocked"
         class="primary autoplay"
         @click="r.run(r.enablePlayback)"
       >
         点击加入播放
       </button>
       <PlaybackPreparation
-        v-if="(full || fullscreen) && preparationVisible"
+        v-if="(full || fullscreen) && preparationVisible && !layoutLocked"
         class="preparation-overlay"
         :state="r.preparation"
+        :loading-stage="r.loadingStage"
+        :diagnostics="r.startupDiagnostics"
         :can-retry="r.connected && r.roomActive"
         @cancel="r.run(r.cancelPreparation)"
         @retry="r.run(r.loadMedia)"
       />
       <span
         v-if="
+          !layoutLocked &&
           !preparationVisible &&
           (((full || fullscreen) && r.recoveryLabel) ||
             (!r.recoveryLabel && r.waiting && r.state?.media_id))
@@ -554,6 +558,8 @@ onBeforeUnmount(() => {
           v-if="!full && !fullscreen && preparationVisible"
           compact
           :state="r.preparation"
+          :loading-stage="r.loadingStage"
+          :diagnostics="r.startupDiagnostics"
           :can-retry="r.connected && r.roomActive"
           @cancel="r.run(r.cancelPreparation)"
           @retry="r.run(r.loadMedia)"

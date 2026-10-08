@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import type { PlaybackMetricsSnapshot } from "./playback-metrics";
+import PlaybackStartupDiagnostics from "./PlaybackStartupDiagnostics.vue";
 import {
   describePlaybackPreparation,
   type PlaybackPreparationState,
@@ -10,11 +12,15 @@ const props = withDefaults(
     state: PlaybackPreparationState;
     compact?: boolean;
     canRetry?: boolean;
+    loadingStage?: string;
+    diagnostics?: PlaybackMetricsSnapshot;
   }>(),
   { compact: false, canRetry: true },
 );
 const emit = defineEmits<{ cancel: []; retry: [] }>();
-const view = computed(() => describePlaybackPreparation(props.state));
+const view = computed(() =>
+  describePlaybackPreparation(props.state, props.loadingStage),
+);
 </script>
 
 <template>
@@ -42,6 +48,13 @@ const view = computed(() => describePlaybackPreparation(props.state));
         {{ Math.ceil(state.failure.retryAfterMs / 1000) }} 秒后重试。
       </p>
     </div>
+    <p
+      v-if="state.phase === 'ready' && loadingStage === 'waiting_frame'"
+      class="helper"
+    >
+      有数据不代表画面已显示；等待过久时会提供重新加载入口。
+    </p>
+    <PlaybackStartupDiagnostics v-if="diagnostics" :diagnostics="diagnostics" />
     <div
       v-if="view.cancel || view.retry || view.account || view.chooseMedia"
       class="preparation-actions"

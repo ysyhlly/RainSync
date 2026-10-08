@@ -36,7 +36,8 @@ defineEmits<{ navigate: [node: string | null] }>();
         class="helper hierarchy-count"
         title="包含当前目录与所有子目录中可浏览的影片"
       >
-        共 {{ totalMedia }} 部影片
+        {{ breadcrumbs.length > 1 ? "此目录及子目录" : "所有可访问片源" }}共
+        {{ totalMedia }} 部影片
       </p>
     </div>
     <div v-if="folders.length" class="folder-grid">
@@ -53,7 +54,7 @@ defineEmits<{ navigate: [node: string | null] }>();
         <span class="folder-copy"
           ><strong>{{ folder.name }}</strong
           ><span class="helper"
-            >{{ folder.type === "source" ? "片源" : "目录" }} ·
+            >{{ folder.type === "source" ? "片源" : "目录" }} · 已索引
             {{ folder.media_count }} 部影片</span
           ></span
         >

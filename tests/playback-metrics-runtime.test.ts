@@ -408,12 +408,117 @@ test("new explicit intent replaces meter; pause and autoplay enable keep the exi
     expect(s.prepares()[1][2].playback_metrics.meter_start_generation).toBe(2);
     await vi.advanceTimersByTimeAsync(8000);
     const current = s.metrics().find((c) => c[2].meter_start_generation === 2)!;
-    expect(current[2].elapsed_ms).toBe(8000);
+    expect(current[2].elapsed_ms).toBe(5000);
   } finally {
     s.cleanup();
   }
 });
 
+test.each([1, 123, 2000])(
+  "a logical meter begun %i ms after construction samples at its first eligible 5s",
+  async (offset) => {
+    const s = setup({ versions: [2] });
+    try {
+      await vi.advanceTimersByTimeAsync(offset);
+      await s.runtime.loadMedia();
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(s.metrics()).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(s.metrics()[0][2]).toMatchObject({
+        elapsed_ms: 5000,
+        seq: 1,
+        meter_start_generation: 1,
+      });
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(s.metrics()).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(s.metrics()[1][2]).toMatchObject({ elapsed_ms: 10000, seq: 2 });
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+test("same-meter fallback/plan replacement does not restart its intent-aligned sampling timer", async () => {
+  const s = setup({ versions: [2, 2] });
+  try {
+    await vi.advanceTimersByTimeAsync(333);
+    await s.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(1000);
+    s.frame();
+    s.el.error = { code: 3 };
+    s.el.onerror();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.prepares()[1][2].playback_metrics.meter_start_generation).toBe(1);
+    await vi.advanceTimersByTimeAsync(3999);
+    expect(s.metrics()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(s.metrics()[0][2]).toMatchObject({
+      elapsed_ms: 5000,
+      seq: 1,
+      plan_generation: 2,
+      meter_start_generation: 1,
+      first_frame_plan_generation: 1,
+    });
+  } finally {
+    s.cleanup();
+  }
+});
+test("pause/background observations keep the same 5s cadence without fabricated first frames or duplicate seq", async () => {
+  const s = setup({ versions: [2] });
+  try {
+    await vi.advanceTimersByTimeAsync(900);
+    await s.runtime.loadMedia();
+    s.state.value.playback_status = "paused";
+    s.el.pause();
+    s.document.visibilityState = "hidden";
+    s.document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(s.metrics()[0][2]).toMatchObject({
+      elapsed_ms: 5000,
+      seq: 1,
+      totals: { background_ms: 5000 },
+    });
+    expect(s.metrics()[0][2]).not.toHaveProperty("first_frame");
+    s.document.visibilityState = "visible";
+    s.document.dispatchEvent(new Event("visibilitychange"));
+    s.frame(); // An actual observed frame ends startup; pause then owns its time.
+    s.el.pause();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(s.metrics()).toHaveLength(2);
+    expect(s.metrics()[1][2]).toMatchObject({
+      elapsed_ms: 10000,
+      seq: 2,
+      totals: { background_ms: 5000, paused_ms: 5000 },
+    });
+    expect(s.prepares()).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("optional sample failure keeps a bounded cadence and intent teardown clears its timer", async () => {
+  const original = playbackMetrics.createPlaybackMetrics;
+  const sample = vi.fn(() => undefined);
+  const factory = vi
+    .spyOn(playbackMetrics, "createPlaybackMetrics")
+    .mockImplementation((config) => ({ ...original(config), sample }));
+  const s = setup({ versions: [2] });
+  try {
+    await s.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(5000);
+    const callsAtDeadline = sample.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(sample).toHaveBeenCalledTimes(callsAtDeadline);
+    expect(s.metrics()).toHaveLength(0);
+    await s.runtime.reset();
+    const callsAfterReset = sample.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sample).toHaveBeenCalledTimes(callsAfterReset);
+  } finally {
+    factory.mockRestore();
+    s.cleanup();
+  }
+});
 test("slow final metrics POST cannot delay exact observation-v1 Stop and key cleanup", async () => {
   const s = setup({ slowFinal: true });
   try {

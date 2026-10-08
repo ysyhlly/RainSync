@@ -3,6 +3,7 @@ import { nextTick, reactive } from "vue";
 import { mountSetup } from "./helpers/mount-setup";
 import * as timeline from "../apps/web/src/features/rooms/timeline-chat";
 import * as viewState from "../apps/web/src/features/rooms/timeline-view-state";
+import { useTransientMessage } from "../apps/web/src/shared/use-transient-message";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
@@ -47,6 +48,7 @@ function fixture() {
       useSession: () => ({ epoch: 1, api }),
       ...timeline,
       ...viewState,
+      useTransientMessage,
     },
     { visible: true },
   );

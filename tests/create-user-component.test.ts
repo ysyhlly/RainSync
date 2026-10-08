@@ -123,7 +123,7 @@ it("keeps validation local and preserves invalid input for correction", async ()
   c.password.value = "short";
   await c.submit();
   expect(api).not.toHaveBeenCalled();
-  expect(c.error.value).toContain("密码须为8–1024个");
+  expect(c.error.value).toContain("密码须为 8–1024 个");
   expect(c.password.value).toBe("short");
   expect(c.busy.value).toBe(false);
 });

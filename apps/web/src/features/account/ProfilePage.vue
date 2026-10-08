@@ -350,7 +350,7 @@ onBeforeUnmount(() => {
                 :disabled="busy"
               />
               <p id="profile-name-help" class="field-hint">
-                可选、可重复，最多50个字符。留空显示登录账号。
+                可选、可重复，最多 50 个字符。留空显示登录账号。
               </p>
               <p
                 v-if="nameError"

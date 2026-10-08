@@ -123,3 +123,12 @@ export type PlaybackRecoveryState =
   | "reconnecting"
   | "background"
   | "failed";
+/** Browser startup phases; SDK or usable-data readiness never proves a frame. */
+export type PlaybackLoadingStage =
+  | "idle"
+  | "preparing"
+  | "initializing"
+  | "loading_media"
+  | "waiting_frame"
+  | "playing"
+  | "failed";

@@ -8,6 +8,7 @@ import PlatformTextSettings from "./PlatformTextSettings.vue";
 import LocalHlsLadderSettings from "./LocalHlsLadderSettings.vue";
 import NativeHlsLadderSettings from "./NativeHlsLadderSettings.vue";
 import AdvancedPlaybackSettings from "./AdvancedPlaybackSettings.vue";
+import PlaybackStartupDiagnostics from "./PlaybackStartupDiagnostics.vue";
 const props = defineProps<{ active: boolean }>();
 const r = useRoomRuntime();
 const emit = defineEmits<{ openChange: [value: boolean] }>();
@@ -110,13 +111,20 @@ onBeforeUnmount(() => {
         >
       </p>
       <div class="option-fields">
+        <PlaybackStartupDiagnostics :diagnostics="r.startupDiagnostics" />
         <p v-if="r.upstreamMeasuredOutput" class="helper">
           上游同会话抽样输出：{{ r.upstreamMeasuredOutput.video.codec }}
           {{ r.upstreamMeasuredOutput.video.profile }}，
-          {{ r.upstreamMeasuredOutput.video.width }}×{{ r.upstreamMeasuredOutput.video.height }}
-          <template v-if="r.upstreamMeasuredOutput.audio">，音频 {{ r.upstreamMeasuredOutput.audio.sample_rate }} Hz</template>。
-          仅验证本次有限样本，不代表整部影片
-          <span v-if="r.upstreamMeasuredMatchesRequested === false">；观察值与请求参数存在差异</span>
+          {{ r.upstreamMeasuredOutput.video.width }}×{{
+            r.upstreamMeasuredOutput.video.height
+          }}
+          <template v-if="r.upstreamMeasuredOutput.audio"
+            >，音频
+            {{ r.upstreamMeasuredOutput.audio.sample_rate }} Hz</template
+          >。 仅验证本次有限样本，不代表整部影片
+          <span v-if="r.upstreamMeasuredMatchesRequested === false"
+            >；观察值与请求参数存在差异</span
+          >
         </p>
         <label v-if="r.nativePlatform"
           >平台播放方式<AppSelect
@@ -134,7 +142,11 @@ onBeforeUnmount(() => {
           HLS 支持和服务器工作进程；失败后保留所选方式。
         </p>
         <NativeHlsLadderSettings
-          v-if="r.nativePlatform && !r.live && ['compatibility', 'adaptive'].includes(r.nativePlaybackMode)"
+          v-if="
+            r.nativePlatform &&
+            !r.live &&
+            ['compatibility', 'adaptive'].includes(r.nativePlaybackMode)
+          "
           :enabled="r.nativePlaybackMode === 'adaptive'"
           :compatibility="true"
           :renditions="r.nativeLadderRenditions"
@@ -142,7 +154,9 @@ onBeforeUnmount(() => {
           :selected="r.ladderSelected"
           :manual="r.ladderManual"
           :disabled="!r.state?.media_id"
-          @enabled-change="r.nativePlaybackMode = $event ? 'adaptive' : 'compatibility'"
+          @enabled-change="
+            r.nativePlaybackMode = $event ? 'adaptive' : 'compatibility'
+          "
           @quality-change="r.selectLadderQuality"
         />
         <label v-if="r.nativePlatform && r.nativeQualityOptions.length"
@@ -164,7 +178,11 @@ onBeforeUnmount(() => {
           v-if="r.nativePlatform && r.nativeQualitySelectedHeight"
           class="helper"
         >
-          {{ r.nativeEncodedHeight || r.nativeLadderRenditions ? "平台源清晰度" : "当前清晰度" }}：{{
+          {{
+            r.nativeEncodedHeight || r.nativeLadderRenditions
+              ? "平台源清晰度"
+              : "当前清晰度"
+          }}：{{
             r.nativeQualitySelectedHeight
           }}p。手动选择设置分辨率上限，实际以平台返回的兼容视频为准。
         </p>
@@ -185,8 +203,9 @@ onBeforeUnmount(() => {
             ]"
         /></label>
         <p v-if="!r.nativePlatform && r.mode === 'finite_hls'" class="helper">
-          仅用于已登记的 HTTP 有限、无 DRM HLS。单一 AVC/AAC 片源或选定的主列表，
-          最多 300 秒、64 段、128 MiB，先验证实际帧时钟再转码；可证明的时间戳重置会归一化，
+          仅用于已登记的 HTTP 有限、无 DRM HLS。单一 AVC/AAC
+          片源或选定的主列表， 最多 300 秒、64 段、128
+          MiB，先验证实际帧时钟再转码；可证明的时间戳重置会归一化，
           变化初始化、直播、多音轨及无法连续映射的音频会拒绝。选择后点击重新加载。
           不能同时启用高级处理、多档、分布式产物或回退。
         </p>

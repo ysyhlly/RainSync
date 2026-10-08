@@ -27,17 +27,63 @@ pub async fn status(
     if !user.admin {
         member(&app, &user, id).await?;
     }
+    let mut tx = app.db.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
     let row = sqlx::query("SELECT r.lifecycle,r.lifecycle_epoch,r.owner_id,s.state FROM rooms r JOIN room_snapshots s ON s.room_id=r.id WHERE r.id=$1")
-        .bind(id).fetch_optional(&app.db).await?
+        .bind(id).fetch_optional(&mut *tx).await?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
-    let cleanup = sqlx::query("SELECT attempts,last_error,completed_at IS NOT NULL AS completed FROM room_cleanup_tasks WHERE room_id=$1 AND lifecycle_epoch=$2")
-        .bind(id).bind(row.get::<i64,_>("lifecycle_epoch")).fetch_optional(&app.db).await?;
+    let epoch = row.get::<i64, _>("lifecycle_epoch");
+    let lifecycle = row.get::<String, _>("lifecycle");
+    let mut blockers = vec![];
+    if lifecycle == "closing" {
+        if !distributed_compute::room_drained(&mut tx, id).await? {
+            blockers.push("distributed_compute_drain_unconfirmed");
+        }
+        blockers.extend(
+            persistence::room_cleanup::blockers(
+                &mut tx,
+                &persistence::room_cleanup::Task {
+                    room: id,
+                    epoch,
+                    owner: Uuid::nil(),
+                },
+            )
+            .await?,
+        );
+    }
+    let cleanup = sqlx::query("SELECT attempts,last_error,completed_at IS NOT NULL AS completed,lease_owner IS NOT NULL AND lease_until>clock_timestamp() AS lease_active,FLOOR(EXTRACT(epoch FROM next_attempt_at)*1000)::bigint AS next_attempt_at_ms,GREATEST(0,FLOOR(EXTRACT(epoch FROM (clock_timestamp()-created_at))*1000))::bigint AS elapsed_ms FROM room_cleanup_tasks WHERE room_id=$1 AND lifecycle_epoch=$2")
+        .bind(id).bind(epoch).fetch_optional(&mut *tx).await?;
+    let cleanup = cleanup.map(|cleanup| {
+        let completed = cleanup.get::<bool, _>("completed");
+        let lease_active = cleanup.get::<bool, _>("lease_active");
+        let last_error = cleanup.get::<Option<String>, _>("last_error");
+        let phase = if completed {
+            "completed"
+        } else if lease_active {
+            "running"
+        } else if !blockers.is_empty() || last_error.is_some() {
+            "waiting"
+        } else {
+            "queued"
+        };
+        json!({
+            "attempts":cleanup.get::<i32,_>("attempts"),
+            "last_error":last_error,"completed":completed,"blockers":blockers,
+            "next_attempt_at_ms":cleanup.get::<i64,_>("next_attempt_at_ms"),
+            "elapsed_ms":cleanup.get::<i64,_>("elapsed_ms"),
+            "lease_active":lease_active,"phase":phase,
+            "retryable":lifecycle == "closing" && !completed,
+        })
+    });
+    tx.rollback().await?;
     Ok(responses::ok_json(json!({
-        "lifecycle":row.get::<String,_>("lifecycle"),
-        "lifecycle_epoch":row.get::<i64,_>("lifecycle_epoch"),
+        "lifecycle":lifecycle,
+        "lifecycle_epoch":epoch,
         "owner_id":row.get::<Uuid,_>("owner_id"),
         "state":row.get::<Value,_>("state"),
-        "cleanup":cleanup.map(|row| json!({"attempts":row.get::<i32,_>("attempts"),"last_error":row.get::<Option<String>,_>("last_error"),"completed":row.get::<bool,_>("completed")})),
+        "cleanup":cleanup,
     })))
 }
 
@@ -48,6 +94,65 @@ pub async fn close(
     Json(body): Json<Change>,
 ) -> Result<Response> {
     change(&app, &h, id, body, "active", "closing").await
+}
+
+/// Reschedule the current closing epoch without stealing a live cleanup owner,
+/// reopening admission, revoking new state, or manufacturing any owner receipt.
+pub async fn retry_cleanup(
+    State(app): State<App>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Change>,
+) -> Result<Response> {
+    let user = auth(&app, &h, true).await?;
+    let mut tx = app.db.begin().await?;
+    let room = sqlx::query(
+        "SELECT owner_id,lifecycle,lifecycle_epoch FROM rooms WHERE id=$1 FOR NO KEY UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
+    let state: RoomState = serde_json::from_value(
+        sqlx::query_scalar("SELECT state FROM room_snapshots WHERE room_id=$1 FOR UPDATE")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?,
+    )
+    .map_err(anyhow::Error::from)?;
+    let membership: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM room_members WHERE room_id=$1 AND user_id=$2 FOR KEY SHARE",
+    )
+    .bind(id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let authority = management_authority::Authority::admit_action(
+        &mut tx,
+        &h,
+        user.id,
+        room.get("owner_id"),
+        membership.is_some(),
+        Some((id, protocol::RoomPermission::Close)),
+    )
+    .await?;
+    if state.revision != body.expected_revision {
+        return Err(err(StatusCode::CONFLICT, "revision_conflict"));
+    }
+    if room.get::<String, _>("lifecycle") != "closing" {
+        return Err(err(StatusCode::CONFLICT, "room_lifecycle_conflict"));
+    }
+    let epoch = room.get::<i64, _>("lifecycle_epoch");
+    // Recreate an absent task too. INSERT is idempotent and does not clear any
+    // durable execution/cleanup state or shorten the old owner's lease.
+    sqlx::query("INSERT INTO room_cleanup_tasks(room_id,lifecycle_epoch) VALUES($1,$2) ON CONFLICT DO NOTHING")
+        .bind(id).bind(epoch).execute(&mut *tx).await?;
+    let scheduled = sqlx::query("UPDATE room_cleanup_tasks SET next_attempt_at=clock_timestamp() WHERE room_id=$1 AND lifecycle_epoch=$2 AND completed_at IS NULL AND (lease_until IS NULL OR lease_until<=clock_timestamp())")
+        .bind(id).bind(epoch).execute(&mut *tx).await?.rows_affected() > 0;
+    authority.commit(tx).await?;
+    Ok(responses::ok_json(
+        json!({"lifecycle":"closing","lifecycle_epoch":epoch,"cleanup":{"scheduled":scheduled}}),
+    ))
 }
 pub async fn reopen(
     State(app): State<App>,

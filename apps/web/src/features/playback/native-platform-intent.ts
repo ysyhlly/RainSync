@@ -12,7 +12,8 @@ import {
 import { validLocalHlsRenditions } from "./local-hls-ladder-intent";
 import { createPlatformDashFence } from "../../../../../packages/player-core/dash";
 
-export type NativePlatformPlaybackMode = "auto" | "native" | "compatibility" | "adaptive";
+export type NativePlatformPlaybackMode =
+  "auto" | "native" | "compatibility" | "adaptive";
 /** Independent transport observations, not a promise about provider permission
  * or codec discovery. A selected compatibility failure never returns native. */
 export function nativePlatformPlaybackChoice(
@@ -26,14 +27,18 @@ export function nativePlatformPlaybackChoice(
   live = false,
 ): "native" | "compatibility" | "unsupported" {
   const hls = capabilities.native_hls || capabilities.mse_h264_aac;
-  if (live) return hls && mode !== "compatibility" && mode !== "adaptive" ? "native" : "unsupported";
+  if (live)
+    return hls && mode !== "compatibility" && mode !== "adaptive"
+      ? "native"
+      : "unsupported";
   const native =
     provider === "bilibili"
       ? capabilities.mse_h264_aac
       : provider === "youtube"
         ? capabilities.mse_h264_aac || capabilities.progressive_h264_aac
         : capabilities.progressive_h264_aac;
-  if (mode === "compatibility" || mode === "adaptive") return hls ? "compatibility" : "unsupported";
+  if (mode === "compatibility" || mode === "adaptive")
+    return hls ? "compatibility" : "unsupported";
   if (native) return "native";
   return mode === "auto" && hls ? "compatibility" : "unsupported";
 }
@@ -59,14 +64,21 @@ export function validNativeCompatibilityDeliveryUrl(
     const url = new URL(value, origin),
       entry = new URL(plan.playback_url, origin);
     const prefix = `/api/v1/platform-delivery/${plan.session_id}/compatibility/`;
-    const ladder=plan.native_platform?.compatibility?.mode === "hls_avc_aac_ladder";
+    const ladder =
+      plan.native_platform?.compatibility?.mode === "hls_avc_aac_ladder";
     const path = url.pathname.slice(prefix.length),
       actual = plan.native_platform?.compatibility?.output?.attempt;
     const rung = path.split("/")[0];
     const segment = path.match(/\/index(0|[1-9][0-9]*)\.m4s$/)?.[1];
-    if (ladder && path !== "master.m3u8" &&
-        (!plan.native_platform?.compatibility?.output?.renditions?.some(r => r.id === rung) ||
-         (segment !== undefined && Number(segment) >= 20000))) return false;
+    if (
+      ladder &&
+      path !== "master.m3u8" &&
+      (!plan.native_platform?.compatibility?.output?.renditions?.some(
+        (r) => r.id === rung,
+      ) ||
+        (segment !== undefined && Number(segment) >= 20000))
+    )
+      return false;
     const query =
       actual === undefined || actual === null
         ? /^\?token=[a-f0-9]{64}$/
@@ -81,10 +93,17 @@ export function validNativeCompatibilityDeliveryUrl(
       query.test(url.search) &&
       url.search === entry.search &&
       (ladder
-        ? (path === "master.m3u8" || (!entryOnly && actual != null &&
-            /^(?:low|medium|high)\/(?:index\.m3u8|init\.mp4|index(?:0|[1-9][0-9]*)\.m4s)$/.test(path)))
-        : (path === "index.m3u8" || (!entryOnly && actual != null &&
-            (path === "init.mp4" || /^index(?:0|[1-9][0-9]*)\.m4s$/.test(path)))))
+        ? path === "master.m3u8" ||
+          (!entryOnly &&
+            actual != null &&
+            /^(?:low|medium|high)\/(?:index\.m3u8|init\.mp4|index(?:0|[1-9][0-9]*)\.m4s)$/.test(
+              path,
+            ))
+        : path === "index.m3u8" ||
+          (!entryOnly &&
+            actual != null &&
+            (path === "init.mp4" ||
+              /^index(?:0|[1-9][0-9]*)\.m4s$/.test(path))))
     );
   } catch {
     return false;
@@ -128,7 +147,7 @@ export function validNativeCompatibilityPlan(
   )
     return false;
   const output = binding.output;
-  const ladder=intent.mode === "hls_avc_aac_ladder";
+  const ladder = intent.mode === "hls_avc_aac_ladder";
   if (plan.transport === "pending_hls") {
     if (
       output != null ||
@@ -140,18 +159,22 @@ export function validNativeCompatibilityPlan(
   } else if (plan.transport === "hls") {
     if (
       !output ||
-      Object.keys(output).sort().join(",") !== (ladder
-        ? "attempt,codecs,complete,height,renditions,width"
-        : "attempt,codecs,complete,height,width") ||
-      !Number.isSafeInteger(output.attempt) || output.attempt <= 0 ||
+      Object.keys(output).sort().join(",") !==
+        (ladder
+          ? "attempt,codecs,complete,height,renditions,width"
+          : "attempt,codecs,complete,height,width") ||
+      !Number.isSafeInteger(output.attempt) ||
+      output.attempt <= 0 ||
       typeof output.complete !== "boolean" ||
       (ladder
-        ? (!validLocalHlsRenditions(output.renditions) ||
-           output.width !== output.renditions.at(-1)?.width ||
-           output.height !== output.renditions.at(-1)?.height ||
-           output.codecs !== output.renditions.at(-1)?.codecs ||
-           output.renditions.some(r => !r.codecs.endsWith(",mp4a.40.2")))
-        : (output.codecs !== "avc1.64001F,mp4a.40.2" || output.width !== 1280 || output.height !== 720)) ||
+        ? !validLocalHlsRenditions(output.renditions) ||
+          output.width !== output.renditions.at(-1)?.width ||
+          output.height !== output.renditions.at(-1)?.height ||
+          output.codecs !== output.renditions.at(-1)?.codecs ||
+          output.renditions.some((r) => !r.codecs.endsWith(",mp4a.40.2"))
+        : output.codecs !== "avc1.64001F,mp4a.40.2" ||
+          output.width !== 1280 ||
+          output.height !== 720) ||
       plan.pending_job_id != null
     )
       return false;
@@ -193,8 +216,11 @@ export function nativePlatformRequest(input: {
   compatibility?: boolean;
   compatibility_ladder?: boolean;
   course?: boolean;
+  /** Existing optional metrics negotiation for finite Bilibili playback only. */
+  playback_metrics?: PlaybackRequest["playback_metrics"];
 }): PlaybackRequest {
-  if (input.compatibility_ladder && !input.compatibility) throw new TypeError("多清晰度 HLS 需要兼容播放模式");
+  if (input.compatibility_ladder && !input.compatibility)
+    throw new TypeError("多清晰度 HLS 需要兼容播放模式");
   if (input.live && (input.compatibility || input.course))
     throw new TypeError("直播不支持有限媒体转码或课程播放选项");
   const provider = input.provider ?? "bilibili",
@@ -209,18 +235,33 @@ export function nativePlatformRequest(input: {
     position_ms: input.live ? 0 : input.position_ms,
     mode: input.compatibility ? "transcode" : "direct",
     audio_index: null,
+    ...(bilibili && !input.live && !input.course && input.playback_metrics
+      ? {
+          playback_metrics_version: 1,
+          playback_metrics_supported_versions: [1, 2],
+          playback_metrics: { ...input.playback_metrics },
+        }
+      : {}),
     capabilities: {
       progressive_h264_aac: !bilibili && input.progressive_h264_aac === true,
       native_hls:
         (input.live === true || input.compatibility === true) &&
         input.native_hls === true,
       mse_h264_aac:
-        (dashPlayback || input.compatibility === true || input.live === true) && input.mse_h264_aac,
+        (dashPlayback || input.compatibility === true || input.live === true) &&
+        input.mse_h264_aac,
     },
     native_platform: {
       version: 1,
       ...(input.compatibility
-        ? { compatibility: { version: 1, mode: input.compatibility_ladder ? "hls_avc_aac_ladder" as const : "hls_avc_aac" as const } }
+        ? {
+            compatibility: {
+              version: 1,
+              mode: input.compatibility_ladder
+                ? ("hls_avc_aac_ladder" as const)
+                : ("hls_avc_aac" as const),
+            },
+          }
         : {}),
       ...(input.course ? { course_version: 1 } : {}),
       ...(input.live ? { live_version: bilibili ? 1 : 2 } : {}),
@@ -361,7 +402,8 @@ export function validNativePlatformPlan(
     // Server chooses a transport from this exact capability snapshot. A bad
     // DASH response must fail closed, never become a client-side MP4 fallback.
     const livePlayback =
-      request.native_platform?.live_version === (provider === "bilibili" ? 1 : 2) &&
+      request.native_platform?.live_version ===
+        (provider === "bilibili" ? 1 : 2) &&
       binding?.live?.version === request.native_platform?.live_version &&
       plan.transport === "hls" &&
       (request.capabilities?.mse_h264_aac === true ||

@@ -21,6 +21,17 @@
   overflow: hidden;
   box-shadow: var(--shadow-panel);
 }
+.registration-panel.registration-panel--simple {
+  grid-template-columns: minmax(0, 1fr);
+  max-width: 560px;
+}
+.registration-panel--simple .registration-steps {
+  padding-bottom: 20px;
+  background: var(--surface-panel);
+}
+.registration-panel--simple .registration-form {
+  padding-top: 8px;
+}
 .registration-steps {
   padding: 36px 28px;
   background: var(--surface-muted);

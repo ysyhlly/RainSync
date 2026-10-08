@@ -3,6 +3,7 @@
 use crate::*;
 use providers::platform::bilibili::{self, Client};
 use tokio::time::{Duration, Instant as Deadline};
+pub(crate) mod bilibili_cache;
 mod bilibili_compatibility_probe;
 mod course;
 mod delivery;
@@ -12,6 +13,7 @@ mod quality;
 mod resolver;
 pub(crate) mod transcode;
 mod youtube_probe;
+pub(crate) use delivery::owner::Registry as NativeDeliveryRegistry;
 pub(crate) use delivery::{TextScope, admit_text, check_text};
 pub use delivery::{manifest, track};
 use descriptor::{Binding, Descriptor, Sealed, Transport};
@@ -455,9 +457,21 @@ async fn resolve_and_publish(
         available_heights = heights;
         (descriptor, expiry)
     } else if entry.provider == "bilibili" {
-        let resolved = Client::new(
+        let signing_cache = app
+            .bilibili_signing_keys
+            .for_scope(
+                user.id,
+                login,
+                account.account_id(),
+                account.revision(),
+                deadline,
+            )
+            .await
+            .map_err(provider_error)?;
+        let resolved = Client::with_wbi_cache(
             DiagnosticTransport(app.platform_http),
             account.cookie().cloned(),
+            signing_cache,
         )
         .resolve(
             &entry.resource(),

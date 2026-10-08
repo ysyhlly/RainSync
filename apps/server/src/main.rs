@@ -102,6 +102,8 @@ use uuid::Uuid;
 pub struct App {
     control_cluster: Option<control_cluster::Runtime>,
     platform_http: providers::platform::http::PlatformHttp,
+    bilibili_signing_keys: Arc<platform_media::bilibili_cache::Registry>,
+    native_delivery_owners: Arc<platform_media::NativeDeliveryRegistry>,
     youtube: providers::platform::youtube::YoutubeResolver,
     live_playback: native_live::LiveStore,
     other_live_playback: native_other_live::LiveStore,
@@ -625,6 +627,8 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     let app = App {
         control_cluster: control_cluster.clone(),
         platform_http: providers::platform::http::PlatformHttp::new(),
+        bilibili_signing_keys: Arc::new(Default::default()),
+        native_delivery_owners: Arc::new(Default::default()),
         youtube: native_platform_config::configured_youtube()?,
         live_playback: native_live::LiveStore::default(),
         other_live_playback: native_other_live::LiveStore::default(),
@@ -723,6 +727,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     let other_live_playback = app.other_live_playback.clone();
     let platform_oauth_exchanges = app.platform_oauth_exchanges.clone();
     let native_transcode_delivery = app.native_transcode_delivery.clone();
+    let native_delivery_owners = app.native_delivery_owners.clone();
     let router = Router::new()
         .route(
             "/api/v1/admin/settings",
@@ -1051,6 +1056,10 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         .route("/api/v1/rooms/{id}/owner", post(room_ownership::transfer))
         .route("/api/v1/rooms/{id}/lifecycle", get(room_lifecycle::status))
         .route("/api/v1/rooms/{id}/close", post(room_lifecycle::close))
+        .route(
+            "/api/v1/rooms/{id}/cleanup/retry",
+            post(room_lifecycle::retry_cleanup),
+        )
         .route("/api/v1/rooms/{id}/reopen", post(room_lifecycle::reopen))
         .route("/api/v1/rooms/{id}/archive", post(room_lifecycle::archive))
         .route("/api/v1/rooms/{id}/join", post(rooms::join))
@@ -1187,6 +1196,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
             live_playback.close_admission();
             other_live_playback.close_admission();
             native_transcode_delivery.close_admission();
+            native_delivery_owners.close_admission();
             if let Some(renewal) = &mut platform_renewal { renewal.close(); }
             platform_oauth_exchanges.close();
             let _ = stop.send(());
@@ -1210,6 +1220,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     live_playback.close_admission();
     other_live_playback.close_admission();
     native_transcode_delivery.close_admission();
+    native_delivery_owners.close_admission();
     if let Some(renewal) = &mut platform_renewal {
         renewal.close();
     }
@@ -1222,6 +1233,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         live_result,
         other_live_result,
         native_transcode_result,
+        native_delivery_result,
         platform_renewal_result,
         oauth_exchange_result,
     ) = tokio::join!(
@@ -1231,6 +1243,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
         live_playback.drain(),
         other_live_playback.drain(),
         native_transcode_delivery.drain(),
+        native_delivery_owners.drain(),
         async {
             match &mut platform_renewal {
                 Some(renewal) => renewal.drain().await,
@@ -1246,6 +1259,7 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
     live_result?;
     other_live_result?;
     native_transcode_result?;
+    native_delivery_result?;
     platform_renewal_result
         .map_err(|_| anyhow::anyhow!("platform account renewal drain unconfirmed"))?;
     oauth_exchange_result

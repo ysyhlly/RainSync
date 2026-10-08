@@ -1,10 +1,20 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount } from "vue";
+import {
+  ref,
+  computed,
+  watch,
+  onMounted,
+  onBeforeUnmount,
+  nextTick,
+} from "vue";
 import { useRouter } from "vue-router";
 import { useSession } from "../auth/session.store";
 import { useRoomRuntime } from "./room-runtime";
 import { roomsApi } from "./rooms.api";
 import { createRoomSubmission } from "./room-creation";
+import { parseGuestInvitation } from "../auth/guest-session";
+import { prewarmNativeDash } from "../playback/dash-prewarm";
+import { useMediaCatalog } from "../library/media-catalog.store";
 import type { Room } from "../../shared/api/types";
 import { useAction } from "../../shared/use-action";
 import AppDialog from "../../shared/ui/AppDialog.vue";
@@ -21,6 +31,7 @@ const session = useSession(),
   runtime = useRoomRuntime(),
   api = roomsApi(session.api),
   router = useRouter();
+const catalog = useMediaCatalog();
 const { busy, error, run } = useAction();
 const { busy: loading, error: loadError, run: runLoad } = useAction();
 const submitRoom = createRoomSubmission(api.create, () => session.user?.id);
@@ -33,6 +44,23 @@ const rooms = ref<Room[]>([]),
   token = ref(""),
   pasted = ref("");
 const inviteParsed = ref(false);
+const nameError = ref(""),
+  nameInput = ref<HTMLInputElement>(),
+  joinError = ref("");
+watch(
+  [name, createOpen],
+  () => {
+    nameError.value = "";
+  },
+  { flush: "sync" },
+);
+watch(
+  [roomId, token, pasted, joinOpen],
+  () => {
+    joinError.value = "";
+  },
+  { flush: "sync" },
+);
 let navigationIntent = 0;
 watch(
   [createOpen, joinOpen],
@@ -108,19 +136,33 @@ function retryLoad() {
 }
 async function enter(room: Room, intent = navigationIntent) {
   if (!alive || intent !== navigationIntent) return;
+  if (runtime.room?.id === room.id && runtime.state?.media_id)
+    void prewarmNativeDash(
+      catalog.roomRecord(room.id, runtime.state.media_id),
+      runtime.nativePlaybackMode,
+    );
   await runtime.enter(room);
   if (!alive || intent !== navigationIntent) return;
   await router.push("/rooms/" + room.id);
 }
 function submitCreate() {
   if (busy.value) return;
+  nameError.value = !name.value.trim()
+    ? "请输入房间名称"
+    : [...name.value.trim()].length > 120
+      ? "房间名称最多 120 个字符"
+      : "";
+  if (nameError.value) {
+    void nextTick(() => nameInput.value?.focus());
+    return;
+  }
   return run(create);
 }
 async function create() {
   const submittedName = name.value,
     intent = navigationIntent;
-  if (!submittedName.trim() || [...submittedName].length > 120)
-    throw Error("房间名称须为1–120个字符");
+  if (!submittedName.trim() || [...submittedName.trim()].length > 120)
+    throw Error("房间名称须为 1–120 个字符");
   const result = await submitRoom(submittedName);
   if (!alive) return;
   const sameDraft = name.value === submittedName;
@@ -143,7 +185,7 @@ async function create() {
 }
 function parse() {
   try {
-    const value = JSON.parse(pasted.value);
+    const value = parseGuestInvitation(pasted.value, window.location.origin);
     if (
       !value ||
       typeof value !== "object" ||
@@ -162,13 +204,16 @@ function parse() {
     roomId.value = "";
     token.value = "";
     inviteParsed.value = false;
-    error.value =
-      "请粘贴完整房间邀请JSON，或清空粘贴内容后分别填写房间ID与邀请token。";
+    error.value = "请粘贴本站的完整房间邀请链接或邀请内容。";
     return false;
   }
 }
 async function join() {
   if (pasted.value.trim() && !parse()) return;
+  if (!roomId.value.trim() || !token.value.trim()) {
+    joinError.value = "请粘贴有效房间邀请，或填写完整的房间与邀请信息";
+    return;
+  }
   const joinedRoomId = roomId.value.trim();
   await api.join(joinedRoomId, token.value.trim());
   if (!alive) return;
@@ -218,9 +263,7 @@ onMounted(reload);
           ><AppIcon name="rooms" :size="28"
         /></span>
         <h2>还没有加入放映室</h2>
-        <p>
-          创建自己的放映室，或向朋友获取房间邀请。注册邀请码只用于创建账号。
-        </p>
+        <p>创建一个放映室，或使用朋友发来的房间邀请加入。</p>
         <div class="button-row">
           <button class="primary" @click="createOpen = true">
             创建第一个房间
@@ -304,11 +347,16 @@ onMounted(reload);
       </template>
     </div>
     <AppDialog v-model="createOpen" title="创建房间" drawer :busy="busy">
-      <form :aria-busy="busy" @submit.prevent="submitCreate">
+      <form novalidate :aria-busy="busy" @submit.prevent="submitCreate">
         <p class="helper">取一个容易认出的名字，创建后即可邀请朋友加入。</p>
         <label
           >房间名称<input
             v-model="name"
+            ref="nameInput"
+            :aria-invalid="!!nameError"
+            :aria-describedby="
+              nameError ? 'room-name-hint room-name-error' : 'room-name-hint'
+            "
             :disabled="busy"
             required
             autofocus
@@ -316,7 +364,10 @@ onMounted(reload);
             autocomplete="off"
             placeholder="例如：周末放映室"
         /></label>
-        <p class="helper">最多120个字符。</p>
+        <p id="room-name-hint" class="helper">最多 120 个字符。</p>
+        <p v-if="nameError" id="room-name-error" class="error" role="alert">
+          {{ nameError }}
+        </p>
         <Notice :message="error" error />
         <div class="dialog-actions">
           <button type="button" :disabled="busy" @click="createOpen = false">
@@ -329,10 +380,8 @@ onMounted(reload);
       </form>
     </AppDialog>
     <AppDialog v-model="joinOpen" title="通过邀请加入" drawer :busy="busy">
-      <form @submit.prevent="!busy && run(join)">
-        <p class="helper">
-          粘贴朋友发送的完整邀请，或直接填写房间 ID 和邀请 token。
-        </p>
+      <form novalidate @submit.prevent="!busy && run(join)">
+        <p class="helper">粘贴朋友发送的房间邀请链接即可加入。</p>
         <label
           >粘贴完整房间邀请<textarea
             v-model="pasted"
@@ -341,15 +390,15 @@ onMounted(reload);
           />
         </label>
         <button type="button" @click="parse">解析邀请</button>
-        <label
-          >房间 ID<input v-model="roomId" required autocomplete="off"
-        /></label>
-        <label
-          >邀请 token<input v-model="token" required autocomplete="off"
-        /></label>
-        <p class="helper">
-          请使用房间邀请，注册邀请码不能加入房间。修改粘贴内容后，需重新解析邀请。
-        </p>
+        <details>
+          <summary>手动填写邀请信息</summary>
+          <label>房间 ID<input v-model="roomId" autocomplete="off" /></label>
+          <label>邀请凭据<input v-model="token" autocomplete="off" /></label>
+          <p class="helper">
+            请使用房间邀请，注册邀请码不能加入房间。修改粘贴内容后，需重新解析邀请。
+          </p>
+        </details>
+        <p v-if="joinError" role="alert" class="error">{{ joinError }}</p>
         <Notice :message="error" error />
         <div class="dialog-actions">
           <button type="button" :disabled="busy" @click="joinOpen = false">

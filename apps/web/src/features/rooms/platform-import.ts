@@ -589,6 +589,9 @@ export interface PlatformImportPreviewItem {
   title: string | null;
   live_version?: 1 | 2;
   course_version?: 1;
+  cover_data_url?: string | null;
+  cover_unavailable_reason?: "platform_preview_cover_unavailable";
+  metadata_error?: PlatformImportFailure;
 }
 export interface PlatformImportPreview {
   items: PlatformImportPreviewItem[];
@@ -600,7 +603,7 @@ export interface PlatformImportPreview {
 }
 export interface PlatformImportBatchItem extends Omit<
   PlatformImportPreviewItem,
-  "title"
+  "title" | "cover_data_url" | "cover_unavailable_reason" | "metadata_error"
 > {
   credential_mode?: NativePlatformCredentialMode;
   account_id?: string;
@@ -638,7 +641,7 @@ const importMessages: Record<string, string> = {
   platform_import_invalid: "链接无效或内容暂不支持，请使用普通视频或官方短链接",
   platform_import_limit: "一次最多预览和导入 20 条，粘贴内容不得超过 16 KiB",
   platform_import_unavailable:
-    "平台短链接或合集暂不可用，可稍后重试或改用完整视频链接",
+    "平台视频信息暂不可用，可稍后重试或改用完整视频链接",
   platform_import_platform_restricted:
     "平台限制了此合集的公开访问，请改用单独视频链接",
   platform_import_deadline:
@@ -732,6 +735,37 @@ export function platformCollectionProvider(
   }
   return recognizedPlatformProvider(candidate) ?? selected;
 }
+/** Preview-only bounded raster; never accept a provider URL as an image source. */
+export function validatePlatformPreviewCover(
+  value: unknown,
+): string | null | undefined {
+  if (value === undefined || value === null) return value;
+  if (typeof value !== "string" || value.length > 699_100)
+    throw Error("预览封面无法安全显示，请重新预览");
+  const match =
+    /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/.exec(value);
+  if (!match || match[2].length % 4 !== 0)
+    throw Error("预览封面无法安全显示，请重新预览");
+  let bytes: string;
+  try {
+    bytes = atob(match[2]);
+  } catch {
+    throw Error("预览封面无法安全显示，请重新预览");
+  }
+  const magic = [...bytes.slice(0, 12)].map((value) => value.charCodeAt(0));
+  const raster =
+    match[1] === "jpeg"
+      ? magic[0] === 255 && magic[1] === 216 && magic[2] === 255
+      : match[1] === "png"
+        ? [137, 80, 78, 71, 13, 10, 26, 10].every(
+            (byte, index) => magic[index] === byte,
+          )
+        : bytes.startsWith("RIFF") && bytes.slice(8, 12) === "WEBP";
+  if (!raster || bytes.length > 524_288)
+    throw Error("预览封面无法安全显示，请重新预览");
+  return value;
+}
+
 export function validatePlatformImportPreview(
   value: unknown,
 ): PlatformImportPreview {
@@ -787,12 +821,25 @@ export function validatePlatformImportPreview(
     )
       throw Error("预览中的视频身份不一致，请重新预览");
     seen.add(item.key);
+    if (
+      item.cover_unavailable_reason !== undefined &&
+      item.cover_unavailable_reason !== "platform_preview_cover_unavailable"
+    )
+      throw Error("预览封面信息无效，请重新预览");
+    const cover = validatePlatformPreviewCover(item.cover_data_url);
     return {
       key: item.key,
       provider: item.provider,
       url: item.url,
       part: item.part,
       title: item.title,
+      ...(cover === undefined ? {} : { cover_data_url: cover }),
+      ...(item.cover_unavailable_reason
+        ? { cover_unavailable_reason: item.cover_unavailable_reason }
+        : {}),
+      ...(item.metadata_error === undefined
+        ? {}
+        : { metadata_error: failure(item.metadata_error) }),
       ...(parsed.live_version ? { live_version: parsed.live_version } : {}),
       ...(parsed.course_version ? { course_version: 1 as const } : {}),
     } as PlatformImportPreviewItem;

@@ -98,6 +98,12 @@ export interface Media {
   duration_ms: number | null;
   kind: string;
   platform?: NativePlatformMedia;
+  /** Optional explicit provider metadata, never inferred from list ordering. */
+  series?: {
+    episode_number?: number;
+    season_number?: number;
+    series_title?: string;
+  };
   original_title: string;
   shared_title: string | null;
   shared_title_revision: string;

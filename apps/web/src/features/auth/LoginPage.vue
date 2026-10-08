@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, onBeforeUnmount } from "vue";
+import { computed, ref, watch, onBeforeUnmount, nextTick } from "vue";
 import { useRouter, useRoute } from "vue-router";
 import { useSession } from "./session.store";
 import { guestRoomPath, parseGuestInvitation } from "./guest-session";
@@ -9,6 +9,11 @@ import { useRegistrationPolicy } from "./registration-policy";
 import { useAction } from "../../shared/use-action";
 import Notice from "../../shared/ui/Notice.vue";
 import { authenticationLocation, safeRedirect } from "../../app/navigation";
+import { clearInvitation } from "./invitation-intent";
+const props = defineProps<{
+  invitation?: { room_id: string; token: string };
+  returnPath?: string;
+}>();
 const session = useSession(),
   router = useRouter(),
   route = useRoute(),
@@ -19,7 +24,32 @@ const session = useSession(),
   guestName = ref(""),
   guestUncertain = ref(false),
   guestNeedsLogout = ref(false);
-const { busy, error, message, run } = useAction();
+const { busy: loginBusy, error, message, run } = useAction();
+const {
+  busy: guestBusy,
+  error: guestError,
+  message: guestMessage,
+  run: runGuest,
+} = useAction();
+const busy = computed(() => loginBusy.value || guestBusy.value);
+const guestOpen = ref(false);
+const loginField = ref<"username" | "password" | "">("");
+const guestField = ref<"invitation" | "name" | "">("");
+watch(
+  () => props.invitation,
+  (invitation) => {
+    if (!invitation) return;
+    guestInvite.value = JSON.stringify(invitation);
+    guestOpen.value = true;
+  },
+  { immediate: true },
+);
+watch([guestInvite, guestName], () => {
+  if (!busy.value) {
+    guestError.value = "";
+    guestField.value = "";
+  }
+});
 const {
   policy,
   loading: policyLoading,
@@ -27,18 +57,39 @@ const {
   reload: reloadPolicy,
 } = useRegistrationPolicy(session);
 watch([username, password], () => {
-  if (!busy.value) error.value = "";
+  if (!busy.value) {
+    error.value = "";
+    loginField.value = "";
+  }
 });
 async function submitLogin() {
   if (busy.value) return;
+  loginField.value = !username.value.trim()
+    ? "username"
+    : !password.value
+      ? "password"
+      : "";
+  if (loginField.value) {
+    error.value =
+      loginField.value === "username" ? "请填写登录账号。" : "请填写密码。";
+    await nextTick();
+    document.getElementById(`login-${loginField.value}`)?.focus();
+    return;
+  }
   await run(login);
 }
-const returnTo = computed(() => safeRedirect(route.query.redirect));
+const returnTo = computed(() =>
+  safeRedirect(props.returnPath ?? route.query.redirect),
+);
 const expired = computed(
   () => route.query.notice === "session-expired" || session.expired,
 );
 const registration = computed(() =>
-  authenticationLocation("/register", returnTo.value, expired.value),
+  authenticationLocation(
+    "/register",
+    props.invitation ? `/invite/${props.invitation.room_id}` : returnTo.value,
+    expired.value,
+  ),
 );
 const authentication = new AbortController();
 let alive = true;
@@ -57,7 +108,13 @@ async function submitGuest() {
     guestNeedsLogout.value
   )
     return;
-  await run(async () => {
+  guestOpen.value = true;
+  guestField.value = "";
+  await runGuest(async () => {
+    if (!guestInvite.value.trim()) {
+      guestField.value = "invitation";
+      throw Error("请粘贴房间邀请链接或邀请数据。");
+    }
     const invitation = parseGuestInvitation(
       guestInvite.value,
       window.location.origin,
@@ -65,7 +122,10 @@ async function submitGuest() {
     const invalid = guestName.value.trim()
       ? validateNickname(guestName.value.trim())
       : null;
-    if (invalid) throw Error(invalid);
+    if (invalid) {
+      guestField.value = "name";
+      throw Error(invalid);
+    }
     try {
       const user = await session.guest(
         invitation.room_id,
@@ -75,6 +135,7 @@ async function submitGuest() {
       );
       if (!alive) return;
       guestInvite.value = guestName.value = "";
+      clearInvitation();
       await router.replace(guestRoomPath(user)!);
     } catch (cause) {
       if (!alive) return;
@@ -84,6 +145,7 @@ async function submitGuest() {
           cause.code,
         )
       ) {
+        clearInvitation();
         await reloadPolicy();
         throw Error(
           "暂时无法通过此邀请进入。请确认站点和房间均允许访客，且邀请为有效的非定向观看邀请。",
@@ -141,7 +203,7 @@ async function submitGuest() {
 }
 async function recoverGuest() {
   if (busy.value || !guestUncertain.value) return;
-  await run(async () => {
+  await runGuest(async () => {
     try {
       const user = await session.load();
       if (alive) await router.replace(guestRoomPath(user) ?? returnTo.value);
@@ -162,7 +224,7 @@ async function recoverGuest() {
 }
 async function clearOldGuestSession() {
   if (busy.value || !guestNeedsLogout.value || session.user) return;
-  await run(async () => {
+  await runGuest(async () => {
     // Another tab may have signed into a registered account since the error.
     try {
       const current = await session.load();
@@ -179,7 +241,7 @@ async function clearOldGuestSession() {
     await session.logout();
     if (!alive) return;
     guestNeedsLogout.value = guestUncertain.value = false;
-    message.value = "旧会话已退出，请确认邀请仍有效后再点击进入。";
+    guestMessage.value = "旧会话已退出，请确认邀请仍有效后再点击进入。";
   });
 }
 async function login() {
@@ -195,8 +257,14 @@ async function login() {
     <div class="auth-panel surface-card">
       <header class="page-intro auth-intro">
         <p class="page-eyebrow">欢迎回来</p>
-        <h1 id="login-title">登录</h1>
-        <p>使用登录账号和密码进入 RainSync。</p>
+        <h1 id="login-title">{{ invitation ? "加入受邀房间" : "登录" }}</h1>
+        <p>
+          {{
+            invitation
+              ? "登录后确认加入，也可以使用下方访客入口。"
+              : "使用登录账号和密码进入 RainSync。"
+          }}
+        </p>
       </header>
       <Notice
         v-if="expired"
@@ -205,7 +273,7 @@ async function login() {
       <p v-if="returnTo.startsWith('/rooms/')" class="helper auth-return-note">
         登录后返回房间页面，请确认后再加入房间。
       </p>
-      <form :aria-busy="busy" @submit.prevent="submitLogin">
+      <form novalidate :aria-busy="busy" @submit.prevent="submitLogin">
         <div class="form-field">
           <label for="login-username">登录账号</label>
           <input
@@ -217,7 +285,19 @@ async function login() {
             required
             autofocus
             :disabled="busy"
+            :aria-invalid="loginField === 'username'"
+            :aria-describedby="
+              loginField === 'username' ? 'login-username-error' : undefined
+            "
           />
+          <p
+            v-if="loginField === 'username'"
+            id="login-username-error"
+            class="field-error"
+            role="alert"
+          >
+            {{ error }}
+          </p>
         </div>
         <div class="form-field">
           <label for="login-password">密码</label>
@@ -229,6 +309,10 @@ async function login() {
               autocomplete="current-password"
               required
               :disabled="busy"
+              :aria-invalid="loginField === 'password'"
+              :aria-describedby="
+                loginField === 'password' ? 'login-password-error' : undefined
+              "
             />
             <button
               type="button"
@@ -240,8 +324,16 @@ async function login() {
               {{ show ? "隐藏" : "显示" }}
             </button>
           </div>
+          <p
+            v-if="loginField === 'password'"
+            id="login-password-error"
+            class="field-error"
+            role="alert"
+          >
+            {{ error }}
+          </p>
         </div>
-        <Notice id="login-error" :message="error" error />
+        <Notice id="login-error" :message="loginField ? '' : error" error />
         <Notice :message="message" />
         <button class="primary" :disabled="busy">
           {{ busy ? "正在登录…" : "登录" }}
@@ -266,16 +358,26 @@ async function login() {
       </p>
       <details
         v-if="
-          (policy?.guests_enabled || guestUncertain || guestNeedsLogout) &&
+          (policy?.guests_enabled ||
+            guestUncertain ||
+            guestNeedsLogout ||
+            guestError ||
+            guestInvite) &&
           !policyLoading &&
           !session.user
         "
         class="guest-entry"
+        :open="guestOpen"
+        @toggle="guestOpen = ($event.target as HTMLDetailsElement).open"
       >
-        <summary>使用房间邀请作为访客进入</summary>
-        <form :aria-busy="busy" @submit.prevent="submitGuest">
+        <summary>
+          <span class="guest-chevron" aria-hidden="true">›</span
+          >使用房间邀请作为访客进入
+        </summary>
+        <form novalidate :aria-busy="busy" @submit.prevent="submitGuest">
           <p class="helper">
-            需要房主允许访客，并持有有效的非定向观看邀请。访客仅可在该房间观看和聊天，不能控制播放、浏览媒体库或管理内容；会话最多持续两小时，权限变化可能提前结束。
+            房主开启访客入口后，可凭观看邀请进入。访客可观看和聊天，会话最长 2
+            小时。
           </p>
           <div class="form-field">
             <label for="guest-invitation">房间邀请 JSON 或本站邀请链接</label
@@ -288,6 +390,8 @@ async function login() {
               :spellcheck="false"
               :disabled="busy || guestUncertain"
               rows="3"
+              :aria-invalid="guestField === 'invitation'"
+              aria-describedby="guest-error"
             />
           </div>
           <div class="form-field">
@@ -298,9 +402,16 @@ async function login() {
               autocomplete="nickname"
               :disabled="busy || guestUncertain"
               maxlength="100"
+              :aria-invalid="guestField === 'name'"
+              aria-describedby="guest-error"
             />
             <p class="field-hint">最多 50 个字符，留空使用系统访客名称。</p>
           </div>
+          <Notice id="guest-error" :message="guestError" error />
+          <Notice :message="guestMessage" />
+          <p v-if="!policy?.guests_enabled" class="helper">
+            本站暂未开放访客入口，请使用账号登录。
+          </p>
           <button
             v-if="!guestUncertain && !guestNeedsLogout"
             class="primary"
@@ -344,6 +455,14 @@ async function login() {
   display: flex;
   align-items: center;
   font-weight: 650;
+  gap: var(--space-2);
+}
+.guest-chevron {
+  font-size: 24px;
+  transition: transform 160ms;
+}
+.guest-entry[open] .guest-chevron {
+  transform: rotate(90deg);
 }
 .guest-entry form {
   margin-top: var(--space-4);

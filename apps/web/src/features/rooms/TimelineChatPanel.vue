@@ -2,6 +2,7 @@
 import { computed, ref, watch, onMounted, onBeforeUnmount } from "vue";
 import { useRoomRuntime } from "./room-runtime";
 import { useSession } from "../auth/session.store";
+import { useTransientMessage } from "../../shared/use-transient-message";
 import {
   displayedComments,
   parseActivity,
@@ -62,6 +63,9 @@ let serial = 0,
   controller: AbortController | undefined,
   pending: Record<string, unknown> | undefined;
 const failed = ref(false);
+const reactionNotice = ref("");
+const reactionPending = ref(false);
+useTransientMessage(reactionNotice);
 let lifetime = new AbortController();
 function requestSignal(timeout: number) {
   return AbortSignal.any([lifetime.signal, AbortSignal.timeout(timeout)]);
@@ -144,6 +148,8 @@ function clearWindow() {
   reactions.value = [];
 }
 function reset() {
+  reactionPending.value = false;
+  reactionNotice.value = "";
   lifetime.abort();
   lifetime = new AbortController();
   ++serial;
@@ -363,6 +369,8 @@ watch(
   ],
   () => {
     // A new media/lifecycle context cannot reuse a submission from the old one.
+    reactionPending.value = false;
+    reactionNotice.value = "";
     ++serial;
     lifetime.abort();
     lifetime = new AbortController();
@@ -458,6 +466,7 @@ watch(
 );
 watch(selected, async (value, old) => {
   if (value === old) return;
+  reactionNotice.value = "";
   clearWindow();
   const sequence = serial,
     window = windowSerial;
@@ -534,26 +543,39 @@ async function send() {
   }
 }
 async function react(emoji: string) {
-  if (!currentSelected.value || !r.roomActive) return;
-  const sequence = serial;
+  if (!currentSelected.value || !r.roomActive || reactionPending.value) return;
+  const sequence = serial,
+    room = r.room?.id,
+    epoch = session.epoch,
+    activity = selected.value;
+  const currentReaction = () =>
+    sequence === serial &&
+    r.room?.id === room &&
+    session.epoch === epoch &&
+    selected.value === activity;
+  reactionPending.value = true;
+  reactionNotice.value = "";
   try {
     await session.api(
       `${prefix()}/reactions`,
       "POST",
       {
         client_reaction_id: crypto.randomUUID(),
-        activity_id: selected.value,
+        activity_id: activity,
         emoji,
       },
       requestSignal(10000),
     );
-    if (sequence === serial) {
+    if (currentReaction()) {
+      reactionNotice.value = `已发送 ${emoji}`;
       clearTimeout(timer);
       void refresh();
     }
   } catch (e) {
-    if (sequence === serial)
+    if (currentReaction())
       error.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    if (sequence === serial) reactionPending.value = false;
   }
 }
 async function manage() {
@@ -775,14 +797,17 @@ onBeforeUnmount(() => {
           <button
             v-for="emoji in reactionEmoji"
             :key="emoji"
-            :disabled="!r.roomActive"
+            :disabled="!r.roomActive || reactionPending"
             :aria-label="`发送表情 ${emoji}`"
             @click="react(emoji)"
           >
             {{ emoji }}
           </button>
         </div>
-        <p class="helper">房间即时反应：每秒2次，突发最多5次，8秒后消失</p>
+        <p class="helper" role="status">
+          {{ reactionPending ? "正在发送表情…" : reactionNotice }}
+        </p>
+        <p class="helper">表情显示 8 秒；评论与表情面板可以收起。</p>
         <div v-if="showReactions" class="recent-reactions" aria-live="off">
           <span
             v-for="e in reactions.filter((e) => e.until > Date.now())"
@@ -838,6 +863,11 @@ onBeforeUnmount(() => {
   padding: 12px;
   margin-top: 8px;
   min-width: 0;
+}
+.timeline-chat > div {
+  max-height: min(560px, 65vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .timeline-toggle {
   width: 100%;

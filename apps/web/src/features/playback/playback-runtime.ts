@@ -10,6 +10,7 @@ import type {
   StaticChildState,
   PlaybackContinuation,
   PlaybackRecoveryState,
+  PlaybackLoadingStage,
 } from "./playback-runtime-types";
 import { createMediaDataDeadline } from "./media-data-deadline";
 import { createPlaybackMetricRuntime } from "./playback-metric-runtime";
@@ -29,7 +30,10 @@ import {
   validNativeLiveBinding,
   validNativeLiveDeliveryUrl,
 } from "./native-live";
-import { createDashPlayback } from "../../../../../packages/player-core/dash";
+import {
+  createDashPlayback,
+  loadDashJs,
+} from "../../../../../packages/player-core/dash";
 import {
   nativePlatformRequest,
   validNativePlatformPlan,
@@ -106,6 +110,7 @@ import { bindPlaybackObservations } from "./observation-binding";
 import {
   createPlaybackMetrics,
   type PlaybackMetricsOrigin,
+  type PlaybackMetricsSnapshot,
 } from "./playback-metrics";
 import {
   summarizePlaybackPlan,
@@ -404,6 +409,11 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     sessionId = ref<string | null>(null);
   const recoveryState = ref<PlaybackRecoveryState>("idle");
   const preparation = ref<PlaybackPreparationState>({ phase: "idle" });
+  const loadingStage = ref<PlaybackLoadingStage>("idle");
+  const startupDiagnostics = ref<PlaybackMetricsSnapshot>();
+  let sourcePresented = false;
+  let recoveryWaitAt: number | undefined;
+  const recoveryTimeoutError = "本机同步等待超时，请重新加载播放以跟上房间进度";
   function failLocalPlayback(message: string, code?: string, notice = message) {
     // A terminal transport/decoder failure owns its error. Loading deadlines
     // must not replace it after the SDK has already detached the source.
@@ -422,6 +432,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         ownsNotice: (value) => value === notice,
       },
     };
+    loadingStage.value = "failed";
   }
   function failNativeCompatibility(p: PlaybackPlan, message: string) {
     if (plan !== p || !p.native_platform?.compatibility) return;
@@ -574,6 +585,9 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     currentPlan,
     video,
     state: () => metricState(),
+    snapshot: (value) => {
+      startupDiagnostics.value = value;
+    },
     send: (binding, body, signal) =>
       session.api<PlaybackMetricsReceipt>(
         `/playback-sessions/${binding.sessionId}/metrics`,
@@ -587,13 +601,20 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     observeMetrics,
     advanceMetricAttempt,
     bindMetricSource,
-    attachMetricSource,
+    attachMetricSource: recordMetricSource,
     bindMetricGrant,
     sampleMetrics,
   } = metricRuntime;
+  const attachMetricSource = () => {
+    recordMetricSource();
+    if (!sourcePresented && !preparation.value.failure)
+      loadingStage.value = "loading_media";
+  };
   const foreground = () =>
     typeof document === "undefined" || document.visibilityState !== "hidden";
   function refreshRecovery() {
+    const ownTimeout =
+      preparation.value.failure?.code === "PLAYBACK_RECOVERY_TIMEOUT";
     const next = evaluatePlaybackRecovery({
       state: state.value,
       element: video.value,
@@ -604,7 +625,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       clockReady: clock.ready,
       now: () => clock.now(),
       connected: connected.value,
-      error: error.value,
+      error:
+        ownTimeout && error.value === recoveryTimeoutError ? "" : error.value,
       blocked: blocked.value,
       waiting: waiting.value,
       ownsPlan:
@@ -613,7 +635,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         !!metricIntent &&
         metricCurrent(metricIntent),
       ownsLoad: !!pendingLoad && metricCurrent(pendingLoad.metrics),
-      pending: recoveryPending,
+      pending: recoveryPending || ownTimeout,
       previous: recoveryState.value,
       terminalEnd,
       rejectedBaseRate,
@@ -627,6 +649,33 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       pendingPlay: !!pendingPlay,
       unsupportedRateError,
     });
+    const at = performance.now();
+    const recovering = next.state === "waiting" || next.state === "catching_up";
+    if (!sourcePresented || !recovering || !Number.isFinite(at)) {
+      recoveryWaitAt = undefined;
+    } else {
+      recoveryWaitAt ??= at;
+      if (ownTimeout || at - recoveryWaitAt >= 20_000) {
+        if (!ownTimeout) {
+          failLocalPlayback(recoveryTimeoutError, "PLAYBACK_RECOVERY_TIMEOUT");
+          if (!error.value) error.value = recoveryTimeoutError;
+        }
+        recoveryPending = false;
+        recoveryState.value = "failed";
+        return;
+      }
+    }
+    // Timeout is local uncertainty. Confirmed room convergence may retire
+    // exactly its own notice, while other media/authentication failures stay.
+    if (ownTimeout && next.state === "idle") {
+      if (error.value === recoveryTimeoutError) error.value = "";
+      preparation.value = {
+        ...preparation.value,
+        phase: "ready",
+        failure: undefined,
+      };
+      loadingStage.value = "playing";
+    }
     recoveryPending = next.pending;
     recoveryState.value = next.state;
   }
@@ -701,8 +750,11 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     metricRuntime.offerFinalIntent();
     if (m) invalidateCandidates(m);
     metricIntent = undefined;
+    startupDiagnostics.value = undefined;
+    loadingStage.value = "idle";
     pendingLoad = undefined;
     metricRuntime.stopSource();
+    metricRuntime.stopMetrics();
     bestEffort(() => metricSender.unbind(true));
   }
   // Accepted intent/visibility edges remain separate from observation-v1 flags.
@@ -1226,6 +1278,9 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       phase: "preparing",
       generation: intent.plan_generation,
     };
+    sourcePresented = false;
+    recoveryWaitAt = undefined;
+    loadingStage.value = "preparing";
     const identity = {};
     const m: MetricIntent = {
       t0,
@@ -1268,6 +1323,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         initial: metricRead(),
       }),
     );
+    metricRuntime.startMetrics();
     return loadAttempt([], intent, m);
   }
   async function loadMedia() {
@@ -1342,6 +1398,9 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     continuation?: PlaybackContinuation,
   ): Promise<void> {
     if (!candidateIntentCurrent(metrics)) return;
+    loadingStage.value = "preparing";
+    sourcePresented = false;
+    recoveryWaitAt = undefined;
     if (preparation.value.generation !== intent.plan_generation)
       preparation.value = {
         phase: "preparing",
@@ -1607,6 +1666,13 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
               metrics.nativeCompatibility &&
               metrics.nativePlaybackMode === "adaptive",
             course: metrics.nativeCourse,
+            playback_metrics:
+              metrics.meter && !metrics.disabled
+                ? freezeCandidateSnapshot({
+                    meter_start_generation: metrics.startGeneration,
+                    startup_origin: metrics.origin,
+                  })
+                : undefined,
           })
         : staticReplay
           ? staticReplay.intent.request
@@ -1687,6 +1753,18 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         discovered.concrete ||
         discovered.upstream
       );
+      if (
+        platform &&
+        metrics.nativeProvider === "bilibili" &&
+        !liveMetadata &&
+        !metrics.nativeCompatibility &&
+        capabilities.mse_h264_aac
+      ) {
+        // This resource can only use DASH on this branch. Overlap the static
+        // SDK download with server preparation, never with media authorization.
+        // The shared loader owns no attachment, identity or room mutation.
+        void loadDashJs().catch(() => {});
+      }
       let p: PlaybackPlan;
       if (continuation?.staticChild) {
         if (plan !== continuation.parent) throw new PlaybackCancelled();
@@ -1781,6 +1859,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         sessionId: p.session_id,
         deliveryMode: p.delivery_mode,
       });
+      loadingStage.value = "initializing";
       playbackSummary.value = p.native_platform
         ? {
             mode: p.native_platform.live
@@ -1896,6 +1975,27 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           !generationWaitFailed &&
           !blocked.value &&
           foreground(),
+        presented: () => {
+          if (
+            serial !== loadSerial ||
+            !currentPlan(p) ||
+            !metricCurrent(metrics)
+          )
+            return;
+          sourcePresented = true;
+          const failed = preparation.value.failure;
+          if (failed?.code === "FIRST_FRAME_TIMEOUT") {
+            preparation.value = {
+              ...preparation.value,
+              phase: "ready",
+              failure: undefined,
+            };
+            if (error.value === firstFrameTimeoutError) error.value = "";
+          }
+          if (!preparation.value.failure) loadingStage.value = "playing";
+          waiting.value = false;
+          updateRecovery();
+        },
         timeout: () => {
           recoveringHls = false;
           waiting.value = false;
@@ -1933,6 +2033,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
               failure: undefined,
             };
           if (error.value === mediaDataTimeoutError) error.value = "";
+          if (!sourcePresented && !preparation.value.failure)
+            loadingStage.value = "waiting_frame";
         },
         clearBlockedFailure: () => {
           if (!blocked.value || error.value !== mediaDataTimeoutError)
@@ -2599,6 +2701,28 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
             sessionId: p.session_id,
             playbackUrl: p.playback_url,
             current,
+            onSourceAttached: () => {
+              if (current()) attachMetricSource();
+            },
+            onStatus: (snapshot) => {
+              if (!current() || sourcePresented) return;
+              if (snapshot.status === "loading")
+                loadingStage.value = "initializing";
+              else if (snapshot.status === "failed")
+                loadingStage.value = "failed";
+              else if (
+                [
+                  "loading_media",
+                  "ready",
+                  "waiting",
+                  "playing",
+                  "paused",
+                  "seeking",
+                ].includes(snapshot.status)
+              )
+                loadingStage.value =
+                  snapshot.readyState >= 2 ? "waiting_frame" : "loading_media";
+            },
             onError: (failure) => {
               if (!current()) return;
               waiting.value = false;
@@ -2609,7 +2733,6 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           dash = attached;
           mediaDataLoad.sourceChanged();
           firstFrameDeadline.attachSource();
-          attachMetricSource();
           if (!(await attached.load()) || !current()) return;
         } else {
           // A native MP4 is a dedicated platform grant, not the generic
@@ -2700,6 +2823,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         phase: "failed",
         failure: preparationFailure(e),
       };
+      loadingStage.value = "failed";
       throw e;
     }
   }
@@ -3235,6 +3359,9 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     finishMetrics();
     ++loadSerial;
     preparation.value = { phase: "idle" };
+    sourcePresented = false;
+    recoveryWaitAt = undefined;
+    loadingStage.value = "idle";
     clockAction = undefined;
     pendingUserSeek = false;
     pendingForce = false;
@@ -3469,6 +3596,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     position,
     sessionId,
     preparation,
+    loadingStage,
+    startupDiagnostics,
     cancelPreparation,
     recoveryState,
     playbackSummary,

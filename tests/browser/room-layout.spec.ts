@@ -107,7 +107,7 @@ test("populated queue and reported members stay useful in the compact default la
     }),
   );
   await expect(widget(page, "members")).toContainText("放映用户");
-  await expect(widget(page, "members")).toContainText("1 位成员已上报在线状态");
+  await expect(widget(page, "members")).toContainText("1 位成员在线");
   const queue = widget(page, "queue");
   for (const width of [1440, 1100]) {
     await page.setViewportSize({ width, height: 1000 });

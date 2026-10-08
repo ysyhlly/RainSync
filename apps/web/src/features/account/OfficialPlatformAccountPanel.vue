@@ -218,10 +218,14 @@ onBeforeUnmount(() => {
 <template>
   <section class="platform-oauth-panel">
     <h3>{{ label }} 官方开放平台授权</h3>
-    <p class="helper">
-      此授权只保存已批准的开放平台用户资料接口令牌，不会生成网页播放
-      Cookie，也不会增加视频、会员或地区访问权限
-    </p>
+    <p class="helper">授权平台资料接口，不增加视频播放权限。</p>
+    <details class="helper">
+      <summary>了解授权范围</summary>
+      <p>
+        此授权只保存已批准的开放平台用户资料接口令牌，不会生成网页播放
+        Cookie，也不会增加视频、会员或地区访问权限
+      </p>
+    </details>
     <p v-if="status && !status.available" role="status">
       服务器尚未配置可用的开放平台应用。仅安装手机 App 无法完成这项授权
     </p>

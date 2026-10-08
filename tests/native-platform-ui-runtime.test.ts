@@ -13,12 +13,26 @@ import type { NativePlatformProvider } from "../packages/protocol";
 const dashboards = vi.hoisted(() => [] as any[]);
 const hlsPlayers = vi.hoisted(() => [] as any[]);
 const browserCapabilities = vi.hoisted(() => ({ mse: true }));
+const dashPreload = vi.hoisted(() => vi.fn(async () => ({})));
 vi.mock("../packages/player-core/dash", async (importOriginal) => ({
   ...(await importOriginal<any>()),
+  loadDashJs: dashPreload,
   createDashPlayback: (options: any) => {
     const controller = {
       options,
-      load: vi.fn(async () => true),
+      load: vi.fn(async () => {
+        options.onStatus?.({
+          status: "loading",
+          readyState: options.video.readyState,
+        });
+        await dashPreload();
+        options.onSourceAttached?.();
+        options.onStatus?.({
+          status: "loading_media",
+          readyState: options.video.readyState,
+        });
+        return true;
+      }),
       destroy: vi.fn(),
     };
     dashboards.push(controller);
@@ -64,6 +78,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
   dashboards.length = 0;
   hlsPlayers.length = 0;
+  dashPreload.mockReset();
+  dashPreload.mockResolvedValue({});
 });
 function nativePlan(
   body: any,
@@ -112,9 +128,25 @@ function setup(
     live?: boolean;
     nativeHls?: boolean;
     compatibilityFailure?: boolean;
+    metricClock?: boolean;
+    metricFrame?: boolean;
+    metricsVersion?: 1 | 2 | false;
+    badMetricsReceipt?: boolean;
   } = {},
 ) {
-  vi.useFakeTimers();
+  vi.useFakeTimers(
+    options.metricClock
+      ? {
+          toFake: [
+            "setTimeout",
+            "clearTimeout",
+            "setInterval",
+            "clearInterval",
+            "performance",
+          ],
+        }
+      : undefined,
+  );
   browserCapabilities.mse = options.mse ?? true;
   vi.stubGlobal("navigator", {});
   vi.stubGlobal("location", {
@@ -199,6 +231,15 @@ function setup(
           selected_height: 1080,
           options: [{ max_height: "p1080", height: 1080 }],
         };
+      if (options.metricsVersion && body.playback_metrics)
+        Object.assign(plan, {
+          playback_metrics_version: options.metricsVersion,
+          playback_metrics: {
+            ...body.playback_metrics,
+            metrics_seq: 0,
+            closed: false,
+          },
+        });
       return plan;
     }
     if (
@@ -221,8 +262,9 @@ function setup(
       events.push("native-post");
       bodies.push(JSON.stringify(body));
       if (options.lost && bodies.length === 1) throw TypeError("lost");
-      if (options.defer) return new Promise((r) => (resolve = r));
-      const plan = nativePlan(body, provider, options.transport);
+      const plan = options.defer
+        ? await new Promise<any>((r) => (resolve = r))
+        : nativePlan(body, provider, options.transport);
       if (options.live)
         Object.assign(plan, {
           transport: "hls",
@@ -249,8 +291,25 @@ function setup(
       }
       if (options.ownAccount)
         plan.native_platform.credential_mode = "own_account";
+      if (options.metricsVersion && body.playback_metrics)
+        Object.assign(plan, {
+          playback_metrics_version: options.metricsVersion,
+          playback_metrics: {
+            ...body.playback_metrics,
+            metrics_seq: 0,
+            closed: false,
+          },
+        });
       return plan;
     }
+    if (path.endsWith("/metrics") && method === "POST")
+      return {
+        session_id: path.split("/")[2],
+        meter_start_generation:
+          body.meter_start_generation + (options.badMetricsReceipt ? 1 : 0),
+        metrics_seq: body.seq,
+        closed: body.final,
+      };
     if (method === "DELETE") events.push(path);
     return {};
   });
@@ -331,6 +390,19 @@ function setup(
     seeking: false,
     readyState: 0,
   });
+  const frameCallbacks: ((at: number, metadata: any) => void)[] = [];
+  const pendingFrames = new Set<number>();
+  if (options.metricFrame)
+    Object.assign(element, {
+      requestVideoFrameCallback: (
+        callback: (typeof frameCallbacks)[number],
+      ) => {
+        frameCallbacks.push(callback);
+        pendingFrames.add(frameCallbacks.length);
+        return frameCallbacks.length;
+      },
+      cancelVideoFrameCallback: (id: number) => pendingFrames.delete(id),
+    });
   runtime.attach(element);
   return {
     runtime,
@@ -350,12 +422,463 @@ function setup(
     ended,
     resolve: (value: any) => resolve(value),
     resolveMedia: () => resolveMedia(selectedMedia),
+    frame: (presentationTime = performance.now()) => {
+      element.paused = false;
+      element.readyState = 4;
+      for (const frame of [...pendingFrames]) {
+        pendingFrames.delete(frame);
+        frameCallbacks[frame - 1](performance.now(), { presentationTime });
+      }
+    },
+    frameCallbacks,
+    metrics: () =>
+      api.mock.calls.filter(
+        ([path, method]) => path.endsWith("/metrics") && method === "POST",
+      ),
     cleanup: () => scope.stop(),
   };
 }
 async function settle() {
   for (let i = 0; i < 50; i++) await Promise.resolve();
 }
+it("Bilibili negotiates the existing v2 protocol and sends the same local meter's phases and presented-frame receipt", async () => {
+  const f = setup({
+    defer: true,
+    metricClock: true,
+    metricFrame: true,
+    metricsVersion: 2,
+  });
+  try {
+    f.state.value.playback_status = "playing";
+    const loading = f.runtime.loadMedia();
+    await settle();
+    const request = JSON.parse(f.bodies[0]);
+    expect(request).toMatchObject({
+      playback_metrics_version: 1,
+      playback_metrics_supported_versions: [1, 2],
+      playback_metrics: {
+        meter_start_generation: 1,
+        startup_origin: "user_intent",
+      },
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    f.resolve(nativePlan(request));
+    await loading;
+    dashboards[0].options.onReady?.();
+    expect(f.runtime.startupDiagnostics.value?.first_frame).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1000);
+    f.frame(1950);
+    await vi.advanceTimersByTimeAsync(3000);
+    const [path, method, packet] = f.metrics()[0];
+    expect(path).toBe(`/playback-sessions/${id(21)}/metrics`);
+    expect(method).toBe("POST");
+    expect(packet).toMatchObject({
+      version: 2,
+      plan_generation: 1,
+      media_generation: 7,
+      meter_start_generation: 1,
+      first_frame_plan_generation: 1,
+      startup_origin: "user_intent",
+      seq: 1,
+      startup_phases: {
+        preparation_ms: 1000,
+        loading_ms: 1000,
+        unobserved_ms: 0,
+      },
+      first_frame: {
+        elapsed_ms: 1950,
+        confirmed_elapsed_ms: 2000,
+        evidence: "video_frame_callback",
+      },
+    });
+    expect(packet.startup_phases).toEqual(
+      f.runtime.startupDiagnostics.value!.startup_phases,
+    );
+    expect(packet.first_frame).toEqual(
+      f.runtime.startupDiagnostics.value!.first_frame,
+    );
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(f.metrics()[1][2]).toMatchObject({
+      seq: 2,
+      startup_phases: packet.startup_phases,
+      first_frame: packet.first_frame,
+    });
+  } finally {
+    f.cleanup();
+  }
+});
+it("Bilibili compatibility reuses preparation negotiation and sends its actual attached-source meter", async () => {
+  const f = setup({
+    metricClock: true,
+    metricFrame: true,
+    metricsVersion: 2,
+    mse: false,
+    nativeHls: true,
+  });
+  try {
+    f.state.value.playback_status = "playing";
+    f.runtime.nativePlaybackMode.value = "compatibility";
+    await f.runtime.loadMedia();
+    const requests = f.bodies.map((body) => JSON.parse(body));
+    expect(requests.length).toBeGreaterThanOrEqual(2);
+    expect(requests[0].native_platform.compatibility).toEqual({
+      version: 1,
+      mode: "hls_avc_aac",
+    });
+    expect(
+      requests.every(
+        (request) =>
+          request.playback_metrics_supported_versions?.join() === "1,2",
+      ),
+    ).toBe(true);
+    expect(
+      new Set(
+        requests.map(
+          (request) => request.playback_metrics.meter_start_generation,
+        ),
+      ),
+    ).toEqual(new Set([1]));
+    await vi.advanceTimersByTimeAsync(1000);
+    f.frame(950);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(f.metrics()[0][2]).toMatchObject({
+      version: 2,
+      plan_generation: 1,
+      meter_start_generation: 1,
+      first_frame_plan_generation: 1,
+      startup_phases: { preparation_ms: 0, loading_ms: 1000, unobserved_ms: 0 },
+      first_frame: {
+        evidence: "video_frame_callback",
+        elapsed_ms: 950,
+        confirmed_elapsed_ms: 1000,
+      },
+    });
+    expect(f.metrics()[0][2].startup_phases).toEqual(
+      f.runtime.startupDiagnostics.value!.startup_phases,
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+it("an older Bilibili response without a grant keeps local startup evidence and sends no metrics", async () => {
+  const f = setup({
+    metricClock: true,
+    metricFrame: true,
+    metricsVersion: false,
+  });
+  try {
+    f.state.value.playback_status = "playing";
+    await f.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(1000);
+    f.frame(950);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(f.runtime.startupDiagnostics.value).toMatchObject({
+      startup_phases: { preparation_ms: 0, loading_ms: 1000, unobserved_ms: 0 },
+      first_frame: { evidence: "video_frame_callback" },
+    });
+    expect(f.metrics()).toHaveLength(0);
+  } finally {
+    f.cleanup();
+  }
+});
+it("a negotiated v1 Bilibili grant keeps its legacy wire shape while retaining local startup phases", async () => {
+  const f = setup({ metricClock: true, metricFrame: true, metricsVersion: 1 });
+  try {
+    f.state.value.playback_status = "playing";
+    await f.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(1000);
+    f.frame(950);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(f.metrics()[0][2]).toMatchObject({
+      version: 1,
+      first_frame: { evidence: "video_frame_callback" },
+    });
+    expect(f.metrics()[0][2]).not.toHaveProperty("startup_phases");
+    expect(f.metrics()[0][2]).not.toHaveProperty("first_frame_plan_generation");
+    expect(f.runtime.startupDiagnostics.value!.startup_phases.loading_ms).toBe(
+      1000,
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+it.each([
+  "user",
+  "epoch",
+  "room",
+  "media_generation",
+  "media_id",
+  "reset",
+] as const)(
+  "Bilibili %s replacement rejects stale frame/grant evidence before the API sender",
+  async (cause) => {
+    const f = setup({
+      metricClock: true,
+      metricFrame: true,
+      metricsVersion: 2,
+    });
+    try {
+      f.state.value.playback_status = "playing";
+      await f.runtime.loadMedia();
+      const staleFrame = f.frameCallbacks[0];
+      f.clock.ready = false;
+      if (cause === "user") f.session.user = { id: id(7) };
+      else if (cause === "epoch") f.session.epoch++;
+      else if (cause === "room")
+        f.state.value = { ...f.state.value, room_id: id(8) };
+      else if (cause === "media_generation")
+        f.state.value = { ...f.state.value, media_generation: 8 };
+      else if (cause === "media_id")
+        f.state.value = { ...f.state.value, media_id: id(8) };
+      else await f.runtime.reset();
+      const beforeStaleCallback = f.metrics().length;
+      if (cause === "reset")
+        expect(f.metrics()[0][2]).toMatchObject({ final: true });
+      await vi.advanceTimersByTimeAsync(1000);
+      staleFrame(performance.now(), { presentationTime: 950 });
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(f.metrics()).toHaveLength(beforeStaleCallback);
+      if (cause !== "reset") expect(beforeStaleCallback).toBe(0);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+it("an invalid Bilibili metrics receipt stops optional sending while keeping local playback evidence", async () => {
+  const f = setup({
+    metricClock: true,
+    metricFrame: true,
+    metricsVersion: 2,
+    badMetricsReceipt: true,
+  });
+  try {
+    f.state.value.playback_status = "playing";
+    await f.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(1000);
+    f.frame(950);
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(f.metrics()).toHaveLength(1);
+    expect(f.runtime.startupDiagnostics.value?.first_frame?.evidence).toBe(
+      "video_frame_callback",
+    );
+    expect(f.runtime.preparation.value.phase).toBe("ready");
+  } finally {
+    f.cleanup();
+  }
+});
+it("downloads the DASH library during Bilibili server preparation without mounting a player", async () => {
+  const f = setup({ defer: true });
+  try {
+    const loading = f.runtime.loadMedia();
+    await settle();
+    expect(f.events).toContain("native-post");
+    expect(dashPreload).toHaveBeenCalledOnce();
+    expect(dashboards).toHaveLength(0);
+    expect(f.runtime.loadingStage.value).toBe("preparing");
+    f.resolve(nativePlan(JSON.parse(f.bodies[0])));
+    await loading;
+    expect(dashboards).toHaveLength(1);
+    expect(f.runtime.loadingStage.value).toBe("loading_media");
+  } finally {
+    f.cleanup();
+  }
+});
+it.each([
+  { provider: "douyin" as const },
+  {
+    provider: "youtube" as const,
+    mse: false,
+    transport: "progressive" as const,
+  },
+  { mse: false, nativeHls: true },
+  { live: true, nativeHls: true },
+])("does not preload DASH for a non-DASH native branch %j", async (options) => {
+  const f = setup(options);
+  try {
+    await f.runtime.loadMedia();
+    expect(dashPreload).not.toHaveBeenCalled();
+    expect(dashboards).toHaveLength(0);
+  } finally {
+    f.cleanup();
+  }
+});
+it("a rejected background preload remains retryable and never replaces the playback error", async () => {
+  dashPreload.mockRejectedValueOnce(
+    new Error("SDK chunk temporarily unavailable"),
+  );
+  const f = setup();
+  try {
+    await f.runtime.loadMedia();
+    expect(dashPreload).toHaveBeenCalledTimes(2);
+    expect(f.runtime.preparation.value.phase).toBe("ready");
+    expect(f.error.value).toBe("");
+  } finally {
+    f.cleanup();
+  }
+});
+it.each(["reset", "identity", "media", "account"])(
+  "late SDK resolution cannot revive a retired %s attachment",
+  async (cause) => {
+    let release!: (value: {}) => void;
+    const pending = new Promise<{}>((resolve) => {
+      release = resolve;
+    });
+    dashPreload.mockReturnValue(pending);
+    const f = setup();
+    try {
+      const loading = f.runtime.loadMedia();
+      await settle();
+      expect(f.runtime.loadingStage.value).toBe("initializing");
+      if (cause === "reset") await f.runtime.reset();
+      else if (cause === "identity") f.session.epoch++;
+      else if (cause === "media")
+        f.state.value = { ...f.state.value, media_generation: 8 };
+      else {
+        f.clock.ready = false;
+        f.account.value++;
+      }
+      const stage = f.runtime.loadingStage.value;
+      release({});
+      await loading;
+      expect(f.runtime.loadingStage.value).toBe(stage);
+      expect(f.runtime.startupDiagnostics.value).toBeUndefined();
+      if (cause === "reset") expect(f.runtime.sessionId.value).toBeNull();
+    } finally {
+      release({});
+      f.cleanup();
+    }
+  },
+);
+it("DASH readiness is not presentation and a late same-source frame clears only its timeout", async () => {
+  const f = setup({ metricClock: true });
+  try {
+    f.state.value.playback_status = "playing";
+    await f.runtime.loadMedia();
+    f.element.readyState = 4;
+    f.element.dispatchEvent(new Event("loadeddata"));
+    dashboards[0].options.onStatus({ status: "ready", readyState: 4 });
+    expect(f.runtime.loadingStage.value).toBe("waiting_frame");
+    expect(f.runtime.startupDiagnostics.value?.first_frame).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "FIRST_FRAME_TIMEOUT",
+    );
+    expect(f.error.value).toContain("播放首帧等待超时");
+    expect(f.runtime.loadingStage.value).toBe("failed");
+    f.element.paused = false;
+    f.element.dispatchEvent(new Event("playing"));
+    f.element.currentTime = 0.1;
+    f.element.dispatchEvent(new Event("timeupdate"));
+    expect(f.runtime.preparation.value.phase).toBe("ready");
+    expect(f.error.value).toBe("");
+    expect(f.runtime.loadingStage.value).toBe("playing");
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(f.runtime.startupDiagnostics.value?.first_frame?.evidence).toBe(
+      "playing_time_advance",
+    );
+    expect(
+      f.runtime.startupDiagnostics.value?.startup_phases.loading_ms,
+    ).toBeGreaterThan(0);
+    expect(JSON.stringify(f.runtime.startupDiagnostics.value)).not.toContain(
+      "token",
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+it("a real media failure after startup timeout remains terminal despite late progress", async () => {
+  const f = setup({ metricClock: true });
+  try {
+    f.state.value.playback_status = "playing";
+    await f.runtime.loadMedia();
+    f.element.readyState = 4;
+    f.element.dispatchEvent(new Event("loadeddata"));
+    await vi.advanceTimersByTimeAsync(20_000);
+    dashboards[0].options.onError({
+      message: "媒体加载失败",
+      code: "DASH_PLAYBACK_ERROR",
+    });
+    f.element.paused = false;
+    f.element.dispatchEvent(new Event("playing"));
+    f.element.currentTime = 1;
+    f.element.dispatchEvent(new Event("timeupdate"));
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "DASH_PLAYBACK_ERROR",
+    );
+    expect(f.error.value).toBe("媒体加载失败");
+    expect(f.runtime.loadingStage.value).toBe("failed");
+  } finally {
+    f.cleanup();
+  }
+});
+it("late presentation clears the first-frame timeout while preserving another notice", async () => {
+  const f = setup({ metricClock: true });
+  try {
+    f.state.value.playback_status = "playing";
+    await f.runtime.loadMedia();
+    f.element.readyState = 4;
+    f.element.dispatchEvent(new Event("loadeddata"));
+    await vi.advanceTimersByTimeAsync(20_000);
+    f.error.value = "另一个房间操作失败";
+    f.element.paused = false;
+    f.element.dispatchEvent(new Event("playing"));
+    f.element.currentTime = 1;
+    f.element.dispatchEvent(new Event("timeupdate"));
+    expect(f.runtime.preparation.value.failure).toBeUndefined();
+    expect(f.error.value).toBe("另一个房间操作失败");
+  } finally {
+    f.cleanup();
+  }
+});
+it("a presented frame cannot leave local synchronization waiting indefinitely", async () => {
+  const f = setup({ metricClock: true });
+  try {
+    await f.runtime.loadMedia();
+    f.element.readyState = 4;
+    f.element.dispatchEvent(new Event("loadeddata"));
+    f.element.paused = false;
+    f.element.dispatchEvent(new Event("playing"));
+    f.element.currentTime = 1;
+    f.element.dispatchEvent(new Event("timeupdate"));
+    expect(f.runtime.loadingStage.value).toBe("playing");
+    await vi.advanceTimersByTimeAsync(20_500);
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "PLAYBACK_RECOVERY_TIMEOUT",
+    );
+    expect(f.runtime.recoveryState.value).toBe("failed");
+    expect(f.state.value.playback_status).toBe("paused");
+  } finally {
+    f.cleanup();
+  }
+});
+it("confirmed convergence retires only the local synchronization timeout", async () => {
+  const f = setup({ metricClock: true });
+  try {
+    await f.runtime.loadMedia();
+    f.element.readyState = 4;
+    f.element.dispatchEvent(new Event("loadeddata"));
+    f.element.paused = false;
+    f.element.dispatchEvent(new Event("playing"));
+    f.element.currentTime = 1;
+    f.element.dispatchEvent(new Event("timeupdate"));
+    await vi.advanceTimersByTimeAsync(20_500);
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "PLAYBACK_RECOVERY_TIMEOUT",
+    );
+    const ranges = { length: 1, start: () => 0, end: () => 100 };
+    f.element.seekable = f.element.buffered = ranges;
+    f.element.paused = true;
+    f.element.currentTime = 5;
+    await f.runtime.applyState(true);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(f.runtime.recoveryState.value).toBe("idle");
+    expect(f.runtime.preparation.value.failure).toBeUndefined();
+    expect(f.runtime.loadingStage.value).toBe("playing");
+    expect(f.error.value).toBe("");
+  } finally {
+    f.cleanup();
+  }
+});
 it("HLS-only Bilibili browser uses the dedicated pending compatibility route and actual attempt", async () => {
   const f = setup({ mse: false, nativeHls: true, quality: true });
   try {
@@ -552,9 +1075,18 @@ it.each(["bilibili", "youtube"] as const)(
         "http_file_fallback_version",
         "static_hls_fallback_version",
         "upstream_profile_report",
-        "playback_metrics_version",
       ])
         expect(body).not.toHaveProperty(field);
+      if (provider === "bilibili")
+        expect(body).toMatchObject({
+          playback_metrics_version: 1,
+          playback_metrics_supported_versions: [1, 2],
+          playback_metrics: {
+            meter_start_generation: body.plan_generation,
+            startup_origin: "user_intent",
+          },
+        });
+      else expect(body).not.toHaveProperty("playback_metrics_version");
       expect(f.api.mock.calls.some(([p]) => p === "/playback-candidates")).toBe(
         false,
       );

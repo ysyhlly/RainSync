@@ -2,6 +2,7 @@ import { createRouter, createWebHistory, type RouterHistory } from "vue-router";
 import { guestRoomPath } from "../features/auth/guest-session";
 import { useSession } from "../features/auth/session.store";
 import { authenticationLocation, safeRedirect } from "./navigation";
+import { navigationPending, navigationTitle } from "./navigation-progress";
 export function createApplicationRouter(
   base = "/",
   history: RouterHistory = createWebHistory(base),
@@ -24,6 +25,11 @@ export function createApplicationRouter(
         path: "/login",
         component: () => import("../features/auth/LoginPage.vue"),
         meta: { public: true, title: "登录" },
+      },
+      {
+        path: "/invite/:roomId",
+        component: () => import("../features/auth/InvitationPage.vue"),
+        meta: { public: true, invitation: true, title: "房间邀请" },
       },
       {
         path: "/rooms",
@@ -81,7 +87,7 @@ export function createApplicationRouter(
       {
         path: "/:pathMatch(.*)*",
         component: () => import("./NotFoundPage.vue"),
-        meta: { title: "页面不存在" },
+        meta: { public: true, notFound: true, title: "页面不存在" },
       },
     ],
     scrollBehavior(to, from, saved) {
@@ -89,6 +95,8 @@ export function createApplicationRouter(
     },
   });
   router.beforeEach(async (to) => {
+    navigationTitle.value = String(to.meta.title ?? "RainSync");
+    navigationPending.value = true;
     const session = useSession();
     await session.restore();
     if (session.startupError) return true;
@@ -96,13 +104,23 @@ export function createApplicationRouter(
       return authenticationLocation("/login", to.fullPath, session.expired);
     const guestHome = guestRoomPath(session.user);
     if (guestHome && to.path !== guestHome) return guestHome;
-    if (session.user && to.meta.public) return safeRedirect(to.query.redirect);
+    if (
+      session.user &&
+      to.meta.public &&
+      !to.meta.invitation &&
+      !to.meta.notFound
+    )
+      return safeRedirect(to.query.redirect);
     if (to.path.startsWith("/admin") && !session.user?.admin)
       return { path: "/rooms", query: { notice: "admin-required" } };
     return true;
   });
   router.afterEach((to) => {
+    navigationPending.value = false;
     document.title = String(to.meta.title ?? "RainSync") + " · RainSync";
+  });
+  router.onError(() => {
+    navigationPending.value = false;
   });
   return router;
 }

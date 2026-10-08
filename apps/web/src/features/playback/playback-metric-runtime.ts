@@ -4,6 +4,7 @@ import { bindPlaybackMetricEvents } from "./metrics-binding";
 import { createPlaybackMetricsSender } from "./metrics-sender";
 import {
   PLAYBACK_METRICS_MAX_ELAPSED_MS,
+  PLAYBACK_METRICS_SAMPLE_MS,
   type PlaybackMetrics,
   type PlaybackMetricsFence,
   type PlaybackMetricsOrigin,
@@ -35,6 +36,7 @@ export function createPlaybackMetricRuntime<
     buffering: boolean;
   };
   send: Parameters<typeof createPlaybackMetricsSender>[0];
+  snapshot?: (value: PlaybackMetricsSnapshot) => void;
 }) {
   const {
     currentIntent: metricCurrent,
@@ -43,6 +45,9 @@ export function createPlaybackMetricRuntime<
     state: metricState,
   } = ctx;
   let metricSource: ReturnType<typeof bindPlaybackMetricEvents> | undefined;
+  let samplingIntent: I | undefined;
+  let sampleTimer: ReturnType<typeof setTimeout> | undefined;
+  let nextSampleAt: number | undefined;
   const metricSender = createPlaybackMetricsSender(ctx.send);
   const metricRead = () =>
     bestEffort(() => metricSource?.read()) ?? {
@@ -68,6 +73,7 @@ export function createPlaybackMetricRuntime<
     if (
       !m?.meter ||
       !metricCurrent(m) ||
+      !currentPlan(p) ||
       m.disabled ||
       !Number.isInteger(p.plan_generation) ||
       p.plan_generation! < 1 ||
@@ -110,9 +116,10 @@ export function createPlaybackMetricRuntime<
     const m = ctx.intent(),
       grant = p.playback_metrics,
       version = p.playback_metrics_version;
+    // Reject obsolete publication before changing this intent's negotiated
+    // version/disabled state. A stale grant must not poison its current meter.
+    if (!m || !metricCurrent(m) || !currentPlan(p)) return;
     if (
-      !m ||
-      !metricCurrent(m) ||
       m.disabled ||
       (version !== 1 && version !== 2) ||
       !Number.isInteger(p.plan_generation) ||
@@ -133,7 +140,6 @@ export function createPlaybackMetricRuntime<
           grant.last_sample.startup_origin !== m.origin))
     ) {
       if (
-        m &&
         grant &&
         (grant.closed ||
           grant.metrics_seq > (m.last?.seq ?? 0) ||
@@ -173,8 +179,65 @@ export function createPlaybackMetricRuntime<
     const snapshot = bestEffort(() => m.meter?.sample(m.fence, metricRead()));
     if (snapshot) {
       m.last = snapshot;
+      // The maintenance tick can also sample. Keep our next timer at least a
+      // complete cadence after whichever owner call actually emitted this seq.
+      if (samplingIntent === m)
+        nextSampleAt = performance.now() + PLAYBACK_METRICS_SAMPLE_MS;
+      bestEffort(() => ctx.snapshot?.(snapshot));
       if (!m.disabled) bestEffort(() => metricSender.offer(snapshot));
     }
+  }
+
+  function stopMetrics() {
+    clearTimeout(sampleTimer);
+    sampleTimer = undefined;
+    samplingIntent = undefined;
+    nextSampleAt = undefined;
+  }
+  /** One cadence per logical meter, starting at its t0. Plan/grant/source
+   * replacement within the same intent never restarts this schedule. */
+  function startMetrics() {
+    const m = ctx.intent();
+    if (samplingIntent === m) return;
+    stopMetrics();
+    if (!m?.meter || !metricCurrent(m)) return;
+    samplingIntent = m;
+    nextSampleAt = m.t0 + PLAYBACK_METRICS_SAMPLE_MS;
+    const schedule = () => {
+      if (samplingIntent !== m) return;
+      sampleTimer = setTimeout(
+        () => {
+          sampleTimer = undefined;
+          if (samplingIntent !== m || ctx.intent() !== m || !metricCurrent(m)) {
+            stopMetrics();
+            return;
+          }
+          const scheduledAt = nextSampleAt;
+          sampleMetrics();
+          if (samplingIntent !== m) return; // snapshot callbacks may replace intent
+          if (
+            !metricCurrent(m) ||
+            performance.now() - m.t0 > PLAYBACK_METRICS_MAX_ELAPSED_MS
+          ) {
+            stopMetrics();
+            return;
+          }
+          // Optional observation/sampling failure must not become a 1 ms retry
+          // loop. Keep the regular cadence without manufacturing a missing seq.
+          if (
+            nextSampleAt === scheduledAt &&
+            nextSampleAt! <= performance.now()
+          )
+            nextSampleAt = performance.now() + PLAYBACK_METRICS_SAMPLE_MS;
+          schedule();
+        },
+        Math.max(
+          1,
+          Math.ceil((nextSampleAt ?? performance.now()) - performance.now()),
+        ),
+      );
+    };
+    schedule();
   }
 
   function observeMetrics() {
@@ -203,6 +266,8 @@ export function createPlaybackMetricRuntime<
     attachMetricSource,
     bindMetricGrant,
     sampleMetrics,
+    startMetrics,
+    stopMetrics,
     stopSource,
     offerFinalIntent,
     progress: () => metricSource?.progress(),

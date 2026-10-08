@@ -70,6 +70,7 @@ function importPanel() {
       roomsApi: () => api,
       Notice: {},
       AppSelect: {},
+      MediaThumbnail: {},
     },
   );
   dispose.push(panel.unmount);

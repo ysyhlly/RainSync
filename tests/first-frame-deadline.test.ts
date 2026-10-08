@@ -104,6 +104,40 @@ test("RVFC has explicit compositor evidence; fallback needs actual post-playing 
   expect(fallback.timeout).not.toHaveBeenCalled();
 });
 
+test.each([false, true])(
+  "a same-source frame after timeout retires the notice once (RVFC=%s)",
+  async (rvfc) => {
+    const s = setup(rvfc);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(s.timeout).toHaveBeenCalledOnce();
+    expect(s.cancel).not.toHaveBeenCalled();
+    s.deadline.sync();
+    if (rvfc) s.frame();
+    else {
+      s.el.paused = false;
+      s.event("playing");
+      s.el.currentTime = 1;
+      s.event("timeupdate");
+    }
+    expect(s.presented).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.timeout).toHaveBeenCalledOnce();
+  },
+);
+
+test("a late callback after a timed-out source is replaced cannot recover its replacement", async () => {
+  const s = setup(true);
+  const stale = s.frames[0];
+  await vi.advanceTimersByTimeAsync(20_000);
+  s.deadline.detachSource();
+  s.deadline.attachSource();
+  stale(performance.now(), { presentationTime: performance.now() });
+  expect(s.presented).not.toHaveBeenCalled();
+  s.frame();
+  expect(s.presented).toHaveBeenCalledOnce();
+  expect(s.timeout).toHaveBeenCalledOnce();
+});
+
 test.each(["hidden", "blocked", "preparing", "paused"])(
   "%s suspends remaining time without converting it into presentation",
   async (cause) => {

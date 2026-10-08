@@ -136,7 +136,9 @@ function frameStyle(item: LayoutItem): CSSProperties {
     return { height: `${width.value / PLAYER_ASPECT_RATIO}px` };
   return {
     minHeight: `${item.h * metrics.value.rowHeight}px`,
-    ...(item.type === "chat" || item.type === "queue" || item.type === "members"
+    ...(item.type === "chat" ||
+    item.type === "queue" ||
+    (item.type === "members" && props.editing)
       ? { height: `${item.h * metrics.value.rowHeight}px` }
       : {}),
   };

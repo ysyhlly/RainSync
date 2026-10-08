@@ -117,8 +117,7 @@ const {
       </div>
       <Notice :message="notice" />
       <p v-if="configurationLoaded && !enabled" class="notice">
-        私人库创建与分享未开启。管理员可在部署配置中开启
-        PRIVATE_LIBRARIES_ENABLED。
+        私人媒体库功能尚未开启，请联系管理员。
       </p>
       <div
         v-if="listBusy && !configurationLoaded"

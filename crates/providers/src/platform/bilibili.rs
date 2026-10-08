@@ -32,12 +32,14 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 pub mod auth;
 pub mod course;
+pub mod cover;
 pub mod live;
 pub mod pgc;
 pub mod renewal;
@@ -535,17 +537,40 @@ struct CachedWbi {
     generation: u64,
 }
 
+#[derive(Default)]
+struct WbiCacheState {
+    cached: Option<CachedWbi>,
+    generation: u64,
+}
+
+/// An opaque cache of signing keys only. Reuse it within one frozen account and
+/// login scope; the owner must keep different scopes isolated. No credential,
+/// login-validity result, metadata or signed media URL is retained here.
+#[derive(Default)]
+pub struct WbiKeyCache {
+    state: Mutex<WbiCacheState>,
+}
+
 pub struct Client<T: Transport> {
     transport: T,
     cookie: Option<Cookie>,
-    wbi: Mutex<Option<CachedWbi>>,
+    wbi: Arc<WbiKeyCache>,
+}
+
+pub struct VideoPreview {
+    pub metadata: VideoMetadata,
+    pub cover: Option<cover::CoverUrl>,
 }
 impl<T: Transport> Client<T> {
     pub fn new(transport: T, cookie: Option<Cookie>) -> Self {
+        Self::with_wbi_cache(transport, cookie, Arc::new(WbiKeyCache::default()))
+    }
+
+    pub fn with_wbi_cache(transport: T, cookie: Option<Cookie>, wbi: Arc<WbiKeyCache>) -> Self {
         Self {
             transport,
             cookie,
-            wbi: Mutex::new(None),
+            wbi,
         }
     }
 
@@ -583,21 +608,20 @@ impl<T: Transport> Client<T> {
     async fn wbi_key(&self, deadline: Instant, stale: Option<u64>) -> Result<(WbiKeys, u64)> {
         // Holding one async mutex through the bounded nav request gives single
         // flight refresh. Waiting for the mutex consumes the original deadline.
-        let mut cache = tokio::time::timeout_at(deadline, self.wbi.lock())
+        let mut cache = tokio::time::timeout_at(deadline, self.wbi.state.lock())
             .await
             .map_err(|_| Error::Deadline)?;
-        if let Some(key) = cache.as_ref()
+        if let Some(key) = cache.cached.as_ref()
             && key.expires > Instant::now()
             && stale != Some(key.generation)
         {
             return Ok((key.keys.clone(), key.generation));
         }
-        let generation = cache
-            .as_ref()
-            .map_or(1, |key| key.generation.saturating_add(1));
-        *cache = None;
+        cache.generation = cache.generation.saturating_add(1);
+        let generation = cache.generation;
+        cache.cached = None;
         let nav = self.nav(deadline).await?;
-        *cache = Some(CachedWbi {
+        cache.cached = Some(CachedWbi {
             keys: nav.wbi.clone(),
             expires: Instant::now() + Duration::from_secs(1800),
             generation,
@@ -606,6 +630,29 @@ impl<T: Transport> Client<T> {
     }
 
     pub async fn view(&self, reference: &VideoRef, deadline: Instant) -> Result<VideoMetadata> {
+        let (reference, response) = self.view_response(reference, deadline).await?;
+        parse_view_response(&response.body, &reference)
+    }
+
+    pub async fn view_preview(
+        &self,
+        reference: &VideoRef,
+        deadline: Instant,
+    ) -> Result<VideoPreview> {
+        let (reference, response) = self.view_response(reference, deadline).await?;
+        let metadata = parse_view_response(&response.body, &reference)?;
+        let value = strict_json(&response.body, MAX_BODY)?;
+        let cover = value["data"]["pic"]
+            .as_str()
+            .and_then(|value| cover::CoverUrl::parse(value).ok());
+        Ok(VideoPreview { metadata, cover })
+    }
+
+    async fn view_response(
+        &self,
+        reference: &VideoRef,
+        deadline: Instant,
+    ) -> Result<(VideoRef, ApiResponse)> {
         // Revalidate public struct construction before query use.
         let reference = parse_resource(&reference.canonical())?;
         let query = match &reference.id {
@@ -618,7 +665,7 @@ impl<T: Transport> Client<T> {
                 deadline,
             )
             .await?;
-        parse_view_response(&response.body, &reference)
+        Ok((reference, response))
     }
 
     pub async fn resolve(
@@ -634,8 +681,14 @@ impl<T: Transport> Client<T> {
         ) {
             return Err(Error::InvalidResponse("requested_quality"));
         }
-        let metadata = self.view(&reference, deadline).await?;
-        let (mut keys, mut generation) = self.wbi_key(deadline, None).await?;
+        // Metadata and signing keys are independent. Start both immediately,
+        // but do not send playurl until the real CID and keys are available.
+        // Both futures keep the original deadline; either failure cancels the
+        // other request without creating a background refresh task.
+        let (metadata, (mut keys, mut generation)) = tokio::try_join!(
+            self.view(&reference, deadline),
+            self.wbi_key(deadline, None)
+        )?;
         // At most two signed playurl attempts and one forced refresh, all under
         // the original deadline. Unauthorized responses are never retried.
         for attempt in 0..2 {

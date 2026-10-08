@@ -3,6 +3,7 @@ import { createPinia } from "pinia";
 import { createApplicationRouter } from "./router";
 import AppShell from "./AppShell.vue";
 import { installGlobalErrorHandlers } from "./global-errors";
+import { initializeTheme } from "./theme";
 import "../styles/tokens.css";
 import "../styles/base.css";
 import "../styles/layout.css";
@@ -14,6 +15,7 @@ import "../styles/design-system.css";
 import "../styles/player-overlay.css";
 export function start(base = "/") {
   const app = createApp(AppShell);
+  app.onUnmount(initializeTheme());
   app.use(createPinia());
   const router = createApplicationRouter(base);
   app.onUnmount(installGlobalErrorHandlers(app, router));

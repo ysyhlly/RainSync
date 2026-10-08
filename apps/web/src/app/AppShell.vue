@@ -22,6 +22,8 @@ import UserAvatar from "../shared/ui/UserAvatar.vue";
 import Notice from "../shared/ui/Notice.vue";
 import { providePlaybackPlacement } from "../features/playback/playback-placement";
 import { useRoomNotice } from "../features/playback/room-notice";
+import ThemeControl from "./ThemeControl.vue";
+import { navigationPending, navigationTitle } from "./navigation-progress";
 import {
   keyboardViewportOpen,
   hasEditableFocus,
@@ -122,6 +124,7 @@ async function retry() {
     }"
   >
     <a v-if="session.user" class="skip-link" href="#main-content">跳转到内容</a>
+    <ThemeControl v-if="!session.user" class="public-theme-control" />
     <aside v-if="session.user" class="sidebar">
       <RouterLink class="brand" to="/rooms">RainSync</RouterLink>
       <AnimatedNavigation
@@ -132,6 +135,7 @@ async function retry() {
       <RouterLink v-else :to="guestRoomPath(session.user)!" class="button"
         >返回受邀房间</RouterLink
       >
+      <ThemeControl class="sidebar-theme" />
       <div class="sidebar-account">
         <RouterLink
           v-if="!session.user.guest"
@@ -164,7 +168,7 @@ async function retry() {
     </aside>
     <header v-if="session.user" class="mobile-header">
       <RouterLink class="brand" to="/rooms">RainSync</RouterLink
-      ><RouterLink
+      ><ThemeControl /><RouterLink
         v-if="!session.user.guest"
         to="/account/profile"
         aria-label="个人资料"
@@ -182,6 +186,7 @@ async function retry() {
       class="workspace"
       :class="{ 'watch-layout': inRoom }"
       tabindex="-1"
+      :aria-busy="navigationPending"
     >
       <div v-if="!session.loaded" class="page loading-state" role="status">
         正在恢复登录状态…
@@ -235,6 +240,18 @@ async function retry() {
             >{{ item.label }}</RouterLink
           >
         </nav>
+        <section
+          v-if="navigationPending"
+          class="route-loading page-stack"
+          role="status"
+          aria-live="polite"
+        >
+          <header class="page-intro">
+            <h1>{{ navigationTitle }}</h1>
+            <p>正在打开页面…</p>
+          </header>
+          <div class="route-loading-skeleton" aria-hidden="true" />
+        </section>
         <Notice
           v-if="route.query.notice === 'admin-required'"
           class="permission-notice"

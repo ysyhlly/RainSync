@@ -1,5 +1,8 @@
 <script setup lang="ts">
 import LibraryHierarchy from "./LibraryHierarchy.vue";
+import LibraryLoading from "./LibraryLoading.vue";
+import { libraryPageSummary } from "./library-summary";
+import { mediaEpisodeLabel } from "./media-label";
 import QueueFeedback from "../rooms/QueueFeedback.vue";
 import { ref, computed, onMounted, onBeforeUnmount } from "vue";
 import { useMediaCatalog } from "./media-catalog.store";
@@ -133,8 +136,9 @@ onBeforeUnmount(() => {
           重试本次加载
         </button>
       </div>
+      <LibraryLoading v-if="!library.loaded && !library.error" />
       <div
-        v-if="library.busy"
+        v-else-if="library.busy"
         class="loading-state loading-state--inline"
         role="status"
       >
@@ -237,6 +241,9 @@ onBeforeUnmount(() => {
             :alt="item.title"
           />
           <h2 :title="item.title">{{ item.title }}</h2>
+          <p v-if="mediaEpisodeLabel(item)" class="helper">
+            {{ mediaEpisodeLabel(item) }}
+          </p>
           <p class="media-meta">
             {{ item.kind }} ·
             {{
@@ -309,8 +316,8 @@ onBeforeUnmount(() => {
         >
           <AppIcon name="back" />上一页</button
         ><span
-          >第 {{ library.page + 1 }} 页 · 本页 {{ library.entryCount }}
-          {{ library.mode === "flat" ? "部" : "项" }}</span
+          >第 {{ library.page + 1 }} 页 · 本页
+          {{ libraryPageSummary(library.folders, items.length) }}</span
         ><button
           :disabled="library.busy || queryChanged || !library.hasMore"
           @click="library.loadPage(library.page + 1)"
@@ -381,10 +388,9 @@ onBeforeUnmount(() => {
   }
   .library-page .page-intro {
     flex: 1;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: var(--space-1) var(--space-3);
+    display: grid;
+    align-content: start;
+    gap: var(--space-1);
   }
   .library-page .page-intro .section-label {
     flex-basis: 100%;
@@ -395,7 +401,7 @@ onBeforeUnmount(() => {
     flex: 0 0 auto;
   }
   .library-page .page-intro > p:last-child {
-    flex: 1 1 24rem;
+    max-width: 44rem;
   }
   .library-page > .page-title > .button {
     flex-shrink: 0;

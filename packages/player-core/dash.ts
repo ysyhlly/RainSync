@@ -1,4 +1,5 @@
 import type { MediaPlayerClass, MediaPlayerSettingClass } from "dashjs";
+import { platformSegmentBaseExtension } from "./dash/segment-base";
 import {
   createPlatformDashFence,
   validatePlatformDashManifest,
@@ -13,11 +14,16 @@ export {
 } from "./dash/manifest";
 export type { PlatformDashFence, PlatformDashSource } from "./dash/manifest";
 
-type RequestInterceptor = Parameters<MediaPlayerClass["addRequestInterceptor"]>[0];
-type ResponseInterceptor = Parameters<MediaPlayerClass["addResponseInterceptor"]>[0];
+type RequestInterceptor = Parameters<
+  MediaPlayerClass["addRequestInterceptor"]
+>[0];
+type ResponseInterceptor = Parameters<
+  MediaPlayerClass["addResponseInterceptor"]
+>[0];
 
 /** Small DI surface: tests never import the browser SDK or perform requests. */
 export interface DashPlayerBridge {
+  extend?: MediaPlayerClass["extend"];
   initialize(video: HTMLVideoElement, url: string, autoplay: boolean): void;
   updateSettings(settings: MediaPlayerSettingClass): void;
   on(event: string, handler: (event: unknown) => void): void;
@@ -35,8 +41,17 @@ export interface DashModuleBridge {
 export type DashModuleLoader = () => Promise<DashModuleBridge>;
 
 export type DashPlaybackStatus =
-  | "idle" | "loading" | "ready" | "waiting" | "playing" | "paused"
-  | "seeking" | "ended" | "failed" | "detached";
+  | "idle"
+  | "loading"
+  | "loading_media"
+  | "ready"
+  | "waiting"
+  | "playing"
+  | "paused"
+  | "seeking"
+  | "ended"
+  | "failed"
+  | "detached";
 export interface DashPlaybackSnapshot {
   status: DashPlaybackStatus;
   positionSeconds: number;
@@ -45,8 +60,14 @@ export interface DashPlaybackSnapshot {
   paused: boolean;
 }
 export interface DashPlaybackError {
-  code: "DASH_UNSAFE_SOURCE" | "DASH_LIBRARY_LOAD_FAILED" | "DASH_INITIALIZATION_FAILED"
-    | "DASH_PLAYBACK_ERROR" | "DASH_UNSAFE_REQUEST" | "DASH_UNSAFE_MANIFEST" | "DASH_ENCRYPTED_MEDIA";
+  code:
+    | "DASH_UNSAFE_SOURCE"
+    | "DASH_LIBRARY_LOAD_FAILED"
+    | "DASH_INITIALIZATION_FAILED"
+    | "DASH_PLAYBACK_ERROR"
+    | "DASH_UNSAFE_REQUEST"
+    | "DASH_UNSAFE_MANIFEST"
+    | "DASH_ENCRYPTED_MEDIA";
   message: string;
   /** Numeric diagnostic only. SDK objects can contain URLs, tokens or bodies. */
   dashCode?: number;
@@ -66,6 +87,8 @@ export interface DashPlaybackOptions {
   onEnded?: (positionSeconds: number) => void;
   /** Local observations only. Never translate them into automatic room actions. */
   onStatus?: (snapshot: DashPlaybackSnapshot) => void;
+  /** initialize has attached the validated source, independently of readiness. */
+  onSourceAttached?: () => void;
   loadModule?: DashModuleLoader;
 }
 
@@ -81,7 +104,10 @@ export function platformDashSettings(): MediaPlayerSettingClass {
       applyProducerReferenceTime: false,
       applyContentSteering: false,
       parseInbandPrft: false,
-      protection: { ignoreEmeEncryptedEvent: true, keepProtectionMediaKeys: false },
+      protection: {
+        ignoreEmeEncryptedEvent: true,
+        keepProtectionMediaKeys: false,
+      },
       utcSynchronization: {
         enabled: false,
         useManifestDateHeaderTimeSource: false,
@@ -89,7 +115,12 @@ export function platformDashSettings(): MediaPlayerSettingClass {
         enableBackgroundSyncAfterSegmentDownloadError: false,
       },
       liveCatchup: { enabled: false },
-      gaps: { jumpGaps: false, jumpLargeGaps: false, enableSeekFix: false, enableStallFix: false },
+      gaps: {
+        jumpGaps: false,
+        jumpLargeGaps: false,
+        enableSeekFix: false,
+        enableStallFix: false,
+      },
       buffer: {
         bufferTimeDefault: 20,
         bufferTimeAtTopQuality: 30,
@@ -106,8 +137,14 @@ export function platformDashSettings(): MediaPlayerSettingClass {
       fragmentRequestTimeout: 20000,
       manifestRequestTimeout: 10000,
       retryAttempts: {
-        MPD: 1, MediaSegment: 1, InitializationSegment: 1, IndexSegment: 1,
-        XLinkExpansion: 0, license: 0, licenseCertificate: 0, other: 0,
+        MPD: 1,
+        MediaSegment: 1,
+        InitializationSegment: 1,
+        IndexSegment: 1,
+        XLinkExpansion: 0,
+        license: 0,
+        licenseCertificate: 0,
+        other: 0,
       },
       abr: {
         autoSwitchBitrate: { video: true, audio: true },
@@ -119,41 +156,69 @@ export function platformDashSettings(): MediaPlayerSettingClass {
   };
 }
 
-export const loadDashJs: DashModuleLoader = async () => {
-  const sdk = await import("dashjs");
-  return {
-    createPlayer: () => sdk.MediaPlayer().create(),
-    events: { ready: sdk.MediaPlayer.events.STREAM_INITIALIZED, error: sdk.MediaPlayer.events.ERROR },
-  };
+let dashModule: Promise<DashModuleBridge> | undefined;
+/** Share only the SDK import. Preloading creates no player or media request. A
+ * failed chunk load is evicted so a later user retry can try again. */
+export const loadDashJs: DashModuleLoader = () => {
+  if (dashModule) return dashModule;
+  const pending = import("dashjs")
+    .then((sdk) => ({
+      createPlayer: () => sdk.MediaPlayer().create(),
+      events: {
+        ready: sdk.MediaPlayer.events.STREAM_INITIALIZED,
+        error: sdk.MediaPlayer.events.ERROR,
+      },
+    }))
+    .catch((failure) => {
+      if (dashModule === pending) dashModule = undefined;
+      throw failure;
+    });
+  dashModule = pending;
+  return pending;
 };
 
 function numberCode(value: unknown, key: string) {
   if (!value || typeof value !== "object") return undefined;
   const result = (value as Record<string, unknown>)[key];
-  return typeof result === "number" && Number.isSafeInteger(result) && result >= 0 ? result : undefined;
+  return typeof result === "number" &&
+    Number.isSafeInteger(result) &&
+    result >= 0
+    ? result
+    : undefined;
 }
 function diagnostic(event: unknown) {
   if (!event || typeof event !== "object") return undefined;
   return numberCode((event as Record<string, unknown>).error, "code");
 }
 function safely(action: () => void) {
-  try { action(); } catch { /* Local callbacks/teardown must not leak the owned player. */ }
+  try {
+    action();
+  } catch {
+    /* Local callbacks/teardown must not leak the owned player. */
+  }
 }
 
 /** Owns SDK attachment only. The actual player remains options.video, which the
  * existing runtime controls directly for play/pause/currentTime/playbackRate. */
 export function createDashPlayback(options: DashPlaybackOptions) {
   const video = options.video;
-  let generation = 0, destroyed = false;
+  let generation = 0,
+    destroyed = false;
   let status: DashPlaybackStatus = "idle";
-  let attachment: {
-    player: DashPlayerBridge;
-    cleanup: (() => void)[];
-    ready: boolean;
-    manifestValidated: boolean;
-  } | undefined;
+  let attachment:
+    | {
+        player: DashPlayerBridge;
+        cleanup: (() => void)[];
+        ready: boolean;
+        manifestValidated: boolean;
+      }
+    | undefined;
   const externalCurrent = () => {
-    try { return !destroyed && options.current?.() !== false; } catch { return false; }
+    try {
+      return !destroyed && options.current?.() !== false;
+    } catch {
+      return false;
+    }
   };
   const snapshot = (): DashPlaybackSnapshot => ({
     status,
@@ -193,8 +258,12 @@ export function createDashPlayback(options: DashPlaybackOptions) {
 
   return {
     video,
-    get attached() { return attachment !== undefined; },
-    get status() { return status; },
+    get attached() {
+      return attachment !== undefined;
+    },
+    get status() {
+      return status;
+    },
     snapshot,
     /** True means initialize attached this source; await is not readiness or
      * first-frame evidence. False means failed, superseded or detached. */
@@ -215,19 +284,32 @@ export function createDashPlayback(options: DashPlaybackOptions) {
           origin: options.origin ?? browserOrigin ?? "",
         });
       } catch {
-        fail({ code: "DASH_UNSAFE_SOURCE", message: "DASH 播放地址无法安全使用" });
+        fail({
+          code: "DASH_UNSAFE_SOURCE",
+          message: "DASH 播放地址无法安全使用",
+        });
         return false;
       }
       publish("loading");
       let module: DashModuleBridge;
-      try { module = await (options.loadModule ?? loadDashJs)(); }
-      catch {
-        if (live()) fail({ code: "DASH_LIBRARY_LOAD_FAILED", message: "DASH 播放器加载失败，请重试" });
+      try {
+        module = await (options.loadModule ?? loadDashJs)();
+      } catch {
+        if (live())
+          fail({
+            code: "DASH_LIBRARY_LOAD_FAILED",
+            message: "DASH 播放器加载失败，请重试",
+          });
         return false;
       }
       if (!live()) return false;
       try {
-        const owned = { player: module.createPlayer(), cleanup: [] as (() => void)[], ready: false, manifestValidated: false };
+        const owned = {
+          player: module.createPlayer(),
+          cleanup: [] as (() => void)[],
+          ready: false,
+          manifestValidated: false,
+        };
         attachment = owned;
         const current = () => live() && attachment === owned;
         // dash.js 5.2.0 HTTPLoader does not catch interceptor rejections. A
@@ -236,17 +318,29 @@ export function createDashPlayback(options: DashPlaybackOptions) {
         // promises own no timer, abort listener or helper-held reference. They
         // are not an application wait and load() has already settled normally.
         const denied = <T>(): Promise<T> => new Promise<T>(() => {});
-        const block = (code: "DASH_UNSAFE_REQUEST" | "DASH_UNSAFE_MANIFEST") => {
-          if (current()) fail({ code, message: "DASH 播放资源校验失败，请重新加载" });
+        const block = (
+          code: "DASH_UNSAFE_REQUEST" | "DASH_UNSAFE_MANIFEST",
+        ) => {
+          if (current())
+            fail({ code, message: "DASH 播放资源校验失败，请重新加载" });
         };
-        const requestInterceptor: RequestInterceptor = async request => {
+        const requestInterceptor: RequestInterceptor = async (request) => {
           if (!current()) return denied();
           try {
             validatePlatformDashRequest(request.url, fence);
-            if ((request.method ?? "GET") !== "GET" && request.method !== "HEAD") throw new Error();
-            if (request.body !== undefined && request.body !== null) throw new Error();
+            if (
+              (request.method ?? "GET") !== "GET" &&
+              request.method !== "HEAD"
+            )
+              throw new Error();
+            if (request.body !== undefined && request.body !== null)
+              throw new Error();
             for (const [name, value] of Object.entries(request.headers ?? {})) {
-              if (name.toLowerCase() !== "range" || !/^bytes=\d+-\d*$/.test(value)) throw new Error();
+              if (
+                name.toLowerCase() !== "range" ||
+                !/^bytes=\d+-\d*$/.test(value)
+              )
+                throw new Error();
             }
             request.credentials = "same-origin";
             request.mode = "same-origin";
@@ -256,13 +350,24 @@ export function createDashPlayback(options: DashPlaybackOptions) {
             return denied();
           }
         };
-        const responseInterceptor: ResponseInterceptor = async response => {
+        const responseInterceptor: ResponseInterceptor = async (response) => {
           if (!current()) return denied();
           try {
-            const requestUrl = validatePlatformDashRequest(response.request.url, fence);
-            if (response.redirected || (response.url && validatePlatformDashRequest(response.url, fence) !== requestUrl))
+            const requestUrl = validatePlatformDashRequest(
+              response.request.url,
+              fence,
+            );
+            if (
+              response.redirected ||
+              (response.url &&
+                validatePlatformDashRequest(response.url, fence) !== requestUrl)
+            )
               throw new Error();
-            if (requestUrl === fence.manifestUrl && (response.status ?? 0) >= 200 && (response.status ?? 0) < 300) {
+            if (
+              requestUrl === fence.manifestUrl &&
+              (response.status ?? 0) >= 200 &&
+              (response.status ?? 0) < 300
+            ) {
               validatePlatformDashManifest(response.data, fence);
               owned.manifestValidated = true;
             }
@@ -273,18 +378,45 @@ export function createDashPlayback(options: DashPlaybackOptions) {
           }
         };
         owned.player.addRequestInterceptor(requestInterceptor);
-        owned.cleanup.push(() => owned.player.removeRequestInterceptor(requestInterceptor));
+        owned.cleanup.push(() =>
+          owned.player.removeRequestInterceptor(requestInterceptor),
+        );
         owned.player.addResponseInterceptor(responseInterceptor);
-        owned.cleanup.push(() => owned.player.removeResponseInterceptor(responseInterceptor));
+        owned.cleanup.push(() =>
+          owned.player.removeResponseInterceptor(responseInterceptor),
+        );
+        // FactoryMaker applies this only inside this player's context. Enable
+        // precise selection after our generated static SegmentBase MPD passes
+        // the existing response guard; stale/detached players keep no authority.
+        owned.player.extend?.(
+          "SegmentBaseGetter",
+          platformSegmentBaseExtension(
+            () => current() && owned.manifestValidated,
+          ),
+          true,
+        );
         const bind = (event: string, callback: (event: unknown) => void) => {
-          const handler = (data: unknown) => { if (current()) callback(data); };
+          const handler = (data: unknown) => {
+            if (current()) callback(data);
+          };
           owned.player.on(event, handler);
           owned.cleanup.push(() => owned.player.off(event, handler));
         };
-        bind(module.events.ready, event => {
-          if (!owned.manifestValidated) { block("DASH_UNSAFE_MANIFEST"); return; }
-          if (event && typeof event === "object" && (event as Record<string, unknown>).error) {
-            fail({ code: "DASH_PLAYBACK_ERROR", message: "DASH 媒体初始化失败", dashCode: diagnostic(event) });
+        bind(module.events.ready, (event) => {
+          if (!owned.manifestValidated) {
+            block("DASH_UNSAFE_MANIFEST");
+            return;
+          }
+          if (
+            event &&
+            typeof event === "object" &&
+            (event as Record<string, unknown>).error
+          ) {
+            fail({
+              code: "DASH_PLAYBACK_ERROR",
+              message: "DASH 媒体初始化失败",
+              dashCode: diagnostic(event),
+            });
             return;
           }
           if (owned.ready) return;
@@ -292,43 +424,80 @@ export function createDashPlayback(options: DashPlaybackOptions) {
           publish("ready");
           if (current()) safely(() => options.onReady?.());
         });
-        bind(module.events.error, event => {
-          fail({ code: "DASH_PLAYBACK_ERROR", message: "DASH 媒体加载或解码失败，请重新加载", dashCode: diagnostic(event) });
+        bind(module.events.error, (event) => {
+          fail({
+            code: "DASH_PLAYBACK_ERROR",
+            message: "DASH 媒体加载或解码失败，请重新加载",
+            dashCode: diagnostic(event),
+          });
         });
         const media = (event: string, callback: () => void) => {
-          const handler = () => { if (current()) callback(); };
+          const handler = () => {
+            if (current()) callback();
+          };
           video.addEventListener(event, handler);
           owned.cleanup.push(() => video.removeEventListener(event, handler));
         };
         for (const [event, next] of [
-          ["waiting", "waiting"], ["stalled", "waiting"], ["playing", "playing"],
-          ["pause", "paused"], ["seeking", "seeking"],
-        ] as const) media(event, () => { if (owned.ready) publish(next); });
-        media("seeked", () => { if (owned.ready) publish(video.paused ? "paused" : "playing"); });
+          ["waiting", "waiting"],
+          ["stalled", "waiting"],
+          ["playing", "playing"],
+          ["pause", "paused"],
+          ["seeking", "seeking"],
+        ] as const)
+          media(event, () => {
+            if (owned.ready) publish(next);
+          });
+        media("seeked", () => {
+          if (owned.ready) publish(video.paused ? "paused" : "playing");
+        });
         media("ended", () => {
           if (!owned.ready || !video.ended) return;
           publish("ended");
-          if (current()) safely(() => options.onEnded?.(snapshot().positionSeconds));
+          if (current())
+            safely(() => options.onEnded?.(snapshot().positionSeconds));
         });
         media("error", () => {
           const mediaCode = numberCode(video.error, "code");
           if (mediaCode === undefined || mediaCode === 1) return;
-          fail({ code: "DASH_PLAYBACK_ERROR", message: "DASH 媒体加载或解码失败，请重新加载", mediaCode });
+          fail({
+            code: "DASH_PLAYBACK_ERROR",
+            message: "DASH 媒体加载或解码失败，请重新加载",
+            mediaCode,
+          });
         });
-        media("encrypted", () => fail({ code: "DASH_ENCRYPTED_MEDIA", message: "此播放方式不支持加密媒体" }));
+        media("encrypted", () =>
+          fail({
+            code: "DASH_ENCRYPTED_MEDIA",
+            message: "此播放方式不支持加密媒体",
+          }),
+        );
         owned.player.updateSettings(platformDashSettings());
         video.autoplay = false;
         video.pause();
-        if (!current()) { release(); return false; }
+        if (!current()) {
+          release();
+          return false;
+        }
         // Do not supply a start time. Runtime metadata/apply fences own seeking.
         owned.player.initialize(video, fence.manifestUrl, false);
+        if (!current()) return false;
+        safely(() => options.onSourceAttached?.());
+        if (current() && !owned.ready) publish("loading_media");
         return current();
       } catch {
-        if (live()) fail({ code: "DASH_INITIALIZATION_FAILED", message: "DASH 播放器初始化失败，请重新加载" });
+        if (live())
+          fail({
+            code: "DASH_INITIALIZATION_FAILED",
+            message: "DASH 播放器初始化失败，请重新加载",
+          });
         return false;
       }
     },
-    detach() { release(); publish("detached"); },
+    detach() {
+      release();
+      publish("detached");
+    },
     destroy() {
       if (destroyed) return;
       release();

@@ -56,9 +56,13 @@ button:disabled {
   color: var(--text-on-accent);
   border-color: var(--border-control);
 }
+:root .primary {
+  /* Text and background must switch together when changing between themes. */
+  transition-property: transform, box-shadow, border-color;
+}
 .primary:hover:not(:disabled) {
   background: var(--accent-hover);
-  color: var(--text-primary);
+  color: var(--text-on-accent);
 }
 .danger {
   color: var(--danger);
@@ -411,11 +415,30 @@ select:disabled {
 input[type="checkbox"],
 input[type="radio"] {
   flex-shrink: 0;
+  width: auto;
+  min-height: 0;
+  margin: 0;
+  accent-color: var(--accent);
 }
 label:has(> input[type="checkbox"]),
 label:has(> input[type="radio"]) {
   min-height: var(--control-height);
   align-items: center;
+  flex-direction: row;
+}
+.field-error {
+  color: var(--danger);
+  font-size: var(--font-size-sm);
+}
+.login-page {
+  justify-content: flex-start;
+  padding-top: clamp(48px, 8vh, 96px);
+}
+.public-theme-control {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 10;
 }
 .password-field > input {
   flex: 1 1 0;

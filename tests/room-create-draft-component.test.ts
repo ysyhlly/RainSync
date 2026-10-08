@@ -26,6 +26,7 @@ async function panel(create: ReturnType<typeof vi.fn>) {
     {
       useSession: () => ({ user: { id: "fixture" } }),
       useRoomRuntime: () => ({ room: null, enter }),
+      useMediaCatalog: () => ({ roomRecord: () => undefined }),
       roomsApi: () => ({ list, create }),
       createRoomSubmission,
       useRouter: () => ({ push }),
@@ -204,7 +205,8 @@ it("keeps room validation local and preserves the invalid draft", async () => {
   expect(create).not.toHaveBeenCalled();
   expect(c.name.value).toBe("   ");
   expect(c.createOpen.value).toBe(true);
-  expect(c.error.value).toBe("房间名称须为1–120个字符");
+  expect(c.nameError.value).toBe("请输入房间名称");
+  expect(c.error.value).toBe("");
   expect(c.busy.value).toBe(false);
 });
 

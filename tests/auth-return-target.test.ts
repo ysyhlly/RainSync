@@ -20,6 +20,7 @@ import {
   validateNickname,
 } from "../apps/web/src/features/auth/account-rules";
 import { RequestFailure } from "../apps/web/src/errors";
+import { clearInvitation } from "../apps/web/src/features/auth/invitation-intent";
 
 afterEach(() => vi.unstubAllGlobals());
 const identity = {
@@ -62,6 +63,7 @@ it("login and registration retain the same safe destination and expiry explanati
   const replace = vi.fn();
   const shared = {
     guestRoomPath,
+    clearInvitation,
     parseGuestInvitation,
     validateNickname,
     RegistrationConfirmationRequired,

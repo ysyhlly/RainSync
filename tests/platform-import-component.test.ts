@@ -66,6 +66,7 @@ function mountImport(api: ReturnType<typeof vi.fn>) {
     ...imports,
     Notice: {},
     AppSelect: {},
+    MediaThumbnail: {},
   };
   const { controls, unmount } = mountSetup(
     new URL(
@@ -113,6 +114,85 @@ it("retains the exact continuation and choices after a retryable page failure", 
     panel.unmount();
   }
 });
+it("explicit metadata retry preserves reviewed choices and completed imports", async () => {
+  const updated = {
+    ...first,
+    title: "真实标题",
+    cover_data_url:
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jWHsAAAAASUVORK5CYII=",
+  };
+  const api = vi
+    .fn()
+    .mockResolvedValueOnce(
+      page(
+        [
+          {
+            ...first,
+            title: null,
+            metadata_error: {
+              code: "platform_import_unavailable",
+              retryable: true,
+            },
+          },
+        ],
+        null,
+      ),
+    )
+    .mockResolvedValueOnce(page([updated], null));
+  const panel = mountImport(api);
+  try {
+    const c = panel.controls;
+    await c.previewVideos();
+    c.selected.value = [first.key];
+    c.outcomes.value = [
+      { key: second.key, media: { id: "imported", title: "已导入" } },
+    ];
+    await c.retryMetadata(first.key);
+    expect(c.preview.value.items[0]).toMatchObject({
+      title: "真实标题",
+      cover_data_url: updated.cover_data_url,
+    });
+    expect(c.selected.value).toEqual([first.key]);
+    expect(c.outcomes.value[0].media.id).toBe("imported");
+    expect(api.mock.calls[1][2].collection).toBe(false);
+    expect(
+      api.mock.calls.every((call) =>
+        call[0].endsWith("/platform-media/preview"),
+      ),
+    ).toBe(true);
+  } finally {
+    panel.unmount();
+  }
+});
+it.each(["room", "login", "input"])(
+  "late metadata retry does not restore a retired %s preview",
+  async (change) => {
+    let release!: (value: unknown) => void;
+    const api = vi
+      .fn()
+      .mockResolvedValueOnce(page())
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+      );
+    const panel = mountImport(api);
+    try {
+      const c = panel.controls;
+      await c.previewVideos();
+      const retrying = c.retryMetadata(first.key);
+      if (change === "room") panel.runtime.room.id = "different-room";
+      else if (change === "login") panel.session.epoch++;
+      else c.url.value = second.url;
+      release(page([{ ...first, title: "旧标题" }], null));
+      await retrying;
+      expect(c.preview.value).toBeUndefined();
+      expect(c.phase.value).toBe("idle");
+    } finally {
+      panel.unmount();
+    }
+  },
+);
 
 it("does not revive the continuation after a non-retryable page response", async () => {
   const api = vi

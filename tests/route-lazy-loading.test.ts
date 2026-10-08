@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createMemoryHistory } from "vue-router";
 const pages = {
   LoginPage: "features/auth/LoginPage.vue",
+  InvitationPage: "features/auth/InvitationPage.vue",
   RegisterPage: "features/auth/RegisterPage.vue",
   ProfilePage: "features/account/ProfilePage.vue",
   RoomsPage: "features/rooms/RoomsPage.vue",
@@ -62,7 +63,7 @@ it("keeps every page including 404 unopened until navigation passes its guard", 
   expect(loaded).toEqual([]);
   expect(
     app.getRoutes().filter((route) => route.components?.default),
-  ).toHaveLength(14);
+  ).toHaveLength(15);
   await app.push("/admin/plugins?tab=installed");
   expect(app.currentRoute.value.path).toBe("/login");
   expect(app.currentRoute.value.query.redirect).toBe(
@@ -105,4 +106,22 @@ it("loads the missing-page view lazily for an authenticated unmatched route", as
   await app.push("/unknown-page");
   expect(loaded).toEqual(["NotFoundPage"]);
   expect(document.title).toBe("页面不存在 · RainSync");
+});
+it("opens a public 404 for an anonymous unknown route without redirecting to login", async () => {
+  const app = await router();
+  await app.push("/nonexistent-xyz");
+  expect(app.currentRoute.value.path).toBe("/nonexistent-xyz");
+  expect(loaded).toEqual(["NotFoundPage"]);
+});
+it("admits a same-site invitation page for anonymous and registered viewers", async () => {
+  const app = await router();
+  const destination =
+    "/invite/11111111-1111-4111-8111-111111111111#token=" + "a".repeat(64);
+  await app.push(destination);
+  expect(app.currentRoute.value.fullPath).toBe(destination);
+  expect(loaded).toEqual(["InvitationPage"]);
+  session.user = { admin: false };
+  await app.push("/rooms");
+  await app.push(destination);
+  expect(app.currentRoute.value.fullPath).toBe(destination);
 });
