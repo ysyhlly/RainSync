@@ -541,7 +541,6 @@ pub async fn track(
         },
     )
     .await?;
-    check(&app, &authority).await?;
     let status = upstream.status;
     let expected = response_facts(status, &upstream.headers, requested.map(|(_, r)| r))?;
     enforce_representation_facts(status, &upstream.headers, track)?;
@@ -554,24 +553,16 @@ pub async fn track(
         Body::empty()
     } else {
         let state = StreamState {
-            app: app.clone(),
-            authority,
             upstream: owned_body,
             remaining: expected,
         };
+        // The owner task is the only in-flight GATE. Revocation closes this body.
         Body::from_stream(stream::try_unfold(state, |mut state| async move {
-            check(&state.app, &state.authority)
+            let result = state
+                .upstream
+                .next()
                 .await
-                .map_err(|_| stream_error())?;
-            let result={
-                let pending=state.upstream.next();tokio::pin!(pending);
-                loop {tokio::select! {
-                    result=&mut pending=>break result,
-                    _=tokio::time::sleep(Duration::from_secs(1))=>check(&state.app,&state.authority).await.map_err(|_|stream_error())?,
-                }}
-            }.transpose().map_err(|_|stream_error())?;
-            check(&state.app, &state.authority)
-                .await
+                .transpose()
                 .map_err(|_| stream_error())?;
             match result {
                 Some(chunk) => {
@@ -641,8 +632,6 @@ fn hide_course_entity_metadata(headers: &mut HeaderMap) {
 }
 
 struct StreamState {
-    app: App,
-    authority: Authority,
     upstream: owner::OwnedBody,
     remaining: Option<u64>,
 }
