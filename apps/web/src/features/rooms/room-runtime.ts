@@ -147,6 +147,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
       ++namesRequest;
       namesPending = false;
       presenceGeneration = presenceState.begin(connection.room);
+      queue.connectionChanged();
     },
     onOpen: (connection) => {
       chatCommands.disconnected();
@@ -226,7 +227,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     send: transport.send,
     connect: transport.connect,
     accept: (input, scope) => {
-      if (!requestScope.currentRoom(scope)) return false;
+      if (!requestScope.current(scope)) return false;
       return applyProjection(
         projectRoomHttp(projection.value, input, connected.value),
       );
@@ -399,7 +400,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     if (!scope) return;
     const current = () =>
       request === permissionsRequest &&
-      requestScope.currentRoom(scope) &&
+      requestScope.current(scope) &&
       permissionIdentity() === identity;
     try {
       const snapshot = await session.api<unknown>(
@@ -597,7 +598,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     const scope = requestScope.capture();
     if (!scope) return;
     void commands.refreshLifecycle().catch((failure) => {
-      if (requestScope.currentRoom(scope) && !(failure instanceof StaleIdentity))
+      if (requestScope.current(scope) && !(failure instanceof StaleIdentity))
         cleanupError.value = "暂时无法获取房间清理状态，将自动重试。";
     });
   }

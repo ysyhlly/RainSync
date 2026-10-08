@@ -25,8 +25,8 @@ boundary. It is not a second playback or transport implementation.
   `projection/chat-projection.ts` purely merges bounded history and deletion
   tombstones. A committed echo clears only its original draft text.
 - `commands/room-scope.ts` captures a frozen runtime owner plus distinct exact
-  login, room, room generation and connection generation. Both room-scoped mutation settlement and connection-scoped history projection
-  use their original captured owner.
+  login, room, room generation and connection generation. Room-scoped mutation
+  settlement is deliberately distinct from connection-scoped read projection.
 - The assembler retains metadata, optional presence names, permission reads,
   page error/busy state and the application viewing composition. Permission
   grants remain one atomic value with original identity/expiry checks.
@@ -36,17 +36,28 @@ clear the room projection and fence socket callbacks before awaiting playback
 cleanup. Playback receives the P04 readonly timeline and separate identity,
 command, error and busy ports. P05 intent/observation ownership is unchanged.
 
-## Extraction and separate read-fencing change
+## Explicit behavior deltas
 
-This rollback unit establishes the atomic projection, transport/command owners
-and finite page surface. It preserves the prior room-lifetime acceptance of
-queue and owner/lifecycle HTTP replies. A separate patch tightens those read
-projections at reconnect and adds before/after regression coverage. It must
-not turn successful mutation settlement into failure or retry a committed edit.
+The extraction also makes these previously incomplete boundaries explicit:
 
-Atomic room publication and removal of unused owner-only page exports are
-intentional boundary changes; they are covered by pure and existing runtime
-regressions. No protocol, media generation, prepare budget or driver changes.
+1. An ownership/lifecycle HTTP response initiated before reconnect cannot
+   project over the resumed snapshot, even if its old clock epoch differs and
+   its revision is higher. The HTTP command still resolves successfully when
+   the server reports a commit; it is not repeated.
+2. Queue reads and trailing invalidation work are connection-scoped. Reconnect
+   detaches an obsolete read so a resumed snapshot can start its fresh read
+   immediately; an old response cannot overwrite it or clear its loading/error.
+3. An obsolete failed chat cursor read cannot start fallback history traffic
+   after the connection or identity has changed.
+4. Related room/state/owner/lifecycle/control fields are published atomically,
+   eliminating partial combinations observable by synchronous Vue watchers.
+5. Owner-only playback callbacks and error writers are no longer auto-exported
+   to every page. The existing used page surface is enumerated explicitly.
+
+Known committed queue edits keep their original dedup operation and receipt
+across same-room reconnect. Chat retransmission retains its original client
+message ID until its original outcome, unless the user changes the draft.
+Connection fencing is not a new media, plan, SDK, prepare-budget or auth token.
 
 ## Finite playback page surface and remaining compatibility
 

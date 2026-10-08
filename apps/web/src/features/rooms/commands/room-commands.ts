@@ -106,7 +106,7 @@ export function createRoomCommands(options: {
         options.connect();
     } catch (failure) {
       if (
-        options.scope.currentRoom(scope) &&
+        options.scope.current(scope) &&
         failure instanceof RequestFailure &&
         ["REVISION_CONFLICT", "ROOM_LIFECYCLE_CONFLICT"].includes(failure.code)
       ) {

@@ -27,7 +27,7 @@ export function createRoomQueue(options: {
     const scope = options.scope.capture(),
       serial = ++request;
     if (!scope) return Promise.resolve();
-    const current = () => options.scope.currentRoom(scope) && serial === request;
+    const current = () => options.scope.current(scope) && serial === request;
     playlistLoading.value = true;
     const work = (async () => {
       try {
@@ -63,7 +63,7 @@ export function createRoomQueue(options: {
     const operation = { dirty: true };
     invalidation = operation;
     const current = () =>
-      invalidation === operation && options.scope.currentRoom(scope);
+      invalidation === operation && options.scope.current(scope);
     void (async () => {
       while (current() && operation.dirty) {
         operation.dirty = false;

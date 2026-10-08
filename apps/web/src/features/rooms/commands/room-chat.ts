@@ -46,6 +46,7 @@ export function createRoomChat(options: {
           `/rooms/${scope.room}/messages${after ? `?after=${encodeURIComponent(after)}` : ""}`,
         );
       } catch (failure) {
+        if (!options.scope.current(scope)) return;
         if (
           !after ||
           !(failure instanceof RequestFailure) ||
