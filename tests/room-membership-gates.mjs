@@ -10,7 +10,7 @@ const hash=async p=>createHash('sha256').update(await readFile(p)).digest('hex')
 try {
  await isolatedServer('room-membership-gates',async f=>{
   fixture=f;
-  const inputs=['crates/persistence/src/lib.rs','crates/persistence/examples/verify_membership_gates.rs','tests/room-membership-gates.mjs'];
+  const inputs=['crates/persistence/src/lib.rs','crates/persistence/src/room_commands.rs','crates/persistence/examples/verify_membership_gates.rs','tests/room-membership-gates.mjs'];
   report.source=await Promise.all(inputs.map(async path=>({path,sha256:await hash(path)})));
   const binary=resolve(f.target,'examples/verify_membership_gates');report.binary={path:binary,sha256:await hash(binary)};
   const output=execFileSync(binary,[],{env:{...f.env,RAINSYNC_ISOLATED_TEST:'1',RAINSYNC_FIXTURE_DATABASE:f.env.DATABASE_URL},encoding:'utf8',timeout:60000});

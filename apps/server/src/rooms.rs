@@ -262,8 +262,8 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                 .map_err(|error| control_error(error, "database_error"))?;
                 if let Some(previous) =
                     match &control_lease {
-                        Some(lease)=>persistence::previous_fenced(&app.db,id,&req.command,req.user_id,&req.session_hash,lease).await,
-                        None=>persistence::previous(&app.db,id,&req.command,req.user_id).await,
+                        Some(lease)=>persistence::room_commands::previous_fenced(&app.db,id,&req.command,req.user_id,&req.session_hash,lease).await,
+                        None=>persistence::room_commands::previous(&app.db,id,&req.command,req.user_id).await,
                     }
                         .map_err(|error| match error.to_string().as_str() {
                             "room_owner_lost" => "service_unavailable".to_string(),
@@ -313,8 +313,8 @@ async fn handle(app: &App, id: Uuid) -> Result<Handle> {
                     resolved_media = Some(resolution);
                 }
                 let next = match &control_lease {
-                    Some(lease)=>persistence::commit_fenced(&app.db,&req.command,req.user_id,&req.session_hash,reducer_time_ms,resolved_media,lease).await,
-                    None=>persistence::commit(&app.db,&req.command,req.user_id,&req.session_hash,reducer_time_ms,resolved_media).await,
+                    Some(lease)=>persistence::room_commands::commit_fenced(&app.db,&req.command,req.user_id,&req.session_hash,reducer_time_ms,resolved_media,lease).await,
+                    None=>persistence::room_commands::commit(&app.db,&req.command,req.user_id,&req.session_hash,reducer_time_ms,resolved_media).await,
                 }
                     .map_err(|error| control_error(error, "commit_failed"))?;
                 state = next.clone();
