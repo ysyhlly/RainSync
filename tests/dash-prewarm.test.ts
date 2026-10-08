@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 const { load } = vi.hoisted(() => ({ load: vi.fn().mockResolvedValue({}) }));
-vi.mock("../packages/player-core/dash", () => ({ loadDashJs: load }));
+vi.mock("../packages/player-core/dash/loader", () => ({ loadDashJs: load }));
 import { prewarmNativeDash } from "../apps/web/src/features/playback/dash-prewarm";
 const bili = {
   platform: {

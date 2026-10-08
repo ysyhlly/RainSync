@@ -1,4 +1,4 @@
-import { loadDashJs } from "../../../../../packages/player-core/dash";
+import { loadDashJs } from "../../../../../packages/player-core/dash/loader";
 import { getPlaybackMediaSource } from "./browser-mse";
 import type { Media } from "../../shared/api/types";
 

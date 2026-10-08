@@ -10,7 +10,7 @@ import {
   validNativeLiveDeliveryUrl,
 } from "./native-live";
 import { validLocalHlsRenditions } from "./local-hls-ladder-intent";
-import { createPlatformDashFence } from "../../../../../packages/player-core/dash";
+import { createPlatformDashFence } from "../../../../../packages/player-core/dash/manifest";
 
 export type NativePlatformPlaybackMode =
   "auto" | "native" | "compatibility" | "adaptive";

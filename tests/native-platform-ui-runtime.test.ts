@@ -15,9 +15,22 @@ const dashboards = vi.hoisted(() => [] as any[]);
 const hlsPlayers = vi.hoisted(() => [] as any[]);
 const browserCapabilities = vi.hoisted(() => ({ mse: true }));
 const dashPreload = vi.hoisted(() => vi.fn(async () => ({})));
+const dashDriverLoad = vi.hoisted(() => ({
+  before: undefined as (() => Promise<void>) | undefined,
+  calls: 0,
+}));
+vi.mock("../apps/web/src/features/playback/dash-driver-loader", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../apps/web/src/features/playback/dash-driver-loader")>();
+  return { loadDashDriver: async () => {
+    ++dashDriverLoad.calls;
+    await dashDriverLoad.before?.();
+    return actual.loadDashDriver();
+  } };
+});
+
+vi.mock("../packages/player-core/dash/loader", () => ({ loadDashJs: dashPreload }));
 vi.mock("../packages/player-core/dash", async (importOriginal) => ({
   ...(await importOriginal<any>()),
-  loadDashJs: dashPreload,
   createDashPlayback: (options: any) => {
     const controller = {
       options,
@@ -81,6 +94,8 @@ afterEach(() => {
   hlsPlayers.length = 0;
   dashPreload.mockReset();
   dashPreload.mockResolvedValue({});
+  dashDriverLoad.before = undefined;
+  dashDriverLoad.calls = 0;
 });
 function nativePlan(
   body: any,
@@ -2148,6 +2163,102 @@ it("native probe rejects a response past its absolute deadline even before a del
     );
   } finally {
     wall.mockRestore();
+    f.cleanup();
+  }
+});
+
+
+it.each(["reset", "identity", "media", "dispose"])(
+  "late DASH driver-module resolution cannot create an adapter after %s",
+  async (cause) => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    dashDriverLoad.before = () => pending;
+    const f = setup();
+    try {
+      const loading = f.runtime.loadMedia();
+      await settle();
+      expect(dashDriverLoad.calls).toBe(1);
+      expect(dashboards).toHaveLength(0);
+      if (cause === "reset") await f.runtime.reset();
+      else if (cause === "identity") ++f.session.epoch;
+      else if (cause === "media") f.state.value.media_generation++;
+      else f.cleanup();
+      release();
+      await loading;
+      expect(dashboards).toHaveLength(0);
+      expect(f.element.src).toBe("");
+    } finally {
+      release();
+      f.cleanup();
+    }
+  },
+);
+it.each(["data", "frame"])(
+  "the DASH driver-module wait consumes the original %s budget",
+  async (kind) => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    dashDriverLoad.before = () => pending;
+    const f = setup({ metricClock: true });
+    try {
+      if (kind === "frame") {
+        f.state.value.playback_status = "playing";
+        f.element.readyState = 4;
+      }
+      const loading = f.runtime.loadMedia();
+      await settle();
+      expect(dashDriverLoad.calls).toBe(1);
+      expect(dashboards).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(19000);
+      expect(f.runtime.preparation.value.failure).toBeUndefined();
+      release();
+      await loading;
+      expect(dashboards).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(f.runtime.preparation.value.failure?.code).toBe(
+        kind === "frame" ? "FIRST_FRAME_TIMEOUT" : "MEDIA_DATA_TIMEOUT",
+      );
+    } finally {
+      release();
+      f.cleanup();
+    }
+  },
+);
+it("a failed DASH driver import keeps the safe library failure category and an explicit retry", async () => {
+  dashDriverLoad.before = async () => { throw Error("private module URL"); };
+  const f = setup();
+  try {
+    await f.runtime.loadMedia();
+    expect(dashboards).toHaveLength(0);
+    expect(f.runtime.preparation.value.failure?.code).toBe("DASH_LIBRARY_LOAD_FAILED");
+    expect(f.error.value).toBe("DASH 播放器加载失败，请重试");
+    expect(f.error.value).not.toContain("private module URL");
+    dashDriverLoad.before = undefined;
+    await f.runtime.runPlayback(() => f.runtime.loadMedia());
+    expect(dashboards).toHaveLength(1);
+    expect(f.bodies).toHaveLength(2);
+    expect(f.error.value).toBe("");
+  } finally { f.cleanup(); }
+});
+it("staged settings during the DASH module wait preserve the already granted attachment", async () => {
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  dashDriverLoad.before = () => pending;
+  const f = setup();
+  try {
+    const loading = f.runtime.loadMedia();
+    await settle();
+    expect(dashDriverLoad.calls).toBe(1);
+    f.runtime.nativePlaybackMode.value = "compatibility";
+    release();
+    await loading;
+    expect(dashboards).toHaveLength(1);
+    expect(dashboards[0].options.video).toBe(f.element);
+    expect(f.bodies).toHaveLength(1);
+    expect(f.error.value).toBe("");
+  } finally {
+    release();
     f.cleanup();
   }
 });

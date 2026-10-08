@@ -109,22 +109,57 @@ test("initial JS stays bounded and every page is a deferred entry", async () => 
   );
 });
 
-test("DASH and HLS SDKs remain outside the initial import closure", () => {
-  const hlsDriver = Object.keys(manifest).find((key) =>
-    key.endsWith("/drivers/hls-driver.ts"),
+test("DASH and HLS SDKs remain outside the initial import closure", async () => {
+  for (const name of ["hls", "dash"]) {
+    const driver = Object.keys(manifest).find((key) =>
+      key.endsWith(`/drivers/${name}-driver.ts`),
+    );
+    assert.ok(driver, `missing independently emitted ${name} driver`);
+    assert.ok(
+      dynamicEntries.has(driver),
+      `${name} driver has no dynamic import`,
+    );
+    assert.ok(
+      deferred.has(driver),
+      `${name} driver has no deferred import path`,
+    );
+    assert.equal(
+      initial.has(driver),
+      false,
+      `${name} driver is statically reachable`,
+    );
+    assert.equal(
+      initialFiles.has(manifest[driver].file),
+      false,
+      `${name} driver shares initial code`,
+    );
+  }
+  // This stable SDK extension installation belongs to the actual adapter.
+  // Checking the facade alone would miss an eager import of its implementation.
+  const marker = "SegmentBaseGetter";
+  const initialBodies = await Promise.all(
+    [...initialFiles]
+      .filter((file) => file.endsWith(".js"))
+      .map((file) => readFile(resolve(output, file), "utf8")),
   );
-  assert.ok(hlsDriver, "missing independently emitted HLS driver");
-  assert.ok(dynamicEntries.has(hlsDriver), "HLS driver has no dynamic import");
-  assert.ok(deferred.has(hlsDriver), "HLS driver has no deferred import path");
-  assert.equal(
-    initial.has(hlsDriver),
-    false,
-    "HLS driver is statically reachable",
+  assert.ok(
+    initialBodies.every((body) => !body.includes(marker)),
+    "DASH adapter reached the initial JavaScript closure",
   );
-  assert.equal(
-    initialFiles.has(manifest[hlsDriver].file),
-    false,
-    "HLS driver shares initial code",
+  const dashDriver = Object.keys(manifest).find((key) =>
+    key.endsWith("/drivers/dash-driver.ts"),
+  );
+  const adapterBodies = await Promise.all(
+    [...dependencies(dashDriver)]
+      .filter((key) => !initial.has(key))
+      .map((key) => manifest[key].file)
+      .filter((file) => file.endsWith(".js"))
+      .map((file) => readFile(resolve(output, file), "utf8")),
+  );
+  // Only static imports of the deferred driver count here, not its dynamic SDK.
+  assert.ok(
+    adapterBodies.some((body) => body.includes(marker)),
+    "DASH adapter is missing from the deferred driver closure",
   );
   for (const [sdk, emittedName] of [
     ["dashjs", "dash.all.min"],

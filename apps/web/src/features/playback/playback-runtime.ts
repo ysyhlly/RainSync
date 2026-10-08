@@ -32,10 +32,9 @@ import {
   validNativeLiveBinding,
   validNativeLiveDeliveryUrl,
 } from "./native-live";
-import {
-  createDashPlayback,
-  loadDashJs,
-} from "../../../../../packages/player-core/dash";
+import type { DashDriver, DashPlaybackError } from "./drivers/dash-driver";
+import { loadDashDriver } from "./dash-driver-loader";
+import { loadDashJs } from "../../../../../packages/player-core/dash/loader";
 import {
   nativePlatformRequest,
   validNativeCompatibilityDeliveryUrl,
@@ -313,7 +312,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       qualityContext = undefined;
     }
   }
-  let dash: ReturnType<typeof createDashPlayback> | undefined,
+  let dash: DashDriver | undefined,
     nativeRefresh: ReturnType<typeof setTimeout> | undefined;
   let failedCompatibilityPlan: PlaybackPlan | undefined;
   const tracks = ref<PlaybackPlan["audio_tracks"]>([]),
@@ -2481,11 +2480,32 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           mediaDataLoad.sourceChanged();
           firstFrameDeadline.attachSource();
         } else if (p.transport === "dash") {
-          const attached = createDashPlayback({
+          const reportFailure = (failure: DashPlaybackError) => {
+            if (!current()) return;
+            waiting.value = false;
+            error.value = failure.message;
+            failLocalPlayback(failure.message, failure.code);
+          };
+          // Loading the driver consumes the same already-started media/frame
+          // budget as the SDK; module resolution cannot reset or own either.
+          mediaDataLoad.sourceChanged();
+          firstFrameDeadline.attachSource();
+          let module: Awaited<ReturnType<typeof loadDashDriver>>;
+          try {
+            module = await loadDashDriver();
+          } catch {
+            reportFailure({
+              code: "DASH_LIBRARY_LOAD_FAILED",
+              message: "DASH 播放器加载失败，请重试",
+            });
+            return;
+          }
+          if (!current()) return;
+          const attached = module.createDashDriver({
             video: el,
             sessionId: p.session_id,
             playbackUrl: p.playback_url,
-            current,
+            current: () => current() && dash === attached,
             onSourceAttached: () => {
               if (current()) attachMetricSource();
             },
@@ -2508,16 +2528,9 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
                 loadingStage.value =
                   snapshot.readyState >= 2 ? "waiting_frame" : "loading_media";
             },
-            onError: (failure) => {
-              if (!current()) return;
-              waiting.value = false;
-              error.value = failure.message;
-              failLocalPlayback(failure.message, failure.code);
-            },
+            onError: reportFailure,
           });
           dash = attached;
-          mediaDataLoad.sourceChanged();
-          firstFrameDeadline.attachSource();
           if (!(await attached.load()) || !current()) return;
         } else {
           // A native MP4 is a dedicated platform grant, not the generic
