@@ -74,7 +74,9 @@ it("gives advanced queue immutable closed version1 guards without replacing stat
 
 it("dispatches only validated advanced claims before ordinary cache or input effects", () => {
   const worker = read("apps/media-worker/src/main.rs");
-  expect(worker).toContain("media_jobs::claim_platform_capable(&app.db, worker)");
+  const scheduler = read("apps/media-worker/src/scheduler.rs");
+  const dispatch = read("apps/media-worker/src/task_dispatch.rs");
+  expect(scheduler).toContain("media_jobs::claim_platform_capable(db, worker)");
   const claims = read("crates/persistence/src/media_jobs.rs");
   const ordinary = claims.match(/Queue::Ordinary =>[^\n]+/)?.[0];
   expect(ordinary).toContain("advanced_local_job_spec_valid(j.spec)");
@@ -82,19 +84,20 @@ it("dispatches only validated advanced claims before ordinary cache or input eff
   const platform = claims.match(/Queue::PlatformCapable =>[^\n]+/)?.[0];
   expect(platform).toContain("advanced_local_job_spec_valid(j.spec)");
   expect(platform).toContain("native_platform_transcode_job_spec_valid(j.spec)");
-  const gate = worker.indexOf("advanced_media::admit_claim(&claim.spec)");
+  const gate = worker.indexOf("task_dispatch::SingleOutput::decode(&claim)?");
   expect(gate).toBeGreaterThan(0);
   expect(gate).toBeLessThan(
-    worker.indexOf("cache::ensure_capacity(&app).await?", gate),
+    worker.indexOf("cache::ensure_capacity(app).await?", gate),
   );
   expect(gate).toBeLessThan(
-    worker.indexOf("cache::reserve_output(&app, &claim).await?", gate),
+    worker.indexOf("cache::reserve_output(app, &claim).await?", gate),
   );
   expect(gate).toBeLessThan(
     worker.indexOf("source_version::verify(spec).await?", gate),
   );
-  expect(worker).toContain(
-    "static_hls_child_gate::reject_unsupported_claim(&claim)?",
+  expect(dispatch).toContain("advanced_media::admit_claim(spec)?");
+  expect(dispatch).toContain(
+    "static_hls_child_gate::reject_unsupported_claim(claim)?",
   );
   const advanced = read("apps/media-worker/src/advanced_media.rs");
   expect(advanced).toContain('spec["kind"] == "advanced_local_transcode_v1"');
