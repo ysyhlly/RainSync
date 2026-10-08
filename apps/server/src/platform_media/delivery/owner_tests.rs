@@ -1,7 +1,11 @@
 //! Opt-in coordinator-owned DB and real loopback HTTP reads, never Bilibili.
 use super::*;
+use futures_util::StreamExt;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -545,19 +549,25 @@ async fn failed_authorization_interrupts_the_body_instead_of_eof() {
     );
     assert_eq!(checks.load(Ordering::SeqCst), 1);
 
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let (cancel, _seen_cancel) = tokio::sync::watch::channel(false);
     sender
         .try_send(Ok(axum::body::Bytes::from_static(b"buffered")))
         .unwrap();
+    let flag = interrupted.clone();
     let deliver = tokio::spawn(async move {
-        interrupt_body(&sender).await;
+        interrupt_body(&sender, &flag);
+        drop(sender);
     });
-    assert_eq!(
-        receiver.recv().await.unwrap().unwrap().as_ref(),
-        b"buffered"
-    );
-    let error = receiver
-        .recv()
+    let mut body = OwnedBody {
+        receiver,
+        cancel,
+        interrupted,
+    };
+    assert_eq!(body.next().await.unwrap().unwrap().as_ref(), b"buffered");
+    let error = body
+        .next()
         .await
         .expect("authorization failure is a stream item, not EOF")
         .unwrap_err();

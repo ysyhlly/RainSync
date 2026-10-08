@@ -5,6 +5,10 @@ use futures_util::Stream;
 use sqlx::Acquire;
 use std::{
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
@@ -97,11 +101,27 @@ pub(super) struct Head {
 pub(super) struct OwnedBody {
     receiver: mpsc::Receiver<std::result::Result<Bytes, std::io::Error>>,
     cancel: watch::Sender<bool>,
+    interrupted: Arc<AtomicBool>,
+}
+fn stream_interrupted() -> std::io::Error {
+    std::io::Error::other("native_platform_stream_interrupted")
 }
 impl Stream for OwnedBody {
     type Item = std::result::Result<Bytes, std::io::Error>;
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().receiver.poll_recv(context)
+        let body = self.get_mut();
+        match body.receiver.poll_recv(context) {
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            // A queued chunk is delivered first. Closing the sender after a
+            // failed authorization is one error, including when the channel was
+            // already full and the error item itself could not be queued.
+            // Later polls end the stream so a consumer cannot spin on the flag.
+            Poll::Ready(None) if body.interrupted.swap(false, Ordering::AcqRel) => {
+                Poll::Ready(Some(Err(stream_interrupted())))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 impl Drop for OwnedBody {
@@ -321,12 +341,15 @@ where
     }
 }
 
-async fn interrupt_body(sender: &mpsc::Sender<std::result::Result<Bytes, std::io::Error>>) {
-    let _ = sender
-        .send(Err(std::io::Error::other(
-            "native_platform_stream_interrupted",
-        )))
-        .await;
+fn interrupt_body(
+    sender: &mpsc::Sender<std::result::Result<Bytes, std::io::Error>>,
+    interrupted: &AtomicBool,
+) {
+    // Do not wait for capacity. A held body is the backpressure case, and the
+    // disposal receipt must still be written. The flag turns the later close
+    // into an error instead of a clean EOF.
+    interrupted.store(true, Ordering::Release);
+    let _ = sender.try_send(Err(stream_interrupted()));
 }
 
 pub(super) async fn start<T: Transport>(
@@ -353,9 +376,11 @@ pub(super) async fn start<T: Transport>(
     let (headers_tx, headers_rx) = oneshot::channel();
     let (sender, receiver) = mpsc::channel(1);
     let (cancel_tx, mut cancel) = watch::channel(false);
+    let interrupted = Arc::new(AtomicBool::new(false));
     let body = OwnedBody {
         receiver,
         cancel: cancel_tx,
+        interrupted: interrupted.clone(),
     };
     tokio::spawn(async move {
         let mut headers_tx = Some(headers_tx);
@@ -412,7 +437,7 @@ pub(super) async fn start<T: Transport>(
             if let Some(headers) = headers_tx.take() {
                 let _ = headers.send(Err(error));
             }
-            interrupt_body(&sender).await;
+            interrupt_body(&sender, &interrupted);
         }
         drop(sender);
         finish(&app, room, id, permit).await;
