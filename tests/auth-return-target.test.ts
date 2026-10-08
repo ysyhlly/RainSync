@@ -85,7 +85,7 @@ it("login and registration retain the same safe destination and expiry explanati
     RequestFailure,
   };
   const login = mountSetup(
-    new URL("../apps/web/src/features/auth/LoginPage.vue", import.meta.url),
+    new URL("../apps/web/src/features/auth/LoginPanel.vue", import.meta.url),
     shared,
   );
   expect(login.controls.registration.value).toEqual(

@@ -286,7 +286,7 @@ it("login remains available when public policy fails and registration link keeps
     vi.fn(async () => {
       throw Error("unavailable");
     }),
-    "LoginPage",
+    "LoginPanel",
   );
   await ready(p);
   expect(p.c.registration.value).toEqual(

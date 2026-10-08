@@ -35,7 +35,7 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
-function auth(file: "LoginPage" | "RegisterPage") {
+function auth(file: "LoginPanel" | "RegisterPage") {
   setActivePinia(createPinia());
   const session = useSession();
   const replace = vi.fn();
@@ -77,7 +77,7 @@ function auth(file: "LoginPage" | "RegisterPage") {
   return { ...page, session, replace, focus, getElementById };
 }
 it("login prevents a repeated submit while preserving password spaces and the return destination", async () => {
-  const p = auth("LoginPage");
+  const p = auth("LoginPanel");
   const request = deferred<any>();
   p.session.login = vi.fn(() => request.promise);
   p.controls.username.value = "fixture";
@@ -98,7 +98,7 @@ it("login prevents a repeated submit while preserving password spaces and the re
   expect(p.replace).toHaveBeenCalledWith("/rooms/fixture?invite=token#confirm");
 });
 it("login input changes clear a stale failure and leaving aborts the current attempt", async () => {
-  const p = auth("LoginPage");
+  const p = auth("LoginPanel");
   p.controls.error.value = "old failure";
   p.controls.username.value = "new-user";
   await nextTick();

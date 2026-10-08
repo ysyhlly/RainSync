@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { writeFileSync } from "node:fs";
-import { resolve } from "node:path";
-import type { PlaybackMetricsSnapshot } from "../../apps/web/src/features/playback/playback-metrics";
+import { fileURLToPath } from "node:url";
+import type { NativeMetricsFixture } from "./fixtures/native-platform-metrics";
 import {
   dashFixtureManifest,
   dashTrackFixture,
@@ -15,27 +15,13 @@ const token = "?token=local_clear_native_metrics_fixture_token";
 const video = dashTrackFixture("video"),
   audio = dashTrackFixture("audio");
 const manifest = dashFixtureManifest(delivery, token, video, audio);
-const runtimeUrl =
+// Vite must transform this module and resolve its bare imports. Its actual
+// optimized dependency URLs depend on the external artifact/cache directory.
+const fixtureUrl =
   "/@fs/" +
-  resolve("apps/web/src/features/playback/playback-runtime.ts").replaceAll(
-    "\\",
-    "/",
-  );
-type BrowserEvidence = {
-  local?: PlaybackMetricsSnapshot;
-  stage: string;
-  session: string;
-  error: string;
-  frames: (VideoFrameCallbackMetadata & { now: number })[];
-  responseReceipts: unknown[];
-  video: {
-    readyState: number;
-    currentTime: number;
-    width: number;
-    height: number;
-    paused: boolean;
-  };
-};
+  fileURLToPath(
+    new URL("./fixtures/native-platform-metrics.ts", import.meta.url),
+  ).replaceAll("\\", "/");
 
 // HTTP grant/receipt fixtures exercise the production browser runtime, meter,
 // sender and dash.js. They do not qualify platform authorization or a live CDN.
@@ -151,112 +137,19 @@ for (const granted of [true, false]) {
     });
     await page.goto("/__native_metrics_fixture__");
     await page.evaluate(
-      async ({ runtimeUrl, ids }) => {
-        const { ref, effectScope } =
-            await import("/node_modules/.vite/deps/vue.js"),
-          { createPlaybackRuntime } = await import(runtimeUrl);
-        const error = ref("");
-        const state = ref({
-          room_id: ids.room,
-          media_id: ids.media,
-          media_generation: 7,
-          revision: 1,
-          playback_status: "playing",
-          anchor_position_ms: 0,
-          anchor_server_time_ms: 0,
-          playback_rate: 1,
-        });
-        const responseReceipts: unknown[] = [];
-        const session = {
-          user: { id: ids.user },
-          epoch: 1,
-          async api(
-            path: string,
-            method = "GET",
-            body?: unknown,
-            signal?: AbortSignal,
-          ) {
-            const response = await fetch("/api/v1" + path, {
-              method,
-              signal,
-              headers: body ? { "Content-Type": "application/json" } : {},
-              body: body ? JSON.stringify(body) : undefined,
-            });
-            if (!response.ok)
-              throw new Error(`Fixture HTTP ${response.status}`);
-            const result = await response.json();
-            if (path.endsWith("/metrics")) responseReceipts.push(result);
-            return result;
-          },
-        };
-        const scope = effectScope();
-        const runtime = scope.run(() =>
-          createPlaybackRuntime({
-            session,
-            state,
-            connected: ref(true),
-            active: ref(true),
-            clock: { ready: true, revision: 1, now: () => 0 },
-            error,
-            resolveMedia: async () => ({
-              id: ids.media,
-              kind: "native_platform",
-              title: "Clear local Bilibili route fixture",
-              platform: {
-                version: 1,
-                provider: "bilibili",
-                content_id: "BV1xx411c7mD",
-                part: 1,
-              },
-            }),
-            run: async (action: () => Promise<void>) => action(),
-          }),
-        )!;
-        const element = document.createElement("video");
-        element.muted = true;
-        element.playsInline = true;
-        element.style.width = "320px";
-        document.body.append(element);
-        const callbacks: unknown[] = [],
-          requestFrame = element.requestVideoFrameCallback.bind(element);
-        // Observe the real browser callback consumed by the production meter.
-        // No synthetic media events, metadata, timers or SDK factories are used.
-        element.requestVideoFrameCallback = (callback) =>
-          requestFrame((now, metadata) => {
-            callbacks.push({ now, ...metadata });
-            callback(now, metadata);
-          });
-        runtime.attach(element);
+      async ({ fixtureUrl, ids }) => {
+        const { startNativeMetricsFixture } = await import(fixtureUrl);
         Object.assign(window, {
-          nativeMetricsFixture: {
-            snapshot: () => ({
-              local: runtime.startupDiagnostics.value,
-              stage: runtime.loadingStage.value,
-              session: runtime.sessionId.value,
-              error: error.value,
-              frames: callbacks,
-              responseReceipts,
-              video: {
-                readyState: element.readyState,
-                currentTime: element.currentTime,
-                width: element.videoWidth,
-                height: element.videoHeight,
-                paused: element.paused,
-              },
-            }),
-            stop: () => scope.stop(),
-          },
+          nativeMetricsFixture: await startNativeMetricsFixture(ids),
         });
-        await runtime.loadMedia();
-        await runtime.enablePlayback();
       },
-      { runtimeUrl, ids: { room: id(5), media: id(3), user: id(6) } },
+      { fixtureUrl, ids: { room: id(5), media: id(3), user: id(6) } },
     );
     const snapshot = () =>
       page.evaluate(() =>
         (
           window as unknown as {
-            nativeMetricsFixture: { snapshot: () => BrowserEvidence };
+            nativeMetricsFixture: NativeMetricsFixture;
           }
         ).nativeMetricsFixture.snapshot(),
       );
@@ -297,6 +190,7 @@ for (const granted of [true, false]) {
       },
     });
     expect(evidence.error).toBe("");
+    expect(evidence.session).toBe(sessionId);
     expect(evidence.frames.length).toBeGreaterThan(0);
     expect(evidence.video).toMatchObject({ width: 160, height: 90 });
     expect(local.startup_phases.preparation_ms).toBeGreaterThan(0);
@@ -359,7 +253,7 @@ for (const granted of [true, false]) {
     await page.evaluate(() =>
       (
         window as unknown as {
-          nativeMetricsFixture: { stop: () => void };
+          nativeMetricsFixture: NativeMetricsFixture;
         }
       ).nativeMetricsFixture.stop(),
     );

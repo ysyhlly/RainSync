@@ -23,10 +23,31 @@ function dependencies(key, visited = new Set()) {
 }
 const initial = dependencies("index.html");
 const initialFiles = new Set([...initial].map((key) => manifest[key].file));
+// Vite gives shared chunks generated keys rather than source paths. Follow the
+// emitted import edges so a shared dependency behind a dynamic entry is legal,
+// but an unreferenced record or an SDK merged into initial code cannot pass.
+const dynamicEntries = new Set();
+const reachable = new Set();
+function visit(key) {
+  if (reachable.has(key)) return;
+  const entry = manifest[key];
+  assert.ok(entry, `missing emitted dependency: ${key}`);
+  reachable.add(key);
+  for (const child of entry.imports ?? []) visit(child);
+  for (const child of entry.dynamicImports ?? []) {
+    dynamicEntries.add(child);
+    visit(child);
+  }
+}
+visit("index.html");
+const deferred = new Set(
+  [...dynamicEntries].flatMap((key) => [...dependencies(key)]),
+);
 
 test("initial JS stays bounded and every page is a deferred entry", async () => {
   const pages = [
     "LoginPage",
+    "InvitationPage",
     "RegisterPage",
     "ProfilePage",
     "RoomsPage",
@@ -47,8 +68,27 @@ test("initial JS stays bounded and every page is a deferred entry", async () => 
     );
     assert.ok(found, `missing built route ${page}`);
     assert.equal(found[1].isDynamicEntry, true, `${page} is eager`);
+    assert.ok(dynamicEntries.has(found[0]), `${page} has no dynamic import`);
     assert.equal(initial.has(found[0]), false, `${page} reaches initial JS`);
   }
+  // Route modules may share their interaction panel without one route
+  // statically importing the other full page.
+  const login = Object.keys(manifest).find((key) =>
+    key.endsWith("/LoginPage.vue"),
+  );
+  const invitation = Object.keys(manifest).find((key) =>
+    key.endsWith("/InvitationPage.vue"),
+  );
+  assert.equal(
+    dependencies(invitation).has(login),
+    false,
+    "invitation imports the login page",
+  );
+  assert.equal(
+    dependencies(login).has(invitation),
+    false,
+    "login imports the invitation page",
+  );
   let bytes = 0;
   for (const file of initialFiles)
     if (file.endsWith(".js")) bytes += (await stat(resolve(output, file))).size;
@@ -70,12 +110,18 @@ test("initial JS stays bounded and every page is a deferred entry", async () => 
 });
 
 test("DASH and HLS SDKs remain outside the initial import closure", () => {
-  for (const sdk of ["dashjs", "hls.js"]) {
-    const records = Object.entries(manifest).filter(([key, entry]) =>
-      `${key}/${entry.src ?? ""}`.includes(`node_modules/${sdk}/`),
+  for (const [sdk, emittedName] of [
+    ["dashjs", "dash.all.min"],
+    ["hls.js", "hls"],
+  ]) {
+    const records = Object.entries(manifest).filter(
+      ([key, entry]) =>
+        `${key}/${entry.src ?? ""}`.includes(`node_modules/${sdk}/`) ||
+        entry.name === emittedName,
     );
     assert.ok(records.length > 0, `missing independently emitted ${sdk} SDK`);
     for (const [key, entry] of records) {
+      assert.ok(deferred.has(key), `${sdk} has no deferred import path`);
       assert.equal(initial.has(key), false, `${sdk} is statically reachable`);
       assert.equal(
         initialFiles.has(entry.file),

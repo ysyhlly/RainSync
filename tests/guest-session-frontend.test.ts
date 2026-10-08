@@ -59,7 +59,7 @@ function panel(enabled = true) {
   const replace = vi.fn();
   vi.stubGlobal("window", { location: { origin } });
   const p = mountSetup(
-    new URL("../apps/web/src/features/auth/LoginPage.vue", import.meta.url),
+    new URL("../apps/web/src/features/auth/LoginPanel.vue", import.meta.url),
     {
       useSession,
       clearInvitation,
@@ -393,7 +393,7 @@ it("old-guest cleanup preserves a registered account that appeared in another ta
 
 it("renders explicit logout recovery separately from uncertain read-only recovery", () => {
   const page = readFileSync(
-    new URL("../apps/web/src/features/auth/LoginPage.vue", import.meta.url),
+    new URL("../apps/web/src/features/auth/LoginPanel.vue", import.meta.url),
     "utf8",
   );
   expect(page).toMatch(

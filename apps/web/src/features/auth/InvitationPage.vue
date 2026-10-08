@@ -4,7 +4,7 @@ import { useRoute, useRouter } from "vue-router";
 import { parseGuestInvitation } from "./guest-session";
 import { useSession } from "./session.store";
 import { useAction } from "../../shared/use-action";
-import LoginPage from "./LoginPage.vue";
+import LoginPanel from "./LoginPanel.vue";
 import Notice from "../../shared/ui/Notice.vue";
 import {
   rememberInvitation,
@@ -92,11 +92,14 @@ async function join() {
       <RouterLink class="button" to="/login">返回登录</RouterLink>
     </div>
   </section>
-  <LoginPage
+  <section
     v-else-if="!session.user"
-    :invitation="invitation"
-    :return-path="route.fullPath"
-  />
+    class="auth-page login-page"
+    aria-labelledby="login-title"
+  >
+    <RouterLink class="brand" to="/">RainSync</RouterLink>
+    <LoginPanel :invitation="invitation" :return-path="route.fullPath" />
+  </section>
   <section v-else class="page empty-state" aria-labelledby="invite-title">
     <h1 id="invite-title">加入受邀房间</h1>
     <p>邀请将在确认加入时验证。过期或已撤销的邀请无法使用。</p>

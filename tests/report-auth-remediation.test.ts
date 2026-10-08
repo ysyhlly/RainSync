@@ -87,7 +87,7 @@ function invitationPage() {
       RequestFailure,
       useRoute: () => route,
       useRouter: () => ({ replace }),
-      LoginPage: {},
+      LoginPanel: {},
       Notice: {},
     },
   );
@@ -168,7 +168,7 @@ function loginPage(props: Record<string, unknown> = {}) {
   vi.stubGlobal("document", { getElementById: () => ({ focus: vi.fn() }) });
   vi.stubGlobal("window", { location: { origin } });
   const p = mountSetup(
-    new URL("../apps/web/src/features/auth/LoginPage.vue", import.meta.url),
+    new URL("../apps/web/src/features/auth/LoginPanel.vue", import.meta.url),
     {
       useSession,
       useAction,
