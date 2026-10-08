@@ -29,7 +29,7 @@ import type {
 import type {
   PlaybackRuntimeContext,
   RoomTimelinePort,
-  MetricIntent,
+  PlaybackIntent,
   CandidateDiscovery,
 } from "./playback-runtime-types";
 import type { StaticHlsAvailability } from "./static-hls-availability";
@@ -39,7 +39,7 @@ export interface CandidateDiscoveryPorts {
   state: RoomTimelinePort["state"];
   clock: RoomTimelinePort["clock"];
   video: Ref<HTMLVideoElement | undefined>;
-  current: (intent: MetricIntent) => boolean;
+  current: (intent: PlaybackIntent) => boolean;
   advancedCapabilities: Ref<AdvancedPlaybackCapabilities | undefined>;
   ladderCapabilities: Ref<LocalHlsLadderCapabilities | undefined>;
   staticHlsAvailability: Ref<StaticHlsAvailability | undefined>;
@@ -49,7 +49,7 @@ export interface CandidateDiscoveryPorts {
 }
 export function discoverPlaybackCandidates(
   ports: CandidateDiscoveryPorts,
-  metrics: MetricIntent,
+  playbackIntent: PlaybackIntent,
   element: HTMLVideoElement,
 ): Promise<CandidateDiscovery> {
   const {
@@ -64,16 +64,16 @@ export function discoverPlaybackCandidates(
     staticHlsAvailability,
     candidateError,
   } = ports;
-  if (metrics.concreteCandidates)
-    return Promise.resolve(metrics.concreteCandidates);
-  if (metrics.candidateDiscovery) return metrics.candidateDiscovery.result;
+  if (playbackIntent.concreteCandidates)
+    return Promise.resolve(playbackIntent.concreteCandidates);
+  if (playbackIntent.candidateDiscovery) return playbackIntent.candidateDiscovery.result;
   const probe = new AbortController();
   ports.setProbe(probe);
   const discovery = {
     probe,
     result: undefined as unknown as Promise<CandidateDiscovery>,
   };
-  metrics.candidateDiscovery = discovery;
+  playbackIntent.candidateDiscovery = discovery;
   discovery.result = (async () => {
     let marked = false,
       concrete = false,
@@ -86,17 +86,17 @@ export function discoverPlaybackCandidates(
           "/playback-candidates",
           "POST",
           {
-            room_id: metrics.room,
-            media_generation: metrics.media,
+            room_id: playbackIntent.room,
+            media_generation: playbackIntent.media,
             advanced_playback_capabilities_version: 1,
             local_hls_ladder_capabilities_version: 1,
-            audio_index: metrics.audio ?? null,
+            audio_index: playbackIntent.audio ?? null,
             position_ms: target(state.value!, clock.now()),
-            ...(metrics.ladder ? { local_hls_ladder: metrics.ladder } : {}),
-            ...(metrics.advanced
-              ? { advanced_playback: metrics.advanced }
+            ...(playbackIntent.ladder ? { local_hls_ladder: playbackIntent.ladder } : {}),
+            ...(playbackIntent.advanced
+              ? { advanced_playback: playbackIntent.advanced }
               : {}),
-            ...(metrics.mode === "direct" || metrics.advanced || metrics.ladder
+            ...(playbackIntent.mode === "direct" || playbackIntent.advanced || playbackIntent.ladder
               ? {}
               : { http_file_capabilities_version: 1 }),
           },
@@ -110,17 +110,17 @@ export function discoverPlaybackCandidates(
           throw failure;
       }
       const current = () =>
-        candidateIntentCurrent(metrics) &&
-        metrics.candidateDiscovery === discovery &&
+        candidateIntentCurrent(playbackIntent) &&
+        playbackIntent.candidateDiscovery === discovery &&
         !probe.signal.aborted &&
         video.value === element;
       if (!current()) throw new PlaybackCancelled();
       let staticHls: CandidateDiscovery["staticHls"];
       if (
         staticHlsFallback === true &&
-        !metrics.advanced &&
-        !metrics.ladder &&
-        ["auto", "direct"].includes(metrics.mode)
+        !playbackIntent.advanced &&
+        !playbackIntent.ladder &&
+        ["auto", "direct"].includes(playbackIntent.mode)
       ) {
         let response: unknown;
         try {
@@ -129,8 +129,8 @@ export function discoverPlaybackCandidates(
             "POST",
             {
               version: 1,
-              room_id: metrics.room,
-              media_generation: metrics.media,
+              room_id: playbackIntent.room,
+              media_generation: playbackIntent.media,
             },
             AbortSignal.any([probe.signal, AbortSignal.timeout(7500)]),
           );
@@ -152,18 +152,18 @@ export function discoverPlaybackCandidates(
         advancedCapabilities.value = freezeCandidateSnapshot(
           structuredClone(candidateSet.advanced_playback),
         );
-      } else if (metrics.advanced) throw new Error(candidateError);
+      } else if (playbackIntent.advanced) throw new Error(candidateError);
       if (candidateSet?.local_hls_ladder !== undefined) {
         if (!validLocalHlsLadderCapabilities(candidateSet.local_hls_ladder))
           throw new Error(candidateError);
         ladderCapabilities.value = freezeCandidateSnapshot(
           structuredClone(candidateSet.local_hls_ladder),
         );
-      } else if (metrics.ladder) throw new Error(candidateError);
+      } else if (playbackIntent.ladder) throw new Error(candidateError);
       marked = candidateSet?.http_file_capabilities_version !== undefined;
       if (marked) {
         if (
-          metrics.mode === "direct" ||
+          playbackIntent.mode === "direct" ||
           candidateSet!.http_file_capabilities_version !== 1 ||
           candidateSet!.schema_version !== 1 ||
           typeof candidateSet!.binding !== "string" ||
@@ -184,12 +184,12 @@ export function discoverPlaybackCandidates(
         // retain the source configurations that produced this device report.
         candidateSet = freezeCandidateSnapshot(structuredClone(candidateSet!));
       }
-      if ((metrics.advanced || metrics.ladder) && !concrete)
+      if ((playbackIntent.advanced || playbackIntent.ladder) && !concrete)
         throw new Error(candidateError);
       const profileDiscovery =
-        !metrics.advanced &&
-        !metrics.ladder &&
-        metrics.mode === "transcode" &&
+        !playbackIntent.advanced &&
+        !playbackIntent.ladder &&
+        playbackIntent.mode === "transcode" &&
         !concrete;
       let mseProbe: ReturnType<typeof getPlaybackMediaSource>;
       let decoder: MediaCapabilities | undefined;
@@ -240,9 +240,9 @@ export function discoverPlaybackCandidates(
             {
               // Discovery advertises our maximum supported profile version.
               profile_version: 2,
-              room_id: metrics.room,
-              media_generation: metrics.media,
-              audio_index: metrics.audio ?? null,
+              room_id: playbackIntent.room,
+              media_generation: playbackIntent.media,
+              audio_index: playbackIntent.audio ?? null,
               position_ms: target(state.value!, clock.now()),
             },
             AbortSignal.any([probe.signal, AbortSignal.timeout(40000)]),
@@ -302,10 +302,10 @@ export function discoverPlaybackCandidates(
               capabilities: detectCapabilities(element, mseProbe),
               upstream: { candidates, report, startedAt },
             };
-            metrics.concreteCandidates = freezeCandidateSnapshot(
+            playbackIntent.concreteCandidates = freezeCandidateSnapshot(
               structuredClone(result),
             );
-            return metrics.concreteCandidates;
+            return playbackIntent.concreteCandidates;
           }
         }
       }
@@ -327,10 +327,10 @@ export function discoverPlaybackCandidates(
           : {}),
       };
       if (concrete) {
-        metrics.concreteCandidates = freezeCandidateSnapshot(
+        playbackIntent.concreteCandidates = freezeCandidateSnapshot(
           structuredClone(result),
         );
-        return metrics.concreteCandidates;
+        return playbackIntent.concreteCandidates;
       }
       return result;
     } finally {
@@ -338,12 +338,12 @@ export function discoverPlaybackCandidates(
       // Concrete report and marked validation failures stay rejected for this
       // intent; recovery cannot downgrade or discover a replacement source.
       if (
-        metrics.candidateDiscovery === discovery &&
+        playbackIntent.candidateDiscovery === discovery &&
         !marked &&
         !concrete &&
         !upstreamAttempted
       )
-        metrics.candidateDiscovery = undefined;
+        playbackIntent.candidateDiscovery = undefined;
       if (ports.probe() === probe) ports.setProbe(undefined);
     }
   })();

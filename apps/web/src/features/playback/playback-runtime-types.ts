@@ -15,12 +15,8 @@ import type {
   DistributedComputePlaybackIntent,
 } from "../../../../../packages/protocol";
 import type { NativePlatformPlaybackMode } from "./native-platform-intent";
-import type {
-  PlaybackMetrics,
-  PlaybackMetricsFence,
-  PlaybackMetricsOrigin,
-  PlaybackMetricsSnapshot,
-} from "./playback-metrics";
+import type { PlaybackMetricsOrigin } from "./playback-metrics";
+import type { PlaybackOwnerToken } from "./playback-scope";
 import type { StaticHlsAvailability } from "./static-hls-availability";
 import type {
   createStaticHlsChildIntentState,
@@ -74,17 +70,15 @@ export type PlaybackRuntimeContext = {
   youtubePlatformAccountChange?: Readonly<Ref<number>>;
   youtubePlatformAccountId?: Readonly<Ref<string | undefined>>;
 };
-export type MetricIntent = {
-  t0: number;
-  identity: object;
-  fence: PlaybackMetricsFence;
-  startGeneration: number;
-  origin: PlaybackMetricsOrigin;
-  user: string | undefined;
-  epoch: number;
-  room: string;
-  media: number;
-  mediaId: string;
+export type PlaybackIntent = {
+  readonly owner: PlaybackOwnerToken;
+  readonly initialPlanGeneration: number;
+  readonly origin: PlaybackMetricsOrigin;
+  readonly user: string | undefined;
+  readonly epoch: number;
+  readonly room: string;
+  readonly media: number;
+  readonly mediaId: string;
   mode: string;
   audio: number | undefined;
   advanced?: AdvancedPlaybackRequest;
@@ -99,10 +93,6 @@ export type MetricIntent = {
   concreteCandidates?: CandidateDiscovery;
   failedCandidates: string[];
   element?: HTMLVideoElement;
-  meter?: PlaybackMetrics;
-  last?: PlaybackMetricsSnapshot;
-  disabled: boolean;
-  metricsVersion?: 1 | 2;
   originRecoveryUsed: boolean;
   accountChange: number;
   nativeCredentialMode: "own_or_anonymous" | "anonymous";

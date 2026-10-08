@@ -5,28 +5,14 @@ import { createPlaybackMetricsSender } from "./metrics-sender";
 import {
   PLAYBACK_METRICS_MAX_ELAPSED_MS,
   PLAYBACK_METRICS_SAMPLE_MS,
-  type PlaybackMetrics,
-  type PlaybackMetricsFence,
-  type PlaybackMetricsOrigin,
   type PlaybackMetricsSnapshot,
 } from "./playback-metrics";
 import { bestEffort } from "./playback-runtime-utils";
-export interface PlaybackMetricAttempt {
-  t0: number;
-  identity: object;
-  fence: PlaybackMetricsFence;
-  startGeneration: number;
-  origin: PlaybackMetricsOrigin;
-  meter?: PlaybackMetrics;
-  last?: PlaybackMetricsSnapshot;
-  disabled: boolean;
-  metricsVersion?: 1 | 2;
-}
-export function createPlaybackMetricRuntime<
-  I extends PlaybackMetricAttempt,
->(ctx: {
-  intent: () => I | undefined;
-  currentIntent: (intent: I) => boolean;
+import type { PlaybackObservationScope } from "./playback-scope";
+export type { PlaybackObservationScope } from "./playback-scope";
+export function createPlaybackMetricRuntime(ctx: {
+  scope: () => PlaybackObservationScope | undefined;
+  currentScope: (scope: PlaybackObservationScope) => boolean;
   currentPlan: (plan: PlaybackPlan) => boolean;
   video: Ref<HTMLVideoElement | undefined>;
   state: () => {
@@ -39,13 +25,13 @@ export function createPlaybackMetricRuntime<
   snapshot?: (value: PlaybackMetricsSnapshot) => void;
 }) {
   const {
-    currentIntent: metricCurrent,
+    currentScope: scopeCurrent,
     currentPlan,
     video,
     state: metricState,
   } = ctx;
   let metricSource: ReturnType<typeof bindPlaybackMetricEvents> | undefined;
-  let samplingIntent: I | undefined;
+  let samplingScope: PlaybackObservationScope | undefined;
   let sampleTimer: ReturnType<typeof setTimeout> | undefined;
   let nextSampleAt: number | undefined;
   const metricSender = createPlaybackMetricsSender(ctx.send);
@@ -55,10 +41,14 @@ export function createPlaybackMetricRuntime<
       paused: video.value?.paused ?? true,
       seeking: video.value?.seeking ?? false,
     };
-  function advanceMetricAttempt(m: I) {
+  function advanceObservationSource(m: PlaybackObservationScope) {
+    if (ctx.scope() !== m || !scopeCurrent(m)) return;
     bestEffort(() => metricSource?.stop());
     metricSource = undefined;
-    m.fence = { identity: m.identity, generation: m.fence.generation + 1 };
+    m.fence = Object.freeze({
+      identity: m.owner,
+      generation: m.fence.generation + 1,
+    });
     bestEffort(() => m.meter?.beginAttempt(m.fence, metricRead()));
   }
 
@@ -67,12 +57,12 @@ export function createPlaybackMetricRuntime<
     el: HTMLVideoElement,
     restart = false,
   ) {
-    const m = ctx.intent();
+    const m = ctx.scope();
     // Local evidence precedes optional negotiation. A later valid grant may
     // enable this same meter; never reconstruct its source phases or frame then.
     if (
       !m?.meter ||
-      !metricCurrent(m) ||
+      !scopeCurrent(m) ||
       !currentPlan(p) ||
       m.disabled ||
       !Number.isInteger(p.plan_generation) ||
@@ -80,7 +70,7 @@ export function createPlaybackMetricRuntime<
       p.plan_generation! > 0xffff_ffff
     )
       return;
-    if (restart) advanceMetricAttempt(m);
+    if (restart) advanceObservationSource(m);
     const fence = m.fence;
     const meter = m.meter;
     metricSource = bestEffort(() =>
@@ -90,7 +80,7 @@ export function createPlaybackMetricRuntime<
         fence,
         planGeneration: p.plan_generation!,
         current: () =>
-          metricCurrent(m) &&
+          scopeCurrent(m) &&
           m.fence === fence &&
           currentPlan(p) &&
           video.value === el,
@@ -100,8 +90,8 @@ export function createPlaybackMetricRuntime<
   }
 
   function attachMetricSource() {
-    const m = ctx.intent();
-    if (!m?.meter || m.disabled || !metricCurrent(m)) return;
+    const m = ctx.scope();
+    if (!m?.meter || m.disabled || !scopeCurrent(m)) return;
     if (bestEffort(() => metricSource?.attachSource()) !== true) {
       // An actual source edge was lost. Do not emit coherent-looking phase
       // totals reconstructed from the later playback state.
@@ -113,12 +103,12 @@ export function createPlaybackMetricRuntime<
   }
 
   function bindMetricGrant(p: PlaybackPlan) {
-    const m = ctx.intent(),
+    const m = ctx.scope(),
       grant = p.playback_metrics,
       version = p.playback_metrics_version;
-    // Reject obsolete publication before changing this intent's negotiated
+    // Reject obsolete publication before changing this scope's negotiated
     // version/disabled state. A stale grant must not poison its current meter.
-    if (!m || !metricCurrent(m) || !currentPlan(p)) return;
+    if (!m || !scopeCurrent(m) || !currentPlan(p)) return;
     if (
       m.disabled ||
       (version !== 1 && version !== 2) ||
@@ -157,14 +147,14 @@ export function createPlaybackMetricRuntime<
         mediaGeneration: p.media_generation,
         meterStartGeneration: m.startGeneration,
         startupOrigin: m.origin,
-        current: () => metricCurrent(m) && currentPlan(p),
+        current: () => scopeCurrent(m) && currentPlan(p),
       }),
     );
   }
 
   function sampleMetrics() {
-    const m = ctx.intent();
-    if (!m || !metricCurrent(m)) return;
+    const m = ctx.scope();
+    if (!m || !scopeCurrent(m)) return;
     if (
       Math.floor(performance.now()) - Math.floor(m.t0) >
       PLAYBACK_METRICS_MAX_ELAPSED_MS
@@ -181,7 +171,7 @@ export function createPlaybackMetricRuntime<
       m.last = snapshot;
       // The maintenance tick can also sample. Keep our next timer at least a
       // complete cadence after whichever owner call actually emitted this seq.
-      if (samplingIntent === m)
+      if (samplingScope === m)
         nextSampleAt = performance.now() + PLAYBACK_METRICS_SAMPLE_MS;
       bestEffort(() => ctx.snapshot?.(snapshot));
       if (!m.disabled) bestEffort(() => metricSender.offer(snapshot));
@@ -191,32 +181,32 @@ export function createPlaybackMetricRuntime<
   function stopMetrics() {
     clearTimeout(sampleTimer);
     sampleTimer = undefined;
-    samplingIntent = undefined;
+    samplingScope = undefined;
     nextSampleAt = undefined;
   }
   /** One cadence per logical meter, starting at its t0. Plan/grant/source
-   * replacement within the same intent never restarts this schedule. */
+   * replacement within the same scope never restarts this schedule. */
   function startMetrics() {
-    const m = ctx.intent();
-    if (samplingIntent === m) return;
+    const m = ctx.scope();
+    if (samplingScope === m) return;
     stopMetrics();
-    if (!m?.meter || !metricCurrent(m)) return;
-    samplingIntent = m;
+    if (!m?.meter || !scopeCurrent(m)) return;
+    samplingScope = m;
     nextSampleAt = m.t0 + PLAYBACK_METRICS_SAMPLE_MS;
     const schedule = () => {
-      if (samplingIntent !== m) return;
+      if (samplingScope !== m) return;
       sampleTimer = setTimeout(
         () => {
           sampleTimer = undefined;
-          if (samplingIntent !== m || ctx.intent() !== m || !metricCurrent(m)) {
+          if (samplingScope !== m || ctx.scope() !== m || !scopeCurrent(m)) {
             stopMetrics();
             return;
           }
           const scheduledAt = nextSampleAt;
           sampleMetrics();
-          if (samplingIntent !== m) return; // snapshot callbacks may replace intent
+          if (samplingScope !== m) return; // snapshot callbacks may replace scope
           if (
-            !metricCurrent(m) ||
+            !scopeCurrent(m) ||
             performance.now() - m.t0 > PLAYBACK_METRICS_MAX_ELAPSED_MS
           ) {
             stopMetrics();
@@ -241,27 +231,27 @@ export function createPlaybackMetricRuntime<
   }
 
   function observeMetrics() {
-    const m = ctx.intent();
-    if (m && metricCurrent(m))
+    const m = ctx.scope();
+    if (m && scopeCurrent(m))
       bestEffort(() => m.meter?.observe(m.fence, metricRead()));
   }
   function stopSource(clear = true) {
     bestEffort(() => metricSource?.stop());
     if (clear) metricSource = undefined;
   }
-  function offerFinalIntent() {
-    const intent = ctx.intent();
-    if (!intent || !metricCurrent(intent)) return;
+  function offerFinalScope() {
+    const scope = ctx.scope();
+    if (!scope || !scopeCurrent(scope)) return;
     const final = bestEffort(() =>
-      intent.meter?.dispose(intent.fence, metricRead()),
+      scope.meter?.dispose(scope.fence, metricRead()),
     );
-    if (final && !intent.disabled) bestEffort(() => metricSender.offer(final));
+    if (final && !scope.disabled) bestEffort(() => metricSender.offer(final));
   }
   return {
     sender: metricSender,
     read: metricRead,
     observeMetrics,
-    advanceMetricAttempt,
+    advanceObservationSource,
     bindMetricSource,
     attachMetricSource,
     bindMetricGrant,
@@ -269,7 +259,7 @@ export function createPlaybackMetricRuntime<
     startMetrics,
     stopMetrics,
     stopSource,
-    offerFinalIntent,
+    offerFinalScope,
     progress: () => metricSource?.progress(),
   };
 }

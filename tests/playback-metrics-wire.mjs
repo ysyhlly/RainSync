@@ -40,6 +40,8 @@ const frontendInputs = [
   "apps/web/src/features/playback/metrics-binding.ts",
   "apps/web/src/features/playback/playback-runtime.ts",
   "apps/web/src/features/playback/playback-runtime-types.ts",
+  "apps/web/src/features/playback/playback-scope.ts",
+  "apps/web/src/features/playback/playback-metric-runtime.ts",
   "apps/web/src/features/playback/playback-candidate-discovery.ts",
   "apps/web/src/features/playback/platform-text-runtime.ts",
   "apps/web/src/features/playback/live-window-recovery.ts",

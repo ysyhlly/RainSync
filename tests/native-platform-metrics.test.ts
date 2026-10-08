@@ -5,7 +5,7 @@ import { nativePlatformRequest } from "../apps/web/src/features/playback/native-
 import { createPlaybackMetrics } from "../apps/web/src/features/playback/playback-metrics";
 import {
   createPlaybackMetricRuntime,
-  type PlaybackMetricAttempt,
+  type PlaybackObservationScope,
 } from "../apps/web/src/features/playback/playback-metric-runtime";
 
 afterEach(() => vi.useRealTimers());
@@ -64,11 +64,11 @@ it.each([
 );
 it("a stale publication cannot downgrade or disable the current Bilibili meter before its actual v2 sender", async () => {
   vi.useFakeTimers({ toFake: ["performance", "setTimeout", "clearTimeout"] });
-  const identity = {},
-    fence = { identity, generation: 1 };
-  const attempt: PlaybackMetricAttempt = {
+  const owner = Object.freeze({ kind: "playback-owner" as const }),
+    fence = { identity: owner, generation: 1 };
+  const attempt: PlaybackObservationScope = {
     t0: 0,
-    identity,
+    owner,
     fence,
     startGeneration: 1,
     origin: "user_intent",
@@ -125,8 +125,8 @@ it("a stale publication cannot downgrade or disable the current Bilibili meter b
     closed: body.final,
   }));
   const runtime = createPlaybackMetricRuntime({
-    intent: () => attempt,
-    currentIntent: (value) => value === attempt,
+    scope: () => attempt,
+    currentScope: (value) => value === attempt,
     currentPlan: (value) => value === current,
     video: ref(element),
     state: () => state,

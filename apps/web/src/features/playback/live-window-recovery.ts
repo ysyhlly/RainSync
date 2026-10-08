@@ -1,6 +1,6 @@
 import type { Ref } from "vue";
 import type { PlaybackPlan } from "../../../../../packages/protocol";
-import type { MetricIntent, RoomTimelinePort } from "./playback-runtime-types";
+import type { PlaybackIntent, RoomTimelinePort } from "./playback-runtime-types";
 import { validNativeLiveDeliveryUrl } from "./native-live";
 import { ignoreBodyCancellation } from "./playback-runtime-utils";
 type LiveWindowBudget = {
@@ -13,11 +13,11 @@ type LiveWindowBudget = {
   resumedPosition?: number;
 };
 export function createLiveWindowRecovery(ctx: {
-  intent: () => MetricIntent | undefined;
+  intent: () => PlaybackIntent | undefined;
   terminalEnd: () => boolean;
   scope: () => string | undefined;
   currentPlan: (plan: PlaybackPlan) => boolean;
-  currentIntent: (intent: MetricIntent) => boolean;
+  currentIntent: (intent: PlaybackIntent) => boolean;
   clearRefresh: () => void;
   needsEdge: () => void;
   error: Ref<string>;
@@ -46,14 +46,14 @@ export function createLiveWindowRecovery(ctx: {
   let liveWindowProbe: AbortController | undefined;
   let liveWindowProgressStop: (() => void) | undefined;
   function recoverExpiredLiveWindow(p: PlaybackPlan): boolean {
-    const metrics = ctx.intent();
+    const playbackIntent = ctx.intent();
     const scope = liveWindowScope();
     if (
       ctx.terminalEnd() ||
       !scope ||
-      !metrics ||
+      !playbackIntent ||
       !currentPlan(p) ||
-      !candidateIntentCurrent(metrics) ||
+      !candidateIntentCurrent(playbackIntent) ||
       liveWindowRecovery?.scope !== scope ||
       liveWindowRecovery.consumed
     )
@@ -136,15 +136,15 @@ export function createLiveWindowRecovery(ctx: {
   }
 
   async function probeExpiredNativeLiveWindow(p: PlaybackPlan) {
-    const metrics = ctx.intent(),
+    const playbackIntent = ctx.intent(),
       scope = liveWindowScope(),
       budget = liveWindowRecovery;
     const current = () =>
       !ctx.terminalEnd() &&
       !!scope &&
-      !!metrics &&
+      !!playbackIntent &&
       currentPlan(p) &&
-      candidateIntentCurrent(metrics) &&
+      candidateIntentCurrent(playbackIntent) &&
       liveWindowScope() === scope &&
       liveWindowRecovery === budget;
     if (!current()) return;
