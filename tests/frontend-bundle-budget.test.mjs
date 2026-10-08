@@ -110,6 +110,22 @@ test("initial JS stays bounded and every page is a deferred entry", async () => 
 });
 
 test("DASH and HLS SDKs remain outside the initial import closure", () => {
+  const hlsDriver = Object.keys(manifest).find((key) =>
+    key.endsWith("/drivers/hls-driver.ts"),
+  );
+  assert.ok(hlsDriver, "missing independently emitted HLS driver");
+  assert.ok(dynamicEntries.has(hlsDriver), "HLS driver has no dynamic import");
+  assert.ok(deferred.has(hlsDriver), "HLS driver has no deferred import path");
+  assert.equal(
+    initial.has(hlsDriver),
+    false,
+    "HLS driver is statically reachable",
+  );
+  assert.equal(
+    initialFiles.has(manifest[hlsDriver].file),
+    false,
+    "HLS driver shares initial code",
+  );
   for (const [sdk, emittedName] of [
     ["dashjs", "dash.all.min"],
     ["hls.js", "hls"],

@@ -33,6 +33,7 @@ vi.mock("../packages/player-core", async (original) => {
 const hls = vi.hoisted(() => ({
   supported: true,
   handlers: [] as ((event: unknown, data: any) => void)[],
+  instances: [] as any[],
   loaded: vi.fn(),
   started: vi.fn(),
   destroyed: vi.fn(),
@@ -43,7 +44,12 @@ vi.mock("hls.js", () => ({
     static isSupported = () => hls.supported;
     static isMSESupported = () => hls.supported;
     static getMediaSource = () => ({ isTypeSupported: () => true });
-    config = {};
+    config: Record<string, any>;
+    destroyed = false;
+    constructor(config: Record<string, any>) {
+      this.config = config;
+      hls.instances.push(this);
+    }
     loadSource(url: string) {
       hls.loaded(url);
     }
@@ -53,6 +59,7 @@ vi.mock("hls.js", () => ({
     }
     stopLoad() {}
     destroy() {
+      this.destroyed = true;
       hls.destroyed();
     }
     on(_event: unknown, handler: (event: unknown, data: any) => void) {
@@ -67,6 +74,7 @@ afterEach(() => {
   vi.clearAllMocks();
   reportFault.value = "";
   hls.handlers.length = 0;
+  hls.instances.length = 0;
   hls.supported = true;
 });
 const gate = <T = void>() => {
@@ -841,6 +849,8 @@ it("native→MSE and same-plan range recovery retain the snapshot and finite rou
   try {
     await s.runtime.loadMedia();
     await s.decode();
+    // A prepared grant can precede its deferred SDK/driver attachment.
+    await vi.waitFor(() => expect(s.el.src).toBe("/authorized-2"));
     expect(s.prepares()[1][2].candidate_report.excluded_candidates).toEqual([
       "direct",
     ]);
@@ -1611,6 +1621,58 @@ it("deferred old SID cleanup cannot use a replacement login", async () => {
           (call.epoch !== 1 || call.user !== "user"),
       ),
     ).toHaveLength(0);
+  } finally {
+    s.cleanup();
+    await vi.advanceTimersByTimeAsync(0);
+  }
+});
+
+
+it("draft playback settings keep the current HLS attachment active until explicit reload", async () => {
+  const candidates = candidateSet("draft-settings", true);
+  candidates.candidates.shift();
+  const s = setup({ candidates });
+  s.el.canPlayType.mockImplementation((mime: string) =>
+    mime.includes("mpegurl") ? "" : "probably",
+  );
+  try {
+    await s.runtime.loadMedia();
+    const old = hls.instances.at(-1)!,
+      oldError = hls.handlers.at(-1)!,
+      element = s.runtime.video.value;
+    expect(s.runtime.sessionId.value).toBe("session-1");
+    expect(hls.instances).toHaveLength(1);
+    s.runtime.mode.value = "transcode";
+    expect(s.prepares()).toHaveLength(1);
+    // The baseline default XHR loader had no custom hook for ordinary HLS.
+    // A driver-owned request hook must retain that active grant while editing.
+    expect(() => old.config.xhrSetup?.({}, "/authorized-1/segment.ts")).not.toThrow();
+    oldError(undefined, {
+      fatal: true,
+      type: "networkError",
+      details: "draft-observation",
+      response: { code: 503 },
+    });
+    expect(s.error.value).toContain("draft-observation");
+    expect(s.prepares()).toHaveLength(1);
+    await s.runtime.loadMedia();
+    expect(s.prepares()).toHaveLength(2);
+    expect(hls.instances).toHaveLength(2);
+    expect(old.destroyed).toBe(true);
+    expect(hls.instances.at(-1)).not.toBe(old);
+    expect(s.runtime.video.value).toBe(element);
+    const currentError = s.error.value;
+    oldError(undefined, {
+      fatal: true,
+      type: "mediaError",
+      details: "late-old-attachment",
+    });
+    expect(s.error.value).toBe(currentError);
+    expect(s.prepares()).toHaveLength(2);
+    if (old.config.xhrSetup)
+      expect(() => old.config.xhrSetup({}, "/authorized-1/segment.ts")).toThrow(
+        "PLAYBACK_ATTACHMENT_RETIRED",
+      );
   } finally {
     s.cleanup();
     await vi.advanceTimersByTimeAsync(0);

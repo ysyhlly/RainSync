@@ -21,8 +21,8 @@ import {
   validateFiniteHlsChoice,
 } from "./finite-hls-intent";
 import { computed, ref, nextTick, onScopeDispose, watch } from "vue";
-import type Hls from "hls.js";
-import { loadHlsLibrary } from "./hls-library";
+import type { HlsDriver } from "./drivers/hls-driver";
+import { loadHlsDriver } from "./hls-driver-loader";
 import { getPlaybackMediaSource, supportsHlsPlayback } from "./browser-mse";
 import {
   liveRoomMatchesPlan,
@@ -51,7 +51,6 @@ import {
   hasHlsLadder,
 } from "./local-hls-ladder-intent";
 import { RoomP2PTransport, type PeerStats } from "./room-p2p";
-import { createP2PFragmentLoader } from "./room-p2p-loader";
 import {
   validDistributedIntent,
   sameDistributedIntent,
@@ -89,7 +88,7 @@ import type {
   DistributedComputePlaybackFacts,
   UpstreamMeasuredOutput,
 } from "../../../../../packages/protocol";
-import { RequestFailure, isUnsupportedTimelineResponse } from "../../errors";
+import { RequestFailure } from "../../errors";
 import { StaleIdentity } from "../../shared/api/client";
 import { actionErrorMessage } from "../../shared/action-error";
 import {
@@ -366,7 +365,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     const level = value === "auto" ? -1 : ladderLevelMap.get(value);
     if (level === undefined) return;
     ladderQuality.value = value;
-    hls.loadLevel = level;
+    hls.setLevel(level);
   }
   const advancedScope = () =>
     [
@@ -511,7 +510,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   let recoveryPending = false,
     confirmedBaseRate: number | undefined,
     rejectedBaseRate: number | undefined;
-  let hls: Hls | undefined,
+  let hls: HlsDriver | undefined,
     loadSerial = 0,
     clockAction: "load" | "apply" | undefined;
   let recoveringHls = false,
@@ -1913,7 +1912,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           if (!error.value) error.value = mediaDataTimeoutError;
         },
       });
-      const Hls = p.transport === "hls" ? await loadHlsLibrary() : undefined;
+      const Hls = p.transport === "hls" ? await loadHlsDriver() : undefined;
       if (
         serial !== loadSerial ||
         !roomIsActive() ||
@@ -2064,10 +2063,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
             attachHls();
             hls!.startLoad(position);
           } else {
-            hls.config.startPosition = position;
-            hls.loadSource(p.playback_url);
-            hls.startLoad(position);
-            attachMetricSource();
+            if (hls.reload(position)) attachMetricSource();
           }
         } else {
           // Native media errors do not expose the failing HTTP status. Retry the
@@ -2201,282 +2197,194 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         return 0;
       };
       const attachHls = () => {
-        if (
-          !Hls ||
-          serial !== loadSerial ||
-          !currentPlan(p) ||
-          video.value !== el
-        )
+        if (!Hls || serial !== loadSerial || !currentPlan(p) || video.value !== el)
           return;
-        hls = new Hls({
+        const attachedHls = Hls.create({
+          element: el,
+          url: p.playback_url,
           startPosition: p.native_platform?.live ? -1 : playbackPosition(),
-          ...(p.distributed_compute && primaryPeer
-            ? {
-                fLoader: createP2PFragmentLoader(
-                  primaryPeer,
-                  primaryBufferSeconds,
-                  Hls,
-                ),
-              }
-            : {}),
-          ...(p.native_platform?.live
-            ? {
-                enableCEA708Captions: true,
-                enableWebVTT: false,
-                enableIMSC1: false,
-                renderTextTracksNatively: false,
-              }
-            : {}),
-          ...(p.native_platform?.live
-            ? {
-                xhrSetup: (_xhr: XMLHttpRequest, url: string) => {
-                  if (
-                    !validNativeLiveDeliveryUrl(
-                      url,
-                      p.session_id,
-                      location.origin,
-                      false,
-                      p.native_platform!.live!.version,
-                    )
-                  )
-                    throw new Error("NATIVE_PLATFORM_DELIVERY_INVALID");
-                },
-              }
-            : {}),
-          ...(p.native_platform?.compatibility
-            ? {
-                xhrSetup: (_xhr: XMLHttpRequest, url: string) => {
-                  if (
-                    !validNativeCompatibilityDeliveryUrl(
-                      url,
-                      p,
-                      location.origin,
-                    )
-                  )
-                    throw new Error("NATIVE_PLATFORM_DELIVERY_INVALID");
-                },
-              }
-            : {}),
-          maxBufferLength: 20,
-          maxMaxBufferLength: 60,
-          backBufferLength: 30,
-        });
-        const attachedHls = hls;
-        const binding = bindAttachment(attachedHls);
-        if (p.native_platform?.live) {
-          // Only decoder-observed CEA captions; no extra subtitle URI fetches.
-          attachedHls.on(Hls.Events.CUES_PARSED, (_, data) => {
-            if (
-              data.type !== "captions" ||
-              serial !== loadSerial ||
-              !currentPlan(p) ||
-              !roomIsActive() ||
-              hls !== attachedHls ||
-              video.value !== el
-            )
-              return;
-            platformText.ingestLiveInbandCaptions(data.track, data.cues);
-          });
-        }
-
-        if (hasHlsLadder(p)) {
-          const current = () =>
-            serial === loadSerial &&
-            currentPlan(p) &&
-            intentCurrent(playbackIntent) &&
-            candidateIntentCurrent(playbackIntent) &&
-            roomIsActive() &&
-            hls === attachedHls &&
-            video.value === el;
-          attachedHls.on(Hls.Events.MANIFEST_PARSED, () => {
-            if (!current()) return;
-            const mapping = bindLocalHlsLevels(
-              p,
-              attachedHls.levels,
-              location.origin,
-            );
-            if (!mapping) {
-              attachedHls.destroy();
-              if (hls === attachedHls) hls = undefined;
-              ladderManual.value = false;
-              ladderLevelMap = undefined;
-              waiting.value = false;
-              error.value =
-                "服务器 HLS 清晰度列表与已授权方案不一致，请重新加载";
-              failLocalPlayback(error.value);
-              return;
-            }
-            ladderLevelMap = mapping;
-            ladderManual.value = true;
-            if (
-              ladderQuality.value !== "auto" &&
-              !mapping.has(ladderQuality.value)
-            )
-              ladderQuality.value = "auto";
-            attachedHls.loadLevel =
-              ladderQuality.value === "auto"
-                ? -1
-                : mapping.get(ladderQuality.value)!;
-          });
-          attachedHls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
-            if (!current() || !ladderLevelMap) return;
-            ladderSelected.value = [...ladderLevelMap].find(
-              ([, index]) => index === data.level,
-            )?.[0];
-          });
-        }
-        hls.loadSource(p.playback_url);
-        hls.attachMedia(el);
-        attachMetricSource();
-        hls.on(Hls.Events.ERROR, (_, data) => {
-          if (
+          current: () =>
             serial === loadSerial &&
             currentPlan(p) &&
             intentCurrent(playbackIntent) &&
             roomIsActive() &&
             hls === attachedHls &&
-            staticBinding === binding &&
-            (data.fatal ||
-              (!!p.native_platform &&
-                [401, 403, 409, 410].includes(data.response?.code ?? 0)))
-          ) {
-            if (p.native_platform?.live) {
-              let code = "NATIVE_PLATFORM_DELIVERY_INVALID";
-              const body = bestEffort(() =>
-                data.networkDetails && "responseText" in data.networkDetails
-                  ? data.networkDetails.responseText
-                  : undefined,
-              );
-              if (typeof body === "string" && body.length <= 16384) {
-                try {
-                  const reported = JSON.parse(body)?.error?.code;
+            video.value === el,
+          live: !!p.native_platform?.live,
+          fragments:
+            p.distributed_compute && primaryPeer
+              ? { transport: primaryPeer, bufferSeconds: primaryBufferSeconds }
+              : undefined,
+          validateRequest: p.native_platform?.live
+            ? (url) =>
+                validNativeLiveDeliveryUrl(
+                  url,
+                  p.session_id,
+                  location.origin,
+                  false,
+                  p.native_platform!.live!.version,
+                )
+            : p.native_platform?.compatibility
+              ? (url) => validNativeCompatibilityDeliveryUrl(url, p, location.origin)
+              : undefined,
+          attached: attachMetricSource,
+          captions: p.native_platform?.live
+            ? (track, cues) => platformText.ingestLiveInbandCaptions(track, cues)
+            : undefined,
+          ...(hasHlsLadder(p)
+            ? {
+                manifest: (levels) => {
+                  if (!candidateIntentCurrent(playbackIntent)) return;
+                  const mapping = bindLocalHlsLevels(p, levels, location.origin);
+                  if (!mapping) {
+                    attachedHls.destroy();
+                    if (hls === attachedHls) hls = undefined;
+                    ladderManual.value = false;
+                    ladderLevelMap = undefined;
+                    waiting.value = false;
+                    error.value =
+                      "服务器 HLS 清晰度列表与已授权方案不一致，请重新加载";
+                    failLocalPlayback(error.value);
+                    return;
+                  }
+                  ladderLevelMap = mapping;
+                  ladderManual.value = true;
                   if (
-                    [
-                      "NATIVE_LIVE_WINDOW_EXPIRED",
-                      "NATIVE_LIVE_BROADCAST_CHANGED",
-                      "NATIVE_LIVE_NOT_BROADCASTING",
-                      "NATIVE_LIVE_PLAYLIST_CHANGED",
-                      "NATIVE_LIVE_STATE_CHANGED",
-                      "NATIVE_LIVE_RATE_LIMITED",
-                      "NATIVE_LIVE_CAPACITY",
-                      "NATIVE_PLATFORM_URL_EXPIRED",
-                      "ROOM_NOT_ACTIVE",
-                      "STALE_MEDIA",
-                    ].includes(reported)
+                    ladderQuality.value !== "auto" &&
+                    !mapping.has(ladderQuality.value)
                   )
-                    code = reported;
-                } catch {
-                  /* Upstream/raw responses never enter the UI. */
-                }
+                    ladderQuality.value = "auto";
+                  attachedHls.setLevel(
+                    ladderQuality.value === "auto"
+                      ? -1
+                      : mapping.get(ladderQuality.value)!,
+                  );
+                },
+                level: (level) => {
+                  if (candidateIntentCurrent(playbackIntent) && ladderLevelMap)
+                    ladderSelected.value = [...ladderLevelMap].find(
+                      ([, index]) => index === level,
+                    )?.[0];
+                },
+              }
+            : {}),
+          error: (data) => {
+            if (
+              serial === loadSerial &&
+              currentPlan(p) &&
+              intentCurrent(playbackIntent) &&
+              roomIsActive() &&
+              hls === attachedHls &&
+              staticBinding === binding &&
+              (data.fatal ||
+                (!!p.native_platform &&
+                  [401, 403, 409, 410].includes(data.response?.code ?? 0)))
+            ) {
+              if (p.native_platform?.live) {
+                const code = data.liveCode ?? "NATIVE_PLATFORM_DELIVERY_INVALID";
+                if (
+                  code === "NATIVE_LIVE_WINDOW_EXPIRED" &&
+                  recoverExpiredLiveWindow(p)
+                )
+                  return;
+                failNativeLive(p, code);
+                return;
+              }
+              if (p.native_platform?.compatibility) {
+                failNativeCompatibility(
+                  p,
+                  "平台兼容转码播放失败，请保持此方式并重新加载；平台授权和片源有效期仍适用",
+                );
+                return;
+              }
+              if (data.unsupportedTimeline) {
+                firstFrameDeadline?.stop();
+                recoveringHls = false;
+                waiting.value = false;
+                error.value = new RequestFailure({
+                  error: { code: "UNSUPPORTED_TIMELINE" },
+                }).message;
+                preparation.value = {
+                  ...preparation.value,
+                  phase: "failed",
+                  failure: preparationFailure(
+                    new RequestFailure({
+                      error: { code: "UNSUPPORTED_TIMELINE" },
+                    }),
+                  ),
+                };
+                return;
               }
               if (
-                code === "NATIVE_LIVE_WINDOW_EXPIRED" &&
-                recoverExpiredLiveWindow(p)
+                retryStaticDecode(binding, {
+                  kind: "hls",
+                  fatal: data.fatal,
+                  type: data.type,
+                  details: data.details,
+                  response: data.response,
+                  media_error_code: data.media_error_code,
+                  error_name: data.error_name,
+                })
               )
                 return;
-              failNativeLive(p, code);
-              return;
-            }
-            if (p.native_platform?.compatibility) {
-              failNativeCompatibility(
-                p,
-                "平台兼容转码播放失败，请保持此方式并重新加载；平台授权和片源有效期仍适用",
-              );
-              return;
-            }
-            if (
-              isUnsupportedTimelineResponse(
-                data.response?.code,
-                bestEffort(() =>
-                  data.networkDetails && "responseText" in data.networkDetails
-                    ? data.networkDetails.responseText
-                    : undefined,
-                ),
-              )
-            ) {
-              firstFrameDeadline?.stop();
+              if (data.response?.code === 409 && recover()) return;
+              if (
+                sameSidRecovery?.recover({
+                  plan: p,
+                  current:
+                    serial === loadSerial &&
+                    currentPlan(p) &&
+                    roomIsActive() &&
+                    intentCurrent(playbackIntent) &&
+                    candidateIntentCurrent(playbackIntent) &&
+                    video.value === el &&
+                    hls === attachedHls,
+                  fatal: data.fatal,
+                  type: data.type,
+                  recoverMediaError: () => attachedHls.recoverMediaError(),
+                })
+              ) {
+                recoveringHls = true;
+                waiting.value = true;
+                return;
+              }
+              if (
+                sameSidRecovery?.recoverNetwork({
+                  plan: p,
+                  current:
+                    serial === loadSerial &&
+                    currentPlan(p) &&
+                    roomIsActive() &&
+                    intentCurrent(playbackIntent) &&
+                    candidateIntentCurrent(playbackIntent) &&
+                    video.value === el &&
+                    hls === attachedHls,
+                  fatal: data.fatal,
+                  type: data.type,
+                  details: data.details,
+                  status: data.response?.code,
+                  startLoad: () => attachedHls.startLoad(-1),
+                })
+              ) {
+                recoveringHls = true;
+                waiting.value = true;
+                return;
+              }
+              if (data.type === "mediaError" && retryDecode()) return;
               recoveringHls = false;
+              error.value = "媒体加载失败：" + data.details;
+              failLocalPlayback(
+                "媒体加载失败，请检查连接或重新发起播放。",
+                undefined,
+                error.value,
+              );
               waiting.value = false;
-              error.value = new RequestFailure({
-                error: { code: "UNSUPPORTED_TIMELINE" },
-              }).message;
-              preparation.value = {
-                ...preparation.value,
-                phase: "failed",
-                failure: preparationFailure(
-                  new RequestFailure({
-                    error: { code: "UNSUPPORTED_TIMELINE" },
-                  }),
-                ),
-              };
-              return;
             }
-            if (
-              retryStaticDecode(binding, {
-                kind: "hls",
-                fatal: data.fatal,
-                type: data.type,
-                details: data.details,
-                response: data.response,
-                media_error_code: el.error?.code,
-                error_name: data.error?.name,
-              })
-            )
-              return;
-            if (data.response?.code === 409 && recover()) return;
-            if (
-              sameSidRecovery?.recover({
-                plan: p,
-                current:
-                  serial === loadSerial &&
-                  currentPlan(p) &&
-                  roomIsActive() &&
-                  intentCurrent(playbackIntent) &&
-                  candidateIntentCurrent(playbackIntent) &&
-                  video.value === el &&
-                  hls === attachedHls,
-                fatal: data.fatal,
-                type: data.type,
-                recoverMediaError: () => attachedHls.recoverMediaError(),
-              })
-            ) {
-              recoveringHls = true;
-              waiting.value = true;
-              return;
-            }
-            if (
-              sameSidRecovery?.recoverNetwork({
-                plan: p,
-                current:
-                  serial === loadSerial &&
-                  currentPlan(p) &&
-                  roomIsActive() &&
-                  intentCurrent(playbackIntent) &&
-                  candidateIntentCurrent(playbackIntent) &&
-                  video.value === el &&
-                  hls === attachedHls,
-                fatal: data.fatal,
-                type: data.type,
-                details: data.details,
-                status: data.response?.code,
-                startLoad: () => attachedHls.startLoad(-1),
-              })
-            ) {
-              recoveringHls = true;
-              waiting.value = true;
-              return;
-            }
-            if (data.type === "mediaError" && retryDecode()) return;
-            recoveringHls = false;
-            error.value = "媒体加载失败：" + data.details;
-            failLocalPlayback(
-              "媒体加载失败，请检查连接或重新发起播放。",
-              undefined,
-              error.value,
-            );
-            waiting.value = false;
-          }
+          },
         });
+        hls = attachedHls;
+        const binding = bindAttachment(attachedHls);
+        attachedHls.attach();
       };
       bindMetricSource(p, el);
       if (p.upstream_profile) {

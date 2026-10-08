@@ -32,7 +32,7 @@ vi.mock("hls.js", async () => {
   };
 });
 
-it("loads HLS once only for HLS plans and fences late SDK resolution by reset, identity and media", async () => {
+it("loads HLS once only for HLS plans and fences late SDK resolution by reset, identity, media and disposal", async () => {
   vi.stubGlobal("self", { MediaSource: { isTypeSupported: () => true } });
   vi.stubGlobal("navigator", {});
   vi.stubGlobal(
@@ -116,7 +116,7 @@ it("loads HLS once only for HLS plans and fences late SDK resolution by reset, i
       },
     });
     runtime.attach(element);
-    return { runtime, session, state, element };
+    return { runtime, session, state, element, dispose: () => scope.stop() };
   };
   try {
     const progressive = setup("progressive", "plain.mp4");
@@ -126,8 +126,9 @@ it("loads HLS once only for HLS plans and fences late SDK resolution by reset, i
     const reset = setup("hls", "reset.m3u8"),
       identity = setup("hls", "identity.m3u8"),
       media = setup("hls", "media.m3u8"),
+      disposed = setup("hls", "disposed.m3u8"),
       current = setup("hls", "current.m3u8");
-    const pending = [reset, identity, media, current].map((s) =>
+    const pending = [reset, identity, media, disposed, current].map((s) =>
       s.runtime.loadMedia(),
     );
     await vi.waitFor(() => expect(sdk.requested).toBe(1));
@@ -137,6 +138,7 @@ it("loads HLS once only for HLS plans and fences late SDK resolution by reset, i
     await reset.runtime.reset();
     ++identity.session.epoch;
     media.state.value.media_generation++;
+    disposed.dispose();
     sdk.release!();
     await Promise.all(pending);
     expect(sdk.attached).toEqual([current.element]);
@@ -144,6 +146,7 @@ it("loads HLS once only for HLS plans and fences late SDK resolution by reset, i
     expect(reset.element.src).toBe("");
     expect(identity.element.src).toBe("");
     expect(media.element.src).toBe("");
+    expect(disposed.element.src).toBe("");
     expect(sdk.requested).toBe(1);
   } finally {
     sdk.release?.();
