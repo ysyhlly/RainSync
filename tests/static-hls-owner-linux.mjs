@@ -5,39 +5,13 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Required local fixture configuration; no machine-specific defaults.
-const runtime = (() => {
-  const required = (name, pattern, description) => {
-    const value = process.env[name];
-    assert.ok(
-      typeof value === "string" && value.length <= 4096 &&
-        !/[\x00-\x1f\x7f]/.test(value) && pattern.test(value),
-      `Set ${name} to ${description}`,
-    );
-    return value;
-  };
-  const absolutePath = (name) => required(
-    name,
-    /^(?:\/[^\x00-\x1f\x7f:]+|[A-Za-z]:[\\/][^\x00-\x1f\x7f:]+)$/,
-    "an absolute local fixture path without control characters",
-  );
-  const imageReference = (name) => required(
-    name,
-    /^(?:sha256:[0-9a-f]{64}|(?=.{1,255}$)(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[0-9]+)?\/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(?:@sha256:[0-9a-f]{64})?)$/,
-    "a valid local Docker image reference",
-  );
-  return Object.freeze({
-    image: imageReference("RAINSYNC_OWNER_TEST_IMAGE"),
-    registry: absolutePath("RAINSYNC_OWNER_TEST_REGISTRY"),
-    cargoConfig: absolutePath("RAINSYNC_OWNER_TEST_CARGO_CONFIG"),
-  });
-})();
-// End required fixture configuration.
+import { staticHlsPrerequisites } from "../scripts/check-static-hls-prerequisites.mjs";
+let runtime;
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const runId = randomUUID();
-const evidence = join(root, ".runtime", "0044-owner-linux", runId);
-const target = join(root, ".runtime", "0044-owner-linux-target");
+const evidence = join(process.env.RAINSYNC_ARTIFACT_DIR ?? join(root, ".runtime"), "static-hls-owner-linux", runId);
+const target = join(process.env.RAINSYNC_RUNTIME_ROOT ?? join(root, ".runtime"), "static-hls-owner-linux-target", runId);
 mkdirSync(evidence, { recursive: true });
 mkdirSync(target, { recursive: true });
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -100,6 +74,8 @@ async function command(
   return record;
 }
 try {
+  runtime = await staticHlsPrerequisites({ postgres: false });
+  report.prerequisites = runtime.summary;
   report.baseCommit = (
     await command("git", ["rev-parse", "HEAD"])
   ).stdout.trim();
@@ -121,6 +97,8 @@ try {
           [
             "Cargo.toml",
             "Cargo.lock",
+            "scripts/check-static-hls-prerequisites.mjs",
+            "scripts/native-owner-binding.mjs",
             "tests/static-hls-owner-linux.mjs",
             "tests/fixtures/Dockerfile.static-hls-owner",
             "tests/fixtures/Dockerfile.static-hls-owner-clippy",
@@ -132,16 +110,7 @@ try {
     path,
     sha256: hash(readFileSync(join(root, path))),
   }));
-  const image = JSON.parse(
-    (
-      await command("docker", [
-        "image",
-        "inspect",
-        runtime.image,
-      ])
-    ).stdout,
-  )[0];
-  assert.equal(image.Os, "linux");
+  const image = { Id: runtime.imageId };
   report.imageId = image.Id;
   const registry = runtime.registry;
   const config = runtime.cargoConfig;
@@ -209,7 +178,7 @@ try {
   report.passed = true;
 } catch (error) {
   report.passed = false;
-  report.error = error.stack;
+  report.error = "static_hls_gate_failed";
   console.error(error.message);
   process.exitCode = 1;
 } finally {

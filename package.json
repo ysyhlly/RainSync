@@ -35,7 +35,12 @@
     "test:static-hls-owner-linux": "node tests/static-hls-owner-linux.mjs",
     "test:static-hls-public-prepare": "node tests/static-hls-public-prepare.mjs",
     "lint": "eslint apps/web/src packages --max-warnings 0",
-    "test:frontend-bundle": "node --test tests/frontend-bundle-budget.test.mjs"
+    "test:frontend-bundle": "node --test tests/frontend-bundle-budget.test.mjs",
+    "test:owner-gate-contracts": "node --test tests/native-owner-gates.test.mjs",
+    "test:native-delivery-owner": "node tests/native-delivery-owner.mjs",
+    "test:room-cleanup-native": "node tests/room-cleanup-native.mjs",
+    "test:static-hls-owner-prerequisites": "node scripts/check-static-hls-prerequisites.mjs owner",
+    "test:static-hls-pending-prerequisites": "node scripts/check-static-hls-prerequisites.mjs pending"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

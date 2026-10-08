@@ -26,6 +26,7 @@ struct Case {
 #[derive(Clone, Default)]
 struct Flags {
     started: Arc<AtomicUsize>,
+    chunks: Arc<AtomicUsize>,
     future_dropped: Arc<AtomicBool>,
     response_dropped: Arc<AtomicBool>,
 }
@@ -60,7 +61,12 @@ impl Source for HttpSource {
             self.response
                 .chunk()
                 .await
-                .map(|chunk| chunk.map(|chunk| chunk.to_vec()))
+                .map(|chunk| {
+                    chunk.map(|chunk| {
+                        self.flags.chunks.fetch_add(1, Ordering::SeqCst);
+                        chunk.to_vec()
+                    })
+                })
                 .map_err(|_| bilibili::Error::Transport)
         })
     }
@@ -237,7 +243,17 @@ async fn native_delivery_owner_http_fixture() {
             range: (case.name == "send_range_drop").then(|| "bytes=0-31".into()),
             deadline: Deadline::now() + Duration::from_secs(30),
         };
-        if case.name == "reject_stopped" {
+        if case.name == "reject_closed_admission" {
+            app.native_delivery_owners.close_admission();
+            assert!(
+                start(&app, &authority, case.room, transport, request)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(flags.started.load(Ordering::SeqCst), 0);
+            assert_eq!(receipts(&db, case.session).await, (0, 0));
+            close(&api, &f, case.room).await;
+        } else if case.name == "reject_stopped" {
             sqlx::query("UPDATE playback_sessions SET stopped=true WHERE id=$1")
                 .bind(case.session)
                 .execute(&db)
@@ -362,6 +378,18 @@ async fn native_delivery_owner_http_fixture() {
                 assert!(flags.response_dropped.load(Ordering::SeqCst));
                 close(&api, &f, case.room).await;
             } else {
+                until(
+                    || async {
+                        body.receiver.len() == 1 && flags.chunks.load(Ordering::SeqCst) == 2
+                    },
+                    "real source fills the bounded body channel before close",
+                )
+                .await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert_eq!(body.receiver.len(), 1);
+                assert_eq!(flags.chunks.load(Ordering::SeqCst), 2);
+                assert!(!flags.response_dropped.load(Ordering::SeqCst));
+                assert_eq!(receipts(&db, case.session).await, (1, 0));
                 close(&api, &f, case.room).await;
                 if !flags.response_dropped.load(Ordering::SeqCst) {
                     assert_eq!(lifecycle(&api, &f, case.room).await["lifecycle"], "closing");

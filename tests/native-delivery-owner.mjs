@@ -2,43 +2,41 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { readdir,stat,writeFile } from "node:fs/promises";
+import { unlink, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { spawn } from "node:child_process";
-import { createReadStream } from "node:fs";
-import { isolatedServer } from "./fixtures/server.mjs";
+import { ownedProcess } from "../deploy/owned-process.mjs";
+import { assertOwnerRun, nativeOwnerCases, nativeOwnerTest } from "../scripts/native-owner-binding.mjs";
+import { nativeOwnerGate } from "./fixtures/native-owner-gate.mjs";
+import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
 import { withPlaybackAdmission,testLoginHash } from "./fixtures/playback-admission.mjs";
 const quote=value=>`'${String(value).replaceAll("'","''")}'`;
-const testName="platform_media::delivery::owner::tests::native_delivery_owner_http_fixture";
-async function isFixtureBinary(path){
-  // Never execute an unknown deps artifact with --list: that directory also
-  // contains the ordinary production binary, which does not use a test runner.
-  const markers=[Buffer.from(testName),Buffer.from("RAINSYNC_NATIVE_DELIVERY_REQUEST")];
-  const found=markers.map(()=>false);let tail=Buffer.alloc(0);
-  for await(const chunk of createReadStream(path,{highWaterMark:1024*1024})){
-    const bytes=Buffer.concat([tail,chunk]);
-    markers.forEach((marker,index)=>{if(bytes.includes(marker))found[index]=true;});
-    if(found.every(Boolean))return true;
-    tail=bytes.subarray(Math.max(0,bytes.length-256));
-  }
-  return false;
-}
-
-await isolatedServer("native-delivery-owner",async f=>{
+await nativeOwnerGate("native-delivery-owner",async (f, {binding, report, check, signal})=>{
   const client=f.client(),user=await client.login(),nonce=randomUUID();
   const records=[];
   const upstream=createServer((request,response)=>{
     const name=request.url.split("/").at(-1);
-    const record={name,method:request.method,range:request.headers.range,cookie:request.headers.cookie,closed:false};records.push(record);
-    response.once("close",()=>{record.closed=true;});
+    const record={name,method:request.method,range:request.headers.range,credential_received:request.headers.cookie!==undefined,closed:false,writes:0};records.push(record);
+    let timer;
+    response.once("close",()=>{record.closed=true;clearInterval(timer);});
     if(name.startsWith("send_"))return;
-    response.writeHead(200,{"Content-Type":"video/mp4","Content-Length":"1000000"});response.flushHeaders();response.write(Buffer.alloc(16));
+    response.writeHead(200,{"Content-Type":"video/mp4","Content-Length":"1000000"});response.flushHeaders();
+    if(name==="body_close") {
+      // Distinct source chunks fill the one-slot Rust body channel. Keep the
+      // source open; closing the room must cancel an actually blocked send.
+      timer=setInterval(()=>{
+        if(record.writes<16 && !response.destroyed) {
+          response.write(Buffer.alloc(16*1024));record.writes++;
+        } else clearInterval(timer);
+      },20);
+    } else response.write(Buffer.alloc(16));
   });
   await new Promise(done=>upstream.listen(0,"127.0.0.1",done));
+  const upstreamPort=upstream.address().port;
+  let requestFile;
   try {
     f.sql(`CREATE TABLE native_delivery_fixture_identity(id uuid PRIMARY KEY,nonce text NOT NULL);INSERT INTO native_delivery_fixture_identity VALUES('${f.id}','${nonce}');`);
     const cases=[];
-    for(const name of ["body_close","body_drop","send_get","send_head","send_range_drop","receipt_failure","receipt_suppressed","reject_stopped"]){
+    for(const name of nativeOwnerCases){
       const room=await client.request("/rooms","POST",{name:`owned native delivery ${name}`});
       const session=randomUUID(),media=randomUUID(),viewer=randomUUID(),token=randomUUID().replaceAll("-","")+randomUUID().replaceAll("-","");
       const login=testLoginHash(f,client);
@@ -55,25 +53,40 @@ await isolatedServer("native-delivery-owner",async f=>{
       cases.push({name,room:room.id,session,user:user.id,login,token,url:`http://127.0.0.1:${upstream.address().port}/source/${name}`});
     }
     // Each isolatedServer exposes root through its configured owned MEDIA_ROOT.
-    const requestFile=resolve(f.env.MEDIA_ROOT,"native-delivery-request.json");
-    await writeFile(requestFile,JSON.stringify({id:f.id,nonce,origin:f.origin,cookie:client.cookie,csrf:client.csrf,cases}),"utf8");
-    const directory=resolve(process.env.CARGO_TARGET_DIR??"target","debug","deps");
-    const suffix=process.platform==="win32"?".exe":"";
-    const candidates=await Promise.all((await readdir(directory)).filter(name=>name.startsWith("rainsync_server-")&&(suffix?name.endsWith(suffix):!name.includes("."))).map(async name=>({path:resolve(directory,name),modified:(await stat(resolve(directory,name))).mtimeMs})));
-    candidates.sort((a,b)=>b.modified-a.modified);
-    let binary;
-    for(const candidate of candidates){if(await isFixtureBinary(candidate.path)){binary=candidate.path;break;}}
-    assert.ok(binary,"build the ignored native owner fixture test binary first");
-    const child=spawn(binary,[testName,"--exact","--ignored","--nocapture"],{windowsHide:true,stdio:["ignore","pipe","pipe"],env:{...f.env,RAINSYNC_ISOLATED_TEST:"1",RAINSYNC_NATIVE_DELIVERY_TEST_DATABASE:f.env.DATABASE_URL,RAINSYNC_NATIVE_DELIVERY_REQUEST:requestFile}});
-    child.stdout.pipe(process.stdout);child.stderr.pipe(process.stderr);
-    let timeout=setTimeout(()=>child.kill(),90000);
-    const result=await new Promise((done,reject)=>{child.once("error",reject);child.once("close",(code,signal)=>done({code,signal}));});clearTimeout(timeout);
-    assert.equal(result.code,0,`native HTTP owner fixture failed: signal=${result.signal}`);
-    assert.equal(records.filter(record=>record.name==="reject_stopped").length,0);
-    assert.ok(records.every(record=>record.cookie===undefined),"loopback native source sees no RainSync login credential");
+    requestFile=resolve(f.env.MEDIA_ROOT,"native-delivery-request.json");
+    await writeFile(requestFile,JSON.stringify({id:f.id,nonce,origin:f.origin,cookie:client.cookie,csrf:client.csrf,cases}),{encoding:"utf8",mode:0o600,flag:"wx"});
+    let result;
+    try {
+      result=await ownedProcess(binding.owner.path,[nativeOwnerTest,"--exact","--ignored","--nocapture"],{
+        timeoutMs:120000,signal,
+        env:{...f.env,RAINSYNC_ISOLATED_TEST:"1",RAINSYNC_NATIVE_DELIVERY_TEST_DATABASE:f.env.DATABASE_URL,RAINSYNC_NATIVE_DELIVERY_REQUEST:requestFile},
+      });
+      const {output,...receipt}=result;
+      report.driver={...receipt,pid_absent:verifyPidAbsent(result.pid)};
+      process.stdout.write(output);
+      assert.equal(result.exit_code,0,"native HTTP owner fixture failed");
+      assert.equal(result.signal,null);
+      assertOwnerRun(output);
+      assert.equal(report.driver.pid_absent,true);
+    } catch(error) {
+      if(error.cleanup) report.driver={...error.cleanup,pid_absent:verifyPidAbsent(error.cleanup.pid)};
+      throw error;
+    }
+    assert.equal(records.filter(record=>record.name.startsWith("reject_")).length,0);
+    assert.ok(records.every(record=>!record.credential_received),"loopback native source sees no RainSync login credential");
+    const closeDeadline=Date.now()+2000;
+    while(!records.every(record=>record.closed)&&Date.now()<closeDeadline)
+      await new Promise(done=>setTimeout(done,20));
     assert.ok(records.every(record=>record.closed),"all owned raw source sockets closed after disposal");
+    assert.ok(records.find(record=>record.name==="body_close").writes>=4,"backpressure uses multiple actual source chunks");
     assert.equal(records.find(record=>record.name==="send_head").method,"HEAD");
     assert.equal(records.find(record=>record.name==="send_range_drop").range,"bytes=0-31");
+    for(const name of nativeOwnerCases) check(name);
     console.log("PASS: real source sockets, deferred HEAD/Range requests, receipt failure/recovery, caller cancellation and denied admission all preserve authoritative room closure");
-  } finally {upstream.closeAllConnections();await new Promise(done=>upstream.close(done));}
-});
+  } finally {
+    upstream.closeAllConnections();await new Promise(done=>upstream.close(done));
+    report.upstream={port:upstreamPort,port_closed:await verifyClosedPort(upstreamPort),requests:records};
+    assert.equal(report.upstream.port_closed,true);
+    if(requestFile) await unlink(requestFile);
+  }
+},{requireTest:true});

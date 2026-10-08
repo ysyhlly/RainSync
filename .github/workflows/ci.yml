@@ -110,3 +110,67 @@ jobs:
           path: ${{ runner.temp }}/rainsync-validation/upstream-profile-admission/*/report.json
           if-no-files-found: ignore
           retention-days: 7
+
+  # Independent of the broad checks job: a frontend or unrelated integration
+  # failure must not silently prevent these owner/commit contracts from running.
+  owner-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      RAINSYNC_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Isolate owner validation outputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/rainsync-owner-validation"
+          echo "RAINSYNC_ARTIFACT_DIR=$RUNNER_TEMP/rainsync-owner-validation/artifacts" >> "$GITHUB_ENV"
+          echo "RAINSYNC_RUNTIME_ROOT=$RUNNER_TEMP/rainsync-owner-validation/runtime" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rainsync-owner-validation/cargo-target" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Verify owner gate orchestration contracts
+        run: npm run test:owner-gate-contracts
+      - name: Prepare owned native PostgreSQL prerequisites
+        id: prerequisites
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: |
+          bash tests/ci-media-prerequisites.sh
+          bash scripts/ci-media-prerequisites.sh
+          mkdir -p "$RAINSYNC_ARTIFACT_DIR" "$RAINSYNC_RUNTIME_ROOT"
+          echo "RAINSYNC_NATIVE_POSTGRES_BIN=$(pg_config --bindir)" >> "$GITHUB_ENV"
+      - name: Bind current production and ignored owner-test executables
+        id: binding
+        if: ${{ !cancelled() && steps.prerequisites.outcome == 'success' }}
+        timeout-minutes: 30
+        run: |
+          node scripts/bind-native-backend.mjs --owner-fixtures > "$RAINSYNC_ARTIFACT_DIR/binding-path.txt"
+          BINDING="$(tail -n 1 "$RAINSYNC_ARTIFACT_DIR/binding-path.txt")"
+          test -s "$BINDING"
+          echo "W03_BACKEND_BINDING=$BINDING" >> "$GITHUB_ENV"
+      - name: Verify actual native delivery owners and durable ACK recovery
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s npm run test:native-delivery-owner
+      - name: Verify native room cleanup and late owner receipts
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s npm run test:room-cleanup-native
+      - name: Retain sanitized owner evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owner-gates-${{ github.sha }}-${{ github.run_attempt }}
+          # No fixture request documents, databases, credentials or raw logs.
+          path: |
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/owner-gates/**/report.json
+            ${{ runner.temp }}/rainsync-owner-validation/runtime/**/backend-binding.json
+          if-no-files-found: warn
+          retention-days: 7

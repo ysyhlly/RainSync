@@ -2,7 +2,8 @@
 // Synthetic owner records model receipts; no real remote state is altered.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { isolatedServer, delay } from "./fixtures/server.mjs";
+import { delay } from "./fixtures/server.mjs";
+import { nativeOwnerGate } from "./fixtures/native-owner-gate.mjs";
 import { withPlaybackAdmission } from "./fixtures/playback-admission.mjs";
 
 const quote = value => `'${String(value).replaceAll("'", "''")}'`;
@@ -12,7 +13,7 @@ async function until(check, label, timeout = 20000) {
   throw Error(`deadline: ${label}`);
 }
 
-await isolatedServer("room-cleanup-native", async f => {
+await nativeOwnerGate("room-cleanup-native", async (f, {check}) => {
   const client = f.client(), user = await client.login();
   const view = id => client.request(`/rooms/${id}/lifecycle`);
   const close = async id => client.request(`/rooms/${id}/close`, "POST", {
@@ -44,6 +45,7 @@ await isolatedServer("room-cleanup-native", async f => {
   await until(async () => (await view(settled.room.id)).lifecycle === "closed", "native DASH close after actual owner obligations drain");
   assert.equal(f.sql(`SELECT count(*) FROM room_lifecycle_events WHERE room_id='${settled.room.id}' AND lifecycle='closed'`), "1");
   assert.equal(f.sql(`SELECT resource ? 'upstream_closed' FROM playback_sessions WHERE id='${settled.session}'`), "f", "completion must not fabricate an irrelevant receipt");
+  check("native_close_without_fabricated_legacy_receipt");
   console.log("PASS: native DASH no longer waits permanently for a legacy owner that never handles it");
 
   const pending = await makeNative("native close retains real preparation and delivery barriers");
@@ -83,6 +85,7 @@ await isolatedServer("room-cleanup-native", async f => {
   await until(async () => (await view(pending.room.id)).lifecycle === "closed", "late execution receipt permits one close");
   assert.equal(f.sql(`SELECT count(*) FROM room_lifecycle_events WHERE room_id='${pending.room.id}' AND lifecycle='closed'`), "1");
   await client.request(`/rooms/${pending.room.id}/cleanup/retry`, "POST", {expected_revision:(await view(pending.room.id)).state.revision}, 409);
+  check("late_owner_receipts_and_revision_fenced_retry");
   console.log("PASS: cleanup progress lists real blockers; retry is revision-fenced, lease-preserving and idempotent; late owner receipts close exactly once");
 
   const unknown = await client.request("/rooms", "POST", {name:"unknown legacy session still requires actual release evidence"}), session = randomUUID();
@@ -93,5 +96,6 @@ await isolatedServer("room-cleanup-native", async f => {
   await delay(1200);
   assert.equal((await view(unknown.id)).lifecycle, "closing");
   assert.equal(f.sql(`SELECT count(*) FROM room_lifecycle_events WHERE room_id='${unknown.id}' AND lifecycle='closed'`), "0");
+  check("unknown_legacy_owner_remains_blocked");
   console.log("PASS: expiry and retry never turn unknown legacy ownership into a false disposal receipt");
 });
