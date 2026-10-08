@@ -35,3 +35,15 @@ report the exact limitation and continue direct source analysis. Do not claim a
 graph query succeeded based only on installation or `doctor`. Do not retry old
 tools, change proxy/network/security settings, or bypass access restrictions.
 Report actual file locations and disclose indexing/parser limitations.
+
+## Cursor Cloud specific instructions
+
+Use a login shell (`bash -lc`) so `/etc/profile.d/rainsync-path.sh` puts project toolchains ahead of the base image:
+
+- Node.js 24 is `/usr/local/bin/node`.
+- Rust stable for edition 2024 is `/usr/local/cargo` (`CARGO_HOME` and `RUSTUP_HOME`).
+- PostgreSQL 16 tools come from `pg_config --bindir`. Set `RAINSYNC_NATIVE_POSTGRES_BIN` to that directory for native test fixtures.
+- FFmpeg and ffprobe are on `PATH`.
+- Docker and Compose are installed. The environment start script runs `sudo service docker start` when the daemon is down. `docker compose up --build` is the documented full stack and is not started on boot.
+
+For a UI loop without a release image build, run `cargo build --workspace --locked --bins`, start `rainsync-server` and `rainsync-media-worker` on a private Postgres cluster, then `npm run dev`. Set `PUBLIC_ORIGIN` to `http://localhost:5173`. `MEDIA_ROOT` and `CACHE_ROOT` must be different directories. An empty users table plus `ADMIN_PASSWORD` creates the first admin at server startup.
