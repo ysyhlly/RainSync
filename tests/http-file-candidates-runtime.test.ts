@@ -1678,3 +1678,56 @@ it("draft playback settings keep the current HLS attachment active until explici
     await vi.advanceTimersByTimeAsync(0);
   }
 });
+
+it("draft playback settings keep the native attachment active until explicit reload", async () => {
+  const s = setup();
+  try {
+    await s.runtime.loadMedia();
+    const oldError = s.el.onerror,
+      element = s.runtime.video.value;
+    s.runtime.mode.value = "transcode";
+    s.el.error = { code: 2 };
+    oldError();
+    expect(s.prepares()).toHaveLength(1);
+    expect(s.runtime.sessionId.value).toBe("session-1");
+    expect(s.error.value).toContain("媒体加载中断");
+    await s.runtime.loadMedia();
+    expect(s.el.src).toBe("/authorized-2");
+    expect(s.runtime.video.value).toBe(element);
+    const currentError = s.error.value;
+    s.el.error = { code: 3 };
+    oldError();
+    expect(s.error.value).toBe(currentError);
+    expect(s.prepares()).toHaveLength(2);
+  } finally {
+    s.cleanup();
+    await vi.advanceTimersByTimeAsync(0);
+  }
+});
+
+it("same-grant native recovery retires the prior source callback without changing the video", async () => {
+  const candidates = candidateSet("native-source-owner", true);
+  candidates.candidates.shift();
+  const s = setup({ candidates });
+  try {
+    await s.runtime.loadMedia();
+    const oldError = s.el.onerror,
+      element = s.runtime.video.value;
+    s.el.error = { code: 2 };
+    oldError();
+    expect(s.el.src).toContain("recovery=1");
+    expect(s.el.onerror).not.toBe(oldError);
+    expect(s.runtime.video.value).toBe(element);
+    expect(s.prepares()).toHaveLength(1);
+    const source = s.el.src;
+    s.el.error = { code: 3 };
+    oldError();
+    expect(s.el.src).toBe(source);
+    expect(hls.loaded).not.toHaveBeenCalled();
+    expect(s.error.value).toBe("");
+    expect(s.prepares()).toHaveLength(1);
+  } finally {
+    s.cleanup();
+    await vi.advanceTimersByTimeAsync(0);
+  }
+});

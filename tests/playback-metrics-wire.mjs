@@ -42,6 +42,7 @@ const frontendInputs = [
   "apps/web/src/features/playback/playback-session-controller.ts",
   "apps/web/src/features/playback/hls-driver-loader.ts",
   "apps/web/src/features/playback/drivers/hls-driver.ts",
+  "apps/web/src/features/playback/drivers/native-driver.ts",
   "apps/web/src/features/playback/room-p2p-loader.ts",
   "apps/web/src/features/playback/playback-runtime-types.ts",
   "apps/web/src/features/playback/playback-scope.ts",

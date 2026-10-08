@@ -22,6 +22,7 @@ import {
 } from "./finite-hls-intent";
 import { computed, ref, nextTick, onScopeDispose, watch } from "vue";
 import type { HlsDriver } from "./drivers/hls-driver";
+import { createNativeDriver, type NativeDriver, type NativeDriverOptions } from "./drivers/native-driver";
 import { loadHlsDriver } from "./hls-driver-loader";
 import { getPlaybackMediaSource, supportsHlsPlayback } from "./browser-mse";
 import {
@@ -510,7 +511,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   let recoveryPending = false,
     confirmedBaseRate: number | undefined,
     rejectedBaseRate: number | undefined;
-  let hls: HlsDriver | undefined,
+  let native: NativeDriver | undefined,
+    hls: HlsDriver | undefined,
     loadSerial = 0,
     clockAction: "load" | "apply" | undefined;
   let recoveringHls = false,
@@ -1006,6 +1008,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     const detachedSession = sessionController.retirePlan();
     const old = detachedSession?.plan;
     playbackSummary.value = undefined;
+    native?.destroy();
+    native = undefined;
     if (video.value) {
       video.value.onerror = null;
       video.value.onended = null;
@@ -1114,6 +1118,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     ) {
       // Retire the owned MP4 immediately, even if room-clock calibration delays
       // the replacement request. All stored handlers are fenced by the new intent.
+      native?.destroy();
+      native = undefined;
       video.value.onerror = null;
       video.value.onended = null;
       video.value.onloadedmetadata = null;
@@ -2028,6 +2034,26 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         void run(() => fallbackLoad([...failedCandidates, candidate]));
         return true;
       };
+      const attachNative = (
+        options: Pick<NativeDriverOptions, "source" | "error" | "requireSource"> & {
+          scope?: () => boolean;
+          load?: boolean;
+        },
+      ) => {
+        native?.destroy();
+        const attached = createNativeDriver({
+          ...options,
+          element: el,
+          current: () =>
+            serial === loadSerial && currentPlan(p) &&
+            intentCurrent(playbackIntent) && roomIsActive() &&
+            video.value === el && native === attached &&
+            (options.scope?.() ?? true),
+          attached: attachMetricSource,
+        });
+        native = attached;
+        attached.attach(options.load);
+      };
       const recover = () => {
         if (
           serial !== loadSerial ||
@@ -2072,41 +2098,27 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           bindMetricSource(p, el, true);
           url.searchParams.set("recovery", String(recoveries));
           url.hash = `t=${position}`;
-          bindNativeError(bindAttachment({}));
-          el.src = url.href;
-          el.load();
-          attachMetricSource();
+          bindNativeSource(bindAttachment({}), url.href, true);
         }
         firstFrameDeadline?.attachSource();
         return true;
       };
-      const bindNativeError = (binding: StaticHlsPlanBinding) => {
-        el.onerror = () => {
-          // load() during teardown and queued events from a previous resource are
-          // not failures of this plan. A real media error belongs to the active URL.
+      const bindNativeSource = (binding: StaticHlsPlanBinding, source: string, load = false) => {
+        attachNative({
+          source, load,
+          scope: () => staticBinding === binding,
+          error: ({ code }) => {
           if (
-            serial !== loadSerial ||
-            !roomIsActive() ||
-            !currentPlan(p) ||
-            video.value !== el ||
-            staticBinding !== binding ||
-            !intentCurrent(playbackIntent) ||
-            !el.getAttribute("src") ||
-            !el.error ||
-            el.error.code === 1
-          )
-            return;
-          if (
-            el.error.code === 3 &&
+            code === 3 &&
             retryStaticDecode(binding, {
               kind: "native",
-              code: el.error.code,
+              code: code,
             })
           )
             return;
           if (p.transport === "hls" && !mse) {
             if (
-              (el.error.code === 3 || el.error.code === 4) &&
+              (code === 3 || code === 4) &&
               Hls?.isSupported()
             ) {
               // A native decoder/parser failure can be transport-specific. Try MSE
@@ -2121,6 +2133,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
               invalidatePlayActions();
               firstFrameDeadline?.detachSource();
               mediaDataLoad?.sourceChanged();
+              native?.destroy();
+              native = undefined;
               el.pause();
               metricRuntime.stopSource(false);
               el.removeAttribute("src");
@@ -2134,12 +2148,12 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           }
           // HTML code 4 mixes format, delivery and support failures. It cannot
           // justify a fresh grant, including the legacy one-hop HTTP continuation.
-          if (el.error.code === 3 && retryDecode()) return;
+          if (code === 3 && retryDecode()) return;
           recoveringHls = false;
           error.value =
-            el.error.code === 2
+            code === 2
               ? "媒体加载中断，请检查连接后重新加载"
-              : el.error.code === 4
+              : code === 4
                 ? "媒体加载或格式支持状态未知，请检查连接后重新加载"
                 : "无法播放此格式，可切换兼容转码后重载";
           if (p.native_platform?.compatibility) {
@@ -2148,7 +2162,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           }
           failLocalPlayback(error.value);
           waiting.value = false;
-        };
+          },
+        });
       };
       if (
         p.upstream_profile &&
@@ -2444,25 +2459,24 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
             });
           if (mse) attachHls();
           else {
-            bindNativeError(bindAttachment({}));
-            el.src = p.playback_url;
-            attachMetricSource();
+            bindNativeSource(bindAttachment({}), p.playback_url);
           }
           mediaDataLoad.sourceChanged();
           firstFrameDeadline.attachSource();
         } else if (binding.live) {
           if (mse) attachHls();
           else {
-            el.onerror = () => {
-              if (!current() || !el.error || el.error.code === 1) return;
-              if (el.error.code === 2) {
-                void probeExpiredNativeLiveWindow(p);
-                return;
-              }
-              failNativeLive(p, "NATIVE_PLATFORM_DELIVERY_INVALID");
-            };
-            el.src = p.playback_url;
-            attachMetricSource();
+            attachNative({
+              source: p.playback_url,
+              requireSource: false,
+              error: ({ code }) => {
+                if (code === 2) {
+                  void probeExpiredNativeLiveWindow(p);
+                  return;
+                }
+                failNativeLive(p, "NATIVE_PLATFORM_DELIVERY_INVALID");
+              },
+            });
           }
           mediaDataLoad.sourceChanged();
           firstFrameDeadline.attachSource();
@@ -2509,25 +2523,19 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           // A native MP4 is a dedicated platform grant, not the generic
           // progressive route. Never offer decoder/worker fallback or mutate
           // its token-bearing URL with generic recovery parameters.
-          el.onerror = () => {
-            if (
-              !current() ||
-              !el.getAttribute("src") ||
-              !el.error ||
-              el.error.code === 1
-            )
-              return;
+          attachNative({
+            source: p.playback_url,
+            error: ({ code }) => {
             waiting.value = false;
             error.value =
-              el.error.code === 2
+              code === 2
                 ? "平台视频加载中断，请检查连接后重新加载"
-                : el.error.code === 4
+                : code === 4
                   ? "平台视频加载或格式支持状态未知，请检查连接后重新加载"
                   : "浏览器无法播放此平台视频格式，请重新加载或选择其他视频";
             failLocalPlayback(error.value, "NATIVE_PLATFORM_MEDIA_FAILED");
-          };
-          el.src = p.playback_url;
-          attachMetricSource();
+            },
+          });
           mediaDataLoad.sourceChanged();
           firstFrameDeadline.attachSource();
         }
@@ -2548,9 +2556,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       } else {
         if (mse) attachHls();
         else {
-          bindNativeError(bindAttachment({}));
-          el.src = p.playback_url;
-          attachMetricSource();
+          bindNativeSource(bindAttachment({}), p.playback_url);
         }
         mediaDataLoad.sourceChanged();
         firstFrameDeadline.attachSource();
@@ -2612,6 +2618,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       return;
     }
     const revision = clockRevision();
+    const nativeSource = native;
     const controller = new AbortController();
     generationWait = controller;
     invalidatePlayActions();
@@ -2665,16 +2672,14 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       if (hls) {
         // Retain the growing EVENT attempt and wait for an actual local interval.
         hls.startLoad(position);
-      } else if (video.value) {
+      } else if (video.value && nativeSource && native === nativeSource) {
         bindMetricSource(p, video.value, true);
         const url = new URL(p.playback_url, location.href);
         url.hash = `t=${position}`;
         invalidatePlayActions();
         firstFrameDeadline?.detachSource();
         mediaDataLoad?.sourceChanged();
-        video.value.src = url.href;
-        video.value.load();
-        attachMetricSource();
+        nativeSource.reload(url.href);
         firstFrameDeadline?.attachSource();
       }
     } catch (e) {

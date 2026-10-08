@@ -167,11 +167,13 @@ it("submits concrete capabilities using the MSE implementation selected by hls.j
     expect(ctx.element.src).toBe("/media-delivery/session/index.m3u8");
     expect(hls.created).not.toHaveBeenCalled();
     // The new report must preserve the existing native decoder → MSE fallback.
+    const oldNativeError = ctx.element.onerror;
     ctx.element.error = { code: 3 };
-    ctx.element.onerror();
+    oldNativeError();
     expect(hls.created).toHaveBeenCalledTimes(1);
     expect(hls.attached).toHaveBeenCalledWith(ctx.element);
-    ctx.element.onerror();
+    expect(ctx.element.onerror).toBeNull();
+    oldNativeError(); // A queued callback remains harmless after exact disposal.
     expect(hls.created).toHaveBeenCalledTimes(1);
     expect(ctx.posts()).toHaveLength(1);
   } finally {
