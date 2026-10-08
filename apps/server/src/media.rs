@@ -744,7 +744,7 @@ pub(crate) async fn prepare_playback(
     } else {
         row.get("duration_ms")
     };
-    let mut position_ms = protocol::bounded_position(body.position_ms, duration);
+    let position_ms = protocol::bounded_position(body.position_ms, duration);
     let mut transport = "progressive";
     let requested_mode = body.mode.as_deref().unwrap_or("auto");
     let mut mode = requested_mode;
@@ -978,7 +978,6 @@ pub(crate) async fn prepare_playback(
     }
     let id = reservation.session;
     let t = token();
-    let mut timeline = 0.0;
     let direct_transport_only = kind == "http"
         && requested_mode == "direct"
         && http_file.is_none()
@@ -1288,166 +1287,60 @@ pub(crate) async fn prepare_playback(
         }
         validation?;
     }
-    let streams = meta["streams"].as_array();
-    let audio_tracks = streams
-        .map(|rows| {
-            rows.iter()
-                .filter(|s| s["codec_type"] == "audio")
-                .filter_map(|s| {
-                    Some(protocol::MediaTrack {
-                        index: playback_plan::stream_index(s)?,
-                        label: s["tags"]["title"].as_str().unwrap_or("Audio").into(),
-                        language: s["tags"]["language"].as_str().unwrap_or("und").into(),
-                        url: None,
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if let Some(index) = body.audio_index
-        && audio_tracks.iter().filter(|t| t.index == index).count() != 1
-    {
-        return Err(err(StatusCode::BAD_REQUEST, "invalid_audio_track"));
-    }
-    let mut subtitle_tracks = streams
-        .map(|rows| {
-            rows.iter()
-                .filter(|s| {
-                    s["codec_type"] == "subtitle"
-                        && matches!(
-                            s["codec_name"].as_str(),
-                            Some("subrip" | "webvtt" | "mov_text")
-                        )
-                })
-                .filter_map(|s| {
-                    let index = playback_plan::stream_index(s)?;
-                    Some(protocol::MediaTrack {
-                        index,
-                        label: s["tags"]["title"].as_str().unwrap_or("Subtitle").into(),
-                        language: s["tags"]["language"].as_str().unwrap_or("und").into(),
-                        url: Some(format!(
-                            "/media-delivery/{id}/subtitle-{index}.vtt?token={t}"
-                        )),
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if let Some(files) = meta["sidecars"].as_object() {
-        for (index, path) in files {
-            if let Ok(index) = index.parse::<u32>() {
-                subtitle_tracks.push(protocol::MediaTrack {
-                    index,
-                    label: path.as_str().unwrap_or("Subtitle").into(),
-                    language: "und".into(),
-                    url: Some(format!(
-                        "/media-delivery/{id}/subtitle-{index}.vtt?token={t}"
-                    )),
-                })
-            }
-        }
+    let playback::projection::TrackInventory {
+        audio_tracks,
+        mut subtitle_tracks,
+    } = playback::projection::tracks(&meta, body.audio_index)?;
+    for track in &mut subtitle_tracks {
+        track.url = Some(format!(
+            "/media-delivery/{id}/subtitle-{}.vtt?token={t}",
+            track.index
+        ));
     }
     resource["subtitle_files"] = meta["sidecars"].clone();
     resource["subtitle_indices"] =
         json!(subtitle_tracks.iter().map(|t| t.index).collect::<Vec<_>>());
-    // A progressive file exposes the original/default track to the browser.
-    // Honor an explicit track selection through the local HLS mapping path.
-    if body.audio_index.is_some()
-        && mode == "direct"
-        && matches!(kind.as_str(), "local" | "http" | "agent")
-    {
-        mode =
-            media_core::compatible_mode(&meta, true).map_err(playback_capabilities::probe_error)?;
-    }
-    if let Some(selection) = &selected {
-        mode = &selection.candidate.delivery_mode;
-        transport = &selection.candidate.transport;
-        if let Some(version) = &selection.source_version {
-            resource["source_version"] = json!(version);
-        }
-    } else if upstream_profile.is_some() {
-        mode = "transcode";
-        transport = "hls";
-    } else if let Some(caps) = &body.capabilities {
-        let (selected_mode, selected_transport) =
-            caps.negotiate(mode, transport).ok_or_else(|| {
-                err(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "device_has_no_compatible_playback_transport",
-                )
-            })?;
-        if selected_mode != mode && matches!(kind.as_str(), "jellyfin" | "emby") {
-            return Err(err(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "upstream_device_profile_required",
-            ));
-        }
-        mode = selected_mode;
-        transport = selected_transport;
-    }
-    position_ms = protocol::bounded_position(position_ms, duration);
-    let local_job = matches!(kind.as_str(), "local" | "http" | "agent") && mode != "direct";
-    if reservation.static_hls.is_some() && (local_job || body.audio_index.is_some()) {
-        return Err(err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "static_hls_native_transport_unavailable",
-        ));
-    }
-    let ladder_recipe = if body.local_hls_ladder.is_some() {
-        local_hls_ladder::require_local(&kind, local_fact_version.as_deref())?;
-        if !local_job || mode != "transcode" || selected.is_none() {
-            return Err(err(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "local_hls_ladder_source_unsupported",
-            ));
-        }
-        Some(if let Some(request) = &body.advanced_playback {
-            local_hls_ladder::recipe_with_advanced(&meta, body.audio_index, position_ms, request)?
-        } else {
-            local_hls_ladder::recipe(&meta, body.audio_index, position_ms)?
-        })
-    } else {
-        None
+    let intent = playback::route::Intent {
+        requested_mode,
+        requested_position_ms: body.position_ms,
+        audio_index: body.audio_index,
+        capabilities: body.capabilities.as_ref(),
+        advanced_playback: body.advanced_playback.as_ref(),
+        local_hls_ladder: body.local_hls_ladder.as_ref(),
+        static_hls: reservation.static_hls.is_some(),
     };
+    let route = playback::route::select(
+        playback::route::RouteFacts {
+            source: source_route,
+            metadata: &meta,
+            current_metadata,
+            probed,
+            local_fact_version: local_fact_version.as_deref(),
+            source_version: source_version.as_deref(),
+            selected: selected.as_ref(),
+            upstream_profile: upstream_profile.is_some(),
+            mode,
+            transport,
+            position_ms,
+            duration_ms: duration,
+        },
+        intent,
+    )?;
+    mode = &route.delivery().mode;
+    transport = &route.delivery().transport;
+    let timeline = route.delivery().timeline_origin_ms;
+    let local_job = route.generated();
+    let ladder_recipe = route.ladder_recipe();
+    if let Some(version) = selected.as_ref().and_then(|s| s.source_version.as_ref()) {
+        resource["source_version"] = json!(version);
+    }
     if ladder_recipe.is_some() {
         resource["local_hls_ladder_version"] = json!(1);
         if body.advanced_playback.is_some() {
             resource["advanced_hls_ladder_version"] = json!(1);
         }
-    } else if let Some(request) = &body.advanced_playback {
-        advanced_playback::require_local(
-            &kind,
-            local_fact_version.as_deref().or(source_version.as_deref()),
-        )?;
-        advanced_playback::analyze(&meta, body.audio_index, position_ms, request)?;
-        if !local_job || mode != "transcode" || selected.is_none() {
-            return Err(err(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "unsupported_video_or_hdr",
-            ));
-        }
-    } else {
-        playback_plan::require_legacy_job_mapping(
-            &kind,
-            local_job,
-            &meta,
-            body.audio_index,
-            current_metadata && probed && (kind != "local" || local_fact_version.is_some()),
-        )?;
     }
     if local_job {
-        if selected.is_none()
-            && mode == "remux"
-            && (position_ms > 0.0 || media_core::hls_needs_video_transform(&meta))
-        {
-            mode = "transcode";
-        }
-        // A concrete remux was probed as stream-copy, so it must not silently
-        // become the nonzero exact-decode recipe in hls_args. No measured
-        // keyframe origin exists for that route; request a new compatible plan.
-        timeline = playback_plan::local_timeline_origin(position_ms, mode)
-            .ok_or_else(|| err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_timeline"))?;
-        transport = "hls";
         resource["job_id"] = json!(id);
         if body.advanced_playback.is_some() && body.local_hls_ladder.is_none() {
             resource["advanced_owned_session_id"] = json!(id);
@@ -1458,96 +1351,35 @@ pub(crate) async fn prepare_playback(
     resource["timeline_origin_ms"] = json!(timeline);
     resource["plan_facts_version"] = json!(1);
     let hls_supported = body.capabilities.as_ref().is_none_or(|c| c.supports_hls());
-    let decoder_fallback_modes = if selected.is_some()
-        || upstream_profile.is_some()
-        || body.advanced_playback.is_some()
-        || body.local_hls_ladder.is_some()
-    {
-        vec![]
-    } else if let Some(info) = &negotiated_info {
-        playback_plan::upstream_fallbacks(info, mode, hls_supported, &config.url)
-    } else if matches!(kind.as_str(), "local" | "http" | "agent") {
-        playback_plan::legacy_mapped_fallbacks(
-            &meta,
-            body.audio_index,
-            mode,
-            position_ms,
-            current_metadata && (kind != "agent" || probed),
-            hls_supported,
-        )
-    } else {
-        playback_plan::local_fallbacks(&meta, mode, position_ms, current_metadata, hls_supported)
-    };
-    let selected_audio_track = if body.advanced_playback.is_some() || ladder_recipe.is_some() {
-        media_core::motion_video::selected_audio_index(&meta, body.audio_index)
-            .map_err(playback_capabilities::probe_error)?
-    } else if matches!(kind.as_str(), "jellyfin" | "emby") {
-        negotiated_info
-            .as_ref()
-            .and_then(|info| playback_plan::upstream_audio(info, body.audio_index, mode))
-    } else {
-        playback_plan::mapped_audio(&meta, body.audio_index, mode, current_metadata)
-    };
-    let subtitle_mode = if body
-        .advanced_playback
-        .as_ref()
-        .is_some_and(|request| request.subtitle_stream_index.is_some())
-    {
-        // Burned pixels cannot be switched off by the browser VTT selector.
+    let playback::projection::PlanFacts {
+        decoder_fallback_modes,
+        selected_audio_track,
+        subtitle_mode,
+        selected_output,
+        selected_candidate_id,
+        decision_reason,
+    } = playback::projection::plan_facts(
+        playback::projection::ProjectionFacts {
+            source: source_route,
+            metadata: &meta,
+            current_metadata,
+            probed,
+            selected: selected.as_ref(),
+            upstream_profile: upstream_profile.is_some(),
+            negotiated_info: negotiated_info.as_ref(),
+            upstream_base: &config.url,
+            has_external_subtitle: subtitle_tracks.iter().any(|track| track.url.is_some()),
+            server_requested_audio_sample_rate_48000: resource["upstream_profile_route_provenance"]
+                ["server_requested_audio_sample_rate"]
+                == 48_000,
+        },
+        intent,
+        &route,
+    )?;
+    if subtitle_mode == protocol::SubtitleDeliveryMode::BurnedIn {
         subtitle_tracks.clear();
         resource["subtitle_indices"] = json!([]);
-        protocol::SubtitleDeliveryMode::BurnedIn
-    } else if subtitle_tracks.iter().any(|track| track.url.is_some()) {
-        protocol::SubtitleDeliveryMode::ExternalVtt
-    } else {
-        protocol::SubtitleDeliveryMode::None
-    };
-    // A master has multiple configurations; a scalar selected_output would
-    // misrepresent the currently decoded ABR rung. Exact recipe facts are separate.
-    let selected_output = if ladder_recipe.is_some() {
-        None
-    } else if let Some(request) = &body.advanced_playback {
-        selected
-            .as_ref()
-            .map(|selection| {
-                playback_capabilities::selected_advanced_output(
-                    selection,
-                    &meta,
-                    body.audio_index,
-                    body.position_ms,
-                    request,
-                )
-            })
-            .transpose()?
-    } else if kind == "agent" {
-        selected
-            .as_ref()
-            .map(|selection| {
-                playback_capabilities::selected_agent_output(
-                    selection,
-                    &meta,
-                    body.audio_index,
-                    body.position_ms,
-                    current_metadata && probed,
-                )
-            })
-            .transpose()?
-            .flatten()
-    } else if current_metadata && matches!(kind.as_str(), "local" | "http") {
-        selected
-            .as_ref()
-            .map(|selection| {
-                playback_capabilities::selected_output(
-                    selection,
-                    &meta,
-                    body.audio_index,
-                    body.position_ms,
-                )
-            })
-            .transpose()?
-    } else {
-        None
-    };
+    }
     if let Some(facts) = &selected_output {
         resource["selected_output"] = serde_json::to_value(facts).map_err(anyhow::Error::from)?;
     }
@@ -1595,29 +1427,8 @@ pub(crate) async fn prepare_playback(
         playback_metrics_version: None,
         playback_metrics: None,
         observation_seq: body.observation_version.map(|_| 0),
-        decision_reason: Some(if ladder_recipe.is_some() {
-            "local_hls_ladder_constrained_recipe".into()
-        } else if body.advanced_playback.is_some() {
-            "advanced_local_constrained_recipe".into()
-        } else if resource["upstream_profile_route_provenance"]["server_requested_audio_sample_rate"]
-            == 48_000
-        {
-            "emby_server_requested_audio_sample_rate_48000".into()
-        } else {
-            playback_plan::decision_reason(
-                &kind,
-                requested_mode,
-                mode,
-                current_metadata,
-                probed,
-                selected.as_ref().map(|s| s.candidate.id.as_str()),
-            )
-        }),
-        selected_candidate_id: if ladder_recipe.is_some() {
-            None
-        } else {
-            selected.as_ref().map(|s| s.candidate.id.clone())
-        },
+        decision_reason: Some(decision_reason),
+        selected_candidate_id,
         selected_output,
         subtitle_mode: Some(subtitle_mode),
         seekable_media_ranges_ms: None,

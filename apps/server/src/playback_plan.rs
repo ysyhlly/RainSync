@@ -5,13 +5,12 @@ use protocol::DecoderFallbackMode;
 use protocol::PlaybackMediaRange;
 use sqlx::postgres::PgRow;
 // Compatibility exports remain until the preparation adapter moves to playback.
-pub use crate::playback::facts::{
-    local_timeline_origin, mapped_audio, stream_index, upstream_audio,
-};
-pub use crate::playback::selection::{
-    decision_reason, legacy_mapped_fallbacks, local_fallbacks, needs_preparation_probe,
-    upstream_fallbacks,
-};
+pub use crate::playback::facts::stream_index;
+#[cfg(test)]
+pub use crate::playback::facts::{local_timeline_origin, mapped_audio, upstream_audio};
+#[cfg(test)]
+pub use crate::playback::selection::{decision_reason, local_fallbacks, upstream_fallbacks};
+pub use crate::playback::selection::{legacy_mapped_fallbacks, needs_preparation_probe};
 
 // Readiness and replay share one permission/current-attempt snapshot. Queue
 // admission fixes job.id=session.id; a foreign or extra job cannot supply facts.

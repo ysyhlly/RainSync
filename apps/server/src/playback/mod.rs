@@ -1,6 +1,8 @@
 //! Playback rules are independent of preparation, admission and publication.
 //! Existing entry points remain adapters until those later extractions land.
 pub(crate) mod facts;
+pub(crate) mod projection;
+pub(crate) mod route;
 pub(crate) mod selection;
 
 impl From<selection::Rejection> for crate::Error {
@@ -72,3 +74,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod route_tests;
