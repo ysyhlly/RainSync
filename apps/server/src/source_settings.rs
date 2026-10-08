@@ -229,12 +229,8 @@ pub async fn change(
     value["rescan_required"] = json!(config_changed);
     lock_admin(&mut tx, &user, &h).await?;
     tx.commit().await?;
-    if config_changed {
-        // Reader fences are committed; existing reconciliation repeats cleanup
-        // if this waiter is interrupted after the source update.
-        source_access::retire(&app.db).await?;
-    }
-    Ok(responses::ok_json(value))
+    let committed = source_access::CommittedSourceChange::new(id, value, config_changed);
+    Ok(responses::ok_json(committed.response(&app.db).await))
 }
 #[cfg(test)]
 mod tests {

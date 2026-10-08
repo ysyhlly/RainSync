@@ -39,6 +39,7 @@
     "test:owner-gate-contracts": "node --test tests/native-owner-gates.test.mjs",
     "test:native-delivery-owner": "node tests/native-delivery-owner.mjs",
     "test:room-cleanup-native": "node tests/room-cleanup-native.mjs",
+    "test:source-change-commit": "node tests/source-change-commit.mjs",
     "test:static-hls-owner-prerequisites": "node scripts/check-static-hls-prerequisites.mjs owner",
     "test:static-hls-pending-prerequisites": "node scripts/check-static-hls-prerequisites.mjs pending"
   },

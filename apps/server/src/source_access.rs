@@ -7,6 +7,41 @@ pub struct Change {
     expected_revision: i64,
     policy: Value,
 }
+
+/// The original write is confirmed before this receipt is created. A failed
+/// COMMIT (including an unknown outcome) must still propagate from its caller.
+pub(crate) struct CommittedSourceChange {
+    source: Uuid,
+    value: Value,
+    retirement_required: bool,
+}
+
+impl CommittedSourceChange {
+    pub(crate) fn new(source: Uuid, value: Value, retirement_required: bool) -> Self {
+        Self {
+            source,
+            value,
+            retirement_required,
+        }
+    }
+
+    /// Eager logical retirement is best effort, not part of the write outcome.
+    /// Committed source revisions immediately fence readers/publication and the
+    /// remaining revision mismatches durably identify work for maintenance.
+    /// This neither waits for physical drain nor claims a disposal receipt.
+    pub(crate) async fn response(self, db: &PgPool) -> Value {
+        if self.retirement_required && retire(db).await.is_err() {
+            // Never log database/provider errors or configuration credentials.
+            tracing::warn!(
+                source = %self.source,
+                cleanup = "pending",
+                "source change committed; retirement deferred to maintenance"
+            );
+        }
+        self.value
+    }
+}
+
 pub async fn guard(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     source: Uuid,
@@ -76,8 +111,9 @@ pub async fn change(
     // Release the source lock before taking session/cleanup locks. Readers and
     // final publication are already fenced by the committed source revision.
     // Reconciliation repeats this retirement if the HTTP waiter is interrupted.
-    retire(&app.db).await?;
-    Ok(Json(json!({"id":id,"access_policy_revision":next})))
+    let committed =
+        CommittedSourceChange::new(id, json!({"id":id,"access_policy_revision":next}), true);
+    Ok(Json(committed.response(&app.db).await))
 }
 pub async fn retire(db: &PgPool) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;

@@ -163,7 +163,11 @@ jobs:
         if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
         timeout-minutes: 5
         run: timeout --signal=TERM --kill-after=45s 240s npm run test:room-cleanup-native
-      - name: Retain sanitized owner evidence
+      - name: Verify committed source writes remain confirmed after cleanup failure
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s npm run test:source-change-commit
+      - name: Retain sanitized owner and source-commit evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -171,6 +175,7 @@ jobs:
           # No fixture request documents, databases, credentials or raw logs.
           path: |
             ${{ runner.temp }}/rainsync-owner-validation/artifacts/owner-gates/**/report.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/source-change-commit/**/report.json
             ${{ runner.temp }}/rainsync-owner-validation/runtime/**/backend-binding.json
           if-no-files-found: warn
           retention-days: 7
