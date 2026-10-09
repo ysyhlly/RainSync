@@ -90,8 +90,9 @@ same wrapped references during that migration; the five Settings-only actions re
 promise settlement privately. No runner, raw store, element or API reaches the
 Settings consumer. The 36 Settings-exclusive aliases are removed from the old
 69-field allowlist. The Host migration below retires twelve more, and the
-RoomPage migration retires eleven, leaving ten compatibility fields with the
-production or fixture consumers listed below.
+RoomPage migration retires eleven. The remaining picker/list and timeline
+consumers reuse existing finite facts, leaving eight compatibility fields for
+the fixture consumers listed below.
 
 `PlaybackHost.vue` receives `playbackHost` from AppShell. Its readonly live
 facts, finite permission query and named join/retry/cancel/subtitle/waiting/seek
@@ -132,10 +133,10 @@ consumers and must not be removed before those migrations.
 - `apps/web/src/features/playback/PlaybackHost.vue`: migrated to `PlaybackHostPort`; no playback compatibility aliases.
 - `apps/web/src/features/playback/PlaybackInformation.vue`: migrated to the finite recovery view; no room-store access.
 - `apps/web/src/features/playback/PlaybackSettings.vue`: migrated to the finite `PlaybackSettingsPort`; no playback compatibility aliases.
-- `apps/web/src/features/rooms/RoomMediaPicker.vue`: `nativePlaybackMode`.
+- `apps/web/src/features/rooms/RoomMediaPicker.vue`: reads the existing readonly `playbackRoom.nativePlaybackMode` fact at its original prewarm argument.
 - `apps/web/src/features/rooms/RoomPage.vue`: migrated to the finite `PlaybackRoomPort`; no playback compatibility aliases.
-- `apps/web/src/features/rooms/RoomsPage.vue`: `nativePlaybackMode`.
-- `apps/web/src/features/rooms/TimelineChatPanel.vue`: `position`.
+- `apps/web/src/features/rooms/RoomsPage.vue`: reads the same `playbackRoom.nativePlaybackMode` fact inside its original same-room prewarm branch.
+- `apps/web/src/features/rooms/TimelineChatPanel.vue`: reads `playbackControls.position` inside its original cached `atMs` computed, retaining the current-frame display, comment cutoff and first-submission timestamp behavior.
 
 The twelve Host-only aliases removed after the production and indirect notice
 migrations are `blocked`, `dragging`, `platformDanmakuEnabled`,
@@ -148,7 +149,10 @@ The eleven RoomPage-only aliases removed after this migration are
 `distributedFacts`, `peerStats`, `peerSharing`, `useDistributedOutput`,
 `useOriginalSource`, `startPeerSharing`, `stopPeerSharing`, `live`, `audioIndex`,
 `duration` and `playbackSummary`. The shared `nativePlaybackMode` and `position`
-aliases retain the picker/list and timeline consumers above.
+aliases are also removed after the three consumers above migrate. Their reads
+retain the same original owner refs, prewarm short circuits, helper defaults,
+computed caching and pending-message retry semantics. No new facade, owner,
+wrapper or eager read is introduced; existing port factories remain unchanged.
 
 Eight compatibility aliases remain for deliberate P24 fixture migration:
 
@@ -162,7 +166,7 @@ Eight compatibility aliases remain for deliberate P24 fixture migration:
 
 These actual store tests retain their original actions, rejection/ownership
 semantics and assertions. No production test-only capture API is added, and a
-raw action is not replaced with a UI runner that catches its failure. The
-two other aliases retain the production consumers listed above.
+raw action is not replaced with a UI runner that catches its failure. No
+production page reads a playback compatibility alias.
 
 The old writable `room` and `state` Pinia adapters remain for existing test fixtures. Production changes use the projection owner. Remove the setters once those fixtures use explicit frame/HTTP inputs and hydration compatibility has been reviewed. No second copy of either authoritative field exists.

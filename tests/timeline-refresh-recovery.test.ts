@@ -32,7 +32,7 @@ function fixture() {
     connected: true,
     roomActive: true,
     state: { media_id: "movie", media_generation: 1 },
-    position: 0,
+    playbackControls: { position: 0 },
     messages: [] as { id: string; body: string; deleted?: boolean }[],
     lastChatDeletion: undefined as string | undefined,
   });

@@ -139,7 +139,7 @@ async function enter(room: Room, intent = navigationIntent) {
   if (runtime.room?.id === room.id && runtime.state?.media_id)
     void prewarmNativeDash(
       catalog.roomRecord(room.id, runtime.state.media_id),
-      runtime.nativePlaybackMode,
+      runtime.playbackRoom.nativePlaybackMode,
     );
   await runtime.enter(room);
   if (!alive || intent !== navigationIntent) return;

@@ -42,7 +42,7 @@ function prewarmItem(id: string) {
     return;
   void prewarmNativeDash(
     items.value.find((item) => item.id === id),
-    runtime.nativePlaybackMode,
+    runtime.playbackRoom.nativePlaybackMode,
   );
 }
 const queryChanged = computed(

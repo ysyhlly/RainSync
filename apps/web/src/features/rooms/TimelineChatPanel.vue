@@ -78,7 +78,7 @@ const displayError = computed(
     refreshError.value ||
     revalidationError.value,
 );
-const atMs = computed(() => Math.max(0, Math.round(r.position * 1000)));
+const atMs = computed(() => Math.max(0, Math.round(r.playbackControls.position * 1000)));
 const currentSelected = computed(
   () => !!current.value && selected.value === current.value.id,
 );

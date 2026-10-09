@@ -45,6 +45,7 @@ async function picker(api = vi.fn().mockResolvedValue(page())) {
     state: { media_id: "current-film", controller_user_id: "alice" },
     roomActive: true,
     connected: true,
+    playbackRoom: { nativePlaybackMode: undefined },
     error: "",
     playlist: [] as { media_id: string }[],
     playlistError: "",

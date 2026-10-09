@@ -6,8 +6,6 @@ const pageFields = [
   "runPlayback",
   "waiting",
   "nativePlatform",
-  "nativePlaybackMode",
-  "position",
   "sessionId",
   "recoveryState",
   "recoveryLabel",

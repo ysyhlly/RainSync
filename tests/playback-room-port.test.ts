@@ -252,6 +252,8 @@ const removedAliases = [
   "audioIndex",
   "duration",
   "playbackSummary",
+  "nativePlaybackMode",
+  "position",
 ] as const;
 const retainedAliases = [
   "runPlayback",
@@ -261,12 +263,10 @@ const retainedAliases = [
   "waiting",
   "recoveryState",
   "nativePlatform",
-  "nativePlaybackMode",
-  "position",
   "recoveryLabel",
 ] as const satisfies readonly (keyof ReturnType<typeof useRoomRuntime>)[];
 
-it("real composition removes eleven aliases, retains ten and emits each original action hook once", async () => {
+it("real composition removes thirteen aliases, retains eight and emits each original action hook once", async () => {
   vi.useFakeTimers();
   vi.stubGlobal("document", new EventTarget());
   vi.stubGlobal("window", new EventTarget());
@@ -286,8 +286,8 @@ it("real composition removes eleven aliases, retains ten and emits each original
   });
   const runtime = useRoomRuntime();
   try {
-    expect(removedAliases).toHaveLength(11);
-    expect(retainedAliases).toHaveLength(10);
+    expect(removedAliases).toHaveLength(13);
+    expect(retainedAliases).toHaveLength(8);
     for (const key of removedAliases) expect(key in runtime, key).toBe(false);
     for (const key of retainedAliases) expect(key in runtime, key).toBe(true);
     const port = runtime.playbackRoom;
@@ -463,3 +463,20 @@ function consumerContract(
   runtime.duration;
 }
 void consumerContract;
+
+// Candidate-only contracts for the last three production fact consumers.
+function remainingPageFactsContract(runtime: ReturnType<typeof useRoomRuntime>) {
+  const mode: PlaybackRoomPort["nativePlaybackMode"] =
+    runtime.playbackRoom.nativePlaybackMode;
+  const position: number = runtime.playbackControls.position;
+  void [mode, position];
+  // @ts-expect-error The reused staged mode fact is readonly.
+  runtime.playbackRoom.nativePlaybackMode = "native";
+  // @ts-expect-error The reused position fact is readonly.
+  runtime.playbackControls.position = 12;
+  // @ts-expect-error The former picker/list fact alias is retired.
+  runtime.nativePlaybackMode;
+  // @ts-expect-error The former timeline fact alias is retired.
+  runtime.position;
+}
+void remainingPageFactsContract;

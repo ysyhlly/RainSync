@@ -108,13 +108,13 @@ const deleted = [
   "audioIndex",
   "duration",
   "playbackSummary",
+  "nativePlaybackMode",
+  "position",
 ] as const;
 const retained = [
   "runPlayback",
   "waiting",
   "nativePlatform",
-  "nativePlaybackMode",
-  "position",
   "sessionId",
   "recoveryState",
   "recoveryLabel",
@@ -142,8 +142,8 @@ it("real composition keeps retired aliases absent and shares original named Host
   });
   const runtime = useRoomRuntime();
   try {
-    expect(deleted).toHaveLength(23);
-    expect(retained).toHaveLength(10);
+    expect(deleted).toHaveLength(25);
+    expect(retained).toHaveLength(8);
     for (const key of deleted) expect(key in runtime, key).toBe(false);
     for (const key of retained) expect(key in runtime, key).toBe(true);
     const port = runtime.playbackHost;
