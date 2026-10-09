@@ -1,14 +1,8 @@
 use super::*;
 use persistence::media_previews::{FRESH, VALID};
 
-pub fn cover(row: &sqlx::postgres::PgRow) -> Value {
-    let status = row
-        .get::<Option<String>, _>("preview_status")
-        .unwrap_or("missing".into());
-    let revision = row.get::<Option<Uuid>, _>("preview_revision");
-    let id: Uuid = row.get("id");
-    json!({"status":status,"revision":revision,"url":if status=="ready" {revision.map(|v|format!("/api/v1/media/{id}/cover?revision={v}"))}else{None},"retry_after_ms":match status.as_str(){"queued"|"running"=>Some(2000),"unavailable"=>Some(60000),_=>None}})
-}
+pub use catalog::media_projection::cover;
+
 fn bounded(mut ids: Vec<Uuid>) -> Result<Vec<Uuid>> {
     ids.sort();
     ids.dedup();

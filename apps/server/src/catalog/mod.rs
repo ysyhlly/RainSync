@@ -1,8 +1,10 @@
 //! Named catalog operations retain their original transaction owners and locks.
 //! These contexts contain capabilities only, never cached permission decisions.
 pub(crate) mod access_policy;
+pub(crate) mod browse;
 pub(crate) mod libraries;
 pub(crate) mod library_authority;
+pub(crate) mod media_projection;
 pub(crate) mod private_sources;
 pub(crate) mod room_shares;
 pub(crate) mod source_rules;
