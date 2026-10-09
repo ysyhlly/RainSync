@@ -7,6 +7,7 @@ pub mod finite_hls;
 pub mod hls_ladder;
 pub mod http_range;
 pub mod input_policy;
+pub mod inspection;
 pub mod job_health;
 pub mod motion_video;
 pub mod runtime_metrics;

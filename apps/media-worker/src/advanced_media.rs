@@ -283,7 +283,7 @@ async fn probe(local: &OwnedLocalInput) -> Result<Value> {
     ensure!(status.success(), "advanced_media_probe_failed");
     local.verify()?;
     let meta = serde_json::from_slice(&bytes)?;
-    local.verify_dolby_vision_rpu(&meta).await?;
+    media_core::inspection::verify_dolby_vision_rpu(local, &meta).await?;
     Ok(meta)
 }
 
