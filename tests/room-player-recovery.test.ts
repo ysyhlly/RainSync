@@ -155,7 +155,7 @@ it("real room wake clears stale correction, waits for a correlated sample, and r
         clock_epoch: "epoch",
       },
     });
-    expect(runtime.recoveryState).toBe("calibrating");
+    expect(runtime.playbackHost.recoveryState).toBe("calibrating");
     reply(requests()[0], 100);
     await vi.advanceTimersByTimeAsync(0);
     expect(el.src).toBe("/authorized.mp4");
@@ -183,8 +183,8 @@ it("real room wake clears stale correction, waits for a correlated sample, and r
     expect(el.paused).toBe(false);
     expect(grants).toBe(1);
     // PlaybackHost's canplay/playing event clears its local buffering flag.
-    runtime.waiting = false;
-    expect(runtime.recoveryState).toBe("idle");
+    runtime.playbackHost.setWaiting(false);
+    expect(runtime.playbackHost.recoveryState).toBe("idle");
     await vi.advanceTimersByTimeAsync(500);
     expect(el.playbackRate).toBeGreaterThan(1);
     const oldPending = requests().at(-1),
@@ -198,33 +198,33 @@ it("real room wake clears stale correction, waits for a correlated sample, and r
     visible("hidden");
     visible("visible");
     expect(el.playbackRate).toBe(1);
-    expect(runtime.recoveryState).toBe("calibrating");
-    expect(runtime.recoveryLabel).toContain("重新校准");
+    expect(runtime.playbackHost.recoveryState).toBe("calibrating");
+    expect(runtime.playbackHost.information.recoveryLabel).toContain("重新校准");
     const firstWake = requests().at(-1);
     reply(oldPending, 9999999);
     await vi.advanceTimersByTimeAsync(0);
     expect(el.currentTime).toBe(before);
     expect(el.paused).toBe(false);
-    expect(runtime.recoveryState).toBe("calibrating");
+    expect(runtime.playbackHost.recoveryState).toBe("calibrating");
     visible("hidden");
     visible("visible");
     reply(firstWake, 9999999);
     await vi.advanceTimersByTimeAsync(0);
     expect(el.currentTime).toBe(before);
-    expect(runtime.recoveryState).toBe("calibrating");
+    expect(runtime.playbackHost.recoveryState).toBe("calibrating");
     // Fresh epoch sample advances the true target to 10.5s. Resume through
     // normal convergence, preserving the 2s automatic hard-seek threshold.
     reply(requests().at(-1), 600);
     await vi.advanceTimersByTimeAsync(0);
     expect(el.currentTime).toBe(before);
     expect(el.paused).toBe(false);
-    expect(runtime.recoveryState).toBe("catching_up");
+    expect(runtime.playbackHost.recoveryState).toBe("catching_up");
     await vi.advanceTimersByTimeAsync(500);
     expect(el.playbackRate).toBeGreaterThan(1);
     expect(el.currentTime).toBe(before);
     expect(el.pause).toHaveBeenCalledTimes(pauses);
     expect(el.load).toHaveBeenCalledTimes(loads);
-    expect(runtime.sessionId).toBe("session-1");
+    expect(runtime.playbackHost.sessionId).toBe("session-1");
     expect(grants).toBe(1);
     const sends = requests().length;
     visible("visible");
@@ -232,22 +232,22 @@ it("real room wake clears stale correction, waits for a correlated sample, and r
       Object.assign(new Event("pageshow"), { persisted: false }),
     );
     expect(requests()).toHaveLength(sends);
-    expect(runtime.recoveryState).toBe("catching_up");
+    expect(runtime.playbackHost.recoveryState).toBe("catching_up");
     // Advancing the actual media into the current stable window completes the
     // recovery. A later ordinary drift must not reopen the live announcement.
     el.currentTime = 11.5;
     await vi.advanceTimersByTimeAsync(500);
-    expect(runtime.recoveryState).toBe("idle");
-    expect(runtime.recoveryLabel).toBe("");
+    expect(runtime.playbackHost.recoveryState).toBe("idle");
+    expect(runtime.playbackHost.information.recoveryLabel).toBe("");
     await vi.advanceTimersByTimeAsync(500);
-    expect(runtime.recoveryState).toBe("idle");
+    expect(runtime.playbackHost.recoveryState).toBe("idle");
     window.dispatchEvent(
       Object.assign(new Event("pageshow"), { persisted: true }),
     );
-    expect(runtime.recoveryState).toBe("calibrating");
+    expect(runtime.playbackHost.recoveryState).toBe("calibrating");
     await runtime.leave();
-    expect(runtime.recoveryState).toBe("idle");
-    expect(runtime.recoveryLabel).toBe("");
+    expect(runtime.playbackHost.recoveryState).toBe("idle");
+    expect(runtime.playbackHost.information.recoveryLabel).toBe("");
   } finally {
     runtime.$dispose();
   }

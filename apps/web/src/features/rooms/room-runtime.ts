@@ -48,7 +48,6 @@ import {
   type RoomProjectionResult,
   type RoomStateFrame,
 } from "./projection/room-projection";
-import { createRoomPlaybackFacade } from "./projection/playback-view";
 import { createPlaybackSettingsPort } from "../playback/playback-settings-port";
 import { createPlaybackControlsPort } from "../playback/playback-controls-port";
 import { createPlaybackHostPort } from "../playback/playback-host-port";
@@ -761,7 +760,6 @@ export const useRoomRuntime = defineStore("room-runtime", ({ action }) => {
     playbackSettings,
     playbackHost,
     playbackRoom,
-    ...createRoomPlaybackFacade(playback),
     runPlayback: settingsActions.runPlayback,
     loadMedia: settingsActions.loadMedia,
     attach: hostActions.attach,

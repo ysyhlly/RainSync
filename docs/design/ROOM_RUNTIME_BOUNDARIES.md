@@ -61,17 +61,18 @@ Connection fencing is not a new media, plan, SDK, prepare-budget or auth token.
 
 ## Finite playback page surface and remaining compatibility
 
-`projection/playback-view.ts` enumerates existing page fields rather than
-spreading the entire playback owner. Production users remain source-compatible.
+Production playback consumers use the finite ports below. The room store
+explicitly retains three named action wrappers for their real fixture callers;
+it does not spread the playback owner or return duplicate playback fact refs.
 The removed owner-only fields have no production room-store consumer:
 `applyState`, `applyRoomState`, `reset`, `onClockReady`, `onClockInvalidated`,
 `mediaChanged`, `resetClockAction`, `playbackError`, `playbackBusy`, and
 `distributedIntent`. Tests that need those internals use the playback factory.
 
-The consumer map below records the remaining playback compatibility fields.
-Delete each alias only after its listed consumers use a dedicated host,
-settings, synchronization or room-page port. P12–P14 own those migrations;
-adding another internal playback field will not silently enlarge this facade.
+The consumer map below records the remaining playback compatibility actions.
+Delete each only after its actual callers retain the same rejection, scope and
+Pinia settlement behavior through a suitable existing boundary. Adding another
+internal playback field does not enlarge the room store's explicit surface.
 
 `PlaybackControls.vue` now receives `playbackControls` through its existing
 host. This finite port reads the original room/playback view and delegates
@@ -91,8 +92,8 @@ promise settlement privately. No runner, raw store, element or API reaches the
 Settings consumer. The 36 Settings-exclusive aliases are removed from the old
 69-field allowlist. The Host migration below retires twelve more, and the
 RoomPage migration retires eleven. The remaining picker/list and timeline
-consumers reuse existing finite facts, leaving eight compatibility fields for
-the fixture consumers listed below.
+consumers reuse existing finite facts. The five remaining fixture fact aliases
+also use existing views and owner refs, leaving the three action wrappers below.
 
 `PlaybackHost.vue` receives `playbackHost` from AppShell. Its readonly live
 facts, finite permission query and named join/retry/cancel/subtitle/waiting/seek
@@ -154,15 +155,23 @@ retain the same original owner refs, prewarm short circuits, helper defaults,
 computed caching and pending-message retry semantics. No new facade, owner,
 wrapper or eager read is introduced; existing port factories remain unchanged.
 
-Eight compatibility aliases remain for deliberate P24 fixture migration:
+The five fixture fact aliases are removed after migrating their 29 references:
+
+- `sessionId` and `recoveryState` assertions read the existing Host view; recovery labels read its information view.
+- The room recovery fixture clears buffering through the existing synchronous `playbackHost.setWaiting` operation.
+- Settings native-platform seeds use the real owner refs already captured by their passthrough fixture. No new inspection API or shadow store property is introduced.
+
+The redundant `projection/playback-view.ts` factory is removed. Its remaining
+raw functions were already overwritten by the composition's explicit wrapped
+entries. The original owner refs and finite getters remain; removing four flat
+state refs and the computed recovery-label getter intentionally narrows Pinia's
+registration surface. This does not preserve the whole `$state` shape.
+
+Three compatibility actions remain for deliberate P24 fixture review:
 
 - `runPlayback`: viewing-runtime-ports seeds and asserts playback-owned notices.
-- `loadMedia`: room-lifecycle-playback exercises the raw closed-lifecycle no-op.
-- `attach`: room-lifecycle-playback, room-player-recovery and viewing-runtime-ports.
-- `sessionId`: those same three real room/playback fixture files.
-- `waiting`, `recoveryState`: room-player-recovery exercises media-event and clock recovery state.
-- `nativePlatform`: playback-settings-component seeds existing runtime settings cases.
-- `recoveryLabel`: room-player-recovery asserts the original clock/media recovery presentation.
+- `loadMedia`: room-lifecycle-playback exercises the direct closed-lifecycle no-op; the actual Host component suite asserts direct rejection and Promise settlement.
+- `attach`: real lifecycle, recovery, room-component and viewing-runtime fixtures attach their element; Host tests also assert wrapper identity, same-element reuse and second-element rejection.
 
 These actual store tests retain their original actions, rejection/ownership
 semantics and assertions. No production test-only capture API is added, and a

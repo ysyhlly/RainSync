@@ -1785,7 +1785,7 @@ it("Room actual Pinia original successful grants use the real API client, driver
     audio_index: 0,
     position_ms: 5000,
   });
-  expect(f.runtime.sessionId).toBe(f.grants[0].session_id);
+  expect(f.runtime.playbackHost.sessionId).toBe(f.grants[0].session_id);
   expect(roomPiniaHls.instances).toHaveLength(1);
   expect(f.owner.peerSharing.value).toBe(false);
   const start = roomPiniaActionProbe(f);
@@ -1983,7 +1983,7 @@ it("Room actual Pinia original qualified-plan mismatch rejects through its origi
   await expect(result.result).rejects.toMatchObject({
     code: "STALE_CAPABILITY_REPORT",
   });
-  expect(f.runtime.sessionId).toBeNull();
+  expect(f.runtime.playbackHost.sessionId).toBeNull();
   expect(roomPiniaHls.instances).toHaveLength(0);
   expect(probe.calls.map((call) => call.name)).toEqual([
     "useDistributedOutput",
@@ -2017,7 +2017,7 @@ it("Room actual Pinia original-source switch during a pending peer join keeps la
   await original;
   expect(f.owner.distributedIntent.value).toBeUndefined();
   expect(f.grants).toHaveLength(2);
-  expect(f.runtime.sessionId).toBe(f.grants[1].session_id);
+  expect(f.runtime.playbackHost.sessionId).toBe(f.grants[1].session_id);
   expect(f.owner.audioIndex.value).toBe(0);
   expect(startFailure).toBeUndefined();
   probe.record("late-join-release");
@@ -2025,7 +2025,7 @@ it("Room actual Pinia original-source switch during a pending peer join keeps la
   await expect(starting).rejects.toMatchObject({ name: "AbortError" });
   await roomPiniaTicks(10);
   expect(f.owner.peerSharing.value).toBe(false);
-  expect(f.runtime.sessionId).toBe(f.grants[1].session_id);
+  expect(f.runtime.playbackHost.sessionId).toBe(f.grants[1].session_id);
   expect(probe.calls.map((call) => call.name)).toEqual([
     "startPeerSharing",
     "useOriginalSource",
@@ -2071,7 +2071,7 @@ it("Room actual Pinia original-source switch while a distributed grant is outsta
   await expect(distributed).resolves.toBeUndefined();
   await expect(original).resolves.toBeUndefined();
   expect(f.grants).toHaveLength(2);
-  expect(f.runtime.sessionId).toBe(f.grants[1].session_id);
+  expect(f.runtime.playbackHost.sessionId).toBe(f.grants[1].session_id);
   expect(f.element.src).toBe(f.grants[1].playback_url);
   expect(roomPiniaHls.instances).toHaveLength(0);
   expect(probe.calls.map((call) => call.name)).toEqual([
@@ -2562,7 +2562,7 @@ it("RoomPage real compiled child preserves all four original Pinia chains throug
   await ticks();
   const probe = renderedActionProbe(f);
   const activate = await probe.observe("用于房间主播放器");
-  expect(f.runtime.sessionId).toBe(f.grants[0].session_id);
+  expect(f.runtime.playbackHost.sessionId).toBe(f.grants[0].session_id);
   expect(f.grants[0].distributed_compute).toBeDefined();
   expect(f.owner.audioIndex.value).toBe(0);
   expect(f.m.panel().props.stats).toBe(f.owner.peerStats.value);
@@ -2600,7 +2600,7 @@ it("RoomPage real compiled panel catches the original Pinia grant rejection afte
   expect(result.calls).toEqual(["useDistributedOutput"]);
   expect(f.m.text(f.m.root)).toContain("Original grant failure");
   expect(f.runtime.busy).toBe(false);
-  expect(f.runtime.sessionId).toBeNull();
+  expect(f.runtime.playbackHost.sessionId).toBeNull();
   expect(result).toEqual(roomRenderedBaseline.REJECT);
 });
 
@@ -2655,7 +2655,7 @@ it("RoomPage real compiled panel discards an old peer action after login retirem
   await ticks();
   expect(f.runtime.error).toBe("Successor notice");
   expect(f.owner.peerSharing.value).toBe(false);
-  expect(f.runtime.sessionId).toBeNull();
+  expect(f.runtime.playbackHost.sessionId).toBeNull();
 });
 
 it("RoomPage real compiled queue button returns the original choose Promise and retains command authority", async () => {

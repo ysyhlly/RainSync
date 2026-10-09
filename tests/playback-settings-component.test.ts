@@ -800,7 +800,7 @@ it.each(["resolved", "rejected", "quality early return", "disposed"])(
       } as any;
     }
     if (scenario === "quality early return") {
-      runtime.nativePlatform = true;
+      playback.nativePlatform.value = true;
       playback.nativeQualityOptions.value = [
         { max_height: "1080", height: 1080 },
       ];
@@ -851,7 +851,7 @@ it.each(["resolved", "rejected", "quality early return", "disposed"])(
 
 it("Settings actual runtime baseline: a staged credential change runs the existing synchronous quality reset without a playback action", () => {
   const { runtime, owner, playback } = actualStoreFixture();
-  runtime.nativePlatform = true;
+  playback.nativePlatform.value = true;
   playback.nativeQualityOptions.value = [{ max_height: "1080", height: 1080 }];
   playback.nativeQualitySelectedHeight.value = 1080;
   playback.nativeQualityMaxHeight.value = "1080";

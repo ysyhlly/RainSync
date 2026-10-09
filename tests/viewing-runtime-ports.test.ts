@@ -404,7 +404,7 @@ it.each(["SEEK", "PLAY"])(
       t3: 0,
       clock_epoch: "clock",
     });
-    await vi.waitFor(() => expect(playback.sessionId).toBe("fixture-playback"));
+    await vi.waitFor(() => expect(playback.playbackHost.sessionId).toBe("fixture-playback"));
     await vi.advanceTimersByTimeAsync(0);
     playback.roomError = "unrelated room failure";
     // Exercise the public playback action instead of exposing its error writer

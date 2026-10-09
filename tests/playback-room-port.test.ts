@@ -254,19 +254,19 @@ const removedAliases = [
   "playbackSummary",
   "nativePlaybackMode",
   "position",
-] as const;
-const retainedAliases = [
-  "runPlayback",
-  "loadMedia",
-  "attach",
   "sessionId",
   "waiting",
   "recoveryState",
   "nativePlatform",
   "recoveryLabel",
+] as const;
+const retainedAliases = [
+  "runPlayback",
+  "loadMedia",
+  "attach",
 ] as const satisfies readonly (keyof ReturnType<typeof useRoomRuntime>)[];
 
-it("real composition removes thirteen aliases, retains eight and emits each original action hook once", async () => {
+it("real composition removes eighteen aliases, retains three and emits each original action hook once", async () => {
   vi.useFakeTimers();
   vi.stubGlobal("document", new EventTarget());
   vi.stubGlobal("window", new EventTarget());
@@ -286,8 +286,8 @@ it("real composition removes thirteen aliases, retains eight and emits each orig
   });
   const runtime = useRoomRuntime();
   try {
-    expect(removedAliases).toHaveLength(13);
-    expect(retainedAliases).toHaveLength(8);
+    expect(removedAliases).toHaveLength(18);
+    expect(retainedAliases).toHaveLength(3);
     for (const key of removedAliases) expect(key in runtime, key).toBe(false);
     for (const key of retainedAliases) expect(key in runtime, key).toBe(true);
     const port = runtime.playbackRoom;

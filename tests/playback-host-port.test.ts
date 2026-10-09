@@ -110,14 +110,14 @@ const deleted = [
   "playbackSummary",
   "nativePlaybackMode",
   "position",
-] as const;
-const retained = [
-  "runPlayback",
   "waiting",
   "nativePlatform",
   "sessionId",
   "recoveryState",
   "recoveryLabel",
+] as const;
+const retained = [
+  "runPlayback",
   "loadMedia",
   "attach",
 ] as const;
@@ -142,8 +142,8 @@ it("real composition keeps retired aliases absent and shares original named Host
   });
   const runtime = useRoomRuntime();
   try {
-    expect(deleted).toHaveLength(25);
-    expect(retained).toHaveLength(8);
+    expect(deleted).toHaveLength(30);
+    expect(retained).toHaveLength(3);
     for (const key of deleted) expect(key in runtime, key).toBe(false);
     for (const key of retained) expect(key in runtime, key).toBe(true);
     const port = runtime.playbackHost;
@@ -237,5 +237,15 @@ function consumerContract(
   runtime.applySubtitles();
   // @ts-expect-error The old mutable preparation alias is retired.
   runtime.preparation.phase = "failed";
+  // @ts-expect-error Waiting effects use the existing finite Host operation.
+  runtime.waiting;
+  // @ts-expect-error Native platform is observed through finite views.
+  runtime.nativePlatform;
+  // @ts-expect-error Session observations use the finite Host view.
+  runtime.sessionId;
+  // @ts-expect-error Recovery state belongs to the finite Host view.
+  runtime.recoveryState;
+  // @ts-expect-error Recovery presentation uses the finite information view.
+  runtime.recoveryLabel;
 }
 void consumerContract;

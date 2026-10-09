@@ -9,7 +9,7 @@ import { createRoomCommands } from "../apps/web/src/features/rooms/commands/room
 import { createRoomScopePort } from "../apps/web/src/features/rooms/commands/room-scope";
 import type { RoomPermission } from "../apps/web/src/shared/api/types";
 import type { PlaybackPreparationState } from "../apps/web/src/features/playback/playback-preparation";
-import type { createRoomPlaybackFacade } from "../apps/web/src/features/rooms/projection/playback-view";
+import type { useRoomRuntime } from "../apps/web/src/features/rooms/room-runtime";
 
 function setup() {
   const state = ref<RoomState | null>({
@@ -224,7 +224,7 @@ it("local audio delegates synchronously without room permission or connection", 
 function finiteControls(
   port: PlaybackControlsPort,
   context: Parameters<typeof createPlaybackControlsPort>[0],
-  page: ReturnType<typeof createRoomPlaybackFacade>,
+  page: ReturnType<typeof useRoomRuntime>,
 ) {
   // @ts-expect-error No media element is exposed to the control strip.
   port.video.src = "/replacement";
