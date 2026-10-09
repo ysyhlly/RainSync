@@ -20,6 +20,12 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Verify upgrade/recovery cleanup contracts
+        timeout-minutes: 3
+        env:
+          RAINSYNC_RECOVERY_SOURCE_ROOT: ${{ github.workspace }}
+          RAINSYNC_RECOVERY_PROBE_ROOT: ${{ runner.temp }}/rainsync-validation/upgrade-recovery-contracts
+        run: timeout --signal=TERM --kill-after=15s 150s npm run test:upgrade-recovery-contracts
       - name: Verify or install media validation prerequisites
         timeout-minutes: 20
         run: |
@@ -93,6 +99,15 @@ jobs:
         run: RAINSYNC_PLAYWRIGHT_MODULE="$PWD/node_modules/@playwright/test/index.mjs" node --test tests/acceptance-browser.test.mjs
       - run: npm run test:browser-real
       - run: node tests/playlist-real.mjs
+      - name: Retain upgrade/recovery cleanup contract summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-recovery-contracts-${{ github.sha }}-${{ github.run_attempt }}
+          # Only the safe terminal summary, never synthetic fixtures or raw logs.
+          path: ${{ runner.temp }}/rainsync-validation/upgrade-recovery-contracts/summary.json
+          if-no-files-found: warn
+          retention-days: 7
       - name: Retain readiness failure report
         if: failure()
         uses: actions/upload-artifact@v4
