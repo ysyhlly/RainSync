@@ -8,7 +8,7 @@ vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
   };
 });
 import { afterEach, expect, it, vi } from "vitest";
-import { effectScope, ref } from "vue";
+import { effectScope, ref, watch } from "vue";
 import { createPlaybackRuntime } from "../apps/web/src/features/playback/playback-runtime";
 import { RequestFailure } from "../apps/web/src/errors";
 import { PLAYBACK_METRICS_MAX_ELAPSED_MS } from "../apps/web/src/features/playback/playback-metrics";
@@ -21,6 +21,7 @@ const faults = vi.hoisted(() => ({
   construct: false,
   observe: false,
   dispose: false,
+  onObserve: undefined as (() => void) | undefined,
 }));
 const meterStarts = vi.hoisted(() => [] as number[]);
 const hls = vi.hoisted(() => ({
@@ -64,6 +65,7 @@ vi.mock(
           dispose = meter.dispose;
         meter.observe = (...input: any[]) => {
           if (faults.observe) throw new Error("telemetry observe");
+          faults.onObserve?.();
           return observe(...input);
         };
         meter.dispose = (...input: any[]) => {
@@ -77,6 +79,7 @@ vi.mock(
 );
 afterEach(() => {
   faults.construct = faults.observe = faults.dispose = false;
+  faults.onObserve = undefined;
   meterStarts.length = 0;
   hls.supported = false;
   hls.start.mockClear();
@@ -2940,3 +2943,201 @@ it.each(["native reload", "native to MSE", "MSE reload"] as const)(
     }
   },
 );
+
+it("gesture port characterization: play lookup follows blocked and metrics callbacks in the original call turn", async () => {
+  const s = setup();
+  const effects: string[] = [];
+  let release!: () => void;
+  const played = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const original = vi.fn(() => Promise.resolve());
+  const replacement = vi.fn(function (this: unknown) {
+    expect(this).toBe(s.el);
+    effects.push("play call");
+    s.el.paused = false;
+    return played;
+  });
+  let selected = original;
+  let stop: (() => void) | undefined;
+  try {
+    await s.prepare();
+    s.state.value.playback_status = "playing";
+    s.runtime.blocked.value = true;
+    Object.defineProperty(s.el, "play", {
+      configurable: true,
+      get: () => {
+        effects.push("play lookup");
+        return selected;
+      },
+    });
+    stop = watch(
+      s.runtime.blocked,
+      (blocked) => {
+        if (!blocked) effects.push("blocked cleared");
+      },
+      { flush: "sync" },
+    );
+    let observeOnce = true;
+    faults.onObserve = () => {
+      if (!observeOnce) return;
+      observeOnce = false;
+      expect(s.runtime.blocked.value).toBe(false);
+      effects.push("metrics");
+      selected = replacement;
+    };
+    const gesture = s.runtime.enablePlayback();
+    effects.push("caller returned");
+    expect(effects).toEqual([
+      "blocked cleared",
+      "metrics",
+      "play lookup",
+      "play call",
+      "caller returned",
+    ]);
+    expect(original).not.toHaveBeenCalled();
+    expect(replacement).toHaveBeenCalledOnce();
+    release();
+    await gesture;
+    expect(replacement).toHaveBeenCalledOnce();
+    expect(s.runtime.video.value).toBe(s.el);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    release();
+    stop?.();
+    faults.onObserve = undefined;
+    s.cleanup();
+  }
+});
+
+for (const source of ["function", "getter"] as const) {
+  it.each(["AbortError", "NotAllowedError", "Error"] as const)(
+    `gesture port characterization: a synchronous ${source} %s preserves classification and exact claim release`,
+    async (name) => {
+      const s = setup();
+      try {
+        await s.prepare();
+        s.state.value.playback_status = "playing";
+        s.runtime.blocked.value = true;
+        const failure =
+          name === "Error"
+            ? new Error("synchronous play failure")
+            : new DOMException("synchronous play failure", name);
+        const called = vi.fn(() => {
+          throw failure;
+        });
+        const lookup = vi.fn(() => {
+          if (source === "getter") throw failure;
+          return called;
+        });
+        Object.defineProperty(s.el, "play", {
+          configurable: true,
+          get: lookup,
+        });
+        const gesture = s.runtime.enablePlayback();
+        expect(lookup).toHaveBeenCalledOnce();
+        expect(called).toHaveBeenCalledTimes(source === "function" ? 1 : 0);
+        expect(s.runtime.blocked.value).toBe(name === "NotAllowedError");
+        if (name === "AbortError") {
+          await expect(gesture).resolves.toBeUndefined();
+          expect(s.error.value).toBe(playInterrupted);
+        } else await expect(gesture).rejects.toBe(failure);
+        const retry = vi.fn(function (this: unknown) {
+          expect(this).toBe(s.el);
+          s.el.paused = false;
+          return Promise.resolve();
+        });
+        Object.defineProperty(s.el, "play", {
+          configurable: true,
+          value: retry,
+        });
+        await s.runtime.enablePlayback();
+        expect(retry).toHaveBeenCalledOnce();
+        expect(s.runtime.blocked.value).toBe(false);
+        expect(s.error.value).toBe("");
+        expect(playbackPosts(s)).toHaveLength(1);
+      } finally {
+        s.cleanup();
+      }
+    },
+  );
+}
+
+it("gesture port characterization: the original element receives latest PAUSE before stale clock rejection", async () => {
+  const s = setup();
+  let release!: () => void;
+  try {
+    await s.prepare();
+    s.state.value.playback_status = "playing";
+    s.runtime.blocked.value = true;
+    s.el.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = () => {
+            s.el.paused = false;
+            resolve();
+          };
+        }),
+    );
+    const gesture = s.runtime.enablePlayback();
+    expect(s.el.play).toHaveBeenCalledOnce();
+    expect(s.runtime.blocked.value).toBe(false);
+    s.state.value.playback_status = "paused";
+    s.invalidate();
+    s.el.pause.mockClear();
+    release();
+    await gesture;
+    expect(s.el.pause).toHaveBeenCalledOnce();
+    expect(s.el.paused).toBe(true);
+    expect(s.runtime.video.value).toBe(s.el);
+    expect(s.error.value).toBe("");
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    release?.();
+    s.cleanup();
+  }
+});
+
+it("gesture port characterization: an old settlement cannot release a successor's pending claim", async () => {
+  const s = setup();
+  let rejectOld!: (failure: Error) => void, releaseCurrent!: () => void;
+  try {
+    await s.prepare();
+    s.state.value.playback_status = "playing";
+    s.el.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectOld = reject;
+        }),
+    );
+    s.el.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseCurrent = () => {
+            s.el.paused = false;
+            resolve();
+          };
+        }),
+    );
+    const oldGesture = s.runtime.enablePlayback();
+    await s.runtime.loadMedia();
+    const currentGesture = s.runtime.enablePlayback();
+    expect(s.el.play).toHaveBeenCalledTimes(2);
+    expect(s.runtime.sessionId.value).toBe("session-2");
+    s.el.pause.mockClear();
+    rejectOld(new DOMException("old gesture denied", "NotAllowedError"));
+    await oldGesture;
+    expect(s.el.pause).not.toHaveBeenCalled();
+    expect(s.runtime.blocked.value).toBe(false);
+    expect(s.error.value).toBe("");
+    await s.runtime.enablePlayback();
+    expect(s.el.play).toHaveBeenCalledTimes(2);
+    releaseCurrent();
+    await currentGesture;
+    expect(s.runtime.video.value).toBe(s.el);
+    expect(playbackPosts(s)).toHaveLength(2);
+  } finally {
+    releaseCurrent?.();
+    s.cleanup();
+  }
+});

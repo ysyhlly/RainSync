@@ -1,5 +1,6 @@
 import { evaluatePlaybackRecovery } from "./playback-recovery-state";
 import { createPlaybackSynchronization } from "./playback-synchronization";
+import { createPlaybackGesture } from "./playback-gesture";
 import { createVodTickPolicy } from "./vod-tick-policy";
 import { createPlaybackMediaIO } from "./drivers/media-io";
 import { createLiveTickPolicy } from "./live-tick-policy";
@@ -2971,67 +2972,59 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       }
     }
   }
-  async function enablePlayback() {
-    if (!roomIsActive()) return;
-    const p = readPlan(),
-      el = video.value;
-    if (p && failedCompatibilityPlan === p) return;
-    if (!clockUsable()) {
-      queueApply();
-      return;
-    }
-    if (
-      p &&
-      el &&
-      currentPlan(p) &&
-      synchronization.ensureBaseRate() &&
-      !synchronization.pendingPlay
-    ) {
-      if (p.native_platform?.live) {
-        if (terminalEnd || el.ended) {
-          if (!terminalEnd) failNativeLive(p);
-          return;
-        }
-        if (state.value?.playback_status !== "playing") return;
-        const edge = nativeLiveEdge(
-          availablePlaybackRanges(el),
-          hls?.liveSyncPosition ?? undefined,
-        );
-        liveNeedsEdge = edge === undefined;
-        if (edge !== undefined) el.currentTime = edge;
-      }
-      const serial = synchronization.beginGesture(),
-        revision = clockRevision();
-      const playing = synchronization.claimPlay(true);
-      // An explicit gesture resumes loading even while play() waits for data.
-      // Only a new permission denial may restore the gesture gate.
-      blocked.value = false;
-      observeMetrics();
-      try {
-        await el.play();
-      } catch (failure) {
-        if (!synchronization.afterPlay(p, el, revision, serial)) return;
-        if (playFailureIs(failure, "NotAllowedError")) {
-          blocked.value = true;
-          observeMetrics();
-        } else {
-          synchronization.failPlay();
-          if (playFailureIs(failure, "AbortError")) {
-            reportPlayInterruption();
-            return;
-          }
-        }
-        throw failure;
-      } finally {
-        synchronization.releasePlay(playing);
-      }
-      if (!synchronization.afterPlay(p, el, revision, serial)) return;
-      blocked.value = false;
+  const enablePlayback = createPlaybackGesture({
+    active: roomIsActive,
+    capture: () => {
+      const p = readPlan(),
+        el = video.value;
+      return {
+        get failed() {
+          return !!p && failedCompatibilityPlan === p;
+        },
+        current: () => {
+          if (!p || !el || !currentPlan(p)) return;
+          return {
+            get live() {
+              return !!p.native_platform?.live;
+            },
+            get ended() {
+              return el.ended;
+            },
+            get terminal() {
+              return terminalEnd;
+            },
+            get playing() {
+              return state.value?.playback_status === "playing";
+            },
+            edge: () => nativeLiveEdge(
+              availablePlaybackRanges(el),
+              hls?.liveSyncPosition ?? undefined,
+            ),
+            align: (edge: number | undefined) => {
+              liveNeedsEdge = edge === undefined;
+              if (edge !== undefined) el.currentTime = edge;
+            },
+            failLive: () => failNativeLive(p),
+            play: () => el.play(),
+            afterPlay: (revision: number, serial: number) =>
+              synchronization.afterPlay(p, el, revision, serial),
+          };
+        },
+      };
+    },
+    clockUsable,
+    clockRevision,
+    queueApply,
+    synchronization,
+    blocked,
+    isFailure: playFailureIs,
+    interrupt: reportPlayInterruption,
+    clearInterruption: () => {
       if (error.value === playInterruptedError) error.value = "";
-      observeMetrics();
-      await applyState(true);
-    }
-  }
+    },
+    observe: observeMetrics,
+    reconcile: () => applyState(true),
+  });
   function tick() {
     try {
       tickPlayback();

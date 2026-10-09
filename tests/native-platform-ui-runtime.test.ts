@@ -2450,3 +2450,197 @@ it("live periodic convergence preserves a terminal episode without repeating its
     f.cleanup();
   }
 });
+
+it("gesture port characterization: live room status is read after a synchronous rate effect", async () => {
+  const f = setup({ live: true });
+  try {
+    f.clock.ready = false;
+    await f.runtime.loadMedia();
+    f.element.readyState = 2;
+    f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+    f.element.currentTime = 102;
+    f.state.value.playback_status = "playing";
+    f.state.value.playback_rate = 1.25;
+    let rate = 1,
+      pauseOnce = true;
+    Object.defineProperty(f.element, "playbackRate", {
+      configurable: true,
+      get: () => rate,
+      set: (value: number) => {
+        rate = value;
+        if (pauseOnce) {
+          pauseOnce = false;
+          f.state.value.playback_status = "paused";
+        }
+      },
+    });
+    f.element.play.mockClear();
+    f.element.play.mockImplementation(async () => {
+      f.element.paused = false;
+    });
+    await f.runtime.enablePlayback();
+    expect(rate).toBe(1.25);
+    expect(f.state.value.playback_status).toBe("paused");
+    expect(f.element.currentTime).toBe(102);
+    expect(f.element.play).not.toHaveBeenCalled();
+    f.state.value.playback_status = "playing";
+    await f.runtime.enablePlayback();
+    expect(f.element.currentTime).toBe(127);
+    expect(f.element.play).toHaveBeenCalledOnce();
+    expect(f.runtime.video.value).toBe(f.element);
+    expect(f.bodies).toHaveLength(1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+it("gesture port characterization: live edge assignment precedes the late play-property lookup", async () => {
+  const f = setup({ live: true });
+  const effects: string[] = [];
+  try {
+    await f.runtime.loadMedia();
+    f.element.readyState = 2;
+    f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+    f.state.value.playback_status = "playing";
+    f.runtime.blocked.value = true;
+    let position = 102;
+    Object.defineProperty(f.element, "currentTime", {
+      configurable: true,
+      get: () => position,
+      set: function (this: unknown, value: number) {
+        expect(this).toBe(f.element);
+        effects.push(`seek ${value}`);
+        position = value;
+      },
+    });
+    f.element.play.mockImplementation(async () => {
+      f.element.paused = false;
+    });
+    const original = f.element.play;
+    Object.defineProperty(f.element, "play", {
+      configurable: true,
+      get: () => {
+        effects.push("play lookup");
+        expect(f.runtime.blocked.value).toBe(false);
+        expect(position).toBe(127);
+        return original;
+      },
+    });
+    const gesture = f.runtime.enablePlayback();
+    effects.push("caller returned");
+    expect(effects.slice(0, 3)).toEqual([
+      "seek 127",
+      "play lookup",
+      "caller returned",
+    ]);
+    await gesture;
+    expect(effects).toEqual([
+      "seek 127",
+      "play lookup",
+      "caller returned",
+      "seek 127",
+    ]);
+    expect(original).toHaveBeenCalledOnce();
+    expect(f.runtime.video.value).toBe(f.element);
+    expect(f.bodies).toHaveLength(1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+it("gesture port characterization: a changed live broadcast retires a late gesture denial", async () => {
+  const f = setup({ live: true });
+  let reject!: (failure: Error) => void;
+  try {
+    await f.runtime.loadMedia();
+    f.element.readyState = 2;
+    f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+    f.state.value.playback_status = "playing";
+    f.runtime.blocked.value = true;
+    f.element.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, no) => {
+          reject = no;
+        }),
+    );
+    const gesture = f.runtime.enablePlayback();
+    expect(f.element.play).toHaveBeenCalledOnce();
+    f.state.value.live = {
+      ...f.state.value.live,
+      broadcast_id: "12:34:1700000001",
+    };
+    const notice = f.error.value;
+    f.element.pause.mockClear();
+    reject(new DOMException("old live gesture", "NotAllowedError"));
+    await gesture;
+    expect(f.runtime.blocked.value).toBe(false);
+    expect(f.error.value).toBe(notice);
+    expect(f.element.pause).not.toHaveBeenCalled();
+    expect(f.bodies).toHaveLength(1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+it("gesture port characterization: an absent element does not move failed-plan admission after clock evaluation", async () => {
+  const f = setup({ provider: "youtube", mse: true, nativeHls: false });
+  try {
+    f.runtime.nativePlaybackMode.value = "compatibility";
+    await f.runtime.loadMedia();
+    hlsPlayers[0].handlers.get("error")!(null, {
+      fatal: true,
+      type: "mediaError",
+      details: "decode-failed",
+    });
+    await settle();
+    expect(f.runtime.preparation.value.phase).toBe("failed");
+    const notice = f.error.value;
+    // Fixture-only absence isolates the failed-plan versus clock read order.
+    f.runtime.video.value = undefined;
+    const clockRead = vi.fn(() => false);
+    Object.defineProperty(f.clock, "ready", {
+      configurable: true,
+      get: clockRead,
+    });
+    await expect(f.runtime.enablePlayback()).resolves.toBeUndefined();
+    expect(clockRead).not.toHaveBeenCalled();
+    expect(f.error.value).toBe(notice);
+    expect(f.element.play).not.toHaveBeenCalled();
+  } finally {
+    f.runtime.video.value = f.element;
+    f.cleanup();
+  }
+});
+
+it("gesture port characterization: terminal live state short-circuits the physical ended getter", async () => {
+  const f = setup({ live: true });
+  try {
+    await f.runtime.loadMedia();
+    f.element.ended = true;
+    f.element.onended();
+    await settle();
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "NATIVE_LIVE_NOT_BROADCASTING",
+    );
+    const notice = f.error.value;
+    const endedRead = vi.fn(() => {
+      throw new Error("terminal episode must short-circuit ended");
+    });
+    Object.defineProperty(f.element, "ended", {
+      configurable: true,
+      get: endedRead,
+    });
+    await expect(f.runtime.enablePlayback()).resolves.toBeUndefined();
+    expect(endedRead).not.toHaveBeenCalled();
+    expect(f.error.value).toBe(notice);
+    expect(f.element.play).not.toHaveBeenCalled();
+    expect(f.bodies).toHaveLength(1);
+  } finally {
+    Object.defineProperty(f.element, "ended", {
+      configurable: true,
+      writable: true,
+      value: true,
+    });
+    f.cleanup();
+  }
+});
