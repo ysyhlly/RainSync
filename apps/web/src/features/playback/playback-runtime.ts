@@ -2,6 +2,7 @@ import { evaluatePlaybackRecovery } from "./playback-recovery-state";
 import { createPlaybackSynchronization } from "./playback-synchronization";
 import { createPlaybackGesture } from "./playback-gesture";
 import { createLiveReconciliation } from "./live-reconciliation";
+import { createVodReconciliation } from "./vod-reconciliation";
 import { createVodTickPolicy } from "./vod-tick-policy";
 import { createPlaybackMediaIO } from "./drivers/media-io";
 import { createLiveTickPolicy } from "./live-tick-policy";
@@ -75,7 +76,6 @@ import {
 import {
   detectCapabilities,
   availablePlaybackRanges,
-  containsPlaybackPosition,
 } from "../../../../../packages/player-core";
 import { target } from "../../../../../packages/sync-engine";
 import type {
@@ -2852,133 +2852,105 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       return Promise.reject(failure);
     }
   }
-  async function reconcileVod(
-    s: NonNullable<typeof state.value>,
-    el: HTMLVideoElement,
-    p: PlaybackPlan,
-    serial: number,
-    force: boolean,
-    userSeek: boolean,
-  ) {
-    if (s.playback_status !== "playing") {
-      el.pause();
-      if (synchronization.restoreBaseRate() === undefined) return;
-    }
-    if (!clockUsable()) {
-      if (synchronization.restoreBaseRate() === undefined) return;
-      queueApply(force, userSeek);
-      return;
-    }
-    if (el.readyState < 1) return;
-    userSeek ||= synchronization.pendingUserSeek;
-    force ||= synchronization.pendingForce;
-    synchronization.clearPendingApply();
-    if (el.ended && s.playback_status === "playing" && !userSeek) {
-      void completed();
-      return;
-    }
-    if (!synchronization.ensureBaseRate()) return;
-    const revision = clockRevision();
-    if (userSeek) {
-      generationWaitFailed = false;
-      generatedEnd = undefined;
-      recoveringHls = false;
-      generationWait?.abort();
-      generationWait = undefined;
-      mediaDataLoad?.sync();
-      firstFrameDeadline?.sync();
-    }
-    if (generationWait || generationWaitFailed) return;
-    const relative = (target(s, clock.now()) - p.timeline_origin_ms) / 1000;
-    const expected = Math.min(generatedEnd ?? Infinity, Math.max(0, relative));
-    const ranges = availablePlaybackRanges(el);
-    const seekable = containsPlaybackPosition(ranges, expected);
-    const end = ranges.length
-      ? Math.max(...ranges.map(([, end]) => end))
-      : undefined;
-    if (
-      force &&
-      p.rebuild_on_seek &&
-      (relative < -0.5 || (userSeek && !seekable))
-    ) {
-      // A fresh authoritative target before this upstream timeline is a new
-      // seek intent, not a decoder retry of the previous profile or SID.
-      const profileTimelineSeek = relative < -0.5 && !!p.upstream_profile;
-      if (userSeek || profileTimelineSeek) await beginLoad("automatic_load");
-      else await fallbackLoad();
-      return;
-    }
-    if (recoveringHls && !seekable) {
-      if (end !== undefined && expected <= end) {
+  const reconcileVod = createVodReconciliation({
+    capture: (
+      s: NonNullable<typeof state.value>,
+      el: HTMLVideoElement,
+      p: PlaybackPlan,
+      serial: number,
+    ) => ({
+      state: s,
+      plan: {
+        get timeline_origin_ms() {
+          return p.timeline_origin_ms;
+        },
+        get rebuild_on_seek() {
+          return p.rebuild_on_seek;
+        },
+        get hasUpstreamProfile() {
+          return !!p.upstream_profile;
+        },
+      },
+      media: {
+        get readyState() {
+          return el.readyState;
+        },
+        get ended() {
+          return el.ended;
+        },
+        get paused() {
+          return el.paused;
+        },
+        get currentTime() {
+          return el.currentTime;
+        },
+        ranges: () => availablePlaybackRanges(el),
+        pause: () => el.pause(),
+        seek: (position: number) => {
+          el.currentTime = position;
+        },
+        play: () => el.play(),
+        afterPlay: (revision: number) =>
+          synchronization.afterPlay(p, el, revision, serial),
+      },
+      waitForGenerated: () => waitForGenerated(p),
+    }),
+    synchronization,
+    blocked,
+    clockUsable,
+    clockRevision,
+    now: () => clock.now(),
+    queueApply,
+    completed,
+    prepare: () => beginLoad("automatic_load"),
+    fallback: () => fallbackLoad(),
+    generated: {
+      get pending() {
+        return !!generationWait;
+      },
+      get failed() {
+        return generationWaitFailed;
+      },
+      get end() {
+        return generatedEnd;
+      },
+      get recovering() {
+        return recoveringHls;
+      },
+      resetSeek: () => {
+        generationWaitFailed = false;
+        generatedEnd = undefined;
+        recoveringHls = false;
+        generationWait?.abort();
+        generationWait = undefined;
+        mediaDataLoad?.sync();
+        firstFrameDeadline?.sync();
+      },
+      rejectHole: () => {
         recoveringHls = false;
         waiting.value = false;
         error.value = "目标进度尚不可定位，请稍后重试或重新加载";
-      }
-      return;
-    }
-    if (
-      p.rebuild_on_seek &&
-      !userSeek &&
-      !recoveringHls &&
-      generatedEnd === undefined &&
-      !seekable &&
-      (end === undefined || expected > end + 0.1)
-    ) {
-      await waitForGenerated(p);
-      return;
-    }
-    // Neither a finite duration nor a later interval authorizes a seek into a
-    // hole. Generated holes stay on the finite recovery/reload path.
-    if (!seekable && Math.abs(el.currentTime - expected) > 0.15) {
-      if (synchronization.restoreBaseRate() === undefined) return;
-      error.value = "目标进度尚不可定位，请稍后重试或重新加载";
-      // Initial playback may need play() to expose any local intervals. Keep
-      // the metadata seek pending, and never assign an unavailable position.
-      if (!ranges.length && force && !userSeek) synchronization.queueApply(true);
-      if (userSeek || ranges.length) return;
-    }
-    if (recoveringHls) recoveringHls = false;
-    if (seekable && error.value === "目标进度尚不可定位，请稍后重试或重新加载")
-      error.value = "";
-    if (force || s.playback_status !== "playing") {
-      if (seekable && Math.abs(el.currentTime - expected) > 0.15)
-        el.currentTime = expected;
-    }
-    if (s.playback_status === "playing") {
-      if (
-        el.paused &&
-        !blocked.value &&
-        !synchronization.pendingPlay &&
-        !synchronization.playFailed
-      ) {
-        const playing = synchronization.claimPlay();
-        try {
-          await el.play();
-          if (!synchronization.afterPlay(p, el, revision, serial)) return;
-          blocked.value = false;
-          if (error.value === playInterruptedError) error.value = "";
-          observeMetrics();
-        } catch (failure) {
-          if (!synchronization.afterPlay(p, el, revision, serial)) return;
-          if (playFailureIs(failure, "NotAllowedError")) {
-            blocked.value = true;
-            observeMetrics();
-          } else {
-            // Stop periodic play retries without claiming a gesture denial or
-            // suspending the independent media-data deadline.
-            synchronization.failPlay();
-            if (playFailureIs(failure, "AbortError")) {
-              reportPlayInterruption();
-              return;
-            }
-            throw failure;
-          }
-        } finally {
-          synchronization.releasePlay(playing);
-        }
-      }
-    }
-  }
+      },
+      clearRecovery: () => {
+        recoveringHls = false;
+      },
+    },
+    notice: {
+      unavailable: () => {
+        error.value = "目标进度尚不可定位，请稍后重试或重新加载";
+      },
+      clearUnavailable: () => {
+        if (error.value === "目标进度尚不可定位，请稍后重试或重新加载")
+          error.value = "";
+      },
+      clearInterruption: () => {
+        if (error.value === playInterruptedError) error.value = "";
+      },
+    },
+    observe: observeMetrics,
+    playFailureIs,
+    interrupt: reportPlayInterruption,
+  });
   const enablePlayback = createPlaybackGesture({
     active: roomIsActive,
     capture: () => {

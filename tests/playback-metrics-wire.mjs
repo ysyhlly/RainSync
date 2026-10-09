@@ -42,6 +42,7 @@ const frontendInputs = [
   "apps/web/src/features/playback/playback-synchronization.ts",
   "apps/web/src/features/playback/playback-gesture.ts",
   "apps/web/src/features/playback/live-reconciliation.ts",
+  "apps/web/src/features/playback/vod-reconciliation.ts",
   "apps/web/src/features/playback/vod-tick-policy.ts",
   "apps/web/src/features/playback/live-tick-policy.ts",
   "apps/web/src/features/playback/playback-session-controller.ts",
