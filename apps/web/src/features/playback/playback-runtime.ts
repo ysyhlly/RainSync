@@ -54,7 +54,7 @@ import {
   bindLocalHlsLevels,
   hasHlsLadder,
 } from "./local-hls-ladder-intent";
-import { RoomP2PTransport, type PeerStats } from "./room-p2p";
+import type { RoomP2PTransport, PeerStats } from "./room-p2p";
 import {
   validDistributedIntent,
   sameDistributedIntent,
@@ -2230,7 +2230,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         : undefined;
       if (p.distributed_compute && Hls?.isSupported()) {
         const f = p.distributed_compute;
-        const peer = new RoomP2PTransport(
+        const peer = new Hls.RoomP2PTransport(
           api,
           s.room_id,
           f.job_id,

@@ -53,6 +53,7 @@ const frontendInputs = [
   "packages/player-core/dash/loader.ts",
   "packages/player-core/dash/manifest.ts",
   "packages/player-core/dash/segment-base.ts",
+  "apps/web/src/features/playback/room-p2p.ts",
   "apps/web/src/features/playback/room-p2p-loader.ts",
   "apps/web/src/features/playback/playback-runtime-types.ts",
   "apps/web/src/features/playback/playback-scope.ts",

@@ -2,6 +2,7 @@ import type Hls from "hls.js";
 import type { ErrorData, HlsListeners } from "hls.js";
 import type { LadderLevel } from "../local-hls-ladder-intent";
 import { createP2PFragmentLoader } from "../room-p2p-loader";
+export { RoomP2PTransport } from "../room-p2p";
 
 const liveCodes = [
   "NATIVE_LIVE_WINDOW_EXPIRED",

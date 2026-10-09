@@ -2,11 +2,12 @@ import { loadHlsLibrary } from "./hls-library";
 import type { HlsDriverOptions } from "./drivers/hls-driver";
 
 async function load() {
-  const [Hls, { createHlsDriver }] = await Promise.all([
+  const [Hls, { createHlsDriver, RoomP2PTransport }] = await Promise.all([
     loadHlsLibrary(),
     import("./drivers/hls-driver"),
   ]);
   return {
+    RoomP2PTransport,
     isSupported: () => Hls.isSupported(),
     create: (options: HlsDriverOptions) => createHlsDriver(Hls, options),
   };

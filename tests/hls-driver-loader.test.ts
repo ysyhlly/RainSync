@@ -1,4 +1,5 @@
 import { expect, it, vi } from "vitest";
+import { RoomP2PTransport } from "../apps/web/src/features/playback/room-p2p";
 const library = vi.hoisted(() => ({ load: vi.fn() }));
 vi.mock("../apps/web/src/features/playback/hls-library", () => ({
   loadHlsLibrary: library.load,
@@ -23,6 +24,7 @@ it("shares the deferred load and retries after its first SDK failure", async () 
   expect(retry).not.toBe(first);
   expect(loadHlsDriver()).toBe(retry);
   const module = await retry;
+  expect(module.RoomP2PTransport).toBe(RoomP2PTransport);
   expect(module.isSupported()).toBe(true);
   expect(supported).toHaveBeenCalledOnce();
   expect(library.load).toHaveBeenCalledTimes(2);

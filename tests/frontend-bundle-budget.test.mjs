@@ -222,3 +222,47 @@ test("Acorn is an independent worker asset and room layout CSS is route-owned", 
     "room route lost its layout styling",
   );
 });
+
+test("the unchanged P2P implementation is deferred with the HLS driver", async () => {
+  const markers = ["P2P 目录绑定不匹配", "rainsync-chunks-v1"];
+  const initialBodies = await Promise.all(
+    [...initialFiles]
+      .filter((file) => file.endsWith(".js"))
+      .map((file) => readFile(resolve(output, file), "utf8")),
+  );
+  const hlsDriver = Object.keys(manifest).find((key) =>
+    key.endsWith("/drivers/hls-driver.ts"),
+  );
+  assert.ok(hlsDriver, "missing deferred HLS driver");
+  const files = new Set(
+    [...dependencies(hlsDriver)]
+      .filter((key) => !initial.has(key))
+      .map((key) => manifest[key].file)
+      .filter((file) => file.endsWith(".js")),
+  );
+  const bodies = await Promise.all(
+    [...files].map((file) => readFile(resolve(output, file), "utf8")),
+  );
+  for (const marker of markers) {
+    assert.ok(
+      initialBodies.every((body) => !body.includes(marker)),
+      "P2P implementation reached the initial JavaScript closure",
+    );
+    assert.ok(
+      bodies.some((body) => body.includes(marker)),
+      "P2P implementation is missing from the deferred HLS driver closure",
+    );
+  }
+  const sizes = await Promise.all(
+    [...files].map(async (file) => ({
+      file,
+      bytes: (await stat(resolve(output, file))).size,
+    })),
+  );
+  console.log(
+    JSON.stringify({
+      hls_deferred_static_js_bytes: sizes.reduce((sum, entry) => sum + entry.bytes, 0),
+      hls_deferred_static_js_files: sizes,
+    }),
+  );
+});
