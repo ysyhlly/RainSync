@@ -9,6 +9,7 @@ pub(crate) mod media_reads;
 pub(crate) mod previews;
 pub(crate) mod private_sources;
 pub(crate) mod room_shares;
+pub(crate) mod scan_pages;
 pub(crate) mod source_rules;
 pub(crate) mod source_settings;
 pub(crate) mod sources;
