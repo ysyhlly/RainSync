@@ -1,5 +1,6 @@
 import { evaluatePlaybackRecovery } from "./playback-recovery-state";
 import { createPlaybackSynchronization } from "./playback-synchronization";
+import { createPlaybackSourceRecoveryState } from "./playback-source-recovery-state";
 import { createPlaybackGesture } from "./playback-gesture";
 import { createLiveReconciliation } from "./live-reconciliation";
 import { createVodReconciliation } from "./vod-reconciliation";
@@ -489,7 +490,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     hls?.stopLoad();
     firstFrameDeadline?.stop();
     mediaDataLoad?.stop();
-    recoveringHls = false;
+    sourceRecovery.endRecovery();
     waiting.value = false;
     error.value = message;
     failLocalPlayback(message, "NATIVE_PLATFORM_DELIVERY_INVALID");
@@ -518,12 +519,9 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     hls: HlsDriver | undefined,
     loadSerial = 0,
     clockAction: "load" | "apply" | undefined;
-  let recoveringHls = false,
-    terminalEnd = false,
-    capabilityProbe: AbortController | undefined,
-    generationWait: AbortController | undefined,
-    generationWaitFailed = false,
-    generatedEnd: number | undefined;
+  const sourceRecovery = createPlaybackSourceRecoveryState();
+  let terminalEnd = false,
+    capabilityProbe: AbortController | undefined;
   let mediaDataLoad:
     | { sourceChanged: () => void; sync: () => void; stop: () => void }
     | undefined;
@@ -620,16 +618,16 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     waiting,
     blocked,
     get generationPending() {
-      return !!generationWait;
+      return sourceRecovery.pending;
     },
     get generationFailed() {
-      return generationWaitFailed;
+      return sourceRecovery.failed;
     },
     get recovering() {
-      return recoveringHls;
+      return sourceRecovery.recovering;
     },
     get generatedEnd() {
-      return generatedEnd;
+      return sourceRecovery.end;
     },
     now: () => clock.now(),
     apply: (force, userSeek) => {
@@ -781,10 +779,10 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       terminalEnd,
       rejectedBaseRate: synchronization.rejectedBaseRate,
       confirmedBaseRate: synchronization.confirmedBaseRate,
-      generatedEnd,
-      generationWait: !!generationWait,
-      generationWaitFailed,
-      recoveringHls,
+      generatedEnd: sourceRecovery.end,
+      generationWait: sourceRecovery.pending,
+      generationWaitFailed: sourceRecovery.failed,
+      recoveringHls: sourceRecovery.recovering,
       pendingForce: synchronization.pendingForce,
       pendingUserSeek: synchronization.pendingUserSeek,
       pendingPlay: synchronization.pendingPlay,
@@ -860,7 +858,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     foreground: foreground(),
     expectedPlaying: state.value?.playback_status === "playing",
     autoplayBlocked: blocked.value,
-    buffering: !!generationWait || recoveringHls,
+    buffering: sourceRecovery.pending || sourceRecovery.recovering,
   });
   const metricRead = metricRuntime.read;
   function visibilityChanged() {
@@ -1054,11 +1052,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       capabilityProbe?.abort();
       capabilityProbe = undefined;
     }
-    generationWait?.abort();
-    generationWait = undefined;
-    generationWaitFailed = false;
-    generatedEnd = undefined;
-    recoveringHls = false;
+    sourceRecovery.retireSource();
     const detachedSession = sessionController.retirePlan();
     const old = detachedSession?.plan;
     playbackSummary.value = undefined;
@@ -1884,14 +1878,14 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         current: () =>
           serial === loadSerial && currentPlan(p) && intentCurrent(playbackIntent),
         suspended: () =>
-          !!generationWait ||
-          generationWaitFailed ||
+          sourceRecovery.pending ||
+          sourceRecovery.failed ||
           blocked.value ||
           !foreground() ||
           state.value?.playback_status !== "playing",
         eligible: () =>
-          !generationWait &&
-          !generationWaitFailed &&
+          !sourceRecovery.pending &&
+          !sourceRecovery.failed &&
           !blocked.value &&
           foreground(),
         presented: () => {
@@ -1916,7 +1910,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           updateRecovery();
         },
         timeout: () => {
-          recoveringHls = false;
+          sourceRecovery.endRecovery();
           waiting.value = false;
           failLocalPlayback(firstFrameTimeoutError, "FIRST_FRAME_TIMEOUT");
           if (!error.value) error.value = firstFrameTimeoutError;
@@ -1940,8 +1934,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           state.value?.media_id === dataMediaId &&
           video.value === el,
         suspended: () =>
-          !!generationWait ||
-          generationWaitFailed ||
+          sourceRecovery.pending ||
+          sourceRecovery.failed ||
           blocked.value ||
           !foreground(),
         ready: () => {
@@ -1962,7 +1956,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           return true;
         },
         timeout: () => {
-          recoveringHls = false;
+          sourceRecovery.endRecovery();
           waiting.value = false;
           failLocalPlayback(mediaDataTimeoutError, "MEDIA_DATA_TIMEOUT");
           if (!error.value) error.value = mediaDataTimeoutError;
@@ -2117,11 +2111,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         )
           return false;
         recoveries++;
-        generationWait?.abort();
-        generationWait = undefined;
-        generationWaitFailed = false;
-        generatedEnd = undefined;
-        recoveringHls = true;
+        sourceRecovery.restartSourceRecovery();
         waiting.value = true;
         synchronization.invalidatePlayActions();
         firstFrameDeadline?.detachSource();
@@ -2174,11 +2164,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
               // A native decoder/parser failure can be transport-specific. Try MSE
               // once, with this same authorized plan and the current room position.
               mse = true;
-              generationWait?.abort();
-              generationWait = undefined;
-              generationWaitFailed = false;
-              generatedEnd = undefined;
-              recoveringHls = true;
+              sourceRecovery.restartSourceRecovery();
               waiting.value = true;
               synchronization.invalidatePlayActions();
               firstFrameDeadline?.detachSource();
@@ -2199,7 +2185,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           // HTML code 4 mixes format, delivery and support failures. It cannot
           // justify a fresh grant, including the legacy one-hop HTTP continuation.
           if (code === 3 && retryDecode()) return;
-          recoveringHls = false;
+          sourceRecovery.endRecovery();
           error.value =
             code === 2
               ? "媒体加载中断，请检查连接后重新加载"
@@ -2364,7 +2350,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
               }
               if (data.unsupportedTimeline) {
                 firstFrameDeadline?.stop();
-                recoveringHls = false;
+                sourceRecovery.endRecovery();
                 waiting.value = false;
                 error.value = new RequestFailure({
                   error: { code: "UNSUPPORTED_TIMELINE" },
@@ -2409,7 +2395,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
                   recoverMediaError: () => attachedHls.recoverMediaError(),
                 })
               ) {
-                recoveringHls = true;
+                sourceRecovery.beginRecovery();
                 waiting.value = true;
                 return;
               }
@@ -2431,12 +2417,12 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
                   startLoad: () => attachedHls.startLoad(-1),
                 })
               ) {
-                recoveringHls = true;
+                sourceRecovery.beginRecovery();
                 waiting.value = true;
                 return;
               }
               if (data.type === "mediaError" && retryDecode()) return;
-              recoveringHls = false;
+              sourceRecovery.endRecovery();
               error.value = "媒体加载失败：" + data.details;
               failLocalPlayback(
                 "媒体加载失败，请检查连接或重新发起播放。",
@@ -2676,15 +2662,14 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     }
   }
   async function waitForGenerated(p: PlaybackPlan) {
-    if (generationWait || generationWaitFailed) return;
+    if (sourceRecovery.pending || sourceRecovery.failed) return;
     if (!clockUsable()) {
       queueApply();
       return;
     }
     const revision = clockRevision();
     const nativeSource = native;
-    const controller = new AbortController();
-    generationWait = controller;
+    const controller = sourceRecovery.beginWait();
     synchronization.invalidatePlayActions();
     mediaDataLoad?.sync();
     firstFrameDeadline?.sync();
@@ -2724,15 +2709,15 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         return;
       }
       if (ready.complete && ready.available_until_ms != null)
-        generatedEnd = ready.available_until_ms / 1000;
+        sourceRecovery.completeAt(ready.available_until_ms / 1000);
       const position = Math.min(
-        generatedEnd ?? Infinity,
+        sourceRecovery.end ?? Infinity,
         Math.max(
           0,
           (target(state.value!, clock.now()) - p.timeline_origin_ms) / 1000,
         ),
       );
-      recoveringHls = true;
+      sourceRecovery.beginRecovery();
       if (hls) {
         // Retain the growing EVENT attempt and wait for an actual local interval.
         hls.startLoad(position);
@@ -2753,7 +2738,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         queueApply();
         return;
       }
-      generationWaitFailed = true;
+      sourceRecovery.failWait();
       waiting.value = false;
       preparation.value = {
         ...preparation.value,
@@ -2762,7 +2747,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       };
       throw e;
     } finally {
-      if (generationWait === controller) generationWait = undefined;
+      sourceRecovery.finishWait(controller);
       mediaDataLoad?.sync();
       firstFrameDeadline?.sync();
       observeMetrics();
@@ -2906,33 +2891,29 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     fallback: () => fallbackLoad(),
     generated: {
       get pending() {
-        return !!generationWait;
+        return sourceRecovery.pending;
       },
       get failed() {
-        return generationWaitFailed;
+        return sourceRecovery.failed;
       },
       get end() {
-        return generatedEnd;
+        return sourceRecovery.end;
       },
       get recovering() {
-        return recoveringHls;
+        return sourceRecovery.recovering;
       },
       resetSeek: () => {
-        generationWaitFailed = false;
-        generatedEnd = undefined;
-        recoveringHls = false;
-        generationWait?.abort();
-        generationWait = undefined;
+        sourceRecovery.resetSeek();
         mediaDataLoad?.sync();
         firstFrameDeadline?.sync();
       },
       rejectHole: () => {
-        recoveringHls = false;
+        sourceRecovery.endRecovery();
         waiting.value = false;
         error.value = "目标进度尚不可定位，请稍后重试或重新加载";
       },
       clearRecovery: () => {
-        recoveringHls = false;
+        sourceRecovery.endRecovery();
       },
     },
     notice: {
@@ -3027,9 +3008,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   }
   function onClockInvalidated() {
     synchronization.invalidateClock();
-    generationWait?.abort();
-    generationWait = undefined;
-    generationWaitFailed = false;
+    sourceRecovery.invalidateClock();
     mediaDataLoad?.sync();
     firstFrameDeadline?.sync();
     queueApply();

@@ -27,7 +27,7 @@ const meterStarts = vi.hoisted(() => [] as number[]);
 // Passthrough probes observe real owner operations without replacing their
 // algorithms. They are inactive outside the automatic VOD caller traces.
 const vodTrace = vi.hoisted(() => ({
-  visit: undefined as ((event: string) => void) | undefined,
+  visit: undefined as ((event: string, deadline?: unknown) => void) | undefined,
   recovery: undefined as (() => void) | undefined,
   synchronization: undefined as any,
   generated: undefined as any,
@@ -80,7 +80,7 @@ vi.mock(
         for (const key of ["sync", "stop"]) {
           const method = deadline[key];
           deadline[key] = () => {
-            vodTrace.visit?.(`data ${key}`);
+            vodTrace.visit?.(`data ${key}`, deadline);
             return method();
           };
         }
@@ -100,7 +100,7 @@ vi.mock(
         for (const key of ["sync", "stop"]) {
           const method = deadline[key];
           deadline[key] = () => {
-            vodTrace.visit?.(`frame ${key}`);
+            vodTrace.visit?.(`frame ${key}`, deadline);
             return method();
           };
         }
@@ -4050,3 +4050,916 @@ it("automatic VOD characterization: fallback reads the intent adopted by a reent
     s.cleanup();
   }
 });
+// Original-runtime generated/source recovery characterization. These calls and
+// observations run against the accepted production source before an owner move.
+function grFacts() {
+  const facts = vodTrace.generated;
+  return [
+    facts.generationPending,
+    facts.generationFailed,
+    facts.generatedEnd ?? null,
+    facts.recovering,
+  ];
+}
+function grRecord(name: string, trace: unknown[]) {
+  expect(trace, name).toEqual(grObservedBaseline[name]);
+}
+function grReady(generation: number, complete = true) {
+  return {
+    session_id: `session-${generation}`,
+    plan_generation: generation,
+    status: "ready",
+    complete,
+    available_until_ms: 120000,
+  };
+}
+function grTraceFacts(trace: unknown[], event: string) {
+  trace.push([event, ...grFacts()]);
+}
+
+it.each([false, true])(
+  "generated source owner baseline: old finally retains a genuinely pending successor (MSE=%s)",
+  async (mse) => {
+    const s = setup({ hls: mse, rebuild: true, ranges: [[0, 10]] });
+    const releases = new Map<string, (value: unknown) => void>();
+    const signals = new Map<string, AbortSignal>();
+    let old: Promise<void> | undefined, successor: Promise<void> | undefined;
+    const trace: unknown[] = [];
+    let hold = "session-1";
+    try {
+      hls.supported = mse;
+      if (mse) s.el.canPlayType = () => "";
+      await s.prepare();
+      const original = s.api.getMockImplementation()!;
+      (s.api as any).mockImplementation(
+        (
+          path: string,
+          method?: string,
+          body?: unknown,
+          signal?: AbortSignal,
+        ) => {
+          if (
+            method === "GET" &&
+            path.startsWith(`/playback-sessions/${hold}?`)
+          ) {
+            const sid = path.split("/")[2].split("?")[0];
+            trace.push([
+              "GET",
+              sid,
+              new URL(path, "http://localhost").searchParams.get(
+                "plan_generation",
+              ),
+            ]);
+            signals.set(sid, signal!);
+            return new Promise((resolve) => releases.set(sid, resolve));
+          }
+          return original(path, method, body);
+        },
+      );
+      s.state.value.anchor_position_ms = 15000;
+      const oldDeadlines = new Map<string, unknown>();
+      vodTrace.visit = (event, deadline) => {
+        if (event === "data sync" || event === "frame sync")
+          oldDeadlines.set(event, deadline);
+      };
+      old = s.runtime.applyState(true);
+      vodTrace.visit = undefined;
+      grTraceFacts(trace, "old pending");
+      hold = "none";
+      s.el.seekable = s.el.buffered = intervals([[0, 120]]);
+      await s.runtime.loadMedia();
+      expect(signals.get("session-1")!.aborted).toBe(true);
+      hold = "session-2";
+      s.el.seekable = s.el.buffered = intervals([[0, 10]]);
+      const successorDeadlines = new Map<string, unknown>();
+      vodTrace.visit = (event, deadline) => {
+        if (event === "data sync" || event === "frame sync")
+          successorDeadlines.set(event, deadline);
+      };
+      successor = s.runtime.applyState(true);
+      vodTrace.visit = undefined;
+      expect(successorDeadlines.size).toBe(2);
+      expect(oldDeadlines.size).toBe(2);
+      for (const [event, deadline] of successorDeadlines)
+        expect(deadline).not.toBe(oldDeadlines.get(event));
+      grTraceFacts(trace, "successor pending");
+      expect(signals.get("session-2")!.aborted).toBe(false);
+      const source = s.el.src,
+        loads = s.el.load.mock.calls.length,
+        starts = hls.start.mock.calls.length;
+      vodTrace.visit = (event, deadline) => {
+        if (event === "data sync" || event === "frame sync") {
+          trace.push([
+            "exact current handle",
+            event,
+            deadline === successorDeadlines.get(event),
+            deadline === oldDeadlines.get(event),
+          ]);
+          expect(deadline).toBe(successorDeadlines.get(event));
+          grTraceFacts(trace, `old finally ${event}`);
+        }
+      };
+      releases.get("session-1")!(grReady(1));
+      await old;
+      vodTrace.visit = undefined;
+      grTraceFacts(trace, "old settled");
+      expect(s.runtime.sessionId.value).toBe("session-2");
+      expect(s.el.src).toBe(source);
+      expect(s.el.load).toHaveBeenCalledTimes(loads);
+      expect(hls.start).toHaveBeenCalledTimes(starts);
+      expect(s.runtime.video.value).toBe(s.el);
+      const reads = s.api.mock.calls.filter(
+        ([, method]) => method === "GET",
+      ).length;
+      await s.runtime.applyState(true);
+      expect(
+        s.api.mock.calls.filter(([, method]) => method === "GET"),
+      ).toHaveLength(reads);
+      grTraceFacts(trace, "second apply still pending");
+      releases.get("session-2")!(grReady(2));
+      await successor;
+      grTraceFacts(trace, "successor settled");
+      trace.push([
+        "posts",
+        playbackPosts(s).length,
+        "SID",
+        s.runtime.sessionId.value,
+      ]);
+      grRecord(`successor:${mse}`, trace);
+    } finally {
+      vodTrace.visit = undefined;
+      for (const [sid, release] of releases)
+        release(grReady(Number(sid.split("-")[1])));
+      await s.runtime.reset();
+      await Promise.all([old?.catch(() => {}), successor?.catch(() => {})]);
+      s.cleanup();
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  },
+);
+
+it.each(["complete", "failed", "pending"] as const)(
+  "generated source owner baseline: clock invalidation observes naturally reached %s facts",
+  async (kind) => {
+    const s = setup({ rebuild: true, ranges: [[0, 10]] });
+    let pending: Promise<void> | undefined,
+      release: ((value: unknown) => void) | undefined;
+    const trace: unknown[] = [];
+    try {
+      await s.prepare();
+      s.state.value.anchor_position_ms = 15000;
+      const original = s.api.getMockImplementation()!;
+      (s.api as any).mockImplementation(
+        (
+          path: string,
+          method?: string,
+          body?: unknown,
+          signal?: AbortSignal,
+        ) => {
+          if (method !== "GET") return original(path, method, body);
+          if (kind === "failed")
+            return Promise.reject(new Error("baseline generated rejection"));
+          if (kind === "pending") {
+            signal!.addEventListener(
+              "abort",
+              () => grTraceFacts(trace, "abort listener"),
+              { once: true },
+            );
+            return new Promise((resolve) => {
+              release = resolve;
+            });
+          }
+          return original(path, method, body);
+        },
+      );
+      pending = s.runtime.applyState(true);
+      if (kind === "failed")
+        await expect(pending).rejects.toThrow("baseline generated rejection");
+      else if (kind === "complete") await pending;
+      grTraceFacts(trace, "before clock");
+      vodTrace.visit = (event) => {
+        if (event === "data sync" || event === "frame sync")
+          grTraceFacts(trace, event);
+      };
+      s.invalidate();
+      grTraceFacts(trace, "after clock");
+      vodTrace.visit = undefined;
+      if (release) {
+        release(grReady(1));
+        await pending;
+        grTraceFacts(trace, "old settled");
+      }
+      trace.push([
+        "posts",
+        playbackPosts(s).length,
+        "SID",
+        s.runtime.sessionId.value,
+      ]);
+      grRecord(`clock:${kind}`, trace);
+    } finally {
+      vodTrace.visit = undefined;
+      release?.(grReady(1));
+      await s.runtime.reset();
+      await pending?.catch(() => {});
+      s.cleanup();
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  },
+);
+
+for (const transition of [
+  "reset",
+  "native recovery",
+  "native to MSE",
+] as const) {
+  it.each([false, true])(
+    `generated source owner baseline: ${transition} keeps abort-first ordering with nested reset=%s`,
+    async (nestedReset) => {
+      const s = setup({
+        hls: transition !== "reset",
+        rebuild: true,
+        ranges: [[0, 10]],
+      });
+      let pending: Promise<void> | undefined,
+        release: ((value: unknown) => void) | undefined;
+      let reset: Promise<void> | undefined,
+        innerReset: Promise<void> | undefined;
+      const trace: unknown[] = [];
+      try {
+        hls.supported = transition === "native to MSE";
+        await s.prepare();
+        s.state.value.anchor_position_ms = 15000;
+        const original = s.api.getMockImplementation()!;
+        (s.api as any).mockImplementation(
+          (
+            path: string,
+            method?: string,
+            body?: unknown,
+            signal?: AbortSignal,
+          ) => {
+            if (method !== "GET") return original(path, method, body);
+            signal!.addEventListener(
+              "abort",
+              () => {
+                grTraceFacts(trace, "abort listener");
+                if (nestedReset) {
+                  grTraceFacts(trace, "nested reset before");
+                  innerReset = s.runtime.reset();
+                  grTraceFacts(trace, "nested reset returned");
+                }
+              },
+              { once: true },
+            );
+            return new Promise((resolve) => {
+              release = resolve;
+            });
+          },
+        );
+        pending = s.runtime.applyState(true);
+        grTraceFacts(trace, "before transition");
+        vodTrace.visit = (event) => {
+          if (event.startsWith("data ") || event.startsWith("frame "))
+            grTraceFacts(trace, event);
+        };
+        if (transition === "reset") reset = s.runtime.reset();
+        else {
+          s.el.error = { code: transition === "native recovery" ? 2 : 3 };
+          s.el.onerror();
+        }
+        grTraceFacts(trace, "transition returned");
+        vodTrace.visit = undefined;
+        await reset;
+        await innerReset;
+        release!(grReady(1));
+        await pending;
+        grTraceFacts(trace, "old settled");
+        trace.push([
+          "posts",
+          playbackPosts(s).length,
+          "SID",
+          s.runtime.sessionId.value,
+          "source",
+          s.el.src,
+          "loads",
+          s.el.load.mock.calls.length,
+          "hls loads",
+          hls.load.mock.calls.length,
+        ]);
+        grRecord(`abort:${transition}:${nestedReset}`, trace);
+      } finally {
+        vodTrace.visit = undefined;
+        release?.(grReady(1));
+        await s.runtime.reset();
+        await pending?.catch(() => {});
+        s.cleanup();
+        expect(vi.getTimerCount()).toBe(0);
+      }
+    },
+  );
+}
+
+it.each(["pause throw", "data sync throw", "pause reset"] as const)(
+  "generated source owner baseline: pre-try %s preserves existing cleanup and settlement",
+  async (kind) => {
+    const s = setup({ rebuild: true, ranges: [[0, 10]] });
+    const trace: unknown[] = [];
+    const failure = new Error(`baseline ${kind}`);
+    let innerReset: Promise<void> | undefined;
+    let armed = true;
+    try {
+      await s.prepare();
+      s.playing();
+      s.state.value.anchor_position_ms = 15000;
+      const originalPause = s.el.pause.getMockImplementation()!;
+      s.el.pause.mockImplementation(() => {
+        grTraceFacts(trace, "pause");
+        if (armed && kind.startsWith("pause")) {
+          armed = false;
+          if (kind === "pause throw") throw failure;
+          innerReset = s.runtime.reset();
+          grTraceFacts(trace, "pause reset returned");
+        }
+        return originalPause();
+      });
+      vodTrace.visit = (event) => {
+        if (event.startsWith("data ") || event.startsWith("frame "))
+          grTraceFacts(trace, event);
+        if (armed && kind === "data sync throw" && event === "data sync") {
+          armed = false;
+          throw failure;
+        }
+      };
+      vodTrace.recovery = () => grTraceFacts(trace, "recovery evaluation");
+      const reads = s.api.mock.calls.filter(
+        ([, method]) => method === "GET",
+      ).length;
+      const result = s.runtime.applyState(true);
+      grTraceFacts(trace, "caller returned");
+      let settled = false,
+        caught: unknown;
+      const observed = result.then(
+        () => {
+          grTraceFacts(trace, "caller resolved");
+          settled = true;
+        },
+        (error) => {
+          caught = error;
+          grTraceFacts(trace, "caller rejected");
+          settled = true;
+        },
+      );
+      for (let tick = 1; tick <= 30 && !settled; tick++) {
+        await Promise.resolve();
+        trace.push(["tick", tick]);
+      }
+      await observed;
+      await innerReset;
+      vodTrace.visit = vodTrace.recovery = undefined;
+      expect(settled).toBe(true);
+      expect(caught).toBe(kind === "pause reset" ? undefined : failure);
+      trace.push([
+        "new readiness reads",
+        s.api.mock.calls.filter(([, method]) => method === "GET").length -
+          reads,
+      ]);
+      grTraceFacts(trace, "after settlement");
+      grRecord(`prefix:${kind}`, trace);
+    } finally {
+      vodTrace.visit = vodTrace.recovery = undefined;
+      s.el.pause.mockImplementation(() => {
+        s.el.paused = true;
+      });
+      await s.runtime.reset();
+      s.cleanup();
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  },
+);
+
+it.each(["data", "frame"] as const)(
+  "generated source owner baseline: real %s expiry clears recovery before waiting and notice",
+  async (kind) => {
+    const s = setup({ hls: true });
+    const trace: unknown[] = [];
+    const stops: (() => void)[] = [];
+    try {
+      s.el.readyState = kind === "data" ? 1 : 2;
+      if (kind === "frame") {
+        s.el.requestVideoFrameCallback = vi.fn(() => 1);
+        s.el.cancelVideoFrameCallback = vi.fn();
+        s.state.value.playback_status = "playing";
+      }
+      await s.runtime.loadMedia();
+      await vi.advanceTimersByTimeAsync(15000);
+      s.el.error = { code: 2 };
+      s.el.onerror();
+      s.el.seekable = s.el.buffered = intervals([[0, 1]]);
+      grTraceFacts(trace, "recovered at 15000");
+      stops.push(
+        watch(
+          s.runtime.waiting,
+          (value) => {
+            grTraceFacts(trace, `waiting:${value}`);
+            trace.push([
+              "phase at waiting",
+              s.runtime.preparation.value.phase,
+              "notice",
+              s.error.value,
+            ]);
+          },
+          { flush: "sync" },
+        ),
+      );
+      stops.push(
+        watch(
+          s.error,
+          (value) => {
+            grTraceFacts(trace, `notice:${value}`);
+            trace.push([
+              "waiting at notice",
+              s.runtime.waiting.value,
+              "phase",
+              s.runtime.preparation.value.phase,
+            ]);
+          },
+          { flush: "sync" },
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(4999);
+      grTraceFacts(trace, "at 19999");
+      expect(s.error.value).toBe("");
+      await vi.advanceTimersByTimeAsync(1);
+      grTraceFacts(trace, "at 20000");
+      expect(s.error.value).toBe(
+        kind === "data"
+          ? mediaDataTimeout
+          : "播放首帧等待超时，尚未确认画面呈现，请重新加载播放",
+      );
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(s.runtime.sessionId.value).toBe("session-1");
+      expect(s.runtime.video.value).toBe(s.el);
+      grRecord(`timeout:${kind}`, trace);
+    } finally {
+      for (const stop of stops) stop();
+      await s.runtime.reset();
+      s.cleanup();
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  },
+);
+
+it.each([false, true])(
+  "generated source owner baseline: real media terminal entry preserves failure ordering (MSE=%s)",
+  async (mse) => {
+    const s = setup({ hls: true });
+    const trace: unknown[] = [];
+    const stops: (() => void)[] = [];
+    try {
+      hls.supported = mse;
+      if (mse) s.el.canPlayType = () => "";
+      await s.prepare();
+      if (mse)
+        hls.errorHandler!(undefined, { fatal: true, response: { code: 409 } });
+      else {
+        s.el.error = { code: 2 };
+        s.el.onerror();
+        s.el.onerror();
+        s.el.onerror();
+      }
+      grTraceFacts(trace, "before terminal");
+      stops.push(
+        watch(
+          s.runtime.waiting,
+          (value) => {
+            grTraceFacts(trace, `waiting:${value}`);
+            trace.push([
+              "phase at waiting",
+              s.runtime.preparation.value.phase,
+              "notice",
+              s.error.value,
+            ]);
+          },
+          { flush: "sync" },
+        ),
+      );
+      stops.push(
+        watch(
+          s.error,
+          (value) => {
+            grTraceFacts(trace, `notice:${value}`);
+            trace.push([
+              "waiting at notice",
+              s.runtime.waiting.value,
+              "phase",
+              s.runtime.preparation.value.phase,
+            ]);
+          },
+          { flush: "sync" },
+        ),
+      );
+      if (mse)
+        hls.errorHandler!(undefined, {
+          fatal: true,
+          details: "synthetic terminal",
+        });
+      else s.el.onerror();
+      grTraceFacts(trace, "terminal returned");
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(s.runtime.sessionId.value).toBe("session-1");
+      expect(s.runtime.video.value).toBe(s.el);
+      grRecord(`terminal:${mse}`, trace);
+    } finally {
+      for (const stop of stops) stop();
+      await s.runtime.reset();
+      s.cleanup();
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  },
+);
+
+for (const transition of [
+  "reset",
+  "native recovery",
+  "native to MSE",
+] as const) {
+  it.each(["complete", "failed"] as const)(
+    `generated source owner baseline: ${transition} clears naturally reached %s facts`,
+    async (kind) => {
+      const s = setup({
+        hls: transition !== "reset",
+        rebuild: true,
+        ranges: [[0, 10]],
+      });
+      const trace: unknown[] = [];
+      try {
+        hls.supported = transition === "native to MSE";
+        await s.prepare();
+        s.state.value.anchor_position_ms = 15000;
+        if (kind === "failed") {
+          const original = s.api.getMockImplementation()!;
+          s.api.mockImplementation((path, method, body) =>
+            method === "GET"
+              ? Promise.reject(new Error("baseline generated rejection"))
+              : original(path, method, body),
+          );
+          await expect(s.runtime.applyState(true)).rejects.toThrow(
+            "baseline generated rejection",
+          );
+        } else await s.runtime.applyState(true);
+        grTraceFacts(trace, "before transition");
+        vodTrace.visit = (event) => {
+          if (event.startsWith("data ") || event.startsWith("frame "))
+            grTraceFacts(trace, event);
+        };
+        let reset: Promise<void> | undefined;
+        if (transition === "reset") reset = s.runtime.reset();
+        else {
+          s.el.error = { code: transition === "native recovery" ? 2 : 3 };
+          s.el.onerror();
+        }
+        grTraceFacts(trace, "transition returned");
+        vodTrace.visit = undefined;
+        await reset;
+        expect(playbackPosts(s)).toHaveLength(1);
+        grRecord(`facts:${transition}:${kind}`, trace);
+      } finally {
+        vodTrace.visit = undefined;
+        await s.runtime.reset();
+        s.cleanup();
+        expect(vi.getTimerCount()).toBe(0);
+      }
+    },
+  );
+}
+
+it("generated source owner baseline: clock abort reentry reads deadline handles only after nested reset", async () => {
+  const s = setup({ rebuild: true, ranges: [[0, 10]] });
+  let pending: Promise<void> | undefined, reset: Promise<void> | undefined;
+  let release: ((value: unknown) => void) | undefined;
+  const trace: unknown[] = [];
+  try {
+    await s.prepare();
+    s.state.value.anchor_position_ms = 15000;
+    const original = s.api.getMockImplementation()!;
+    (s.api as any).mockImplementation(
+      (path: string, method?: string, body?: unknown, signal?: AbortSignal) => {
+        if (method !== "GET") return original(path, method, body);
+        signal!.addEventListener(
+          "abort",
+          () => {
+            grTraceFacts(trace, "abort listener");
+            reset = s.runtime.reset();
+            grTraceFacts(trace, "nested reset returned");
+          },
+          { once: true },
+        );
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      },
+    );
+    pending = s.runtime.applyState(true);
+    vodTrace.visit = (event) => {
+      if (event.startsWith("data ") || event.startsWith("frame "))
+        grTraceFacts(trace, event);
+    };
+    s.invalidate();
+    grTraceFacts(trace, "clock returned");
+    vodTrace.visit = undefined;
+    await reset;
+    release!(grReady(1));
+    await pending;
+    grTraceFacts(trace, "old settled");
+    expect(s.runtime.sessionId.value).toBe(null);
+    expect(playbackPosts(s)).toHaveLength(1);
+    grRecord("clock:abort reset", trace);
+  } finally {
+    vodTrace.visit = undefined;
+    release?.(grReady(1));
+    await s.runtime.reset();
+    await pending?.catch(() => {});
+    s.cleanup();
+    expect(vi.getTimerCount()).toBe(0);
+  }
+});
+
+// Recorded from probe-03 against exact 5501c9d before candidate code existed.
+const grObservedBaseline: Record<string, unknown[]> = {
+  "successor:false": [
+    ["GET", "session-1", "1"],
+    ["old pending", true, false, null, false],
+    ["GET", "session-2", "2"],
+    ["successor pending", true, false, null, false],
+    ["exact current handle", "data sync", true, false],
+    ["old finally data sync", true, false, null, false],
+    ["exact current handle", "frame sync", true, false],
+    ["old finally frame sync", true, false, null, false],
+    ["old settled", true, false, null, false],
+    ["second apply still pending", true, false, null, false],
+    ["successor settled", false, false, 120, true],
+    ["posts", 2, "SID", "session-2"],
+  ],
+  "successor:true": [
+    ["GET", "session-1", "1"],
+    ["old pending", true, false, null, false],
+    ["GET", "session-2", "2"],
+    ["successor pending", true, false, null, false],
+    ["exact current handle", "data sync", true, false],
+    ["old finally data sync", true, false, null, false],
+    ["exact current handle", "frame sync", true, false],
+    ["old finally frame sync", true, false, null, false],
+    ["old settled", true, false, null, false],
+    ["second apply still pending", true, false, null, false],
+    ["successor settled", false, false, 120, true],
+    ["posts", 2, "SID", "session-2"],
+  ],
+  "clock:complete": [
+    ["before clock", false, false, 120, true],
+    ["data sync", false, false, 120, true],
+    ["frame sync", false, false, 120, true],
+    ["after clock", false, false, 120, true],
+    ["posts", 1, "SID", "session-1"],
+  ],
+  "clock:failed": [
+    ["before clock", false, true, null, false],
+    ["data sync", false, false, null, false],
+    ["frame sync", false, false, null, false],
+    ["after clock", false, false, null, false],
+    ["posts", 1, "SID", "session-1"],
+  ],
+  "clock:pending": [
+    ["before clock", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["data sync", false, false, null, false],
+    ["frame sync", false, false, null, false],
+    ["after clock", false, false, null, false],
+    ["old settled", false, false, null, false],
+    ["posts", 1, "SID", "session-1"],
+  ],
+  "abort:reset:false": [
+    ["before transition", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["frame stop", true, false, null, false],
+    ["data stop", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["transition returned", false, false, null, false],
+    ["old settled", false, false, null, false],
+    ["posts", 1, "SID", null, "source", "", "loads", 2, "hls loads", 0],
+  ],
+  "abort:reset:true": [
+    ["before transition", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["frame stop", true, false, null, false],
+    ["data stop", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["nested reset before", true, false, null, false],
+    ["nested reset returned", false, false, null, false],
+    ["transition returned", false, false, null, false],
+    ["old settled", false, false, null, false],
+    ["posts", 1, "SID", null, "source", "", "loads", 3, "hls loads", 0],
+  ],
+  "abort:native recovery:false": [
+    ["before transition", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["transition returned", false, false, null, true],
+    ["old settled", false, false, null, true],
+    [
+      "posts",
+      1,
+      "SID",
+      "session-1",
+      "source",
+      "http://localhost/authorized.mp4?recovery=1#t=15",
+      "loads",
+      2,
+      "hls loads",
+      0,
+    ],
+  ],
+  "abort:native recovery:true": [
+    ["before transition", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["nested reset before", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["frame stop", true, false, null, false],
+    ["data stop", true, false, null, false],
+    ["nested reset returned", false, false, null, false],
+    ["transition returned", false, false, null, true],
+    ["old settled", false, false, null, true],
+    ["posts", 1, "SID", null, "source", "", "loads", 2, "hls loads", 0],
+  ],
+  "abort:native to MSE:false": [
+    ["before transition", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["transition returned", false, false, null, true],
+    ["old settled", false, false, null, true],
+    ["posts", 1, "SID", "session-1", "source", "", "loads", 2, "hls loads", 1],
+  ],
+  "abort:native to MSE:true": [
+    ["before transition", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["nested reset before", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["frame stop", true, false, null, false],
+    ["data stop", true, false, null, false],
+    ["nested reset returned", false, false, null, false],
+    ["transition returned", false, false, null, true],
+    ["old settled", false, false, null, true],
+    ["posts", 1, "SID", null, "source", "", "loads", 3, "hls loads", 0],
+  ],
+  "prefix:pause throw": [
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["recovery evaluation", true, false, null, false],
+    ["pause", true, false, null, false],
+    ["caller returned", true, false, null, false],
+    ["tick", 1],
+    ["recovery evaluation", true, false, null, false],
+    ["tick", 2],
+    ["caller rejected", true, false, null, false],
+    ["tick", 3],
+    ["new readiness reads", 0],
+    ["after settlement", true, false, null, false],
+  ],
+  "prefix:data sync throw": [
+    ["data sync", true, false, null, false],
+    ["caller returned", true, false, null, false],
+    ["tick", 1],
+    ["recovery evaluation", true, false, null, false],
+    ["tick", 2],
+    ["caller rejected", true, false, null, false],
+    ["tick", 3],
+    ["new readiness reads", 0],
+    ["after settlement", true, false, null, false],
+  ],
+  "prefix:pause reset": [
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["recovery evaluation", true, false, null, false],
+    ["pause", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["recovery evaluation", true, false, null, false],
+    ["frame stop", true, false, null, false],
+    ["data stop", true, false, null, false],
+    ["pause", false, false, null, false],
+    ["pause reset returned", false, false, null, false],
+    ["caller returned", false, false, null, false],
+    ["tick", 1],
+    ["tick", 2],
+    ["recovery evaluation", false, false, null, false],
+    ["tick", 3],
+    ["caller resolved", false, false, null, false],
+    ["tick", 4],
+    ["new readiness reads", 0],
+    ["after settlement", false, false, null, false],
+  ],
+  "timeout:data": [
+    ["recovered at 15000", false, false, null, true],
+    ["at 19999", false, false, null, true],
+    ["waiting:false", false, false, null, false],
+    ["phase at waiting", "ready", "notice", ""],
+    [
+      "notice:媒体数据加载超时，请检查连接或重新加载播放",
+      false,
+      false,
+      null,
+      false,
+    ],
+    ["waiting at notice", false, "phase", "failed"],
+    ["at 20000", false, false, null, false],
+  ],
+  "timeout:frame": [
+    ["recovered at 15000", false, false, null, true],
+    ["at 19999", false, false, null, true],
+    ["waiting:false", false, false, null, false],
+    ["phase at waiting", "ready", "notice", ""],
+    [
+      "notice:播放首帧等待超时，尚未确认画面呈现，请重新加载播放",
+      false,
+      false,
+      null,
+      false,
+    ],
+    ["waiting at notice", false, "phase", "failed"],
+    ["at 20000", false, false, null, false],
+  ],
+  "terminal:false": [
+    ["before terminal", false, false, null, true],
+    ["notice:媒体加载中断，请检查连接后重新加载", false, false, null, false],
+    ["waiting at notice", true, "phase", "ready"],
+    ["waiting:false", false, false, null, false],
+    [
+      "phase at waiting",
+      "failed",
+      "notice",
+      "媒体加载中断，请检查连接后重新加载",
+    ],
+    ["terminal returned", false, false, null, false],
+  ],
+  "terminal:true": [
+    ["before terminal", false, false, null, true],
+    ["notice:媒体加载失败：synthetic terminal", false, false, null, false],
+    ["waiting at notice", true, "phase", "ready"],
+    ["waiting:false", false, false, null, false],
+    [
+      "phase at waiting",
+      "failed",
+      "notice",
+      "媒体加载失败：synthetic terminal",
+    ],
+    ["terminal returned", false, false, null, false],
+  ],
+  "facts:reset:complete": [
+    ["before transition", false, false, 120, true],
+    ["data sync", false, false, 120, true],
+    ["frame sync", false, false, 120, true],
+    ["frame stop", false, false, 120, true],
+    ["data stop", false, false, 120, true],
+    ["transition returned", false, false, null, false],
+  ],
+  "facts:reset:failed": [
+    ["before transition", false, true, null, false],
+    ["frame stop", false, true, null, false],
+    ["data stop", false, true, null, false],
+    ["transition returned", false, false, null, false],
+  ],
+  "facts:native recovery:complete": [
+    ["before transition", false, false, 120, true],
+    ["transition returned", false, false, null, true],
+  ],
+  "facts:native recovery:failed": [
+    ["before transition", false, true, null, false],
+    ["data sync", false, false, null, true],
+    ["frame sync", false, false, null, true],
+    ["transition returned", false, false, null, true],
+  ],
+  "facts:native to MSE:complete": [
+    ["before transition", false, false, 120, true],
+    ["transition returned", false, false, null, true],
+  ],
+  "facts:native to MSE:failed": [
+    ["before transition", false, true, null, false],
+    ["data sync", false, false, null, true],
+    ["frame sync", false, false, null, true],
+    ["transition returned", false, false, null, true],
+  ],
+  "clock:abort reset": [
+    ["abort listener", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["frame stop", true, false, null, false],
+    ["data stop", true, false, null, false],
+    ["nested reset returned", false, false, null, false],
+    ["clock returned", false, false, null, false],
+    ["old settled", false, false, null, false],
+  ],
+};
