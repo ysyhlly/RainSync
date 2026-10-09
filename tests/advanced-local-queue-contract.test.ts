@@ -73,7 +73,7 @@ it("gives advanced queue immutable closed version1 guards without replacing stat
 });
 
 it("dispatches only validated advanced claims before ordinary cache or input effects", () => {
-  const worker = read("apps/media-worker/src/main.rs");
+  const worker = read("apps/media-worker/src/executors/single_output.rs").replace(/\s+/g, "");
   const scheduler = read("apps/media-worker/src/scheduler.rs");
   const dispatch = read("apps/media-worker/src/task_dispatch.rs");
   expect(scheduler).toContain("media_jobs::claim_platform_capable(db, worker)");
@@ -84,13 +84,13 @@ it("dispatches only validated advanced claims before ordinary cache or input eff
   const platform = claims.match(/Queue::PlatformCapable =>[^\n]+/)?.[0];
   expect(platform).toContain("advanced_local_job_spec_valid(j.spec)");
   expect(platform).toContain("native_platform_transcode_job_spec_valid(j.spec)");
-  const gate = worker.indexOf("task_dispatch::SingleOutput::decode(&claim)?");
+  const gate = worker.indexOf("task_dispatch::SingleOutput::decode(claim)?");
   expect(gate).toBeGreaterThan(0);
   expect(gate).toBeLessThan(
-    worker.indexOf("cache::ensure_capacity(app).await?", gate),
+    worker.indexOf("cache::ensure_capacity_at(services.db,services.cache).await?", gate),
   );
   expect(gate).toBeLessThan(
-    worker.indexOf("cache::reserve_output(app, &claim).await?", gate),
+    worker.indexOf("cache::reserve_output_at(services.db,services.cache,claim).await?", gate),
   );
   expect(gate).toBeLessThan(
     worker.indexOf("source_version::verify(spec).await?", gate),
@@ -116,11 +116,19 @@ it("assigns every closed owned ladder validation5 and keeps its read lookup gene
 
 
 it("keeps advanced attempt guards on narrow borrowed ports outside recipe preparation", () => {
-  const worker = read("apps/media-worker/src/main.rs");
+  const worker = read("apps/media-worker/src/executors/single_output.rs").replace(/\s+/g, "");
   const recipe = read("apps/media-worker/src/advanced_media.rs").split("#[cfg(test)]")[0];
   const guards = read("apps/media-worker/src/attempts/advanced.rs");
+  const main = read("apps/media-worker/src/main.rs");
+  const executor = read("apps/media-worker/src/executors/single_output.rs").split("#[cfg(test)]")[0];
+  expect(main).toContain("executors::single_output::run(");
+  expect(executor).not.toContain("App");
+  expect(executor).not.toContain("Scope::new");
+  expect(executor).not.toContain("Gate::default");
+  expect(executor).not.toContain("tokio::spawn");
+  expect(executor).toContain("Box::pin(execute(");
   for (const name of ["prepare_scoped", "verify_scope", "monitor_scope"]) {
-    expect(worker).toContain(`attempts::advanced::${name}(&app.db,`);
+    expect(worker).toContain(`attempts::advanced::${name}(services.db,`);
     expect(recipe).not.toContain(`fn ${name}`);
     expect(guards).toContain(`fn ${name}`);
   }
