@@ -1,7 +1,7 @@
 name: checks
 on: [push, pull_request]
 jobs:
-  checks:
+  core-checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +26,9 @@ jobs:
           RAINSYNC_RECOVERY_SOURCE_ROOT: ${{ github.workspace }}
           RAINSYNC_RECOVERY_PROBE_ROOT: ${{ runner.temp }}/rainsync-validation/upgrade-recovery-contracts
         run: timeout --signal=TERM --kill-after=15s 150s npm run test:upgrade-recovery-contracts
+      - name: Verify CI layer contracts
+        timeout-minutes: 3
+        run: timeout --signal=TERM --kill-after=15s 150s npm run test:verification-contracts
       - name: Verify or install media validation prerequisites
         timeout-minutes: 20
         run: |
@@ -82,11 +85,6 @@ jobs:
         run: |
           timeout --signal=TERM --kill-after=15s 240s node tests/remaining-library-lifecycle.mjs
           timeout --signal=TERM --kill-after=15s 240s node tests/source-resource-limits.mjs
-      - name: Verify recovery integrity and current upgrade baseline
-        timeout-minutes: 4
-        run: |
-          export RAINSYNC_NATIVE_POSTGRES_BIN="$(pg_config --bindir)"
-          timeout --signal=TERM --kill-after=15s 180s node --test tests/recovery-integrity.test.mjs tests/current-baseline-upgrade.test.mjs
       - run: npm run test:accounts
       - name: Verify avatars with the deployment image's FFmpeg
         run: |
@@ -125,6 +123,58 @@ jobs:
           path: ${{ runner.temp }}/rainsync-validation/upstream-profile-admission/*/report.json
           if-no-files-found: ignore
           retention-days: 7
+
+  upgrade-recovery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Isolate upgrade/recovery outputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/rainsync-upgrade-recovery"
+          echo "RAINSYNC_ARTIFACT_DIR=$RUNNER_TEMP/rainsync-upgrade-recovery/artifacts" >> "$GITHUB_ENV"
+          echo "RAINSYNC_RUNTIME_ROOT=$RUNNER_TEMP/rainsync-upgrade-recovery/runtime" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Prepare owned PostgreSQL prerequisites
+        timeout-minutes: 20
+        run: |
+          bash tests/ci-media-prerequisites.sh
+          bash scripts/ci-media-prerequisites.sh
+      - name: Verify recovery integrity and current upgrade baseline
+        timeout-minutes: 4
+        run: |
+          export RAINSYNC_NATIVE_POSTGRES_BIN="$(pg_config --bindir)"
+          npm run test:upgrade-recovery
+      - name: Retain sanitized upgrade/recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-recovery-${{ github.sha }}-${{ github.run_attempt }}
+          # Raw receipts, databases, keys and child output are never uploaded.
+          path: |
+            ${{ runner.temp }}/rainsync-upgrade-recovery/artifacts/*/report.json
+            ${{ runner.temp }}/rainsync-upgrade-recovery/artifacts/*/manifest.json
+            ${{ runner.temp }}/rainsync-upgrade-recovery/artifacts/*/safe-fixtures/*.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  checks:
+    name: checks
+    runs-on: ubuntu-latest
+    needs: [core-checks, upgrade-recovery]
+    if: always()
+    steps:
+      - name: Require both verification layers
+        shell: bash
+        env:
+          CORE_RESULT: ${{ needs.core-checks.result }}
+          RECOVERY_RESULT: ${{ needs.upgrade-recovery.result }}
+        run: |
+          test "$CORE_RESULT" = success
+          test "$RECOVERY_RESULT" = success
 
   # Independent of the broad checks job: a frontend or unrelated integration
   # failure must not silently prevent these owner/commit contracts from running.

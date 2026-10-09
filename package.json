@@ -9,6 +9,8 @@
     "dev": "npm run dev -w apps/web",
     "build": "npm run build -w apps/web",
     "test": "vitest run",
+    "test:upgrade-recovery": "node scripts/verification/upgrade-recovery.mjs",
+    "test:verification-contracts": "node --test tests/verification-layers.test.mjs",
     "test:upgrade-recovery-contracts": "node --test tests/upgrade-recovery-evidence.test.mjs",
     "test:backend-contracts": "node --test tests/backend-cleanup-contract.test.mjs tests/server-bootstrap-contract.test.mjs",
     "test:review-regressions": "node tests/login-admission-regressions.mjs && node tests/source-mutation-authority.mjs && node tests/playlist-chat-regressions.mjs && node tests/preview-lease-regressions.mjs && node tests/http-transport-classification.mjs",
