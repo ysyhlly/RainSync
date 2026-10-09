@@ -45,6 +45,7 @@ const frontendInputs = [
   "apps/web/src/features/playback/playback-session-controller.ts",
   "apps/web/src/features/playback/hls-driver-loader.ts",
   "apps/web/src/features/playback/drivers/hls-driver.ts",
+  "apps/web/src/features/playback/drivers/media-io.ts",
   "apps/web/src/features/playback/drivers/native-driver.ts",
   "apps/web/src/features/playback/dash-driver-loader.ts",
   "apps/web/src/features/playback/drivers/dash-driver.ts",

@@ -9,6 +9,7 @@ import {
   type PlaybackState,
 } from "../../../../../packages/sync-engine";
 import type { createPlaybackSynchronization } from "./playback-synchronization";
+import type { VodMediaPort } from "./drivers/media-io";
 
 type VodTickState = Readonly<Omit<PlaybackState, "live">> & {
   readonly live?: Readonly<NonNullable<PlaybackState["live"]>>;
@@ -16,13 +17,6 @@ type VodTickState = Readonly<Omit<PlaybackState, "live">> & {
 type VodTickPlan = Readonly<
   Pick<PlaybackPlan, "timeline_origin_ms" | "rebuild_on_seek">
 >;
-type VodTickElement = Pick<HTMLVideoElement, "currentTime"> &
-  Readonly<
-    Pick<
-      HTMLVideoElement,
-      "seekable" | "buffered" | "ended" | "paused" | "seeking" | "readyState"
-    >
-  >;
 type VodCorrectionOwner = Readonly<
   Pick<
     ReturnType<typeof createPlaybackSynchronization<object>>,
@@ -58,10 +52,11 @@ export function createVodTickPolicy(ctx: {
 }) {
   return (
     s: VodTickState,
-    el: VodTickElement,
+    media: VodMediaPort,
     p: VodTickPlan,
     usable: boolean,
   ) => {
+    const el = media.facts;
     if (!ctx.dragging.value)
       ctx.position.value = el.currentTime + p.timeline_origin_ms / 1000;
     if (!usable || s.playback_status !== "playing") {
@@ -126,6 +121,6 @@ export function createVodTickPolicy(ctx: {
       ctx.synchronization.resetCorrection();
       return;
     }
-    if (adjustment.seek) el.currentTime = expected;
+    if (adjustment.seek) media.seek(expected);
   };
 }

@@ -2898,3 +2898,45 @@ it.each(["hidden", "disconnected"])(
     }
   },
 );
+
+it.each(["native reload", "native to MSE", "MSE reload"] as const)(
+  "%s keeps the same rate rejection proof on the permanent element",
+  async (path) => {
+    const s = setup({
+      hls: true,
+      acceptRate: (requested, actual) => (requested === 1 ? 1 : actual),
+    });
+    try {
+      hls.supported = path !== "native reload";
+      if (path === "MSE reload") s.el.canPlayType = () => "";
+      await s.prepare();
+      s.playing();
+      s.state.value.anchor_position_ms = 10400;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(s.writes).toHaveBeenCalledOnce();
+      expect(s.el.playbackRate).toBe(1);
+      if (path === "MSE reload") {
+        hls.errorHandler?.(undefined, {
+          fatal: true,
+          response: { code: 409 },
+        });
+      } else {
+        s.el.error = { code: path === "native to MSE" ? 3 : 2 };
+        s.el.onerror();
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      s.runtime.waiting.value = false;
+      s.playing();
+      s.el.currentTime = 10;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(s.writes).toHaveBeenCalledOnce();
+      expect(s.el.playbackRate).toBe(1);
+      expect(s.runtime.sessionId.value).toBe("session-1");
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(s.runtime.video.value).toBe(s.el);
+      expect(s.error.value).toBe("");
+    } finally {
+      s.cleanup();
+    }
+  },
+);

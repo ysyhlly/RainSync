@@ -1,10 +1,11 @@
 import { PlaybackRateSupport } from "../../../../../packages/player-core";
 import { Corrector } from "../../../../../packages/sync-engine";
+import type { PlaybackRateIO } from "./drivers/media-io";
 
 export type PlaybackRateFacts = Readonly<
   Pick<PlaybackRateSupport, "baseSupported" | "fineUnsupported">
 >;
-type SynchronizationElement = Pick<HTMLVideoElement, "pause" | "playbackRate">;
+type SynchronizationElement = Pick<HTMLVideoElement, "pause">;
 
 /** One synchronous action/rate owner for VOD, live and explicit gestures.
  * The caller retains play promises, seek policy, grants and loading deadlines. */
@@ -191,7 +192,7 @@ export function createPlaybackSynchronization<Plan extends object>(ctx: {
     preparedSeek(revision: number) {
       if (revision === seekRevision) clearPendingApply();
     },
-    attachRateElement(element: SynchronizationElement) {
+    attachRateElement(element: PlaybackRateIO) {
       const tracker = new PlaybackRateSupport(element);
       rates = tracker;
       // A snapshot keeps the tracker selected at its original read point.

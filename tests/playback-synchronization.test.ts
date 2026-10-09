@@ -215,6 +215,8 @@ function finiteSynchronizationPorts(
   context.element()?.play();
   // @ts-expect-error The owner has no source attachment capability.
   context.element()!.src = "/replacement";
+  // @ts-expect-error Play-action identity does not carry rate-write authority.
+  context.element()!.playbackRate = 2;
   // @ts-expect-error Timeline seeks stay in the VOD/live policy branches.
   context.element()!.currentTime = 20;
   // @ts-expect-error Synchronization receives no mutable clock instance.
@@ -258,7 +260,11 @@ function finiteVodTickPorts(
   input[1].playbackRate = 2;
   // @ts-expect-error Periodic correction does not receive session/grant identity.
   input[2].session_id;
-  input[1].currentTime = 10;
+  // @ts-expect-error VOD receives readonly facts and an explicit seek action.
+  input[1].facts.currentTime = 10;
+  // @ts-expect-error The rate I/O view remains private to the shared tracker.
+  input[1].rate;
+  input[1].seek(10);
   context.position.value = 10;
 }
 void finiteVodTickPorts;

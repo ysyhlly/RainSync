@@ -1,6 +1,7 @@
 import { evaluatePlaybackRecovery } from "./playback-recovery-state";
 import { createPlaybackSynchronization } from "./playback-synchronization";
 import { createVodTickPolicy } from "./vod-tick-policy";
+import { createPlaybackMediaIO } from "./drivers/media-io";
 import { createLiveTickPolicy } from "./live-tick-policy";
 import { createPlaybackSessionController, checkCandidateLifetime } from "./playback-session-controller";
 export type { PlaybackRecoveryState } from "./playback-runtime-types";
@@ -198,6 +199,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     provider === "tiktok" ||
     provider === "youtube";
   const roomIsActive = () => timeline.active?.value !== false;
+  let mediaIO: ReturnType<typeof createPlaybackMediaIO>;
   const video = ref<HTMLVideoElement>(),
     waiting = ref(false),
     blocked = ref(false),
@@ -3049,7 +3051,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       tickLive(s, el, p);
       return;
     }
-    tickVod(s, el, p, usable);
+    tickVod(s, mediaIO, p, usable);
   }
   function onClockInvalidated() {
     synchronization.invalidateClock();
@@ -3165,8 +3167,9 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   function attach(element: HTMLVideoElement) {
     if (video.value === element) return;
     if (video.value) throw new Error("播放器已绑定；需先显式停止");
+    mediaIO = createPlaybackMediaIO(element);
     video.value = element;
-    synchronization.attachRateElement(element);
+    synchronization.attachRateElement(mediaIO.rate);
     if (
       !readPlan() &&
       pendingLoad &&
