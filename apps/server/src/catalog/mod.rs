@@ -10,6 +10,7 @@ pub(crate) mod room_shares;
 pub(crate) mod source_rules;
 pub(crate) mod source_settings;
 pub(crate) mod sources;
+pub(crate) mod titles;
 
 use crate::{Result, User, err};
 use axum::http::{HeaderMap, StatusCode};
