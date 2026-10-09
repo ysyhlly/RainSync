@@ -12,6 +12,11 @@ const playback = vi.hoisted(() => ({
 }));
 vi.mock("../apps/web/src/features/playback/playback-runtime", () => ({
   createPlaybackRuntime: () => ({
+    // RoomPage action registration requires these unused capabilities.
+    useDistributedOutput: () => { throw Error("Unexpected useDistributedOutput in room-request-scopes.test.ts"); },
+    useOriginalSource: () => { throw Error("Unexpected useOriginalSource in room-request-scopes.test.ts"); },
+    startPeerSharing: () => { throw Error("Unexpected startPeerSharing in room-request-scopes.test.ts"); },
+    stopPeerSharing: () => { throw Error("Unexpected stopPeerSharing in room-request-scopes.test.ts"); },
     // Host action registration requires these unused capabilities.
     attach: () => { throw Error("Unexpected attach in room-request-scopes.test.ts"); },
     enablePlayback: () => { throw Error("Unexpected enablePlayback in room-request-scopes.test.ts"); },

@@ -18,6 +18,11 @@ vi.mock("../apps/web/src/features/playback/playback-runtime", () => ({
   createPlaybackRuntime: (ctx: any) => {
     playback.ctx = ctx;
     return {
+      // RoomPage action registration requires these unused capabilities.
+      useDistributedOutput: () => { throw Error("Unexpected useDistributedOutput in room-clock-recovery.test.ts"); },
+      useOriginalSource: () => { throw Error("Unexpected useOriginalSource in room-clock-recovery.test.ts"); },
+      startPeerSharing: () => { throw Error("Unexpected startPeerSharing in room-clock-recovery.test.ts"); },
+      stopPeerSharing: () => { throw Error("Unexpected stopPeerSharing in room-clock-recovery.test.ts"); },
       // Host action registration requires these unused capabilities.
       attach: () => { throw Error("Unexpected attach in room-clock-recovery.test.ts"); },
       enablePlayback: () => { throw Error("Unexpected enablePlayback in room-clock-recovery.test.ts"); },

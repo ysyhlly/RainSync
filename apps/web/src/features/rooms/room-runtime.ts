@@ -52,6 +52,7 @@ import { createRoomPlaybackFacade } from "./projection/playback-view";
 import { createPlaybackSettingsPort } from "../playback/playback-settings-port";
 import { createPlaybackControlsPort } from "../playback/playback-controls-port";
 import { createPlaybackHostPort } from "../playback/playback-host-port";
+import { createPlaybackRoomPort } from "../playback/playback-room-port";
 import {
   createRoomTransport,
   type RoomConnection,
@@ -381,6 +382,16 @@ export const useRoomRuntime = defineStore("room-runtime", ({ action }) => {
     playback,
     actions: settingsActions,
     hasMedia: () => !!state.value?.media_id,
+  });
+  // Preserve the original public action names without changing raw owner calls.
+  const playbackRoom = createPlaybackRoomPort({
+    playback,
+    actions: {
+      useDistributedOutput: action(playback.useDistributedOutput, "useDistributedOutput"),
+      useOriginalSource: action(playback.useOriginalSource, "useOriginalSource"),
+      startPeerSharing: action(playback.startPeerSharing, "startPeerSharing"),
+      stopPeerSharing: action(playback.stopPeerSharing, "stopPeerSharing"),
+    },
   });
   // The epoch is invalidated before session.user changes. Keep the original
   // login-only notice clearing rule without scheduling another room cleanup.
@@ -749,6 +760,7 @@ export const useRoomRuntime = defineStore("room-runtime", ({ action }) => {
     playbackControls,
     playbackSettings,
     playbackHost,
+    playbackRoom,
     ...createRoomPlaybackFacade(playback),
     runPlayback: settingsActions.runPlayback,
     loadMedia: settingsActions.loadMedia,

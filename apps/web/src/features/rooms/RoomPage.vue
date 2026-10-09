@@ -220,7 +220,7 @@ function prewarmQueueItem(id: string) {
   if (!r.roomActive || !r.connected || !r.can("change_media")) return;
   void prewarmNativeDash(
     catalog.roomRecord(r.room?.id, id),
-    r.nativePlaybackMode,
+    r.playbackRoom.nativePlaybackMode,
   );
 }
 function chooseQueueItem(id: string) {
@@ -231,12 +231,12 @@ watch(
   currentMedia,
   (media) => {
     if (r.roomActive && r.connected)
-      void prewarmNativeDash(media, r.nativePlaybackMode);
+      void prewarmNativeDash(media, r.playbackRoom.nativePlaybackMode);
   },
   { immediate: true },
 );
 const currentDuration = computed(() =>
-  r.duration > 0 ? r.duration : (currentMedia.value?.duration_ms ?? 0) / 1000,
+  r.playbackRoom.duration > 0 ? r.playbackRoom.duration : (currentMedia.value?.duration_ms ?? 0) / 1000,
 );
 const playbackPermissions = computed(() =>
   roomPermissionOptions.filter(
@@ -631,7 +631,7 @@ async function transferOwnership() {
             </div>
             <p v-if="r.state?.media_id" class="helper">
               {{
-                r.live
+                r.playbackRoom.live
                   ? "直播"
                   : currentDuration > 0
                     ? formatTime(currentDuration)
@@ -639,11 +639,11 @@ async function transferOwnership() {
               }}
               ·
               {{ playbackPermissionSummary
-              }}<template v-if="r.playbackSummary">
-                · {{ r.playbackSummary.mode }}</template
+              }}<template v-if="r.playbackRoom.playbackSummary">
+                · {{ r.playbackRoom.playbackSummary.mode }}</template
               >
-              <template v-if="r.recoveryLabel">
-                · {{ r.recoveryLabel }}</template
+              <template v-if="r.playbackRoom.recoveryLabel">
+                · {{ r.playbackRoom.recoveryLabel }}</template
               >
             </p>
             <p v-else class="helper">{{ preparationMessage }}</p>
@@ -822,14 +822,14 @@ async function transferOwnership() {
         v-if="managementOpen && r.room && r.state && r.roomActive"
         :room-id="r.room.id"
         :media-generation="r.state.media_generation"
-        :audio-index="r.audioIndex"
-        :active-job="r.distributedFacts?.job_id"
-        :sharing="r.peerSharing"
-        :stats="r.peerStats"
-        :activate="r.useDistributedOutput"
-        :original="r.useOriginalSource"
-        :share="r.startPeerSharing"
-        :stop-sharing="r.stopPeerSharing"
+        :audio-index="r.playbackRoom.audioIndex"
+        :active-job="r.playbackRoom.distributedFacts?.job_id"
+        :sharing="r.playbackRoom.peerSharing"
+        :stats="r.playbackRoom.peerStats"
+        :activate="r.playbackRoom.useDistributedOutput"
+        :original="r.playbackRoom.useOriginalSource"
+        :share="r.playbackRoom.startPeerSharing"
+        :stop-sharing="r.playbackRoom.stopPeerSharing"
       />
     </AppDialog>
     <AppDialog v-model="inviteOpen" title="房间邀请" drawer :busy="busy"

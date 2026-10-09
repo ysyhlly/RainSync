@@ -97,9 +97,6 @@ const deleted = [
   "cancelPreparation",
   "enablePlayback",
   "applySubtitles",
-] as const;
-const retained = [
-  "runPlayback",
   "distributedFacts",
   "peerStats",
   "peerSharing",
@@ -107,22 +104,25 @@ const retained = [
   "useOriginalSource",
   "startPeerSharing",
   "stopPeerSharing",
-  "waiting",
-  "nativePlatform",
-  "nativePlaybackMode",
   "live",
   "audioIndex",
   "duration",
+  "playbackSummary",
+] as const;
+const retained = [
+  "runPlayback",
+  "waiting",
+  "nativePlatform",
+  "nativePlaybackMode",
   "position",
   "sessionId",
   "recoveryState",
-  "playbackSummary",
   "recoveryLabel",
   "loadMedia",
   "attach",
 ] as const;
 
-it("real composition removes twelve unused aliases and shares original named action wrappers", async () => {
+it("real composition keeps retired aliases absent and shares original named Host action wrappers", async () => {
   vi.useFakeTimers();
   vi.stubGlobal("document", new EventTarget());
   vi.stubGlobal("window", new EventTarget());
@@ -142,8 +142,8 @@ it("real composition removes twelve unused aliases and shares original named act
   });
   const runtime = useRoomRuntime();
   try {
-    expect(deleted).toHaveLength(12);
-    expect(retained).toHaveLength(21);
+    expect(deleted).toHaveLength(23);
+    expect(retained).toHaveLength(10);
     for (const key of deleted) expect(key in runtime, key).toBe(false);
     for (const key of retained) expect(key in runtime, key).toBe(true);
     const port = runtime.playbackHost;
