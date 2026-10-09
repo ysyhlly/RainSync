@@ -1,6 +1,7 @@
 import { expect, it, vi } from "vitest";
 import { createPlaybackSynchronization } from "../apps/web/src/features/playback/playback-synchronization";
 import type { createVodTickPolicy } from "../apps/web/src/features/playback/vod-tick-policy";
+import type { createLiveTickPolicy } from "../apps/web/src/features/playback/live-tick-policy";
 
 function setup() {
   const element = { pause: vi.fn(), playbackRate: 1 };
@@ -253,3 +254,38 @@ function finiteVodTickPorts(
   context.position.value = 10;
 }
 void finiteVodTickPorts;
+
+type LiveTickFactory = typeof createLiveTickPolicy<
+  Readonly<{ playback_status: string }>,
+  object
+>;
+function finiteLiveTickPorts(
+  context: Parameters<LiveTickFactory>[0],
+  input: Parameters<ReturnType<LiveTickFactory>>,
+) {
+  // @ts-expect-error Periodic live convergence has no general request client.
+  context.api;
+  // @ts-expect-error The live tick cannot claim another play action.
+  context.synchronization.claimPlay();
+  // @ts-expect-error Decoder-edge policy, not the tick, owns rate operations.
+  context.synchronization.ensureBaseRate();
+  // @ts-expect-error A tick cannot reset the terminal episode.
+  context.terminalEnd = false;
+  // @ts-expect-error Existing recovery owns edge-seeking state.
+  context.needsEdge = true;
+  // @ts-expect-error Only the existing bounded state-change failure is accepted.
+  context.fail(input[2], "UNOWNED_RETRY");
+  // @ts-expect-error The tick has no room-wide seek authority.
+  context.apply(true, true);
+  // @ts-expect-error The selected playback status is readonly.
+  input[0].playback_status = "playing";
+  // @ts-expect-error The tick cannot seek the video itself.
+  input[1].currentTime = 10;
+  // @ts-expect-error The tick cannot play the video itself.
+  input[1].play();
+  // @ts-expect-error Rate writes stay with the shared synchronization owner.
+  input[1].playbackRate = 2;
+  // @ts-expect-error Plan identity is opaque to the periodic policy.
+  input[2].session_id;
+}
+void finiteLiveTickPorts;

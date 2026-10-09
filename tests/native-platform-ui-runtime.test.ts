@@ -2367,3 +2367,86 @@ it.each([
     }
   },
 );
+
+it("live periodic convergence keeps paused time local and resumes only at the decoder edge", async () => {
+  const f = setup({ live: true });
+  try {
+    f.clock.ready = false;
+    await f.runtime.loadMedia();
+    f.element.readyState = 2;
+    f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+    f.element.currentTime = 102;
+    f.runtime.position.value = 999;
+    f.runtime.duration.value = 999;
+    f.element.pause.mockClear();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(f.runtime.position.value).toBe(0);
+    expect(f.runtime.duration.value).toBe(0);
+    expect(f.element.currentTime).toBe(102);
+    expect(f.element.pause).toHaveBeenCalledOnce();
+    expect(f.element.play).not.toHaveBeenCalled();
+    f.state.value.playback_status = "playing";
+    await vi.advanceTimersByTimeAsync(500);
+    expect(f.element.currentTime).toBe(127);
+    expect(f.element.play).toHaveBeenCalledOnce();
+    expect(f.clock.ready).toBe(false);
+    expect(f.runtime.video.value).toBe(f.element);
+    expect(f.bodies).toHaveLength(1);
+    expect(f.ended).not.toHaveBeenCalled();
+  } finally {
+    f.cleanup();
+  }
+});
+
+it.each(["broadcast", "media"] as const)(
+  "live periodic convergence rejects a changed %s identity before classifying ended media",
+  async (identity) => {
+    const f = setup({ live: true });
+    try {
+      await f.runtime.loadMedia();
+      f.element.readyState = 2;
+      f.element.ended = true;
+      if (identity === "broadcast")
+        f.state.value.live = {
+          ...f.state.value.live,
+          broadcast_id: "12:34:1700000001",
+        };
+      else f.state.value.media_generation++;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(f.runtime.preparation.value.failure?.code).toBe(
+        "NATIVE_LIVE_STATE_CHANGED",
+      );
+      expect(f.element.play).not.toHaveBeenCalled();
+      expect(f.bodies).toHaveLength(1);
+      expect(f.ended).not.toHaveBeenCalled();
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+it("live periodic convergence preserves a terminal episode without repeating its failure", async () => {
+  const f = setup({ live: true });
+  try {
+    await f.runtime.loadMedia();
+    f.element.readyState = 2;
+    f.element.ended = true;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "NATIVE_LIVE_NOT_BROADCASTING",
+    );
+    f.error.value = "independent current notice";
+    f.element.pause.mockClear();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.error.value).toBe("independent current notice");
+    expect(f.element.pause).not.toHaveBeenCalled();
+    expect(f.element.play).not.toHaveBeenCalled();
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "NATIVE_LIVE_NOT_BROADCASTING",
+    );
+    expect(f.bodies).toHaveLength(1);
+    expect(f.ended).not.toHaveBeenCalled();
+  } finally {
+    f.cleanup();
+  }
+});

@@ -1,6 +1,7 @@
 import { evaluatePlaybackRecovery } from "./playback-recovery-state";
 import { createPlaybackSynchronization } from "./playback-synchronization";
 import { createVodTickPolicy } from "./vod-tick-policy";
+import { createLiveTickPolicy } from "./live-tick-policy";
 import { createPlaybackSessionController, checkCandidateLifetime } from "./playback-session-controller";
 export type { PlaybackRecoveryState } from "./playback-runtime-types";
 import { createLiveWindowRecovery } from "./live-window-recovery";
@@ -606,6 +607,22 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     },
     completed: () => {
       void completed();
+    },
+  });
+  const tickLive = createLiveTickPolicy({
+    synchronization,
+    position,
+    duration,
+    get terminalEnd() {
+      return terminalEnd;
+    },
+    get needsEdge() {
+      return liveNeedsEdge;
+    },
+    matches: liveRoomMatchesPlan,
+    fail: failNativeLive,
+    apply: () => {
+      void runAutomaticApply();
     },
   });
   function queueApply(force = false, userSeek = false) {
@@ -3003,21 +3020,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     if (!s || !el || !p) return;
     if (failedCompatibilityPlan === p) return;
     if (p.native_platform?.live) {
-      position.value = duration.value = 0;
-      synchronization.resetCorrection();
-      if (!liveRoomMatchesPlan(s, p)) {
-        failNativeLive(p, "NATIVE_LIVE_STATE_CHANGED");
-        return;
-      }
-      if (el.ended) {
-        if (!terminalEnd) failNativeLive(p);
-        return;
-      }
-      if (
-        !terminalEnd &&
-        (s.playback_status !== "playing" || el.paused || liveNeedsEdge)
-      )
-        void runAutomaticApply();
+      tickLive(s, el, p);
       return;
     }
     tickVod(s, el, p, usable);
