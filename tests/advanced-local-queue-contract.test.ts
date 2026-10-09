@@ -113,3 +113,25 @@ it("assigns every closed owned ladder validation5 and keeps its read lookup gene
   expect(jobs).toContain('output_validation_version(&claim.spec["kind"])');
   expect(reader).toContain("'advanced_owned_hls_ladder_v1'");
 });
+
+
+it("keeps advanced attempt guards on narrow borrowed ports outside recipe preparation", () => {
+  const worker = read("apps/media-worker/src/main.rs");
+  const recipe = read("apps/media-worker/src/advanced_media.rs").split("#[cfg(test)]")[0];
+  const guards = read("apps/media-worker/src/attempts/advanced.rs");
+  for (const name of ["prepare_scoped", "verify_scope", "monitor_scope"]) {
+    expect(worker).toContain(`attempts::advanced::${name}(&app.db,`);
+    expect(recipe).not.toContain(`fn ${name}`);
+    expect(guards).toContain(`fn ${name}`);
+  }
+  for (const dependency of ["super::App", "persistence::", "sqlx::"]) {
+    expect(recipe).not.toContain(dependency);
+  }
+  expect(guards).toContain("db: &PgPool");
+  expect(guards).toContain("claim: &Claim");
+  expect(guards).toContain("prepared: Option<&Prepared>");
+  expect(guards).toContain("tokio::pin!(work)");
+  expect(guards).not.toContain("App");
+  expect(guards).not.toContain("tokio::spawn");
+  expect(guards).not.toContain("Scope::new");
+});

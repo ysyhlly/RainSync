@@ -781,7 +781,7 @@ async fn run_next_job(
             // and FFmpeg's default fMP4 init belongs to this owned output.
             let dir = std::path::absolute(dir).map_err(cache::write_error)?;
             let audio_index = task.audio_index()?;
-            let advanced = if native {Some(native_platform_transcode::prepare(app,&claim,&dir.join("index.m3u8"),input_failure.token()).await?)} else {advanced_media::prepare_scoped(app, &claim, &input, &dir.join("index.m3u8"), audio_index).await?};
+            let advanced = if native {Some(native_platform_transcode::prepare(app,&claim,&dir.join("index.m3u8"),input_failure.token()).await?)} else {attempts::advanced::prepare_scoped(&app.db, &claim, &input, &dir.join("index.m3u8"), audio_index).await?};
             let mut args = if let Some(advanced) = &advanced {
                 advanced.args.clone()
             } else if let Some(mode)=task.negotiated_mode() {
@@ -828,7 +828,7 @@ async fn run_next_job(
                 app.readiness.check_lease(process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, &claim))).await
             }, async {
                 tokio::select! {
-                    error = advanced_media::monitor_scope(app, &claim, advanced.as_ref()) => error,
+                    error = attempts::advanced::monitor_scope(&app.db, &claim, advanced.as_ref()) => error,
                     error = cache::monitor(app) => error,
                     error = output_publish::monitor(&app.db, &claim, persistence::media_jobs::output_dir(&app.cache, claim.id, claim.attempt), output_builder.clone(), &output_decoder) => error,
                 }
@@ -887,7 +887,7 @@ async fn run_next_job(
             result = match process::finalization_deadline(Duration::from_secs(10), async {
                 let proof=output_publish::prepare(output_builder.clone(), directory, true, &output_decoder).await?;
                 source_version::verify(&claim.spec).await?;
-                advanced_media::verify_scope(app, &claim).await?;
+                attempts::advanced::verify_scope(&app.db, &claim).await?;
                 if claim.spec["kind"]==persistence::native_platform_transcode::KIND {native_platform_transcode::validate_completed(&claim.spec,&proof)?;}
                 Ok(proof)
             }).await {
