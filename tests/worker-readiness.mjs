@@ -6,9 +6,10 @@ import { delimiter, resolve } from "node:path";
 import { isolatedMediaStack } from "./fixtures/media-stack.mjs";
 import { delay } from "./fixtures/server.mjs";
 import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
+import { safeFailure } from "./fixtures/safe-failure.mjs";
 
 assert.notEqual(process.platform, "win32", "This focused POSIX fault fixture uses shell tool wrappers");
-const report = { schema_version: 1, result: "running", checks: [] };
+const report = { schema_version: 1, result: "running", active_stage: "fixture-start", checks: [] };
 let fixture;
 const quote = s => `'${s.replaceAll("'", "'\\''")}'`;
 const until = async (predicate, label, timeout = 18000) => {
@@ -20,6 +21,7 @@ try {
   await isolatedMediaStack("worker-readiness", async f => {
     fixture = f;
     const workerBinary = resolve(f.target, "rainsync-media-worker");
+    report.active_stage = "bounded-database-tests";
     const rust = execFileSync("cargo", ["test", "--offline", "-p", "rainsync-media-worker", "--test", "readiness_runtime", "postgres_timeout_cancellation_and_pool_exhaustion_recover", "--", "--ignored", "--nocapture"], {
       env: { ...process.env, RAINSYNC_READINESS_TEST_DATABASE_URL: f.env.DATABASE_URL },
       timeout: 60000, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
@@ -29,6 +31,7 @@ try {
     // A package-scoped Cargo test can relink the non-test Worker with a narrower
     // dependency feature set. Restore the complete workspace build before
     // hashing or launching the services used by the HTTP fixture.
+    report.active_stage = "workspace-restore";
     const build = execFileSync("cargo", ["build", "--workspace", "--bins", "--examples", "--locked"], {
       env: process.env, timeout: 120000, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
     });
@@ -42,8 +45,12 @@ try {
       const actual = execFileSync("which", [tool], { encoding: "utf8" }).trim();
       await writeFile(resolve(tools, tool), `#!/bin/sh\nif [ -e ${quote(resolve(tools, tool + "-fail"))} ]; then exit 1; fi\nif [ -e ${quote(resolve(tools, tool + "-hang"))} ]; then\n  echo $$ > ${quote(resolve(tools, tool + "-pid"))}\n  sleep 120 &\n  echo $! > ${quote(resolve(tools, tool + "-child-pid"))}\n  wait\n  exit 1\nfi\nexec ${quote(actual)} "$@"\n`, { mode: 0o700 });
     }
+    report.active_stage = "worker-start";
     await f.startWorker({ PATH: tools + delimiter + process.env.PATH, CACHE_MAX_BYTES: "1048576" });
     const workerPid = f.workerPid;
+    const workerPort = Number(new URL(f.workerOrigin).port);
+    report.worker = { pid: workerPid, port: workerPort };
+    report.active_stage = "functional-checks";
     const ready = async () => {
       const response = await fetch(f.workerOrigin + "/ready", { signal: AbortSignal.timeout(1500) });
       assert.equal(response.headers.get("cache-control"), "no-store");
@@ -103,21 +110,49 @@ try {
     await until(async () => (await ready()).status === 200, "claim loop recovers after owned lock release");
     report.checks.push("real claim advisory-lock fault returns 503 despite healthy independent DB probe, then queue recovers");
 
-    await f.stopWorker();
-    assert.ok(verifyPidAbsent(workerPid));
-    assert.ok(await verifyClosedPort(Number(new URL(f.workerOrigin).port)));
+    report.active_stage = "worker-stop";
+    report.worker_stop = await f.stopWorker();
+    report.worker_stop_recorded_at = new Date().toISOString();
+    report.active_stage = "worker-pid-absence";
+    report.worker_pid_absent = verifyPidAbsent(workerPid);
+    assert.ok(report.worker_pid_absent);
+    report.active_stage = "worker-port-closure";
+    const portProbeStarted = performance.now();
+    report.worker_port_probe = { port: workerPort, started_at: new Date().toISOString(), outcome: "pending" };
+    try {
+      const closed = await verifyClosedPort(workerPort);
+      report.worker_port_probe.outcome = closed ? "closed" : "connected";
+      assert.ok(closed);
+    } catch (error) {
+      if (report.worker_port_probe.outcome === "pending") {
+        report.worker_port_probe.outcome = error.message === "Owned fixture port closure unconfirmed" ? "timeout" : "probe-failed";
+      }
+      throw error;
+    } finally {
+      report.worker_port_probe.finished_at = new Date().toISOString();
+      report.worker_port_probe.elapsed_ms = performance.now() - portProbeStarted;
+    }
+    report.active_stage = "cache-residue";
     assert.deepEqual(await readdir(cache), []);
     report.worker_cleanup = { pid: workerPid, pid_absent: true, port_closed: true, cache_probe_files: 0 };
     report.checks.push("shutdown closes owned Worker process/listener and leaves no cache probe files");
+    report.active_stage = "completed";
     report.result = "passed";
   }, { binary: process.env.RAINSYNC_READINESS_SERVER_BINARY });
 } catch (error) {
   report.result = "failed";
-  report.failure = String(error.stack ?? error);
+  report.failure = safeFailure(error);
   process.exitCode = 1;
 } finally {
   if (fixture) {
-    report.cleanup = await fixture.verifyStopped();
+    try {
+      report.cleanup = await fixture.verifyStopped();
+    } catch (error) {
+      report.result = "failed";
+      report.cleanup = { completed: false, verification: "unconfirmed" };
+      report.cleanup_failure = safeFailure(error);
+      process.exitCode = 1;
+    }
     report.postgres = fixture.postgresDiagnostics();
     await writeFile(resolve(fixture.root, "report.json"), JSON.stringify(report, null, 2));
     console.log(`${report.result}: ${resolve(fixture.root, "report.json")}`);
