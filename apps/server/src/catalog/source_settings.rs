@@ -49,6 +49,8 @@ pub(crate) async fn get(
         &row.get::<String, _>("config_encrypted"),
     )?)?;
     let value = safe_detail(&row, &config);
+    // The source lock may wait beyond this exact login's natural expiry.
+    lock_admin(&mut tx, user, h).await?;
     tx.commit().await?;
     Ok(value)
 }
