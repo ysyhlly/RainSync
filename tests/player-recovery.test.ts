@@ -2601,3 +2601,63 @@ it("clearing the current media closes the old session without requiring clock ca
     s.cleanup();
   }
 });
+
+it("clock recalibration keeps one pending play across automatic and gesture entry points", async () => {
+  const s = setup();
+  try {
+    await s.prepare();
+    s.state.value.playback_status = "playing";
+    let reject!: (reason: Error) => void;
+    s.el.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, fail) => {
+          reject = fail;
+        }),
+    );
+    const playing = s.runtime.applyState();
+    s.invalidate();
+    s.clock.ready = true;
+    s.runtime.onClockReady();
+    await s.runtime.enablePlayback();
+    expect(s.el.play).toHaveBeenCalledTimes(1);
+    reject(new DOMException("retired clock result", "NotAllowedError"));
+    await playing;
+    expect(s.runtime.blocked.value).toBe(false);
+    await s.runtime.enablePlayback();
+    expect(s.el.play).toHaveBeenCalledTimes(2);
+    expect(s.el.paused).toBe(false);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("a later PAUSE still wins when the old play settles during clock recalibration", async () => {
+  const s = setup();
+  try {
+    await s.prepare();
+    s.state.value.playback_status = "playing";
+    let resolve!: () => void;
+    s.el.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((done) => {
+          resolve = () => {
+            s.el.paused = false;
+            done();
+          };
+        }),
+    );
+    const playing = s.runtime.applyState();
+    s.state.value.playback_status = "paused";
+    s.invalidate();
+    s.el.pause.mockClear();
+    resolve();
+    await playing;
+    expect(s.el.pause).toHaveBeenCalledOnce();
+    expect(s.el.paused).toBe(true);
+    expect(s.runtime.blocked.value).toBe(false);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});

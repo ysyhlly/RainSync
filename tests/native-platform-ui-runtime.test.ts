@@ -417,6 +417,7 @@ function setup(
   return {
     runtime,
     element,
+    selectedMedia,
     session,
     state,
     active,
@@ -2262,3 +2263,107 @@ it("staged settings during the DASH module wait preserve the already granted att
     f.cleanup();
   }
 });
+
+
+it.each([
+  [false, "resolve"],
+  [false, "reject"],
+  [true, "resolve"],
+  [true, "reject"],
+] as const)(
+  "a retired %s live play %s cannot release or block the successor policy's play",
+  async (fromLive, settlement) => {
+    const options = { live: fromLive };
+    const f = setup(options);
+    const call = f.api.getMockImplementation()!;
+    f.api.mockImplementation(async (path, method, body) => {
+      const result = await call(path, method, body);
+      return path === "/playback-sessions/native-platform" && method === "POST"
+        ? { ...result, media_generation: body.media_generation }
+        : result;
+    });
+    const live = {
+      version: 1,
+      broadcast_id: "12:34:1700000000",
+      sync_mode: "live_edge_control",
+    };
+    let settleOld!: () => void, rejectNew!: (failure: Error) => void;
+    try {
+      f.state.value.playback_rate = fromLive ? 1 : 1.25;
+      await f.runtime.loadMedia();
+      f.element.readyState = 4;
+      f.element.seekable = { length: 1, start: () => 0, end: () => 120 };
+      f.element.play
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((resolve, reject) => {
+              settleOld = () =>
+                settlement === "reject"
+                  ? reject(
+                      new DOMException("retired autoplay", "NotAllowedError"),
+                    )
+                  : resolve();
+            }),
+        )
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              rejectNew = reject;
+            }),
+        );
+      f.state.value.playback_status = "playing";
+      const oldPlaying = f.runtime.applyState();
+      expect(f.element.play).toHaveBeenCalledTimes(1);
+      const oldSession = f.runtime.sessionId.value;
+
+      options.live = !fromLive;
+      f.selectedMedia.platform = options.live
+        ? {
+            version: 3,
+            provider: "bilibili",
+            part: 1,
+            content_id: `live:12:${live.broadcast_id}`,
+            resource: {
+              kind: "bilibili_live",
+              room_id: "12",
+              uid: "34",
+              broadcast_id: live.broadcast_id,
+            },
+          }
+        : { ...media.platform };
+      f.state.value = {
+        ...f.state.value,
+        media_generation: f.state.value.media_generation + 1,
+        playback_status: "paused",
+        playback_rate: options.live ? 1 : 1.5,
+        live: options.live ? live : undefined,
+        anchor_position_ms: options.live ? 0 : 5000,
+        duration_ms: options.live ? null : 100000,
+      };
+      await f.runtime.loadMedia();
+      expect(f.runtime.sessionId.value).not.toBe(oldSession);
+      expect(f.runtime.live.value).toBe(!fromLive);
+      expect(f.runtime.video.value).toBe(f.element);
+      f.state.value.playback_status = "playing";
+      const newPlaying = f.runtime.applyState();
+      expect(f.element.play).toHaveBeenCalledTimes(2);
+      expect(f.element.playbackRate).toBe(options.live ? 1 : 1.5);
+      f.element.pause.mockClear();
+      settleOld();
+      await oldPlaying;
+      expect(f.element.pause).not.toHaveBeenCalled();
+      expect(f.runtime.blocked.value).toBe(false);
+      expect(f.error.value).toBe("");
+      // An old finally must not free the successor's in-flight claim, including
+      // the explicit gesture entry point shared by both policies.
+      await f.runtime.enablePlayback();
+      expect(f.element.play).toHaveBeenCalledTimes(2);
+      rejectNew(new DOMException("current autoplay", "NotAllowedError"));
+      await newPlaying;
+      expect(f.runtime.blocked.value).toBe(true);
+      expect(f.bodies).toHaveLength(2);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
