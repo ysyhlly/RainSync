@@ -1,14 +1,8 @@
+use super::asset_contract::SubtitleKind;
 use anyhow::{Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SubtitleKind {
-    Ass,
-    Ssa,
-    Pgs,
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SubtitleSelection {
     pub index: u32,

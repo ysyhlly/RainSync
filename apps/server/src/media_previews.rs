@@ -8,10 +8,10 @@ pub async fn request(
     Json(body): Json<Request>,
 ) -> Result<Response> {
     let user = auth(&app, &h, true).await?;
-    Ok(responses::ok_json(
+    Ok(responses::ok_json(json!(
         catalog::previews::request(&app.db, user.id, body, &|| app.preview_settings.queue_limit)
-            .await?,
-    ))
+            .await?
+    )))
 }
 pub async fn status(
     State(app): State<App>,
@@ -19,9 +19,9 @@ pub async fn status(
     axum::extract::Query(q): axum::extract::Query<Query>,
 ) -> Result<Response> {
     let user = auth(&app, &h, false).await?;
-    Ok(responses::ok_json(
-        catalog::previews::status(&app.db, user.id, q).await?,
-    ))
+    Ok(responses::ok_json(json!(
+        catalog::previews::status(&app.db, user.id, q).await?
+    )))
 }
 pub async fn image(
     State(app): State<App>,

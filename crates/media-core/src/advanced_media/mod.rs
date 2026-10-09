@@ -1,5 +1,6 @@
 //! Closed ordinary-job media recipes. These are intentionally separate from
 //! the deterministic, capture-owned static-HLS child recipe.
+mod asset_contract;
 mod assets;
 mod dolby_vision;
 mod encoder;
@@ -12,10 +13,11 @@ mod source_profile;
 mod subtitle;
 mod webm_source;
 
-pub use assets::{
+pub use asset_contract::{
     AssetCatalog, AssetFile, EXTERNAL_ASS_INDEX, EXTERNAL_PGS_INDEX, EXTERNAL_SSA_INDEX,
-    MAX_ASSET_BYTES, OwnedAssets, SubtitleAsset, validate_subtitle_bytes,
+    HTTP_ASSET_SOURCE, MAX_ASSET_BYTES, SubtitleAsset, SubtitleKind,
 };
+pub use assets::{OwnedAssets, validate_subtitle_bytes};
 pub use dolby_vision::DolbyVisionSource;
 pub use encoder::{Backend, EncoderPreference, EncoderSelection, FallbackReason};
 pub use hdr::{HdrSource, classify_hdr};
@@ -23,12 +25,11 @@ pub use input::{Input, OwnedLocalInput, WorkerGatewayInput};
 pub use inventory::{DeviceObservation, Inventory, RuntimeQualification};
 pub use recipe::{Recipe, analyze};
 pub use remote_assets::{
-    HTTP_ASSET_SOURCE, HttpAssetAssociation, HttpAssetPin, HttpSourcePin, REMOTE_ASSET_KIND,
-    REMOTE_ASSET_QUEUE, RemoteAssetCatalog, http_asset_url, sha256 as asset_sha256,
-    source_http_version,
+    HttpAssetAssociation, HttpAssetPin, HttpSourcePin, REMOTE_ASSET_KIND, REMOTE_ASSET_QUEUE,
+    RemoteAssetCatalog, http_asset_url, sha256 as asset_sha256, source_http_version,
 };
 pub use source_profile::{VideoSourceExpectation, VideoSourceProof, extended_source_proof};
-pub use subtitle::{SubtitleKind, SubtitleSelection, select_subtitle};
+pub use subtitle::{SubtitleSelection, select_subtitle};
 pub use webm_source::{PrivateInputContainer, WebmSourceExpectation};
 
 use anyhow::{Result, ensure};

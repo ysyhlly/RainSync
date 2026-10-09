@@ -9,24 +9,10 @@ fn valid_id(id: &str) -> bool {
     IDS.contains(&id)
 }
 fn digest(id: &str, version: &str) -> String {
-    // Stable closed-catalog identities, seeded from the accepted LF source.
-    // Stored historical digests remain provenance; these are not runtime grants.
-    match (id, version) {
-        ("metadata.duration-badge", "1.0.0") => {
-            "e1a0375faf6224d349a4e34753cb316cc36c51784c3317730d301a526d572674"
-        }
-        ("metadata.duration-badge", "1.1.0") => {
-            "68d99aa06af5314143bd35da49fc781ba0ddc0a5fc3b0812636b5774bea37532"
-        }
-        ("metadata.title-label", "1.0.0") => {
-            "17328d7f21af07f28fd0a0596fb5174bec7c90cdb93d65b9d3ab52dae2a0ff63"
-        }
-        ("metadata.title-label", "1.1.0") => {
-            "ac5972556afc0dd927683b49097336e9a42078755313591682e384e9d74a29bb"
-        }
-        _ => unreachable!("validated closed-catalog id and version"),
-    }
-    .to_owned()
+    hash(&format!(
+        "rainsync-declarative-metadata-v1:{id}:{version}:{}",
+        include_str!("plugins.rs")
+    ))
 }
 fn config_valid(id: &str, version: &str, config: &Value, grants: &[String]) -> bool {
     if !valid_id(id) || !VERSIONS.contains(&version) || grants != [PERMISSION] {
@@ -56,7 +42,7 @@ pub async fn catalog(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     let rows = sqlx::query("SELECT * FROM rainsync_plugins ORDER BY id")
         .fetch_all(&app.db)
         .await?;
-    Ok(responses::ok_json(
+    Ok(media_titles::private_json(
         json!({"api_major":1,"api_minor":0,"catalog":IDS.iter().map(|id|manifest(id)).collect::<Vec<_>>(),"installed":rows.iter().filter(|r| !r.get::<bool,_>("removed")).map(installed).collect::<Vec<_>>(),"configuration_revisions":rows.iter().map(|r|(r.get::<String,_>("id"),json!(r.get::<i64,_>("revision").to_string()))).collect::<serde_json::Map<String,Value>>(),"runtime_boundary":"仅运行编译进应用的封闭声明式扩展，无远程脚本、网络、文件、数据库或凭据权限"}),
     ))
 }
@@ -147,18 +133,6 @@ pub async fn configure(
         return Err(err(StatusCode::CONFLICT, "plugin_revision_conflict"));
     }
     let login = admin_login(&mut tx, &h, user.id).await?;
-    if let Some(row) = &previous
-        && !row.get::<bool, _>("removed")
-        && row.get::<String, _>("version") == body.version
-        && row.get::<bool, _>("enabled") == body.enabled
-        && row.get::<Value, _>("config") == body.config
-        && row.get::<Value, _>("granted_permissions") == json!(body.granted_permissions)
-    {
-        // Preserve the last meaningful rollback snapshot and CAS receipt.
-        let result = installed(row);
-        commit(tx, &login, user.id).await?;
-        return Ok(responses::ok_json(result));
-    }
     let action = if let Some(r) = &previous {
         if r.get::<bool, _>("removed") {
             "install"
@@ -183,7 +157,7 @@ pub async fn configure(
         .await?;
     let result = installed(&row);
     commit(tx, &login, user.id).await?;
-    Ok(responses::ok_json(result))
+    Ok(media_titles::private_json(result))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -234,7 +208,7 @@ pub async fn remove(
         actual + 1
     };
     commit(tx, &login, user.id).await?;
-    Ok(responses::ok_json(
+    Ok(media_titles::private_json(
         json!({"id":id,"removed":true,"revision":removed_revision.to_string()}),
     ))
 }
@@ -292,7 +266,7 @@ pub async fn rollback(
         .await?;
     let result = installed(&row);
     commit(tx, &login, user.id).await?;
-    Ok(responses::ok_json(result))
+    Ok(media_titles::private_json(result))
 }
 fn transform(id: &str, version: &str, config: &Value, media: &Value) -> Option<Value> {
     match id {
@@ -350,7 +324,7 @@ pub async fn metadata(
     if latest != media {
         return Err(err(StatusCode::CONFLICT, "plugin_media_changed"));
     }
-    Ok(responses::ok_json(
+    Ok(media_titles::private_json(
         json!({"media_id":id,"extensions":output,"api_major":1}),
     ))
 }
@@ -358,7 +332,7 @@ pub async fn audit(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     let user = auth(&app, &h, false).await?;
     admin(&user)?;
     let rows=sqlx::query("SELECT id,plugin_id,revision,action,artifact_digest,floor(extract(epoch FROM created_at)*1000)::bigint AS at_ms FROM rainsync_plugin_audit ORDER BY created_at DESC,id DESC LIMIT 100").fetch_all(&app.db).await?;
-    Ok(responses::ok_json(
+    Ok(media_titles::private_json(
         json!({"items":rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"plugin_id":r.get::<String,_>("plugin_id"),"revision":r.get::<i64,_>("revision").to_string(),"action":r.get::<String,_>("action"),"artifact_digest":r.get::<String,_>("artifact_digest"),"created_at":r.get::<i64,_>("at_ms")})).collect::<Vec<_>>()}),
     ))
 }

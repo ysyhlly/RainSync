@@ -1,4 +1,5 @@
 //! Stateless viewer-specific media cards and explicit provider metadata.
+use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::Row;
 use uuid::Uuid;
@@ -57,13 +58,111 @@ fn series_metadata(kind: &str, metadata: &Value) -> Option<Value> {
     (!series.is_empty()).then_some(Value::Object(series))
 }
 
-pub fn cover(row: &sqlx::postgres::PgRow) -> Value {
-    let status = row
-        .get::<Option<String>, _>("preview_status")
-        .unwrap_or("missing".into());
+/// Internal success data; nullable fields remain present on the wire.
+#[derive(Serialize)]
+pub(crate) struct CoverView {
+    status: String,
+    revision: Option<Uuid>,
+    url: Option<String>,
+    retry_after_ms: Option<u32>,
+}
+
+impl CoverView {
+    pub(super) fn new(id: Uuid, status: Option<String>, revision: Option<Uuid>) -> Self {
+        let status = status.unwrap_or("missing".into());
+        let url = if status == "ready" {
+            revision.map(|value| format!("/api/v1/media/{id}/cover?revision={value}"))
+        } else {
+            None
+        };
+        let retry_after_ms = match status.as_str() {
+            "queued" | "running" => Some(2000),
+            "unavailable" => Some(60000),
+            _ => None,
+        };
+        Self {
+            status,
+            revision,
+            url,
+            retry_after_ms,
+        }
+    }
+}
+
+pub fn cover(row: &sqlx::postgres::PgRow) -> CoverView {
+    let status = row.get::<Option<String>, _>("preview_status");
     let revision = row.get::<Option<Uuid>, _>("preview_revision");
     let id: Uuid = row.get("id");
-    json!({"status":status,"revision":revision,"url":if status=="ready" {revision.map(|v|format!("/api/v1/media/{id}/cover?revision={v}"))}else{None},"retry_after_ms":match status.as_str(){"queued"|"running"=>Some(2000),"unavailable"=>Some(60000),_=>None}})
+    CoverView::new(id, status, revision)
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+
+    #[test]
+    fn missing_and_revisionless_ready_keep_explicit_null_fields() {
+        for status in [None, Some("missing"), Some("ready")] {
+            let cover = CoverView::new(Uuid::from_u128(1), status.map(str::to_owned), None);
+            assert_eq!(
+                serde_json::to_value(cover).unwrap(),
+                json!({"status":status.unwrap_or("missing"),"revision":null,"url":null,"retry_after_ms":null})
+            );
+        }
+    }
+
+    #[test]
+    fn queued_running_and_unavailable_keep_revision_and_retry_values() {
+        let revision = Uuid::from_u128(2);
+        for (status, retry_after_ms) in
+            [("queued", 2000), ("running", 2000), ("unavailable", 60000)]
+        {
+            let cover = CoverView::new(Uuid::from_u128(1), Some(status.into()), Some(revision));
+            assert_eq!(
+                serde_json::to_value(cover).unwrap(),
+                json!({"status":status,"revision":revision,"url":null,"retry_after_ms":retry_after_ms})
+            );
+        }
+    }
+
+    #[test]
+    fn ready_keeps_exact_revision_url_and_null_retry() {
+        let cover = CoverView::new(
+            Uuid::from_u128(1),
+            Some("ready".into()),
+            Some(Uuid::from_u128(2)),
+        );
+        assert_eq!(
+            serde_json::to_value(cover).unwrap(),
+            json!({
+                "status":"ready",
+                "revision":"00000000-0000-0000-0000-000000000002",
+                "url":"/api/v1/media/00000000-0000-0000-0000-000000000001/cover?revision=00000000-0000-0000-0000-000000000002",
+                "retry_after_ms":null
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_status_and_nonready_revision_are_not_normalized() {
+        let revision = Uuid::from_u128(2);
+        for status in [
+            None,
+            Some("future-preview-state"),
+            Some(""),
+            Some("missing"),
+        ] {
+            let cover = CoverView::new(
+                Uuid::from_u128(1),
+                status.map(str::to_owned),
+                Some(revision),
+            );
+            assert_eq!(
+                serde_json::to_value(cover).unwrap(),
+                json!({"status":status.unwrap_or("missing"),"revision":revision,"url":null,"retry_after_ms":null})
+            );
+        }
+    }
 }
 
 #[cfg(test)]

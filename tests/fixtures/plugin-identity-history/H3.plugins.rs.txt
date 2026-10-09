@@ -9,24 +9,10 @@ fn valid_id(id: &str) -> bool {
     IDS.contains(&id)
 }
 fn digest(id: &str, version: &str) -> String {
-    // Stable closed-catalog identities, seeded from the accepted LF source.
-    // Stored historical digests remain provenance; these are not runtime grants.
-    match (id, version) {
-        ("metadata.duration-badge", "1.0.0") => {
-            "e1a0375faf6224d349a4e34753cb316cc36c51784c3317730d301a526d572674"
-        }
-        ("metadata.duration-badge", "1.1.0") => {
-            "68d99aa06af5314143bd35da49fc781ba0ddc0a5fc3b0812636b5774bea37532"
-        }
-        ("metadata.title-label", "1.0.0") => {
-            "17328d7f21af07f28fd0a0596fb5174bec7c90cdb93d65b9d3ab52dae2a0ff63"
-        }
-        ("metadata.title-label", "1.1.0") => {
-            "ac5972556afc0dd927683b49097336e9a42078755313591682e384e9d74a29bb"
-        }
-        _ => unreachable!("validated closed-catalog id and version"),
-    }
-    .to_owned()
+    hash(&format!(
+        "rainsync-declarative-metadata-v1:{id}:{version}:{}",
+        include_str!("plugins.rs")
+    ))
 }
 fn config_valid(id: &str, version: &str, config: &Value, grants: &[String]) -> bool {
     if !valid_id(id) || !VERSIONS.contains(&version) || grants != [PERMISSION] {

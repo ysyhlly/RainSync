@@ -1,12 +1,22 @@
 //! Preview use cases preserve the original queue and image transaction owners.
-use super::media_projection::cover;
+use super::media_projection::{CoverView, cover};
 use crate::{Result, err};
 use axum::http::StatusCode;
 use persistence::media_previews::{FRESH, VALID};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
+
+#[derive(Serialize)]
+pub(crate) struct PreviewStates {
+    items: Vec<PreviewItem>,
+}
+
+#[derive(Serialize)]
+struct PreviewItem {
+    media_id: Uuid,
+    cover: CoverView,
+}
 
 /// A result of the original image transaction, not a continuing authority token.
 pub struct ImageRead {
@@ -44,7 +54,7 @@ pub async fn request(
     viewer: Uuid,
     body: Request,
     queue_limit: &(dyn Fn() -> i64 + Sync),
-) -> Result<Value> {
+) -> Result<PreviewStates> {
     let ids = bounded(body.media_ids)?;
     let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM media_items WHERE id=ANY($1) AND library_media_allowed($2,id,'browse',NULL)").bind(&ids).bind(viewer).fetch_all(db).await?;
     if !persistence::media_previews::enqueue(db, &ids, queue_limit()).await? {
@@ -55,7 +65,7 @@ pub async fn request(
     }
     states(db, viewer, &ids).await
 }
-pub async fn status(db: &PgPool, viewer: Uuid, q: Query) -> Result<Value> {
+pub async fn status(db: &PgPool, viewer: Uuid, q: Query) -> Result<PreviewStates> {
     let ids = if q.ids.is_empty() {
         vec![]
     } else {
@@ -67,12 +77,18 @@ pub async fn status(db: &PgPool, viewer: Uuid, q: Query) -> Result<Value> {
     };
     states(db, viewer, &bounded(ids)?).await
 }
-async fn states(db: &PgPool, user: Uuid, ids: &[Uuid]) -> Result<Value> {
+async fn states(db: &PgPool, user: Uuid, ids: &[Uuid]) -> Result<PreviewStates> {
     let rows=sqlx::query(&format!("SELECT m.id,p.status AS preview_status,p.result_revision AS preview_revision FROM media_items m JOIN sources s ON s.id=m.source_id LEFT JOIN media_previews p ON p.media_id=m.id AND {FRESH} WHERE m.id=ANY($1) AND {VALID} AND library_media_allowed($2,m.id,'browse',NULL)"))
         .bind(ids).bind(user).fetch_all(db).await?;
-    Ok(
-        json!({"items":rows.iter().map(|r|json!({"media_id":r.get::<Uuid,_>("id"),"cover":cover(r)})).collect::<Vec<_>>()}),
-    )
+    Ok(PreviewStates {
+        items: rows
+            .iter()
+            .map(|r| PreviewItem {
+                media_id: r.get::<Uuid, _>("id"),
+                cover: cover(r),
+            })
+            .collect(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -105,4 +121,45 @@ pub async fn image(db: &PgPool, viewer: Uuid, id: Uuid, q: ImageQuery) -> Result
     sqlx::query("UPDATE media_previews SET accessed_at=clock_timestamp() WHERE media_id=$1 AND accessed_at<clock_timestamp()-interval '1 minute'").bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(ImageRead { row })
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn empty_states_serialize_to_an_empty_items_array() {
+        assert_eq!(
+            serde_json::to_value(PreviewStates { items: vec![] }).unwrap(),
+            json!({"items":[]})
+        );
+    }
+
+    #[test]
+    fn state_serialization_keeps_fields_and_supplied_vector_order() {
+        let first = Uuid::from_u128(2);
+        let second = Uuid::from_u128(1);
+        let revision = Uuid::from_u128(3);
+        let states = PreviewStates {
+            items: vec![
+                PreviewItem {
+                    media_id: first,
+                    cover: CoverView::new(first, Some("queued".into()), Some(revision)),
+                },
+                PreviewItem {
+                    media_id: second,
+                    cover: CoverView::new(second, None, None),
+                },
+            ],
+        };
+        // This checks serialization order, not an ORDER BY guarantee for SQL.
+        assert_eq!(
+            serde_json::to_value(states).unwrap(),
+            json!({"items":[
+                {"media_id":first,"cover":{"status":"queued","revision":revision,"url":null,"retry_after_ms":2000}},
+                {"media_id":second,"cover":{"status":"missing","revision":null,"url":null,"retry_after_ms":null}}
+            ]})
+        );
+    }
 }

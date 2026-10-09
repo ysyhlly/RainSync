@@ -275,11 +275,3 @@ pub async fn scan(
         catalog::scan_pages::scan(&context, user, h, lib, source, body).await?,
     ))
 }
-// Stateless compatibility entry for the shared-admin S3 scan adapter.
-pub async fn scan_source_page(app: &App, source: Uuid, restart: bool) -> Result<Value> {
-    let context = catalog::SourceReadContext {
-        db: &app.db,
-        decrypt: &|value| app.decrypt(value),
-    };
-    catalog::scan_pages::scan_source_page(&context, source, restart).await
-}
