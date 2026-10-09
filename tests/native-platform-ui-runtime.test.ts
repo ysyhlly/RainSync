@@ -10,7 +10,21 @@ vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
 import { afterEach, expect, it, vi } from "vitest";
 import { effectScope, ref } from "vue";
 import { createPlaybackRuntime } from "../apps/web/src/features/playback/playback-runtime";
+import { PlaybackCancelled } from "../apps/web/src/playback-request";
 import type { NativePlatformProvider } from "../packages/protocol";
+const recoveryTrace = vi.hoisted(() => ({
+  visit: undefined as (() => void) | undefined,
+}));
+vi.mock("../apps/web/src/features/playback/playback-recovery-state", async (original) => {
+  const actual = await original<typeof import("../apps/web/src/features/playback/playback-recovery-state")>();
+  return {
+    ...actual,
+    evaluatePlaybackRecovery: (...args: Parameters<typeof actual.evaluatePlaybackRecovery>) => {
+      recoveryTrace.visit?.();
+      return actual.evaluatePlaybackRecovery(...args);
+    },
+  };
+});
 const dashboards = vi.hoisted(() => [] as any[]);
 const hlsPlayers = vi.hoisted(() => [] as any[]);
 const browserCapabilities = vi.hoisted(() => ({ mse: true }));
@@ -88,6 +102,7 @@ const media: any = {
   },
 };
 afterEach(() => {
+  recoveryTrace.visit = undefined;
   vi.useRealTimers();
   vi.unstubAllGlobals();
   dashboards.length = 0;
@@ -2644,3 +2659,490 @@ it("gesture port characterization: terminal live state short-circuits the physic
     f.cleanup();
   }
 });
+
+async function traceAutomaticSettlement(
+  f: ReturnType<typeof setup>,
+  effects: string[],
+  release?: () => void,
+) {
+  recoveryTrace.visit = () => effects.push("recovery");
+  const applying = f.runtime.applyState();
+  effects.push("caller returned");
+  let failure: unknown;
+  const settled = applying.then(
+    () => {
+      effects.push("caller resolved");
+    },
+    (error: unknown) => {
+      failure = error;
+      effects.push("caller rejected");
+    },
+  );
+  const sentinels = (async () => {
+    for (let tick = 1; tick <= 6; tick++) {
+      await Promise.resolve();
+      effects.push(`microtask ${tick}`);
+      if (tick === 1 && release) {
+        effects.push("release");
+        release();
+      }
+    }
+  })();
+  await Promise.all([settled, sentinels]);
+  recoveryTrace.visit = undefined;
+  return failure;
+}
+
+const automaticSettlementModes = [
+  "paused",
+  "resolve",
+  "reject",
+  "method throw",
+  "getter throw",
+  "deferred resolve",
+  "deferred reject",
+] as const;
+for (const live of [true, false]) {
+  it.each(automaticSettlementModes)(
+    `automatic live characterization: ${live ? "live" : "VOD"} %s preserves pre-await effects and recovery settlement`,
+    async (mode) => {
+      const f = setup({ live });
+      const effects: string[] = [];
+      const failure = new Error("synthetic media failure");
+      let release: (() => void) | undefined;
+      try {
+        await f.runtime.loadMedia();
+        f.clock.ready = !live;
+        f.element.readyState = 2;
+        f.element.seekable = { length: 1, start: () => 0, end: () => 120 };
+        f.state.value.playback_status =
+          mode === "paused" ? "paused" : "playing";
+        let position = 15;
+        Object.defineProperty(f.element, "currentTime", {
+          configurable: true,
+          get: () => position,
+          set: (value: number) => {
+            position = value;
+            effects.push(`seek ${value}`);
+          },
+        });
+        f.element.pause.mockImplementation(() => {
+          effects.push("pause");
+          f.element.paused = true;
+        });
+        const play = function (this: unknown) {
+          expect(this).toBe(f.element);
+          effects.push("play");
+          if (mode === "method throw") throw failure;
+          if (mode === "reject") return Promise.reject(failure);
+          if (mode.startsWith("deferred"))
+            return new Promise<void>((resolve, reject) => {
+              release = () => {
+                if (mode === "deferred reject") reject(failure);
+                else {
+                  f.element.paused = false;
+                  resolve();
+                }
+              };
+            });
+          f.element.paused = false;
+          return Promise.resolve();
+        };
+        Object.defineProperty(f.element, "play", {
+          configurable: true,
+          get: () => {
+            effects.push("play lookup");
+            if (mode === "getter throw") throw failure;
+            return play;
+          },
+        });
+        const result = await traceAutomaticSettlement(
+          f,
+          effects,
+          mode.startsWith("deferred") ? () => release!() : undefined,
+        );
+        const rejected =
+          !live &&
+          [
+            "reject",
+            "method throw",
+            "getter throw",
+            "deferred reject",
+          ].includes(mode);
+        expect(result).toBe(rejected ? failure : undefined);
+        const prefix =
+          mode === "paused"
+            ? ["pause", ...(!live ? ["seek 5"] : [])]
+            : [
+                ...(live ? ["seek 117"] : []),
+                "play lookup",
+                ...(mode === "getter throw" ? [] : ["play"]),
+              ];
+        const outcome = rejected ? "caller rejected" : "caller resolved";
+        const tail = mode.startsWith("deferred")
+          ? [
+              "microtask 1",
+              "release",
+              "microtask 2",
+              "recovery",
+              "microtask 3",
+              outcome,
+              "microtask 4",
+              "microtask 5",
+              "microtask 6",
+            ]
+          : mode === "resolve" || mode === "reject"
+            ? [
+                "microtask 1",
+                "recovery",
+                "microtask 2",
+                outcome,
+                "microtask 3",
+                "microtask 4",
+                "microtask 5",
+                "microtask 6",
+              ]
+            : [
+                "recovery",
+                "microtask 1",
+                outcome,
+                "microtask 2",
+                "microtask 3",
+                "microtask 4",
+                "microtask 5",
+                "microtask 6",
+              ];
+        // Live interruption publication triggers its existing synchronous recovery
+        // watcher before the later applyState finally evaluation.
+        if (live && (mode === "method throw" || mode === "getter throw"))
+          prefix.push("recovery");
+        if (live && mode === "reject") tail.unshift("recovery");
+        if (live && mode === "deferred reject") tail.splice(2, 0, "recovery");
+        expect([...effects]).toEqual([...prefix, "caller returned", ...tail]);
+        expect(f.runtime.video.value).toBe(f.element);
+        expect(f.bodies).toHaveLength(1);
+        if (mode.includes("throw") || mode.includes("reject")) {
+          expect(f.runtime.blocked.value).toBe(false);
+          if (live) expect(f.error.value).toContain("中断");
+        }
+      } finally {
+        recoveryTrace.visit = undefined;
+        release?.();
+        f.cleanup();
+      }
+    },
+  );
+}
+
+it.each([false, true])(
+  "automatic live characterization: prefix getter %s cancellation retains the rejected-promise boundary",
+  async (cancelled) => {
+    const f = setup({ live: true });
+    const effects: string[] = [];
+    const failure = cancelled
+      ? new PlaybackCancelled()
+      : new Error("synthetic prefix getter");
+    let armed = true;
+    try {
+      await f.runtime.loadMedia();
+      Object.defineProperty(f.active, "value", {
+        configurable: true,
+        get: () => {
+          if (armed) {
+            armed = false;
+            effects.push("prefix getter throws");
+            throw failure;
+          }
+          return true;
+        },
+      });
+      const result = await traceAutomaticSettlement(f, effects);
+      expect(result).toBe(cancelled ? undefined : failure);
+      expect(effects).toEqual([
+        "prefix getter throws",
+        "caller returned",
+        "recovery",
+        "microtask 1",
+        cancelled ? "caller resolved" : "caller rejected",
+        "microtask 2",
+        "microtask 3",
+        "microtask 4",
+        "microtask 5",
+        "microtask 6",
+      ]);
+      expect(f.element.play).not.toHaveBeenCalled();
+    } finally {
+      recoveryTrace.visit = undefined;
+      delete (f.active as any).value;
+      f.cleanup();
+    }
+  },
+);
+
+it.each(["missing plan", "inactive", "failed plan"] as const)(
+  "automatic live characterization: %s early return retains recovery-finally timing",
+  async (mode) => {
+    const f = setup({ live: true });
+    const effects: string[] = [];
+    try {
+      if (mode !== "missing plan") await f.runtime.loadMedia();
+      if (mode === "inactive") {
+        f.active.value = false;
+        await settle();
+      }
+      if (mode === "failed plan") {
+        f.element.error = { code: 3 };
+        f.element.onerror();
+        expect(f.runtime.preparation.value.failure).toBeDefined();
+      }
+      const result = await traceAutomaticSettlement(f, effects);
+      expect(result).toBeUndefined();
+      expect(effects).toEqual([
+        "caller returned",
+        "recovery",
+        "microtask 1",
+        "caller resolved",
+        "microtask 2",
+        "microtask 3",
+        "microtask 4",
+        "microtask 5",
+        "microtask 6",
+      ]);
+      expect(f.element.play).not.toHaveBeenCalled();
+    } finally {
+      recoveryTrace.visit = undefined;
+      f.cleanup();
+    }
+  },
+);
+
+it.each([
+  "disconnected",
+  "hidden",
+  "metadata",
+  "user seek",
+  "paused hidden",
+] as const)(
+  "automatic live characterization: %s retains rate and short-circuit media admission order",
+  async (condition) => {
+    const f = setup({ live: true });
+    const effects: string[] = [];
+    let afterRate = false;
+    try {
+      await f.runtime.loadMedia();
+      f.clock.ready = false;
+      f.state.value.playback_status =
+        condition === "paused hidden" ? "paused" : "playing";
+      f.state.value.playback_rate = 1.25;
+      if (condition === "disconnected") f.connected.value = false;
+      vi.stubGlobal(
+        "document",
+        Object.assign(new EventTarget(), {
+          get visibilityState() {
+            return "visible";
+          },
+        }),
+      );
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => {
+          if (afterRate) effects.push("foreground");
+          return condition.includes("hidden") ? "hidden" : "visible";
+        },
+      });
+      let rate = 1;
+      Object.defineProperty(f.element, "playbackRate", {
+        configurable: true,
+        get: () => rate,
+        set: (value: number) => {
+          rate = value;
+          afterRate = true;
+          effects.push("rate");
+        },
+      });
+      Object.defineProperty(f.element, "readyState", {
+        configurable: true,
+        get: () => {
+          if (afterRate) effects.push("metadata");
+          return condition === "metadata" ? 0 : 2;
+        },
+      });
+      f.element.pause.mockImplementation(() => {
+        effects.push("pause");
+      });
+      const applying = f.runtime.applyState(false, condition === "user seek");
+      const beforeReturn = [...effects];
+      afterRate = false;
+      await applying;
+      expect(beforeReturn).toEqual(
+        condition === "disconnected"
+          ? ["rate"]
+          : condition === "hidden"
+            ? ["rate", "foreground"]
+            : condition === "paused hidden"
+              ? ["rate", "pause"]
+              : ["rate", "foreground", "metadata"],
+      );
+      expect(f.element.play).not.toHaveBeenCalled();
+      expect(f.element.currentTime).toBe(0);
+      expect(f.element.playbackRate).toBe(1.25);
+      expect(f.runtime.video.value).toBe(f.element);
+      expect(f.bodies).toHaveLength(1);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+it("automatic live characterization: latest PAUSE keeps its original-element right during clock invalidation", async () => {
+  const f = setup({ live: true });
+  let release!: () => void;
+  try {
+    await f.runtime.loadMedia();
+    f.element.readyState = 2;
+    f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+    f.state.value.playback_status = "playing";
+    f.element.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = () => {
+            f.element.paused = false;
+            resolve();
+          };
+        }),
+    );
+    f.element.pause.mockImplementation(() => {
+      f.element.paused = true;
+    });
+    const applying = f.runtime.applyState();
+    expect(f.element.play).toHaveBeenCalledOnce();
+    f.state.value.playback_status = "paused";
+    f.connected.value = false;
+    f.clock.revision++;
+    f.runtime.onClockInvalidated();
+    f.element.pause.mockClear();
+    release();
+    await applying;
+    expect(f.element.pause).toHaveBeenCalledOnce();
+    expect(f.element.paused).toBe(true);
+    expect(f.runtime.blocked.value).toBe(false);
+    expect(f.error.value).toBe("");
+    expect(f.bodies).toHaveLength(1);
+  } finally {
+    release?.();
+    f.cleanup();
+  }
+});
+
+it.each(["identity", "room", "reload"] as const)(
+  "automatic live characterization: late %s settlement cannot pause, block or free a successor gesture",
+  async (cause) => {
+    const f = setup({ live: true });
+    let rejectOld!: (failure: Error) => void, releaseCurrent!: () => void;
+    try {
+      await f.runtime.loadMedia();
+      f.element.readyState = 2;
+      f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+      f.state.value.playback_status = "playing";
+      f.element.play.mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectOld = reject;
+          }),
+      );
+      const applying = f.runtime.applyState();
+      expect(f.element.play).toHaveBeenCalledOnce();
+      if (cause === "identity") f.session.epoch++;
+      if (cause === "room") f.state.value.room_id = id(55);
+      await f.runtime.loadMedia();
+      f.element.play.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseCurrent = () => {
+              f.element.paused = false;
+              resolve();
+            };
+          }),
+      );
+      const gesture = f.runtime.enablePlayback();
+      expect(f.element.play).toHaveBeenCalledTimes(2);
+      f.element.pause.mockClear();
+      rejectOld(new DOMException("old live permission", "NotAllowedError"));
+      await applying;
+      expect(f.element.pause).not.toHaveBeenCalled();
+      expect(f.runtime.blocked.value).toBe(false);
+      expect(f.error.value).toBe("");
+      await f.runtime.applyState();
+      expect(f.element.play).toHaveBeenCalledTimes(2);
+      releaseCurrent();
+      await gesture;
+      expect(f.element.play).toHaveBeenCalledTimes(2);
+      expect(f.runtime.video.value).toBe(f.element);
+      expect(f.bodies).toHaveLength(2);
+    } finally {
+      rejectOld?.(new Error("cleanup"));
+      releaseCurrent?.();
+      f.cleanup();
+    }
+  },
+);
+
+it.each(["staged settings", "Reload"] as const)(
+  "automatic live characterization: %s during the edge write preserves the existing private invocation limit",
+  async (change) => {
+    const f = setup({ live: true });
+    const effects: string[] = [];
+    let loading: Promise<void> | undefined;
+    let once = true,
+      position = 102;
+    const sessionsAtPlay: (string | null)[] = [];
+    try {
+      await f.runtime.loadMedia();
+      f.element.readyState = 2;
+      f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+      f.state.value.playback_status = "playing";
+      Object.defineProperty(f.element, "currentTime", {
+        configurable: true,
+        get: () => position,
+        set: (value: number) => {
+          position = value;
+          effects.push("edge write");
+          if (once) {
+            once = false;
+            if (change === "Reload") loading = f.runtime.loadMedia();
+            else f.runtime.nativePlaybackMode.value = "compatibility";
+            effects.push(change);
+          }
+        },
+      });
+      f.element.play.mockImplementationOnce(function (this: unknown) {
+        expect(this).toBe(f.element);
+        effects.push("play");
+        sessionsAtPlay.push(f.runtime.sessionId.value);
+        f.element.paused = false;
+        return Promise.resolve();
+      });
+      const applying = f.runtime.applyState();
+      effects.push("caller returned");
+      expect([...effects]).toEqual([
+        "edge write",
+        change,
+        "play",
+        "caller returned",
+      ]);
+      // This records existing behavior, not a reusable/retired driver promise:
+      // edge-write reentrancy does not add a second pre-play admission check.
+      expect(sessionsAtPlay).toEqual([change === "Reload" ? null : id(21)]);
+      await applying;
+      await loading;
+      expect(f.element.play).toHaveBeenCalledOnce();
+      expect(f.runtime.blocked.value).toBe(false);
+      expect(f.error.value).toBe("");
+      expect(f.runtime.video.value).toBe(f.element);
+      expect(f.bodies).toHaveLength(change === "Reload" ? 2 : 1);
+    } finally {
+      await loading;
+      f.cleanup();
+    }
+  },
+);

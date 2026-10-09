@@ -1,6 +1,7 @@
 import { evaluatePlaybackRecovery } from "./playback-recovery-state";
 import { createPlaybackSynchronization } from "./playback-synchronization";
 import { createPlaybackGesture } from "./playback-gesture";
+import { createLiveReconciliation } from "./live-reconciliation";
 import { createVodTickPolicy } from "./vod-tick-policy";
 import { createPlaybackMediaIO } from "./drivers/media-io";
 import { createLiveTickPolicy } from "./live-tick-policy";
@@ -2777,82 +2778,88 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       updateRecovery();
     }
   }
-  async function reconcileState(force = false, userSeek = false) {
-    const serial = synchronization.beginApply(userSeek);
-    observeMetrics();
-    if (!roomIsActive()) return;
-    const s = state.value,
-      el = video.value;
-    const p = readPlan();
-    if (!s || !el || !p) return;
-    if (failedCompatibilityPlan === p) return;
-    if (!currentPlan(p)) {
-      if (p.native_platform?.live) failNativeLive(p, "NATIVE_LIVE_STATE_CHANGED");
-      return;
-    }
-    if (p.native_platform?.live) {
-      const directive = nativeLiveDirective({
-        room: s,
-        plan: p,
-        active: roomIsActive(),
-        connected: connected.value,
-        ended: el.ended || terminalEnd,
-      });
-      synchronization.resetCorrection();
-      if (directive === "stale") {
-        failNativeLive(p, "NATIVE_LIVE_STATE_CHANGED");
-        return;
+  const reconcileLive = createLiveReconciliation({
+    synchronization,
+    blocked,
+    foreground,
+    clockRevision,
+    isPermissionDenied: (failure) => playFailureIs(failure, "NotAllowedError"),
+    interrupt: reportPlayInterruption,
+  });
+  function reconcileState(force = false, userSeek = false): Promise<void> {
+    try {
+      const serial = synchronization.beginApply(userSeek);
+      observeMetrics();
+      if (!roomIsActive()) return Promise.resolve();
+      const s = state.value,
+        el = video.value;
+      const p = readPlan();
+      if (!s || !el || !p) return Promise.resolve();
+      if (failedCompatibilityPlan === p) return Promise.resolve();
+      if (!currentPlan(p)) {
+        if (p.native_platform?.live)
+          failNativeLive(p, "NATIVE_LIVE_STATE_CHANGED");
+        return Promise.resolve();
       }
-      if (directive === "offline") {
-        if (!terminalEnd) failNativeLive(p);
-        return;
-      }
-      if (!synchronization.ensureBaseRate()) return;
-      if (synchronization.restoreBaseRate() === undefined) return;
-      if (directive === "pause") {
-        el.pause();
-        liveNeedsEdge = true;
-        return;
-      }
-      if (directive === "wait" || !foreground() || el.readyState < 1) return;
-      if (userSeek) return; // Room-wide seeks are never broadcast timeline claims.
-      if (el.paused) liveNeedsEdge = true;
-      if (force || liveNeedsEdge) {
-        const edge = nativeLiveEdge(
-          availablePlaybackRanges(el),
-          hls?.liveSyncPosition ?? undefined,
+      if (p.native_platform?.live) {
+        return reconcileLive(
+          {
+            directive: () =>
+              nativeLiveDirective({
+                room: s,
+                plan: p,
+                active: roomIsActive(),
+                connected: connected.value,
+                ended: el.ended || terminalEnd,
+              }),
+            get terminal() {
+              return terminalEnd;
+            },
+            get readyState() {
+              return el.readyState;
+            },
+            get paused() {
+              return el.paused;
+            },
+            get needsEdge() {
+              return liveNeedsEdge;
+            },
+            failChanged: () => failNativeLive(p, "NATIVE_LIVE_STATE_CHANGED"),
+            failOffline: () => failNativeLive(p),
+            pause: () => el.pause(),
+            requireEdge: () => {
+              liveNeedsEdge = true;
+            },
+            edge: () =>
+              nativeLiveEdge(
+                availablePlaybackRanges(el),
+                hls?.liveSyncPosition ?? undefined,
+              ),
+            align: (edge: number) => {
+              el.currentTime = edge;
+              liveNeedsEdge = false;
+            },
+            play: () => el.play(),
+            afterPlay: (revision: number) =>
+              synchronization.afterPlay(p, el, revision, serial),
+          },
+          force,
+          userSeek,
         );
-        if (edge !== undefined) {
-          el.currentTime = edge;
-          liveNeedsEdge = false;
-        }
       }
-      synchronization.clearPendingApply();
-      if (
-        el.paused &&
-        !blocked.value &&
-        !synchronization.pendingPlay &&
-        !synchronization.playFailed
-      ) {
-        const playing = synchronization.claimPlay();
-        const revision = clockRevision();
-        try {
-          await el.play();
-          if (!synchronization.afterPlay(p, el, revision, serial)) return;
-          blocked.value = false;
-        } catch (failure) {
-          if (!synchronization.afterPlay(p, el, revision, serial)) return;
-          if (playFailureIs(failure, "NotAllowedError")) blocked.value = true;
-          else {
-            synchronization.failPlay();
-            reportPlayInterruption();
-          }
-        } finally {
-          synchronization.releasePlay(playing);
-        }
-      }
-      return;
+      return reconcileVod(s, el, p, serial, force, userSeek);
+    } catch (failure) {
+      return Promise.reject(failure);
     }
+  }
+  async function reconcileVod(
+    s: NonNullable<typeof state.value>,
+    el: HTMLVideoElement,
+    p: PlaybackPlan,
+    serial: number,
+    force: boolean,
+    userSeek: boolean,
+  ) {
     if (s.playback_status !== "playing") {
       el.pause();
       if (synchronization.restoreBaseRate() === undefined) return;
