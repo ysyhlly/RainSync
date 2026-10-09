@@ -164,6 +164,24 @@ it("real room wake clears stale correction, waits for a correlated sample, and r
     await vi.advanceTimersByTimeAsync(0);
     expect(el.currentTime).toBe(10);
     expect(el.paused).toBe(false);
+    // The actual room composition exposes finite controls, never the raw video.
+    expect(runtime).not.toHaveProperty("video");
+    expect(runtime.$state).not.toHaveProperty("playbackControls");
+    const controls = runtime.playbackControls;
+    expect(controls.state?.playback_status).toBe("playing");
+    controls.setLocalVolume(0.6);
+    controls.setLocalMuted(true);
+    expect(el.volume).toBe(0.6);
+    expect(el.muted).toBe(true);
+    expect(controls.togglePlayback()).toBe(true);
+    expect(JSON.parse(socket.send.mock.calls.at(-1)![0])).toEqual(
+      expect.objectContaining({
+        type: "PAUSE", room_id: "room", control_epoch: "control",
+        expected_revision: 1, media_generation: 1,
+      }),
+    );
+    expect(el.paused).toBe(false);
+    expect(grants).toBe(1);
     // PlaybackHost's canplay/playing event clears its local buffering flag.
     runtime.waiting = false;
     expect(runtime.recoveryState).toBe("idle");

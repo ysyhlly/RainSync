@@ -49,6 +49,7 @@ import {
   type RoomStateFrame,
 } from "./projection/room-projection";
 import { createRoomPlaybackFacade } from "./projection/playback-view";
+import { createPlaybackControlsPort } from "../playback/playback-controls-port";
 import {
   createRoomTransport,
   type RoomConnection,
@@ -607,6 +608,25 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     playback.dragging.value = false;
     commands.send("SEEK", { position_ms: position.value * 1000 });
   }
+  const playbackControls = createPlaybackControlsPort({
+    timeline: { state: readonly(state), connected: readonly(connected), can },
+    playback: {
+      duration: playback.duration,
+      position,
+      dragging: playback.dragging,
+      live: playback.live,
+      preparation: playback.preparation,
+      loadingStage: playback.loadingStage,
+      setLocalVolume: playback.setLocalVolume,
+      setLocalMuted: playback.setLocalMuted,
+    },
+    commands: {
+      play: () => commands.send("PLAY"),
+      pause: () => commands.send("PAUSE"),
+      setRate: (rate) => commands.send("SET_RATE", { rate }),
+      seek,
+    },
+  });
   const statusTimer = setInterval(() => {
     checkClockContinuity();
     if (room.value?.lifecycle === "closing") refreshLifecycleInBackground();
@@ -685,6 +705,7 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     revokeInvite: commands.revokeInvite,
     seek,
     run,
+    playbackControls,
     ...createRoomPlaybackFacade(playback),
   };
 });

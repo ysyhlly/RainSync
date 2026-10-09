@@ -73,7 +73,20 @@ Delete each alias only after its listed consumers use a dedicated host,
 settings, synchronization or room-page port. P12–P14 own those migrations;
 adding another internal playback field will not silently enlarge this facade.
 
-- `apps/web/src/features/playback/PlaybackControls.vue`: `dragging`, `duration`, `live`, `loadingStage`, `position`, `preparation`, `video`.
+`PlaybackControls.vue` now receives `playbackControls` through its existing
+host. This finite port reads the original room/playback view and delegates
+play/pause/seek/rate to the room command owner. Drag/position actions use the
+existing draft refs; local volume/mute call synchronous playback-owner methods
+that read its current element on every call. The component has no room-store,
+raw-video, session or general command/API access. Its local audio preferences
+remain component-local, and the host/video lifecycle is unchanged.
+
+The public `video` compatibility alias is removed after migrating its only
+production page consumer, PlaybackControls. Room assembly still reads the
+playback owner's element internally. Other aliases below retain their existing
+consumers and must not be removed before those migrations.
+
+- `apps/web/src/features/playback/PlaybackControls.vue`: migrated to the finite `PlaybackControlsPort`; no playback compatibility aliases.
 - `apps/web/src/features/playback/PlaybackHost.vue`: `applySubtitles`, `attach`, `blocked`, `cancelPreparation`, `dragging`, `duration`, `enablePlayback`, `live`, `loadMedia`, `loadingStage`, `nativePlatform`, `platformDanmakuCues`, `platformDanmakuEnabled`, `preparation`, `recoveryLabel`, `recoveryState`, `runPlayback`, `sessionId`, `startupDiagnostics`, `subtitleIndex`, `subtitles`, `waiting`.
 - `apps/web/src/features/playback/PlaybackInformation.vue`: `recoveryLabel`.
 - `apps/web/src/features/playback/PlaybackSettings.vue`: `advancedCapabilities`, `advancedFacts`, `applySubtitles`, `audioIndex`, `burnInSubtitleIndex`, `ladderCapabilities`, `ladderFacts`, `ladderManual`, `ladderQuality`, `ladderSelected`, `live`, `loadMedia`, `localHlsLadderEnabled`, `mode`, `nativeCredentialMode`, `nativeEncodedHeight`, `nativeLadderRenditions`, `nativePlatform`, `nativePlaybackMode`, `nativeProvider`, `nativeQualityMaxHeight`, `nativeQualityOptions`, `nativeQualitySelectedHeight`, `platformDanmakuEnabled`, `platformDanmakuStatus`, `platformLiveDanmakuMode`, `platformSubtitleId`, `platformSubtitleStatus`, `platformSubtitleTracks`, `platformTextError`, `platformTextLive`, `playbackSummary`, `runPlayback`, `selectLadderQuality`, `selectNativeQuality`, `selectPlatformSubtitle`, `setPlatformDanmaku`, `setPlatformLiveDanmaku`, `startupDiagnostics`, `staticHlsAvailability`, `staticHlsAvailabilityText`, `staticHlsFallbackEnabled`, `subtitleIndex`, `subtitles`, `toneMapHdr`, `tracks`, `upstreamMeasuredMatchesRequested`, `upstreamMeasuredOutput`.

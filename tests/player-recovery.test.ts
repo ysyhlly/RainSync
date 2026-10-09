@@ -2696,3 +2696,30 @@ it.each(["blocked", "waiting"] as const)(
     }
   },
 );
+
+it("local audio operations preserve playback status and use the owner's current element", async () => {
+  const s = setup({ deferAttach: true });
+  try {
+    s.runtime.setLocalVolume(0.25);
+    s.runtime.setLocalMuted(true);
+    expect(s.el.volume).toBeUndefined();
+    expect(s.el.muted).toBeUndefined();
+    s.runtime.attach(s.el);
+    await s.prepare();
+    s.error.value = "keep this playback notice";
+    s.runtime.playbackBusy.value = true;
+    s.connected.value = false;
+    s.active.value = false;
+    s.runtime.setLocalVolume(0.35);
+    s.runtime.setLocalMuted(true);
+    expect(s.el.volume).toBe(0.35);
+    expect(s.el.muted).toBe(true);
+    expect(s.error.value).toBe("keep this playback notice");
+    expect(s.runtime.playbackBusy.value).toBe(true);
+    expect(s.runtime.video.value).toBe(s.el);
+    expect(playbackPosts(s)).toHaveLength(1);
+    expect(s.el.play).not.toHaveBeenCalled();
+  } finally {
+    s.cleanup();
+  }
+});

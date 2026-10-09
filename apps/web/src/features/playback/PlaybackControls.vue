@@ -1,46 +1,55 @@
 <script setup lang="ts">
-import { ref, computed, watch, useId } from "vue";
-import { useRoomRuntime } from "../rooms/room-runtime";
+import { ref, computed, watch, useId, toRef } from "vue";
+import type { PlaybackControlsPort } from "./playback-controls-port";
 import AppSelect from "../../shared/ui/AppSelect.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import { formatTime } from "../../shared/use-action";
-defineProps<{ mini?: boolean; fullscreen?: boolean }>();
-const r = useRoomRuntime(),
+const props = defineProps<{
+  controls: PlaybackControlsPort;
+  mini?: boolean;
+  fullscreen?: boolean;
+}>();
+const r = toRef(props, "controls"),
   volume = ref(1),
   muted = ref(false);
 const availabilityId = useId();
 const controlDescription = computed(() => {
-  if (!r.state?.media_id) return "尚未选择影片，暂不能控制房间播放。";
-  if (!r.connected) return "房间连接尚未就绪，暂不能控制房间播放。";
-  if (!r.can(r.state?.playback_status === "playing" ? "pause" : "play"))
+  if (!r.value.state?.media_id) return "尚未选择影片，暂不能控制房间播放。";
+  if (!r.value.connected) return "房间连接尚未就绪，暂不能控制房间播放。";
+  if (
+    !r.value.can(
+      r.value.state?.playback_status === "playing" ? "pause" : "play",
+    )
+  )
     return "你可以观看影片；房间播放由有控制权限的成员操作。本机静音只影响自己。";
   return "播放、进度和倍速影响房间所有观众；音量和静音只影响本机。";
 });
 const animateProgress = ref(false);
 watch(
-  () => r.position,
+  () => r.value.position,
   (value, old) => {
-    animateProgress.value = !r.dragging && value >= old && value - old < 2;
+    animateProgress.value =
+      !r.value.dragging && value >= old && value - old < 2;
   },
 );
 const progress = computed(() =>
-  Number.isFinite(r.duration) && r.duration > 0
-    ? Math.max(0, Math.min(100, (r.position / r.duration) * 100))
+  Number.isFinite(r.value.duration) && r.value.duration > 0
+    ? Math.max(0, Math.min(100, (r.value.position / r.value.duration) * 100))
     : 0,
 );
 const durationKnown = computed(
-  () => Number.isFinite(r.duration) && r.duration > 0,
+  () => Number.isFinite(r.value.duration) && r.value.duration > 0,
 );
 const localUnavailable = computed(() =>
-  ["failed", "cancelled"].includes(r.preparation?.phase ?? ""),
+  ["failed", "cancelled"].includes(r.value.preparationPhase ?? ""),
 );
 function setVolume(event: Event) {
   volume.value = Number((event.target as HTMLInputElement).value);
-  if (r.video) r.video.volume = volume.value;
+  r.value.setLocalVolume(volume.value);
 }
 function mute() {
   muted.value = !muted.value;
-  if (r.video) r.video.muted = muted.value;
+  r.value.setLocalMuted(muted.value);
 }
 const emit = defineEmits<{
   fullscreen: [];
@@ -49,11 +58,11 @@ const emit = defineEmits<{
 }>();
 function drag(event: PointerEvent) {
   (event.target as HTMLElement).setPointerCapture(event.pointerId);
-  r.dragging = true;
+  r.value.setDragging(true);
   emit("dragging", true);
 }
 function end() {
-  r.dragging = false;
+  r.value.setDragging(false);
   emit("dragging", false);
 }
 </script>
@@ -80,7 +89,7 @@ function end() {
         !r.connected ||
         !r.state?.media_id
       "
-      @click="r.send(r.state?.playback_status === 'playing' ? 'PAUSE' : 'PLAY')"
+      @click="r.togglePlayback()"
     >
       <AppIcon
         :name="r.state?.playback_status === 'playing' ? 'pause' : 'play'"
@@ -117,8 +126,8 @@ function end() {
       "
       @pointerdown="drag"
       @input="
-        r.dragging = true;
-        r.position = Number(($event.target as HTMLInputElement).value);
+        r.setDragging(true);
+        r.previewSeek(Number(($event.target as HTMLInputElement).value));
       "
       @change="r.seek"
       @pointerup="end"
@@ -160,7 +169,7 @@ function end() {
       :options="
         [0.5, 1, 1.5, 2].map((value) => ({ value, label: value + '×' }))
       "
-      @change="r.send('SET_RATE', { rate: $event })"
+      @change="r.setRate($event)"
     /><slot /><button
       v-if="!mini"
       class="icon-button"

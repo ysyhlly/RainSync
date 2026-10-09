@@ -511,6 +511,7 @@ onBeforeUnmount(() => {
         @keydown="chrome.activity"
       >
         <PlaybackControls
+          :controls="r.playbackControls"
           :mini="!full && !fullscreen"
           :fullscreen="fullscreen"
           @menu-open="menu('select', $event)"

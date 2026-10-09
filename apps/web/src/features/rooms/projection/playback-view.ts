@@ -4,7 +4,6 @@ type PlaybackRuntime = ReturnType<typeof createPlaybackRuntime>;
 /** Explicit allowlist: adding owner internals never enlarges the page surface. */
 const pageFields = [
   "runPlayback",
-  "video",
   "distributedFacts",
   "peerStats",
   "peerSharing",

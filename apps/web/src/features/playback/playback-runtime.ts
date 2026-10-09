@@ -3130,6 +3130,12 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   function resetClockAction() {
     clockAction = undefined;
   }
+  function setLocalVolume(volume: number) {
+    if (video.value) video.value.volume = volume;
+  }
+  function setLocalMuted(muted: boolean) {
+    if (video.value) video.value.muted = muted;
+  }
   function attach(element: HTMLVideoElement) {
     if (video.value === element) return;
     if (video.value) throw new Error("播放器已绑定；需先显式停止");
@@ -3248,6 +3254,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     playbackBusy: busy,
     runPlayback: run,
     video,
+    setLocalVolume,
+    setLocalMuted,
     distributedIntent,
     distributedFacts,
     peerStats,
