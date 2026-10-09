@@ -85,7 +85,7 @@ export function createVodTickPolicy(ctx: {
     );
     const ranges = availablePlaybackRanges(el);
     if (!containsPlaybackPosition(ranges, expected)) {
-      ctx.synchronization.restoreBaseRate();
+      if (ctx.synchronization.restoreBaseRate() === undefined) return;
       ctx.synchronization.resetCorrection();
       if (p.rebuild_on_seek) void ctx.apply(true);
       return;
@@ -115,12 +115,14 @@ export function createVodTickPolicy(ctx: {
       performance.now(),
       pausedCorrection,
     );
-    if (pausedCorrection || adjustment.seek)
-      ctx.synchronization.restoreBaseRate();
-    else if (!ctx.synchronization.rateFacts!.fineUnsupported)
-      ctx.synchronization.applyCorrection(adjustment.rate);
+    if (pausedCorrection || adjustment.seek) {
+      if (ctx.synchronization.restoreBaseRate() === undefined) return;
+    } else if (!ctx.synchronization.rateFacts!.fineUnsupported) {
+      if (ctx.synchronization.applyCorrection(adjustment.rate) === undefined)
+        return;
+    }
     if (!ctx.synchronization.rateFacts!.baseSupported) {
-      ctx.synchronization.reportUnsupportedRate();
+      if (ctx.synchronization.reportUnsupportedRate() === undefined) return;
       ctx.synchronization.resetCorrection();
       return;
     }

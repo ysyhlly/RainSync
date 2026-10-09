@@ -14,6 +14,7 @@ export function createPlaybackSynchronization<Plan extends object>(ctx: {
   active: () => boolean;
   status: () => string | undefined;
   rate: () => number | undefined;
+  captureRateScope: () => () => boolean;
   clockUsable: () => boolean;
   clockRevision: () => number;
   rateSupported: () => void;
@@ -31,24 +32,62 @@ export function createPlaybackSynchronization<Plan extends object>(ctx: {
   let pendingPlay: object | undefined;
   let playFailed = false;
 
-  function reportUnsupportedRate() {
-    rejectedBaseRate = ctx.rate();
-    ctx.rateRejected();
+  function rateAttempt() {
+    const rate = ctx.rate(),
+      tracker = rates;
+    if (rate === undefined || !tracker) return undefined;
+    const qualify = ctx.captureRateScope();
+    return {
+      rate,
+      operation: tracker.operation(
+        () => rates === tracker && Object.is(ctx.rate(), rate) && qualify(),
+      ),
+    };
   }
-  function ensureBaseRate() {
-    const rate = ctx.rate();
-    if (rate === undefined || !rates) return false;
-    const supported = rates.ensureBase(rate);
-    if (!supported) reportUnsupportedRate();
+  type RateAttempt = NonNullable<ReturnType<typeof rateAttempt>>;
+  function rejectRate(rate: number, current: () => boolean) {
+    if (!current()) return undefined;
+    rejectedBaseRate = rate;
+    ctx.rateRejected();
+    return current() ? false : undefined;
+  }
+  function reportUnsupportedRate() {
+    const attempt = rateAttempt();
+    return attempt
+      ? rejectRate(attempt.rate, attempt.operation.capture())
+      : false;
+  }
+  function ensureRate(attempt: RateAttempt) {
+    const receipt = attempt.operation.ensureBase(attempt.rate);
+    if (receipt.result === undefined || !receipt.current()) return receipt;
+    if (!receipt.result) rejectRate(attempt.rate, receipt.current);
     else {
-      confirmedBaseRate = rate;
+      confirmedBaseRate = attempt.rate;
       rejectedBaseRate = undefined;
       ctx.rateSupported();
     }
-    return supported;
+    return receipt;
+  }
+  function ensureBaseRate() {
+    const attempt = rateAttempt();
+    if (!attempt) return false;
+    const receipt = ensureRate(attempt);
+    return receipt.current() ? receipt.result : undefined;
   }
   function restoreBaseRate() {
-    if (ensureBaseRate() && !rates!.restoreBase()) reportUnsupportedRate();
+    const attempt = rateAttempt();
+    if (!attempt) return false;
+    const ensured = ensureRate(attempt);
+    // A proof callback cannot lend the old continuation a newer record, even
+    // when a reusable operation handle has advanced to that successor.
+    if (!ensured.current()) return undefined;
+    if (ensured.result !== true) return ensured.result;
+    const restored = attempt.operation.restoreBase();
+    return restored.result === false
+      ? rejectRate(attempt.rate, restored.current)
+      : restored.current()
+        ? restored.result
+        : undefined;
   }
   function clearPendingApply() {
     pendingForce = pendingUserSeek = false;
@@ -178,7 +217,10 @@ export function createPlaybackSynchronization<Plan extends object>(ctx: {
       return corrector.step(drift, rate, now, paused);
     },
     applyCorrection(rate: number) {
-      return rates!.applyCorrection(rate);
+      const attempt = rateAttempt();
+      if (!attempt) return false;
+      const receipt = attempt.operation.applyCorrection(rate);
+      return receipt.current() ? receipt.result : undefined;
     },
     ensureBaseRate,
     restoreBaseRate,

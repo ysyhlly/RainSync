@@ -2723,3 +2723,178 @@ it("local audio operations preserve playback status and use the owner's current 
     s.cleanup();
   }
 });
+
+it("a retired correction must not publish rate rejection into its replacement", async () => {
+  let replace: (() => void) | undefined;
+  const s = setup({
+    acceptRate: (requested, actual) => {
+      if (replace && requested === 1.5) {
+        const action = replace;
+        replace = undefined;
+        action();
+        return actual;
+      }
+      return requested;
+    },
+  });
+  let replacement: Promise<unknown> | undefined;
+  try {
+    await s.prepare();
+    s.playing();
+    s.state.value.playback_rate = 1.5;
+    replace = () => {
+      replacement = s.runtime.runPlayback(s.runtime.loadMedia);
+    };
+    // Synchronous advance observes the original rate effect before the newer
+    // request can settle, preserving the exact owner transition under test.
+    vi.advanceTimersByTime(500);
+    const observed = {
+      notice: s.error.value,
+      phase: s.runtime.preparation.value.phase,
+      generation: s.runtime.preparation.value.generation,
+      session: s.runtime.sessionId.value,
+      busy: s.runtime.playbackBusy.value,
+      rate: s.el.playbackRate,
+    };
+    await replacement;
+    expect(observed.generation).toBe(2);
+    expect(observed.phase).toBe("preparing");
+    expect(observed.notice).toBe("");
+  } finally {
+    s.cleanup();
+  }
+});
+
+it.each(["identity", "media", "room"])(
+  "a rate setter retired by %s replacement cannot publish its rejection or seek",
+  async (replacement) => {
+    let retire: (() => void) | undefined;
+    const s = setup({
+      acceptRate: (requested, actual) => {
+        if (retire && requested === 1.5) {
+          const action = retire;
+          retire = undefined;
+          action();
+          return actual;
+        }
+        return requested;
+      },
+    });
+    try {
+      await s.prepare();
+      s.playing();
+      s.state.value.playback_rate = 1.5;
+      s.state.value.anchor_position_ms = 50000;
+      retire = () => {
+        if (replacement === "identity") ++s.session.epoch;
+        else if (replacement === "media") ++s.state.value.media_generation;
+        else s.state.value.room_id = "replacement-room";
+      };
+      s.seeks.mockClear();
+      vi.advanceTimersByTime(500);
+      expect(s.error.value).toBe("");
+      expect(s.seeks).not.toHaveBeenCalled();
+      expect(s.el.play).not.toHaveBeenCalled();
+      expect(s.runtime.video.value).toBe(s.el);
+      expect(playbackPosts(s)).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it("staged settings during a current rate setter preserve readback and correction", async () => {
+  let stage: (() => void) | undefined;
+  const s = setup({
+    acceptRate: (requested) => {
+      stage?.();
+      stage = undefined;
+      return requested;
+    },
+  });
+  try {
+    await s.prepare();
+    s.playing();
+    s.state.value.playback_rate = 1.5;
+    s.state.value.anchor_position_ms = 10400;
+    stage = () => {
+      s.runtime.mode.value = "transcode";
+    };
+    s.writes.mockClear();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(s.runtime.mode.value).toBe("transcode");
+    expect(s.el.playbackRate).toBeGreaterThan(1.5);
+    expect(s.writes.mock.calls[0]).toEqual([1.5]);
+    expect(s.error.value).toBe("");
+    expect(playbackPosts(s)).toHaveLength(1);
+    expect(s.runtime.video.value).toBe(s.el);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("a retired hard-seek restoration stops before seeking the successor element", async () => {
+  let reload: (() => void) | undefined;
+  const s = setup({
+    rate: 1.5,
+    acceptRate: (requested) => {
+      if (reload && requested === 1.5) {
+        const action = reload;
+        reload = undefined;
+        action();
+      }
+      return requested;
+    },
+  });
+  let replacement: Promise<unknown> | undefined;
+  try {
+    await s.prepare();
+    s.playing();
+    s.state.value.anchor_position_ms = 10500;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(s.el.playbackRate).toBeGreaterThan(1.5);
+    s.state.value.anchor_position_ms = 50000;
+    reload = () => {
+      replacement = s.runtime.runPlayback(s.runtime.loadMedia);
+    };
+    s.seeks.mockClear();
+    vi.advanceTimersByTime(500);
+    expect(s.runtime.preparation.value).toMatchObject({
+      phase: "preparing",
+      generation: 2,
+    });
+    expect(s.seeks).not.toHaveBeenCalled();
+    expect(s.error.value).toBe("");
+    expect(s.runtime.video.value).toBe(s.el);
+    await replacement;
+  } finally {
+    s.cleanup();
+  }
+});
+
+it.each(["hidden", "disconnected"])(
+  "restores the base while %s after a current fine correction",
+  async (condition) => {
+    const s = setup({ rate: 1.5 });
+    try {
+      await s.prepare();
+      s.playing();
+      s.state.value.anchor_position_ms = 10500;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(s.el.playbackRate).toBeGreaterThan(1.5);
+      if (condition === "hidden") s.document.visibilityState = "hidden";
+      else s.connected.value = false;
+      s.writes.mockClear();
+      s.seeks.mockClear();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(s.el.playbackRate).toBe(1.5);
+      expect(s.writes.mock.calls).toEqual([[1.5]]);
+      expect(s.seeks).not.toHaveBeenCalled();
+      expect(s.error.value).toBe("");
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(s.runtime.video.value).toBe(s.el);
+    } finally {
+      s.cleanup();
+    }
+  },
+);

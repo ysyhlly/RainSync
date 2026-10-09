@@ -23,6 +23,13 @@ function setup() {
     active: () => state.active,
     status: () => state.status,
     rate: () => state.rate,
+    captureRateScope: () => {
+      const plan = state.plan,
+        element = state.element,
+        active = state.active;
+      return () =>
+        state.plan === plan && state.element === element && state.active === active;
+    },
     clockUsable,
     clockRevision: () => state.revision,
     rateSupported,
@@ -42,6 +49,7 @@ it("does not read incomplete runtime assembly during construction", () => {
     active: premature,
     status: premature,
     rate: premature,
+    captureRateScope: premature,
     clockUsable: premature,
     clockRevision: premature,
     rateSupported: premature,
@@ -289,3 +297,175 @@ function finiteLiveTickPorts(
   input[2].session_id;
 }
 void finiteLiveTickPorts;
+
+it("preserves current outer proof after a synchronous clock restoration attempt", () => {
+  let actual = 1;
+  let reenter = true;
+  const events: string[] = [];
+  let owner!: ReturnType<typeof createPlaybackSynchronization<object>>;
+  const element = {
+    pause: vi.fn(),
+    get playbackRate() {
+      return actual;
+    },
+    set playbackRate(value: number) {
+      actual = value;
+      if (reenter) {
+        reenter = false;
+        events.push("rate effect");
+        owner.invalidateClock();
+      }
+    },
+  };
+  const context = {
+    element: () => element,
+    currentPlan: () => true,
+    active: () => true,
+    status: () => "playing",
+    rate: () => 1.5,
+    clockUsable: () => true,
+    clockRevision: () => 0,
+    captureRateScope: () => () => true,
+    rateSupported: () => {
+      events.push("supported");
+    },
+    rateRejected: () => {
+      events.push("rejected");
+    },
+  };
+  owner = createPlaybackSynchronization(context);
+  owner.attachRateElement(element);
+  owner.claimPlay();
+  expect(owner.ensureBaseRate()).toBe(true);
+  expect(events).toEqual(["rate effect", "rejected", "supported"]);
+  expect(owner.rateFacts!.baseSupported).toBe(true);
+  expect(owner.confirmedBaseRate).toBe(1.5);
+  expect(owner.rejectedBaseRate).toBeUndefined();
+  expect(owner.pendingPlay).toBe(true);
+});
+
+it.each(["supported", "rejected"])(
+  "a %s callback cannot let an old restore read or publish through a successor",
+  (outcome) => {
+    const s = setup();
+    let actual = 1,
+      reads = 0,
+      successorReads = -1;
+    const writes: number[] = [];
+    Object.defineProperty(s.element, "playbackRate", {
+      get: () => {
+        ++reads;
+        return actual;
+      },
+      set: (value: number) => {
+        writes.push(value);
+        actual = outcome === "rejected" ? 1 : value;
+      },
+    });
+    const callback = outcome === "supported" ? s.rateSupported : s.rateRejected;
+    callback.mockImplementationOnce(() => {
+      s.state.plan = {};
+      s.owner.resetRates();
+      s.state.rate = actual = 2;
+      expect(s.owner.ensureBaseRate()).toBe(true);
+      successorReads = reads;
+    });
+    s.state.rate = 1.5;
+    expect(s.owner.restoreBaseRate()).toBeUndefined();
+    expect(reads).toBe(successorReads);
+    expect(writes).toEqual([1.5]);
+    expect(s.owner.rateFacts!.baseSupported).toBe(true);
+    expect(s.owner.confirmedBaseRate).toBe(2);
+    expect(s.owner.rejectedBaseRate).toBeUndefined();
+  },
+);
+
+it("a plan change during rate I/O is silent without resetting successor state", () => {
+  const s = setup();
+  let actual = 1;
+  Object.defineProperty(s.element, "playbackRate", {
+    get: () => actual,
+    set: (value: number) => {
+      actual = value;
+      s.state.plan = {};
+    },
+  });
+  s.state.rate = 1.5;
+  expect(s.owner.ensureBaseRate()).toBeUndefined();
+  expect(s.owner.rateFacts!.baseSupported).toBe(false);
+  expect(s.owner.confirmedBaseRate).toBeUndefined();
+  expect(s.owner.rejectedBaseRate).toBeUndefined();
+  expect(s.rateSupported).not.toHaveBeenCalled();
+  expect(s.rateRejected).not.toHaveBeenCalled();
+});
+
+it("a replacement tracker retains its own successful rate after an old setter resumes", () => {
+  const s = setup();
+  let actual = 1;
+  const replacement = { playbackRate: 2, pause: vi.fn() };
+  Object.defineProperty(s.element, "playbackRate", {
+    get: () => actual,
+    set: (value: number) => {
+      actual = value;
+      s.state.element = replacement;
+      s.owner.attachRateElement(replacement);
+      s.state.rate = 2;
+      expect(s.owner.ensureBaseRate()).toBe(true);
+    },
+  });
+  s.state.rate = 1.5;
+  expect(s.owner.ensureBaseRate()).toBeUndefined();
+  expect(s.owner.rateFacts!.baseSupported).toBe(true);
+  expect(s.owner.confirmedBaseRate).toBe(2);
+  expect(s.owner.rejectedBaseRate).toBeUndefined();
+  expect(replacement.playbackRate).toBe(2);
+  expect(s.rateRejected).not.toHaveBeenCalled();
+  expect(s.rateSupported).toHaveBeenCalledOnce();
+});
+
+it("unsupported publication reports callback retirement before a caller continues", () => {
+  const s = setup();
+  s.state.rate = 3;
+  expect(s.owner.ensureBaseRate()).toBe(false);
+  s.rateRejected.mockImplementationOnce(() => {
+    s.owner.resetRates();
+    s.state.plan = {};
+    s.state.rate = 1;
+    expect(s.owner.ensureBaseRate()).toBe(true);
+  });
+  expect(s.owner.reportUnsupportedRate()).toBeUndefined();
+  expect(s.owner.confirmedBaseRate).toBe(1);
+  expect(s.owner.rejectedBaseRate).toBeUndefined();
+  expect(s.owner.rateFacts!.baseSupported).toBe(true);
+});
+
+it("current no-tracker and no-rate operations are explicit non-retired no-ops", () => {
+  let rate: number | undefined = 1;
+  const scope = vi.fn(() => () => true);
+  const published = vi.fn();
+  const element = { pause: vi.fn(), playbackRate: 1 };
+  const owner = createPlaybackSynchronization({
+    element: () => element,
+    currentPlan: () => true,
+    active: () => true,
+    status: () => "playing",
+    rate: () => rate,
+    captureRateScope: scope,
+    clockUsable: () => true,
+    clockRevision: () => 0,
+    rateSupported: published,
+    rateRejected: published,
+  });
+  for (const attached of [false, true]) {
+    if (attached) {
+      owner.attachRateElement(element);
+      rate = undefined;
+    }
+    expect(owner.ensureBaseRate()).toBe(false);
+    expect(owner.restoreBaseRate()).toBe(false);
+    expect(owner.applyCorrection(1.05)).toBe(false);
+    expect(owner.reportUnsupportedRate()).toBe(false);
+  }
+  expect(scope).not.toHaveBeenCalled();
+  expect(published).not.toHaveBeenCalled();
+});

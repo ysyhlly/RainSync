@@ -576,6 +576,32 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     active: roomIsActive,
     status: () => state.value?.playback_status,
     rate: () => state.value?.playback_rate,
+    captureRateScope: () => {
+      const serial = loadSerial,
+        plan = readPlan(),
+        intent = readIntent(),
+        element = video.value,
+        identity = viewer.current(),
+        room = state.value?.room_id,
+        media = state.value?.media_id,
+        generation = state.value?.media_generation,
+        active = roomIsActive(),
+        wasDisposed = disposed;
+      // Compare supersession only. Clock recovery, staged settings and an SDK
+      // that is not ready must retain their existing base-restoration rights.
+      return () =>
+        serial === loadSerial &&
+        plan === readPlan() &&
+        intent === readIntent() &&
+        element === video.value &&
+        identity.userId === viewer.current().userId &&
+        identity.epoch === viewer.current().epoch &&
+        room === state.value?.room_id &&
+        media === state.value?.media_id &&
+        generation === state.value?.media_generation &&
+        active === roomIsActive() &&
+        wasDisposed === disposed;
+    },
     clockUsable,
     clockRevision,
     rateRejected: reportUnsupportedRate,
@@ -2779,7 +2805,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         return;
       }
       if (!synchronization.ensureBaseRate()) return;
-      synchronization.restoreBaseRate();
+      if (synchronization.restoreBaseRate() === undefined) return;
       if (directive === "pause") {
         el.pause();
         liveNeedsEdge = true;
@@ -2826,10 +2852,10 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     }
     if (s.playback_status !== "playing") {
       el.pause();
-      synchronization.restoreBaseRate();
+      if (synchronization.restoreBaseRate() === undefined) return;
     }
     if (!clockUsable()) {
-      synchronization.restoreBaseRate();
+      if (synchronization.restoreBaseRate() === undefined) return;
       queueApply(force, userSeek);
       return;
     }
@@ -2894,7 +2920,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     // Neither a finite duration nor a later interval authorizes a seek into a
     // hole. Generated holes stay on the finite recovery/reload path.
     if (!seekable && Math.abs(el.currentTime - expected) > 0.15) {
-      synchronization.restoreBaseRate();
+      if (synchronization.restoreBaseRate() === undefined) return;
       error.value = "目标进度尚不可定位，请稍后重试或重新加载";
       // Initial playback may need play() to expose any local intervals. Keep
       // the metadata seek pending, and never assign an unavailable position.
