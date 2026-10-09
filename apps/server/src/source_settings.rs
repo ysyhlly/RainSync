@@ -1,10 +1,6 @@
 //! HTTP adaptation for source settings; catalog operations own the transaction.
 use super::*;
 pub use catalog::source_settings::Change;
-// Compatibility until private-source callers move to catalog rules.
-pub(crate) use catalog::source_rules::{
-    merge_config, name, parse_config, revision, safe_detail, validate_config,
-};
 
 pub async fn get(State(app): State<App>, h: HeaderMap, Path(id): Path<Uuid>) -> Result<Response> {
     let user = auth(&app, &h, false).await?;
