@@ -49,6 +49,7 @@ import {
   type RoomStateFrame,
 } from "./projection/room-projection";
 import { createRoomPlaybackFacade } from "./projection/playback-view";
+import { createPlaybackSettingsPort } from "../playback/playback-settings-port";
 import { createPlaybackControlsPort } from "../playback/playback-controls-port";
 import {
   createRoomTransport,
@@ -61,7 +62,7 @@ import { createRoomChat } from "./commands/room-chat";
 import { createRoomCommands } from "./commands/room-commands";
 
 /** Compatibility composition only: projection, transport and commands own their state. */
-export const useRoomRuntime = defineStore("room-runtime", () => {
+export const useRoomRuntime = defineStore("room-runtime", ({ action }) => {
   const session = useSession(),
     catalog = useMediaCatalog(),
     platformAccount = usePlatformAccount();
@@ -362,6 +363,24 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     },
   );
   const playback = viewing.playback;
+
+  // Keep the original Pinia action hooks and promise layers, including actions
+  // whose former flat page aliases retire with the Settings consumer.
+  const settingsActions = {
+    runPlayback: action(playback.runPlayback, "runPlayback"),
+    loadMedia: action(playback.loadMedia, "loadMedia"),
+    applySubtitles: action(playback.applySubtitles, "applySubtitles"),
+    selectNativeQuality: action(playback.selectNativeQuality, "selectNativeQuality"),
+    selectLadderQuality: action(playback.selectLadderQuality, "selectLadderQuality"),
+    selectPlatformSubtitle: action(playback.selectPlatformSubtitle, "selectPlatformSubtitle"),
+    setPlatformDanmaku: action(playback.setPlatformDanmaku, "setPlatformDanmaku"),
+    setPlatformLiveDanmaku: action(playback.setPlatformLiveDanmaku, "setPlatformLiveDanmaku"),
+  };
+  const playbackSettings = createPlaybackSettingsPort({
+    playback,
+    actions: settingsActions,
+    hasMedia: () => !!state.value?.media_id,
+  });
   // The epoch is invalidated before session.user changes. Keep the original
   // login-only notice clearing rule without scheduling another room cleanup.
   watch(
@@ -706,6 +725,10 @@ export const useRoomRuntime = defineStore("room-runtime", () => {
     seek,
     run,
     playbackControls,
+    playbackSettings,
     ...createRoomPlaybackFacade(playback),
+    runPlayback: settingsActions.runPlayback,
+    loadMedia: settingsActions.loadMedia,
+    applySubtitles: settingsActions.applySubtitles,
   };
 });

@@ -1,3 +1,4 @@
+import { createPlaybackSettingsPort } from "../apps/web/src/features/playback/playback-settings-port";
 import { readFileSync } from "node:fs";
 import { parse, compileScript } from "@vue/compiler-sfc";
 import ts from "typescript";
@@ -107,7 +108,6 @@ it("completed playback can still inspect a later meter sample through Settings",
     startupDiagnostics: undefined as unknown,
   });
   const settings = component("PlaybackSettings.vue", {
-    useRoomRuntime: () => r,
     PlaybackStartupDiagnostics: diagnostics,
     AppSelect: empty,
     AppIcon: empty,
@@ -117,13 +117,24 @@ it("completed playback can still inspect a later meter sample through Settings",
     NativeHlsLadderSettings: empty,
     AdvancedPlaybackSettings: empty,
   });
+  const settingsPort = createPlaybackSettingsPort({
+    playback: new Proxy(
+      {},
+      {
+        get: (_target, key) =>
+          Vue.toRef(r as Record<string, any>, key as string),
+      },
+    ) as Parameters<typeof createPlaybackSettingsPort>[0]["playback"],
+    actions: r as any,
+    hasMedia: () => !!r.state?.media_id,
+  });
   const before = await SSR.renderToString(
-    Vue.createSSRApp(settings, { active: true }),
+    Vue.createSSRApp(settings, { active: true, settings: settingsPort }),
   );
   expect(before).toContain("暂无本地耗时观测");
   r.startupDiagnostics = snapshot("video_frame_callback");
   const after = await SSR.renderToString(
-    Vue.createSSRApp(settings, { active: true }),
+    Vue.createSSRApp(settings, { active: true, settings: settingsPort }),
   );
   expect(after).toContain("首帧信号");
   expect(after).toContain("3.5 秒");

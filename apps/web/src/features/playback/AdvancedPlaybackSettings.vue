@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { DeepReadonly } from "vue";
 import { computed } from "vue";
 import type {
   AdvancedPlaybackCapabilities,
@@ -9,8 +10,8 @@ import type { SelectValue } from "../../shared/ui/select";
 import { validAdvancedPlaybackCapabilities } from "./advanced-playback-intent";
 
 const props = defineProps<{
-  capabilities?: AdvancedPlaybackCapabilities;
-  facts?: AdvancedPlaybackFacts;
+  capabilities?: DeepReadonly<AdvancedPlaybackCapabilities>;
+  facts?: DeepReadonly<AdvancedPlaybackFacts>;
   toneMapHdr: boolean;
   subtitleStreamIndex?: number;
   disabled?: boolean;

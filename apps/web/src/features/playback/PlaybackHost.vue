@@ -518,7 +518,7 @@ onBeforeUnmount(() => {
           @dragging="chrome.setDragging"
           @fullscreen="toggleFullscreen"
         >
-          <PlaybackSettings
+          <PlaybackSettings :settings="r.playbackSettings"
             :active="full || fullscreen"
             v-show="full || fullscreen"
             @open-change="menu('settings', $event)"

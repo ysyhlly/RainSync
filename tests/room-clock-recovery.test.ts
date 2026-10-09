@@ -20,6 +20,14 @@ vi.mock("../apps/web/src/features/playback/playback-runtime", () => ({
     return {
       playbackError: ref(""),
       playbackBusy: ref(false),
+      // Existing Settings actions are required by composition, but this room
+      // fixture must never execute them. Keep unexpected calls observable.
+      applySubtitles: () => { throw Error("Unexpected applySubtitles in room-clock-recovery.test.ts"); },
+      selectNativeQuality: () => { throw Error("Unexpected selectNativeQuality in room-clock-recovery.test.ts"); },
+      selectLadderQuality: () => { throw Error("Unexpected selectLadderQuality in room-clock-recovery.test.ts"); },
+      selectPlatformSubtitle: () => { throw Error("Unexpected selectPlatformSubtitle in room-clock-recovery.test.ts"); },
+      setPlatformDanmaku: () => { throw Error("Unexpected setPlatformDanmaku in room-clock-recovery.test.ts"); },
+      setPlatformLiveDanmaku: () => { throw Error("Unexpected setPlatformLiveDanmaku in room-clock-recovery.test.ts"); },
       runPlayback: async (action: () => Promise<unknown>) => { await action(); },
       video: ref(),
       position: ref(0),

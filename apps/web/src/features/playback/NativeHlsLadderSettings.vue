@@ -5,7 +5,7 @@ import { validLocalHlsRenditions } from "./local-hls-ladder-intent";
 defineProps<{
   enabled: boolean;
   compatibility: boolean;
-  renditions?: LocalHlsRendition[];
+  renditions?: readonly LocalHlsRendition[];
   quality: string;
   selected?: string;
   manual: boolean;

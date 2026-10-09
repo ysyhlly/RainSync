@@ -1,3 +1,4 @@
+import { createPlaybackSettingsPort } from "../apps/web/src/features/playback/playback-settings-port";
 import { readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -74,8 +75,6 @@ async function renderSettings(overrides: Record<string, unknown> = {}) {
     }
     const require = (specifier: string) => {
       if (specifier === "vue") return Vue;
-      if (specifier === "../rooms/room-runtime")
-        return { useRoomRuntime: () => runtime };
       if (specifier === "./playback-selections") return selections;
       if (
         specifier === "./PlatformTextSettings.vue" ||
@@ -98,8 +97,19 @@ async function renderSettings(overrides: Record<string, unknown> = {}) {
     loaded.set(name, module.exports.default);
     return module.exports.default;
   }
+  const settings = createPlaybackSettingsPort({
+    playback: new Proxy(
+      {},
+      {
+        get: (_target, key) =>
+          Vue.toRef(runtime as Record<string, any>, key as string),
+      },
+    ) as Parameters<typeof createPlaybackSettingsPort>[0]["playback"],
+    actions: runtime as any,
+    hasMedia: () => !!runtime.state?.media_id,
+  });
   return renderToString(
-    Vue.createSSRApp(load("PlaybackSettings.vue"), { active: true }),
+    Vue.createSSRApp(load("PlaybackSettings.vue"), { active: true, settings }),
   );
 }
 

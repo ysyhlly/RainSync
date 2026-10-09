@@ -81,6 +81,16 @@ that read its current element on every call. The component has no room-store,
 raw-video, session or general command/API access. Its local audio preferences
 remain component-local, and the host/video lifecycle is unchanged.
 
+`PlaybackSettings.vue` receives `playbackSettings` through the same Host. Its
+facts are deeply readonly live views over the existing refs, and named actions
+preserve staged inputs, immediate reload/audio/quality operations and platform
+text routing. The composition uses Pinia's supported setup action helper under
+the original eight action names. Shared run/load/subtitle aliases retain the
+same wrapped references; the five Settings-only actions retain their hooks and
+promise settlement privately. No runner, raw store, element or API reaches the
+Settings consumer. The 36 Settings-exclusive aliases are removed from the old
+69-field allowlist; its remaining 33 fields retain the consumers listed below.
+
 The public `video` compatibility alias is removed after migrating its only
 production page consumer, PlaybackControls. Room assembly still reads the
 playback owner's element internally. Other aliases below retain their existing
@@ -89,7 +99,7 @@ consumers and must not be removed before those migrations.
 - `apps/web/src/features/playback/PlaybackControls.vue`: migrated to the finite `PlaybackControlsPort`; no playback compatibility aliases.
 - `apps/web/src/features/playback/PlaybackHost.vue`: `applySubtitles`, `attach`, `blocked`, `cancelPreparation`, `dragging`, `duration`, `enablePlayback`, `live`, `loadMedia`, `loadingStage`, `nativePlatform`, `platformDanmakuCues`, `platformDanmakuEnabled`, `preparation`, `recoveryLabel`, `recoveryState`, `runPlayback`, `sessionId`, `startupDiagnostics`, `subtitleIndex`, `subtitles`, `waiting`.
 - `apps/web/src/features/playback/PlaybackInformation.vue`: `recoveryLabel`.
-- `apps/web/src/features/playback/PlaybackSettings.vue`: `advancedCapabilities`, `advancedFacts`, `applySubtitles`, `audioIndex`, `burnInSubtitleIndex`, `ladderCapabilities`, `ladderFacts`, `ladderManual`, `ladderQuality`, `ladderSelected`, `live`, `loadMedia`, `localHlsLadderEnabled`, `mode`, `nativeCredentialMode`, `nativeEncodedHeight`, `nativeLadderRenditions`, `nativePlatform`, `nativePlaybackMode`, `nativeProvider`, `nativeQualityMaxHeight`, `nativeQualityOptions`, `nativeQualitySelectedHeight`, `platformDanmakuEnabled`, `platformDanmakuStatus`, `platformLiveDanmakuMode`, `platformSubtitleId`, `platformSubtitleStatus`, `platformSubtitleTracks`, `platformTextError`, `platformTextLive`, `playbackSummary`, `runPlayback`, `selectLadderQuality`, `selectNativeQuality`, `selectPlatformSubtitle`, `setPlatformDanmaku`, `setPlatformLiveDanmaku`, `startupDiagnostics`, `staticHlsAvailability`, `staticHlsAvailabilityText`, `staticHlsFallbackEnabled`, `subtitleIndex`, `subtitles`, `toneMapHdr`, `tracks`, `upstreamMeasuredMatchesRequested`, `upstreamMeasuredOutput`.
+- `apps/web/src/features/playback/PlaybackSettings.vue`: migrated to the finite `PlaybackSettingsPort`; no playback compatibility aliases.
 - `apps/web/src/features/rooms/RoomMediaPicker.vue`: `nativePlaybackMode`.
 - `apps/web/src/features/rooms/RoomPage.vue`: `audioIndex`, `distributedFacts`, `duration`, `live`, `nativePlaybackMode`, `peerSharing`, `peerStats`, `playbackSummary`, `recoveryLabel`, `startPeerSharing`, `stopPeerSharing`, `useDistributedOutput`, `useOriginalSource`.
 - `apps/web/src/features/rooms/RoomsPage.vue`: `nativePlaybackMode`.

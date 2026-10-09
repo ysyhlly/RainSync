@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { DeepReadonly } from "vue";
 import type {
   LocalHlsLadderCapabilities,
   LocalHlsLadderFacts,
@@ -6,8 +7,8 @@ import type {
 import AppSelect from "../../shared/ui/AppSelect.vue";
 import { validLocalHlsLadderCapabilities } from "./local-hls-ladder-intent";
 defineProps<{
-  capabilities?: LocalHlsLadderCapabilities;
-  facts?: LocalHlsLadderFacts;
+  capabilities?: DeepReadonly<LocalHlsLadderCapabilities>;
+  facts?: DeepReadonly<LocalHlsLadderFacts>;
   enabled: boolean;
   quality: string;
   selected?: string;

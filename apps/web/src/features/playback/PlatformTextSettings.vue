@@ -6,7 +6,7 @@ import type {
   PlatformTextStatus,
 } from "./platform-text";
 const props = defineProps<{
-  tracks: PlatformSubtitleTrack[];
+  tracks: readonly PlatformSubtitleTrack[];
   subtitleId: string | null;
   subtitleStatus: PlatformTextStatus;
   danmakuStatus: PlatformTextStatus;
