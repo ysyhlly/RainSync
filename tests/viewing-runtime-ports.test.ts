@@ -1,3 +1,5 @@
+import type { createPlatformTextRuntime } from "../apps/web/src/features/playback/platform-text-runtime";
+import type { PlatformTextGrant } from "../apps/web/src/features/playback/platform-text";
 import { afterEach, expect, it, vi } from "vitest";
 import { createPinia, disposePinia, setActivePinia } from "pinia";
 import { effectScope, proxyRefs, reactive, readonly, ref } from "vue";
@@ -431,3 +433,49 @@ it.each(["SEEK", "PLAY"])(
     expect(playback.busy).toBe(false);
   },
 );
+
+function finitePlatformTextInputs(
+  context: Parameters<typeof createPlatformTextRuntime>[0],
+  grant: PlatformTextGrant,
+) {
+  if (context.video.value) {
+    // @ts-expect-error Text observes time; synchronization owns seeking.
+    context.video.value.currentTime = 10;
+    // @ts-expect-error Source attachment is not a text capability.
+    context.video.value.src = "/replacement.mp4";
+    // @ts-expect-error Autoplay remains with the application.
+    context.video.value.play();
+    context.video.value.addTextTrack("subtitles");
+  }
+  // @ts-expect-error Text cannot replace the permanent media element.
+  context.video.value = undefined;
+  const signal = new AbortController().signal;
+  context.api("/catalog", "GET", undefined, signal);
+  // @ts-expect-error Text's JSON reader cannot submit a mutation.
+  context.api("/playback-sessions", "POST", undefined, signal);
+  // @ts-expect-error The read port accepts no request body.
+  context.api("/catalog", "GET", { unauthorized: true }, signal);
+  // @ts-expect-error The read port cannot supply arbitrary credentials/headers.
+  context.api("/catalog", "GET", undefined, signal, {
+    authorization: "unowned",
+  });
+  // @ts-expect-error Responses stay unknown until the existing parser validates them.
+  context.api<{ unauthorized: true }>("/catalog", "GET", undefined, signal);
+  // @ts-expect-error The session owner controls SID and grant identity.
+  grant.session_id = "replacement";
+  if (grant.native_platform?.live) {
+    // @ts-expect-error Broadcast ownership cannot be rewritten by captions.
+    grant.native_platform.live.broadcast_id = "replacement";
+  }
+  if (grant.native_platform?.compatibility?.output) {
+    // @ts-expect-error The granted output attempt is immutable.
+    grant.native_platform.compatibility.output.attempt = 2;
+  }
+  // @ts-expect-error Text does not own or consume server plan generation.
+  grant.plan_generation;
+  // @ts-expect-error Decoder/worker fallback policy does not belong to text.
+  grant.decoder_fallback_modes;
+  // @ts-expect-error Quality selection is outside the text grant view.
+  grant.native_platform?.quality;
+}
+void finitePlatformTextInputs;

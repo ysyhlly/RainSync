@@ -1,7 +1,5 @@
 import { compileDanmakuCues } from "./advanced-danmaku-loader";
 import { ref, watch, onScopeDispose, type Ref } from "vue";
-import type { PlaybackPlan } from "../../../../../packages/protocol";
-import type { ApiClient } from "../../shared/api/client";
 import type { PlaybackIdentityPort } from "./playback-runtime-types";
 import { RequestFailure } from "../../errors";
 import {
@@ -15,11 +13,31 @@ import {
   type PlatformSubtitleTrack,
   type PlatformDanmakuCue,
   type PlatformTextStatus,
+  type PlatformTextGrant,
 } from "./platform-text";
+/** Keep the original client reference and cancellation arguments, but expose
+ * no mutation method, body, extra headers or unvalidated generic response. */
+export type PlatformTextJsonReader = (
+  path: string,
+  method: "GET",
+  body: undefined,
+  signal: AbortSignal,
+) => Promise<unknown>;
+export type PlatformTextElement = Readonly<
+  Pick<
+    HTMLVideoElement,
+    | "currentTime"
+    | "currentSrc"
+    | "textTracks"
+    | "addTextTrack"
+    | "addEventListener"
+    | "removeEventListener"
+  >
+>;
 export function createPlatformTextRuntime(ctx: {
   identity: PlaybackIdentityPort;
-  api: ApiClient;
-  video: Ref<HTMLVideoElement | undefined>;
+  api: PlatformTextJsonReader;
+  video: Readonly<Ref<PlatformTextElement | undefined>>;
   /** Stable viewer/room/media/account identity, excluding grant and quality. */
   preferenceScope?: () => string | undefined;
 }) {
@@ -35,7 +53,7 @@ export function createPlatformTextRuntime(ctx: {
   let preferenceOwner: string | undefined;
   let preferredSubtitle: PlatformSubtitleTrack | undefined;
   let preferredDanmaku = false;
-  function ownerFor(plan: PlaybackPlan) {
+  function ownerFor(plan: PlatformTextGrant) {
     const scope = ctx.preferenceScope?.();
     if (
       (ctx.preferenceScope && !scope) ||
@@ -65,7 +83,7 @@ export function createPlatformTextRuntime(ctx: {
     subtitleRequest: AbortController | undefined,
     danmakuRequest: AbortController | undefined;
   let nativeTrack: TextTrack | undefined,
-    nativeElement: HTMLVideoElement | undefined;
+    nativeElement: PlatformTextElement | undefined;
   type InbandCue = { start: number; end: number; text: string };
   const inband = new Map<
     string,
@@ -174,7 +192,7 @@ export function createPlatformTextRuntime(ctx: {
     if (platformSubtitleId.value === source.track.id)
       renderInband(source.track.id);
   }
-  function observeNativeLiveCaptions(plan: PlaybackPlan) {
+  function observeNativeLiveCaptions(plan: PlatformTextGrant) {
     const element = ctx.video.value,
       tracks = element?.textTracks;
     if (!tracks || typeof tracks.addEventListener !== "function") return;
@@ -273,7 +291,7 @@ export function createPlatformTextRuntime(ctx: {
     const [path, query] = base.split("?");
     return `${path}${suffix}?${query}`;
   }
-  async function bind(plan: PlaybackPlan) {
+  async function bind(plan: PlatformTextGrant) {
     const owner = ownerFor(plan);
     if (!owner || owner !== preferenceOwner) reset();
     else retire();
