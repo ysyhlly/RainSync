@@ -1,16 +1,10 @@
 use super::*;
 use crate::responses::ok_json;
 
-pub use catalog::media_projection::{BROWSE, SELECT, VISIBLE, media};
+pub use catalog::media_projection::{SELECT, VISIBLE, media};
 
 pub async fn read(app: &App, viewer: Uuid, id: Uuid) -> Result<Value> {
-    let row = sqlx::query(&format!("{SELECT} WHERE {BROWSE} AND m.id=$2"))
-        .bind(viewer)
-        .bind(id)
-        .fetch_optional(&app.db)
-        .await?
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "media_not_found"))?;
-    Ok(media(&row))
+    catalog::media_reads::read(&app.db, viewer, id).await
 }
 
 pub async fn detail(

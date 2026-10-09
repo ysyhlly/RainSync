@@ -248,24 +248,16 @@ async fn save_scan_batch(
     tx.commit().await?;
     Ok(())
 }
-#[derive(Deserialize)]
-pub struct LibraryQuery {
-    after: Option<Uuid>,
-    limit: Option<i64>,
-    #[serde(default)]
-    search: String,
-}
+pub use catalog::media_reads::LibraryQuery;
 pub async fn library(
     State(app): State<App>,
     h: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<LibraryQuery>,
 ) -> Result<Response> {
     let user = auth(&app, &h, false).await?;
-    let rows=sqlx::query(&format!("{} WHERE {} AND ($2::uuid IS NULL OR m.id>$2) AND strpos(lower(COALESCE(u.title,m.shared_title,m.title)),lower($3))>0 ORDER BY m.id LIMIT $4", media_titles::SELECT, media_titles::BROWSE))
-        .bind(user.id).bind(query.after).bind(query.search).bind(query.limit.unwrap_or(100).clamp(1,200)).fetch_all(&app.db).await?;
-    Ok(responses::ok_json(Value::Array(
-        rows.iter().map(media_titles::media).collect(),
-    )))
+    Ok(responses::ok_json(
+        catalog::media_reads::list(&app.db, user.id, query).await?,
+    ))
 }
 pub async fn playback(
     State(app): State<App>,

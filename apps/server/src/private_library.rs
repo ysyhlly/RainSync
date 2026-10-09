@@ -235,13 +235,7 @@ pub async fn attach_source(
     Ok(responses::ok_json(committed.response(&app.db).await))
 }
 
-#[derive(Deserialize)]
-pub struct MediaQuery {
-    after: Option<Uuid>,
-    limit: Option<i64>,
-    #[serde(default)]
-    search: String,
-}
+pub use catalog::media_reads::MediaQuery;
 pub async fn media(
     State(app): State<App>,
     h: HeaderMap,
@@ -249,19 +243,9 @@ pub async fn media(
     axum::extract::Query(q): axum::extract::Query<MediaQuery>,
 ) -> Result<Response> {
     let u = auth(&app, &h, false).await?;
-    let allowed: bool = sqlx::query_scalar("SELECT library_allowed($1,$2,'browse')")
-        .bind(u.id)
-        .bind(id)
-        .fetch_one(&app.db)
-        .await?;
-    if !allowed {
-        return Err(err(StatusCode::NOT_FOUND, "library_not_found"));
-    }
-    let rows=sqlx::query(&format!("{} WHERE {} AND s.library_id=$2 AND library_media_allowed($1,m.id,'browse',NULL) AND ($3::uuid IS NULL OR m.id>$3) AND strpos(lower(COALESCE(u.title,m.shared_title,m.title)),lower($4))>0 ORDER BY m.id LIMIT $5",media_titles::SELECT,media_titles::VISIBLE))
-      .bind(u.id).bind(id).bind(q.after).bind(q.search).bind(q.limit.unwrap_or(100).clamp(1,200)).fetch_all(&app.db).await?;
-    Ok(responses::ok_json(json!(
-        rows.iter().map(media_titles::media).collect::<Vec<_>>()
-    )))
+    Ok(responses::ok_json(
+        catalog::media_reads::list_private(&app.db, u.id, id, q).await?,
+    ))
 }
 
 #[derive(Deserialize, Default)]
