@@ -12,6 +12,10 @@ const playback = vi.hoisted(() => ({
 }));
 vi.mock("../apps/web/src/features/playback/playback-runtime", () => ({
   createPlaybackRuntime: () => ({
+    // Host action registration requires these unused capabilities.
+    attach: () => { throw Error("Unexpected attach in room-request-scopes.test.ts"); },
+    enablePlayback: () => { throw Error("Unexpected enablePlayback in room-request-scopes.test.ts"); },
+    cancelPreparation: () => { throw Error("Unexpected cancelPreparation in room-request-scopes.test.ts"); },
     playbackError: ref(""),
     playbackBusy: ref(false),
     // Existing Settings actions are required by composition, but this room

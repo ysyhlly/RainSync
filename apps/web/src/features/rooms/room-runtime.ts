@@ -51,6 +51,7 @@ import {
 import { createRoomPlaybackFacade } from "./projection/playback-view";
 import { createPlaybackSettingsPort } from "../playback/playback-settings-port";
 import { createPlaybackControlsPort } from "../playback/playback-controls-port";
+import { createPlaybackHostPort } from "../playback/playback-host-port";
 import {
   createRoomTransport,
   type RoomConnection,
@@ -646,6 +647,27 @@ export const useRoomRuntime = defineStore("room-runtime", ({ action }) => {
       seek,
     },
   });
+  // Preserve the same public Pinia names and wrappers at the finite Host edge.
+  // Internal room/control calls still use their original raw owner functions.
+  const hostActions = {
+    runPlayback: settingsActions.runPlayback,
+    loadMedia: settingsActions.loadMedia,
+    applySubtitles: settingsActions.applySubtitles,
+    attach: action(playback.attach, "attach"),
+    enablePlayback: action(playback.enablePlayback, "enablePlayback"),
+    cancelPreparation: action(playback.cancelPreparation, "cancelPreparation"),
+    can: action(can, "can"),
+    send: action(commands.send, "send"),
+    dismissError: action(viewing.dismissError, "dismissError"),
+  };
+  const playbackHost = createPlaybackHostPort({
+    timeline: { room, state, connected, connectionStopped, roomActive, currentTitle },
+    playback,
+    notice: { error: viewing.error, errorNotice: viewing.errorNotice },
+    actions: hostActions,
+    playbackControls,
+    playbackSettings,
+  });
   const statusTimer = setInterval(() => {
     checkClockContinuity();
     if (room.value?.lifecycle === "closing") refreshLifecycleInBackground();
@@ -695,12 +717,12 @@ export const useRoomRuntime = defineStore("room-runtime", ({ action }) => {
     error: viewing.error,
     busy: viewing.busy,
     errorNotice: viewing.errorNotice,
-    dismissError: viewing.dismissError,
+    dismissError: hostActions.dismissError,
     roomError: error,
     roomBusy: busy,
     owner,
     canManageRoom,
-    can,
+    can: hostActions.can,
     refreshPermissions,
     roomActive,
     lifecycleLabel,
@@ -714,7 +736,7 @@ export const useRoomRuntime = defineStore("room-runtime", ({ action }) => {
     leave,
     connect: transport.connect,
     selectionContext: () => `${roomSerial}:${transport.generation()}`,
-    send: commands.send,
+    send: hostActions.send,
     sendChat,
     choose: commands.choose,
     transferOwnership: commands.transferOwnership,
@@ -726,9 +748,10 @@ export const useRoomRuntime = defineStore("room-runtime", ({ action }) => {
     run,
     playbackControls,
     playbackSettings,
+    playbackHost,
     ...createRoomPlaybackFacade(playback),
     runPlayback: settingsActions.runPlayback,
     loadMedia: settingsActions.loadMedia,
-    applySubtitles: settingsActions.applySubtitles,
+    attach: hostActions.attach,
   };
 });

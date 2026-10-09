@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, onBeforeUnmount, type CSSProperties } from "vue";
+import { computed, ref, watch, onBeforeUnmount, type CSSProperties, type DeepReadonly } from "vue";
 import {
   sampleSceneNode,
   danmakuActionUrl,
@@ -9,8 +9,8 @@ import {
   type DanmakuAction,
 } from "./advanced-danmaku";
 const props = defineProps<{
-  node: SceneNode;
-  nodes: SceneNode[];
+  node: DeepReadonly<SceneNode>;
+  nodes: readonly DeepReadonly<SceneNode>[];
   elapsed: number;
   width: number;
   height: number;

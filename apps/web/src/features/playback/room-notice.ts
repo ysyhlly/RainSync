@@ -1,4 +1,4 @@
-import { computed, watch, type Ref } from "vue";
+import { computed, watch, type DeepReadonly, type Ref } from "vue";
 import {
   playbackFailureOwnsNotice,
   type PlaybackPreparationState,
@@ -10,11 +10,15 @@ export type RuntimeErrorNotice = Readonly<{
   message: string;
 }>;
 type RoomNoticeRuntime = {
-  error: string;
-  errorNotice?: RuntimeErrorNotice;
-  dismissError?: (notice: RuntimeErrorNotice | undefined) => void;
-  preparation?: PlaybackPreparationState;
-};
+  readonly errorNotice?: RuntimeErrorNotice;
+  readonly preparation?: DeepReadonly<PlaybackPreparationState>;
+} & (
+  | {
+      readonly error: string;
+      readonly dismissError: (notice: RuntimeErrorNotice | undefined) => void;
+    }
+  | { error: string; dismissError?: undefined }
+);
 
 /** One presentation of the current error, not a new error store or queue. */
 export function useRoomNotice(

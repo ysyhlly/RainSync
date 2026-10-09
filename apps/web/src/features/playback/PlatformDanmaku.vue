@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, onBeforeUnmount } from "vue";
+import { computed, ref, watch, onBeforeUnmount, type DeepReadonly } from "vue";
 import {
   visiblePlatformDanmaku,
   type PlatformDanmakuCue,
@@ -8,7 +8,7 @@ import AdvancedDanmakuScene from "./AdvancedDanmakuScene.vue";
 import { danmakuActionUrl } from "./advanced-danmaku";
 const emit = defineEmits<{ seek: [atMs: number] }>();
 const props = defineProps<{
-  cues: readonly PlatformDanmakuCue[];
+  cues: readonly DeepReadonly<PlatformDanmakuCue>[];
   enabled: boolean;
   video?: HTMLVideoElement;
   canSeek?: boolean;

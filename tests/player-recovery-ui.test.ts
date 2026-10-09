@@ -9,6 +9,7 @@ import * as Vue from "vue";
 import type { MediaTrack } from "../packages/protocol";
 import { SubtitleLoadState } from "../apps/web/src/features/playback/subtitle-load-state";
 import { useRoomNotice } from "../apps/web/src/features/playback/room-notice";
+import { createPlaybackHostPort } from "../apps/web/src/features/playback/playback-host-port";
 import {
   describePlaybackPreparation,
   preparationFailure,
@@ -190,15 +191,33 @@ async function renderPlayer(
     components.set(filename, module.exports.default);
     return module.exports.default;
   }
+  type HostContext = Parameters<typeof createPlaybackHostPort>[0];
+  const raw = runtime as unknown as Record<string, any>;
+  const required = (name: string) => () => { throw Error(`Unexpected ${name} in recovery SSR fixture`); };
+  const hostPort = createPlaybackHostPort({
+    timeline: Object.fromEntries(["room", "state", "connected", "connectionStopped", "roomActive", "currentTitle"].map(key => [key, Vue.toRef(raw, key)])) as HostContext["timeline"],
+    playback: Object.fromEntries(["waiting", "blocked", "dragging", "duration", "live", "nativePlatform", "platformDanmakuEnabled", "platformDanmakuCues", "subtitles", "subtitleIndex", "sessionId", "preparation", "loadingStage", "startupDiagnostics", "recoveryState", "recoveryLabel"].map(key => [key, Vue.toRef(raw, key)])) as HostContext["playback"],
+    notice: { error: Vue.toRef(raw, "error"), errorNotice: Vue.toRef(raw, "errorNotice") },
+    actions: {
+      can: permission => runtime.can(permission),
+      attach: runtime.attach,
+      enablePlayback: runtime.enablePlayback,
+      runPlayback: required("runPlayback"), loadMedia: required("loadMedia"),
+      cancelPreparation: required("cancelPreparation"), applySubtitles: required("applySubtitles"), send: required("send"),
+      dismissError: () => { runtime.error = ""; },
+    },
+    playbackControls: raw.playbackControls, playbackSettings: raw.playbackSettings,
+  });
   const props = options.information
     ? {
+        information: hostPort.information,
         title: runtime.currentTitle,
         room: runtime.room.name,
         connected: runtime.connected,
         stopped: runtime.connectionStopped,
         owner: runtime.owner,
       }
-    : { full: options.full ?? true };
+    : { playback: hostPort, full: options.full ?? true };
   const app = Vue.createSSRApp(
     load(options.information ? "PlaybackInformation.vue" : "PlaybackHost.vue"),
     props,

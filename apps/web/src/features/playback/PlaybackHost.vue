@@ -8,7 +8,7 @@ import {
   onBeforeUnmount,
   watch,
 } from "vue";
-import { useRoomRuntime } from "../rooms/room-runtime";
+import type { PlaybackHostPort } from "./playback-host-port";
 import PlaybackControls from "./PlaybackControls.vue";
 import PlatformDanmaku from "./PlatformDanmaku.vue";
 import PlaybackInformation from "./PlaybackInformation.vue";
@@ -22,16 +22,17 @@ import {
   type SubtitleResource,
 } from "./subtitle-load-state";
 const props = defineProps<{
+  playback: PlaybackHostPort;
   full: boolean;
   anchor?: HTMLElement | null;
   layoutEditing?: boolean;
 }>();
 const emit = defineEmits<{ miniResize: [height: number] }>();
-const r = useRoomRuntime(),
+const r = props.playback,
   element = ref<HTMLVideoElement>(),
   host = ref<HTMLElement>(),
   fullscreenError = ref("");
-const runtimeNotice = useRoomNotice(r);
+const runtimeNotice = useRoomNotice(r.notice);
 const miniCollapsed = ref(false);
 const shortViewport = matchMedia("(max-height: 500px)");
 function adaptMini() {
@@ -182,8 +183,8 @@ const emptyRoom = computed(
     !preparationVisible.value &&
     !r.waiting &&
     !r.blocked &&
-    !r.error &&
-    !r.recoveryLabel,
+    !r.notice.error &&
+    !r.information.recoveryLabel,
 );
 const preparationVisible = computed(
   () =>
@@ -256,8 +257,7 @@ async function retrySubtitle() {
   r.applySubtitles();
 }
 function closeSubtitles() {
-  r.subtitleIndex = undefined;
-  r.applySubtitles();
+  r.closeSubtitles();
 }
 let keyboard = false,
   settingsOpen = false,
@@ -397,9 +397,9 @@ onBeforeUnmount(() => {
         @click="surface"
         ref="element"
         playsinline
-        @waiting="r.waiting = true"
-        @canplay="r.waiting = false"
-        @playing="r.waiting = false"
+        @waiting="r.setWaiting(true)"
+        @canplay="r.setWaiting(false)"
+        @playing="r.setWaiting(false)"
       >
         <track
           v-for="track in subtitleResources"
@@ -421,18 +421,7 @@ onBeforeUnmount(() => {
         :can-seek="
           r.can('seek') && r.connected && !r.live && !!r.state?.media_id
         "
-        @seek="
-          (at) => {
-            if (
-              r.can('seek') &&
-              r.connected &&
-              !r.live &&
-              r.state?.media_id &&
-              at < r.duration * 1000
-            )
-              r.send('SEEK', { position_ms: at });
-          }
-        "
+        @seek="(at) => r.seekDanmaku(at)"
       />
       <div v-if="!r.state?.media_id" class="player-empty">
         <AppIcon name="movie" :size="40" />
@@ -462,7 +451,7 @@ onBeforeUnmount(() => {
       <button
         v-if="r.blocked && !layoutLocked"
         class="primary autoplay"
-        @click="r.runPlayback(r.enablePlayback)"
+        @click="r.joinPlayback()"
       >
         点击加入播放
       </button>
@@ -473,23 +462,24 @@ onBeforeUnmount(() => {
         :loading-stage="r.loadingStage"
         :diagnostics="r.startupDiagnostics"
         :can-retry="r.connected && r.roomActive"
-        @cancel="r.runPlayback(r.cancelPreparation)"
-        @retry="r.runPlayback(r.loadMedia)"
+        @cancel="r.cancelPlayback()"
+        @retry="r.retryPlayback()"
       />
       <span
         v-if="
           !layoutLocked &&
           !preparationVisible &&
-          (((full || fullscreen) && r.recoveryLabel) ||
-            (!r.recoveryLabel && r.waiting && r.state?.media_id))
+          (((full || fullscreen) && r.information.recoveryLabel) ||
+            (!r.information.recoveryLabel && r.waiting && r.state?.media_id))
         "
         class="buffering"
         role="status"
-        >{{ r.recoveryLabel || "正在准备影片…" }}</span
+        >{{ r.information.recoveryLabel || "正在准备影片…" }}</span
       >
 
       <PlaybackInformation
         v-if="fullscreen"
+        :information="r.information"
         class="fullscreen-information"
         :class="{ 'chrome-shown': visible }"
         :title="r.currentTitle"
@@ -562,19 +552,19 @@ onBeforeUnmount(() => {
           :loading-stage="r.loadingStage"
           :diagnostics="r.startupDiagnostics"
           :can-retry="r.connected && r.roomActive"
-          @cancel="r.runPlayback(r.cancelPreparation)"
-          @retry="r.runPlayback(r.loadMedia)"
+          @cancel="r.cancelPlayback()"
+          @retry="r.retryPlayback()"
         />
         <span
           v-else-if="
             !full &&
             !fullscreen &&
-            (r.recoveryLabel || miniCollapsed || emptyRoom)
+            (r.information.recoveryLabel || miniCollapsed || emptyRoom)
           "
           class="mini-status"
           role="status"
           >{{
-            emptyRoom ? "尚未选择影片" : r.recoveryLabel || r.room?.name
+            emptyRoom ? "尚未选择影片" : r.information.recoveryLabel || r.room?.name
           }}</span
         >
       </div>

@@ -3,6 +3,7 @@ import {
   validNativeLiveBinding,
   validNativeLiveDeliveryUrl,
 } from "./native-live";
+import type { DeepReadonly } from "vue";
 import type {
   PlaybackPlan,
   NativePlatformPlaybackBinding,
@@ -475,7 +476,7 @@ export function parsePlatformVtt(
   });
 }
 export function visiblePlatformDanmaku(
-  cues: readonly PlatformDanmakuCue[],
+  cues: DeepReadonly<PlatformDanmakuCue[]>,
   timeMs: number,
 ) {
   if (!Number.isFinite(timeMs) || timeMs < 0) return [];

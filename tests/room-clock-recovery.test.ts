@@ -18,6 +18,10 @@ vi.mock("../apps/web/src/features/playback/playback-runtime", () => ({
   createPlaybackRuntime: (ctx: any) => {
     playback.ctx = ctx;
     return {
+      // Host action registration requires these unused capabilities.
+      attach: () => { throw Error("Unexpected attach in room-clock-recovery.test.ts"); },
+      enablePlayback: () => { throw Error("Unexpected enablePlayback in room-clock-recovery.test.ts"); },
+      cancelPreparation: () => { throw Error("Unexpected cancelPreparation in room-clock-recovery.test.ts"); },
       playbackError: ref(""),
       playbackBusy: ref(false),
       // Existing Settings actions are required by composition, but this room

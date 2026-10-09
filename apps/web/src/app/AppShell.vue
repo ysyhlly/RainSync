@@ -53,7 +53,7 @@ const inRoom = computed(
 const miniHeight = ref(112);
 const { anchor: playbackAnchor, editing: layoutEditing } =
   providePlaybackPlacement();
-const currentNotice = useRoomNotice(runtime, error);
+const currentNotice = useRoomNotice(runtime.playbackHost.notice, error);
 function viewport() {
   document.documentElement.style.setProperty(
     "--viewport-height",
@@ -267,6 +267,7 @@ async function retry() {
       ></template>
       <PlaybackHost
         v-if="playbackHostShown"
+        :playback="runtime.playbackHost"
         :full="inRoom"
         :anchor="playbackAnchor"
         :layout-editing="layoutEditing"
