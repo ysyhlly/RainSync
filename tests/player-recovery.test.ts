@@ -2661,3 +2661,38 @@ it("a later PAUSE still wins when the old play settles during clock recalibratio
     s.cleanup();
   }
 });
+
+it.each(["blocked", "waiting"] as const)(
+  "VOD correction reads %s changes from the same tick's synchronous rate event",
+  async (field) => {
+    let rateEvent: (() => void) | undefined;
+    const s = setup({
+      acceptRate: (requested) => {
+        rateEvent?.();
+        return requested;
+      },
+    });
+    try {
+      await s.prepare();
+      s.playing();
+      s.state.value.anchor_position_ms = 10400;
+      s.state.value.playback_rate = 1.25;
+      rateEvent = () => {
+        s.runtime[field].value = true;
+      };
+      s.writes.mockClear();
+      s.seeks.mockClear();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(s.runtime[field].value).toBe(true);
+      expect(s.el.playbackRate).toBe(1.25);
+      expect(s.writes.mock.calls).toEqual([[1.25]]);
+      expect(s.seeks).not.toHaveBeenCalled();
+      expect(s.el.play).not.toHaveBeenCalled();
+      expect(s.runtime.video.value).toBe(s.el);
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(s.error.value).toBe("");
+    } finally {
+      s.cleanup();
+    }
+  },
+);

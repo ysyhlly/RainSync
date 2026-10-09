@@ -1,5 +1,6 @@
 import { evaluatePlaybackRecovery } from "./playback-recovery-state";
 import { createPlaybackSynchronization } from "./playback-synchronization";
+import { createVodTickPolicy } from "./vod-tick-policy";
 import { createPlaybackSessionController, checkCandidateLifetime } from "./playback-session-controller";
 export type { PlaybackRecoveryState } from "./playback-runtime-types";
 import { createLiveWindowRecovery } from "./live-window-recovery";
@@ -579,6 +580,32 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     rateRejected: reportUnsupportedRate,
     rateSupported: () => {
       if (error.value === unsupportedRateError) error.value = "";
+    },
+  });
+  const tickVod = createVodTickPolicy({
+    synchronization,
+    position,
+    dragging,
+    waiting,
+    blocked,
+    get generationPending() {
+      return !!generationWait;
+    },
+    get generationFailed() {
+      return generationWaitFailed;
+    },
+    get recovering() {
+      return recoveringHls;
+    },
+    get generatedEnd() {
+      return generatedEnd;
+    },
+    now: () => clock.now(),
+    apply: (force, userSeek) => {
+      void runAutomaticApply(force, userSeek);
+    },
+    completed: () => {
+      void completed();
     },
   });
   function queueApply(force = false, userSeek = false) {
@@ -2993,68 +3020,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         void runAutomaticApply();
       return;
     }
-    if (!dragging.value)
-      position.value = el.currentTime + p.timeline_origin_ms / 1000;
-    if (!usable || s.playback_status !== "playing") {
-      synchronization.resetCorrection();
-      synchronization.restoreBaseRate();
-      return;
-    }
-    if (!synchronization.ensureBaseRate()) return;
-    if (el.ended) {
-      void completed();
-      return;
-    }
-    if (generationWait || generationWaitFailed) return;
-    if (recoveringHls) {
-      void runAutomaticApply(true);
-      return;
-    }
-    const expected = Math.min(
-      generatedEnd ?? Infinity,
-      (target(s, clock.now()) - p.timeline_origin_ms) / 1000,
-    );
-    const ranges = availablePlaybackRanges(el);
-    if (!containsPlaybackPosition(ranges, expected)) {
-      synchronization.restoreBaseRate();
-      synchronization.resetCorrection();
-      if (p.rebuild_on_seek) void runAutomaticApply(true);
-      return;
-    }
-    if (
-      !blocked.value &&
-      !synchronization.pendingPlay &&
-      !synchronization.playFailed &&
-      (el.paused ||
-        synchronization.pendingForce ||
-        synchronization.pendingUserSeek)
-    ) {
-      void runAutomaticApply(
-        synchronization.pendingForce,
-        synchronization.pendingUserSeek,
-      );
-      return;
-    }
-    const drift = (expected - el.currentTime) * 1000;
-    const pausedCorrection =
-      waiting.value || el.seeking || blocked.value || el.readyState < 2;
-    const adjustment = synchronization.correction(
-      synchronization.rateFacts!.fineUnsupported && Math.abs(drift) <= 500
-        ? 0
-        : drift,
-      s.playback_rate,
-      performance.now(),
-      pausedCorrection,
-    );
-    if (pausedCorrection || adjustment.seek) synchronization.restoreBaseRate();
-    else if (!synchronization.rateFacts!.fineUnsupported)
-      synchronization.applyCorrection(adjustment.rate);
-    if (!synchronization.rateFacts!.baseSupported) {
-      synchronization.reportUnsupportedRate();
-      synchronization.resetCorrection();
-      return;
-    }
-    if (adjustment.seek) el.currentTime = expected;
+    tickVod(s, el, p, usable);
   }
   function onClockInvalidated() {
     synchronization.invalidateClock();

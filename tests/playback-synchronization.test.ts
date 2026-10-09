@@ -1,5 +1,6 @@
 import { expect, it, vi } from "vitest";
 import { createPlaybackSynchronization } from "../apps/web/src/features/playback/playback-synchronization";
+import type { createVodTickPolicy } from "../apps/web/src/features/playback/vod-tick-policy";
 
 function setup() {
   const element = { pause: vi.fn(), playbackRate: 1 };
@@ -219,3 +220,36 @@ function finiteSynchronizationPorts(
   owner.corrector;
 }
 void finiteSynchronizationPorts;
+
+function finiteVodTickPorts(
+  context: Parameters<typeof createVodTickPolicy>[0],
+  input: Parameters<ReturnType<typeof createVodTickPolicy>>,
+) {
+  // @ts-expect-error Periodic correction has no general request client.
+  context.api;
+  // @ts-expect-error The policy cannot allocate a separate action generation.
+  context.synchronization.beginApply(false);
+  // @ts-expect-error The shared play claim remains owned by reconciliation.
+  context.synchronization.claimPlay();
+  // @ts-expect-error The policy cannot replace the shared owner's operations.
+  context.synchronization.resetCorrection = () => {};
+  // @ts-expect-error Loading facts are not a second mutable state owner.
+  context.generationPending = false;
+  // @ts-expect-error Only the existing play owner changes the gesture gate.
+  context.blocked.value = false;
+  // @ts-expect-error A clock snapshot is not mutable clock authority.
+  context.clock.reset();
+  // @ts-expect-error The selected room timeline is readonly.
+  input[0].playback_rate = 2;
+  // @ts-expect-error Periodic correction cannot attach a source.
+  input[1].src = "/replacement";
+  // @ts-expect-error Play promises remain in the existing runtime branches.
+  input[1].play();
+  // @ts-expect-error Rate writes belong to the existing synchronization owner.
+  input[1].playbackRate = 2;
+  // @ts-expect-error Periodic correction does not receive session/grant identity.
+  input[2].session_id;
+  input[1].currentTime = 10;
+  context.position.value = 10;
+}
+void finiteVodTickPorts;
