@@ -11,6 +11,7 @@ mod agents;
 mod avatar_image;
 mod avatars;
 mod bootstrap;
+mod catalog;
 mod control_cluster;
 mod control_recovery_metrics;
 mod database_checks;

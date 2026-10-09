@@ -1,12 +1,7 @@
 //! Source policy changes fence grants without claiming physical resource drain.
 use super::*;
+pub use catalog::access_policy::Change;
 use persistence::media_job_timing::{CancellationScope, cancel_jobs};
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Change {
-    expected_revision: i64,
-    policy: Value,
-}
 
 /// The original write is confirmed before this receipt is created. A failed
 /// COMMIT (including an unknown outcome) must still propagate from its caller.
@@ -65,54 +60,12 @@ pub async fn change(
 ) -> Result<Json<Value>> {
     let user = auth(&app, &headers, true).await?;
     admin(&user)?;
-    let mut tx = app.db.begin().await?;
-    let login = admin_settings::lock_admin(&mut tx, &user, &headers, true).await?;
-    let row = sqlx::query(
-        "SELECT kind,config_encrypted,access_policy_revision FROM sources WHERE id=$1 FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| err(StatusCode::NOT_FOUND, "source_not_found"))?;
-    let kind: String = row.get("kind");
-    if !matches!(kind.as_str(), "http" | "jellyfin" | "emby") {
-        return Err(err(StatusCode::BAD_REQUEST, "invalid_source"));
-    }
-    let previous: i64 = row.get("access_policy_revision");
-    if previous != body.expected_revision {
-        return Err(err(StatusCode::CONFLICT, "source_changed"));
-    }
-    let next = previous
-        .checked_add(1)
-        .ok_or_else(|| err(StatusCode::CONFLICT, "source_changed"))?;
-    let mut config: providers::SourceConfig =
-        serde_json::from_value(app.decrypt(&row.get::<String, _>("config_encrypted"))?)
-            .map_err(anyhow::Error::from)?;
-    config.access_policy = serde_json::from_value(body.policy)
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_source"))?;
-    providers::access_policy::SourceAccess::new(&config.url, config.access_policy.as_ref())
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_source"))?;
-    providers::validate_source_headers(&config.headers)
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_source"))?;
-    let encrypted = app.encrypt(&serde_json::to_value(config).map_err(anyhow::Error::from)?)?;
-    sqlx::query("UPDATE sources SET config_encrypted=$2,access_policy_revision=$3 WHERE id=$1")
-        .bind(id)
-        .bind(encrypted)
-        .bind(next)
-        .execute(&mut *tx)
-        .await?;
-    // Migration 0024 invalidates previews once when config_encrypted changes.
-    sqlx::query("UPDATE source_scans SET generation=$2 WHERE source_id=$1")
-        .bind(id)
-        .bind(Uuid::new_v4())
-        .execute(&mut *tx)
-        .await?;
-    admin_settings::finish(tx, &user, &login).await?;
-    // Release the source lock before taking session/cleanup locks. Readers and
-    // final publication are already fenced by the committed source revision.
-    // Reconciliation repeats this retirement if the HTTP waiter is interrupted.
-    let committed =
-        CommittedSourceChange::new(id, json!({"id":id,"access_policy_revision":next}), true);
+    let context = catalog::SourceChangeContext {
+        db: &app.db,
+        encrypt: &|value| app.encrypt(value),
+        decrypt: &|value| app.decrypt(value),
+    };
+    let committed = catalog::access_policy::change(context, &user, &headers, id, body).await?;
     Ok(Json(committed.response(&app.db).await))
 }
 pub async fn retire(db: &PgPool) -> anyhow::Result<()> {
