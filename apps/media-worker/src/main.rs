@@ -1,5 +1,6 @@
 mod advanced_media;
 mod advanced_remote;
+mod attempts;
 mod cache;
 mod cache_outputs;
 mod cache_read;
@@ -908,51 +909,18 @@ async fn run_next_job(
         }
         Ok(())
     }).await;
-    if reservation.is_some() {
-        app.readiness.receipt_pending(true);
-    }
-    if output_decoder.stop().await.is_err() {
-        app.readiness.drain_failed();
-        tracing::error!("first segment decoder could not be reaped");
-        // Keep the gate alive and retry cleanup before accepting more work.
-        while output_decoder.stop().await.is_err() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-    if execution_scope.shutdown().await.is_err() {
-        app.readiness.drain_failed();
-        writer_stopped = false;
-        tracing::error!("media execution resource drain unconfirmed");
-    }
-    if writer_stopped && let Some((id, owner, attempt)) = reservation {
-        // Both encoder and decoder have positive OS-tree reaping evidence.
-        // Persist the receipt independently of job cancellation/lease state.
-        // Retain ownership through transient DB failures (also on shutdown).
-        loop {
-            if matches!(
-                tokio::time::timeout(
-                    Duration::from_secs(3),
-                    persistence::media_executions::acknowledge_job(&app.db, id, attempt, owner)
-                )
-                .await,
-                Ok(Ok(()))
-            ) {
-                break;
-            }
-            tracing::warn!("media execution drain acknowledgement retry");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        // Completion/error/exit all release only after the child is reaped.
-        // On database failure, the next budget snapshot uses this receipt.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(3),
-            persistence::cache_budget::release(&app.db, id, owner, attempt),
+    // run_next_job remains the scope/gate owner. Borrowing them preserves their
+    // original declarations and drop order around the execution result.
+    Box::pin(
+        attempts::settlement::OriginalAttempt::from_parts(
+            &execution_scope,
+            &output_decoder,
+            reservation,
+            &mut writer_stopped,
         )
-        .await;
-    }
-    if writer_stopped {
-        app.readiness.receipt_pending(false);
-    }
+        .settle(&app.db, &app.readiness),
+    )
+    .await;
     result
 }
 
