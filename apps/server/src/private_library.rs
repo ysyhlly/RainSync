@@ -1,6 +1,7 @@
 //! Explicitly scoped libraries. Host administrators are trusted operators, but
 //! normal catalog access still requires the same user/room grant as everyone else.
 use super::*;
+use sqlx::Connection;
 
 pub fn enabled() -> bool {
     std::env::var("PRIVATE_LIBRARIES_ENABLED").is_ok_and(|v| v == "true")
@@ -124,8 +125,10 @@ pub async fn create(
     .execute(&mut *tx)
     .await?;
     audit(&mut tx, id, u.id, "created", None).await?;
+    let value = detail_value(&mut tx, u.id, id).await?;
     commit_caller(tx, &u, &h, false).await?;
-    detail(State(app), h, Path(id)).await
+    let committed = CommittedLibraryChange::new(id, value, false);
+    Ok(responses::ok_json(committed.response(&app.db).await))
 }
 pub async fn detail(
     State(app): State<App>,
@@ -133,21 +136,30 @@ pub async fn detail(
     Path(id): Path<Uuid>,
 ) -> Result<Response> {
     let u = auth(&app, &h, false).await?;
+    let mut connection = app.db.acquire().await?;
+    Ok(responses::ok_json(
+        detail_value(&mut connection, u.id, id).await?,
+    ))
+}
+
+// Reads may use an ordinary pooled connection. Mutation receipts use their
+// existing transaction, before final expiry checks and confirmed commit.
+async fn detail_value(connection: &mut sqlx::PgConnection, user: Uuid, id: Uuid) -> Result<Value> {
     let row=sqlx::query(&format!("{LIB_SELECT} WHERE l.id=$2 AND (library_allowed($1,l.id,'browse') OR library_allowed($1,l.id,'manage'))"))
-        .bind(u.id).bind(id).fetch_optional(&app.db).await?.ok_or_else(||err(StatusCode::NOT_FOUND,"library_not_found"))?;
+        .bind(user).bind(id).fetch_optional(&mut *connection).await?.ok_or_else(||err(StatusCode::NOT_FOUND,"library_not_found"))?;
     let mut value = library_value(&row);
     // No titles, source paths, credentials or grants leak to room-only viewers.
     if row.get::<bool, _>("manage") {
-        let sources=sqlx::query("SELECT id,name,kind,access_policy_revision,settings_revision FROM sources WHERE library_id=$1 AND deleted_at IS NULL ORDER BY name,id").bind(id).fetch_all(&app.db).await?;
+        let sources=sqlx::query("SELECT id,name,kind,access_policy_revision,settings_revision FROM sources WHERE library_id=$1 AND deleted_at IS NULL ORDER BY name,id").bind(id).fetch_all(&mut *connection).await?;
         value["sources"]=json!(sources.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"kind":r.get::<String,_>("kind"),"revision":r.get::<i64,_>("settings_revision").to_string(),"access_policy_revision":r.get::<i64,_>("access_policy_revision")})).collect::<Vec<_>>());
-        let grants=sqlx::query("SELECT g.*,u.username,floor(extract(epoch FROM g.expires_at)*1000)::bigint AS expiry FROM library_grants g JOIN users u ON u.id=g.user_id WHERE g.library_id=$1 ORDER BY u.username").bind(id).fetch_all(&app.db).await?;
+        let grants=sqlx::query("SELECT g.*,u.username,floor(extract(epoch FROM g.expires_at)*1000)::bigint AS expiry FROM library_grants g JOIN users u ON u.id=g.user_id WHERE g.library_id=$1 ORDER BY u.username").bind(id).fetch_all(&mut *connection).await?;
         value["grants"]=json!(grants.iter().map(|r|json!({"user_id":r.get::<Uuid,_>("user_id"),"username":r.get::<String,_>("username"),"browse":r.get::<bool,_>("browse"),"play":r.get::<bool,_>("play"),"share_to_room":r.get::<bool,_>("share_to_room"),"manage":r.get::<bool,_>("manage"),"expires_at":r.get::<i64,_>("expiry")})).collect::<Vec<_>>());
-        let rows=sqlx::query("SELECT id,actor_id,action,target_id,floor(extract(epoch FROM created_at)*1000)::bigint AS created_ms FROM library_permission_audit WHERE library_id=$1 ORDER BY created_at DESC,id LIMIT 100").bind(id).fetch_all(&app.db).await?;
+        let rows=sqlx::query("SELECT id,actor_id,action,target_id,floor(extract(epoch FROM created_at)*1000)::bigint AS created_ms FROM library_permission_audit WHERE library_id=$1 ORDER BY created_at DESC,id LIMIT 100").bind(id).fetch_all(&mut *connection).await?;
         value["audit"]=json!(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"actor_id":r.get::<Option<Uuid>,_>("actor_id"),"action":r.get::<String,_>("action"),"target_id":r.get::<Option<Uuid>,_>("target_id"),"created_at":r.get::<i64,_>("created_ms")})).collect::<Vec<_>>());
     }
-    let shares=sqlx::query("SELECT g.id,g.media_id,g.room_id,g.mode,g.permission_epoch,CASE WHEN s.library_id=$1 AND s.deleted_at IS NULL THEN m.title ELSE '已移出或删除的影片' END AS title,floor(extract(epoch FROM g.created_at+interval '24 hours')*1000)::bigint AS max_expiry,floor(extract(epoch FROM g.expires_at)*1000)::bigint AS expiry,(g.revoked_at IS NULL AND s.library_id=$1 AND s.deleted_at IS NULL AND g.permission_epoch=$2 AND g.source_generation=m.library_source_generation AND m.available AND g.expires_at>clock_timestamp() AND library_allowed(g.grantor_id,g.library_id,'share_to_room')) AS active FROM room_media_grants g JOIN media_items m ON m.id=g.media_id JOIN sources s ON s.id=m.source_id WHERE g.library_id=$1 AND (g.grantor_id=$3 OR library_allowed($3,$1,'manage')) ORDER BY g.created_at DESC LIMIT 100").bind(id).bind(row.get::<i64,_>("permission_epoch")).bind(u.id).fetch_all(&app.db).await?;
+    let shares=sqlx::query("SELECT g.id,g.media_id,g.room_id,g.mode,g.permission_epoch,CASE WHEN s.library_id=$1 AND s.deleted_at IS NULL THEN m.title ELSE '已移出或删除的影片' END AS title,floor(extract(epoch FROM g.created_at+interval '24 hours')*1000)::bigint AS max_expiry,floor(extract(epoch FROM g.expires_at)*1000)::bigint AS expiry,(g.revoked_at IS NULL AND s.library_id=$1 AND s.deleted_at IS NULL AND g.permission_epoch=$2 AND g.source_generation=m.library_source_generation AND m.available AND g.expires_at>clock_timestamp() AND library_allowed(g.grantor_id,g.library_id,'share_to_room')) AS active FROM room_media_grants g JOIN media_items m ON m.id=g.media_id JOIN sources s ON s.id=m.source_id WHERE g.library_id=$1 AND (g.grantor_id=$3 OR library_allowed($3,$1,'manage')) ORDER BY g.created_at DESC LIMIT 100").bind(id).bind(row.get::<i64,_>("permission_epoch")).bind(user).fetch_all(&mut *connection).await?;
     value["room_shares"]=json!(shares.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"media_id":r.get::<Uuid,_>("media_id"),"room_id":r.get::<Uuid,_>("room_id"),"mode":r.get::<String,_>("mode"),"title":r.get::<String,_>("title"),"expires_at":r.get::<i64,_>("expiry"),"max_expires_at":r.get::<i64,_>("max_expiry"),"active":r.get::<bool,_>("active")})).collect::<Vec<_>>());
-    Ok(responses::ok_json(value))
+    Ok(value)
 }
 async fn lock_manage(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -217,21 +229,103 @@ async fn advance(
         .bind(lib).bind(permissions).execute(&mut **tx).await?;
     Ok(())
 }
-async fn retire(app: &App) -> Result<()> {
-    // Do not hold library locks while locking playback/jobs. Reader predicates
-    // already reject old epochs; process-local cancellation observes stopped.
-    let mut tx = app.db.begin().await?;
-    sqlx::query("UPDATE playback_sessions SET stopped=true WHERE NOT stopped AND NOT playback_library_session_allowed(id)")
-        .execute(&mut *tx).await?;
-    let obs = persistence::media_job_timing::cancel_jobs(
-        &mut *tx,
-        persistence::media_job_timing::CancellationScope::StoppedSessions,
-    )
-    .await?
-    .into_commit_observation();
+/// Construct only after the original transaction confirms COMMIT. This receipt
+/// carries the response captured under that transaction's authority, not a new
+/// post-commit read or permission token. COMMIT errors still propagate.
+struct CommittedLibraryChange {
+    library: Uuid,
+    value: Value,
+    retirement_required: bool,
+}
+impl CommittedLibraryChange {
+    fn new(library: Uuid, value: Value, retirement_required: bool) -> Self {
+        Self {
+            library,
+            value,
+            retirement_required,
+        }
+    }
+    async fn response(self, db: &PgPool) -> Value {
+        if self.retirement_required && retire(db).await.is_err() {
+            // Existing epoch/source predicates fence use immediately; the
+            // existing maintenance coordinator retries logical retirement.
+            // This is not a physical resource-disposal receipt.
+            tracing::warn!(library = %self.library, cleanup = "pending", "library change committed; retirement deferred to maintenance");
+        }
+        self.value
+    }
+}
+
+pub(crate) async fn retire(db: &PgPool) -> Result<()> {
+    // Preserve the eager path's original transaction and commit-observation order.
+    let mut tx = db.begin().await?;
+    let obs = retire_rows(&mut tx).await?.into_commit_observation();
     tx.commit().await?;
     obs.confirmed();
     Ok(())
+}
+
+// The same SQL operation serves eager retirement and bounded maintenance. It
+// starts no process/network disposal and never owns a second transaction.
+async fn retire_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<media_core::job_health::PendingJobHealth> {
+    // Do not hold library locks while locking playback/jobs. Reader predicates
+    // already reject old epochs; process-local cancellation observes stopped.
+    sqlx::query("UPDATE playback_sessions SET stopped=true WHERE NOT stopped AND NOT playback_library_session_allowed(id)")
+        .execute(&mut **tx).await?;
+    Ok(persistence::media_job_timing::cancel_jobs(
+        &mut **tx,
+        persistence::media_job_timing::CancellationScope::StoppedSessions,
+    )
+    .await?)
+}
+
+// Follow upstream_policy's connection ownership: an interrupted or failed
+// attempt discards its connection rather than returning uncertain SQL to the pool.
+// Normal release is allowed only after the transaction confirms its commit.
+struct RetirementConnection(Option<sqlx::pool::PoolConnection<sqlx::Postgres>>);
+impl Drop for RetirementConnection {
+    fn drop(&mut self) {
+        if let Some(connection) = &mut self.0 {
+            connection.close_on_drop();
+        }
+    }
+}
+impl RetirementConnection {
+    fn release(&mut self) {
+        drop(self.0.take());
+    }
+}
+
+pub(crate) async fn retire_maintenance(db: &PgPool) -> Result<()> {
+    // Include pool acquisition, transaction start and COMMIT in the overall
+    // budget. A timeout is only an unfinished attempt, never disposal evidence.
+    let attempt = async {
+        let mut connection = RetirementConnection(Some(db.acquire().await?));
+        let mut tx = connection
+            .0
+            .as_mut()
+            .expect("retirement connection")
+            .begin()
+            .await?;
+        // Same bounded SQL convention as room cleanup; only this background
+        // attempt receives limits. The eager receipt path is unchanged.
+        sqlx::query("SET LOCAL lock_timeout='2s'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SET LOCAL statement_timeout='3s'")
+            .execute(&mut *tx)
+            .await?;
+        let obs = retire_rows(&mut tx).await?.into_commit_observation();
+        tx.commit().await?;
+        obs.confirmed();
+        connection.release();
+        Ok::<(), Error>(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), attempt)
+        .await
+        .map_err(|_| anyhow::anyhow!("library_retirement_timeout"))?
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -256,9 +350,11 @@ pub async fn rename(
         .execute(&mut *tx)
         .await?;
     audit(&mut tx, id, u.id, "renamed", None).await?;
+    let value = detail_value(&mut tx, u.id, id).await?;
     require_current_permission(&mut tx, u.id, id, "manage").await?;
     commit_caller(tx, &u, &h, false).await?;
-    detail(State(app), h, Path(id)).await
+    let committed = CommittedLibraryChange::new(id, value, false);
+    Ok(responses::ok_json(committed.response(&app.db).await))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -308,9 +404,10 @@ pub async fn grant(
       .bind(id).bind(target).bind(body.browse).bind(body.play).bind(body.share_to_room).bind(body.manage).bind(i64::from(body.expires_in_hours)).bind(u.id).execute(&mut *tx).await?;
     advance(&mut tx, id, true).await?;
     audit(&mut tx, id, u.id, "grant_updated", Some(target)).await?;
+    let value = detail_value(&mut tx, u.id, id).await?;
     commit_caller(tx, &u, &h, false).await?;
-    retire(&app).await?;
-    detail(State(app), h, Path(id)).await
+    let committed = CommittedLibraryChange::new(id, value, true);
+    Ok(responses::ok_json(committed.response(&app.db).await))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -337,9 +434,10 @@ pub async fn revoke(
         .await?;
     advance(&mut tx, id, true).await?;
     audit(&mut tx, id, u.id, "grant_revoked", Some(target)).await?;
+    let value = detail_value(&mut tx, u.id, id).await?;
     commit_caller(tx, &u, &h, false).await?;
-    retire(&app).await?;
-    detail(State(app), h, Path(id)).await
+    let committed = CommittedLibraryChange::new(id, value, true);
+    Ok(responses::ok_json(committed.response(&app.db).await))
 }
 /// Archive the scope rather than deleting rows referenced by audit, playback,
 /// playlists and compute. No source is detached or reassigned to shared scope.
@@ -386,8 +484,8 @@ pub async fn remove(
         .bind(id).execute(&mut *tx).await?;
     audit(&mut tx, id, u.id, "library_deleted", None).await?;
     commit_caller(tx, &u, &h, false).await?;
-    retire(&app).await?;
-    Ok(responses::ok_json(json!({"id":id,"deleted":true})))
+    let committed = CommittedLibraryChange::new(id, json!({"id":id,"deleted":true}), true);
+    Ok(responses::ok_json(committed.response(&app.db).await))
 }
 
 #[derive(Deserialize)]
@@ -428,10 +526,12 @@ pub async fn transfer(
         .await?;
     audit(&mut tx, id, u.id, "ownership_transferred", Some(target)).await?;
     commit_caller(tx, &u, &h, false).await?;
-    retire(&app).await?;
-    Ok(responses::ok_json(
+    let committed = CommittedLibraryChange::new(
+        id,
         json!({"id":id,"owner_id":target,"transferred":true}),
-    ))
+        true,
+    );
+    Ok(responses::ok_json(committed.response(&app.db).await))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -563,10 +663,12 @@ pub async fn update_share(
         return Err(err(StatusCode::CONFLICT, "library_share_inactive"));
     }
     commit_caller(tx, &u, &h, false).await?;
-    retire(&app).await?;
-    Ok(responses::ok_json(
-        json!({"id":grant,"revision":(lib.get::<i64,_>("revision")+1).to_string()}),
-    ))
+    let committed = CommittedLibraryChange::new(
+        id,
+        json!({"id":grant,"revision":(lib.get::<i64, _>("revision")+1).to_string()}),
+        true,
+    );
+    Ok(responses::ok_json(committed.response(&app.db).await))
 }
 
 async fn preserve_current_room_shares(
@@ -608,8 +710,8 @@ pub async fn revoke_share(
         return Err(err(StatusCode::NOT_FOUND, "library_not_found"));
     }
     commit_caller(tx, &u, &h, false).await?;
-    retire(&app).await?;
-    Ok(responses::ok_json(json!({"ok":true})))
+    let committed = CommittedLibraryChange::new(id, json!({"ok":true}), true);
+    Ok(responses::ok_json(committed.response(&app.db).await))
 }
 #[derive(Deserialize)]
 pub struct MediaQuery {
@@ -930,10 +1032,8 @@ pub async fn update_source(
     value["rescan_required"] = json!(changed);
     require_current_permission(&mut tx, u.id, library, "manage").await?;
     commit_caller(tx, &u, &h, operator).await?;
-    if changed {
-        retire(&app).await?;
-    }
-    Ok(responses::ok_json(value))
+    let committed = CommittedLibraryChange::new(library, value, changed);
+    Ok(responses::ok_json(committed.response(&app.db).await))
 }
 async fn require_idle_sources(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1005,8 +1105,8 @@ pub async fn remove_source(
     audit(&mut tx, library, u.id, "source_deleted", Some(source)).await?;
     require_current_permission(&mut tx, u.id, library, "manage").await?;
     commit_caller(tx, &u, &h, false).await?;
-    retire(&app).await?;
-    Ok(responses::ok_json(json!({"id":source,"deleted":true})))
+    let committed = CommittedLibraryChange::new(library, json!({"id":source,"deleted":true}), true);
+    Ok(responses::ok_json(committed.response(&app.db).await))
 }
 
 #[derive(Deserialize)]
@@ -1083,10 +1183,12 @@ pub async fn attach_source(
     )
     .await?;
     commit_caller(tx, &u, &h, true).await?;
-    retire(&app).await?;
-    Ok(responses::ok_json(
+    let committed = CommittedLibraryChange::new(
+        id,
         json!({"ok":true,"library_id":id,"source_id":body.source_id}),
-    ))
+        true,
+    );
+    Ok(responses::ok_json(committed.response(&app.db).await))
 }
 
 #[derive(Deserialize, Default)]

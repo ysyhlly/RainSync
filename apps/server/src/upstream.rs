@@ -583,6 +583,10 @@ pub async fn maintenance(app: App) {
     tokio::spawn(legacy_maintenance(app.clone()));
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
+        // One failed cleanup must not suppress another owner's retry.
+        if private_library::retire_maintenance(&app.db).await.is_err() {
+            tracing::warn!("library retirement deferred to maintenance");
+        }
         if source_access::retire(&app.db).await.is_err()
             || ledger::reconcile(&app.db, app.epoch).await.is_err()
         {
