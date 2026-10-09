@@ -4,12 +4,44 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createServer as httpServer } from "node:http";
 import { createServer as netServer } from "node:net";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { chromium, expect } from "@playwright/test";
 import { createServer as viteServer } from "vite";
 import WebSocket from "ws";
-import { isolatedServer } from "./fixtures/server.mjs";
+import { isolatedServer, delay } from "./fixtures/server.mjs";
+import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
+import { safeFailure } from "./fixtures/safe-failure.mjs";
+import { withTerminationSignal } from "../deploy/owned-process.mjs";
+
+const args = process.argv.slice(2);
+assert.ok(
+  args.length === 0 || (args.length === 1 && args[0] === "--backend-only"),
+);
+const backendOnly = args[0] === "--backend-only";
+const report = {
+  schema_version: 1,
+  selection: backendOnly ? "backend-only" : "full",
+  result: "running",
+  backend: "running",
+  browser: backendOnly ? "not_run" : "pending",
+  started_at: new Date().toISOString(),
+  failures: [],
+};
+let owned;
+const save = async () => {
+  if (owned)
+    await writeFile(
+      resolve(owned.root, "report.json"),
+      JSON.stringify(report, null, 2) + "\n",
+    );
+};
+const runServer = (name, run, options) =>
+  backendOnly
+    ? withTerminationSignal((signal) =>
+        isolatedServer(name, run, { ...options, signal }),
+      )
+    : isolatedServer(name, run, options);
 
 const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
 async function prepareLocal(f, client, room, media) {
@@ -69,6 +101,168 @@ async function prepareLocal(f, client, room, media) {
     socket.terminate();
   }
 }
+// Establish deletion commit before the scan's next guarded publication step.
+// Awaiting the DELETE response before releasing the provider would deadlock:
+// the provider holds a source FOR SHARE lock for its complete response.
+async function deleteDuringHeldScan(f, admin, source) {
+  const scan = admin.raw(`/sources/${source.id}/test`, { method: "POST" });
+  // Preserve both deferred outcomes until their assertion and final settlement.
+  scan.catch(() => {});
+  let deletion, barrier, barrierMarker, timer;
+  let barrierReleased = false,
+    primaryFailed = false,
+    primaryError;
+  const evidence = { checks: [] };
+  report.scan_deletion_order = evidence;
+  async function releaseBarrier() {
+    if (!barrier || barrierReleased) return;
+    barrierReleased = true;
+    if (!barrier.stdin.destroyed && !barrier.stdin.writableEnded)
+      barrier.stdin.end("COMMIT;\n\\q\n");
+    await barrier.done;
+    assert.equal(barrier.exitCode, 0);
+    assert.equal(barrier.signalCode, null);
+    assert.equal(verifyPidAbsent(barrier.pid), true);
+    await f.waitForSql(
+      `SELECT count(*) FROM pg_stat_activity WHERE application_name=${quote(barrierMarker)}`,
+      "0",
+      2000,
+    );
+    evidence.release = {
+      pid: barrier.pid,
+      exit_code: 0,
+      signal: null,
+      observed_close: true,
+      pid_absent: true,
+      postgres_connection_absent: true,
+    };
+  }
+  try {
+    try {
+      await Promise.race([
+        reached,
+        new Promise((_done, reject) => {
+          timer = setTimeout(
+            () => reject(Error("owned scan did not reach provider")),
+            10000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    evidence.checks.push("provider response held");
+    deletion = admin.request(`/sources/${source.id}`, "DELETE");
+    deletion.catch(() => {});
+    const deadline = Date.now() + 2000;
+    let writer;
+    while (Date.now() < deadline) {
+      f.abortSignal?.throwIfAborted();
+      const rows = JSON.parse(
+        f.sql(
+          "SELECT COALESCE(json_agg(json_build_object('pid',w.pid,'blocker',b.pid)),'[]'::json) FROM pg_stat_activity w CROSS JOIN LATERAL unnest(pg_blocking_pids(w.pid)) x(pid) JOIN pg_stat_activity b ON b.pid=x.pid WHERE w.datname=current_database() AND w.query='SELECT kind,library_id FROM sources WHERE id=$1 FOR UPDATE' AND w.wait_event_type='Lock' AND b.state='idle in transaction' AND EXISTS(SELECT 1 FROM pg_locks l WHERE l.pid=w.pid AND l.relation='sources'::regclass AND l.mode='RowShareLock' AND l.granted) AND EXISTS(SELECT 1 FROM pg_locks l WHERE l.pid=b.pid AND l.relation='sources'::regclass AND l.mode='RowShareLock' AND l.granted)",
+        ),
+      );
+      if (rows.length === 1) {
+        writer = rows[0];
+        break;
+      }
+      await delay(20);
+    }
+    assert.ok(writer, "exact DELETE writer waits on the held provider guard");
+    evidence.writer = {
+      pid: writer.pid,
+      provider_backend_pid: writer.blocker,
+      relation_lock_owned: true,
+    };
+    evidence.checks.push("exact DELETE writer waits on provider guard");
+    // The admitted writer can upgrade its existing relation lock before this
+    // EXCLUSIVE waiter; the next scan's fresh RowShareLock queues behind it.
+    barrierMarker = `source_delete_barrier_${randomUUID().replaceAll("-", "")}`;
+    barrier = f.sqlProcess(undefined, { interactive: true });
+    barrier.stdout.resume();
+    barrier.stdin.write(
+      `SET application_name=${quote(barrierMarker)}; BEGIN; SET LOCAL statement_timeout='10s'; SET LOCAL idle_in_transaction_session_timeout='10s'; LOCK TABLE sources IN EXCLUSIVE MODE;\n`,
+    );
+    await f.waitForSql(
+      `SELECT count(*) FROM pg_stat_activity WHERE application_name=${quote(barrierMarker)}`,
+      "1",
+      2000,
+    );
+    const barrierPid = Number(
+      f.sql(
+        `SELECT pid FROM pg_stat_activity WHERE application_name=${quote(barrierMarker)}`,
+      ),
+    );
+    assert.ok(Number.isSafeInteger(barrierPid) && barrierPid > 0);
+    evidence.barrier_backend_pid = barrierPid;
+    await f.waitForSql(
+      `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=${barrierPid} AND relation='sources'::regclass AND mode='ExclusiveLock' AND NOT granted)`,
+      "t",
+      2000,
+    );
+    evidence.checks.push("exact table barrier queued before provider release");
+    releaseScan();
+    await f.waitForSql(
+      `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=${barrierPid} AND relation='sources'::regclass AND mode='ExclusiveLock' AND granted)`,
+      "t",
+      2000,
+    );
+    await deletion;
+    assert.equal(
+      f.sql(`SELECT count(*) FROM sources WHERE id=${quote(source.id)}`),
+      "0",
+    );
+    assert.equal(
+      f.sql(
+        `SELECT count(*) FROM media_items WHERE source_id=${quote(source.id)} OR resource='late-item'`,
+      ),
+      "0",
+    );
+    const nextGuard =
+      "SELECT kind,config_encrypted FROM sources WHERE id=$1 AND deleted_at IS NULL FOR SHARE";
+    await f.waitForSql(
+      `SELECT count(*) FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid WHERE a.datname=current_database() AND a.query=${quote(nextGuard)} AND l.relation='sources'::regclass AND l.mode='RowShareLock' AND NOT l.granted AND ${barrierPid}=ANY(pg_blocking_pids(a.pid))`,
+      "1",
+      2000,
+    );
+    evidence.checks.push(
+      "DELETE committed with zero items while exact next scan guard waits",
+    );
+    await releaseBarrier();
+    const response = await scan;
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).error.code, "SOURCE_SCAN_FAILED");
+    assert.equal(
+      f.sql(
+        `SELECT count(*) FROM media_items WHERE source_id=${quote(source.id)} OR resource='late-item'`,
+      ),
+      "0",
+    );
+    evidence.response = { status: 409, error_code: "SOURCE_SCAN_FAILED" };
+    evidence.checks.push(
+      "deleted source scan fails without publishing any item",
+    );
+  } catch (error) {
+    primaryFailed = true;
+    primaryError = error;
+    throw error;
+  } finally {
+    releaseScan?.();
+    try {
+      await releaseBarrier();
+    } catch (error) {
+      if (primaryFailed)
+        throw new AggregateError(
+          [primaryError, error],
+          "scan deletion and barrier cleanup failed",
+        );
+      throw error;
+    } finally {
+      await Promise.allSettled([scan, deletion].filter(Boolean));
+    }
+  }
+}
 const listener = netServer();
 await new Promise((done) => listener.listen(0, "127.0.0.1", done));
 const port = listener.address().port;
@@ -89,10 +283,15 @@ const upstream = httpServer(async (_request, response) => {
   );
 });
 await new Promise((done) => upstream.listen(0, "127.0.0.1", done));
+const upstreamPort = upstream.address().port;
+let primaryFailed = false;
+const cleanupErrors = [];
 try {
-  await isolatedServer(
+  await runServer(
     "source-deletion",
     async (f) => {
+      report.server_pid = f.serverPid;
+      await save();
       const admin = f.client();
       const me = await admin.login();
       const mediaRoot = resolve(f.root, "owned-media");
@@ -244,27 +443,7 @@ try {
           token: "fixture",
         },
       });
-      const scan = admin.raw(`/sources/${late.id}/test`, { method: "POST" });
-      await Promise.race([
-        reached,
-        new Promise((_done, reject) =>
-          setTimeout(
-            () => reject(Error("owned scan did not reach provider")),
-            10000,
-          ).unref(),
-        ),
-      ]);
-      await admin.request(`/sources/${late.id}`, "DELETE");
-      releaseScan();
-      const scanResponse = await scan;
-      assert.equal(scanResponse.status, 404);
-      assert.equal((await scanResponse.json()).error.code, "SOURCE_NOT_FOUND");
-      assert.equal(
-        f.sql(
-          `SELECT count(*) FROM media_items WHERE source_id=${quote(late.id)} OR resource='late-item'`,
-        ),
-        "0",
-      );
+      await deleteDuringHeldScan(f, admin, late);
 
       const privateSource = await admin.request("/sources", "POST", {
         name: "private scope",
@@ -292,6 +471,9 @@ try {
         library,
       );
 
+      report.backend = "passed";
+      if (backendOnly) return;
+      report.browser = "running";
       process.env.RAINSYNC_SERVER_PROXY_URL = f.origin;
       const dev = await viteServer({
         root: process.env.RAINSYNC_TEST_WEB_DIST ?? resolve("apps/web"),
@@ -436,16 +618,61 @@ try {
         await browser?.close();
         await dev.close();
       }
+      report.browser = "passed";
     },
     {
       env: { PUBLIC_ORIGIN: origin },
+      beforeStart: async (fixture) => {
+        owned = fixture;
+        report.fixture_id = fixture.id;
+        report.server_origin = fixture.origin;
+        report.postgres = fixture.postgresDiagnostics();
+        await save();
+      },
       ...(process.env.RAINSYNC_TEST_SERVER_BINARY
         ? { binary: process.env.RAINSYNC_TEST_SERVER_BINARY }
         : {}),
     },
   );
+} catch (error) {
+  primaryFailed = true;
+  report.failures.push(safeFailure(error) ?? "verification_failed");
 } finally {
   releaseScan?.();
   upstream.closeAllConnections();
-  await new Promise((done) => upstream.close(done));
+  for (const step of [
+    async () => {
+      await new Promise((done, reject) =>
+        upstream.close((error) => (error ? reject(error) : done())),
+      );
+      report.upstream_port_closed = await verifyClosedPort(upstreamPort);
+      assert.equal(report.upstream_port_closed, true);
+    },
+    async () => {
+      if (owned) report.cleanup = await owned.verifyStopped();
+    },
+  ]) {
+    try {
+      await step();
+    } catch (error) {
+      cleanupErrors.push(error);
+      report.failures.push("cleanup_failed");
+    }
+  }
+}
+report.result = primaryFailed || cleanupErrors.length ? "failed" : "passed";
+report.finished_at = new Date().toISOString();
+try {
+  await save();
+} catch (error) {
+  cleanupErrors.push(error);
+}
+if (primaryFailed || cleanupErrors.length) {
+  // Assertion details, command output and browser call logs remain private.
+  console.error("source_deletion_verification_failed");
+  process.exitCode = 1;
+} else if (backendOnly) {
+  console.log(
+    "PASS: source-deletion backend assertions; browser not run (--backend-only)",
+  );
 }
