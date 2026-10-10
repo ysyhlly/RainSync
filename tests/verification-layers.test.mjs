@@ -52,27 +52,96 @@ const badTaps = {
 };
 for (const [name, alter] of Object.entries(badTaps)) test(`TAP rejects ${name}`, () => assert.throws(() => parseGateResults(alter(actualTap))));
 
-test('actual checks shell accepts only success/success with Actions fail-fast flags', async () => {
+function workflowJob(workflow, name) {
+  const jobs = [...workflow.matchAll(/^  ([\w-]+):\n/gm)];
+  assert.equal(jobs.filter(match => match[1] === name).length, 1, `unique job ${name}`);
+  const index = jobs.findIndex(match => match[1] === name);
+  return workflow.slice(jobs[index].index, jobs[index + 1]?.index ?? workflow.length);
+}
+function runScripts(job) {
+  return [...job.matchAll(/^      - run: (.+)$|^        run: (.+)$/gm)].map(match => {
+    const value = match[1] ?? match[2];
+    if (value !== '|') return value;
+    const lines = job.slice(match.index + match[0].length + 1).split('\n');
+    const end = lines.findIndex(line => !line.startsWith('          '));
+    return lines.slice(0, end < 0 ? undefined : end).map(line => line.slice(10)).join('\n');
+  });
+}
+
+test('actual checks shell accepts only four successful layers with Actions fail-fast flags', async () => {
   const workflow = await fs.readFile(resolve(repo, '.github/workflows/ci.yml'), 'utf8');
-  const job = workflow.split('  checks:\n')[1].split('  # Independent')[0];
-  assert.match(job, /needs: \[core-checks, upgrade-recovery\]/); assert.match(job, /if: always\(\)/);
-  assert.match(job, /shell: bash/);
-  const body = job.split('        run: |\n')[1].split('\n').filter(line => line.startsWith('          ')).map(line => line.slice(10)).join('\n');
-  assert.equal(body, 'test "$CORE_RESULT" = success\ntest "$RECOVERY_RESULT" = success');
+  const job = workflowJob(workflow, 'checks');
+  assert.match(job, /^    needs: \[core-checks, upgrade-recovery, frontend-checks, browser-mock\]$/m);
+  assert.deepEqual(job.match(/^ +if:.*$/gm), ['    if: always()']);
+  assert.match(job, /^        shell: bash$/m);
+  assert.doesNotMatch(job, /continue-on-error/);
+  const layers = [
+    ['CORE_RESULT', 'core-checks'], ['RECOVERY_RESULT', 'upgrade-recovery'],
+    ['FRONTEND_RESULT', 'frontend-checks'], ['BROWSER_RESULT', 'browser-mock'],
+  ];
+  for (const [variable, layer] of layers)
+    assert.ok(job.includes(`          ${variable}: \${{ needs.${layer}.result }}\n`));
+  const scripts = runScripts(job); assert.equal(scripts.length, 1);
+  const body = scripts[0];
+  assert.equal(body, layers.map(([variable]) => `test "$${variable}" = success`).join('\n'));
   const outcomes = ['success', 'failure', 'cancelled', 'skipped', '', 'unknown'];
-  for (const core of outcomes) for (const recovery of outcomes) {
-    const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', body], {
-      env: { PATH: '/usr/bin:/bin', CORE_RESULT: core, RECOVERY_RESULT: recovery }, timeout: 1000, encoding: 'utf8',
-    });
-    assert.equal(result.status === 0, core === 'success' && recovery === 'success', `${core}/${recovery}`);
+  for (const core of outcomes) for (const recovery of outcomes)
+    for (const frontend of outcomes) for (const browser of outcomes) {
+      const values = [core, recovery, frontend, browser];
+      const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', body], {
+        env: { PATH: '/usr/bin:/bin', ...Object.fromEntries(layers.map(([variable], index) => [variable, values[index]])) },
+        timeout: 1000, encoding: 'utf8',
+      });
+      assert.equal(result.status === 0, values.every(value => value === 'success'), values.join('/'));
+    }
+});
+test('frontend and mock-browser gates move exactly once into independent strict jobs', async () => {
+  const workflow = await fs.readFile(resolve(repo, '.github/workflows/ci.yml'), 'utf8');
+  const frontend = workflowJob(workflow, 'frontend-checks'), browser = workflowJob(workflow, 'browser-mock');
+  const driver = 'RAINSYNC_PLAYWRIGHT_MODULE="$PWD/node_modules/@playwright/test/index.mjs" node --test tests/acceptance-browser.test.mjs';
+  const scripts = runScripts(workflow);
+  const commands = scripts.flatMap(script => script.split('\n').flatMap(line => line.split(' && ')));
+  for (const [command, job] of [
+    ['npm run lint', frontend], ['npm test', frontend], ['npm run build', frontend],
+    ['npm run test:frontend-bundle', frontend], ['npm run test:e2e', browser], [driver, browser],
+  ]) {
+    assert.equal(commands.filter(value => value === command).length, 1, `one gate: ${command}`);
+    assert.ok(runScripts(job).some(script => script.split(' && ').includes(command)), `owner: ${command}`);
   }
+  for (const job of [frontend, browser]) {
+    assert.match(job, /^    runs-on: ubuntu-latest$/m);
+    assert.match(job, /uses: actions\/checkout@v4/);
+    assert.match(job, /uses: actions\/setup-node@v4\n        with:\n          node-version: 24\n          cache: npm/);
+    assert.doesNotMatch(job, /(?:needs|if|continue-on-error|paths-ignore|paths|strategy):/);
+    assert.doesNotMatch(runScripts(job).join('\n'), /cargo|pg_config|docker|bind-native-backend|test:browser-real/);
+  }
+  assert.deepEqual(runScripts(frontend), [
+    'mkdir -p "$RUNNER_TEMP/rainsync-frontend-validation"\n' +
+      'echo "RAINSYNC_ARTIFACT_DIR=$RUNNER_TEMP/rainsync-frontend-validation" >> "$GITHUB_ENV"',
+    'npm ci && npm run lint && npm test && npm run build', 'npm run test:frontend-bundle',
+  ]);
+  assert.deepEqual(runScripts(browser), [
+    'mkdir -p "$RUNNER_TEMP/rainsync-browser-mock"\n' +
+      'echo "RAINSYNC_ARTIFACT_DIR=$RUNNER_TEMP/rainsync-browser-mock" >> "$GITHUB_ENV"',
+    'npm ci', 'npx playwright install --with-deps chromium && npm run test:e2e', driver,
+  ]);
+  // Separate runners need their own installs. These are prerequisites, not
+  // duplicated gates or a dependency on another layer's successful artifacts.
+  const core = runScripts(workflowJob(workflow, 'core-checks'));
+  assert.equal(core.filter(command => command === 'npm ci').length, 1);
+  assert.equal(core.filter(command => command === 'npx playwright install --with-deps chromium').length, 1);
+  assert.ok(core.indexOf('npm ci') < core.indexOf('npm run test:backend-contracts'));
+  assert.ok(core.indexOf('npx playwright install --with-deps chromium') < core.indexOf('npm run test:browser-real'));
+  assert.ok(core.indexOf('npm run test:browser-real') < core.indexOf('node tests/playlist-real.mjs'));
+  assert.equal(commands.filter(command => command === 'npm ci').length, 3);
+  assert.equal(commands.filter(command => command === 'npx playwright install --with-deps chromium').length, 2);
 });
 test('routing owns each new entry once and leaves owner and unrelated native chains independent', async () => {
   const workflow = await fs.readFile(resolve(repo, '.github/workflows/ci.yml'), 'utf8');
   const packageJson = JSON.parse(await fs.readFile(resolve(repo, 'package.json')));
-  const core = workflow.split('  core-checks:\n')[1].split('  upgrade-recovery:\n')[0];
-  const recovery = workflow.split('  upgrade-recovery:\n')[1].split('  checks:\n')[0];
-  const owner = workflow.slice(workflow.indexOf('  owner-gates:\n'));
+  const core = workflowJob(workflow, 'core-checks');
+  const recovery = workflowJob(workflow, 'upgrade-recovery');
+  const owner = workflowJob(workflow, 'owner-gates');
   for (const name of ['test:upgrade-recovery-contracts', 'test:verification-contracts']) {
     assert.equal(workflow.split(`npm run ${name}`).length - 1, 1); assert.ok(core.includes(`npm run ${name}`));
   }

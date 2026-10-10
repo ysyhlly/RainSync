@@ -38,9 +38,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo run -p protocol --example export -- --check
-      - run: npm ci && npm run lint && npm test && npm run build
-      - name: Verify frontend bundle boundaries
-        run: npm run test:frontend-bundle
+      # Native integration and real-browser fixtures still need Node dependencies.
+      - run: npm ci
       - run: npm run test:backend-contracts
       - name: Verify deployment configuration contracts
         run: node --test tests/deployment-settings.test.mjs
@@ -92,9 +91,8 @@ jobs:
           npm run test:avatar-container
       - run: npm run test:chat
       - run: node tests/playlist-scan.mjs
-      - run: npx playwright install --with-deps chromium && npm run test:e2e
-      - name: Verify independent browser measurement driver
-        run: RAINSYNC_PLAYWRIGHT_MODULE="$PWD/node_modules/@playwright/test/index.mjs" node --test tests/acceptance-browser.test.mjs
+      # The independent mock-browser job has its own runner/browser installation.
+      - run: npx playwright install --with-deps chromium
       - run: npm run test:browser-real
       - run: node tests/playlist-real.mjs
       - name: Retain upgrade/recovery cleanup contract summary
@@ -123,6 +121,41 @@ jobs:
           path: ${{ runner.temp }}/rainsync-validation/upstream-profile-admission/*/report.json
           if-no-files-found: ignore
           retention-days: 7
+
+  # No Rust, PostgreSQL or native-integration dependency blocks these gates.
+  frontend-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolate frontend validation outputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/rainsync-frontend-validation"
+          echo "RAINSYNC_ARTIFACT_DIR=$RUNNER_TEMP/rainsync-frontend-validation" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci && npm run lint && npm test && npm run build
+      - name: Verify frontend bundle boundaries
+        run: npm run test:frontend-bundle
+
+  browser-mock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolate mock-browser validation outputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/rainsync-browser-mock"
+          echo "RAINSYNC_ARTIFACT_DIR=$RUNNER_TEMP/rainsync-browser-mock" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      # Playwright serves the current sources through Vite, not the built bundle.
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium && npm run test:e2e
+      - name: Verify independent browser measurement driver
+        run: RAINSYNC_PLAYWRIGHT_MODULE="$PWD/node_modules/@playwright/test/index.mjs" node --test tests/acceptance-browser.test.mjs
 
   upgrade-recovery:
     runs-on: ubuntu-latest
@@ -164,17 +197,21 @@ jobs:
   checks:
     name: checks
     runs-on: ubuntu-latest
-    needs: [core-checks, upgrade-recovery]
+    needs: [core-checks, upgrade-recovery, frontend-checks, browser-mock]
     if: always()
     steps:
-      - name: Require both verification layers
+      - name: Require all verification layers
         shell: bash
         env:
           CORE_RESULT: ${{ needs.core-checks.result }}
           RECOVERY_RESULT: ${{ needs.upgrade-recovery.result }}
+          FRONTEND_RESULT: ${{ needs.frontend-checks.result }}
+          BROWSER_RESULT: ${{ needs.browser-mock.result }}
         run: |
           test "$CORE_RESULT" = success
           test "$RECOVERY_RESULT" = success
+          test "$FRONTEND_RESULT" = success
+          test "$BROWSER_RESULT" = success
 
   # Independent of the broad checks job: a frontend or unrelated integration
   # failure must not silently prevent these owner/commit contracts from running.
