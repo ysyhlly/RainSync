@@ -3,7 +3,7 @@ use super::*;
 pub use catalog::source_settings::Change;
 
 pub async fn get(State(app): State<App>, h: HeaderMap, Path(id): Path<Uuid>) -> Result<Response> {
-    let user = auth(&app, &h, false).await?;
+    let user = identity::request::authenticate(app.identity_context(), &h, false, false).await?;
     admin(&user)?;
     let context = catalog::SourceReadContext {
         db: &app.db,
@@ -19,7 +19,7 @@ pub async fn change(
     Path(id): Path<Uuid>,
     Json(body): Json<Change>,
 ) -> Result<Response> {
-    let user = auth(&app, &h, true).await?;
+    let user = identity::request::authenticate(app.identity_context(), &h, true, false).await?;
     admin(&user)?;
     let context = catalog::SourceChangeContext {
         db: &app.db,
