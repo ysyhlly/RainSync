@@ -144,7 +144,8 @@ pub(crate) async fn finish(tx: Transaction<'_, Postgres>, user: &User, login: &s
 }
 
 pub async fn get(State(app): State<App>, headers: HeaderMap) -> Result<Response> {
-    let user = auth(&app, &headers, false).await?;
+    let user =
+        identity::request::authenticate(app.identity_context(), &headers, false, false).await?;
     admin(&user)?;
     let mut admission =
         identity::admin::AdminTransaction::begin(&app.db, &user, &headers, false).await?;
@@ -160,7 +161,8 @@ pub async fn change(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response> {
-    let user = auth(&app, &headers, true).await?;
+    let user =
+        identity::request::authenticate(app.identity_context(), &headers, true, false).await?;
     admin(&user)?;
     let body: Change = serde_json::from_slice(&body).map_err(|_| invalid())?;
     let expected = revision(&body.expected_revision)?;
