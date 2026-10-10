@@ -248,6 +248,63 @@ await isolatedMediaStack("nas-missing-root-receipts", async (f) => {
     const mapped = await makeSession(
       "persisted NAS receipt with missing mount",
     );
+    // Test-only observation of the actual Worker delivery_response load gate.
+    // Never writes authority or includes delivery tokens/encrypted resources.
+    const diagnosticFailures = [];
+    async function observeInitialDelivery(phase) {
+      const path = resolve(f.root, `initial-delivery-${phase}.private.json`);
+      try {
+        const projection = f.sql(`WITH target AS (
+          SELECT '${mapped.session}'::uuid AS id, '${hash(mapped.token)}'::text AS expected_token_hash
+        ) SELECT json_build_object(
+          'phase','${phase}', 'observed_at',clock_timestamp(),
+          'session_exists',p.id IS NOT NULL, 'session_id',p.id,
+          'token_match',p.delivery_token_hash=t.expected_token_hash,
+          'stopped',p.stopped, 'expires_at',p.expires_at,
+          'unexpired',p.expires_at>now(), 'user_id',p.user_id, 'room_id',p.room_id,
+          'lifecycle',r.lifecycle, 'room_epoch',r.lifecycle_epoch,
+          'session_epoch',p.lifecycle_epoch, 'epoch_match',r.lifecycle_epoch=p.lifecycle_epoch,
+          'session_generation',p.generation,
+          'snapshot_generation',snap.state->>'media_generation',
+          'generation_match',(snap.state->>'media_generation')::bigint=p.generation,
+          'snapshot_exists',snap.room_id IS NOT NULL,
+          'media_id',p.media_id, 'media_exists',mi.id IS NOT NULL,
+          'media_available',mi.available, 'indexed_source_version',mi.source_version,
+          'source_id',src.id, 'source_kind',src.kind, 'source_deleted',src.deleted_at IS NOT NULL,
+          'agent_revoked',a.revoked, 'library_id',src.library_id,
+          'login_binding_present',p.auth_login_hash IS NOT NULL,
+          'login_hash',p.auth_login_hash,
+          'login_row_exists',login.token_hash IS NOT NULL,
+          'login_expires_at',login.expires_at,
+          'membership_exists',m.user_id IS NOT NULL,
+          'membership_epoch',m.membership_epoch,
+          'session_membership_epoch',p.auth_membership_epoch,
+          'login_allowed',playback_login_allowed(p.user_id,p.auth_login_hash),
+          'origin_allowed',playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch),
+          'library_media_allowed',library_media_allowed(p.user_id,p.media_id,'play',p.room_id),
+          'library_session_allowed',playback_library_session_allowed(p.id),
+          'source_allowed_2',playback_source_allowed(p.media_id,p.resource),
+          'source_allowed_3',playback_source_allowed(p.media_id,p.resource,p.id),
+          'worker_load_allowed',COALESCE(r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch
+            AND p.id=t.id AND p.delivery_token_hash=t.expected_token_hash AND p.expires_at>now()
+            AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource,p.id)
+            AND (snap.state->>'media_generation')::bigint=p.generation AND m.user_id IS NOT NULL,false)
+        ) FROM target t LEFT JOIN playback_sessions p ON p.id=t.id
+        LEFT JOIN rooms r ON r.id=p.room_id LEFT JOIN room_snapshots snap ON snap.room_id=p.room_id
+        LEFT JOIN room_members m ON m.room_id=p.room_id AND m.user_id=p.user_id
+        LEFT JOIN media_items mi ON mi.id=p.media_id LEFT JOIN sources src ON src.id=mi.source_id
+        LEFT JOIN agents a ON a.id=src.id
+        LEFT JOIN sessions login ON login.token_hash=p.auth_login_hash AND login.user_id=p.user_id`);
+        await writeFile(path, JSON.stringify(JSON.parse(projection), null, 2) + "\n", { flag: "wx", mode: 0o600 });
+      } catch (error) {
+        diagnosticFailures.push(phase);
+        // Retain original diagnostic failure privately; keep the original HTTP
+        // request and status assertion running even if observation failed.
+        await writeFile(path + ".failure", error?.stack ?? String(error), { flag: "wx", mode: 0o600 })
+          .catch(() => { diagnosticFailures.push(`${phase}_failure_write`); });
+      }
+    }
+    await observeInitialDelivery("before");
     const stream = { response: null, aborted: false };
     const req = request(
       `${f.workerOrigin}/media-delivery/${mapped.session}/source?token=${mapped.token}`,
@@ -264,7 +321,9 @@ await isolatedMediaStack("nas-missing-root-receipts", async (f) => {
     requests.add(req);
     req.end();
     await until(() => stream.response, "real NAS response");
+    await observeInitialDelivery("after");
     assert.equal(stream.response.statusCode, 200);
+    assert.deepEqual(diagnosticFailures, [], "Initial delivery diagnostic capture must succeed");
     await until(
       async () => (await openFiles()) > 0,
       "real NAS descriptor retained",
