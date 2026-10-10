@@ -1,0 +1,167 @@
+{
+  "created_utc": "2026-10-10T13:26:36.518243+00:00",
+  "repository": "ysyhlly/RainSync",
+  "handoff_branch": "codex/rainsync-handoff-20261010",
+  "source_head": "990cf8a75b65c102279539fbce683c52196f4c67",
+  "source_commit_count": 246,
+  "source_tracked_files": 1574,
+  "observed_remote_main": "fc985a818f50be654e78d4e50165c320291c7a96",
+  "previously_unpushed_commits": 106,
+  "restored_library_v19_head": "7ed7667dbf0a38a531343502ed300f0b47e87c96",
+  "publication_authorization": "User explicitly requested Git push for handoff; no merge or deployment authorized.",
+  "cloud_role": "testing only for definite next candidates; this commit contains handoff documentation and preserved source drafts, no product implementation changes",
+  "p22": {
+    "result": "passed_actual_p22_finite_original9_candidate11_test_only_pair",
+    "server_test_totals": [
+      [
+        "392",
+        "0",
+        "9"
+      ],
+      [
+        "19",
+        "0",
+        "0"
+      ],
+      [
+        "17",
+        "0",
+        "0"
+      ]
+    ],
+    "production_changed": false,
+    "all_other1572_source_equal": true,
+    "scope": "Actual complete original nine current245 and added finish CHECK timeout plus same execution WARN1/2/4/8 recovery, awaited twelve actual driver connections returned with same backend identities. Shared nine-case contract remains nine. Added cases close after recovery; no new ACK-pending room close, physical descendant drain, overflow/saturation, soak or whole-plan acceptance.",
+    "plan_complete": false
+  },
+  "kick_failure": {
+    "actual_code": "FORBIDDEN",
+    "fixture_expected_code": "GUEST_RESTRICTED",
+    "http_status": 403,
+    "completed_check_groups": 0,
+    "same_source_real_lock_cases_not_entered": true,
+    "legacy_six_and_original_after18_not_run": true,
+    "fixture_assertion_unchanged": true,
+    "production_unchanged": true
+  },
+  "kick_process_cleanup": {
+    "server_exit_code": 0,
+    "postgres_exit_code": 0,
+    "owned_pids_absent": true,
+    "ports_closed": true,
+    "pg_ctl_status": 3
+  },
+  "pending_source_proposals": [
+    {
+      "directory": "room-kick-operations-v2-20261010T1220Z",
+      "manifest_present": true,
+      "manifest_sha256": "63a5cc1d15ff2dba2e07009c0a5f351072443dc17a99da763806656a2e723b09",
+      "classification": "external_only_not_product_applied_not_runtime_accepted"
+    },
+    {
+      "directory": "room-kick-authority-native-20261010T122538Z",
+      "manifest_present": true,
+      "manifest_sha256": "eeca3138c1221fb31586e23957782c691e3db86bdf55d327d0c3af340b671feb",
+      "classification": "external_only_not_product_applied_not_runtime_accepted"
+    },
+    {
+      "directory": "room-lifecycle-operations-20261010T1232Z",
+      "manifest_present": true,
+      "manifest_sha256": "a3b3a80b4d5a867be97f881ab163950b677c943af4887a3d94c3915997b40653",
+      "classification": "external_only_not_product_applied_not_runtime_accepted"
+    },
+    {
+      "directory": "room-lifecycle-operations-v2-20261010T1236Z",
+      "manifest_present": true,
+      "manifest_sha256": "bb47de3d011dddbf57554658437cd147f9be86d8cc0d04d8353959303f45eea2",
+      "classification": "external_only_not_product_applied_not_runtime_accepted"
+    },
+    {
+      "directory": "room-lifecycle-authority-native-v1-20261010T1255Z",
+      "manifest_present": true,
+      "manifest_sha256": "7feb4e8a5531bf5480e91ef0f15a67be103bb73307a7b6058098e51ea1fd1a1f",
+      "classification": "external_only_not_product_applied_not_runtime_accepted"
+    },
+    {
+      "directory": "room-lifecycle-authority-native-v2-20261010T1300Z",
+      "manifest_present": true,
+      "manifest_sha256": "db7ee7883cbd4a26d1540f9f65cf2f6fa886be692b9dc9e8a313c5d42191dd00",
+      "classification": "external_only_not_product_applied_not_runtime_accepted"
+    },
+    {
+      "directory": "room-guest-access-operations-20261010T1305Z",
+      "manifest_present": true,
+      "manifest_sha256": "f5c4705c1ec2c05f3ae1c134f0441b1a169369f84fccaf9d3dc89c74f288a4f6",
+      "classification": "external_only_not_product_applied_not_runtime_accepted"
+    },
+    {
+      "directory": "room-guest-access-authority-native-20261010T125217Z",
+      "manifest_present": true,
+      "manifest_sha256": "8a4706e9d1a6160efe4cde5502e9e0248b0fe95629b74294266429c1e78bfddb",
+      "classification": "external_only_not_product_applied_not_runtime_accepted"
+    },
+    {
+      "directory": "room-directory-operations-20261010T1320Z",
+      "manifest_present": false,
+      "manifest_sha256": null,
+      "classification": "unfrozen_incomplete_draft"
+    },
+    {
+      "directory": "short-platform-account-whole-family-v2-20261010T1316Z",
+      "manifest_present": true,
+      "manifest_sha256": "35e44ce4730e106eb455b87415da74481df5af325d1efc91c702bb1676ba7261",
+      "classification": "external_only_not_product_applied_not_runtime_accepted"
+    },
+    {
+      "directory": "short-platform-account-authority-native-20261010T1340Z",
+      "manifest_present": true,
+      "manifest_sha256": "21e22321f1d2f7364a68cfa65a106845665059bb556bd815179c19c6b1419e12",
+      "classification": "external_only_not_product_applied_not_runtime_accepted"
+    },
+    {
+      "directory": "remaining-lifecycle-whole-units-after-244-20261010T1224Z",
+      "manifest_present": true,
+      "manifest_sha256": "779dd3ba1b4f417f16cf1dec0455386f5716098be30933b4101e60c6763915d6",
+      "classification": "external_only_not_product_applied_not_runtime_accepted"
+    },
+    {
+      "directory": "remaining-presentation-whole-units-after-245-20261010T1306Z",
+      "manifest_present": true,
+      "manifest_sha256": "7d8876e3fe2f528467e1355551fca593249aa40ecb0d418616796f146000f220",
+      "classification": "external_only_not_product_applied_not_runtime_accepted"
+    }
+  ],
+  "future_tests_not_started": [
+    "kick wide-protocol/lifecycle/consistency/ownership/invitation/scoped-guests and lock cases after first failed ingress; candidate production never applied",
+    "lifecycle new ten-case original/candidate",
+    "guest-access new five-case original/candidate",
+    "short-provider new eight-case original/candidate",
+    "room-directory proposed baseline; production/consumer draft not frozen",
+    "later candidate fullworkspace/browser/Docker/platform/Windows/Actions/requiredchecks/soak dependent prerequisites"
+  ],
+  "constraints": [
+    "P08/P09 remain excluded after prior refusals",
+    "No production data or user-computer access",
+    "No merge or deployment",
+    "No broadening assertions, ignores, timeouts, or fallbacks to mask observed failures"
+  ],
+  "unverified": [
+    "full-workspace and browser rerun on this handoff commit",
+    "physical Windows and provider accounts",
+    "cross-host TLS and upgrade compatibility",
+    "remote required checks",
+    "long soak",
+    "Docker acceptance with exact offline fixture images"
+  ],
+  "remote_ci": "not yet observed; push may trigger existing checks workflow, no acceptance claim",
+  "source_draft_archive": {
+    "filename": "pending-source-proposals.zip",
+    "members": 2905,
+    "bytes": 11541264,
+    "sha256": "7ea9f669b08e6092dc3d6bea46af0e4d1b60a2d467d5e2100ba36c6749c550e5"
+  },
+  "library_upload": {
+    "result": "failed before preparing uploads with HTTP401",
+    "new_versions": null
+  }
+}

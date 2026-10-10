@@ -1,0 +1,60 @@
+{
+  "source_snapshot_utc": "2026-10-10T13:03:03.085775+00:00",
+  "records": [
+    {
+      "command": [
+        "python3",
+        "../kick-root-1308/install-original-fixture.py"
+      ],
+      "exit_code": 0,
+      "source_unchanged": false,
+      "log_sha256": "747bc49ac5af4c1443e8ca650cdccc7b789bb48550c6fc2e98e5d9b7dea5dba4",
+      "sha256": "8f6bf9540d2f5c26db9c0e72fdc7108f959a95d938d6bced35e851c16f22f93e"
+    },
+    {
+      "command": [
+        "node",
+        "--check",
+        "tests/room-kick-authority-native.mjs"
+      ],
+      "exit_code": 0,
+      "source_unchanged": true,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "sha256": "a4d2a8dd715b12edff89ced831ee6328d73af8c3be977c64f9fb2ed8552ca924"
+    },
+    {
+      "command": [
+        "node",
+        "../evidence/verify-owned-binding.mjs",
+        "/workspace/rainsync-refactor-20261010/evidence/kick-original-before-eighteen-1308.json"
+      ],
+      "exit_code": 0,
+      "source_unchanged": true,
+      "log_sha256": "6884c813f7e920a9dbd4fc41ce49fdcfeedc76b1b17e86360b98efcd2e7310ce",
+      "sha256": "f42b607797419a02b1eb3c4bbfec4285b2e9d114b6b6d11de91d542a5913b89d"
+    },
+    {
+      "command": [
+        "node",
+        "tests/room-kick-authority-native.mjs"
+      ],
+      "exit_code": 1,
+      "source_unchanged": true,
+      "log_sha256": "7feb1c92a73e2375e843b509c74a33bd07073ddd1465af022bd202025759b463",
+      "sha256": "0c91194d00a99076f42245aacb210b26bb90186cc0a5704afe8c1eae4e34eae1"
+    },
+    {
+      "command": [
+        "node",
+        "../evidence/verify-owned-binding.mjs",
+        "/workspace/rainsync-refactor-20261010/evidence/testing-only-handoff-after-eighteen-1300.json"
+      ],
+      "exit_code": 0,
+      "source_unchanged": true,
+      "log_sha256": "6884c813f7e920a9dbd4fc41ce49fdcfeedc76b1b17e86360b98efcd2e7310ce",
+      "sha256": "3eb7deaefa4abddb9e289318a40e8222af8c5ad0739609a497e209e67a433715"
+    }
+  ],
+  "raw_log_location": "original private cloud evidence, omitted from this public repository",
+  "note": "Recorded runs from the source snapshot, not new tests run while publishing this handoff."
+}
