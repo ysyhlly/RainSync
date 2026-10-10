@@ -170,12 +170,43 @@ async fn acknowledge_absent_or_disposed(app: &App, room: Uuid, id: Uuid) -> anyh
 }
 
 async fn finish(app: &App, room: Uuid, id: Uuid, _permit: OwnedSemaphorePermit) {
+    let started = std::time::Instant::now();
+    let mut failed_calls = 0_u64;
     loop {
-        if matches!(
-            tokio::time::timeout(CHECK, acknowledge_absent_or_disposed(app, room, id)).await,
-            Ok(Ok(()))
-        ) {
-            return;
+        let failure = match tokio::time::timeout(
+            CHECK,
+            acknowledge_absent_or_disposed(app, room, id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                if failed_calls != 0 {
+                    tracing::info!(
+                        target: "native_delivery_ack",
+                        room_id = %room,
+                        execution_id = %id,
+                        ack_age_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        failed_calls,
+                        outcome = "recovered",
+                        "native delivery acknowledgement call recovered"
+                    );
+                }
+                return;
+            }
+            Ok(Err(_)) => "ack_error",
+            Err(_) => "timeout",
+        };
+        failed_calls = failed_calls.saturating_add(1);
+        if failed_calls.is_power_of_two() {
+            tracing::warn!(
+                target: "native_delivery_ack",
+                room_id = %room,
+                execution_id = %id,
+                ack_age_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                failed_calls,
+                failure,
+                "native delivery acknowledgement remains unconfirmed"
+            );
         }
         // Keep the admitted owner and retry the same positive local-disposal
         // result. Unknown database state never becomes a manufactured receipt.

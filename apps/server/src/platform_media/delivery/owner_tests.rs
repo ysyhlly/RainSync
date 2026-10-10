@@ -3,6 +3,92 @@ use super::*;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+// Test-only process-global capture: exact ignored driver, fixed targets/typed fields.
+struct AckCaptureState {
+    file: std::fs::File,
+    failed: bool,
+    event_count: usize,
+}
+#[derive(Clone)]
+struct AckCaptureLayer(Arc<std::sync::Mutex<AckCaptureState>>);
+#[derive(Default)]
+struct AckCaptureFields(serde_json::Map<String, Value>);
+impl tracing::field::Visit for AckCaptureFields {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if matches!(field.name(), "ack_age_ms" | "failed_calls" | "probe") {
+            self.0.insert(field.name().into(), json!(value));
+        }
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if matches!(
+            (field.name(), value),
+            ("failure", "ack_error" | "timeout") | ("outcome", "recovered")
+        ) {
+            self.0.insert(field.name().into(), json!(value));
+        }
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if matches!(field.name(), "room_id" | "execution_id")
+            && let Ok(id) = Uuid::parse_str(&format!("{value:?}"))
+        {
+            self.0.insert(field.name().into(), json!(id.to_string()));
+        }
+    }
+}
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AckCaptureLayer {
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        matches!(
+            metadata.target(),
+            "native_delivery_ack" | "native_delivery_ack_capture_probe"
+        )
+    }
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if !matches!(
+            event.metadata().target(),
+            "native_delivery_ack" | "native_delivery_ack_capture_probe"
+        ) {
+            return;
+        }
+        let mut fields = AckCaptureFields::default();
+        event.record(&mut fields);
+        fields
+            .0
+            .insert("target".into(), json!(event.metadata().target()));
+        fields
+            .0
+            .insert("level".into(), json!(event.metadata().level().as_str()));
+        let mut state = match self.0.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                poisoned.into_inner().failed = true;
+                return;
+            }
+        };
+        if state.failed {
+            return;
+        }
+        if state.event_count >= 128 {
+            state.failed = true;
+            return;
+        }
+        state.event_count += 1;
+        use std::io::Write;
+        if serde_json::to_writer(&mut state.file, &fields.0).is_err()
+            || state.file.write_all(b"\n").is_err()
+        {
+            state.failed = true;
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct Fixture {
     id: Uuid,
@@ -190,6 +276,7 @@ async fn native_delivery_owner_http_fixture() {
         .canonicalize()
         .unwrap();
     assert!(request.starts_with(&artifacts));
+    let capture_path = request.with_file_name("native-ack-observation.private.log");
     let f: Fixture = serde_json::from_slice(&std::fs::read(request).unwrap()).unwrap();
     let database = std::env::var("RAINSYNC_NATIVE_DELIVERY_TEST_DATABASE").unwrap();
     assert_eq!(
@@ -206,6 +293,28 @@ async fn native_delivery_owner_http_fixture() {
     .await
     .unwrap();
     assert!(owned, "explicit coordinator identity required");
+    let mut capture_options = std::fs::OpenOptions::new();
+    capture_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        capture_options.mode(0o600);
+    }
+    let capture = Arc::new(std::sync::Mutex::new(AckCaptureState {
+        file: capture_options.open(capture_path).unwrap(),
+        failed: false,
+        event_count: 0,
+    }));
+    use tracing_subscriber::prelude::*;
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(AckCaptureLayer(capture.clone())),
+    )
+    .expect("exact owned driver installs one capture subscriber");
+    let capture_secret = f.nonce.clone();
+    tokio::spawn(async move {
+        tracing::debug!(target: "native_delivery_ack_capture_probe", probe = 1_u64, capture_secret = %capture_secret);
+    }).await.unwrap();
+
     assert_eq!(
         reqwest::Url::parse(&f.origin).unwrap().host_str(),
         Some("127.0.0.1")
@@ -419,4 +528,20 @@ async fn native_delivery_owner_http_fixture() {
         println!("PASS: native owned real-HTTP lifecycle case {}", case.name);
     }
     app.native_delivery_owners.drain().await.unwrap();
+    let mut captured = match capture.lock() {
+        Ok(state) => state,
+        Err(poisoned) => {
+            let mut state = poisoned.into_inner();
+            state.failed = true;
+            state
+        }
+    };
+    use std::io::Write;
+    if captured.file.flush().is_err() {
+        captured.failed = true;
+    }
+    assert!(
+        !captured.failed,
+        "typed ACK capture must not overflow or lose writes"
+    );
 }

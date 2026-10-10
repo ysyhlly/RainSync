@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { closeSync, openSync } from "node:fs";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 import {
   ownedProcess,
   withTerminationSignal,
@@ -100,3 +104,25 @@ test(
     }
   },
 );
+
+
+test("borrowed output descriptor retains complete stdout/stderr beyond the console cap", async (t) => {
+  const root = await mkdtemp(resolve(tmpdir(), "rainsync-owned-output-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = resolve(root, "driver.private.log");
+  const fd = openSync(path, "wx", 0o600);
+  let result;
+  try {
+    result = await ownedProcess(process.execPath, ["-e",
+      "process.stdout.write('X'.repeat(40000));process.stderr.write('owned-stderr-complete')",
+    ], { outputFd: fd });
+  } finally { closeSync(fd); }
+  assert.equal(result.exit_code, 0);
+  assert.equal(result.signal, null);
+  assert.equal(result.observed_close, true);
+  assert.equal(verifyPidAbsent(result.pid), true);
+  assert.equal(result.output, "", "direct descriptor does not claim bounded console capture");
+  const bytes = await readFile(path);
+  assert.equal(bytes.length, 40000 + Buffer.byteLength("owned-stderr-complete"));
+  assert.equal(bytes.toString().replaceAll("owned-stderr-complete", ""), "X".repeat(40000));
+});

@@ -6,18 +6,21 @@ import { spawn } from "node:child_process";
 export async function ownedProcess(
   program,
   args,
-  { env = process.env, timeoutMs = 10000, signal, graceMs = 3000 } = {},
+  { env = process.env, timeoutMs = 10000, signal, graceMs = 3000, outputFd } = {},
 ) {
   signal?.throwIfAborted();
+  // The caller owns this descriptor and closes it after the observed child close.
+  // Direct OS output is uncapped; the default pipe capture remains bounded.
+  assert.ok(outputFd === undefined || (Number.isInteger(outputFd) && outputFd >= 0));
   const child = spawn(program, args, {
     env,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["ignore", outputFd ?? "pipe", outputFd ?? "pipe"],
   });
   let output = "",
     closed = false,
     timer,
     abortListener;
-  for (const stream of [child.stdout, child.stderr])
+  for (const stream of [child.stdout, child.stderr].filter(Boolean))
     stream.on("data", (bytes) => {
       if (output.length < 32768)
         output += bytes.toString("utf8").slice(0, 32768 - output.length);
