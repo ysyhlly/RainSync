@@ -13,6 +13,9 @@ import { withPlaybackAdmission,testLoginHash } from "./fixtures/playback-admissi
 const args=process.argv.slice(2);
 assert.ok(args.length===0 || (args.length===1 && args[0]==="--baseline-no-ack-observations"));
 const baseline=args.length===1;
+const additionalFinishCases=["finish_pool_timeout","finish_retry_eight"];
+const allNativeCases=[...nativeOwnerCases.slice(0,-1),...additionalFinishCases,nativeOwnerCases.at(-1)];
+
 
 async function ackObservations(f,cases,report){
   const path=resolve(f.root,"native-ack-observation.private.log");
@@ -62,6 +65,28 @@ async function ackObservations(f,cases,report){
     assert.ok(actual.filter(e=>e.level==="WARN").every(e=>e.failure==="ack_error"));
     faults.push({name,warnings:actual.filter(e=>e.level==="WARN").length,last_failed_calls:actual.at(-1).failed_calls,first_ack_age_ms:actual[0].ack_age_ms,recovered_ack_age_ms:actual.at(-1).ack_age_ms,failure_class:"ack_error",reaped:true});
   }
+  for(const name of additionalFinishCases){
+    const c=cases.find(c=>c.name===name);
+    const rows=JSON.parse(f.sql(`SELECT COALESCE(json_agg(json_build_object('id',id,'reaped',reaped_at IS NOT NULL)),'[]'::json) FROM media_executions WHERE session_id='${c.session}'`));
+    assert.equal(rows.length,1);assert.equal(rows[0].reaped,true);
+    const list=groups.get(rows[0].id);assert.ok(list);
+    if(name==='finish_pool_timeout')assert.ok(list.some(e=>e.level==='WARN'&&e.failure==='timeout'&&e.failed_calls===1));
+    else for(const count of [1,2,4,8])assert.ok(list.some(e=>e.level==='WARN'&&e.failure==='ack_error'&&e.failed_calls===count));
+    assert.equal(list.filter(e=>e.level==='INFO'&&e.outcome==='recovered').length,1);
+  }
+  for(const name of additionalFinishCases){
+    const path=resolve(f.root,`${name}.finish-witness.private.json`),bytes=await readFile(path),witness=JSON.parse(bytes);
+    assert.equal(witness.first_assertion_failed,false);assert.deepEqual(witness.cleanup_errors,[]);
+    assert.equal(witness.observer_pool_closed,true);
+    if(name==='finish_pool_timeout'){
+      assert.equal(witness.held.connection_count,12);assert.equal(witness.held.pool_idle,0);
+      assert.equal(witness.connections_returned.count,12);assert.equal(witness.connections_returned.held_vector_empty,true);
+      assert.equal(witness.returned_backends.pool_idle,12);assert.equal(witness.response_disposed.observed,true);
+      assert.deepEqual(witness.held.actual_backends.map(x=>[x.pid,x.backend_start]),witness.returned_backends.actual_backends.map(x=>[x.pid,x.backend_start]));
+      assert.ok(witness.returned_backends.actual_backends.every(x=>x.state==='idle'&&x.xact_start===null));
+    }else assert.equal(witness.fault_released,true);
+    report.additional_finish_witnesses??=[];report.additional_finish_witnesses.push({name,path,bytes:bytes.length,sha256:sha256(bytes),execution:witness.execution});
+  }
   report.ack_observation={mode:baseline?"original_no_native_fields":"acceptance",capture_sha256:sha256(bytes),capture_bytes:bytes.length,probe_events:1,native_events:native.length,faults,outer_timeout_observed:native.some(e=>e.failure==="timeout"),raw_private_not_ci_uploaded:true};
 }
 const quote=value=>`'${String(value).replaceAll("'","''")}'`;
@@ -75,7 +100,7 @@ await nativeOwnerGate("native-delivery-owner",async (f, {binding, report, check,
     response.once("close",()=>{record.closed=true;clearInterval(timer);});
     if(name.startsWith("send_"))return;
     response.writeHead(200,{"Content-Type":"video/mp4","Content-Length":"1000000"});response.flushHeaders();
-    if(name==="body_close") {
+    if(name==="body_close"||name==="finish_pool_timeout") {
       // Distinct source chunks fill the one-slot Rust body channel. Keep the
       // source open; closing the room must cancel an actually blocked send.
       timer=setInterval(()=>{
@@ -91,7 +116,7 @@ await nativeOwnerGate("native-delivery-owner",async (f, {binding, report, check,
   try {
     f.sql(`CREATE TABLE native_delivery_fixture_identity(id uuid PRIMARY KEY,nonce text NOT NULL);INSERT INTO native_delivery_fixture_identity VALUES('${f.id}','${nonce}');`);
     const cases=[];
-    for(const name of nativeOwnerCases){
+    for(const name of allNativeCases){
       const room=await client.request("/rooms","POST",{name:`owned native delivery ${name}`});
       const session=randomUUID(),media=randomUUID(),viewer=randomUUID(),token=randomUUID().replaceAll("-","")+randomUUID().replaceAll("-","");
       const login=testLoginHash(f,client);
@@ -150,7 +175,7 @@ await nativeOwnerGate("native-delivery-owner",async (f, {binding, report, check,
     assert.ok(records.find(record=>record.name==="body_close").writes>=4,"backpressure uses multiple actual source chunks");
     assert.equal(records.find(record=>record.name==="send_head").method,"HEAD");
     assert.equal(records.find(record=>record.name==="send_range_drop").range,"bytes=0-31");
-    for(const name of nativeOwnerCases) check(name);
+    for(const name of allNativeCases) check(name);
     console.log("PASS: real source sockets, deferred HEAD/Range requests, receipt failure/recovery, caller cancellation and denied admission all preserve authoritative room closure");
   } finally {
     upstream.closeAllConnections();await new Promise(done=>upstream.close(done));

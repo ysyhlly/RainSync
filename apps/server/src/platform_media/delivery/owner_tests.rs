@@ -264,6 +264,25 @@ async fn receipts(db: &PgPool, session: Uuid) -> (i64, i64) {
     (row.get("total"), row.get("reaped"))
 }
 
+// Observe actual existing typed events; never synthesize retry counts.
+fn fixture_ack_events(
+    request: &std::path::Path,
+    capture: &Arc<std::sync::Mutex<AckCaptureState>>,
+    execution: Uuid,
+) -> Vec<Value> {
+    let guard = capture.lock().expect("existing typed capture lock");
+    assert!(!guard.failed, "typed ACK observation remains complete");
+    std::fs::read_to_string(request.with_file_name("native-ack-observation.private.log"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("complete typed event line"))
+        .filter(|event| {
+            event["target"] == "native_delivery_ack"
+                && event["execution_id"] == execution.to_string()
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the owned native-delivery HTTP/PostgreSQL coordinator"]
 async fn native_delivery_owner_http_fixture() {
@@ -277,7 +296,7 @@ async fn native_delivery_owner_http_fixture() {
         .unwrap();
     assert!(request.starts_with(&artifacts));
     let capture_path = request.with_file_name("native-ack-observation.private.log");
-    let f: Fixture = serde_json::from_slice(&std::fs::read(request).unwrap()).unwrap();
+    let f: Fixture = serde_json::from_slice(&std::fs::read(&request).unwrap()).unwrap();
     let database = std::env::var("RAINSYNC_NATIVE_DELIVERY_TEST_DATABASE").unwrap();
     assert_eq!(
         reqwest::Url::parse(&database).unwrap().host_str(),
@@ -324,6 +343,7 @@ async fn native_delivery_owner_http_fixture() {
         .pool_max_idle_per_host(0)
         .build()
         .unwrap();
+    let fixture_request_path = request.clone();
     for case in &f.cases {
         assert_eq!(
             reqwest::Url::parse(&case.url).unwrap().host_str(),
@@ -422,7 +442,140 @@ async fn native_delivery_owner_http_fixture() {
                 .unwrap();
             assert_eq!(receipts(&db, case.session).await, (1, 0));
             assert!(!flags.response_dropped.load(Ordering::SeqCst));
-            if case.name == "receipt_failure" || case.name == "receipt_suppressed" {
+            if case.name == "finish_pool_timeout" || case.name == "finish_retry_eight" {
+                use futures_util::FutureExt;
+                let observer = persistence::connect(&database).await.unwrap();
+                let mut held = Vec::new();
+                let mut pids = Vec::new();
+                let mut body = Some(body);
+                let mut fault_attempted = false;
+                let mut execution = None;
+                let mut witness = json!({"case":case.name,"room":case.room,"session":case.session});
+                // Catch only this added test case; original nine assertions are untouched.
+                // Any panic is resumed only after explicit fixture fault/connection cleanup.
+                let run_result = std::panic::AssertUnwindSafe(async {
+                    let id: Uuid = sqlx::query_scalar("SELECT id FROM media_executions WHERE session_id=$1")
+                        .bind(case.session).fetch_one(&observer).await.unwrap();
+                    execution=Some(id);witness["execution"]=json!(id);
+                    assert!(fixture_ack_events(&fixture_request_path, &capture, id).is_empty());
+                    if case.name == "finish_pool_timeout" {
+                        until(|| async {body.as_ref().unwrap().receiver.len()==1 && flags.chunks.load(Ordering::SeqCst)==2},
+                            "real body backpressure before holding driver pool").await;
+                        tokio::time::timeout(Duration::from_secs(15), async {
+                            for _ in 0..12 {
+                                let mut connection=db.acquire().await.unwrap();
+                                // Put the connection into the externally retained vector before SQL can fail.
+                                let pid_result=sqlx::query_scalar::<_,i32>("SELECT pg_backend_pid()")
+                                    .fetch_one(&mut *connection).await;
+                                held.push(connection);pids.push(pid_result.unwrap());
+                            }
+                        }).await.expect("all twelve actual driver connections owned within existing witness bound");
+                        assert_eq!(db.size(),12);assert_eq!(db.num_idle(),0);
+                        let unique:std::collections::BTreeSet<_>=pids.iter().copied().collect();
+                        assert_eq!(unique.len(),12);assert!(pids.iter().all(|pid|*pid>0));
+                        assert!(!flags.response_dropped.load(Ordering::SeqCst),"source remains live before explicit body drop");
+                        assert!(fixture_ack_events(&fixture_request_path, &capture, id).is_empty());
+                        let actual:Value=sqlx::query_scalar("SELECT jsonb_agg(jsonb_build_object('pid',pid,'backend_start',backend_start,'state',state) ORDER BY pid) FROM pg_stat_activity WHERE pid=ANY($1)")
+                            .bind(&pids).fetch_one(&observer).await.unwrap();
+                        assert_eq!(actual.as_array().unwrap().len(),12);
+                        witness["held"]=json!({"connection_count":held.len(),"pool_size":db.size(),"pool_idle":db.num_idle(),"actual_backends":actual,"observed_at_epoch_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()});
+                        drop(body.take());
+                        until(|| async {flags.response_dropped.load(Ordering::SeqCst)},"positive raw response disposal before finish timeout").await;
+                        witness["response_disposed"]=json!({"observed":true,"observed_at_epoch_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()});
+                        until(|| async {fixture_ack_events(&fixture_request_path, &capture, id).iter().any(|e|e["level"]=="WARN" && e["failure"]=="timeout" && e["failed_calls"]==1)},
+                            "actual first finish CHECK timeout typed warning").await;
+                    } else {
+                        fault_attempted=true;
+                        sqlx::query(&format!("CREATE FUNCTION native_delivery_ack_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.session_id='{}' AND NEW.reaped_at IS NOT NULL THEN RAISE EXCEPTION 'owned_injected_ack_failure'; END IF; RETURN NEW; END $$",case.session)).execute(&observer).await.unwrap();
+                        sqlx::query("CREATE TRIGGER native_delivery_ack_failure BEFORE UPDATE ON media_executions FOR EACH ROW EXECUTE FUNCTION native_delivery_ack_failure()").execute(&observer).await.unwrap();
+                        drop(body.take());
+                        until(|| async {flags.response_dropped.load(Ordering::SeqCst)},"positive source disposal before retry witnesses").await;
+                        until(|| async {fixture_ack_events(&fixture_request_path, &capture, id).iter().any(|e|e["level"]=="WARN" && e["failed_calls"]==8)},"actual same-execution eighth failed ACK warning").await;
+                        let events=fixture_ack_events(&fixture_request_path, &capture, id);
+                        for count in [1,2,4,8] {assert!(events.iter().any(|e|e["level"]=="WARN" && e["failed_calls"]==count && e["failure"]=="ack_error"));}
+                    }
+                    let events=fixture_ack_events(&fixture_request_path, &capture, id);
+                    assert!(events.iter().all(|e|e["outcome"]!="recovered"));
+                    assert_eq!(receipts(&observer,case.session).await,(1,0));
+                    assert_eq!(app.native_delivery_owners.slots.available_permits(),LIMIT-1);
+                    witness["fault_observation"]=json!({"events":events,"receipt_reaped":false,"permit_retained":true});
+                }).catch_unwind().await;
+                // Cleanup runs after both success and caught first assertion failure.
+                let mut cleanup_errors = Vec::new();
+                if fault_attempted {
+                    for statement in [
+                        "DROP TRIGGER IF EXISTS native_delivery_ack_failure ON media_executions",
+                        "DROP FUNCTION IF EXISTS native_delivery_ack_failure()",
+                    ] {
+                        if let Err(error) = sqlx::query(statement).execute(&observer).await {
+                            cleanup_errors.push(format!("fixture_fault_release:{error}"));
+                        }
+                    }
+                    let remaining:std::result::Result<bool,sqlx::Error>=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgname='native_delivery_ack_failure') OR to_regprocedure('native_delivery_ack_failure()') IS NOT NULL")
+                        .fetch_one(&observer).await;
+                    match remaining {
+                        Ok(false) => witness["fault_released"] = json!(true),
+                        _ => cleanup_errors.push("fixture_fault_absence_unconfirmed".into()),
+                    }
+                }
+                drop(body.take());
+                let returned = held.len();
+                // Explicit awaited return releases actual Rust connection ownership; backend survival is normal.
+                for mut connection in held.drain(..) {
+                    connection.return_to_pool().await;
+                }
+                witness["connections_returned"] =
+                    json!({"count":returned,"held_vector_empty":held.is_empty()});
+                let recovery=std::panic::AssertUnwindSafe(async {
+                    if let Some(id)=execution {
+                        until(|| async {receipts(&observer,case.session).await==(1,1) && app.native_delivery_owners.slots.available_permits()==LIMIT},"same execution durable ACK and returned permit after cleanup").await;
+                        let events=fixture_ack_events(&fixture_request_path, &capture, id);
+                        if run_result.is_ok(){assert_eq!(events.iter().filter(|e|e["outcome"]=="recovered").count(),1);}
+                        witness["recovered_events"]=json!(events);
+                    }
+                    if returned==12 {
+                        until(|| async {db.num_idle()==12},"all twelve actual driver connections returned idle").await;
+                        let states:Value=sqlx::query_scalar("SELECT jsonb_agg(jsonb_build_object('pid',pid,'backend_start',backend_start,'state',state,'xact_start',xact_start) ORDER BY pid) FROM pg_stat_activity WHERE pid=ANY($1)")
+                            .bind(&pids).fetch_one(&observer).await.unwrap();
+                        assert_eq!(states.as_array().unwrap().len(),12);
+                        assert!(states.as_array().unwrap().iter().all(|row|row["state"]=="idle" && row["xact_start"].is_null()));
+                        let identity=|rows:&Value| rows.as_array().unwrap().iter().map(|row|(row["pid"].clone(),row["backend_start"].clone())).collect::<Vec<_>>();
+                        assert_eq!(identity(&states),identity(&witness["held"]["actual_backends"]));
+                        witness["returned_backends"]=json!({"pool_idle":db.num_idle(),"actual_backends":states});
+                    }
+                    close(&api,&f,case.room).await;
+                }).catch_unwind().await;
+                if recovery.is_err() {
+                    cleanup_errors.push("recovery_or_connection_return_observation_failed".into());
+                }
+                observer.close().await;
+                witness["observer_pool_closed"] = json!(observer.is_closed());
+                witness["cleanup_errors"] = json!(cleanup_errors);
+                witness["first_assertion_failed"] = json!(run_result.is_err());
+                let path = fixture_request_path
+                    .with_file_name(format!("{}.finish-witness.private.json", case.name));
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let written = options.open(path).and_then(|mut file| {
+                    use std::io::Write;
+                    file.write_all(serde_json::to_string(&witness).unwrap().as_bytes())?;
+                    file.sync_all()
+                });
+                // Preserve original panic as first failure after recording cleanup outcome.
+                if let Err(first) = run_result {
+                    std::panic::resume_unwind(first);
+                }
+                assert!(written.is_ok(), "private cleanup witness write confirmed");
+                assert!(
+                    cleanup_errors.is_empty(),
+                    "added finish fixture cleanup must be positive"
+                );
+            } else if case.name == "receipt_failure" || case.name == "receipt_suppressed" {
                 let failure = if case.name == "receipt_suppressed" {
                     "RETURN NULL;"
                 } else {
