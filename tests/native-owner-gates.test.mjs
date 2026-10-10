@@ -162,6 +162,14 @@ test("CI keeps owner/cleanup gates mandatory and retains only safe summaries", a
     assert.match(step, /if: \$\{\{ !cancelled\(\) && steps\.binding\.outcome == 'success' \}\}/,
       "Independent gates must run after another gate fails, but never with an unbound backend");
   }
+  assert.ok(ownerJob.includes('run: npm ci'), 'Native WS fixtures require locked Node dependencies');
+  for (const name of ['nas-index-session-native','cluster-route-resolution-native','cluster-peer-lifetime-native','cluster-start-lifecycle-native','app-startup-settings-native']) {
+    const step=ownerJob.split(/(?=      - name:)/).find(text=>text.includes(`node tests/${name}.mjs`));
+    assert.ok(step, `Owned operation baseline must remain mandatory: ${name}`);
+    assert.match(step, /if: \$\{\{ !cancelled\(\) && steps\.binding\.outcome == 'success' \}\}/);
+    assert.match(step, /timeout --signal=TERM --kill-after=45s 240s/);
+  }
+  assert.doesNotMatch(ownerJob, /node tests\/room-p2p-server-native\.mjs|--diagnose-after-known-payload-boundary|--observe-transaction-repair/);
   assert.doesNotMatch(ownerJob, /continue-on-error|paths-ignore|if-no-files-found: ignore/);
   assert.match(ownerJob, /if: always\(\)/);
   assert.match(ownerJob, /owner-gates\/\*\*\/report\.json/);

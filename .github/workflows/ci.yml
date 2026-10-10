@@ -238,6 +238,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: Install locked Node fixture dependencies
+        run: npm ci
       - name: Verify owner gate orchestration contracts
         run: npm run test:owner-gate-contracts
       - name: Prepare owned native PostgreSQL prerequisites
@@ -278,6 +280,26 @@ jobs:
         if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
         timeout-minutes: 5
         run: timeout --signal=TERM --kill-after=45s 240s npm run test:room-command-transactions
+      - name: Verify actual NAS multi-page INDEX and ACK session lifecycle
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/nas-index-session-native.mjs
+      - name: Verify original cluster route and cache authority boundaries
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/cluster-route-resolution-native.mjs
+      - name: Verify actual cluster peer relay lifetime
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/cluster-peer-lifetime-native.mjs
+      - name: Verify actual cluster registration heartbeat and fencing lifetime
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/cluster-start-lifecycle-native.mjs
+      - name: Verify actual Server startup settings and failure order
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/app-startup-settings-native.mjs
       - name: Retain sanitized owner, transaction and source-commit evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -289,6 +311,12 @@ jobs:
             ${{ runner.temp }}/rainsync-owner-validation/artifacts/**/fixture-cleanup.json
             ${{ runner.temp }}/rainsync-owner-validation/artifacts/source-change-commit/**/report.json
             ${{ runner.temp }}/rainsync-owner-validation/artifacts/compute-retention-native-*/evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/nas-index-native-*/evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/nas-index-failure-*/evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/cluster-route-resolution-native-*/evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/cluster-peer-lifetime-native-*/evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/cluster-start-lifecycle-native-*/evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/app-startup-*/*/startup-evidence.json
             ${{ runner.temp }}/rainsync-owner-validation/runtime/**/backend-binding.json
           if-no-files-found: warn
           retention-days: 7
