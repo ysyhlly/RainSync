@@ -155,6 +155,18 @@ pub async fn signal(
         return Err(err(StatusCode::BAD_REQUEST, "invalid_p2p_signal"));
     }
     let mut tx = app.db.begin().await?;
+    // Same room lock/order as join; serialize sender count and insertion.
+    // This lookup is a hint. The original final INSERT rechecks authority.
+    let room: Uuid = sqlx::query_scalar("SELECT room_id FROM room_p2p_peers WHERE id=$1")
+        .bind(peer)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "p2p_peer_expired"))?;
+    sqlx::query("SELECT id FROM rooms WHERE id=$1 FOR NO KEY UPDATE")
+        .bind(room)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "p2p_peer_expired"))?;
     let count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM room_p2p_signals WHERE sender=$1 AND expires_at>clock_timestamp()",
     )
@@ -205,9 +217,22 @@ pub async fn poll(
     Path(peer): Path<Uuid>,
     Query(cursor): Query<Cursor>,
 ) -> Result<Json<Value>> {
-    owner(&app, &h, peer, false).await?;
+    let user = owner(&app, &h, peer, false).await?;
+    let login = crate::media_authorization::login_hash(&h)?;
     let mut candidates = cursor.connected_peers()?;
     let mut tx = app.db.begin().await?;
+    // Acquire without authorization predicates: a row-lock wait may cross expiry.
+    sqlx::query("SELECT id FROM room_p2p_peers WHERE id=$1 FOR UPDATE")
+        .bind(peer)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "p2p_peer_expired"))?;
+    // A separate statement observes the current clock and exact login after waiting.
+    let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM room_p2p_peers WHERE id=$1 AND user_id=$2 AND login_hash=$3 AND expires_at>clock_timestamp() AND room_p2p_peer_authorized(id))")
+        .bind(peer).bind(user.id).bind(&login).fetch_one(&mut *tx).await?;
+    if !valid {
+        return Err(err(StatusCode::NOT_FOUND, "p2p_peer_expired"));
+    }
     // Every renewal rechecks the old expiry first. Expired tickets cannot resurrect.
     let n=sqlx::query("UPDATE room_p2p_peers SET expires_at=clock_timestamp()+interval '30 seconds' WHERE id=$1 AND room_p2p_peer_authorized(id)").bind(peer).execute(&mut *tx).await?.rows_affected();
     if n != 1 {
