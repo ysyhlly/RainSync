@@ -1143,7 +1143,7 @@ async fn socket_inner(
                             Ok(result)=>result,
                             Err(reason)=>{reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;if reason=="not_a_member" {break};continue},
                         };
-                        let identity=match profile::value(&app,user.id).await{Ok(value)=>value,Err(_)=>{reject_with_presence(&mut out, "database_error", presence_lease.as_ref()).await;break}};
+                        let identity=match identity::profiles::value(&app.db,user.id).await{Ok(value)=>value,Err(_)=>{reject_with_presence(&mut out, "database_error", presence_lease.as_ref()).await;break}};
                         let reply=json!({"type":"CHAT","id":cid,"created_at":created_at,"user_id":user.id,"username":identity["username"],"display_name":identity["display_name"],"avatar_url":identity["avatar_url"],"avatar_version":identity["avatar_version"],"body":if deleted{""}else{body},"deleted":deleted,"client_message_id":client_message_id});
                         if replayed {
                             if let Err(reason)=socket_access(&app,id,user.id,&session_hash).await {reject_with_presence(&mut out, reason, presence_lease.as_ref()).await;break};

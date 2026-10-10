@@ -261,7 +261,7 @@ async fn login(
 }
 async fn me(State(app): State<App>, h: HeaderMap) -> Result<Response> {
     let u = auth_viewer(&app, &h, false).await?;
-    let mut value = profile::value(&app, u.id).await?;
+    let mut value = identity::profiles::value(&app.db, u.id).await?;
     let csrf: String = sqlx::query_scalar("SELECT csrf FROM sessions WHERE token_hash=$1")
         .bind(hash(&cookie(&h).unwrap()))
         .fetch_one(&app.db)
