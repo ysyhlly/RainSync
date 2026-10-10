@@ -1,5 +1,6 @@
 //! Policy-gated, fenced NAS-local jobs. The ordinary Agent token never grants compute by itself.
 mod admission_policy;
+mod retention;
 
 use super::*;
 use admission_policy::{AdmissionError, MAX_SOURCE_BYTES, budget_fits, valid_capabilities};
@@ -1081,56 +1082,11 @@ mod tests {
 /// Call from the existing single-owner maintenance loop; filesystem errors remain visible.
 pub async fn cleanup(app: &App) -> anyhow::Result<()> {
     let Ok(root) = enabled() else { return Ok(()) };
-    sqlx::query("UPDATE distributed_compute_jobs SET status='cancelled',error='compute_authority_lost' WHERE status IN('queued','running','ready') AND NOT distributed_compute_authorized(id)").execute(&app.db).await?;
-    // Short-lived signaling must not depend on filesystem/history cleanup.
-    sqlx::query("DELETE FROM room_p2p_signals WHERE expires_at<=clock_timestamp()")
-        .execute(&app.db)
-        .await?;
-    sqlx::query("DELETE FROM room_p2p_peers WHERE expires_at<=clock_timestamp() OR NOT room_p2p_peer_authorized(id)").execute(&app.db).await?;
-    let mut directories = match tokio::fs::read_dir(&root).await {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    while let Some(job) = directories.next_entry().await? {
-        let Some(id) = job
-            .file_name()
-            .to_str()
-            .and_then(|s| Uuid::parse_str(s).ok())
-        else {
-            continue;
-        };
-        if !job.file_type().await?.is_dir() {
-            continue;
-        }
-        let keep:Option<Uuid>=sqlx::query_scalar("SELECT output_generation FROM distributed_compute_jobs WHERE id=$1 AND expires_at>clock_timestamp() AND status IN('running','ready')").bind(id).fetch_optional(&app.db).await?.flatten();
-        let mut generations = tokio::fs::read_dir(job.path()).await?;
-        while let Some(generation) = generations.next_entry().await? {
-            let Some(g) = generation
-                .file_name()
-                .to_str()
-                .and_then(|s| Uuid::parse_str(s).ok())
-            else {
-                continue;
-            };
-            if Some(g) != keep && generation.file_type().await?.is_dir() {
-                tokio::fs::remove_dir_all(generation.path()).await?;
-                sqlx::query("DELETE FROM distributed_compute_files WHERE job_id=$1 AND output_generation=$2").bind(id).bind(g).execute(&app.db).await?;
-            }
-        }
-        if keep.is_none() {
-            let _ = tokio::fs::remove_dir(job.path()).await;
-        }
-    }
-    sqlx::query("DELETE FROM distributed_compute_attempts a USING distributed_compute_jobs j WHERE a.job_id=j.id AND j.expires_at<clock_timestamp()-interval '48 hours' AND a.process_reaped_at IS NOT NULL AND a.files_removed_at IS NOT NULL AND (a.server_verification_started_at IS NULL OR a.server_verification_reaped_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM room_cleanup_tasks c WHERE c.room_id=a.room_id AND c.completed_at IS NULL)").execute(&app.db).await?;
-    // Playback bindings are immutable retained session history. Keep their job
-    // rather than cascading away evidence or repeatedly failing the whole batch.
-    sqlx::query(
-        "DELETE FROM distributed_compute_jobs j WHERE expires_at<clock_timestamp()-interval '1 hour' AND NOT EXISTS(SELECT 1 FROM distributed_compute_attempts a WHERE a.job_id=j.id) AND NOT EXISTS(SELECT 1 FROM distributed_playback_bindings b WHERE b.job_id=j.id)",
-    )
-    .execute(&app.db)
-    .await?;
-    Ok(())
+    retention::sweep(retention::Context {
+        db: &app.db,
+        root: &root,
+    })
+    .await
 }
 
 #[derive(Deserialize)]

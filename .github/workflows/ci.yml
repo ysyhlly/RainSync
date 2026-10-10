@@ -262,6 +262,10 @@ jobs:
         if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
         timeout-minutes: 5
         run: timeout --signal=TERM --kill-after=45s 240s npm run test:native-delivery-owner
+      - name: Verify full compute retention sweep with owned database and files
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s npm run test:distributed-compute-retention-native
       - name: Verify native room cleanup and late owner receipts
         if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
         timeout-minutes: 5
@@ -284,6 +288,7 @@ jobs:
             ${{ runner.temp }}/rainsync-owner-validation/artifacts/owner-gates/**/report.json
             ${{ runner.temp }}/rainsync-owner-validation/artifacts/**/fixture-cleanup.json
             ${{ runner.temp }}/rainsync-owner-validation/artifacts/source-change-commit/**/report.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/compute-retention-native-*/evidence.json
             ${{ runner.temp }}/rainsync-owner-validation/runtime/**/backend-binding.json
           if-no-files-found: warn
           retention-days: 7

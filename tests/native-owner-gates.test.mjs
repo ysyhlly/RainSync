@@ -155,9 +155,9 @@ test("CI keeps owner/cleanup gates mandatory and retains only safe summaries", a
   for (const name of ["RAINSYNC_ARTIFACT_DIR", "RAINSYNC_RUNTIME_ROOT", "CARGO_TARGET_DIR"])
     assert.ok(ownerJob.includes(`echo "${name}=$RUNNER_TEMP/`),
       "Runner-local output paths must be assigned by a step through GITHUB_ENV");
-  for (const command of ["--owner-fixtures", "test:native-delivery-owner", "test:room-cleanup-native", "test:room-command-transactions", "test:owner-gate-contracts"])
+  for (const command of ["--owner-fixtures", "test:native-delivery-owner", "test:distributed-compute-retention-native", "test:room-cleanup-native", "test:room-command-transactions", "test:owner-gate-contracts"])
     assert.ok(ownerJob.includes(command), command);
-  for (const gate of ["test:native-delivery-owner", "test:room-cleanup-native", "test:room-command-transactions"]) {
+  for (const gate of ["test:native-delivery-owner", "test:distributed-compute-retention-native", "test:room-cleanup-native", "test:room-command-transactions"]) {
     const step = ownerJob.split(/(?=      - name:)/).find((text) => text.includes(`npm run ${gate}`));
     assert.match(step, /if: \$\{\{ !cancelled\(\) && steps\.binding\.outcome == 'success' \}\}/,
       "Independent gates must run after another gate fails, but never with an unbound backend");
@@ -165,6 +165,7 @@ test("CI keeps owner/cleanup gates mandatory and retains only safe summaries", a
   assert.doesNotMatch(ownerJob, /continue-on-error|paths-ignore|if-no-files-found: ignore/);
   assert.match(ownerJob, /if: always\(\)/);
   assert.match(ownerJob, /owner-gates\/\*\*\/report\.json/);
+  assert.match(ownerJob, /artifacts\/compute-retention-native-\*\/evidence\.json/);
   assert.doesNotMatch(ownerJob, /path:.*(?:\.log|request\.json)/);
   assert.ok(workflow.includes("npm run test:lifecycle-capabilities"));
   assert.ok(workflow.includes("npm run test:parallel-integration"));
