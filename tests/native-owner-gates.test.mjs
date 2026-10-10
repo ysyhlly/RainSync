@@ -170,6 +170,14 @@ test("CI keeps owner/cleanup gates mandatory and retains only safe summaries", a
     assert.match(step, /timeout --signal=TERM --kill-after=45s 240s/);
   }
   assert.doesNotMatch(ownerJob, /node tests\/room-p2p-server-native\.mjs|--diagnose-after-known-payload-boundary|--observe-transaction-repair/);
+  const placementStep=ownerJob.split(/(?=      - name:)/).find(text=>text.includes('node tests/distributed-compute-placement-native.mjs'));
+  assert.ok(placementStep, 'Complete placement normal12 gate must remain mandatory');
+  assert.match(placementStep, /if: \$\{\{ !cancelled\(\) && steps\.binding\.outcome == 'success' \}\}/);
+  assert.match(placementStep, /timeout-minutes: 7/);
+  assert.match(placementStep, /timeout --signal=TERM --kill-after=45s 360s node tests\/distributed-compute-placement-native\.mjs\s*$/);
+  assert.doesNotMatch(ownerJob, /--observe-stale-heartbeat-wait/);
+  assert.ok(ownerJob.includes('artifacts/compute-placement-*/*/evidence.json'));
+  assert.ok(ownerJob.includes('artifacts/compute-placement-coordinator-*.json'));
   assert.doesNotMatch(ownerJob, /continue-on-error|paths-ignore|if-no-files-found: ignore/);
   assert.match(ownerJob, /if: always\(\)/);
   assert.match(ownerJob, /owner-gates\/\*\*\/report\.json/);
