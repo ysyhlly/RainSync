@@ -6,7 +6,8 @@ import * as fs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { assertBindingsUnchanged, bindingSourceFiles, captureBindings, collectReceipts, coherentVersions, createInvocation,
   gateNames, inspectReceipt, leaves, nativeArgs, observeNativePair, orchestrate, parseGateResults, pgTools,
@@ -489,4 +490,61 @@ test('full binding accepts recognized dispatcher while binding its ELF dependenc
     if (program === resolve(f.bin, 'ldd') && args[0] === await fs.realpath('/usr/bin/perl')) throw Error('owned interpreter dependency failure');
     return run(program, args);
   }));
+});
+
+// Actual child-process capture contracts. The retained TAP is test input, not a native PG run.
+for (const exitCode of [0, 7]) test(`private invocation retains actual child output and exit ${exitCode}`, async t => {
+  const runtime = await owned(t), stderr = 'owned private stderr\n';
+  let executionError;
+  const run = async () => {
+    try { return await promisify(execFile)(process.execPath,
+      ['-e', 'process.stdout.write(process.argv[1]); process.stderr.write(process.argv[2]); process.exit(Number(process.argv[3]));', actualTap, stderr, String(exitCode)],
+      { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: 3000 }); }
+    catch (error) { executionError = error; throw error; }
+  };
+  const invocation = observeNativePair({ timeout: '/owned/timeout', node: process.execPath, root: repo, env: {}, runtime }, run);
+  if (exitCode) await assert.rejects(invocation, error => error === executionError);
+  else assert.equal((await invocation).counts.pass, 8);
+  const directory = resolve(runtime, 'native-invoke-private');
+  assert.equal(await fs.readFile(resolve(directory, 'stdout.log'), 'utf8'), actualTap);
+  assert.equal(await fs.readFile(resolve(directory, 'stderr.log'), 'utf8'), stderr);
+  const receipt = JSON.parse(await fs.readFile(resolve(directory, 'receipt.json'), 'utf8'));
+  assert.equal(receipt.exit_code, exitCode); assert.equal(receipt.complete, exitCode === 0);
+  assert.equal(receipt.stdout_bytes, Buffer.byteLength(actualTap));
+  assert.doesNotMatch(JSON.stringify(receipt), /private stderr|"message"|"stack"|"env"|"args"/);
+  assert.equal((await fs.stat(directory)).mode & 0o777, 0o700);
+  for (const name of ['stdout.log', 'stderr.log', 'receipt.json']) assert.equal((await fs.stat(resolve(directory, name))).mode & 0o777, 0o600);
+});
+test('private log write failure cannot hide an original execution failure', async t => {
+  const runtime = await owned(t), original = Object.assign(Error('PRIVATE_EXCEPTION_SENTINEL'), { code: 7, stdout: 'partial', stderr: 'partial' });
+  await fs.mkdir(resolve(runtime, 'native-invoke-private'));
+  await assert.rejects(observeNativePair({ timeout: '/owned/timeout', node: process.execPath, root: repo, env: {}, runtime }, async () => { throw original; }),
+    error => error instanceof AggregateError && error.errors[0] === original);
+});
+test('private evidence write failure rejects an otherwise successful invocation', async t => {
+  const runtime = await owned(t);
+  await fs.mkdir(resolve(runtime, 'native-invoke-private'));
+  await assert.rejects(observeNativePair({ timeout: '/owned/timeout', node: process.execPath, root: repo, env: {}, runtime },
+    async () => ({ stdout: actualTap, stderr: '' })), { code: 'EEXIST' });
+});
+
+test('private invocation preserves every falsy rejection value', async t => {
+  for (const original of [null, undefined, false, 0, '']) {
+    const runtime = await owned(t);
+    let caught = false;
+    try {
+      await observeNativePair({ timeout: '/owned/timeout', node: process.execPath, root: repo, env: {}, runtime },
+        async () => { throw original; });
+    } catch (error) { caught = true; assert.equal(error, original); }
+    assert.equal(caught, true);
+    const receipt = JSON.parse(await fs.readFile(resolve(runtime, 'native-invoke-private/receipt.json'), 'utf8'));
+    assert.equal(receipt.execution, 'failed'); assert.equal(receipt.complete, false);
+    assert.equal(receipt.exit_code, null);
+    assert.equal(receipt.stdout_available, false); assert.equal(receipt.stderr_available, false);
+    const blockedRuntime = await owned(t);
+    await fs.mkdir(resolve(blockedRuntime, 'native-invoke-private'));
+    await assert.rejects(observeNativePair({ timeout: '/owned/timeout', node: process.execPath,
+      root: repo, env: {}, runtime: blockedRuntime }, async () => { throw original; }),
+      error => error instanceof AggregateError && error.errors[0] === original);
+  }
 });

@@ -356,10 +356,47 @@ export async function orchestrate(operations) {
   return report;
 }
 
-export async function observeNativePair({ timeout, node, root, env }, run = execute) {
-  const result = await run(timeout, nativeArgs(node), {
-    cwd: root, env, timeout: 197000, maxBuffer: 4 * 1024 * 1024, encoding: 'utf8',
-  });
+export async function observeNativePair({ timeout, node, root, env, runtime }, run = execute) {
+  let result, executionFailure, executionFailed = false;
+  try {
+    result = await run(timeout, nativeArgs(node), {
+      cwd: root, env, timeout: 197000, maxBuffer: 4 * 1024 * 1024, encoding: 'utf8',
+    });
+  } catch (error) { executionFailed = true; executionFailure = error; }
+  if (runtime) {
+    try {
+      // Private runtime evidence only: no exception message/stack, arguments or environment
+      // enter the receipt or safe CI exports. execFile can return partial output on failure.
+      const directory = resolve(runtime, 'native-invoke-private');
+      await fs.mkdir(directory, { mode: 0o700 });
+      const captured = executionFailed ? executionFailure : result;
+      const stdout = typeof captured?.stdout === 'string' ? captured.stdout : '';
+      const stderr = typeof captured?.stderr === 'string' ? captured.stderr : '';
+      const receipt = {
+        schema_version: 1, execution: executionFailed ? 'failed' : 'completed',
+        exit_code: executionFailed ? (Number.isInteger(executionFailure?.code) ? executionFailure.code : null) : 0,
+        signal: ['SIGINT', 'SIGTERM', 'SIGKILL'].includes(executionFailure?.signal) ? executionFailure.signal : null,
+        killed: executionFailure?.killed === true,
+        stdout_available: typeof captured?.stdout === 'string', stderr_available: typeof captured?.stderr === 'string',
+        stdout_bytes: Buffer.byteLength(stdout), stderr_bytes: Buffer.byteLength(stderr),
+        stdout_sha256: sha(stdout), stderr_sha256: sha(stderr),
+        timeout_ms: 197000, max_buffer_bytes: 4 * 1024 * 1024,
+        complete: !executionFailed,
+        completeness: executionFailed ? 'unconfirmed_exec_failure_may_include_timeout_or_buffer_limit' : 'captured_completed_exec_output',
+      };
+      const writes = await Promise.allSettled([
+        fs.writeFile(resolve(directory, 'stdout.log'), stdout, { flag: 'wx', mode: 0o600 }),
+        fs.writeFile(resolve(directory, 'stderr.log'), stderr, { flag: 'wx', mode: 0o600 }),
+        fs.writeFile(resolve(directory, 'receipt.json'), JSON.stringify(receipt, null, 2) + '\n', { flag: 'wx', mode: 0o600 }),
+      ]);
+      const failed = writes.filter(value => value.status === 'rejected').map(value => value.reason);
+      if (failed.length) throw new AggregateError(failed, 'private_invocation_evidence_write_failed');
+    } catch (error) {
+      if (executionFailed) throw new AggregateError([executionFailure, error], 'native_invocation_and_evidence_failed');
+      throw error;
+    }
+  }
+  if (executionFailed) throw executionFailure;
   return parseGateResults(result.stdout);
 }
 
@@ -384,7 +421,7 @@ export async function runUpgradeRecovery({ root = repository, env = process.env 
       report.published_baseline = publishedBaseline;
     },
     async invoke(report) {
-      report.gates = await observeNativePair({ timeout: binding.selected.timeout, node: binding.selected.node, root, env: clean });
+      report.gates = await observeNativePair({ timeout: binding.selected.timeout, node: binding.selected.node, root, env: clean, runtime: paths.runtime });
     },
     async receipts(report) {
       const receipt = await collectReceipts(paths.receipts, binding.source); receiptExports = receipt.exports;
