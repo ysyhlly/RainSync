@@ -587,7 +587,7 @@ pub async fn maintenance(app: App) {
         if private_library::retire_maintenance(&app.db).await.is_err() {
             tracing::warn!("library retirement deferred to maintenance");
         }
-        if source_access::retire(&app.db).await.is_err()
+        if catalog::access_policy::retire(&app.db).await.is_err()
             || ledger::reconcile(&app.db, app.epoch).await.is_err()
         {
             tracing::warn!("upstream reconciliation failed");

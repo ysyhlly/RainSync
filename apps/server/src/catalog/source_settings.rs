@@ -1,8 +1,9 @@
 //! In-place source settings own the original caller-first transaction. Keep
 //! this local administrator policy distinct from administrative settings admission.
+use super::access_policy::CommittedSourceChange;
 use super::source_rules::*;
 use super::*;
-use crate::{media_authorization, source_access};
+use crate::media_authorization;
 use serde_json::Map;
 
 #[derive(Deserialize)]
@@ -60,7 +61,7 @@ pub(crate) async fn change(
     h: &HeaderMap,
     id: Uuid,
     body: Change,
-) -> Result<source_access::CommittedSourceChange> {
+) -> Result<CommittedSourceChange> {
     let expected = revision(&body.expected_revision)?;
     let mut tx = context.db.begin().await?;
     lock_admin(&mut tx, user, h).await?;
@@ -131,6 +132,6 @@ pub(crate) async fn change(
     value["rescan_required"] = json!(config_changed);
     lock_admin(&mut tx, user, h).await?;
     tx.commit().await?;
-    let committed = source_access::CommittedSourceChange::new(id, value, config_changed);
+    let committed = CommittedSourceChange::new(id, value, config_changed);
     Ok(committed)
 }
