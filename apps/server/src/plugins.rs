@@ -51,7 +51,7 @@ fn installed(row: &sqlx::postgres::PgRow) -> Value {
     json!({"id":row.get::<String,_>("id"),"version":row.get::<String,_>("version"),"enabled":row.get::<bool,_>("enabled"),"config":row.get::<Value,_>("config"),"granted_permissions":row.get::<Value,_>("granted_permissions"),"revision":row.get::<i64,_>("revision").to_string(),"artifact_digest":row.get::<String,_>("artifact_digest"),"can_rollback":row.get::<Option<Value>,_>("previous_state").is_some()})
 }
 pub async fn catalog(State(app): State<App>, h: HeaderMap) -> Result<Response> {
-    let user = auth(&app, &h, false).await?;
+    let user = identity::request::authenticate(app.identity_context(), &h, false, false).await?;
     admin(&user)?;
     let rows = sqlx::query("SELECT * FROM rainsync_plugins ORDER BY id")
         .fetch_all(&app.db)
@@ -125,7 +125,7 @@ pub async fn configure(
         ));
     }
     let expected = revision(&body.expected_revision)?;
-    let user = auth(&app, &h, true).await?;
+    let user = identity::request::authenticate(app.identity_context(), &h, true, false).await?;
     admin(&user)?;
     let mut tx = app.db.begin().await?;
     sqlx::query("SET LOCAL statement_timeout='3s'")
@@ -202,7 +202,7 @@ pub async fn remove(
         return Err(err(StatusCode::NOT_FOUND, "plugin_not_found"));
     }
     let expected = revision(&body.expected_revision)?;
-    let user = auth(&app, &h, true).await?;
+    let user = identity::request::authenticate(app.identity_context(), &h, true, false).await?;
     admin(&user)?;
     let mut tx = app.db.begin().await?;
     sqlx::query("SET LOCAL statement_timeout='3s'")
@@ -248,7 +248,7 @@ pub async fn rollback(
         return Err(err(StatusCode::NOT_FOUND, "plugin_not_found"));
     }
     let expected = revision(&body.expected_revision)?;
-    let user = auth(&app, &h, true).await?;
+    let user = identity::request::authenticate(app.identity_context(), &h, true, false).await?;
     admin(&user)?;
     let mut tx = app.db.begin().await?;
     sqlx::query("SET LOCAL statement_timeout='3s'")
@@ -325,7 +325,7 @@ pub async fn metadata(
     h: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Response> {
-    let user = auth(&app, &h, false).await?;
+    let user = identity::request::authenticate(app.identity_context(), &h, false, false).await?;
     // Existing authoritative catalog visibility/ACL remains the only media grant.
     let media = media_titles::read(&app, user.id, id).await?;
     let rows=sqlx::query("SELECT id,version,config,granted_permissions,revision FROM rainsync_plugins WHERE enabled AND NOT removed ORDER BY id LIMIT 2").fetch_all(&app.db).await?;
@@ -355,7 +355,7 @@ pub async fn metadata(
     ))
 }
 pub async fn audit(State(app): State<App>, h: HeaderMap) -> Result<Response> {
-    let user = auth(&app, &h, false).await?;
+    let user = identity::request::authenticate(app.identity_context(), &h, false, false).await?;
     admin(&user)?;
     let rows=sqlx::query("SELECT id,plugin_id,revision,action,artifact_digest,floor(extract(epoch FROM created_at)*1000)::bigint AS at_ms FROM rainsync_plugin_audit ORDER BY created_at DESC,id DESC LIMIT 100").fetch_all(&app.db).await?;
     Ok(responses::ok_json(
