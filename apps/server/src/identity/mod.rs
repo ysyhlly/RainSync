@@ -1,5 +1,6 @@
 //! Request snapshots and caller-first transaction admission have separate lifetimes.
 //! Room-first playback authorization stays in media_authorization and persistence.
+pub(crate) mod account_exit;
 pub(crate) mod admin;
 pub(crate) mod profiles;
 pub(crate) mod request;

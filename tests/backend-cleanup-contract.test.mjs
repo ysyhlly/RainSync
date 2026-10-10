@@ -84,14 +84,14 @@ test("password verification callers retain their distinct worker-failure mapping
     "PasswordHash::new",
     "verify_password",
   ]);
-  const retirement = source("account_exit");
+  const retirement = source("identity/account_exit");
   inOrder(retirement, [
     "let expected = stored.clone()",
     "password_verification_worker(",
     ".await",
     ".unwrap_or(false)",
     'StatusCode::UNAUTHORIZED, "invalid_credentials"',
-    "let mut tx = app.db.begin()",
+    "let mut tx = db.begin()",
     'current.get::<String, _>("password_hash") != expected',
   ]);
 });

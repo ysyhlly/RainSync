@@ -70,7 +70,7 @@ jobs:
           timeout --signal=TERM --kill-after=15s 180s node tests/distributed-compute-retention.mjs
           timeout --signal=TERM --kill-after=15s 600s node tests/distributed-compute-hd.mjs
           # Settings and hierarchy use owned databases and synthetic records only.
-          for test in admin-settings scoped-guests-migration scoped-guests profile-identity-native source-settings plugin-configuration-migration plugin-configuration-runtime nas-configuration-settings media-title-authority-native media-hierarchy-migration media-hierarchy-native private-library-lifecycle-migration private-library-settings-native private-library-expiry-native; do
+          for test in admin-settings scoped-guests-migration scoped-guests profile-identity-native account-exit-authority-native source-settings plugin-configuration-migration plugin-configuration-runtime nas-configuration-settings media-title-authority-native media-hierarchy-migration media-hierarchy-native private-library-lifecycle-migration private-library-settings-native private-library-expiry-native; do
             timeout --signal=TERM --kill-after=15s 180s node "tests/$test.mjs"
           done
       - name: Verify two-node control routing
