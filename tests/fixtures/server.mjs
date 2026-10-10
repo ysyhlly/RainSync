@@ -219,8 +219,11 @@ export async function isolatedServer(name, run, options = {}) {
       options.signal?.throwIfAborted();
       await fixture.stopServer();
       options.signal?.throwIfAborted();
-      const log = createWriteStream(resolve(root, `server-${++launches}.log`));
+      const logPath = resolve(root, `server-${++launches}.log`);
+      const log = createWriteStream(logPath);
       streams.push(log);
+      // Optional test evidence observer sees events from creation, including startup failure.
+      options.observeServerLog?.(log, logPath);
       server = spawn(binary, [], {
         env: { ...fixture.env, ...extra },
         windowsHide: true,

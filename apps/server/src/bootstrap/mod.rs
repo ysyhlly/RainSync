@@ -1,4 +1,5 @@
 //! Server composition root: offline commands, runtimes, database startup and owners.
+mod app_assembly;
 mod config;
 mod lifecycle;
 mod routes;
@@ -205,41 +206,15 @@ async fn run(lost: tokio::sync::oneshot::Sender<()>) -> anyhow::Result<()> {
             }
         });
     }
-    let app = App {
-        control_cluster: control_cluster.clone(),
-        platform_http: providers::platform::http::PlatformHttp::new(),
-        bilibili_signing_keys: Arc::new(Default::default()),
-        native_delivery_owners: Arc::new(Default::default()),
-        youtube: native_platform_config::configured_youtube()?,
-        live_playback: native_live::LiveStore::default(),
-        other_live_playback: native_other_live::LiveStore::default(),
-        other_live_enabled: native_platform_config::configured_other_live()?,
-        platform_oauth: Arc::new(
-            providers::platform::oauth::Registry::from_env(&public_origin)
-                .map_err(|_| anyhow::anyhow!("invalid platform OAuth configuration"))?,
-        ),
-        platform_oauth_exchanges: Arc::new(platform_accounts::exchanges::Registry::new()),
-        native_transcode_delivery: Arc::new(Default::default()),
-        presence_sequence: presence::Sequence::default(),
-        account_security: account_security::Security::configured()?,
-        avatar_settings: avatar_image::Settings::configured()?,
-        session_limit: limits::configured("PLAYBACK_SESSION_LIMIT", limits::DEFAULT_SESSION_LIMIT)?,
-        queue_limit: limits::configured("MEDIA_QUEUE_LIMIT", limits::DEFAULT_QUEUE_LIMIT)?,
-        preview_settings: persistence::media_previews::Settings::configured()?,
-        metrics: Default::default(),
-        readiness: readiness.clone(),
-        db: db.clone(),
-        secure: public_origin.starts_with("https://"),
-        origin: public_origin,
-        key: Arc::new(cipher),
+    let app = app_assembly::assemble(app_assembly::Context {
+        db: &db,
+        readiness: &readiness,
+        control_cluster: &control_cluster,
+        public_origin,
+        cipher,
         epoch,
         start,
-        rooms: Default::default(),
-        agent_controls: Default::default(),
-        upstream: Default::default(),
-        upstream_policy: Default::default(),
-        preparations: Default::default(),
-    };
+    })?;
     // Retire previous-process grants before same-key recovery. The instance
     // lock fences new valid publication; it is not positive physical drain
     // proof. Unknown preparation/resource receipts remain unconfirmed.
