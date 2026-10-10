@@ -327,7 +327,7 @@ pub async fn metadata(
 ) -> Result<Response> {
     let user = identity::request::authenticate(app.identity_context(), &h, false, false).await?;
     // Existing authoritative catalog visibility/ACL remains the only media grant.
-    let media = media_titles::read(&app, user.id, id).await?;
+    let media = catalog::media_reads::read(&app.db, user.id, id).await?;
     let rows=sqlx::query("SELECT id,version,config,granted_permissions,revision FROM rainsync_plugins WHERE enabled AND NOT removed ORDER BY id LIMIT 2").fetch_all(&app.db).await?;
     let mut output = Vec::new();
     for row in rows {
@@ -346,7 +346,7 @@ pub async fn metadata(
     }
     // A late ACL/source change during the installed-plugin lookup cannot reuse
     // the first authorized metadata snapshot. There is no per-user metadata cache.
-    let latest = media_titles::read(&app, user.id, id).await?;
+    let latest = catalog::media_reads::read(&app.db, user.id, id).await?;
     if latest != media {
         return Err(err(StatusCode::CONFLICT, "plugin_media_changed"));
     }

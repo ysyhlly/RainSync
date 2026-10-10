@@ -1,10 +1,10 @@
 //! Personal/shared title mutation with its original caller-first transaction.
 use super::media_projection::{BROWSE, SELECT, VISIBLE, media};
-use crate::{Result, User, err, media_authorization};
+use crate::{Result, err, identity, media_authorization};
 use axum::http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -50,13 +50,17 @@ fn validate(value: Value) -> Result<(Option<String>, i64)> {
 }
 
 pub async fn change(
-    db: &PgPool,
-    user: User,
+    context: identity::RequestContext<'_>,
     h: HeaderMap,
     id: Uuid,
     body: Value,
     shared: bool,
 ) -> Result<Value> {
+    let db = context.db;
+    let user = identity::request::authenticate(context, &h, true, false).await?;
+    if shared {
+        identity::request::admin(&user)?;
+    }
     let (title, revision) = validate(body)?;
     let mut tx = db.begin().await?;
     let login = media_authorization::login_hash(&h)?;
