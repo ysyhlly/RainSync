@@ -1,5 +1,6 @@
 //! Policy-gated, fenced NAS-local jobs. The ordinary Agent token never grants compute by itself.
 mod admission_policy;
+mod file_validation;
 mod retention;
 
 use super::*;
@@ -724,45 +725,6 @@ pub async fn upload(
     tx.commit().await?;
     Ok(Json(json!({"ok":true,"sha256":sha})))
 }
-fn playlist_segments(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
-    let text = std::str::from_utf8(bytes)?;
-    anyhow::ensure!(
-        text.starts_with("#EXTM3U\n") && text.lines().any(|s| s == "#EXT-X-ENDLIST"),
-        "invalid_hls_manifest"
-    );
-    let mut files = Vec::new();
-    let mut duration = false;
-    for line in text.lines() {
-        if line.starts_with("#EXTINF:") {
-            let d = line
-                .trim_start_matches("#EXTINF:")
-                .trim_end_matches(',')
-                .parse::<f64>()?;
-            anyhow::ensure!(
-                d.is_finite() && d > 0.0 && d <= 30.0,
-                "invalid_segment_duration"
-            );
-            duration = true;
-        } else if !line.is_empty() && !line.starts_with('#') {
-            anyhow::ensure!(
-                duration
-                    && safe_name(line)
-                    && line != "index.m3u8"
-                    && !files.iter().any(|s| s == line),
-                "invalid_hls_segment"
-            );
-            files.push(line.to_string());
-            duration = false;
-        } else if line.contains("URI=")
-            || line.starts_with("#EXT-X-KEY")
-            || line.starts_with("#EXT-X-STREAM-INF")
-        {
-            anyhow::bail!("unsupported_hls_manifest")
-        }
-    }
-    anyhow::ensure!(!files.is_empty() && !duration, "empty_hls_manifest");
-    Ok(files)
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Finish {
@@ -770,37 +732,6 @@ pub struct Finish {
     attempt: i32,
     output_generation: Uuid,
     qualification: media_core::distributed_compute::Qualification,
-}
-async fn verify_files(
-    root: &FsPath,
-    id: Uuid,
-    generation: Uuid,
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-) -> Result<()> {
-    let manifest = tokio::fs::read(file_path(root, id, generation, "index.m3u8"))
-        .await
-        .map_err(anyhow::Error::from)?;
-    let files = playlist_segments(&manifest)
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_compute_manifest"))?;
-    let rows=sqlx::query("SELECT name,sha256,size_bytes FROM distributed_compute_files WHERE job_id=$1 AND output_generation=$2").bind(id).bind(generation).fetch_all(&mut **tx).await?;
-    if rows.len() != files.len() + 1 {
-        return Err(err(StatusCode::CONFLICT, "incomplete_compute_artifact"));
-    }
-    for row in &rows {
-        let name: String = row.get("name");
-        if name != "index.m3u8" && !files.contains(&name) {
-            return Err(err(StatusCode::CONFLICT, "unreferenced_compute_artifact"));
-        }
-        let bytes = tokio::fs::read(file_path(root, id, generation, &name))
-            .await
-            .map_err(anyhow::Error::from)?;
-        if bytes.len() as i64 != row.get::<i64, _>("size_bytes")
-            || hex::encode(Sha256::digest(&bytes)) != row.get::<String, _>("sha256")
-        {
-            return Err(err(StatusCode::CONFLICT, "compute_artifact_changed"));
-        }
-    }
-    Ok(())
 }
 pub async fn finish(
     State(app): State<App>,
@@ -833,7 +764,7 @@ pub async fn finish(
             || binding.get::<Option<i32>,_>("selected_audio_index")!=q.selected_audio_index.map(|v|v as i32) {
             return Err(err(StatusCode::CONFLICT,"compute_qualification_binding_changed"));
         }
-        verify_files(&root,id,fence.output_generation,&mut tx).await?;
+        file_validation::verify_files(&root,id,fence.output_generation,&mut tx).await?;
         lock_job(&mut tx,id,agent,&fence).await?;
         let verification=Uuid::new_v4();
         let started=sqlx::query("UPDATE distributed_compute_attempts SET server_verification_id=$6,server_verification_owner_epoch=$7,server_verification_started_at=clock_timestamp() WHERE job_id=$1 AND owner_agent=$2 AND owner_connection=$3 AND attempt=$4 AND output_generation=$5 AND server_verification_id IS NULL")
@@ -877,7 +808,7 @@ pub async fn finish(
         let sha=hash(&serde_json::to_string(&qualification).map_err(anyhow::Error::from)?);
         let mut tx=app.db.begin().await?;
         lock_job(&mut tx,id,agent,&fence).await?;
-        verify_files(&root,id,fence.output_generation,&mut tx).await?;
+        file_validation::verify_files(&root,id,fence.output_generation,&mut tx).await?;
         lock_job(&mut tx,id,agent,&fence).await?;
         sqlx::query("UPDATE distributed_compute_jobs SET status='ready',lease_until=NULL,qualification=$2,qualification_sha256=$3 WHERE id=$1")
             .bind(id).bind(qualification).bind(sha).execute(&mut *tx).await?;
@@ -1072,9 +1003,12 @@ mod tests {
     #[test]
     fn strict_manifest() {
         assert!(
-            playlist_segments(b"#EXTM3U\n#EXTINF:4.0,\nsegment00000.ts\n#EXT-X-ENDLIST\n").is_ok()
+            file_validation::playlist_segments(
+                b"#EXTM3U\n#EXTINF:4.0,\nsegment00000.ts\n#EXT-X-ENDLIST\n"
+            )
+            .is_ok()
         );
-        for value in [b"#EXTM3U\n#EXTINF:4,\n../x.ts\n#EXT-X-ENDLIST\n".as_slice(),b"#EXTM3U\n#EXTINF:4,\nhttps://example.com/segment00000.ts\n#EXT-X-ENDLIST\n",b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"x\"\n#EXTINF:4,\nsegment00000.ts\n#EXT-X-ENDLIST\n"]{assert!(playlist_segments(value).is_err())}
+        for value in [b"#EXTM3U\n#EXTINF:4,\n../x.ts\n#EXT-X-ENDLIST\n".as_slice(),b"#EXTM3U\n#EXTINF:4,\nhttps://example.com/segment00000.ts\n#EXT-X-ENDLIST\n",b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"x\"\n#EXTINF:4,\nsegment00000.ts\n#EXT-X-ENDLIST\n"]{assert!(file_validation::playlist_segments(value).is_err())}
     }
 }
 

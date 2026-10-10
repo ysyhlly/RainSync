@@ -158,7 +158,7 @@ async fn owned_file_validation() -> Result<()> {
             .to_owned();
         std::fs::create_dir_all(&directory)?;
         let bytes = manifest(name);
-        let parser = match playlist_segments(&bytes) {
+        let parser = match file_validation::playlist_segments(&bytes) {
             Ok(files) => json!({"ok":files}),
             Err(error) => json!({"error":error.to_string()}),
         };
@@ -206,7 +206,7 @@ async fn owned_file_validation() -> Result<()> {
         let before: Value = sqlx::query_scalar("SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text),'[]'::jsonb) FROM distributed_compute_files t").fetch_one(&mut *tx).await?;
         let jobs_before: Value = sqlx::query_scalar("SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text),'[]'::jsonb) FROM distributed_compute_jobs t").fetch_one(&mut *tx).await?;
         let files_before = tree(&root)?;
-        let result = verify_files(&root, id(10), generation, &mut tx).await;
+        let result = file_validation::verify_files(&root, id(10), generation, &mut tx).await;
         let expected = match *name {
             "valid" | "same_transaction_visibility" => None,
             "missing_manifest" | "missing_segment" | "directory_read_error" => {
