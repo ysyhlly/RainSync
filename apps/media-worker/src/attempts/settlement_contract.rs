@@ -135,6 +135,7 @@ async fn contract_inner() -> Result<()> {
         tracing_subscriber::fmt()
             .without_time()
             .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
             .with_writer(move || writer.clone())
             .finish(),
     )?;
