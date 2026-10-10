@@ -1185,3 +1185,6 @@ pub async fn room_drained(
 
 #[cfg(test)]
 mod admission_policy_contract;
+
+#[cfg(test)]
+mod retention_contract;
