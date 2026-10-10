@@ -29,7 +29,7 @@ assert.equal(binding.result, "passed");
 assert.equal(binding.build.exit_code, 0);
 assert.ok(binding.source?.length > 0 && binding.binaries?.length > 0);
 assert.equal(digest(JSON.stringify(binding.source)), binding.source_digest);
-for (const path of ["apps/server/src/metrics.rs", "apps/media-worker/src/metrics.rs",
+for (const path of ["apps/server/src/metrics.rs", "apps/media-worker/src/metrics.rs", "apps/media-worker/src/metrics/observations.rs",
   "apps/media-worker/src/readiness.rs", "apps/media-worker/src/readiness_cache.rs",
   "crates/media-core/src/child_process.rs", "crates/persistence/src/lib.rs"])
   assert.ok(binding.source.some((item) => item.path === path), `Binding includes ${path}`);

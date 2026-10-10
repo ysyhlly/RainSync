@@ -10,7 +10,7 @@ assert.ok(process.env.RAINSYNC_ARTIFACT_DIR);
 const root = resolve(process.env.RAINSYNC_ARTIFACT_DIR, "runtime-metrics-auth", randomUUID());
 await mkdir(root, { recursive: true });
 const inputs = await Promise.all([
-  "apps/media-worker/src/metrics.rs", "apps/media-worker/tests/runtime_metrics.rs",
+  "apps/media-worker/src/metrics.rs", "apps/media-worker/src/metrics/observations.rs", "apps/media-worker/tests/runtime_metrics.rs",
   "tests/runtime-metrics-auth.mjs", "tests/fixtures/postgres.mjs",
 ].map(async path => ({ path, sha256: createHash("sha256").update(await readFile(path)).digest("hex") })));
 const fixture = isolatedPostgres({ root, name: "runtime-metrics-auth" });
