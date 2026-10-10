@@ -1,20 +1,20 @@
 //! Explicitly opt-in, fenced room control. Media state remains single-authority.
 mod http_policy;
+mod lifecycle;
+mod peer_transport;
+pub use peer_transport::proxy_socket;
+mod route_resolution;
 
 use crate::*;
 use axum::body::{Body, to_bytes};
-use axum::extract::{
-    Request,
-    ws::{Message, WebSocket},
-};
+use axum::extract::Request;
 use axum::middleware::Next;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use http_policy::{forward_response_headers, guest_rate_identity, node_route, room_path};
 use persistence::room_node_leases::{self as leases, Lease, Route};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 
 const PEER: &str = "x-rainsync-control-peer";
 const SECRET: &str = "x-rainsync-control-secret";
@@ -112,117 +112,6 @@ struct Inner {
     http: reqwest::Client,
 }
 impl Runtime {
-    pub async fn start(
-        db: PgPool,
-        settings: Settings,
-        epoch: Uuid,
-        start: Instant,
-    ) -> anyhow::Result<Self> {
-        let mut lock = db.acquire().await?;
-        let key = i32::from_be_bytes(settings.node.as_bytes()[..4].try_into().unwrap());
-        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(72614932,$1)")
-            .bind(key)
-            .fetch_one(&mut *lock)
-            .await?;
-        anyhow::ensure!(acquired, "another process owns this control node ID");
-        let fingerprint = settings.fingerprint();
-        sqlx::query("INSERT INTO control_cluster_activation(singleton,configuration_hash) VALUES(true,$1) ON CONFLICT DO NOTHING").bind(&fingerprint).execute(&db).await?;
-        let current: String = sqlx::query_scalar(
-            "SELECT configuration_hash FROM control_cluster_activation WHERE singleton",
-        )
-        .fetch_one(&db)
-        .await?;
-        anyhow::ensure!(
-            current == fingerprint,
-            "control cluster configuration mismatch"
-        );
-        leases::register_instance(
-            &db,
-            settings.node,
-            settings.instance,
-            &settings.nodes[&settings.node],
-        )
-        .await?;
-        let runtime = Self {
-            inner: Arc::new(Inner {
-                settings,
-                db,
-                epoch,
-                start,
-                live: AtomicBool::new(true),
-                create_route: AtomicU64::new(0),
-                owned: Mutex::new(HashMap::new()),
-                fenced: Mutex::new(HashSet::new()),
-                routes: Mutex::new(HashMap::new()),
-                http: reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .timeout(DEADLINE)
-                    .build()?,
-            }),
-        };
-        let heartbeat = runtime.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(2));
-            loop {
-                tick.tick().await;
-                if !heartbeat.healthy() {
-                    std::future::pending::<()>().await;
-                }
-                let healthy = tokio::time::timeout(Duration::from_millis(1500), async {
-                    sqlx::query("SELECT 1").execute(&mut *lock).await?;
-                    leases::heartbeat_instance(
-                        &heartbeat.inner.db,
-                        heartbeat.node(),
-                        heartbeat.inner.settings.instance,
-                    )
-                    .await
-                })
-                .await;
-                if !matches!(healthy, Ok(Ok(()))) {
-                    heartbeat.inner.live.store(false, Ordering::Release);
-                    break;
-                }
-            }
-            // No reacquisition within this process after connection/identity loss.
-            heartbeat.inner.owned.lock().await.clear();
-            std::future::pending::<()>().await;
-        });
-        let renewal = runtime.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(2));
-            loop {
-                tick.tick().await;
-                if !renewal.healthy() {
-                    break;
-                }
-                let owned: Vec<Lease> =
-                    renewal.inner.owned.lock().await.values().cloned().collect();
-                futures_util::stream::iter(owned)
-                    .for_each_concurrent(8, |lease| {
-                        let renewal = renewal.clone();
-                        async move {
-                            let renewed = tokio::time::timeout(
-                                Duration::from_millis(1800),
-                                leases::renew_checkpoint(
-                                    &renewal.inner.db,
-                                    &lease,
-                                    renewal.inner.epoch,
-                                    renewal.now(),
-                                ),
-                            )
-                            .await;
-                            if !matches!(renewed, Ok(Ok(true))) {
-                                renewal.inner.owned.lock().await.remove(&lease.room);
-                                renewal.inner.fenced.lock().await.insert(lease.room);
-                                renewal.inner.routes.lock().await.remove(&lease.room);
-                            }
-                        }
-                    })
-                    .await;
-            }
-        });
-        Ok(runtime)
-    }
     fn now(&self) -> f64 {
         self.inner.start.elapsed().as_secs_f64() * 1000.0
     }
@@ -288,38 +177,6 @@ impl Runtime {
             "untrusted_control_route"
         );
         Ok(())
-    }
-    pub async fn resolve(&self, room: Uuid) -> anyhow::Result<Route> {
-        anyhow::ensure!(self.healthy(), "control_node_unhealthy");
-        if let Some((when, route)) = self.inner.routes.lock().await.get(&room).cloned()
-            && when.elapsed() < Duration::from_millis(250)
-        {
-            self.trusted(&route)?;
-            return Ok(route);
-        }
-        let mut route =
-            tokio::time::timeout(Duration::from_secs(2), leases::route(&self.inner.db, room))
-                .await??;
-        if route.is_none() {
-            match self.local_lease(room).await {
-                Ok(_) => route = leases::route(&self.inner.db, room).await?,
-                Err(error) if error.to_string() == "room_owner_changed" => {
-                    route = leases::route(&self.inner.db, room).await?
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        let route = route.ok_or_else(|| anyhow::anyhow!("room_owner_unavailable"))?;
-        self.trusted(&route)?;
-        if route.node == self.node() {
-            self.local_lease(room).await?;
-        }
-        let mut cache = self.inner.routes.lock().await;
-        if cache.len() >= 1024 {
-            cache.clear()
-        }
-        cache.insert(room, (Instant::now(), route.clone()));
-        Ok(route)
     }
     async fn new_room_route(&self) -> anyhow::Result<Route> {
         let rows=tokio::time::timeout(Duration::from_secs(2),sqlx::query("SELECT id,route_origin FROM control_nodes WHERE heartbeat_at>clock_timestamp()-interval '10 seconds' ORDER BY id LIMIT 32").fetch_all(&self.inner.db)).await??;
@@ -543,69 +400,6 @@ pub async fn middleware(State(app): State<App>, mut request: Request, next: Next
     }
 }
 
-pub async fn proxy_socket(
-    cluster: Runtime,
-    route: Route,
-    user: Uuid,
-    session: String,
-    first: String,
-    mut out: futures_util::stream::SplitSink<WebSocket, Message>,
-    mut input: futures_util::stream::SplitStream<WebSocket>,
-) {
-    let result=async {
-        cluster.trusted(&route)?;
-        let origin=route.origin.replacen("https://","wss://",1).replacen("http://","ws://",1);
-        let initial:Value=serde_json::from_str(&first)?;
-        let room=Uuid::parse_str(initial["room_id"].as_str().ok_or_else(||anyhow::anyhow!("invalid room"))?)?;
-        let mut request=format!("{origin}/_rainsync/control/ws/{room}").into_client_request()?;
-        request.headers_mut().insert(PEER,cluster.node().to_string().parse()?);
-        request.headers_mut().insert(SECRET,cluster.inner.settings.secret.parse()?);
-        request.headers_mut().insert("x-rainsync-control-user",user.to_string().parse()?);
-        request.headers_mut().insert("x-rainsync-control-session",session.parse()?);
-        let mut config=tungstenite::protocol::WebSocketConfig::default();
-        config.max_message_size=Some(MAX_BODY);config.max_frame_size=Some(MAX_BODY);config.max_write_buffer_size=MAX_RESPONSE;
-        let (upstream,_)=tokio::time::timeout(DEADLINE,tokio_tungstenite::connect_async_with_config(request,Some(config),false)).await??;
-        let (mut peer_out,mut peer_in)=upstream.split();
-        tokio::time::timeout(DEADLINE,peer_out.send(tungstenite::Message::Text(first.into()))).await??;
-        let mut ownership=tokio::time::interval(Duration::from_secs(2));
-        loop {
-            tokio::select! {
-                _=ownership.tick()=>{
-                    let current=tokio::time::timeout(Duration::from_secs(2),leases::route(&cluster.inner.db,room)).await;
-                    if !matches!(current,Ok(Ok(Some(ref current))) if current.node==route.node && current.fencing_token==route.fencing_token) {break}
-                }
-                message=input.next()=>{
-                    let Some(Ok(message))=message else {break};
-                    let close=matches!(message,Message::Close(_));
-                    let message=match message {Message::Text(t)=>tungstenite::Message::Text(t.to_string().into()),Message::Binary(b)=>tungstenite::Message::Binary(b),Message::Ping(b)=>tungstenite::Message::Ping(b),Message::Pong(b)=>tungstenite::Message::Pong(b),Message::Close(_)=>tungstenite::Message::Close(None)};
-                    tokio::time::timeout(DEADLINE,peer_out.send(message)).await??;
-                    if close {break}
-                }
-                message=peer_in.next()=>{
-                    let Some(Ok(message))=message else {break};
-                    let close=matches!(message,tungstenite::Message::Close(_));
-                    let message=match message {tungstenite::Message::Text(t)=>Message::Text(t.to_string().into()),tungstenite::Message::Binary(b)=>Message::Binary(b),tungstenite::Message::Ping(b)=>Message::Ping(b),tungstenite::Message::Pong(b)=>Message::Pong(b),tungstenite::Message::Close(_)=>Message::Close(None),tungstenite::Message::Frame(_)=>continue};
-                    tokio::time::timeout(DEADLINE,out.send(message)).await??;
-                    if close {break}
-                }
-            }
-        }
-        Ok::<_,anyhow::Error>(())
-    }.await;
-    if result.is_err() {
-        let _ = tokio::time::timeout(
-            DEADLINE,
-            out.send(Message::Text(
-                json!({"type":"ERROR","error":{"code":"SERVICE_UNAVAILABLE","retryable":true}})
-                    .to_string()
-                    .into(),
-            )),
-        )
-        .await;
-    }
-    let _ = tokio::time::timeout(Duration::from_secs(1), out.send(Message::Close(None))).await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,3 +541,12 @@ mod tests {
 
 #[cfg(test)]
 mod http_policy_contract;
+
+#[cfg(test)]
+mod route_contract;
+
+#[cfg(test)]
+mod peer_contract;
+
+#[cfg(test)]
+mod start_contract;

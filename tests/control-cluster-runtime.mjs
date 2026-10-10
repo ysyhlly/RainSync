@@ -12,18 +12,60 @@ import {isolatedServer,Client,delay} from './fixtures/server.mjs';
 import {sourceMedia} from './fixtures/source-grant.mjs';
 import {verifyClosedPort,verifyPidAbsent} from './fixtures/postgres.mjs';
 import {reapOwnedChildren} from '../deploy/owned-process.mjs';
+import {loadOwnerBinding,sha256} from '../scripts/native-owner-binding.mjs';
 import {redactEvidence} from '../scripts/acceptance-runtime.mjs';
 const quote=v=>`'${String(v).replaceAll("'","''")}'`;
 async function port(){const server=createServer();await new Promise(r=>server.listen(0,'127.0.0.1',r));const p=server.address().port;await new Promise(r=>server.close(r));return p}
 async function until(fn,label,ms=20000){const end=Date.now()+ms;while(Date.now()<end){const result=await fn();if(result)return result;await delay(100)}throw Error(`Timeout: ${label}`)}
 const report={schema_version:1,result:'running',checks:[],scope:'Owned loopback two-server PostgreSQL/HTTP/WS control acceptance; SIGSTOP partition; no OS network changes, production accounts, cross-host TLS or performance claim'};
 const nodes=[randomUUID(),randomUUID()];let secondaryPort,fixture,secondary,secondaryOrigin;const children=new Set(),streams=[],sockets=new Set();let launches=0;
+const repo=resolve(import.meta.dirname,'..');
+const inputPaths=['tests/control-cluster-runtime.mjs','tests/fixtures/server.mjs','tests/fixtures/postgres.mjs','tests/fixtures/unused-port.mjs','tests/fixtures/source-grant.mjs','scripts/native-owner-binding.mjs','deploy/owned-process.mjs','scripts/acceptance-runtime.mjs'];
+const inputSnapshot=()=>Promise.all(inputPaths.map(async path=>({path,sha256:sha256(await readFile(resolve(repo,path)))})));
+let binding;const executableChecks=[],logPaths=[],logErrors=[],logStates=[];
+function observeLog(stream,path){
+ logPaths.push(path);const state={stream,path,finished:false,closed:false,failed:false};logStates.push(state);
+ stream.on('finish',()=>state.finished=true);stream.on('close',()=>state.closed=true);
+ stream.on('error',error=>{state.failed=true;logErrors.push(error);});return state;
+}
+function closeLog(state){
+ return new Promise((resolve,reject)=>{
+  let timer;const done=error=>{clearTimeout(timer);state.stream.off('finish',check);state.stream.off('close',check);state.stream.off('error',fail);error?reject(error):resolve();};
+  const check=()=>{if(state.failed)done(Error('uncapped_log_write_failed'));else if(state.finished&&state.closed)done();};
+  const fail=()=>done(Error('uncapped_log_write_failed'));
+  if(state.failed)return reject(Error('uncapped_log_write_failed'));
+  if(state.finished&&state.closed)return resolve();
+  timer=setTimeout(()=>{state.failed=true;done(Error('uncapped_log_close_unconfirmed'));},5000);
+  state.stream.on('finish',check);state.stream.on('close',check);state.stream.on('error',fail);
+  if(!state.stream.writableEnded&&!state.stream.destroyed)state.stream.end(error=>{if(error){state.failed=true;logErrors.push(error);fail();}});
+  check();
+ });
+}
+function captureExecutable(pid,label){
+ const entry={pid,label,result:'pending'};report.running_executables??=[];report.running_executables.push(entry);
+ const check=readFile(`/proc/${pid}/exe`).then(bytes=>{entry.sha256=sha256(bytes);assert.equal(entry.sha256,report.server_binary_sha256);entry.result='verified';}).catch(error=>{entry.result='unconfirmed';entry.error='running_executable_binding_unconfirmed';return error;});
+ executableChecks.push(check);return check;
+}
+async function verifyInputs(){await binding.verify();assert.deepEqual(await inputSnapshot(),report.coordinator);}
 try {
+ assert.equal(process.platform,'linux','Existing SIGSTOP/proc fixture requires Linux');assert.ok(!process.env.DATABASE_URL);
+ binding=await loadOwnerBinding({root:repo,target:process.env.CARGO_TARGET_DIR,path:process.env.W03_BACKEND_BINDING});report.backend_binding=binding.summary;report.coordinator=await inputSnapshot();
  await isolatedServer('control-cluster-runtime',async f=>{
-  fixture=f;
+  fixture=f;await verifyInputs();
   assert.equal(createHash('sha256').update(await readFile(resolve(f.target,'rainsync-server'))).digest('hex'),report.server_binary_sha256,'server binary unchanged after primary launch');
   try {
-  const launch=(extra)=>{const log=createWriteStream(resolve(f.root,`extra-node-${++launches}.log`));streams.push(log);const child=spawn(resolve(f.target,'rainsync-server'),[],{env:{...f.env,...extra},stdio:['ignore','pipe','pipe']});const record={child,closed:new Promise(r=>child.once('close',(code,signal)=>r({code,signal}))),wasStopped:false};children.add(record);child.stdout.pipe(log,{end:false});child.stderr.pipe(log,{end:false});return record};
+  const launch=(extra)=>{
+   const label=`extra-node-${++launches}`,path=resolve(f.root,`${label}.log`),log=createWriteStream(path);streams.push(log);observeLog(log,path);
+   const child=spawn(resolve(f.target,'rainsync-server'),[],{env:{...f.env,...extra},stdio:['ignore','pipe','pipe']});
+   const record={child,closed:new Promise(r=>child.once('close',(code,signal)=>{record.exit={code,signal,observed_close:true};r({code,signal});})),wasStopped:false};
+   // The error listener is installed before any asynchronous evidence work.
+   child.on('error',error=>{record.spawn_error='extra_server_spawn_failed';logErrors.push(error);});
+   const liveCheck=new Promise(resolve=>{
+    child.once('spawn',()=>resolve(captureExecutable(child.pid,label)));
+    child.once('error',error=>{report.running_executables??=[];report.running_executables.push({pid:child.pid??null,label,result:'unconfirmed',error:'running_executable_spawn_failed'});resolve(error);});
+   });
+   executableChecks.push(liveCheck);children.add(record);child.stdout?.pipe(log,{end:false});child.stderr?.pipe(log,{end:false});return record;
+  };
   const secondaryClient=primary=>{const client=new Client({...f,origin:secondaryOrigin});client.cookie=primary.cookie;client.csrf=primary.csrf;return client};
   async function socket(origin,client,room,resume){const ws=new WebSocket(origin.replace('http','ws')+'/api/v1/ws',{headers:{Cookie:client.cookie,Origin:f.origin},maxPayload:1048576});sockets.add(ws);const messages=[];let closed=false;ws.on('message',data=>{try{messages.push(JSON.parse(data))}catch{}});ws.on('error',()=>{});ws.on('close',()=>closed=true);await new Promise((r,j)=>{ws.once('open',r);ws.once('error',j)});ws.send(JSON.stringify(resume??{type:'JOIN',room_id:room}));const snapshot=await until(()=>messages.find(m=>m.type==='SNAPSHOT'),'WS snapshot');return{ws,messages,snapshot,get closed(){return closed},wait:predicate=>until(()=>messages.find(predicate),'WS message')};}
   const admin=f.client();const adminUser=await admin.login();
@@ -211,6 +253,58 @@ try {
   await until(()=>f.sql(`SELECT count(*) FROM account_exit_room_cleanup WHERE user_id=${quote(exitUser.id)}`)==='0','previously locked account-exit receipt drains after release');
   for(const id of balanced)assert.equal(f.sql(`SELECT count(*) FROM room_members WHERE room_id=${quote(id)} AND user_id IN (${quote(adminUser.id)},${quote(viewerUser.id)})`),'2','queue contention cannot revoke unrelated members');
   report.checks.push('atomic queue rotation skips a row held by an owned PostgreSQL transaction; the other live room owner completes independently, and the held receipt retries after lock release');
+  // Complete real peer handshake/forwarding baseline; separate ordinary account.
+  await admin.request('/users','POST',{username:'peer-lifetime',password:f.password});
+  const peerClient=f.client(),peerUser=await peerClient.login('peer-lifetime',f.password);
+  const peerInvite=await admin.request(`/rooms/${room}/invites`,'POST');
+  await peerClient.request(`/rooms/${room}/join`,'POST',{token:peerInvite.token});
+  const peerLogin=f.sql(`SELECT token_hash FROM sessions WHERE user_id=${quote(peerUser.id)}`);
+  assert.match(peerLogin,/^[0-9a-f]{64}$/);
+  const privateHeaders={'x-rainsync-control-peer':nodes[0],'x-rainsync-control-secret':f.env.RAINSYNC_CONTROL_PEER_TOKEN,'x-rainsync-control-user':peerUser.id,'x-rainsync-control-session':peerLogin};
+  async function privateUpgrade(headers,expected,code){
+   const ws=new WebSocket(secondaryOrigin.replace('http','ws')+'/_rainsync/control/ws/'+room,{headers});sockets.add(ws);
+   let accepted=false,primaryFailed=false,primaryError;
+   ws.on('error',()=>{});
+   try {
+    const outcome=await new Promise((resolve,reject)=>{
+     let settled=false,response;
+     const finish=(error,value)=>{if(settled)return;settled=true;clearTimeout(timer);ws.off('error',failed);ws.off('close',closed);if(error){response?.destroy();reject(error);}else resolve(value);};
+     const failed=error=>finish(error),closed=()=>finish(Error('private_upgrade_closed_without_result'));
+     const timer=setTimeout(()=>finish(Error('private_upgrade_observation_timeout')),20000);
+     ws.once('error',failed);ws.once('close',closed);
+     ws.once('open',()=>finish(null,{status:101}));
+     ws.once('unexpected-response',(_request,incoming)=>{response=incoming;let text='';incoming.on('data',chunk=>text+=chunk);incoming.once('end',()=>{try{finish(null,{status:incoming.statusCode,value:JSON.parse(text)});}catch(error){finish(error);}});incoming.once('error',failed);incoming.once('aborted',()=>finish(Error('private_upgrade_response_aborted')));});
+    });
+    assert.equal(outcome.status,expected);if(code)assert.equal(outcome.value?.error?.code,code);
+    if(expected!==101){ws.terminate();await until(()=>ws.readyState===WebSocket.CLOSED,'rejected private socket close');}
+    accepted=expected===101;
+   report.peer_lifetime??={handshakes:[]};report.peer_lifetime.handshakes.push({status:outcome.status,code:outcome.value?.error?.code??null});
+   return ws;
+   } catch(error){primaryFailed=true;primaryError=error;throw error;} finally {if(!accepted){try{ws.terminate();await until(()=>ws.readyState===WebSocket.CLOSED,'private handshake cleanup close');}catch(error){if(primaryFailed)throw new AggregateError([primaryError,error],'private_upgrade_and_cleanup_failed');throw error;}}}
+  }
+  const privatePeer=await privateUpgrade(privateHeaders,101);
+  let privateSnapshot,privateMessageError;privatePeer.on('message',data=>{try{const value=JSON.parse(data);if(value.type==='SNAPSHOT')privateSnapshot=value;}catch(error){privateMessageError=error;}});
+  privatePeer.send(JSON.stringify({type:'JOIN',room_id:room}));
+  await until(()=>{if(privateMessageError)throw privateMessageError;return privateSnapshot;},'private peer authenticated snapshot');
+  privatePeer.close();await until(()=>privatePeer.readyState===WebSocket.CLOSED,'private peer positive close');
+  await privateUpgrade({...privateHeaders,'x-rainsync-control-secret':'invalid'},403,'FORBIDDEN');
+  await privateUpgrade({...privateHeaders,'x-rainsync-control-user':'invalid'},403,'FORBIDDEN');
+  await privateUpgrade({...privateHeaders,'x-rainsync-control-session':'invalid'},403,'FORBIDDEN');
+  const forwarded=await socket(f.origin,peerClient,room);
+  assert.equal(forwarded.snapshot.state.revision,privateSnapshot.state.revision,'private and forwarded identity see same owner snapshot');
+  let pong;forwarded.ws.once('pong',bytes=>pong=bytes.toString());forwarded.ws.ping('peer-owned-ping');
+  await until(()=>pong==='peer-owned-ping','forwarded websocket pong');
+  forwarded.ws.close();await until(()=>forwarded.closed,'forwarded positive close');
+  await admin.request(`/rooms/${room}/members/${peerUser.id}`,'DELETE');
+  await privateUpgrade(privateHeaders,403,'SESSION_EXPIRED');
+  const renewedInvite=await admin.request(`/rooms/${room}/invites`,'POST');
+  await peerClient.request(`/rooms/${room}/join`,'POST',{token:renewedInvite.token});
+  assert.equal(f.sql(`SELECT count(*) FROM room_members WHERE room_id=${quote(room)} AND user_id=${quote(peerUser.id)}`),'1');
+  // Expiry is lawful fixture mutation of this account's real login, not SQL auth success.
+  f.sql(`UPDATE sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE user_id=${quote(peerUser.id)}`);
+  await privateUpgrade(privateHeaders,403,'SESSION_EXPIRED');
+  assert.equal(secondary.child.exitCode,null,'owner remains running throughout peer lifetime cases');
+  report.checks.push('real configured peer handshake and forwarded ordinary identity, snapshot, client ping/pong and positive close; malformed credentials and removed/expired identity rejected');
   let a=await socket(f.origin,admin,room),b=await socket(secondaryOrigin,viaSecondary,room);
   const make=(state,type,payload)=>({protocol_version:1,command_id:randomUUID(),control_epoch:a.snapshot.control_epoch.id,room_id:room,expected_revision:state.revision,media_generation:state.media_generation,type,...payload});
   let command=make(a.snapshot.state,'CHANGE_MEDIA',{payload:{media_id:media}});a.ws.send(JSON.stringify(command));let ack=await a.wait(m=>m.type==='ACK'&&m.command_id===command.command_id);
@@ -269,19 +363,31 @@ try {
   assert.notEqual(f.sql(`SELECT incarnation FROM control_nodes WHERE id=${quote(nodes[1])}`),incarnation);
   report.checks.push('gateway restart preserves durable room owner/replay history; stable node ID receives a distinct process incarnation');
   assert.equal(createHash('sha256').update(await readFile(resolve(f.target,'rainsync-server'))).digest('hex'),report.server_binary_sha256,'server binary unchanged for entire two-node fixture');
+  for(const error of await Promise.all(executableChecks))if(error)throw error;await verifyInputs();
   report.result='passed';
   } finally {
    for(const ws of sockets)ws.terminate();
    for(const record of children)if(record.wasStopped){record.child.kill('SIGCONT');record.wasStopped=false;}
    await reapOwnedChildren([...children]);
   }
- },{beforeStart:async f=>{report.server_binary_sha256=createHash('sha256').update(await readFile(resolve(f.target,'rainsync-server'))).digest('hex');secondaryPort=await port();secondaryOrigin=`http://127.0.0.1:${secondaryPort}`;Object.assign(f.env,{TRUSTED_PROXY_CIDRS:'',RAINSYNC_CONTROL_CLUSTER:'1',RAINSYNC_CONTROL_NODE_ID:nodes[0],RAINSYNC_CONTROL_ROLE:'media',RAINSYNC_CONTROL_NODES:JSON.stringify({[nodes[0]]:f.origin,[nodes[1]]:secondaryOrigin}),RAINSYNC_CONTROL_PEER_TOKEN:randomBytes(32).toString('hex')})},signal:AbortSignal.timeout(150000)});
+ },{observeServerLog:observeLog,beforeStart:async f=>{fixture=f;const originalStart=f.startServer.bind(f);let primaryLaunch=0;f.startServer=async(...args)=>{const label=`primary-${++primaryLaunch}`;let value;try{value=await originalStart(...args);}catch(error){report.running_executables??=[];report.running_executables.push({pid:f.serverPid??null,label,result:'unconfirmed',error:'primary_start_executable_unconfirmed'});throw error;}const error=await captureExecutable(f.serverPid,label);if(error)throw error;return value;};report.server_binary_sha256=createHash('sha256').update(await readFile(resolve(f.target,'rainsync-server'))).digest('hex');assert.equal(report.server_binary_sha256,binding.summary.binaries.find(item=>item.name==='rainsync-server').sha256);await verifyInputs();secondaryPort=await port();secondaryOrigin=`http://127.0.0.1:${secondaryPort}`;Object.assign(f.env,{TRUSTED_PROXY_CIDRS:'',RAINSYNC_CONTROL_CLUSTER:'1',RAINSYNC_CONTROL_NODE_ID:nodes[0],RAINSYNC_CONTROL_ROLE:'media',RAINSYNC_CONTROL_NODES:JSON.stringify({[nodes[0]]:f.origin,[nodes[1]]:secondaryOrigin}),RAINSYNC_CONTROL_PEER_TOKEN:randomBytes(32).toString('hex')})},signal:AbortSignal.timeout(150000)});
  report.cleanup=await fixture.verifyStopped();
 }catch(error){report.result='failed';report.error=String(error);throw error}
 finally {
- for(const ws of sockets){ws.terminate()}
- for(const record of children)if(record.wasStopped)record.child.kill('SIGCONT');
- await reapOwnedChildren([...children]);
- for(const stream of streams)await new Promise(r=>stream.end(r));
- if(fixture){report.extra_cleanup={pids_absent:[...children].every(r=>verifyPidAbsent(r.child.pid)),secondary_port_closed:await verifyClosedPort(secondaryPort)};await writeFile(resolve(fixture.root,'evidence.json'),JSON.stringify(redactEvidence(report,[fixture.password,fixture.env.RAINSYNC_CONTROL_PEER_TOKEN]),null,2));console.log(JSON.stringify(report,null,2))}
+ const evidenceErrors=[];
+ const attempt=async(name,run)=>{try{await run();}catch(error){evidenceErrors.push({phase:name,message:String(error)});report.result='failed';process.exitCode=1;}};
+ await attempt('socket_close',async()=>{for(const ws of sockets)ws.terminate();});
+ await attempt('resume_stopped_children',async()=>{for(const record of children)if(record.wasStopped)record.child.kill('SIGCONT');});
+ await attempt('extra_reap',()=>reapOwnedChildren([...children]));
+ for(const state of logStates)await attempt('uncapped_log_finish_close',()=>closeLog(state));
+ await attempt('running_executable_checks',async()=>{for(const error of await Promise.all(executableChecks))if(error)throw error;});
+ if(binding)await attempt('final_binding_and_coordinator',verifyInputs);
+ if(fixture){
+  await attempt('fixture_cleanup_receipt',async()=>{report.cleanup=await fixture.verifyStopped();});
+  await attempt('extra_cleanup',async()=>{report.extra_cleanup={processes:[...children].map(r=>({pid:r.child.pid,...r.exit,pid_absent:verifyPidAbsent(r.child.pid)})),secondary_port_closed:await verifyClosedPort(secondaryPort)};assert.ok(report.extra_cleanup.processes.every(r=>r.observed_close&&r.pid_absent));assert.equal(report.extra_cleanup.secondary_port_closed,true);});
+  await attempt('complete_uncapped_logs',async()=>{report.full_logs=await Promise.all(logPaths.map(async path=>{const bytes=await readFile(path);return{path,bytes:bytes.length,sha256:sha256(bytes),complete_to_observed_close:report.cleanup?.completed===true&&[...children].every(r=>r.exit?.observed_close===true)&&logStates.every(s=>s.finished&&s.closed&&!s.failed)&&logErrors.length===0};}));});
+  if(logErrors.length){report.result='failed';process.exitCode=1;evidenceErrors.push({phase:'extra_log_write'});}
+  report.log_closures=logStates.map(({path,finished,closed,failed})=>({path,finished,closed,failed}));report.evidence_failures=evidenceErrors.map(error=>error.phase);
+  await writeFile(resolve(fixture.root,'evidence.json'),JSON.stringify(redactEvidence(report,[fixture.password,fixture.env.RAINSYNC_CONTROL_PEER_TOKEN]),null,2));console.log(JSON.stringify(redactEvidence(report,[fixture.password,fixture.env.RAINSYNC_CONTROL_PEER_TOKEN]),null,2));
+ }
 }
