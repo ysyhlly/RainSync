@@ -632,6 +632,8 @@ pub(crate) async fn commit_controller(
 pub(crate) mod invitation_operations;
 #[path = "room_invites.rs"]
 mod invites_runtime;
+#[path = "room_permission_operations.rs"]
+pub(crate) mod permission_operations;
 #[path = "room_permissions.rs"]
 pub(crate) mod permissions_runtime;
 pub(crate) use invites_runtime::redeem_error;

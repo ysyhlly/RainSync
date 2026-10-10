@@ -1,4 +1,4 @@
-use super::{commit_controller, controller_admission, permissions_runtime};
+use super::{commit_controller, controller_admission, permission_operations};
 use crate::identity::{RequestContext, request};
 use crate::{Error, Result, err, hash, room_lifecycle, token};
 use axum::http::{HeaderMap, StatusCode};
@@ -49,7 +49,7 @@ impl Default for Policy {
 }
 impl Policy {
     fn validate(&self) -> Result<()> {
-        permissions_runtime::Grant {
+        permission_operations::Grant {
             role: self.role.clone(),
             permissions: self.permissions.clone(),
             expires_in_seconds: self.grant_expires_in_seconds,

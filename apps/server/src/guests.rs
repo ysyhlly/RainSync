@@ -164,7 +164,7 @@ pub async fn set_access(
     Json(body): Json<Access>,
 ) -> Result<Response> {
     let (mut tx, authority, actor) =
-        rooms::permissions_runtime::owner_authority(&app, &h, room).await?;
+        rooms::permission_operations::owner_authority(app.identity_context(), &h, room).await?;
     sqlx::query("INSERT INTO room_guest_access(room_id,enabled,updated_by) VALUES($1,$2,$3) ON CONFLICT(room_id) DO UPDATE SET enabled=EXCLUDED.enabled,updated_by=EXCLUDED.updated_by,updated_at=clock_timestamp()")
         .bind(room).bind(body.enabled).bind(actor).execute(&mut *tx).await?;
     authority.commit(tx).await?;
