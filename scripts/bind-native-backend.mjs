@@ -65,6 +65,12 @@ for(const name of ["verify_job_health_events","stop_claim_fixture","verify_job_p
   const path=resolve(process.env.CARGO_TARGET_DIR,"debug","examples",name+(process.platform==="win32"?".exe":""));
   test_helpers.push({name,path,sha256:sha(await readFile(path))});
 }
+// The compute node is a test driver built by the same successful workspace command.
+{
+  const name="rainsync-compute-node";
+  const path=resolve(process.env.CARGO_TARGET_DIR,"debug",name+(process.platform==="win32"?".exe":""));
+  test_helpers.push({name,path,sha256:sha(await readFile(path))});
+}
 const binding={schema_version:1,result:"passed",platform:process.platform,producers,source,source_digest:sha(Buffer.from(JSON.stringify(source))),binaries,test_helpers,...(ownerFixtures.length ? {owner_fixtures} : {}),build:{command:["cargo",...args],profile_environment:Object.fromEntries(["CARGO_INCREMENTAL","CARGO_PROFILE_DEV_DEBUG","CARGO_PROFILE_TEST_DEBUG","CARGO_PROFILE_DEV_DEBUG_ASSERTIONS","CARGO_PROFILE_TEST_DEBUG_ASSERTIONS"].filter(name=>process.env[name]!==undefined).map(name=>[name,process.env[name]])),started_at,finished_at:new Date().toISOString(),exit_code:code,log_path:logPath,log_sha256:sha(await readFile(logPath)),rustc:execFileSync("rustc",["--version"],{encoding:"utf8"}).trim(),cargo:execFileSync("cargo",["--version"],{encoding:"utf8"}).trim()},producer:{path:relative(root,fileURLToPath(import.meta.url)),sha256:sha(await readFile(fileURLToPath(import.meta.url)))}};
 const bindingPath=resolve(output,"backend-binding.json");await writeFile(bindingPath,JSON.stringify(binding,null,2)+"\n",{flag:"wx"});
 console.log(bindingPath);

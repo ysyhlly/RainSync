@@ -304,6 +304,16 @@ jobs:
         if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
         timeout-minutes: 7
         run: timeout --signal=TERM --kill-after=45s 360s node tests/distributed-compute-placement-native.mjs
+      - name: Verify uploaded bytes and complete attempt transaction fences
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 14
+        run: timeout --signal=TERM --kill-after=45s 780s node tests/distributed-compute-attempt-upload-native.mjs
+      - name: Verify real compute verification children, detached ACK and pending shutdown
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          RAINSYNC_MEDIA_STACK_EVIDENCE: 1
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/compute-finish-owner-native.mjs
       - name: Retain sanitized owner, transaction and source-commit evidence
         if: always()
         uses: actions/upload-artifact@v4
