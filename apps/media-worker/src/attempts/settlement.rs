@@ -6,7 +6,7 @@
 //! retaining that obligation beyond the attempt is a separate behavioral issue.
 use crate::{child_process::Scope, output_decode::Gate, readiness};
 use sqlx::PgPool;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub(crate) struct OriginalAttempt<'a> {
@@ -36,6 +36,7 @@ impl<'a> OriginalAttempt<'a> {
     /// Keep the original order and outcomes, including retrying receipt SQL
     /// through shutdown and leaving an unconfirmed drain without a positive ACK.
     pub(crate) async fn settle(self, db: &PgPool, readiness: &readiness::Runtime) {
+        let settlement_started = Instant::now();
         if self.reservation.is_some() {
             readiness.receipt_pending(true);
         }
@@ -58,30 +59,73 @@ impl<'a> OriginalAttempt<'a> {
             // Both encoder and decoder have positive OS-tree reaping evidence.
             // Persist the receipt independently of job cancellation/lease state.
             // Retain ownership through transient DB failures (also on shutdown).
+            let acknowledgement_started = Instant::now();
+            let mut failed_calls = 0_u64;
             loop {
-                if matches!(
-                    tokio::time::timeout(
-                        Duration::from_secs(3),
-                        persistence::media_executions::acknowledge_job(db, id, attempt, owner)
-                    )
-                    .await,
-                    Ok(Ok(()))
-                ) {
-                    break;
-                }
-                tracing::warn!("media execution drain acknowledgement retry");
+                let call = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    persistence::media_executions::acknowledge_job(db, id, attempt, owner),
+                )
+                .await;
+                let failure_class = match call {
+                    Ok(Ok(())) => {
+                        if failed_calls > 0 {
+                            tracing::info!(
+                                job_id = %id,
+                                owner_id = %owner,
+                                attempt,
+                                failed_calls,
+                                acknowledgement_elapsed_ms = acknowledgement_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                                "media execution acknowledgement call recovered"
+                            );
+                        }
+                        break;
+                    }
+                    Ok(Err(_)) => "db_error",
+                    Err(_) => "timeout",
+                };
+                failed_calls = failed_calls.saturating_add(1);
+                tracing::warn!(
+                    job_id = %id,
+                    owner_id = %owner,
+                    attempt,
+                    failed_calls,
+                    failure_class,
+                    acknowledgement_elapsed_ms = acknowledgement_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    "media execution drain acknowledgement retry"
+                );
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             // Completion/error/exit all release only after the child is reaped.
             // On database failure, the next budget snapshot uses this receipt.
-            let _ = tokio::time::timeout(
+            let release_call = tokio::time::timeout(
                 Duration::from_secs(3),
                 persistence::cache_budget::release(db, id, owner, attempt),
             )
             .await;
+            let release_call_outcome = match release_call {
+                Ok(Ok(())) => "ok",
+                Ok(Err(_)) => "db_error",
+                Err(_) => "timeout",
+            };
+            tracing::debug!(
+                job_id = %id,
+                owner_id = %owner,
+                attempt,
+                release_call_outcome,
+                "media cache reservation release call completed"
+            );
         }
         if *self.writer_stopped {
             readiness.receipt_pending(false);
         }
+        tracing::debug!(
+            writer_stopped = *self.writer_stopped,
+            settlement_elapsed_ms = settlement_started
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            "media original attempt settlement call completed"
+        );
     }
 }
