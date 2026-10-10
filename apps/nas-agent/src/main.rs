@@ -1,3 +1,4 @@
+mod connected_session;
 mod data_transfer;
 mod drain;
 mod receipt_mode;
@@ -5,7 +6,7 @@ mod transfer_admission;
 mod uplink_metrics;
 mod uplink_reporter;
 use anyhow::{Context, Result};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use media_core::runtime_metrics::NasUplinkMetrics;
 use serde_json::{Value, json};
 use std::{
@@ -298,122 +299,22 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
             _ = drain::cancelled(&mut shutdown) => break,
             result = tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(req)) => result,
         };
-        if let Ok(Ok((mut socket, _))) = connection {
-            let mut reporter = uplink_reporter::Reporter::new(uplink.snapshot());
-            if send_control(&mut socket, reporter.hello(), &shutdown)
-                .await
-                .is_err()
-            {
-                if retry_or_shutdown(&mut shutdown).await {
-                    break;
-                }
-                continue;
-            }
-            let mut transfers = tokio::task::JoinSet::new();
-            let (cancel_transfers, cancelled_transfers) = tokio::sync::watch::channel(false);
-            let mut scan: Option<IndexScan> = None;
-            let mut refresh = tokio::time::interval(index_interval);
-            refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = drain::cancelled(&mut shutdown) => break,
-                    ended = transfers.join_next(), if !transfers.is_empty() => {
-                        if let Some(Ok(Some(id))) = ended && receipts.add(id).await.is_err() { tracing::warn!("drain receipt persistence failed"); }
-                    }
-                    _ = refresh.tick() => {
-                        if scan.is_none() { scan = start_index(root.clone(), scans.clone()); }
-                    }
-                    page = async { scan.as_mut().unwrap().incoming.recv().await }, if scan.as_ref().is_some_and(|s| !s.awaiting_ack) => {
-                        let current = scan.as_mut().unwrap();
-                        let message = match page {
-                            Some(Ok((items, final_page))) => {
-                                current.final_page = final_page;
-                                json!({"type":"INDEX","snapshot":current.snapshot,"sequence":current.sequence,"final":final_page,"items":items})
-                            }
-                            _ => {
-                                tracing::warn!("index scan incomplete; retaining previous snapshot");
-                                current.aborting = true;
-                                json!({"type":"INDEX_ABORT","snapshot":current.snapshot,"sequence":current.sequence})
-                            }
-                        };
-                        if send_control(&mut socket, message, &shutdown).await.is_err() { break }
-                        current.awaiting_ack = true;
-                        current.sent_at = tokio::time::Instant::now();
-                    }
-                    _=heartbeat.tick()=>{
-                        let mut receipt_failed=false;
-                        for id in receipts.batch() {
-                            if send_control(&mut socket, json!({"type":"TRANSFER_DRAINED","id":id}), &shutdown).await.is_err() { receipt_failed=true; break; }
-                        }
-                        if receipt_failed { break; }
-                        if scan.as_ref().is_some_and(|s| s.awaiting_ack && s.sent_at.elapsed().as_secs() > 60) { break }
-                        if send_control(&mut socket, reporter.heartbeat(uplink.snapshot()), &shutdown).await.is_err() { break }
-                    }
-                    message=socket.next()=>{let text = match message { Some(Ok(Message::Text(text))) => text, Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue, _ => break };let Ok(v)=serde_json::from_str::<Value>(&text)else{continue};
-                        if v["type"] == "NAS_METRICS_READY" {
-                            reporter.ready(&text);
-                            continue;
-                        }
-                        if v["type"] == "TRANSFER_DRAINED_ACK" && (v["accepted"] == true || v["rejected_permanently"] == true) {
-                            if let Some(id)=v["id"].as_str().and_then(|id|uuid::Uuid::parse_str(id).ok()) && receipts.acknowledged(id).await.is_err() { tracing::warn!("drain receipt acknowledgement persistence failed"); }
-                            continue;
-                        }
-                        if v["type"] == "INDEX_ERROR" { break }
-                        if v["type"] == "SCAN" {
-
-                            let Some(request_id) = v["snapshot"].as_str() else { continue };
-                            if request_id.is_empty() || request_id.len() > 64 { continue; }
-                            let requested = if scan.is_none() { start_index(root.clone(), scans.clone()) } else { None };
-                            if let Some(mut requested) = requested {
-                                requested.snapshot = request_id.to_owned();
-                                scan = Some(requested);
-                            } else if send_control(&mut socket, json!({"type":"SCAN_BUSY","snapshot":request_id}), &shutdown).await.is_err() { break }
-                            continue;
-                        }
-                        if v["type"] == "INDEX_ACK" || v["type"] == "INDEX_ABORT_ACK" {
-                            let Some(current) = scan.as_mut() else { break };
-                            if !current.awaiting_ack || v["sequence"].as_u64() != Some(current.sequence)
-                                || (!v["snapshot"].is_null() && v["snapshot"] != current.snapshot)
-                                || (v["type"] == "INDEX_ABORT_ACK") != current.aborting { break }
-                            if current.aborting || current.final_page { scan = None; }
-                            else { current.awaiting_ack = false; current.sequence += 1; }
-                            continue
-                        }
-                        if v["type"]=="TRANSFER" {
-                            let context = transfer_admission::Context {
-                                root: &root,
-                                agent_data_origin: &deployment.agent_data_origin,
-                                slots: &slots,
-                                rejections: &rejections,
-                                cancelled_transfers: &cancelled_transfers,
-                                transfers: &mut transfers,
-                                receipts: &mut receipts,
-                                uplink: &uplink,
-                                reporter_ready: reporter.is_ready(),
-                            };
-                            if transfer_admission::admit(context, &v).await == transfer_admission::Flow::Disconnect {
-                                break;
-                            }
-                        }}
-                }
-            }
-            // End control admission before draining accepted work. Shutdown
-            // must not leave a live socket accepting further dispatches while
-            // this process is waiting for old file owners or receipt writes.
-            drop(socket);
-            drop(scan);
-            // Control loss includes revoked credentials. No old transfer may
-            // outlive that authorized connection or retain its admission slot.
-            let _ = cancel_transfers.send(true);
-            // Never abort a waiter that still owns a blocking file operation.
-            while let Some(result) = transfers.join_next().await {
-                if let Ok(Some(id)) = result
-                    && receipts.add(id).await.is_err()
-                {
-                    tracing::warn!("drain receipt persistence failed");
-                }
+        if let Ok(Ok((socket, _))) = connection {
+            let context = connected_session::Context {
+                root: &root,
+                agent_data_origin: &deployment.agent_data_origin,
+                slots: &slots,
+                rejections: &rejections,
+                scans: &scans,
+                index_interval,
+                shutdown: &mut shutdown,
+                receipts: &mut receipts,
+                uplink: &uplink,
+            };
+            match connected_session::run(context, socket).await {
+                connected_session::Flow::Stop => break,
+                connected_session::Flow::Retried => continue,
+                connected_session::Flow::Drained => {}
             }
         }
         if retry_or_shutdown(&mut shutdown).await {
