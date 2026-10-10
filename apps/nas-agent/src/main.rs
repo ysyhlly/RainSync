@@ -1,6 +1,7 @@
 mod data_transfer;
 mod drain;
 mod receipt_mode;
+mod transfer_admission;
 mod uplink_metrics;
 mod uplink_reporter;
 use anyhow::{Context, Result};
@@ -380,44 +381,22 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
                             else { current.awaiting_ack = false; current.sequence += 1; }
                             continue
                         }
-                        if v["type"]=="TRANSFER"{let mut request=v["request"].clone();
-                        let receipt = if request["drain_receipt_required"] == true {
-                            v["id"].as_str().and_then(|id| uuid::Uuid::parse_str(id).ok())
-                        } else { None };
-                        // Bound receipt persistence before opening more files. A
-                        // peer that never acknowledges causes conservative backpressure.
-                        if receipts.full() {
-                            // This dispatch is already durable at the Server,
-                            // but we have not opened any resource for it.
-                            if let Some(id)=receipt { let _=receipts.add(id).await; }
-                            break;
-                        }
-                        // Data ingress shares the configured service origin; localhost in server configuration is not the NAS host.
-                        if let Some(value)=request["data_url"].as_str() {
-                            let Ok(mut url)=reqwest::Url::parse(&deployment.agent_data_origin) else { if let Some(id)=receipt { let _=receipts.add(id).await; } continue };
-                            let Ok(data)=reqwest::Url::parse(value) else { if let Some(id)=receipt { let _=receipts.add(id).await; } continue };
-                            url.set_path(data.path());url.set_query(data.query());
-                            let scheme=if url.scheme()=="https" {"wss"} else {"ws"};
-                            if url.set_scheme(scheme).is_err(){ if let Some(id)=receipt { let _=receipts.add(id).await; } continue }
-                            request["data_url"]=json!(url.as_str());
-                        }
-                        let root=root.clone();
-                        let permit = match slots.clone().try_acquire_owned() {
-                            Ok(permit) => permit,
-                            Err(_) => { let Ok(permit) = rejections.clone().try_acquire_owned() else {
-                                if let Some(id)=receipt { let _=receipts.add(id).await; }
-                                continue
-                            }; request["busy"] = json!(true); permit }
-                        };
-                        let cancel=cancelled_transfers.clone();
-                        let metrics=reporter.is_ready().then(||uplink.clone());
-                        transfers.spawn(async move {
-                            let _permit=permit;
-                            let result=data_transfer::run(root,request,cancel,metrics).await;
-                            let confirmed=!result.as_ref().is_err_and(|error|error.is::<drain::DrainUnconfirmed>());
-                            if result.is_err(){tracing::warn!("transfer ended with error")}
-                            receipt.filter(|_|confirmed)
-                        });}}
+                        if v["type"]=="TRANSFER" {
+                            let context = transfer_admission::Context {
+                                root: &root,
+                                agent_data_origin: &deployment.agent_data_origin,
+                                slots: &slots,
+                                rejections: &rejections,
+                                cancelled_transfers: &cancelled_transfers,
+                                transfers: &mut transfers,
+                                receipts: &mut receipts,
+                                uplink: &uplink,
+                                reporter_ready: reporter.is_ready(),
+                            };
+                            if transfer_admission::admit(context, &v).await == transfer_admission::Flow::Disconnect {
+                                break;
+                            }
+                        }}
                 }
             }
             // End control admission before draining accepted work. Shutdown
