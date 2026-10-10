@@ -13,7 +13,7 @@ assert.ok(process.env.RAINSYNC_ARTIFACT_DIR && isAbsolute(process.env.RAINSYNC_A
 const root = resolve(process.env.RAINSYNC_ARTIFACT_DIR, `compute-retention-native-${randomUUID()}`);
 await mkdir(root, { recursive: true });
 const test = 'distributed_compute::retention_contract::owned_retention_sweep';
-const cases = ['success', 'missing', 'not_directory', 'sql_after_files'];
+const cases = ['success', 'missing', 'not_directory', 'sql_after_files', 'sql_after_files_retry', 'sql_after_attempts'];
 const report = { result: 'running', scope: 'direct cleanup, full SQLx schema, synthetic owned uploaded files; no proof of child reaping', cases: [] };
 let failure;
 const inputs = ['tests/distributed-compute-retention-native.mjs', 'tests/fixtures/postgres.mjs',

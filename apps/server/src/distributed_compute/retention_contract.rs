@@ -242,12 +242,15 @@ async fn owned_retention_sweep() -> Result<()> {
     let root = PathBuf::from(std::env::var("RAINSYNC_COMPUTE_OUTPUT_ROOT")?);
     ensure!(root.is_absolute() && !root.exists());
     let case = std::env::var("RAINSYNC_RETENTION_CASE")?;
+    let recovery = case == "sql_after_files_retry" || case == "sql_after_attempts";
+    let file_failure = case == "sql_after_files" || case == "sql_after_files_retry";
+    let observation_path = PathBuf::from(std::env::var("RAINSYNC_RETENTION_OBSERVATION")?);
     if case == "not_directory" {
         std::fs::write(&root, b"owned root file")?;
     } else if case != "missing" {
         std::fs::create_dir(&root)?;
         for n in 10..=17 {
-            if case == "sql_after_files" && n != 12 {
+            if (file_failure && n != 12) || case == "sql_after_attempts" {
                 continue;
             }
             let path = root.join(id(n).to_string()).join(id(n + 100).to_string());
@@ -260,10 +263,46 @@ async fn owned_retention_sweep() -> Result<()> {
             std::fs::write(stale.join("old"), b"old")?;
         }
         std::fs::write(root.join("unrelated"), b"untouched")?;
-        if case == "sql_after_files" {
+        if file_failure {
             sql(&db,"CREATE FUNCTION rainsync_retention_delete_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'owned_file_delete_failure'; END $$; CREATE TRIGGER rainsync_retention_delete_failure BEFORE DELETE ON distributed_compute_files FOR EACH ROW EXECUTE FUNCTION rainsync_retention_delete_failure()").await?;
         }
     }
+    if case == "sql_after_attempts" {
+        // Only this owned fixture's final job DELETE is made to fail. Any preceding
+        // attempt DELETE remains its original independent production statement.
+        sql(&db, &format!("CREATE FUNCTION rainsync_retention_job_delete_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.id='{}'::uuid THEN RAISE EXCEPTION 'owned_job_delete_failure'; END IF; RETURN OLD; END $$; CREATE TRIGGER rainsync_retention_job_delete_failure BEFORE DELETE ON distributed_compute_jobs FOR EACH ROW EXECUTE FUNCTION rainsync_retention_job_delete_failure()", id(11))).await?;
+    }
+    // A separate pool observes committed effects. It never wraps the production
+    // sweep in a transaction, supplies receipts, or repairs missing metadata.
+    let witness = if recovery {
+        let witness = persistence::connect(&url).await?;
+        let mut held_writer = db.acquire().await?;
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *held_writer)
+            .await?;
+        let reader_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&witness)
+            .await?;
+        ensure!(
+            writer_pid != reader_pid,
+            "independent pool must use another backend"
+        );
+        println!("OWNED retention witness backend {reader_pid}; held writer {writer_pid}");
+        drop(held_writer);
+        Some(witness)
+    } else {
+        None
+    };
+    let before = if let Some(witness) = &witness {
+        let before = observe(witness, &root, "before").await?;
+        std::fs::write(
+            observation_path.with_extension("before.json"),
+            serde_json::to_vec_pretty(&before)?,
+        )?;
+        Some(before)
+    } else {
+        None
+    };
     let result = super::cleanup(&app).await;
     let outcome = match &result {
         Ok(()) => "ok",
@@ -274,12 +313,27 @@ async fn owned_retention_sweep() -> Result<()> {
             );
             "not_directory"
         }
-        Err(e) if case == "sql_after_files" => {
+        Err(e) if file_failure => {
             ensure!(e.to_string().contains("owned_file_delete_failure"));
-            "sql_after_files"
+            case.as_str()
+        }
+        Err(e) if case == "sql_after_attempts" => {
+            ensure!(e.to_string().contains("owned_job_delete_failure"));
+            "sql_after_attempts"
         }
         Err(e) => return Err(anyhow::anyhow!("unexpected cleanup: {e}")),
     };
+    if recovery {
+        let database_error = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<sqlx::Error>())
+            .and_then(|error| error.as_database_error())
+            .ok_or_else(|| {
+                anyhow::anyhow!("recovery fault must be an actual SQLx database error")
+            })?;
+        ensure!(database_error.code().as_deref() == Some("P0001"));
+    }
     ensure!((case == "missing" || case == "success") == result.is_ok());
     let jobs: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM distributed_compute_jobs ORDER BY id")
         .fetch_all(&db)
@@ -297,7 +351,7 @@ async fn owned_retention_sweep() -> Result<()> {
         sqlx::query_scalar("SELECT job_id FROM distributed_compute_attempts ORDER BY job_id")
             .fetch_all(&db)
             .await?;
-    let expected = if case == "success" {
+    let expected = if case == "success" || case == "sql_after_attempts" {
         vec![12, 13, 14]
     } else {
         vec![12, 13, 14, 15, 16]
@@ -348,7 +402,7 @@ async fn owned_retention_sweep() -> Result<()> {
         file_count == if case == "success" { 2 } else { 8 },
         "metadata count: {file_count}"
     );
-    if case == "sql_after_files" {
+    if file_failure {
         ensure!(
             !root
                 .join(id(12).to_string())
@@ -374,10 +428,125 @@ async fn owned_retention_sweep() -> Result<()> {
             "repeat changed settled sweep"
         );
     }
-    std::fs::write(
-        std::env::var("RAINSYNC_RETENTION_OBSERVATION")?,
-        serde_json::to_vec_pretty(&first)?,
-    )?;
+    let recorded = if let Some(witness) = witness {
+        let before = before.expect("recovery observation prepared before sweep");
+        let committed_first = observe(&witness, &root, outcome).await?;
+        ensure!(
+            first == committed_first,
+            "failure effects must be visible to independent pool"
+        );
+        std::fs::write(
+            observation_path.with_extension("first.json"),
+            serde_json::to_vec_pretty(&committed_first)?,
+        )?;
+        let first_budget: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(sum(size_bytes),0)::bigint FROM distributed_compute_files",
+        )
+        .fetch_one(&witness)
+        .await?;
+        ensure!(
+            first_budget == 40,
+            "first failure must retain all eight metadata rows"
+        );
+        if file_failure {
+            // The real directory and bytes existed before the first sweep. That
+            // successful filesystem delete survives the metadata statement error.
+            ensure!(
+                !root
+                    .join(id(12).to_string())
+                    .join(id(112).to_string())
+                    .exists()
+            );
+            ensure!(sqlx::query_scalar::<_, bool>("SELECT process_reaped_at IS NULL AND files_removed_at IS NULL FROM distributed_compute_attempts WHERE job_id=$1")
+                .bind(id(12)).fetch_one(&witness).await?);
+            sql(&db, "DROP TRIGGER rainsync_retention_delete_failure ON distributed_compute_files; DROP FUNCTION rainsync_retention_delete_failure()").await?;
+        } else {
+            // The failing jobs statement rolls back its own rows; successful
+            // attempt pruning has already committed and must remain visible.
+            ensure!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM distributed_compute_attempts WHERE job_id IN($1,$2)"
+                )
+                .bind(id(15))
+                .bind(id(16))
+                .fetch_one(&witness)
+                .await?
+                    == 0
+            );
+            ensure!(before["files"] == committed_first["files"]);
+            sql(&db, "DROP TRIGGER rainsync_retention_job_delete_failure ON distributed_compute_jobs; DROP FUNCTION rainsync_retention_job_delete_failure()").await?;
+        }
+        // Remove only the fixture failure injection. Do not recreate generation
+        // directories, adjust expiry, change authorization, or clear receipts.
+        super::cleanup(&app).await?;
+        let retry = observe(&witness, &root, "ok").await?;
+        std::fs::write(
+            observation_path.with_extension("retry.json"),
+            serde_json::to_vec_pretty(&retry)?,
+        )?;
+        let jobs: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM distributed_compute_jobs ORDER BY id")
+                .fetch_all(&witness)
+                .await?;
+        ensure!(
+            jobs == vec![10, 12, 13, 14, 17]
+                .into_iter()
+                .map(id)
+                .collect::<Vec<_>>()
+        );
+        let attempts: Vec<Uuid> =
+            sqlx::query_scalar("SELECT job_id FROM distributed_compute_attempts ORDER BY job_id")
+                .fetch_all(&witness)
+                .await?;
+        ensure!(attempts == vec![12, 13, 14].into_iter().map(id).collect::<Vec<_>>());
+        let metadata_jobs: Vec<Uuid> =
+            sqlx::query_scalar("SELECT job_id FROM distributed_compute_files ORDER BY job_id")
+                .fetch_all(&witness)
+                .await?;
+        ensure!(
+            metadata_jobs == jobs,
+            "only final job deletion cascades the three removed metadata rows"
+        );
+        let retry_budget: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(sum(size_bytes),0)::bigint FROM distributed_compute_files",
+        )
+        .fetch_one(&witness)
+        .await?;
+        let retained_job12_bytes: i64 = sqlx::query_scalar("SELECT COALESCE(sum(size_bytes),0)::bigint FROM distributed_compute_files WHERE job_id=$1")
+            .bind(id(12)).fetch_one(&witness).await?;
+        ensure!(retry_budget == 25 && retained_job12_bytes == 5);
+        ensure!(sqlx::query_scalar::<_, bool>("SELECT process_reaped_at IS NULL AND files_removed_at IS NULL FROM distributed_compute_attempts WHERE job_id=$1")
+            .bind(id(12)).fetch_one(&witness).await?);
+        ensure!(
+            !sqlx::query_scalar::<_, bool>("SELECT distributed_compute_room_drained($1)")
+                .bind(id(4))
+                .fetch_one(&witness)
+                .await?
+        );
+        ensure!(!root.join(id(12).to_string()).exists());
+        ensure!(std::fs::read(root.join("unrelated"))?.as_slice() == b"untouched");
+        if !file_failure {
+            ensure!(committed_first["files"] == retry["files"]);
+        }
+        super::cleanup(&app).await?;
+        let repeat = observe(&witness, &root, "ok").await?;
+        std::fs::write(
+            observation_path.with_extension("repeat.json"),
+            serde_json::to_vec_pretty(&repeat)?,
+        )?;
+        ensure!(
+            retry == repeat,
+            "retry must settle without repairing the retained row"
+        );
+        witness.close().await;
+        json!({"before":before,"first":committed_first,"retry":retry,"repeat":repeat,
+            "metadata_budget":{"first_failure_bytes":first_budget,"retry_bytes":retry_budget,
+                "retained_job12_bytes":retained_job12_bytes},
+            "fault":case,"scope":"existing full production sweep; synthetic owner receipts; no physical drain proof"})
+    } else {
+        first
+    };
+    std::fs::write(&observation_path, serde_json::to_vec_pretty(&recorded)?)?;
     db.close().await;
     println!("\nPASS: owned retention {case}");
     Ok(())
