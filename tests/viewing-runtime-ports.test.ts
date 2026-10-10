@@ -160,15 +160,23 @@ it("a stale dismissal cannot clear another error owner even when its text is ide
   expect(f.runtime.errorNotice.value?.owner).toBe("room");
 });
 
-it("the writable legacy error facade clears only the visible owner", () => {
+it("the readonly presentation is cleared only through its captured owner notice", () => {
   const f = viewing();
-  f.runtime.error.value = "legacy room error";
+  f.room.error.value = "legacy room error";
   f.runtime.playback.playbackError.value = "new playback error";
-  f.runtime.error.value = "";
+  f.runtime.dismissError(f.runtime.errorNotice.value);
   expect(f.runtime.playback.playbackError.value).toBe("");
   expect(f.room.error.value).toBe("legacy room error");
   expect(f.runtime.error.value).toBe("legacy room error");
 });
+
+function readonlyPresentationContract(runtime: ReturnType<typeof createViewingRuntime>) {
+  // @ts-expect-error Presentation cannot publish owner errors.
+  runtime.error.value = "unowned";
+  // @ts-expect-error Presentation cannot replace independently owned busy state.
+  runtime.busy.value = false;
+}
+void readonlyPresentationContract;
 
 it("old action failures and finalizers cannot overwrite a successor exact login", async () => {
   const f = viewing(),
@@ -243,7 +251,7 @@ it("the room facade begins leaving synchronously when the exact-login epoch chan
     duration_ms: null,
     clock_epoch: "clock",
   };
-  room.error = "existing account failure";
+  room.roomError = "existing account failure";
   session.clear();
   expect(room.error).toBe("existing account failure");
   expect(room.room).toBeNull();
@@ -479,3 +487,27 @@ function finitePlatformTextInputs(
   grant.native_platform?.quality;
 }
 void finitePlatformTextInputs;
+
+it("a stale playback snapshot cannot dismiss an equal-text successor room owner", () => {
+  const f = viewing();
+  f.runtime.playback.playbackError.value = "equal text";
+  const stale = f.notice.value!;
+  f.room.error.value = "equal text";
+  stale.dismiss();
+  expect(f.runtime.errorNotice.value?.owner).toBe("room");
+  expect(f.room.error.value).toBe("equal text");
+  f.notice.value!.dismiss();
+  expect(f.room.error.value).toBe("");
+  expect(f.runtime.playback.playbackError.value).toBe("equal text");
+});
+
+it("a stale owner snapshot cannot dismiss a clear-and-recreated identical owner message", () => {
+  const f = viewing();
+  f.room.error.value = "repeat";
+  const stale = f.runtime.errorNotice.value!;
+  f.room.error.value = "";
+  f.room.error.value = "repeat";
+  expect(f.runtime.errorNotice.value!.revision).toBeGreaterThan(stale.revision);
+  f.runtime.dismissError(stale);
+  expect(f.room.error.value).toBe("repeat");
+});

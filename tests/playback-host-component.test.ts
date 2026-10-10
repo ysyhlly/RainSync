@@ -1,3 +1,4 @@
+import { withNoticeOwner } from "./helpers/notice-owner";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -400,23 +401,25 @@ function fakeRuntime(env: Environment, overrides: Record<string, any> = {}) {
         return methods[key];
       },
     });
-  const raw = Vue.reactive(plain);
+  const raw = Vue.reactive(withNoticeOwner(plain as typeof plain & { error: string }));
   return {
     raw,
     methods,
     events,
     spyReads(keys: string[]) {
       for (const key of keys) {
+        const descriptor = Object.getOwnPropertyDescriptor(plain, key);
         let value = plain[key];
         Object.defineProperty(plain, key, {
           configurable: true,
           enumerable: true,
           get() {
             if (armed) events.push(`read:${key}`);
-            return value;
+            return descriptor?.get ? descriptor.get.call(plain) : value;
           },
           set(next) {
-            value = next;
+            if (descriptor?.set) descriptor.set.call(plain, next);
+            else value = next;
           },
         });
       }
@@ -497,10 +500,7 @@ function suppliedHostPort(raw: Record<string, any>) {
     Object.defineProperty(actions, key, { get: () => raw[key].bind(raw) });
   Object.defineProperty(actions, "dismissError", {
     get: () =>
-      raw.dismissError?.bind(raw) ??
-      (() => {
-        raw.error = "";
-      }),
+      raw.dismissError.bind(raw),
   });
   return module.exports.createPlaybackHostPort({
     timeline,

@@ -1,3 +1,4 @@
+import { withNoticeOwner } from "./helpers/notice-owner";
 import { readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -192,6 +193,7 @@ async function renderPlayer(
     return module.exports.default;
   }
   type HostContext = Parameters<typeof createPlaybackHostPort>[0];
+  const ownedNotice = withNoticeOwner(runtime);
   const raw = runtime as unknown as Record<string, any>;
   const required = (name: string) => () => { throw Error(`Unexpected ${name} in recovery SSR fixture`); };
   const hostPort = createPlaybackHostPort({
@@ -204,7 +206,7 @@ async function renderPlayer(
       enablePlayback: runtime.enablePlayback,
       runPlayback: required("runPlayback"), loadMedia: required("loadMedia"),
       cancelPreparation: required("cancelPreparation"), applySubtitles: required("applySubtitles"), send: required("send"),
-      dismissError: () => { runtime.error = ""; },
+      dismissError: ownedNotice.dismissError,
     },
     playbackControls: raw.playbackControls, playbackSettings: raw.playbackSettings,
   });

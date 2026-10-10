@@ -79,13 +79,8 @@ export function createViewingRuntime(
     if (notice.owner === "room") room.error.value = "";
     else playback.playbackError.value = "";
   }
-  const error = computed({
-    get: () => errorNotice.value?.message ?? "",
-    set: (message: string) => {
-      if (message) room.error.value = message;
-      else dismissError(errorNotice.value);
-    },
-  });
+  // Presentation is readonly; writes remain with the room/playback owners.
+  const error = computed(() => errorNotice.value?.message ?? "");
   const busy = computed(() => room.busy.value || playback.playbackBusy.value);
   return { playback, error, busy, errorNotice, dismissError };
 }

@@ -416,7 +416,7 @@ it("remote seek preserves an existing authentication error", async () => {
     const socket = s.sockets[0];
     socket.onopen();
     s.snapshot();
-    s.runtime.error = "登录已失效，请重新登录";
+    s.runtime.roomError = "登录已失效，请重新登录";
     s.frame(socket, {
       type: "EVENT",
       action: { type: "SEEK" },

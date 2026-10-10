@@ -2649,7 +2649,7 @@ it("RoomPage real compiled panel discards an old peer action after login retirem
   f.session.clear();
   await ticks();
   expect(f.m.panel()).toBeUndefined();
-  f.runtime.error = "Successor notice";
+  f.runtime.roomError = "Successor notice";
   gate.resolve(Response.json(f.peerReply(oldPlan)));
   await expect(old).resolves.toBeUndefined();
   await ticks();

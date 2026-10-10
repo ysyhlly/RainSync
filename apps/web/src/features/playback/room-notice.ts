@@ -10,15 +10,11 @@ export type RuntimeErrorNotice = Readonly<{
   message: string;
 }>;
 type RoomNoticeRuntime = {
-  readonly errorNotice?: RuntimeErrorNotice;
+  readonly errorNotice: RuntimeErrorNotice | undefined;
   readonly preparation?: DeepReadonly<PlaybackPreparationState>;
-} & (
-  | {
-      readonly error: string;
-      readonly dismissError: (notice: RuntimeErrorNotice | undefined) => void;
-    }
-  | { error: string; dismissError?: undefined }
-);
+  readonly error: string;
+  readonly dismissError: (notice: RuntimeErrorNotice | undefined) => void;
+};
 
 /** One presentation of the current error, not a new error store or queue. */
 export function useRoomNotice(
@@ -28,7 +24,7 @@ export function useRoomNotice(
   let runtimeRevision = 0;
   let actionRevision = 0;
   watch(
-    () => runtime.errorNotice ?? runtime.error,
+    () => runtime.errorNotice,
     () => ++runtimeRevision,
     { flush: "sync" },
   );
@@ -60,8 +56,7 @@ export function useRoomNotice(
           if (actionRevision === revision && actionError?.value === message)
             actionError.value = "";
         } else if (runtimeRevision === revision && runtime.error === message) {
-          if (runtime.dismissError) runtime.dismissError(runtimeNotice);
-          else runtime.error = "";
+          runtime.dismissError(runtimeNotice);
         }
       },
     };
