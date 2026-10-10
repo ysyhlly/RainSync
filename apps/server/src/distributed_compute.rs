@@ -1144,3 +1144,6 @@ mod admission_policy_contract;
 
 #[cfg(test)]
 mod retention_contract;
+
+#[cfg(test)]
+mod file_validation_contract;
