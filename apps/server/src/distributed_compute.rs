@@ -1,16 +1,18 @@
 //! Policy-gated, fenced NAS-local jobs. The ordinary Agent token never grants compute by itself.
+mod admission_policy;
+
 use super::*;
+use admission_policy::{AdmissionError, MAX_SOURCE_BYTES, budget_fits, valid_capabilities};
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Query},
 };
 use futures_util::TryStreamExt;
-use media_core::distributed_compute::{
-    COMPUTE_RECIPES, MAX_SEGMENT_BYTES, MAX_SOURCE_DURATION_SECONDS, compute_recipe,
-};
+#[cfg(test)]
+use media_core::distributed_compute::COMPUTE_RECIPES;
+use media_core::distributed_compute::{MAX_SEGMENT_BYTES, compute_recipe};
 use std::path::{Path as FsPath, PathBuf};
 
-const MAX_SOURCE_BYTES: i64 = 16 * 1024 * 1024 * 1024;
 const MAX_POLICY_SLOTS: i32 = 4;
 const MIN_POLICY_OUTPUT_BYTES: i64 = 1048576;
 const MAX_POLICY_OUTPUT_BYTES: i64 = 1073741824;
@@ -23,18 +25,7 @@ fn total_output_budget_bytes() -> i64 {
         .unwrap_or(MAX_POLICY_OUTPUT_BYTES)
 }
 
-fn valid_capabilities(capabilities: &[String]) -> bool {
-    !capabilities.is_empty()
-        && capabilities.len() <= COMPUTE_RECIPES.len()
-        && capabilities
-            .iter()
-            .enumerate()
-            .all(|(i, id)| compute_recipe(id).is_ok() && !capabilities[..i].contains(id))
-}
-
-// Only version-bound probe metadata may influence admission. This is a
-// conservative capacity estimate, not a promise of actual encoded size. Unknown
-// metadata/remux still undergo the node and server runtime byte/probe checks.
+// Keep the existing transport contract at the handler boundary.
 fn estimated_output_bytes(
     recipe: &str,
     metadata: &Value,
@@ -42,41 +33,23 @@ fn estimated_output_bytes(
     source_bytes: i64,
     with_audio: bool,
 ) -> Result<Option<u64>> {
-    let recipe = compute_recipe(recipe)
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_compute_recipe"))?;
-    if source_bytes <= 0 || source_bytes > MAX_SOURCE_BYTES {
-        return Err(err(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "compute_source_too_large",
-        ));
-    }
-    if metadata["capability_source_version"].as_str() != Some(source_version)
-        || metadata["format"]["duration"].is_null()
-    {
-        return Ok(None);
-    }
-    let duration = metadata["format"]["duration"].as_f64().or_else(|| {
-        metadata["format"]["duration"]
-            .as_str()
-            .and_then(|v| v.parse::<f64>().ok())
-    });
-    let duration = duration
-        .filter(|v| v.is_finite() && *v > 0.0 && *v <= MAX_SOURCE_DURATION_SECONDS)
-        .ok_or_else(|| {
-            err(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "compute_source_duration_unsupported",
-            )
-        })?;
-    // Preserve legacy 480p/remux admission; their actual runtime byte limits
-    // still apply. Only the new HD recipes reserve conservative capacity.
-    Ok((recipe.segment_seconds == 2)
-        .then(|| recipe.estimated_output_bytes(duration, with_audio))
-        .flatten())
-}
-
-fn budget_fits(estimate: Option<u64>, budget: i64) -> bool {
-    budget > 0 && estimate.is_none_or(|bytes| bytes <= budget as u64)
+    admission_policy::estimated_output_bytes(
+        recipe,
+        metadata,
+        source_version,
+        source_bytes,
+        with_audio,
+    )
+    .map_err(|error| match error {
+        AdmissionError::InvalidRecipe => err(StatusCode::BAD_REQUEST, "invalid_compute_recipe"),
+        AdmissionError::SourceTooLarge => {
+            err(StatusCode::PAYLOAD_TOO_LARGE, "compute_source_too_large")
+        }
+        AdmissionError::SourceDurationUnsupported => err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "compute_source_duration_unsupported",
+        ),
+    })
 }
 
 pub fn routes() -> Router<App> {
@@ -1209,3 +1182,6 @@ pub async fn room_drained(
             .await?,
     )
 }
+
+#[cfg(test)]
+mod admission_policy_contract;
