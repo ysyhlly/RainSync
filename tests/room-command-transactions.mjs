@@ -8,7 +8,7 @@ import { nativeOwnerGate } from "./fixtures/native-owner-gate.mjs";
 import { verifyPidAbsent } from "./fixtures/postgres.mjs";
 
 const cases = Object.freeze([
-  "atomic_commit_and_compatibility_replay",
+  "atomic_commit_and_replay",
   "normalized_payload_and_replay_denials",
   "latest_snapshot_lock_wait",
   "end_media_latest_queue",

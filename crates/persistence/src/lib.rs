@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use protocol::{Command, RoomState};
+use protocol::RoomState;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
 pub mod admin_settings;
@@ -153,63 +153,4 @@ pub async fn cleanup_control_history(pool: &PgPool) -> Result<()> {
         .await?;
     Ok(())
 }
-// Compatibility entrypoints while callers migrate to `room_commands`.
-// Remove these only after all production and fixture callers have migrated (P24).
-pub async fn previous(
-    pool: &PgPool,
-    room: Uuid,
-    command: &Command,
-    user: Uuid,
-) -> Result<Option<RoomState>> {
-    room_commands::previous(pool, room, command, user).await
-}
-pub async fn previous_fenced(
-    pool: &PgPool,
-    room: Uuid,
-    command: &Command,
-    user: Uuid,
-    session_hash: &str,
-    lease: &room_node_leases::Lease,
-) -> Result<Option<RoomState>> {
-    room_commands::previous_fenced(pool, room, command, user, session_hash, lease).await
-}
-pub async fn commit(
-    pool: &PgPool,
-    command: &Command,
-    user: Uuid,
-    session_hash: &str,
-    server_time_ms: f64,
-    resolved_media: Option<room_core::diagnostics::ResolvedMedia>,
-) -> Result<RoomState> {
-    room_commands::commit(
-        pool,
-        command,
-        user,
-        session_hash,
-        server_time_ms,
-        resolved_media,
-    )
-    .await
-}
-pub async fn commit_fenced(
-    pool: &PgPool,
-    command: &Command,
-    user: Uuid,
-    session_hash: &str,
-    server_time_ms: f64,
-    resolved_media: Option<room_core::diagnostics::ResolvedMedia>,
-    lease: &room_node_leases::Lease,
-) -> Result<RoomState> {
-    room_commands::commit_fenced(
-        pool,
-        command,
-        user,
-        session_hash,
-        server_time_ms,
-        resolved_media,
-        lease,
-    )
-    .await
-}
-
 pub mod media_previews;

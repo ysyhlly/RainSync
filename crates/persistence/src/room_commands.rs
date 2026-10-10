@@ -1,4 +1,4 @@
-//! Named room-command transactions, shared by the Actor and compatibility entrypoints.
+//! Named room-command transactions, shared by the Actor and owned fixtures.
 //!
 //! Each operation owns its complete transaction. `commit` locks the current
 //! snapshot before reduction, resolves END_MEDIA from the latest queue, and

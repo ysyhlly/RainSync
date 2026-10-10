@@ -137,7 +137,7 @@ async fn wait_blocked(db: &PgPool, fragment: &str) -> Result<()> {
     Ok(())
 }
 
-async fn atomic_commit_and_compatibility_replay(db: &PgPool) -> Result<()> {
+async fn atomic_commit_and_replay(db: &PgPool) -> Result<()> {
     let f = fixture(db, false).await?;
     ensure!(
         room_commands::previous(db, f.state.room_id, &f.command, f.user)
@@ -152,11 +152,11 @@ async fn atomic_commit_and_compatibility_replay(db: &PgPool) -> Result<()> {
         room_commands::previous(db, f.state.room_id, &f.command, f.user).await?
             == Some(state.clone())
     );
-    ensure!(persistence::previous(db, f.state.room_id, &f.command, f.user).await? == Some(state));
+    ensure!(room_commands::previous(db, f.state.room_id, &f.command, f.user).await? == Some(state));
     ensure!(durable(db, f.state.room_id).await? == before);
-    // A root compatibility write still executes the same production unit.
+    // A second room executes the same named production unit independently.
     let legacy = fixture(db, false).await?;
-    let state = persistence::commit(
+    let state = room_commands::commit(
         db,
         &legacy.command,
         legacy.user,
@@ -415,7 +415,7 @@ async fn fenced_commit_and_replay(db: &PgPool) -> Result<()> {
             == Some(state.clone())
     );
     ensure!(
-        persistence::previous_fenced(db, f.state.room_id, &f.command, f.user, &f.login, &lease)
+        room_commands::previous_fenced(db, f.state.room_id, &f.command, f.user, &f.login, &lease)
             .await?
             == Some(state)
     );
@@ -433,10 +433,10 @@ async fn fenced_commit_and_replay(db: &PgPool) -> Result<()> {
             == "session_expired"
     );
     ensure!(durable(db, f.state.room_id).await? == before);
-    // Exercise the old fenced write entrypoint as well as the new namespace.
+    // Exercise a fenced write for an independently leased second room.
     let legacy = fixture(db, false).await?;
     let legacy_lease = self::lease(db, legacy.state.room_id).await?;
-    let state = persistence::commit_fenced(
+    let state = room_commands::commit_fenced(
         db,
         &legacy.command,
         legacy.user,
@@ -503,8 +503,8 @@ async fn main() -> Result<()> {
         .fetch_one(&db)
         .await?;
     ensure!(database.starts_with("rainsync_"));
-    atomic_commit_and_compatibility_replay(&db).await?;
-    println!("PASS: atomic_commit_and_compatibility_replay");
+    atomic_commit_and_replay(&db).await?;
+    println!("PASS: atomic_commit_and_replay");
     normalized_payload_and_replay_denials(&db).await?;
     println!("PASS: normalized_payload_and_replay_denials");
     latest_snapshot_lock_wait(&db).await?;
