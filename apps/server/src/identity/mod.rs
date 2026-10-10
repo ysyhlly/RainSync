@@ -3,6 +3,7 @@
 pub(crate) mod account_exit;
 pub(crate) mod admin;
 pub(crate) mod profiles;
+pub(crate) mod registration_invites;
 pub(crate) mod request;
 
 use crate::{Error, err};
