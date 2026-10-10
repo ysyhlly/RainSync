@@ -527,26 +527,19 @@ pub(crate) async fn controller_for_permission<'a>(
     id: Uuid,
     permission: protocol::RoomPermission,
 ) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
-    controller_admission(app, h, id, permission, true).await
+    let u = auth(app, h, true).await?;
+    member(app, &u, id).await?;
+    controller_admission(&app.db, u, h, id, permission, true).await
 }
-pub(crate) async fn controller_read_for_permission<'a>(
-    app: &'a App,
-    h: &HeaderMap,
-    id: Uuid,
-    permission: protocol::RoomPermission,
-) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
-    controller_admission(app, h, id, permission, false).await
-}
-async fn controller_admission<'a>(
-    app: &'a App,
+pub(crate) async fn controller_admission<'a>(
+    db: &'a sqlx::PgPool,
+    u: User,
     h: &HeaderMap,
     id: Uuid,
     permission: protocol::RoomPermission,
     write: bool,
 ) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
-    let u = auth(app, h, write).await?;
-    member(app, &u, id).await?;
-    let mut tx = app.db.begin().await?;
+    let mut tx = db.begin().await?;
     // Same order as joining: room first, then snapshot/invitation.
     persistence::room_lifecycle::lock_active(&mut tx, id)
         .await
@@ -635,6 +628,8 @@ pub(crate) async fn commit_controller(
     Ok(())
 }
 
+#[path = "room_invite_operations.rs"]
+pub(crate) mod invitation_operations;
 #[path = "room_invites.rs"]
 mod invites_runtime;
 #[path = "room_permissions.rs"]
