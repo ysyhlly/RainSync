@@ -613,7 +613,8 @@ const privateCatalogEnabledStep = `      - name: Verify private catalog ingress 
         timeout-minutes: 3
         env:
           PRIVATE_LIBRARIES_ENABLED: "true"
-        run: ${privateCatalogEnabledCommand}
+        run: |
+          ${privateCatalogEnabledCommand}
 `;
 function assertPrivateCatalogEnabledGate(workflow) {
   const core = workflowJob(workflow, 'core-checks');
@@ -636,7 +637,8 @@ for (const [name, from, to] of [
   ['missing scans', ' catalog::scan_pages::tests::', ''],
   ['name filter', ' --test-threads=1', ' --skip private_source --test-threads=1'],
   ['native suffix', privateCatalogEnabledCommand, `${privateCatalogEnabledCommand} && node tests/private-library-settings-native.mjs`],
-  ['continued failures', `        run: ${privateCatalogEnabledCommand}\n`, `        run: ${privateCatalogEnabledCommand}\n        continue-on-error: true\n`],
+  ['continued failures', `        run: |\n          ${privateCatalogEnabledCommand}\n`, `        run: |\n          ${privateCatalogEnabledCommand}\n        continue-on-error: true\n`],
+  ['invalid plain YAML scalar', `        run: |\n          ${privateCatalogEnabledCommand}\n`, `        run: ${privateCatalogEnabledCommand}\n`],
 ]) test(`private catalog enabled CI rejects ${name}`, async () => {
   const workflow = await fs.readFile(resolve(repo, '.github/workflows/ci.yml'), 'utf8');
   assert.ok(workflow.includes(from), 'real mutation target');

@@ -41,7 +41,8 @@ jobs:
         timeout-minutes: 3
         env:
           PRIVATE_LIBRARIES_ENABLED: "true"
-        run: timeout --signal=TERM --kill-after=15s 150s cargo test -p rainsync-server --bin rainsync-server --locked -- catalog::libraries::tests:: catalog::media_reads::private_admission_tests:: catalog::room_shares::tests:: catalog::private_sources::tests:: catalog::scan_pages::tests:: --test-threads=1
+        run: |
+          timeout --signal=TERM --kill-after=15s 150s cargo test -p rainsync-server --bin rainsync-server --locked -- catalog::libraries::tests:: catalog::media_reads::private_admission_tests:: catalog::room_shares::tests:: catalog::private_sources::tests:: catalog::scan_pages::tests:: --test-threads=1
       - run: cargo run -p protocol --example export -- --check
       # Native integration and real-browser fixtures still need Node dependencies.
       - run: npm ci
