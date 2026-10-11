@@ -399,10 +399,10 @@ async fn run_case(
             "case {provider:?}/{wait_at:?}/{expected:?}: {error}"
         ));
     }
-    if let Some(tx) = blocker {
-        if let Err(error) = tx.rollback().await {
-            errors.push(format!("blocker rollback: {error}"));
-        }
+    if let Some(tx) = blocker
+        && let Err(error) = tx.rollback().await
+    {
+        errors.push(format!("blocker rollback: {error}"));
     }
     if let Err(error) = sqlx::query("SELECT 1").execute(actor).await {
         errors.push(format!("actor rollback barrier: {error}"));
