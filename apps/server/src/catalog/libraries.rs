@@ -1,6 +1,7 @@
 //! Named libraries use cases; transaction ownership stays here.
 use super::library_authority::*;
 use super::*;
+use crate::identity::{RequestContext, request as identity_request};
 const LIB_SELECT: &str = "SELECT l.*,library_allowed($1,l.id,'browse') AS browse,library_allowed($1,l.id,'play') AS play,library_allowed($1,l.id,'share_to_room') AS share_to_room,library_allowed($1,l.id,'manage') AS manage FROM private_libraries l";
 
 #[derive(Deserialize)]
@@ -89,13 +90,21 @@ async fn detail_value(connection: &mut sqlx::PgConnection, user: Uuid, id: Uuid)
     Ok(value)
 }
 
-pub(crate) async fn list(db: &PgPool, u: User) -> Result<Value> {
+pub(crate) async fn list(request: RequestContext<'_>, h: HeaderMap) -> Result<Value> {
+    let db = request.db;
+    let u = identity_request::authenticate(request, &h, false, false).await?;
     let rows=sqlx::query(&format!("{LIB_SELECT} WHERE library_allowed($1,l.id,'browse') OR library_allowed($1,l.id,'manage') ORDER BY l.name,l.id"))
         .bind(u.id).fetch_all(db).await?;
     Ok(json!({"enabled":enabled(),"items":rows.iter().map(library_value).collect::<Vec<_>>()}))
 }
 
-pub(crate) async fn issued_shares(db: &PgPool, u: User, query: IssuedSharesQuery) -> Result<Value> {
+pub(crate) async fn issued_shares(
+    request: RequestContext<'_>,
+    h: HeaderMap,
+    query: IssuedSharesQuery,
+) -> Result<Value> {
+    let db = request.db;
+    let u = identity_request::authenticate(request, &h, false, false).await?;
     // Grantors can withdraw their own records after losing library access.
     // Return no source configuration, other grantors, or inaccessible titles.
     let rows = sqlx::query("SELECT g.id,g.library_id,g.media_id,g.room_id,g.mode,l.revision,CASE WHEN s.library_id=l.id AND s.deleted_at IS NULL AND library_allowed($1,l.id,'browse') THEN m.title ELSE NULL END AS title,floor(extract(epoch FROM g.expires_at)*1000)::bigint AS expiry,(g.permission_epoch=l.permission_epoch AND s.library_id=l.id AND s.deleted_at IS NULL AND g.source_generation=m.library_source_generation AND m.available AND g.expires_at>clock_timestamp() AND library_allowed($1,l.id,'share_to_room')) AS active FROM room_media_grants g JOIN private_libraries l ON l.id=g.library_id JOIN media_items m ON m.id=g.media_id JOIN sources s ON s.id=m.source_id WHERE g.grantor_id=$1 AND g.revoked_at IS NULL AND l.deleted_at IS NULL AND ($2::uuid IS NULL OR g.id>$2) ORDER BY g.id LIMIT 101")
@@ -106,11 +115,13 @@ pub(crate) async fn issued_shares(db: &PgPool, u: User, query: IssuedSharesQuery
 }
 
 pub(crate) async fn create(
-    db: &PgPool,
-    u: User,
+    request: RequestContext<'_>,
     h: HeaderMap,
     body: Create,
-) -> Result<CommittedLibraryChange> {
+) -> Result<Value> {
+    let db = request.db;
+    require_enabled()?;
+    let u = identity_request::authenticate(request, &h, true, false).await?;
     let name = name(&body.name)?;
     let id = Uuid::new_v4();
     let mut tx = db.begin().await?;
@@ -140,21 +151,24 @@ pub(crate) async fn create(
     let value = detail_value(&mut tx, u.id, id).await?;
     commit_caller(tx, &u, &h, false).await?;
     let committed = CommittedLibraryChange::new(id, value, false);
-    Ok(committed)
+    Ok(committed.response(db).await)
 }
 
-pub(crate) async fn detail(db: &PgPool, u: User, id: Uuid) -> Result<Value> {
+pub(crate) async fn detail(request: RequestContext<'_>, h: HeaderMap, id: Uuid) -> Result<Value> {
+    let db = request.db;
+    let u = identity_request::authenticate(request, &h, false, false).await?;
     let mut connection = db.acquire().await?;
     detail_value(&mut connection, u.id, id).await
 }
 
 pub(crate) async fn rename(
-    db: &PgPool,
-    u: User,
+    request: RequestContext<'_>,
     h: HeaderMap,
     id: Uuid,
     body: Rename,
-) -> Result<CommittedLibraryChange> {
+) -> Result<Value> {
+    let db = request.db;
+    let u = identity_request::authenticate(request, &h, true, false).await?;
     let name = name(&body.name)?;
     let mut tx = db.begin().await?;
     lock_caller(&mut tx, &u, &h, false).await?;
@@ -169,16 +183,18 @@ pub(crate) async fn rename(
     require_current_permission(&mut tx, u.id, id, "manage").await?;
     commit_caller(tx, &u, &h, false).await?;
     let committed = CommittedLibraryChange::new(id, value, false);
-    Ok(committed)
+    Ok(committed.response(db).await)
 }
 
 pub(crate) async fn grant(
-    db: &PgPool,
-    u: User,
+    request: RequestContext<'_>,
     h: HeaderMap,
     id: Uuid,
     body: Grant,
-) -> Result<CommittedLibraryChange> {
+) -> Result<Value> {
+    let db = request.db;
+    require_enabled()?;
+    let u = identity_request::authenticate(request, &h, true, false).await?;
     if !(1..=720).contains(&body.expires_in_hours)
         || !(body.browse || body.play || body.share_to_room || body.manage)
         || (body.share_to_room && !body.play)
@@ -211,17 +227,18 @@ pub(crate) async fn grant(
     let value = detail_value(&mut tx, u.id, id).await?;
     commit_caller(tx, &u, &h, false).await?;
     let committed = CommittedLibraryChange::new(id, value, true);
-    Ok(committed)
+    Ok(committed.response(db).await)
 }
 
 pub(crate) async fn revoke(
-    db: &PgPool,
-    u: User,
+    request: RequestContext<'_>,
     h: HeaderMap,
     id: Uuid,
     target: Uuid,
     body: Expected,
-) -> Result<CommittedLibraryChange> {
+) -> Result<Value> {
+    let db = request.db;
+    let u = identity_request::authenticate(request, &h, true, false).await?;
     let mut tx = db.begin().await?;
     lock_caller(&mut tx, &u, &h, false).await?;
     let lib = lock_manage(&mut tx, u.id, id, revision(&body.expected_revision)?).await?;
@@ -238,16 +255,19 @@ pub(crate) async fn revoke(
     let value = detail_value(&mut tx, u.id, id).await?;
     commit_caller(tx, &u, &h, false).await?;
     let committed = CommittedLibraryChange::new(id, value, true);
-    Ok(committed)
+    Ok(committed.response(db).await)
 }
 
 pub(crate) async fn remove(
-    context: SourceWriteContext<'_>,
-    u: User,
+    request: RequestContext<'_>,
+    encrypt: &(dyn Fn(&Value) -> anyhow::Result<String> + Sync),
     h: HeaderMap,
     id: Uuid,
     body: Expected,
-) -> Result<CommittedLibraryChange> {
+) -> Result<Value> {
+    let db = request.db;
+    let u = identity_request::authenticate(request, &h, true, false).await?;
+    let context = SourceWriteContext { db, encrypt };
     let mut tx = context.db.begin().await?;
     lock_caller(&mut tx, &u, &h, false).await?;
     let lib = lock_manage(&mut tx, u.id, id, revision(&body.expected_revision)?).await?;
@@ -285,16 +305,18 @@ pub(crate) async fn remove(
     audit(&mut tx, id, u.id, "library_deleted", None).await?;
     commit_caller(tx, &u, &h, false).await?;
     let committed = CommittedLibraryChange::new(id, json!({"id":id,"deleted":true}), true);
-    Ok(committed)
+    Ok(committed.response(db).await)
 }
 
 pub(crate) async fn transfer(
-    db: &PgPool,
-    u: User,
+    request: RequestContext<'_>,
     h: HeaderMap,
     id: Uuid,
     body: Transfer,
-) -> Result<CommittedLibraryChange> {
+) -> Result<Value> {
+    let db = request.db;
+    require_enabled()?;
+    let u = identity_request::authenticate(request, &h, true, false).await?;
     let mut tx = db.begin().await?;
     lock_caller(&mut tx, &u, &h, false).await?;
     let lib = lock_manage(&mut tx, u.id, id, revision(&body.expected_revision)?).await?;
@@ -324,7 +346,7 @@ pub(crate) async fn transfer(
         json!({"id":id,"owner_id":target,"transferred":true}),
         true,
     );
-    Ok(committed)
+    Ok(committed.response(db).await)
 }
 
 #[cfg(test)]
@@ -338,6 +360,206 @@ mod tests {
         assert!(revision("1").is_ok());
         for value in ["0", "-1", "1.0", " 1", "9223372036854775807"] {
             assert!(revision(value).is_err());
+        }
+    }
+    #[test]
+    fn library_revision_keeps_positive_leading_zero_and_ascii_rules() {
+        for (wire, expected) in [
+            ("1", 1),
+            ("01", 1),
+            ("000123", 123),
+            ("9223372036854775806", i64::MAX - 1),
+        ] {
+            assert_eq!(revision(wire).unwrap(), expected);
+        }
+        for wire in [
+            "",
+            "0",
+            "000",
+            "+1",
+            "-1",
+            "1.0",
+            " 1",
+            "1 ",
+            "１",
+            "١",
+            "9223372036854775807",
+            "9223372036854775808",
+        ] {
+            let error = revision(wire).unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert_eq!(error.1, "library_invalid");
+        }
+    }
+
+    #[test]
+    fn library_names_keep_trim_unicode_length_and_control_rules() {
+        assert_eq!(name("  私人片库  ").unwrap(), "私人片库");
+        assert_eq!(name(&"片".repeat(100)).unwrap().chars().count(), 100);
+        for value in [
+            "".to_owned(),
+            "  ".into(),
+            "a\nb".into(),
+            "a\0b".into(),
+            "片".repeat(101),
+        ] {
+            let error = name(&value).unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert_eq!(error.1, "library_invalid");
+        }
+    }
+
+    #[test]
+    fn library_write_dtos_keep_deny_unknown_fields() {
+        fn rejects_extra<T: serde::de::DeserializeOwned>(mut valid: Value) {
+            assert!(serde_json::from_value::<T>(valid.clone()).is_ok());
+            valid["unexpected"] = json!(true);
+            assert!(serde_json::from_value::<T>(valid).is_err());
+        }
+        rejects_extra::<Create>(json!({"name":"library"}));
+        rejects_extra::<Rename>(json!({"name":"library","expected_revision":"01"}));
+        rejects_extra::<Grant>(json!({"username":"viewer","browse":true,"play":true,
+            "share_to_room":false,"manage":false,"expires_in_hours":1,"expected_revision":"01"}));
+        rejects_extra::<Expected>(json!({"expected_revision":"01"}));
+        rejects_extra::<Transfer>(json!({"username":"viewer","expected_revision":"01"}));
+    }
+
+    async fn closed_pool() -> PgPool {
+        // No connection is opened. A misplaced SQL operation fails against an
+        // already closed pool rather than ever opening a database socket.
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .min_connections(0)
+            .connect_lazy_with(sqlx::postgres::PgConnectOptions::new());
+        db.close().await;
+        assert!(db.is_closed());
+        db
+    }
+
+    fn request(db: &PgPool) -> RequestContext<'_> {
+        RequestContext {
+            db,
+            origin: "https://rainsync.example",
+        }
+    }
+
+    fn login_required(result: Result<Value>) {
+        let error = result.unwrap_err();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.1, "login_required");
+    }
+
+    #[tokio::test]
+    async fn library_reads_authenticate_before_database_access() {
+        let db = closed_pool().await;
+        login_required(list(request(&db), HeaderMap::new()).await);
+        login_required(
+            issued_shares(
+                request(&db),
+                HeaderMap::new(),
+                IssuedSharesQuery { after: None },
+            )
+            .await,
+        );
+        login_required(detail(request(&db), HeaderMap::new(), Uuid::nil()).await);
+    }
+
+    #[tokio::test]
+    async fn ungated_library_writes_authenticate_before_name_revision_or_transaction() {
+        let db = closed_pool().await;
+        login_required(
+            rename(
+                request(&db),
+                HeaderMap::new(),
+                Uuid::nil(),
+                Rename {
+                    name: "".into(),
+                    expected_revision: "invalid".into(),
+                },
+            )
+            .await,
+        );
+        login_required(
+            revoke(
+                request(&db),
+                HeaderMap::new(),
+                Uuid::nil(),
+                Uuid::nil(),
+                Expected {
+                    expected_revision: "invalid".into(),
+                },
+            )
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn library_remove_authenticates_before_protection_revision_or_cipher() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let db = closed_pool().await;
+        let calls = AtomicUsize::new(0);
+        let encrypt = |_: &Value| -> anyhow::Result<String> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("cipher must not run before authentication")
+        };
+        login_required(
+            remove(
+                request(&db),
+                &encrypt,
+                HeaderMap::new(),
+                Uuid::from_u128(1),
+                Expected {
+                    expected_revision: "invalid".into(),
+                },
+            )
+            .await,
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn gated_library_writes_reject_before_business_validation_or_database_access() {
+        let db = closed_pool().await;
+        // Exercise the process's real setting without mutating global env. Run
+        // this test in separate enabled/disabled processes to qualify both paths.
+        let expected = if enabled() {
+            (StatusCode::UNAUTHORIZED, "login_required")
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "private_libraries_disabled",
+            )
+        };
+        let outcomes = [
+            create(request(&db), HeaderMap::new(), Create { name: "".into() }).await,
+            grant(
+                request(&db),
+                HeaderMap::new(),
+                Uuid::nil(),
+                Grant {
+                    username: "".into(),
+                    browse: false,
+                    play: false,
+                    share_to_room: true,
+                    manage: false,
+                    expires_in_hours: 0,
+                    expected_revision: "invalid".into(),
+                },
+            )
+            .await,
+            transfer(
+                request(&db),
+                HeaderMap::new(),
+                Uuid::nil(),
+                Transfer {
+                    username: "".into(),
+                    expected_revision: "invalid".into(),
+                },
+            )
+            .await,
+        ];
+        for outcome in outcomes {
+            let error = outcome.unwrap_err();
+            assert_eq!((error.0, error.1.as_str()), expected);
         }
     }
 }

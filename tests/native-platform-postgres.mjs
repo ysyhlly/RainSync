@@ -93,9 +93,10 @@ try {
   const migration = names.find((name) => name === "0051_native_platform.sql");
   assert.ok(migration, "0051_native_platform.sql is required");
   const inputPaths = [...names.map((name) => "migrations/" + name),
-    "tests/fixtures/postgres.mjs", "tests/native-platform-postgres.mjs", "apps/server/src/platform_accounts.rs"];
+    "tests/fixtures/postgres.mjs", "tests/native-platform-postgres.mjs", "apps/server/src/platform_accounts.rs",
+    "apps/server/src/platform_accounts/qr_login.rs"];
   for (const path of inputPaths) report.inputs.push({ path, sha256: sha(await readFile(resolve(repo, path))) });
-  const accountSource = await readFile(resolve(repo, "apps/server/src/platform_accounts.rs"), "utf8");
+  const accountSource = (await readFile(resolve(repo, "apps/server/src/platform_accounts/qr_login.rs"), "utf8")).split("#[cfg(test)]")[0];
   const predicates = [...accountSource.matchAll(/sqlx::query\("(UPDATE platform_accounts SET state='connected'[^"\n]+)"\)/g)];
   assert.equal(predicates.length, 1, "exactly one QR account-completion SQL literal must be identifiable");
   completionSQL = predicates[0][1];

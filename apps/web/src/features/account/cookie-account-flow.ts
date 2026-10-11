@@ -8,12 +8,12 @@ export function createCookieAccountFlow<
   current: () => boolean;
   hasInput: (secret: string) => boolean;
   validateInput: (secret: string) => boolean;
-  validateStatus: (value: Status) => unknown;
+  validateStatus: (value: unknown) => Status;
   submit: (
     secret: string,
     revision: string | null,
     signal: AbortSignal,
-  ) => Promise<Status>;
+  ) => Promise<unknown>;
   clearSecret: () => void;
   change: (phase: CookieAccountPhase) => void;
 }) {
@@ -37,10 +37,14 @@ export function createCookieAccountFlow<
     }
     options.change("submitting");
     try {
-      const value = await options.submit(secret, revision, controller.signal);
+      const response = await options.submit(
+        secret,
+        revision,
+        controller.signal,
+      );
       secret = "";
       if (!current()) return;
-      options.validateStatus(value);
+      const value = options.validateStatus(response);
       options.change(value.state === "connected" ? "stored" : "uncertain");
     } catch {
       // Never surface service error text that could echo a session credential.

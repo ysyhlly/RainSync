@@ -1,13 +1,16 @@
 //! Resumable source-page operations retain complete checkpoint transactions.
 use super::{
     SourceReadContext,
-    library_authority::{lock_caller, require_current_permission},
+    library_authority::{lock_caller, require_current_permission, require_enabled},
 };
-use crate::{Result, User, err, hash};
+use crate::{
+    Result, User, err, hash,
+    identity::{RequestContext, request},
+};
 use axum::http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 #[derive(Deserialize, Default)]
@@ -19,7 +22,14 @@ pub struct ScanRequest {
 fn scan_value(row: &sqlx::postgres::PgRow) -> Value {
     json!({"scan_id":row.get::<Uuid,_>("scan_id"),"status":row.get::<String,_>("status"),"item_count":row.get::<i64,_>("item_count"),"page_count":row.get::<i64,_>("page_count"),"has_more":row.get::<Option<String>,_>("continuation_token").is_some(),"last_error":row.get::<Option<String>,_>("last_error")})
 }
-pub async fn scan_status(db: &PgPool, viewer: Uuid, lib: Uuid, source: Uuid) -> Result<Value> {
+pub async fn scan_status(
+    request: RequestContext<'_>,
+    h: HeaderMap,
+    lib: Uuid,
+    source: Uuid,
+) -> Result<Value> {
+    let db = request.db;
+    let viewer = request::authenticate(request, &h, false, false).await?.id;
     let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sources WHERE id=$1 AND library_id=$2 AND deleted_at IS NULL AND library_allowed($3,$2,'manage'))").bind(source).bind(lib).bind(viewer).fetch_one(db).await?;
     if !allowed {
         return Err(err(StatusCode::NOT_FOUND, "source_not_found"));
@@ -42,18 +52,22 @@ pub async fn scan_status(db: &PgPool, viewer: Uuid, lib: Uuid, source: Uuid) -> 
         .unwrap_or(json!({"status":"not_started","item_count":0,"page_count":0,"has_more":false})))
 }
 pub async fn scan(
-    context: &SourceReadContext<'_>,
-    user: User,
+    request: RequestContext<'_>,
+    decrypt: &(dyn Fn(&str) -> anyhow::Result<Value> + Sync),
     h: HeaderMap,
     lib: Uuid,
     source: Uuid,
     body: ScanRequest,
 ) -> Result<Value> {
+    let db = request.db;
+    require_enabled()?;
+    let user = request::authenticate(request, &h, true, false).await?;
+    let context = SourceReadContext { db, decrypt };
     let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sources WHERE id=$1 AND library_id=$2 AND deleted_at IS NULL AND library_allowed($3,$2,'manage'))").bind(source).bind(lib).bind(user.id).fetch_one(context.db).await?;
     if !allowed {
         return Err(err(StatusCode::NOT_FOUND, "source_not_found"));
     }
-    scan_source_page_as(context, source, body.restart, Some((user, h, lib))).await
+    scan_source_page_as(&context, source, body.restart, Some((user, h, lib))).await
 }
 /// One resumable, atomically checkpointed page. No detached scan can finish after
 /// its source revision/cursor has changed. A failed page never removes old items.
@@ -324,4 +338,69 @@ async fn scan_source_page_as(
         .await?;
     commit_scan(tx, &caller).await?;
     Ok(scan_value(&row))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_scan_request_preserves_restart_default_and_strict_wire_shape() {
+        assert!(!ScanRequest::default().restart);
+        assert!(
+            !serde_json::from_value::<ScanRequest>(json!({}))
+                .unwrap()
+                .restart
+        );
+        assert!(
+            serde_json::from_value::<ScanRequest>(json!({"restart":true}))
+                .unwrap()
+                .restart
+        );
+        assert!(serde_json::from_value::<ScanRequest>(json!({"restart":"true"})).is_err());
+        assert!(serde_json::from_value::<ScanRequest>(json!({"unexpected":true})).is_err());
+    }
+
+    #[tokio::test]
+    async fn private_scan_admission_precedes_database_slots_and_decryption() {
+        // No connection is ever opened. Any accidental DB access fails against
+        // the closed pool rather than being accepted as an authentication error.
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .min_connections(0)
+            .connect_lazy("postgres://unused:unused@localhost/unused")
+            .unwrap();
+        db.close().await;
+        let request = || RequestContext {
+            db: &db,
+            origin: "https://rainsync.example",
+        };
+        let failure = scan_status(request(), HeaderMap::new(), Uuid::nil(), Uuid::nil())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(failure.1, "login_required");
+        let decrypt = |_: &str| -> anyhow::Result<Value> {
+            panic!("scan admission must reject before decryption")
+        };
+        let failure = scan(
+            request(),
+            &decrypt,
+            HeaderMap::new(),
+            Uuid::nil(),
+            Uuid::nil(),
+            ScanRequest::default(),
+        )
+        .await
+        .unwrap_err();
+        let (status, reason) = if super::super::library_authority::enabled() {
+            (StatusCode::UNAUTHORIZED, "login_required")
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "private_libraries_disabled",
+            )
+        };
+        assert_eq!(failure.0, status);
+        assert_eq!(failure.1, reason);
+    }
 }

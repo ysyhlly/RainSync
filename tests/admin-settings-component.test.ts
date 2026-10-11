@@ -635,3 +635,89 @@ it("rejects malformed access settings without exposing arbitrary values", () => 
   value.overrides.guests_enabled = "true";
   expect(() => helpers.checkedSettings(value)).toThrow();
 });
+
+it.each([null, true, "receipt", [], { revision: "8" }])(
+  "unknown PATCH receipt %j preserves draft and blocks repeat writes",
+  async (receipt) => {
+    const p = panel(
+      vi.fn(async (_path, method = "GET") =>
+        method === "PATCH" ? receipt : fixture(),
+      ),
+    );
+    await ready(p);
+    edit(p);
+    await p.c.save();
+    expect(p.c.uncertain.value).toBe(true);
+    expect(p.c.error.value).toContain("保存响应不完整");
+    expect(p.c.detail.value.revision).toBe("7");
+    expect(p.c.draft.value.playback_session_limit.value).toBe(8);
+    expect(p.c.message.value).toBe("");
+    await p.c.save();
+    expect(mutations(p.api)).toHaveLength(1);
+  },
+);
+
+it("a retired admin PATCH receipt is not parsed or classified as a current uncertain write", async () => {
+  const pending = deferred<unknown>();
+  const p = panel(
+    vi.fn(async (_path, method = "GET") =>
+      method === "PATCH" ? pending.promise : fixture(),
+    ),
+  );
+  await ready(p);
+  edit(p);
+  const work = p.c.save();
+  const touch = vi.fn(() => {
+    throw Error("retired receipt");
+  });
+  p.session.clear();
+  pending.resolve(Object.defineProperty({}, "revision", { get: touch }));
+  await work;
+  expect(touch).not.toHaveBeenCalled();
+  expect(p.c.uncertain.value).toBe(false);
+  expect(p.c.detail.value).toBeUndefined();
+  expect(p.c.message.value).toBe("");
+});
+
+it.each([undefined, "1730000000000", Number.MAX_SAFE_INTEGER + 1])(
+  "malformed updated_at %s in a PATCH receipt is uncertain, never a confirmed save",
+  async (updated_at) => {
+    const p = panel(
+      vi.fn(async (_path, method = "GET") =>
+        method === "PATCH"
+          ? { ...fixture("8", { playback_session_limit: 8 }), updated_at }
+          : fixture(),
+      ),
+    );
+    await ready(p);
+    edit(p);
+    await p.c.save();
+    expect(p.c.uncertain.value).toBe(true);
+    expect(p.c.error.value).toContain("保存响应不完整");
+    expect(p.c.detail.value.revision).toBe("7");
+    expect(p.c.draft.value.playback_session_limit.value).toBe(8);
+    expect(p.c.message.value).toBe("");
+    await p.c.save();
+    expect(mutations(p.api)).toHaveLength(1);
+    expect(reads(p.api)).toHaveLength(1);
+  },
+);
+
+it("malformed updated_at GET follows the existing load-error path and preserves an edited draft", async () => {
+  let calls = 0;
+  const p = panel(
+    vi.fn(async () =>
+      ++calls === 2 ? fixture() : { ...fixture(), updated_at: "bad" },
+    ),
+  );
+  await ready(p);
+  expect(p.c.detail.value).toBeUndefined();
+  expect(p.c.error.value).toBe("设置读取失败，请检查连接后重试。");
+  await p.c.load();
+  edit(p);
+  await p.c.load();
+  expect(p.c.detail.value.revision).toBe("7");
+  expect(p.c.draft.value.playback_session_limit.value).toBe(8);
+  expect(p.c.refreshError.value).toContain("设置读取失败");
+  expect(p.c.uncertain.value).toBe(false);
+});

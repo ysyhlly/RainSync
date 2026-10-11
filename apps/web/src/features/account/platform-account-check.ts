@@ -1,3 +1,4 @@
+import { responseRecord, responseMember } from "../../shared/api/response";
 import type {
   PlatformAccountCheck,
   PlatformAccountStatus,
@@ -5,12 +6,12 @@ import type {
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function validatePlatformAccountStatus(
-  value: PlatformAccountStatus,
+  value: unknown,
 ): PlatformAccountStatus {
   if (
-    !value ||
+    !responseRecord(value) ||
     value.provider !== "bilibili" ||
-    !["connected", "expired", "revoked"].includes(value.state) ||
+    !responseMember(value.state, ["connected", "expired", "revoked"]) ||
     (value.id !== null &&
       (typeof value.id !== "string" || !uuid.test(value.id))) ||
     (value.revision !== null &&
@@ -29,15 +30,22 @@ export function validatePlatformAccountStatus(
 }
 
 export function validatePlatformAccountCheck(
-  value: PlatformAccountCheck,
+  value: unknown,
 ): PlatformAccountCheck {
-  if (!value) throw Error("平台账号检查响应不完整");
+  if (!responseRecord(value)) throw Error("平台账号检查响应不完整");
   const account = validatePlatformAccountStatus(value.account);
   if (
-    !["verified", "invalid", "unknown", "none"].includes(value.verification) ||
+    !responseMember(value.verification, [
+      "verified",
+      "invalid",
+      "unknown",
+      "none",
+    ]) ||
     value.renew_method !== "qr_login" ||
     (value.checked_at !== null &&
-      (!Number.isSafeInteger(value.checked_at) || value.checked_at <= 0)) ||
+      (typeof value.checked_at !== "number" ||
+        !Number.isSafeInteger(value.checked_at) ||
+        value.checked_at <= 0)) ||
     (value.verification === "none") !== (value.checked_at === null) ||
     (["verified", "unknown"].includes(value.verification) &&
       account.state !== "connected") ||

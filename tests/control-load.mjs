@@ -137,6 +137,7 @@ const sourceFiles = candidate
       "crates/persistence/src/lib.rs",
       "crates/persistence/src/room_commands.rs",
       "apps/server/src/rooms.rs",
+      "apps/server/src/room_directory_operations.rs",
       "apps/server/src/metrics.rs",
       "tests/control-load.mjs",
     ];

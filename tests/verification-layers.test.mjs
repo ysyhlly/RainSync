@@ -14,6 +14,41 @@ import { assertBindingsUnchanged, bindingSourceFiles, captureBindings, collectRe
   publishedBaseline, resolvePgConfig, saveReport, validateHistory, validateSelection,
 } from '../scripts/verification/upgrade-recovery.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+// Fixed owned command, not a count-only check: no skip filters, shell comments,
+// or appended native execution may masquerade as this pure contract gate.
+const backendContractFiles = [
+  'tests/backend-cleanup-contract.test.mjs',
+  'tests/server-bootstrap-contract.test.mjs',
+  'tests/room-lifecycle-source-contract.test.mjs',
+  'tests/room-lifecycle-snapshot.test.mjs',
+  'tests/room-guest-access-contract.test.mjs',
+  'tests/short-platform-account-snapshot.test.mjs',
+  'tests/short-platform-account-response.test.mjs',
+  'tests/short-platform-account-schema.test.mjs',
+  'tests/authority-required-checks.test.mjs',
+  'tests/room-kick-seed-contract.test.mjs',
+  'tests/room-lifecycle-clock-socket.test.mjs',
+  'tests/room-directory-clock-socket.test.mjs',
+  'tests/media-preview-admission-contract.test.mjs',
+  'tests/room-playlist-contract.test.mjs',
+  'tests/room-playlist-socket.test.mjs',
+  'tests/catalog-boundaries.test.mjs',
+  'tests/catalog-cipher-contract.test.mjs',
+  'tests/private-library-grants-ingress-contract.test.mjs',
+  'tests/private-library-room-shares-ingress-contract.test.mjs',
+  'tests/private-library-sources-ingress-contract.test.mjs',
+  'tests/youtube-account-ingress-contract.test.mjs',
+  'tests/youtube-platform-account-schema.test.mjs',
+  'tests/existing-fixture-failure-contract.test.mjs',
+  'tests/oauth-account-operations-contract.test.mjs',
+  'tests/platform-account-renewal-schema.test.mjs',
+  'tests/bilibili-login-operations-contract.test.mjs',
+  'tests/bilibili-account-operations-contract.test.mjs',
+  'tests/bilibili-renewal-account-operations-contract.test.mjs',
+];
+const backendContractCommand = `node --test ${backendContractFiles.join(' ')}`;
+const assertBackendContractCommand = command => assert.equal(command, backendContractCommand);
+
 // Sanitized retained Node 24 native-pass TAP; no raw diagnostics or durations.
 const actualTap = "TAP version 13\n# Subtest: full immutable migration history is checked against the recent published baseline and candidate SHA\nok 1 - full immutable migration history is checked against the recent published baseline and candidate SHA\n# Subtest: populated recent baseline upgrades and restores separately while old-schema preflight remains closed\nok 2 - populated recent baseline upgrades and restores separately while old-schema preflight remains closed\n# Subtest: source and platform encrypted fields use one fixed startup/recovery inventory\nok 3 - source and platform encrypted fields use one fixed startup/recovery inventory\n# Subtest: private malformed input and arbitrary assertion diagnostics never leave safe error boundaries\nok 4 - private malformed input and arbitrary assertion diagnostics never leave safe error boundaries\n# Subtest: every encrypted field rejects wrong keys and corrupt bytes before backup output exists\nok 5 - every encrypted field rejects wrong keys and corrupt bytes before backup output exists\n# Subtest: pairing and revocation between material validation and dump preserve the captured recovery point\nok 6 - pairing and revocation between material validation and dump preserve the captured recovery point\n# Subtest: recovery ciphertext validation rejects noncanonical base64 and invalid UTF-8\nok 7 - recovery ciphertext validation rejects noncanonical base64 and invalid UTF-8\n# Subtest: lost snapshot exporter cannot produce a complete backup manifest\nok 8 - lost snapshot exporter cannot produce a complete backup manifest\n1..8\n# tests 8\n# suites 0\n# pass 8\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n";
 const source = { head: 'a'.repeat(40), migrations: [] };
@@ -104,6 +139,7 @@ test('frontend and mock-browser gates move exactly once into independent strict 
   const commands = scripts.flatMap(script => script.split('\n').flatMap(line => line.split(' && ')));
   for (const [command, job] of [
     ['npm run lint', frontend], ['npm test', frontend], ['npm run build', frontend],
+    ['npm run test:response-boundary-types', frontend],
     ['npm run test:frontend-bundle', frontend], ['npm run test:e2e', browser], [driver, browser],
   ]) {
     assert.equal(commands.filter(value => value === command).length, 1, `one gate: ${command}`);
@@ -119,7 +155,8 @@ test('frontend and mock-browser gates move exactly once into independent strict 
   assert.deepEqual(runScripts(frontend), [
     'mkdir -p "$RUNNER_TEMP/rainsync-frontend-validation"\n' +
       'echo "RAINSYNC_ARTIFACT_DIR=$RUNNER_TEMP/rainsync-frontend-validation" >> "$GITHUB_ENV"',
-    'npm ci && npm run lint && npm test && npm run build', 'npm run test:frontend-bundle',
+    'npm ci && npm run lint && npm test && npm run build',
+    'npm run test:response-boundary-types', 'npm run test:frontend-bundle',
   ]);
   assert.deepEqual(runScripts(browser), [
     'mkdir -p "$RUNNER_TEMP/rainsync-browser-mock"\n' +
@@ -134,12 +171,16 @@ test('frontend and mock-browser gates move exactly once into independent strict 
   assert.ok(core.indexOf('npm ci') < core.indexOf('npm run test:backend-contracts'));
   assert.ok(core.indexOf('npx playwright install --with-deps chromium') < core.indexOf('npm run test:browser-real'));
   assert.ok(core.indexOf('npm run test:browser-real') < core.indexOf('node tests/playlist-real.mjs'));
-  assert.equal(commands.filter(command => command === 'npm ci').length, 3);
+  // The separately owned native-gates runner also installs its own dependencies.
+  assert.equal(runScripts(workflowJob(workflow, 'owner-gates')).filter(command => command === 'npm ci').length, 1);
+  assert.equal(commands.filter(command => command === 'npm ci').length, 4);
   assert.equal(commands.filter(command => command === 'npx playwright install --with-deps chromium').length, 2);
 });
 test('routing owns each new entry once and leaves owner and unrelated native chains independent', async () => {
   const workflow = await fs.readFile(resolve(repo, '.github/workflows/ci.yml'), 'utf8');
   const packageJson = JSON.parse(await fs.readFile(resolve(repo, 'package.json')));
+  assert.equal(packageJson.scripts['test:response-boundary-types'], 'node scripts/verification/response-boundary-types.mjs');
+  assertBackendContractCommand(packageJson.scripts['test:backend-contracts']);
   const core = workflowJob(workflow, 'core-checks');
   const recovery = workflowJob(workflow, 'upgrade-recovery');
   const owner = workflowJob(workflow, 'owner-gates');
@@ -547,4 +588,56 @@ test('private invocation preserves every falsy rejection value', async t => {
       root: repo, env: {}, runtime: blockedRuntime }, async () => { throw original; }),
       error => error instanceof AggregateError && error.errors[0] === original);
   }
+});
+
+
+for (const file of backendContractFiles) {
+  test(`backend gate rejects missing ${file}`, () => {
+    assert.throws(() => assertBackendContractCommand(backendContractCommand.replace(` ${file}`, '')), assert.AssertionError);
+  });
+  test(`backend gate rejects duplicated ${file}`, () => {
+    assert.throws(() => assertBackendContractCommand(`${backendContractCommand} ${file}`), assert.AssertionError);
+  });
+}
+for (const [name, mutate] of [
+  ['skip filter', command => command.replace('node --test', 'node --test --test-name-pattern=^NEVER_MATCH_ANY_TEST$')],
+  ['shell comment', command => command.replace(` ${backendContractFiles.at(-5)}`, ` # ${backendContractFiles.at(-5)}`)],
+  ['native suffix', command => `${command} && node tests/private-library-settings-native.mjs`],
+]) test(`backend gate rejects ${name}`, () => {
+  assert.throws(() => assertBackendContractCommand(mutate(backendContractCommand)), assert.AssertionError);
+});
+
+const privateCatalogEnabledCommand = 'timeout --signal=TERM --kill-after=15s 150s cargo test -p rainsync-server --bin rainsync-server --locked -- catalog::libraries::tests:: catalog::media_reads::private_admission_tests:: catalog::room_shares::tests:: catalog::private_sources::tests:: catalog::scan_pages::tests:: --test-threads=1';
+const privateCatalogEnabledStep = `      - name: Verify private catalog ingress with feature enabled
+        timeout-minutes: 3
+        env:
+          PRIVATE_LIBRARIES_ENABLED: "true"
+        run: ${privateCatalogEnabledCommand}
+`;
+function assertPrivateCatalogEnabledGate(workflow) {
+  const core = workflowJob(workflow, 'core-checks');
+  assert.equal(workflow.split('name: Verify private catalog ingress with feature enabled').length - 1, 1);
+  const start = core.indexOf('      - name: Verify private catalog ingress with feature enabled');
+  assert.ok(start >= 0);
+  const next = core.indexOf('\n      - ', start + 1);
+  assert.equal(core.slice(start, next < 0 ? core.length : next + 1), privateCatalogEnabledStep);
+  assert.equal(workflow.split(privateCatalogEnabledCommand).length - 1, 1);
+  const commands = runScripts(core);
+  assert.ok(commands.indexOf('cargo test --workspace --locked') >= 0);
+  assert.equal(commands.indexOf(privateCatalogEnabledCommand), commands.indexOf('cargo test --workspace --locked') + 1);
+}
+test('private catalog CI separately exercises its enabled admission branch with exact pure filters', async () => {
+  assertPrivateCatalogEnabledGate(await fs.readFile(resolve(repo, '.github/workflows/ci.yml'), 'utf8'));
+});
+for (const [name, from, to] of [
+  ['disabled flag', 'PRIVATE_LIBRARIES_ENABLED: "true"', 'PRIVATE_LIBRARIES_ENABLED: "false"'],
+  ['conditional skip', '        timeout-minutes: 3\n        env:\n          PRIVATE_LIBRARIES_ENABLED', '        if: false\n        timeout-minutes: 3\n        env:\n          PRIVATE_LIBRARIES_ENABLED'],
+  ['missing scans', ' catalog::scan_pages::tests::', ''],
+  ['name filter', ' --test-threads=1', ' --skip private_source --test-threads=1'],
+  ['native suffix', privateCatalogEnabledCommand, `${privateCatalogEnabledCommand} && node tests/private-library-settings-native.mjs`],
+  ['continued failures', `        run: ${privateCatalogEnabledCommand}\n`, `        run: ${privateCatalogEnabledCommand}\n        continue-on-error: true\n`],
+]) test(`private catalog enabled CI rejects ${name}`, async () => {
+  const workflow = await fs.readFile(resolve(repo, '.github/workflows/ci.yml'), 'utf8');
+  assert.ok(workflow.includes(from), 'real mutation target');
+  assert.throws(() => assertPrivateCatalogEnabledGate(workflow.replace(from, to)), assert.AssertionError);
 });

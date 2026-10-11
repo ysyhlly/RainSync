@@ -163,5 +163,159 @@
   "library_upload": {
     "result": "failed before preparing uploads with HTTP401",
     "new_versions": null
+  },
+  "snapshot_scope": {
+    "record_kind": "frozen_handoff_snapshot",
+    "as_of_utc": "2026-10-10T13:26:36.518243+00:00",
+    "applies_to": "All pre-existing fields above remain historical facts at the original handoff; none is replaced by this additive index.",
+    "stale_as_current_state": [
+      "source_head and source counts",
+      "observed_remote_main and previously_unpushed_commits",
+      "cloud_role",
+      "pending_source_proposals classifications",
+      "future_tests_not_started",
+      "remote_ci"
+    ],
+    "publication_authorization_scope": "The original publication_authorization applies only to the old handoff. It does not authorize publication of the new branch, merge or deployment.",
+    "evidence_preservation": "Original failures, archive bytes, manifests, hashes and all historical field values are retained. Later implementation or retries do not rewrite their outcomes."
+  },
+  "current_status_index": {
+    "as_of_utc": "2026-10-10T15:54:05Z",
+    "document": "CURRENT_STATUS_20261010.md",
+    "observed_committed_head": "526a5906fb7a5dfdfbabbe6a8ae252b5ed236afe",
+    "production_comparison_base": "ffe4f7f03450d2a59d89b309d63dfcf951590cc9",
+    "production_changed_since_comparison_base": false,
+    "checkpoint_documents": [
+      "FIVE_OPERATION_INTEGRATION_STATUS.md",
+      "NEXT_OPERATION_INTEGRATION_STATUS.md",
+      "PRIVATE_LIBRARY_INTEGRATION_STATUS.md",
+      "YOUTUBE_INTEGRATION_STATUS.md"
+    ],
+    "implemented_scope": [
+      "room kick, guest-policy, lifecycle, directory and short-platform account operations",
+      "preview admission, playlist operations and selected frontend response boundaries",
+      "all twenty private-library HTTP ingress adapters",
+      "all three YouTube status/import/unlink ingress adapters"
+    ],
+    "current_pure_checks_reported_by_integration_lane": {
+      "five_fixture_contract_files_combined": {
+        "passed": 151,
+        "failed": 0,
+        "private_local_mutations": 15,
+        "youtube_native_fixture": 76,
+        "existing_short_snapshot_and_response": 58,
+        "existing_youtube_schema": 2
+      },
+      "backend_contracts": {
+        "passed": 329,
+        "failed": 0
+      },
+      "ci_verification_contracts": {
+        "passed": 160,
+        "failed": 0
+      },
+      "owner_gate_contracts": {
+        "passed": 25,
+        "failed": 0
+      },
+      "native_execution": false,
+      "scope": "The five-file run includes the normal-exit changes integrated as 526a590. The two new files contribute 91 of its 151 passing cases. Separate backend/CI/owner counts overlap other contracts and must not be summed into a distinct grand total. Final independent review is pending; pure tests do not freeze or natively qualify the fixture."
+    },
+    "historical_same_source_rust_result": {
+      "distinct_server_tests": 83,
+      "server_test_invocations": 104,
+      "source_report": "YOUTUBE_INTEGRATION_STATUS.md",
+      "recompiled_or_rerun_for_this_index": false
+    },
+    "new_native_fixture_qualification": {
+      "private_local_mutations": "authored and pure-checked only; no ORIGINAL or CANDIDATE qualification",
+      "youtube_accounts": "normal-exit gate and outer-supervisor documentation integrated as 526a590 from db9658a; final review pending; not frozen; no ORIGINAL or CANDIDATE qualification",
+      "registered_as_ci_native_gates": false
+    },
+    "saved_environment_private_original_result": {
+      "phase": "ORIGINAL",
+      "provenance": "Saved RainSync test-environment execution reported to the integration coordinator; the documentation-only update did not independently reopen the raw archive.",
+      "fixtures": [
+        {
+          "name": "private-library-expiry-native.mjs",
+          "exit_code": 0,
+          "lock_wait_cases": 4,
+          "self_revoke_cases": 1,
+          "post_run_checks_passed": 23
+        },
+        {
+          "name": "catalog-media-reads.mjs",
+          "exit_code": 0,
+          "checks_passed": 19,
+          "post_run_checks_passed": 23
+        },
+        {
+          "name": "catalog-scan-pages.mjs",
+          "exit_code": 0,
+          "checks_passed": 9,
+          "post_run_checks_passed": 24
+        }
+      ],
+      "binding_artifacts_unchanged": 18,
+      "protected_inputs_unchanged": 23,
+      "ports_cleaned": 7,
+      "archive_sha256": "57ec5344a95a9194de2905094b820b4bc91a357e55cde0ba0e643a1e7f19a1fb",
+      "candidate_parity_established": false
+    },
+    "saved_environment_in_progress_at_snapshot": [
+      "playlist-chat ORIGINAL",
+      "queue-propagation ORIGINAL"
+    ],
+    "candidate_transfer_and_new_branch_publication": "pending user response; old handoff publication approval is not reused",
+    "candidate_native_pairing": "pending independent source/binary bindings and byte-identical qualified fixture/helper inputs",
+    "plan_complete": false,
+    "excluded": [
+      "P08",
+      "P09",
+      "dependent playback scope",
+      "user-computer actions",
+      "merge",
+      "deployment"
+    ]
+  },
+  "latest_followup": {
+    "as_of_utc": "2026-10-10T16:06:43.509982+00:00",
+    "implementation_test_head": "f72ea93",
+    "source_unchanged_from": "ffe4f7f03450d2a59d89b309d63dfcf951590cc9",
+    "backend_inventory_files": 626,
+    "checks": {
+      "combined_six_fixture_contract_files": 176,
+      "backend_contracts": 348,
+      "verification_contracts": 162,
+      "owner_pure_contracts": 25,
+      "counts_overlap": true,
+      "native_executed_locally": false
+    },
+    "fixture_review": "Private mutation, YouTube and existing failure-chain changes independently pure-reviewed. No new native qualification; changed helper bytes require fresh pairing.",
+    "queue_original": {
+      "exit_code": 0,
+      "main_assertion_evaluations": 10,
+      "post_checks": 26,
+      "bindings_unchanged": 18,
+      "protected_programs_unchanged": 23,
+      "websockets_close_and_tcp_close_observed": 3,
+      "cleanup": "Node, Server and PostgreSQL exited; ports closed; pg_ctl status=3"
+    },
+    "playlist_chat_original": {
+      "state": "not_started",
+      "scope_preflight_exit_code": 2,
+      "reason": "Room command transaction enters excluded playback session updates and cancel_jobs; not retried."
+    },
+    "saved_evidence_archive": {
+      "sha256": "9b7cee6279755216479f57c9cda8b1c387294ca158c41427e54ff09cb393edbe",
+      "bytes": 13610268,
+      "restored_files": 2490,
+      "independent_restore": "passed in saved environment"
+    },
+    "saved_task_running": false,
+    "candidate_transfer": "pending user response",
+    "candidate_native_pairing": "not_run",
+    "published": false,
+    "plan_complete": false
   }
 }

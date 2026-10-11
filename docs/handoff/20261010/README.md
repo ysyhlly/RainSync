@@ -1,5 +1,11 @@
 # RainSync 重构交接：2026-10-10
 
+> **阅读范围：本页原文与 `status.json` 的既有字段是 2026-10-10 13:26 UTC 的冻结交接快照，不是当前实现或测试状态。** 当前索引见 [CURRENT_STATUS_20261010.md](CURRENT_STATUS_20261010.md)，按时间连接 [五操作](FIVE_OPERATION_INTEGRATION_STATUS.md)、[preview/playlist/响应边界](NEXT_OPERATION_INTEGRATION_STATUS.md)、[private-library](PRIVATE_LIBRARY_INTEGRATION_STATUS.md) 和 [YouTube](YOUTUBE_INTEGRATION_STATUS.md) 四份阶段报告。下文的提交数、远端观察、未应用草稿、未运行测试与推送授权均保留其历史范围。
+>
+> 五操作、preview/playlist、private-library 20 个入口和 YouTube 3 个入口已经集成；新夹具的纯检查、ORIGINAL 原版结果与 CANDIDATE 配对必须分别阅读。最新 YouTube native 夹具及既有错误证据链修订已合入并通过纯复审，尚未取得原版/候选 native 运行资格。旧交接推送授权只适用于旧交接；新分支发布仍待用户回应，不授权 merge/deploy。历史 ZIP、manifest、失败及摘要保持不变。
+
+## 13:26 UTC 历史交接原文
+
 本分支保存完整未推送历史及交接材料。代码基线为 `990cf8a75b65c102279539fbce683c52196f4c67`，包含 246 个提交、1574 个已跟踪文件；交接提交仅增加本目录。推送前远端 main 为 `fc985a818f50be654e78d4e50165c320291c7a96`，有 106 个代码历史提交尚未推送。
 
 此前从 Library v19 的完整 Git bundle 恢复到 `7ed7667dbf0a38a531343502ed300f0b47e87c96`，随后完成的 40 个提交见 [提交列表](commits-since-restored-v19.txt)。未从远端 main 重新开始，也未改写既有历史。

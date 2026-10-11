@@ -1,5 +1,6 @@
 //! Exact-owner/login/revision Bilibili refresh grants. No automatic opt-in.
 use super::*;
+mod account_operations;
 use providers::platform::bilibili::renewal::{self, RefreshToken, Transport};
 const PURPOSE: &str = "bilibili_refresh_token_v1";
 fn envelope(scope: AccountScope, login: &str, token: &RefreshToken) -> Value {
@@ -22,7 +23,7 @@ fn token_from(scope: AccountScope, login: &str, value: Value) -> Result<RefreshT
         .map_err(|_| credential_error())
 }
 pub(super) async fn store_grant(
-    app: &App,
+    encrypt: &(dyn Fn(&Value) -> anyhow::Result<String> + Sync),
     tx: &mut Transaction<'_, Postgres>,
     scope: AccountScope,
     login: &str,
@@ -35,37 +36,13 @@ pub(super) async fn store_grant(
     let Some(token) = token else {
         return Ok(());
     };
-    let cipher = app
-        .encrypt(&envelope(scope, login, &token))
-        .map_err(|_| credential_error())?;
+    let cipher = encrypt(&envelope(scope, login, &token)).map_err(|_| credential_error())?;
     super::maintenance::phase(sqlx::query("INSERT INTO platform_account_renewals(account_id,credential_revision,consent_login_hash,refresh_encrypted,state,next_refresh_at) VALUES($1,$2,$3,$4,'scheduled',clock_timestamp()+interval '1 day')")
         .bind(scope.account_id).bind(scope.revision).bind(login).bind(cipher).execute(&mut **tx)).await?;
     Ok(())
 }
-fn public_status(account: Value, row: Option<&PgRow>) -> Value {
-    json!({"account":account,"method":"web_cookie_refresh","supported":true,"enabled":row.is_some_and(|r|matches!(r.get::<String,_>("state").as_str(),"scheduled"|"running")),
-        "state":row.map(|r|r.get::<String,_>("state")).unwrap_or_else(||"disabled".to_owned()),
-        "next_refresh_at":row.and_then(|r|r.get::<Option<i64>,_>("next_refresh_at_ms")),
-        "enable_requires":"new_consented_qr_login"})
-}
 pub async fn status(State(app): State<App>, headers: HeaderMap) -> Result<Response> {
-    let user = auth(&app, &headers, false).await?;
-    let login = login_hash(&headers)?;
-    let mut tx = super::maintenance::begin(&app).await?;
-    super::maintenance::phase(guard_login(&mut tx, user.id, &login)).await?;
-    let account = super::maintenance::phase(
-        sqlx::query(ACCOUNT_SELECT)
-            .bind(user.id)
-            .fetch_optional(&mut *tx),
-    )
-    .await?;
-    // Renewal is scoped to the originating login. A different browser login
-    // may inspect account state, but cannot inherit background renewal consent.
-    let row=super::maintenance::phase(sqlx::query("SELECT r.state,floor(extract(epoch FROM r.next_refresh_at)*1000)::bigint AS next_refresh_at_ms FROM platform_account_renewals r JOIN platform_accounts a ON a.id=r.account_id AND a.revision=r.credential_revision WHERE a.user_id=$1 AND a.provider='bilibili' AND a.state='connected' AND r.consent_login_hash=$2 AND playback_login_allowed($1,$2)")
-        .bind(user.id).bind(&login).fetch_optional(&mut *tx)).await?;
-    super::maintenance::phase(guard_login_live(&mut tx, user.id, &login)).await?;
-    let value = public_status(status_value(account.as_ref()), row.as_ref());
-    super::maintenance::commit(tx).await?;
+    let value = account_operations::status(app.identity_context(), headers).await?;
     Ok(responses::private_json(StatusCode::OK, value))
 }
 #[derive(Deserialize)]
@@ -79,30 +56,7 @@ pub async fn set_preference(
     headers: HeaderMap,
     Json(body): Json<Preference>,
 ) -> Result<Response> {
-    let user = auth(&app, &headers, true).await?;
-    let login = login_hash(&headers)?;
-    let expected = expected_revision(&body.expected_revision)?;
-    if body.enabled {
-        return Err(err(
-            StatusCode::CONFLICT,
-            "platform_renewal_new_consented_qr_required",
-        ));
-    }
-    let mut tx = super::maintenance::begin(&app).await?;
-    super::maintenance::phase(guard_login(&mut tx, user.id, &login)).await?;
-    let row = super::maintenance::phase(lock_account(&mut tx, user.id)).await?;
-    if expected != Some(row.get("revision")) {
-        return Err(err(StatusCode::CONFLICT, "platform_account_changed"));
-    }
-    super::maintenance::phase(
-        sqlx::query("DELETE FROM platform_account_renewals WHERE account_id=$1")
-            .bind(row.get::<Uuid, _>("id"))
-            .execute(&mut *tx),
-    )
-    .await?;
-    super::maintenance::phase(guard_login_live(&mut tx, user.id, &login)).await?;
-    let value = public_status(status_value(Some(&row)), None);
-    super::maintenance::commit(tx).await?;
+    let value = account_operations::set_preference(app.identity_context(), headers, body).await?;
     Ok(responses::private_json(StatusCode::OK, value))
 }
 /// One bounded pass. Caller supplies shutdown-aware cadence; nothing runs at

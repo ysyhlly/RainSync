@@ -2,6 +2,7 @@
 use super::libraries::{Expected, revision};
 use super::library_authority::*;
 use super::*;
+use crate::identity::{RequestContext, request};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,12 +35,14 @@ async fn preserve_current_room_shares(
 }
 
 pub(crate) async fn share(
-    db: &PgPool,
-    u: User,
+    request: RequestContext<'_>,
     h: HeaderMap,
     id: Uuid,
     body: Share,
 ) -> Result<Value> {
+    let db = request.db;
+    require_enabled()?;
+    let u = request::authenticate(request, &h, true, false).await?;
     if !matches!(body.mode.as_str(), "room_members" | "library_members")
         || !(1..=1440).contains(&body.expires_in_minutes)
     {
@@ -83,13 +86,15 @@ pub(crate) async fn share(
 }
 
 pub(crate) async fn update_share(
-    db: &PgPool,
-    u: User,
+    request: RequestContext<'_>,
     h: HeaderMap,
     id: Uuid,
     grant: Uuid,
     body: UpdateShare,
-) -> Result<CommittedLibraryChange> {
+) -> Result<Value> {
+    let db = request.db;
+    require_enabled()?;
+    let u = request::authenticate(request, &h, true, false).await?;
     if !matches!(body.mode.as_str(), "room_members" | "library_members") || body.expires_at <= 0 {
         return Err(err(StatusCode::BAD_REQUEST, "library_invalid"));
     }
@@ -150,17 +155,18 @@ pub(crate) async fn update_share(
         json!({"id":grant,"revision":(lib.get::<i64, _>("revision")+1).to_string()}),
         true,
     );
-    Ok(committed)
+    Ok(committed.response(db).await)
 }
 
 pub(crate) async fn revoke_share(
-    db: &PgPool,
-    u: User,
+    request: RequestContext<'_>,
     h: HeaderMap,
     id: Uuid,
     grant: Uuid,
     body: Expected,
-) -> Result<CommittedLibraryChange> {
+) -> Result<Value> {
+    let db = request.db;
+    let u = request::authenticate(request, &h, true, false).await?;
     let mut tx = db.begin().await?;
     lock_caller(&mut tx, &u, &h, false).await?;
     let lib=sqlx::query("SELECT * FROM private_libraries WHERE id=$1 AND deleted_at IS NULL AND (library_allowed($2,id,'manage') OR EXISTS(SELECT 1 FROM room_media_grants g WHERE g.id=$3 AND g.library_id=$1 AND g.grantor_id=$2)) FOR UPDATE").bind(id).bind(u.id).bind(grant).fetch_optional(&mut *tx).await?.ok_or_else(||err(StatusCode::NOT_FOUND,"library_not_found"))?;
@@ -183,5 +189,162 @@ pub(crate) async fn revoke_share(
     }
     commit_caller(tx, &u, &h, false).await?;
     let committed = CommittedLibraryChange::new(id, json!({"ok":true}), true);
-    Ok(committed)
+    Ok(committed.response(db).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn closed_pool() -> PgPool {
+        // Lazy construction plus closing before admission guarantees these tests
+        // cannot open a connection, even if an entry accidentally reaches SQL.
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .min_connections(0)
+            .connect_lazy_with(sqlx::postgres::PgConnectOptions::new());
+        db.close().await;
+        assert!(db.is_closed());
+        db
+    }
+
+    fn context(db: &PgPool) -> RequestContext<'_> {
+        RequestContext {
+            db,
+            origin: "https://rainsync.example",
+        }
+    }
+
+    fn gated_entry_failure(error: crate::Error) {
+        // Read the existing flag without mutating process-global environment.
+        // Run this module with true and with disabled/unset for both branches.
+        let (status, reason) = if enabled() {
+            (StatusCode::UNAUTHORIZED, "login_required")
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "private_libraries_disabled",
+            )
+        };
+        assert_eq!(error.0, status);
+        assert_eq!(error.1, reason);
+        assert_eq!(error.2, None);
+    }
+
+    #[tokio::test]
+    async fn share_admission_precedes_body_validation_and_room_storage() {
+        let db = closed_pool().await;
+        let error = share(
+            context(&db),
+            HeaderMap::new(),
+            Uuid::nil(),
+            Share {
+                room_id: Uuid::nil(),
+                media_id: Uuid::nil(),
+                mode: "invalid".into(),
+                expires_in_minutes: 0,
+                expected_revision: "invalid".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        gated_entry_failure(error);
+    }
+
+    #[tokio::test]
+    async fn update_admission_precedes_body_validation_and_target_storage() {
+        let db = closed_pool().await;
+        let error = update_share(
+            context(&db),
+            HeaderMap::new(),
+            Uuid::nil(),
+            Uuid::nil(),
+            UpdateShare {
+                mode: "invalid".into(),
+                expires_at: 0,
+                expected_revision: "invalid".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        gated_entry_failure(error);
+    }
+
+    #[tokio::test]
+    async fn revoke_requires_login_without_a_feature_gate_or_body_prevalidation() {
+        let db = closed_pool().await;
+        let error = revoke_share(
+            context(&db),
+            HeaderMap::new(),
+            Uuid::nil(),
+            Uuid::nil(),
+            Expected {
+                expected_revision: "invalid".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.1, "login_required");
+        assert_eq!(error.2, None);
+    }
+
+    #[test]
+    fn share_dto_keeps_required_wire_types_and_denies_unknown_fields() {
+        let valid = json!({
+            "room_id": Uuid::from_u128(1),
+            "media_id": Uuid::from_u128(2),
+            "mode": "room_members",
+            "expires_in_minutes": 60,
+            "expected_revision": "01"
+        });
+        let decoded: Share = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(decoded.room_id, Uuid::from_u128(1));
+        assert_eq!(decoded.media_id, Uuid::from_u128(2));
+        assert_eq!(decoded.mode, "room_members");
+        assert_eq!(decoded.expires_in_minutes, 60);
+        assert_eq!(decoded.expected_revision, "01");
+        for field in [
+            "room_id",
+            "media_id",
+            "mode",
+            "expires_in_minutes",
+            "expected_revision",
+        ] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<Share>(missing).is_err());
+        }
+        for (field, value) in [
+            ("extra", json!(true)),
+            ("room_id", json!("invalid")),
+            ("expires_in_minutes", json!(-1)),
+            ("expires_in_minutes", json!(60.5)),
+            ("expected_revision", json!(1)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(serde_json::from_value::<Share>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn update_dto_leaves_business_validation_at_the_original_operation_position() {
+        // These remain structurally valid JSON. Moving mode/expiry/revision
+        // validation into deserialization would change gate/auth precedence.
+        let decoded: UpdateShare = serde_json::from_value(json!({
+            "mode": "invalid", "expires_at": -1, "expected_revision": "invalid"
+        }))
+        .unwrap();
+        assert_eq!(decoded.mode, "invalid");
+        assert_eq!(decoded.expires_at, -1);
+        assert_eq!(decoded.expected_revision, "invalid");
+        for invalid in [
+            json!({"mode":"room_members", "expires_at":1}),
+            json!({"mode":"room_members", "expires_at":"1", "expected_revision":"1"}),
+            json!({"mode":"room_members", "expires_at":1, "expected_revision":1}),
+            json!({"mode":"room_members", "expires_at":1, "expected_revision":"1", "extra":true}),
+        ] {
+            assert!(serde_json::from_value::<UpdateShare>(invalid).is_err());
+        }
+    }
 }

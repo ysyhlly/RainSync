@@ -305,3 +305,76 @@ it.each(providers)(
     }
   },
 );
+
+it.each(providers)(
+  "%s fences malformed late receipts before touching response fields",
+  async (provider) => {
+    for (const action of [
+      "epoch",
+      "read-retired",
+      "mutation-timeout",
+    ] as const) {
+      const response = deferred();
+      const touch = vi.fn(() => {
+        throw Error("parser touched retired receipt");
+      });
+      const poisoned = Object.defineProperty({}, "provider", { get: touch });
+      const timeout = new AbortController();
+      vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeout.signal);
+      const api = vi
+        .fn()
+        .mockResolvedValueOnce(status(provider))
+        .mockReturnValue(response.promise);
+      const { session, select } = setup(api);
+      const work = select(provider);
+      await work.refresh();
+      const running =
+        action === "mutation-timeout" ? work.unlink() : work.refresh(true);
+      const rejected = expect(running).rejects.toBeInstanceOf(StaleIdentity);
+      await settle();
+      if (action === "epoch") session.clear();
+      else if (action === "mutation-timeout") timeout.abort();
+      else {
+        api.mockResolvedValue(status(provider, "2", "revoked"));
+        await work.unlink();
+      }
+      response.resolve(poisoned);
+      await rejected;
+      expect(touch).not.toHaveBeenCalled();
+      expect(work.status()).toEqual(
+        action === "epoch"
+          ? undefined
+          : action === "read-retired"
+            ? status(provider, "2", "revoked")
+            : status(provider),
+      );
+      vi.restoreAllMocks();
+    }
+  },
+);
+
+it.each(providers)(
+  "%s rejects current malformed reads and writes without replacing a confirmed DTO",
+  async (provider) => {
+    const api = vi
+      .fn()
+      .mockResolvedValueOnce(status(provider))
+      .mockResolvedValue(null);
+    const { account, select } = setup(api);
+    const work = select(provider);
+    await work.refresh();
+    const before = [
+      account.change,
+      account.youtubeChange,
+      { ...account.shortChanges },
+    ];
+    await expect(work.refresh(true)).rejects.toThrow("响应不完整");
+    await expect(work.unlink()).rejects.toThrow("响应不完整");
+    expect(work.status()).toEqual(status(provider));
+    expect([
+      account.change,
+      account.youtubeChange,
+      account.shortChanges,
+    ]).toEqual(before);
+  },
+);

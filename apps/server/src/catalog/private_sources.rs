@@ -3,7 +3,10 @@ use super::libraries::{name, revision};
 use super::library_authority::*;
 use super::source_rules as source_settings;
 use super::*;
-use crate::identity::request::admin;
+use crate::identity::{
+    RequestContext,
+    request::{self, admin},
+};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,12 +46,16 @@ fn manageable_scoped_source(row: &sqlx::postgres::PgRow) -> Result<()> {
 }
 
 pub(crate) async fn add_source(
-    context: SourceWriteContext<'_>,
-    u: User,
+    request: RequestContext<'_>,
+    encrypt: &(dyn Fn(&Value) -> anyhow::Result<String> + Sync),
     h: HeaderMap,
     id: Uuid,
     mut body: Source,
 ) -> Result<Value> {
+    let db = request.db;
+    require_enabled()?;
+    let u = request::authenticate(request, &h, true, false).await?;
+    let context = SourceWriteContext { db, encrypt };
     if !matches!(body.kind.as_str(), "http" | "s3") {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_source"));
     }
@@ -120,12 +127,15 @@ pub(crate) async fn add_source(
 }
 
 pub(crate) async fn source_detail(
-    context: SourceReadContext<'_>,
-    u: User,
+    request: RequestContext<'_>,
+    decrypt: &(dyn Fn(&str) -> anyhow::Result<Value> + Sync),
     h: HeaderMap,
     library: Uuid,
     source: Uuid,
 ) -> Result<Value> {
+    let db = request.db;
+    let u = request::authenticate(request, &h, false, false).await?;
+    let context = SourceReadContext { db, decrypt };
     let mut tx = context.db.begin().await?;
     lock_caller(&mut tx, &u, &h, false).await?;
     lock_source_library(&mut tx, u.id, library).await?;
@@ -148,13 +158,22 @@ pub(crate) async fn source_detail(
 }
 
 pub(crate) async fn update_source(
-    context: SourceChangeContext<'_>,
-    u: User,
+    request: RequestContext<'_>,
+    encrypt: &(dyn Fn(&Value) -> anyhow::Result<String> + Sync),
+    decrypt: &(dyn Fn(&str) -> anyhow::Result<Value> + Sync),
     h: HeaderMap,
     library: Uuid,
     source: Uuid,
     body: SourceChange,
-) -> Result<CommittedLibraryChange> {
+) -> Result<Value> {
+    let db = request.db;
+    require_enabled()?;
+    let u = request::authenticate(request, &h, true, false).await?;
+    let context = SourceChangeContext {
+        db,
+        encrypt,
+        decrypt,
+    };
     let expected = source_settings::revision(&body.expected_revision)?;
     let operator = u.admin && body.config.is_some();
     let mut tx = context.db.begin().await?;
@@ -267,17 +286,20 @@ pub(crate) async fn update_source(
     require_current_permission(&mut tx, u.id, library, "manage").await?;
     commit_caller(tx, &u, &h, operator).await?;
     let committed = CommittedLibraryChange::new(library, value, changed);
-    Ok(committed)
+    Ok(committed.response(db).await)
 }
 
 pub(crate) async fn remove_source(
-    context: SourceWriteContext<'_>,
-    u: User,
+    request: RequestContext<'_>,
+    encrypt: &(dyn Fn(&Value) -> anyhow::Result<String> + Sync),
     h: HeaderMap,
     library: Uuid,
     source: Uuid,
     body: SourceExpected,
-) -> Result<CommittedLibraryChange> {
+) -> Result<Value> {
+    let db = request.db;
+    let u = request::authenticate(request, &h, true, false).await?;
+    let context = SourceWriteContext { db, encrypt };
     let mut tx = context.db.begin().await?;
     lock_caller(&mut tx, &u, &h, false).await?;
     lock_manage(
@@ -318,16 +340,19 @@ pub(crate) async fn remove_source(
     require_current_permission(&mut tx, u.id, library, "manage").await?;
     commit_caller(tx, &u, &h, false).await?;
     let committed = CommittedLibraryChange::new(library, json!({"id":source,"deleted":true}), true);
-    Ok(committed)
+    Ok(committed.response(db).await)
 }
 
 pub(crate) async fn attach_source(
-    db: &PgPool,
-    u: User,
+    request: RequestContext<'_>,
     h: HeaderMap,
     id: Uuid,
     body: Attach,
-) -> Result<CommittedLibraryChange> {
+) -> Result<Value> {
+    let db = request.db;
+    require_enabled()?;
+    let u = request::authenticate(request, &h, true, false).await?;
+    admin(&u)?;
     let mut tx = db.begin().await?;
     lock_caller(&mut tx, &u, &h, true).await?;
     // This is an explicit audited operator action. Normal private catalog reads
@@ -392,5 +417,179 @@ pub(crate) async fn attach_source(
         json!({"ok":true,"library_id":id,"source_id":body.source_id}),
         true,
     );
-    Ok(committed)
+    Ok(committed.response(db).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A closed, lazily constructed pool cannot acquire a connection. These
+    // checks cover pre-database admission only, not live-session or lock races.
+    async fn closed_pool() -> PgPool {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .min_connections(0)
+            .connect_lazy("postgres://unused:unused@localhost/unused")
+            .unwrap();
+        db.close().await;
+        db
+    }
+
+    fn assert_login_required(result: Result<Value>) {
+        let failure = result.unwrap_err();
+        assert_eq!(failure.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(failure.1, "login_required");
+    }
+
+    fn assert_gated_login_required(result: Result<Value>) {
+        let failure = result.unwrap_err();
+        let (status, reason) = if enabled() {
+            (StatusCode::UNAUTHORIZED, "login_required")
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "private_libraries_disabled",
+            )
+        };
+        assert_eq!(failure.0, status);
+        assert_eq!(failure.1, reason);
+    }
+
+    #[tokio::test]
+    async fn private_source_reads_and_removal_admit_before_database_or_cipher() {
+        let db = closed_pool().await;
+        let request = || RequestContext {
+            db: &db,
+            origin: "https://rainsync.example",
+        };
+        let encrypt = |_: &Value| -> anyhow::Result<String> {
+            panic!("admission must reject before encryption")
+        };
+        let decrypt = |_: &str| -> anyhow::Result<Value> {
+            panic!("admission must reject before decryption")
+        };
+        assert_login_required(
+            source_detail(
+                request(),
+                &decrypt,
+                HeaderMap::new(),
+                Uuid::nil(),
+                Uuid::nil(),
+            )
+            .await,
+        );
+        assert_login_required(
+            remove_source(
+                request(),
+                &encrypt,
+                HeaderMap::new(),
+                Uuid::nil(),
+                Uuid::nil(),
+                SourceExpected {
+                    expected_revision: "invalid".into(),
+                    expected_library_revision: "invalid".into(),
+                },
+            )
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn private_source_gated_writes_admit_before_business_validation_or_cipher() {
+        let db = closed_pool().await;
+        let request = || RequestContext {
+            db: &db,
+            origin: "https://rainsync.example",
+        };
+        let encrypt = |_: &Value| -> anyhow::Result<String> {
+            panic!("admission must reject before encryption")
+        };
+        let decrypt = |_: &str| -> anyhow::Result<Value> {
+            panic!("admission must reject before decryption")
+        };
+        assert_gated_login_required(
+            add_source(
+                request(),
+                &encrypt,
+                HeaderMap::new(),
+                Uuid::nil(),
+                Source {
+                    name: "".into(),
+                    kind: "invalid".into(),
+                    config: serde_json::from_value(json!({})).unwrap(),
+                },
+            )
+            .await,
+        );
+        assert_gated_login_required(
+            update_source(
+                request(),
+                &encrypt,
+                &decrypt,
+                HeaderMap::new(),
+                Uuid::nil(),
+                Uuid::nil(),
+                SourceChange {
+                    expected_revision: "invalid".into(),
+                    name: None,
+                    config: None,
+                },
+            )
+            .await,
+        );
+        assert_gated_login_required(
+            attach_source(
+                request(),
+                HeaderMap::new(),
+                Uuid::nil(),
+                Attach {
+                    source_id: Uuid::nil(),
+                    expected_revision: "invalid".into(),
+                },
+            )
+            .await,
+        );
+    }
+
+    #[test]
+    fn private_source_keeps_distinct_library_and_source_validation_contracts() {
+        assert_eq!(revision("01").unwrap(), 1);
+        assert_eq!(source_settings::revision("1").unwrap(), 1);
+        assert_eq!(
+            source_settings::revision("01").unwrap_err().1,
+            "invalid_source"
+        );
+        for invalid in ["", "0", "-1", " 1", "1 ", "9223372036854775807"] {
+            assert_eq!(revision(invalid).unwrap_err().1, "library_invalid");
+            assert_eq!(
+                source_settings::revision(invalid).unwrap_err().1,
+                "invalid_source"
+            );
+        }
+        assert_eq!(name(" ").unwrap_err().1, "library_invalid");
+        assert_eq!(source_settings::name(" ").unwrap_err().1, "invalid_source");
+        assert_eq!(name("  source  ").unwrap(), "source");
+        assert_eq!(source_settings::name("  source  ").unwrap(), "source");
+    }
+
+    #[test]
+    fn private_source_wire_dtos_still_reject_unknown_fields() {
+        let source = json!({"name":"source","kind":"http","config":{}});
+        let change = json!({"expected_revision":"1"});
+        let expected = json!({"expected_revision":"1","expected_library_revision":"01"});
+        let attach = json!({"source_id":Uuid::nil(),"expected_revision":"01"});
+        assert!(serde_json::from_value::<Source>(source.clone()).is_ok());
+        assert!(serde_json::from_value::<SourceChange>(change.clone()).is_ok());
+        assert!(serde_json::from_value::<SourceExpected>(expected.clone()).is_ok());
+        assert!(serde_json::from_value::<Attach>(attach.clone()).is_ok());
+        let extra = |mut value: Value| {
+            value["unexpected"] = json!(true);
+            value
+        };
+        assert!(serde_json::from_value::<Source>(extra(source)).is_err());
+        assert!(serde_json::from_value::<SourceChange>(extra(change)).is_err());
+        assert!(serde_json::from_value::<SourceExpected>(extra(expected)).is_err());
+        assert!(serde_json::from_value::<Attach>(extra(attach)).is_err());
+        assert!(serde_json::from_value::<SourceChange>(json!({"expected_revision":1})).is_err());
+    }
 }

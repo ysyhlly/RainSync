@@ -1,7 +1,7 @@
 use super::*;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
-use protocol::{Command, PlaybackStatus, RoomState};
+use protocol::{Command, RoomState};
 use tokio::sync::{mpsc, oneshot};
 
 #[path = "room_delivery.rs"]
@@ -12,6 +12,9 @@ mod presence_runtime;
 
 #[path = "room_client_status.rs"]
 mod client_status;
+
+#[path = "room_guest_access_operations.rs"]
+pub(crate) mod guest_access_operations;
 
 #[derive(Clone)]
 pub struct Handle {
@@ -373,33 +376,14 @@ fn control_error(error: anyhow::Error, fallback: &str) -> String {
     }
 }
 
-pub async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
-    let u = auth_viewer(&app, &h, false).await?;
-    let rows=sqlx::query("SELECT r.id,r.name,r.owner_id,r.lifecycle,r.lifecycle_epoch FROM rooms r JOIN room_members m ON m.room_id=r.id WHERE m.user_id=$1 ORDER BY r.created_at DESC").bind(u.id).fetch_all(&app.db).await?;
-    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"owner_id":r.get::<Uuid,_>("owner_id"),"lifecycle":r.get::<String,_>("lifecycle"),"lifecycle_epoch":r.get::<i64,_>("lifecycle_epoch")})).collect())))
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Name {
-    pub name: String,
-}
+#[path = "room_directory_operations.rs"]
+pub(crate) mod directory_operations;
+pub use directory_operations::Name;
 
-async fn creation_session_valid(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    user: Uuid,
-    session_hash: &str,
-) -> Result<()> {
-    // now() is fixed at transaction start and would accept a session that
-    // expires while a concurrent creation holds the request-key lock.
-    let valid: bool = sqlx::query_scalar("SELECT playback_login_allowed($2,$1)")
-        .bind(session_hash)
-        .bind(user)
-        .fetch_one(&mut **tx)
-        .await?;
-    if !valid {
-        return Err(err(StatusCode::UNAUTHORIZED, "session_expired"));
-    }
-    Ok(())
+pub async fn list(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
+    Ok(Json(
+        directory_operations::list(app.identity_context(), &h).await?,
+    ))
 }
 
 pub async fn create(
@@ -407,111 +391,10 @@ pub async fn create(
     h: HeaderMap,
     Json(body): Json<Name>,
 ) -> Result<Json<Value>> {
-    let u = auth(&app, &h, true).await?;
-    if body.name.trim().is_empty() || body.name.chars().count() > 120 {
-        return Err(err(StatusCode::BAD_REQUEST, "invalid_name"));
-    }
-    let mut keys = h.get_all("idempotency-key").iter();
-    let request_key = keys
-        .next()
-        .map(|value| {
-            value
-                .to_str()
-                .ok()
-                .filter(|key| {
-                    !key.is_empty()
-                        && key.len() <= 128
-                        && key.bytes().all(|b| {
-                            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-')
-                        })
-                })
-                .ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid_idempotency_key"))
-        })
-        .transpose()?;
-    if keys.next().is_some() {
-        return Err(err(StatusCode::BAD_REQUEST, "invalid_idempotency_key"));
-    }
-    let id = Uuid::new_v4();
-    let mut tx = app.db.begin().await?;
-    // Coordinate with account exit and hold the exact authenticated session
-    // until commit; a prior auth check alone cannot authorize queued work.
-    sqlx::query("SELECT id FROM users WHERE id=$1 FOR SHARE")
-        .bind(u.id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "session_expired"))?;
-    let session_hash =
-        hash(&cookie(&h).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "login_required"))?);
-    sqlx::query("SELECT token_hash FROM sessions WHERE token_hash=$1 AND user_id=$2 AND csrf=$3 AND expires_at>clock_timestamp() FOR SHARE")
-        .bind(&session_hash)
-        .bind(u.id)
-        .bind(h.get("x-csrf-token").and_then(|v| v.to_str().ok()).unwrap_or_default())
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "session_expired"))?;
-    if let Some(key) = request_key {
-        // PostgreSQL's unique-key conflict wait coordinates all Server nodes.
-        // A losing INSERT sees the committed row in the following statement
-        // (READ COMMITTED), rather than in the INSERT's earlier snapshot.
-        let claimed = sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO room_creation_requests(user_id,request_key,name,room_id) VALUES($1,$2,$3,$4) ON CONFLICT (user_id,request_key) DO NOTHING RETURNING room_id",
-        )
-        .bind(u.id)
-        .bind(key)
-        .bind(&body.name)
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if claimed.is_none() {
-            let result = sqlx::query(
-                "SELECT name,room_id FROM room_creation_requests WHERE user_id=$1 AND request_key=$2",
-            )
-            .bind(u.id)
-            .bind(key)
-            .fetch_one(&mut *tx)
-            .await?;
-            if result.get::<String, _>("name") != body.name {
-                return Err(err(StatusCode::CONFLICT, "idempotency_key_conflict"));
-            }
-            let original = result.get::<Uuid, _>("room_id");
-            creation_session_valid(&mut tx, u.id, &session_hash).await?;
-            tx.commit().await?;
-            return Ok(Json(json!({"id":original})));
-        }
-    }
-    let state = RoomState {
-        room_id: id,
-        revision: 0,
-        media_id: None,
-        media_generation: 0,
-        playback_status: PlaybackStatus::Paused,
-        anchor_position_ms: 0.0,
-        anchor_server_time_ms: app.now(),
-        playback_rate: 1.0,
-        controller_user_id: u.id,
-        duration_ms: None,
-        live: None,
-        clock_epoch: app.epoch,
-    };
-    sqlx::query("INSERT INTO rooms(id,name,owner_id) VALUES($1,$2,$3)")
-        .bind(id)
-        .bind(body.name)
-        .bind(u.id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("INSERT INTO room_members(room_id,user_id) VALUES($1,$2)")
-        .bind(id)
-        .bind(u.id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("INSERT INTO room_snapshots VALUES($1,$2)")
-        .bind(id)
-        .bind(serde_json::to_value(state).unwrap())
-        .execute(&mut *tx)
-        .await?;
-    creation_session_valid(&mut tx, u.id, &session_hash).await?;
-    tx.commit().await?;
-    Ok(Json(json!({"id":id})))
+    Ok(Json(
+        directory_operations::create(app.identity_context(), &h, body, app.start, app.epoch)
+            .await?,
+    ))
 }
 
 pub(crate) async fn controller<'a>(
@@ -632,6 +515,10 @@ pub(crate) async fn commit_controller(
 pub(crate) mod invitation_operations;
 #[path = "room_invites.rs"]
 mod invites_runtime;
+#[path = "room_kick_operations.rs"]
+pub(crate) mod kick_operations;
+#[path = "room_lifecycle_operations.rs"]
+pub(crate) mod lifecycle_operations;
 #[path = "room_ownership_operations.rs"]
 pub(crate) mod ownership_operations;
 #[path = "room_permission_operations.rs"]
@@ -641,38 +528,17 @@ pub(crate) mod permissions_runtime;
 pub(crate) use invites_runtime::redeem_error;
 pub use invites_runtime::{invite, join, list_invites, revoke_invite};
 pub use permissions_runtime::{kick, permissions, revoke_permissions, set_permissions};
+#[path = "room_playlist_operations.rs"]
+pub(crate) mod playlist_operations;
+pub use playlist_operations::Add;
+
 pub async fn playlist(
     State(app): State<App>,
     h: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Response> {
-    let u = auth_viewer(&app, &h, false).await?;
-    member(&app, &u, id).await?;
-    let rows=sqlx::query(&format!("{} JOIN playlist_items q ON q.media_id=m.id WHERE {} AND q.room_id=$2 AND library_media_allowed($1,m.id,'play',$2) ORDER BY q.sort_order,q.id", media_titles::SELECT.replace("SELECT m.id,", "SELECT q.id AS playlist_id,q.sort_order AS queue_order,m.id,"), media_titles::VISIBLE)).bind(u.id).bind(id).fetch_all(&app.db).await?;
-    let mut items: Vec<(i64, Uuid, Value)> = rows.iter().map(|r| {
-        let mut media = media_titles::media(r);
-        if let Some(url) = media["cover"]["url"].as_str() {
-            media["cover"]["url"] = json!(format!("{url}{}room_id={id}", if url.contains('?') { "&" } else { "?" }));
-        }
-        let item = r.get::<Uuid,_>("playlist_id");
-        (r.get("queue_order"), item, json!({"id":item,"media_id":media["id"],"title":media["title"],"cover":media["cover"]}))
-    }).collect();
-    let platform = sqlx::query("SELECT q.id,q.media_id,q.sort_order,e.title FROM playlist_items q JOIN room_platform_media e ON e.media_id=q.media_id AND e.room_id=q.room_id JOIN media_items m ON m.id=e.media_id WHERE q.room_id=$1 AND m.available AND m.source_id IS NULL AND library_media_allowed($2,m.id,'play',$1)")
-        .bind(id).bind(u.id).fetch_all(&app.db).await?;
-    items.extend(platform.iter().map(|r| {
-        let item = r.get::<Uuid,_>("id");
-        (r.get("sort_order"), item, json!({"id":item,"media_id":r.get::<Uuid,_>("media_id"),"title":r.get::<String,_>("title"),"kind":"native_platform","cover":{"state":"missing","revision":null,"url":null,"retry_after_ms":null}}))
-    }));
-    items.sort_by_key(|(order, id, _)| (*order, *id));
-    let current = auth_viewer(&app, &h, false).await?;
-    member(&app, &current, id).await?;
-    Ok(responses::ok_json(Value::Array(
-        items.into_iter().map(|(_, _, value)| value).collect(),
-    )))
-}
-#[derive(Deserialize)]
-pub struct Add {
-    media_id: Uuid,
+    let playlist = playlist_operations::list(app.identity_context(), &h, id).await?;
+    Ok(responses::ok_json(playlist.into_value()))
 }
 pub async fn add_playlist(
     State(app): State<App>,
@@ -680,53 +546,20 @@ pub async fn add_playlist(
     Path(id): Path<Uuid>,
     Json(body): Json<Add>,
 ) -> Result<Json<Value>> {
-    let user = auth(&app, &h, true).await?;
-    let mut tx = controller(&app, &h, id).await?;
-    sqlx::query("SELECT id FROM media_items WHERE id=$1 FOR SHARE")
-        .bind(body.media_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    sqlx::query("SELECT media_id FROM room_platform_media WHERE media_id=$1 FOR SHARE")
-        .bind(body.media_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let available: bool = sqlx::query_scalar(
-        "SELECT room_media_allowed($1,$2) AND library_media_allowed($3,$2,'play',$1)",
-    )
-    .bind(id)
-    .bind(body.media_id)
-    .bind(user.id)
-    .fetch_one(&mut *tx)
-    .await?;
-    if !available {
-        return Err(err(StatusCode::NOT_FOUND, "media_not_found"));
+    let added = playlist_operations::add(app.identity_context(), &h, id, body).await?;
+    if added.changed() {
+        // Invalidate only. Each viewer's REST read retains its own library filter.
+        broadcast_timeline(&app, id, json!({"type":"PLAYLIST_CHANGED"})).await;
     }
-    if let Some(item) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM playlist_items WHERE room_id=$1 AND media_id=$2 ORDER BY sort_order,id LIMIT 1")
-        .bind(id).bind(body.media_id).fetch_optional(&mut *tx).await? {
-        commit_controller(tx, &h).await?;
-        return Ok(Json(json!({"id":item})));
-    }
-    let item = Uuid::new_v4();
-    sqlx::query("INSERT INTO playlist_items SELECT $1,$2,$3,COALESCE(max(sort_order),0)+1 FROM playlist_items WHERE room_id=$2").bind(item).bind(id).bind(body.media_id).execute(&mut *tx).await?;
-    commit_controller(tx, &h).await?;
-    // Invalidate only. Each viewer's REST read retains its own library filter.
-    broadcast_timeline(&app, id, json!({"type":"PLAYLIST_CHANGED"})).await;
-    Ok(Json(json!({"id":item})))
+    Ok(Json(json!({"id":added.item()})))
 }
 pub async fn remove_playlist(
     State(app): State<App>,
     h: HeaderMap,
     Path((id, item)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>> {
-    let mut tx = controller(&app, &h, id).await?;
-    let removed = sqlx::query("DELETE FROM playlist_items WHERE room_id=$1 AND id=$2")
-        .bind(id)
-        .bind(item)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    commit_controller(tx, &h).await?;
-    if removed > 0 {
+    let removed = playlist_operations::remove(app.identity_context(), &h, id, item).await?;
+    if removed.changed() {
         broadcast_timeline(&app, id, json!({"type":"PLAYLIST_CHANGED"})).await;
     }
     Ok(Json(json!({"ok":true})))

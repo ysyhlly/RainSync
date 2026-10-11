@@ -1,0 +1,10 @@
+{
+  "extends": "../apps/web/tsconfig.json",
+  "include": [
+    "typechecks/platform-login-boundaries.ts",
+    "platform-login-response-boundary.test.ts",
+    "platform-login-boundary-controls.test.ts",
+    "platform-login-qr-flow.test.ts",
+    "../apps/web/src/env.d.ts"
+  ]
+}

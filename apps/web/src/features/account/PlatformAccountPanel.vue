@@ -70,13 +70,17 @@ async function readRenewal() {
   renewal.value = null;
   renewalPhase.value = "loading";
   const current = () =>
-    alive && serial === renewalSerial && key === accountKey.value;
+    alive &&
+    !checkController.signal.aborted &&
+    serial === renewalSerial &&
+    key === accountKey.value;
   const work = (async () => {
     try {
-      const value = validateBilibiliRenewal(
-        await bilibiliRenewalApi(session.api).status(checkController.signal),
+      const response = await bilibiliRenewalApi(session.api).status(
+        checkController.signal,
       );
       if (!current()) return;
+      const value = validateBilibiliRenewal(response);
       if (!matchingRenewal(value)) throw Error("续期状态与当前账号版本不一致");
       renewal.value = value;
       renewalPhase.value = "ready";
@@ -192,38 +196,30 @@ async function disableRenewal() {
   const epoch = session.epoch,
     user = session.user?.id,
     csrf = session.user?.csrf;
+  const current = () =>
+    alive &&
+    !checkController.signal.aborted &&
+    serial === renewalSerial &&
+    key === accountKey.value &&
+    epoch === session.epoch &&
+    user === session.user?.id &&
+    csrf === session.user?.csrf;
   busy.value = true;
   error.value = "";
   renewal.value = null;
   renewalPhase.value = "loading";
   try {
-    const value = validateBilibiliRenewal(
-      await bilibiliRenewalApi(session.api).disable(
-        observed.account.revision,
-        checkController.signal,
-      ),
+    const response = await bilibiliRenewalApi(session.api).disable(
+      observed.account.revision,
+      checkController.signal,
     );
-    if (
-      alive &&
-      serial === renewalSerial &&
-      key === accountKey.value &&
-      epoch === session.epoch &&
-      user === session.user?.id &&
-      csrf === session.user?.csrf
-    ) {
-      if (!matchingRenewal(value)) throw Error("续期状态与当前账号版本不一致");
-      renewal.value = value;
-      renewalPhase.value = "ready";
-    }
+    if (!current()) return;
+    const value = validateBilibiliRenewal(response);
+    if (!matchingRenewal(value)) throw Error("续期状态与当前账号版本不一致");
+    renewal.value = value;
+    renewalPhase.value = "ready";
   } catch {
-    if (
-      alive &&
-      serial === renewalSerial &&
-      key === accountKey.value &&
-      epoch === session.epoch &&
-      user === session.user?.id &&
-      csrf === session.user?.csrf
-    ) {
+    if (current()) {
       error.value = "停止自动续期结果尚未确认，请刷新状态";
       renewalPhase.value = "error";
     }

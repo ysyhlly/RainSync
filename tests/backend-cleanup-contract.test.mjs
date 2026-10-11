@@ -210,7 +210,14 @@ test("permission updates discard epochs and commit authority before notification
       '"ROOM_PERMISSIONS_CHANGED"',
     ]);
   }
-  const kick = permissions.slice(permissions.indexOf("pub async fn kick("));
-  assert.ok(kick.includes("commit_controller(tx, &h).await?"));
+  const kick = source("room_kick_operations");
+  assert.ok(kick.includes("commit_controller(tx, h).await?"));
   assert.ok(!kick.includes("finish_permissions_change("));
+  const kickAdapter = permissions.slice(permissions.indexOf("pub async fn kick("));
+  inOrder(kickAdapter, [
+    "super::kick_operations::kick(",
+    ".await?;",
+    "broadcast_timeline(",
+    '"ROOM_PERMISSIONS_CHANGED"',
+  ]);
 });

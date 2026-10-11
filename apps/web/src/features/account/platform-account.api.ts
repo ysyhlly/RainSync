@@ -45,19 +45,21 @@ export interface PlatformLogin {
   next_poll_at: number;
   server_time: number;
 }
+// Receipts remain unknown until their existing parser runs after its identity
+// fence. QR start/poll binding stays in its own flow; cancel receipts are ignored.
 const path = "/platform-accounts/bilibili";
 export const platformAccountApi = (api: ApiClient) => ({
   status: (signal?: AbortSignal) =>
-    api<PlatformAccountStatus>(path, "GET", undefined, signal),
+    api<unknown>(path, "GET", undefined, signal),
   check: (expectedRevision: string | null, signal?: AbortSignal) =>
-    api<PlatformAccountCheck>(
+    api<unknown>(
       `${path}/check`,
       "POST",
       { expected_revision: expectedRevision },
       signal,
     ),
   start: (key: string, signal?: AbortSignal, consentToRenew = false) =>
-    api<PlatformLogin>(
+    api<unknown>(
       `${path}/login`,
       "POST",
       {
@@ -68,21 +70,21 @@ export const platformAccountApi = (api: ApiClient) => ({
       signal,
     ),
   poll: (id: string, signal?: AbortSignal) =>
-    api<PlatformLogin>(
+    api<unknown>(
       `${path}/login/${encodeURIComponent(id)}/poll`,
       "POST",
       undefined,
       signal,
     ),
   cancel: (id: string) =>
-    api<PlatformLogin>(
+    api<unknown>(
       `${path}/login/${encodeURIComponent(id)}`,
       "DELETE",
       undefined,
       AbortSignal.timeout(10000),
     ),
   unlink: (signal?: AbortSignal) =>
-    api<PlatformAccountStatus>(path, "DELETE", undefined, signal),
+    api<unknown>(path, "DELETE", undefined, signal),
 });
 
 export const shortPlatformAccountApi = (
@@ -94,20 +96,20 @@ export const shortPlatformAccountApi = (
   const path = `/platform-accounts/${provider}`;
   return {
     status: (signal?: AbortSignal) =>
-      api<ShortPlatformAccountStatus>(path, "GET", undefined, signal),
+      api<unknown>(path, "GET", undefined, signal),
     importCredential: (
       cookie: string,
       expectedRevision: string | null,
       signal?: AbortSignal,
     ) =>
-      api<ShortPlatformAccountStatus>(
+      api<unknown>(
         `${path}/credential`,
         "PUT",
         { cookie, consent_to_store: true, expected_revision: expectedRevision },
         signal,
       ),
     unlink: (expectedRevision: string | null, signal?: AbortSignal) =>
-      api<ShortPlatformAccountStatus>(
+      api<unknown>(
         path,
         "DELETE",
         { expected_revision: expectedRevision },
@@ -120,13 +122,13 @@ export const youtubePlatformAccountApi = (api: ApiClient) => {
   const path = "/platform-accounts/youtube";
   return {
     status: (signal?: AbortSignal) =>
-      api<YoutubePlatformAccountStatus>(path, "GET", undefined, signal),
+      api<unknown>(path, "GET", undefined, signal),
     importCredential: (
       cookieFile: string,
       expectedRevision: string | null,
       signal?: AbortSignal,
     ) =>
-      api<YoutubePlatformAccountStatus>(
+      api<unknown>(
         `${path}/credential`,
         "PUT",
         {
@@ -137,7 +139,7 @@ export const youtubePlatformAccountApi = (api: ApiClient) => {
         signal,
       ),
     unlink: (expectedRevision: string | null, signal?: AbortSignal) =>
-      api<YoutubePlatformAccountStatus>(
+      api<unknown>(
         path,
         "DELETE",
         { expected_revision: expectedRevision },

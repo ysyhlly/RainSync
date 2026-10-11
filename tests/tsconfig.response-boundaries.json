@@ -1,0 +1,4 @@
+{
+  "extends": "../apps/web/tsconfig.json",
+  "include": ["typechecks/response-boundaries.ts", "../apps/web/src/env.d.ts"]
+}

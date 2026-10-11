@@ -17,6 +17,8 @@ mod control_recovery_metrics;
 mod database_checks;
 mod distributed_compute;
 mod distributed_playback;
+#[cfg(test)]
+mod encryption_tests;
 mod error;
 mod finite_hls;
 mod guests;
@@ -149,26 +151,41 @@ impl App {
         self.start.elapsed().as_secs_f64() * 1000.0
     }
     fn encrypt(&self, value: &Value) -> anyhow::Result<String> {
-        let mut nonce = [0; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
-        let cipher = self
-            .key
-            .encrypt((&nonce).into(), serde_json::to_vec(value)?.as_slice())
-            .map_err(|_| anyhow::anyhow!("encryption_failed"))?;
-        Ok(STANDARD.encode([nonce.to_vec(), cipher].concat()))
+        encrypt_value(&self.key, value)
     }
     fn decrypt(&self, value: &str) -> anyhow::Result<Value> {
-        let bytes = STANDARD.decode(value)?;
-        if bytes.len() < 12 {
-            anyhow::bail!("invalid_ciphertext")
-        }
-        let data = self
-            .key
-            .decrypt(bytes[..12].into(), &bytes[12..])
-            .map_err(|_| anyhow::anyhow!("decryption_failed"))?;
-        Ok(serde_json::from_slice(&data)?)
+        decrypt_value(&self.key, value)
+    }
+    // Construct narrow callbacks without doing crypto or capturing application state.
+    fn catalog_encryptor(&self) -> impl Fn(&Value) -> anyhow::Result<String> + Sync + '_ {
+        let key = self.key.as_ref();
+        move |value| encrypt_value(key, value)
+    }
+    fn catalog_decryptor(&self) -> impl Fn(&str) -> anyhow::Result<Value> + Sync + '_ {
+        let key = self.key.as_ref();
+        move |value| decrypt_value(key, value)
     }
 }
+fn encrypt_value(key: &Aes256Gcm, value: &Value) -> anyhow::Result<String> {
+    let mut nonce = [0; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let cipher = key
+        .encrypt((&nonce).into(), serde_json::to_vec(value)?.as_slice())
+        .map_err(|_| anyhow::anyhow!("encryption_failed"))?;
+    Ok(STANDARD.encode([nonce.to_vec(), cipher].concat()))
+}
+
+fn decrypt_value(key: &Aes256Gcm, value: &str) -> anyhow::Result<Value> {
+    let bytes = STANDARD.decode(value)?;
+    if bytes.len() < 12 {
+        anyhow::bail!("invalid_ciphertext")
+    }
+    let data = key
+        .decrypt(bytes[..12].into(), &bytes[12..])
+        .map_err(|_| anyhow::anyhow!("decryption_failed"))?;
+    Ok(serde_json::from_slice(&data)?)
+}
+
 pub use error::Error;
 use error::err;
 pub use identity::RequestIdentity as User;

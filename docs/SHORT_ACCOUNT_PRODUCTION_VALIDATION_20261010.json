@@ -1,0 +1,88 @@
+{
+  "status": "source_and_node_checks_passed_rust_and_native_runtime_not_run",
+  "baseline": "5d976089e3f44a767264a7cb76fe0e23bd321f55",
+  "worktree": "/workspace/shared/rainsync-short-production-lane-20261010",
+  "frozen_proposal": "short-platform-account-whole-family-v2-20261010T1316Z",
+  "frozen_archive_sha256": "7ea9f669b08e6092dc3d6bea46af0e4d1b60a2d467d5e2100ba36c6749c550e5",
+  "frozen_members_verified": 136,
+  "frozen_aggregate_sha256": "95cbdf091b55dbf0e4b951eb15a7c536fa9032dfbe206f1434de5450da915cec",
+  "baseline_inputs_verified": 122,
+  "production_comparison": "Each final production file, after removing only new cfg(test) additions, equals rustfmt output of its frozen candidate byte for byte.",
+  "rustfmt_version": "rustfmt 1.9.0-stable (48a229ceae 2026-09-01)",
+  "files": [
+    {
+      "path": "apps/server/src/main.rs",
+      "frozen_sha256": "fe2ad98e172ad330f8a6bdd6448271a6908ddc3b8a5c6eb0230ac2e7415ad4d6",
+      "formatted_production_sha256": "fe2ad98e172ad330f8a6bdd6448271a6908ddc3b8a5c6eb0230ac2e7415ad4d6",
+      "actual_with_tests_sha256": "22a059ff10eed3e7ad55a56d74344ea5ad8d61a7a19089b3835532d545ebafa0",
+      "formatter_only_production": true
+    },
+    {
+      "path": "apps/server/src/platform_accounts.rs",
+      "frozen_sha256": "6f7d1cc8453f86df194d86beb1662d13832192879a37d1b6fc7ee2d71b2cab1e",
+      "formatted_production_sha256": "c061bcbbd58625ba40f336eaa9dc53bf2f591dabc58340905a89801a901fd738",
+      "actual_with_tests_sha256": "c061bcbbd58625ba40f336eaa9dc53bf2f591dabc58340905a89801a901fd738",
+      "formatter_only_production": true
+    },
+    {
+      "path": "apps/server/src/platform_accounts/short.rs",
+      "frozen_sha256": "c3835ce099c813c27053faf327a4d976f045a6b9762faca7ade8d038934dd269",
+      "formatted_production_sha256": "7c3fb80492cd294b6a5a6ecfbb015a206eddeca9ed2bb51bea25a72efe02b30f",
+      "actual_with_tests_sha256": "91b14f187cf080f3d6d29618271ce646836e2f684236f8b0c3ce741b028b6cb3",
+      "formatter_only_production": true
+    },
+    {
+      "path": "apps/server/src/encryption_tests.rs",
+      "actual_with_tests_sha256": "62473993c01a15b27e36293fdf4d333ab07858503afcc859bf49d5b2c88959b1",
+      "test_only": true
+    }
+  ],
+  "reverse_patch_check": "Actual four-file diff applied in reverse in an isolated probe; both original files restored byte for byte and both new files removed.",
+  "restored_files": [
+    {
+      "path": "apps/server/src/main.rs",
+      "sha256": "b25a8f0e77df61ef56206230554c7c666f40d90185edf989f032fb57624335dc"
+    },
+    {
+      "path": "apps/server/src/platform_accounts.rs",
+      "sha256": "cdb2cabf999c3a9fb6b0efd20fbe58a0493d96d78e4a2335bd5a60542a1f6ebd"
+    }
+  ],
+  "explicit_app_encrypt_source_call_count": {
+    "baseline": 39,
+    "candidate": 38,
+    "moved_call": "platform_accounts/short.rs calls the same encrypt_value directly"
+  },
+  "checks": [
+    {
+      "name": "frozen candidate git apply --check",
+      "result": "passed"
+    },
+    {
+      "name": "rustfmt --edition 2024 --config skip_children=true --check for four changed Rust files",
+      "result": "passed"
+    },
+    {
+      "name": "node --test tests/short-platform-account-schema.test.mjs tests/backend-cleanup-contract.test.mjs tests/server-bootstrap-contract.test.mjs",
+      "result": "passed",
+      "passed": 16,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "name": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "not_run": [
+    "Cargo or Rust compiler",
+    "new Rust unit tests (4 authored only)",
+    "Clippy",
+    "PostgreSQL / server / sockets",
+    "original/candidate native fixture",
+    "real provider accounts or upstream requests",
+    "browser",
+    "workspace aggregate checks"
+  ],
+  "scope_limits": "No native fixture or archived input edits; no migrations, provider URLs, wire DTO policies, encryption key management, credentials, pushes, merges, deploys, P08/P09 or user-computer operations."
+}

@@ -22,8 +22,8 @@ export function createYoutubeAccountStore(
     timeoutMs: 20000,
     busyMessage: "YouTube 会话操作尚未确认，请刷新状态",
   });
-  function accept(value: YoutubePlatformAccountStatus) {
-    value = validateYoutubeAccountStatus(value);
+  function accept(response: unknown) {
+    const value = validateYoutubeAccountStatus(response);
     const previous = status.value;
     status.value = value;
     if (
@@ -45,7 +45,7 @@ export function createYoutubeAccountStore(
   const refresh = work.refresh;
   function mutate(
     expectedRevision: string | null,
-    action: (signal: AbortSignal) => Promise<YoutubePlatformAccountStatus>,
+    action: (signal: AbortSignal) => Promise<unknown>,
     external?: AbortSignal,
   ) {
     return work.mutate(action, accept, external, () => {

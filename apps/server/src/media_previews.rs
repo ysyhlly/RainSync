@@ -7,10 +7,14 @@ pub async fn request(
     h: HeaderMap,
     Json(body): Json<Request>,
 ) -> Result<Response> {
-    let user = auth(&app, &h, true).await?;
     Ok(responses::ok_json(json!(
-        catalog::previews::request(&app.db, user.id, body, &|| app.preview_settings.queue_limit)
-            .await?
+        catalog::previews::request(
+            app.identity_context(),
+            &h,
+            body,
+            catalog::previews::QueueLimit::new(&app.preview_settings.queue_limit),
+        )
+        .await?
     )))
 }
 pub async fn status(
@@ -18,9 +22,8 @@ pub async fn status(
     h: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<Query>,
 ) -> Result<Response> {
-    let user = auth(&app, &h, false).await?;
     Ok(responses::ok_json(json!(
-        catalog::previews::status(&app.db, user.id, q).await?
+        catalog::previews::status(app.identity_context(), &h, q).await?
     )))
 }
 pub async fn image(
@@ -29,8 +32,7 @@ pub async fn image(
     Path(id): Path<Uuid>,
     axum::extract::Query(q): axum::extract::Query<ImageQuery>,
 ) -> Result<Response> {
-    let user = auth_viewer(&app, &h, false).await?;
-    let row = catalog::previews::image(&app.db, user.id, id, q).await?;
+    let row = catalog::previews::image(app.identity_context(), &h, id, q).await?;
     let etag = format!("\"{}\"", row.sha256());
     let unchanged = h.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(&etag);
     let mut response = if unchanged {

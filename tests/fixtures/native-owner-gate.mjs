@@ -8,13 +8,14 @@ import { fileURLToPath } from "node:url";
 import { withTerminationSignal } from "../../deploy/owned-process.mjs";
 import { loadOwnerBinding, sha256 } from "../../scripts/native-owner-binding.mjs";
 import { isolatedServer } from "./server.mjs";
+import { privateFailureDetails } from "./short-platform-account-response.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const commonInputs = [
   "scripts/native-owner-binding.mjs", "tests/fixtures/native-owner-gate.mjs",
   "tests/fixtures/server.mjs", "tests/fixtures/postgres.mjs",
   "tests/fixtures/unused-port.mjs", "tests/fixtures/playback-admission.mjs",
-  "deploy/owned-process.mjs",
+  "deploy/owned-process.mjs", "tests/fixtures/short-platform-account-response.mjs",
 ];
 
 export async function nativeOwnerGate(name, run, { requireTest = false } = {}) {
@@ -28,12 +29,32 @@ export async function nativeOwnerGate(name, run, { requireTest = false } = {}) {
     schema_version: 1, gate: name, result: "running",
     started_at: new Date().toISOString(),
     scope: "Owned synthetic PostgreSQL and loopback HTTP; no provider credentials or production data",
-    checks: [], cleanup: { completed: false },
+    checks: [], cleanup: { completed: false }, failures: [],
   };
-  let fixture, binding, failure, stage = "prerequisites";
+  let fixture, binding, coordinatorCaptured = false, stage = "prerequisites";
+  const failures = [];
+  const fail = (error, code, at = stage) => {
+    failures.push(error);
+    report.failures.push({ stage: at, code });
+    report.failure ??= { stage: at, code };
+  };
+  async function privateFailures(label) {
+    let bytes;
+    try {
+      bytes = JSON.stringify(privateFailureDetails(new AggregateError(
+        [...failures], "owner_gate_original_and_following_failures",
+      ))) + "\n";
+    } catch (error) {
+      fail(error, "private_failure_serialization_failed", "evidence");
+      bytes = '{"code":"private_failure_serialization_failed","details":"raw failure details unavailable"}\n';
+    }
+    try {
+      await writeFile(resolve(directory, label + ".private.json"), bytes, { flag: "wx", mode: 0o600 });
+    } catch (error) { fail(error, "private_failure_write_failed", "evidence"); }
+  }
   const save = () => writeFile(reportPath, JSON.stringify(report, null, 2) + "\n");
-  await save();
   try {
+    await save();
     assert.ok(!process.env.DATABASE_URL,
       "Owner gates reject caller-supplied DATABASE_URL; the fixture owns its database");
     assert.ok(process.env.RAINSYNC_NATIVE_POSTGRES_BIN,
@@ -43,9 +64,10 @@ export async function nativeOwnerGate(name, run, { requireTest = false } = {}) {
       path: process.env.W03_BACKEND_BINDING, requireTest,
     });
     report.backend_binding = binding.summary;
-    report.coordinator = await Promise.all([
-      ...commonInputs, `tests/${name}.mjs`,
-    ].map(async (path) => ({ path, sha256: sha256(await readFile(resolve(root, path))) })));
+    report.coordinator = [];
+    for (const path of [...commonInputs, `tests/${name}.mjs`])
+      report.coordinator.push({ path, sha256: sha256(await readFile(resolve(root, path))) });
+    coordinatorCaptured = true;
     stage = "fixture";
     await withTerminationSignal(async (termination) => {
       const deadline = new AbortController();
@@ -70,22 +92,34 @@ export async function nativeOwnerGate(name, run, { requireTest = false } = {}) {
         clearTimeout(timer);
       }
     });
-    stage = "binding_recheck";
-    await binding.verify();
-    for (const input of report.coordinator)
-      assert.equal(sha256(await readFile(resolve(root, input.path))), input.sha256,
-        "Owner coordinator source changed during validation");
-    report.inputs_unchanged = true;
   } catch (error) {
-    failure = error;
-    // Never serialize exception messages: driver/SQL errors can contain secrets.
-    report.failure = { stage, code: "owner_gate_failed" };
+    // Never serialize exception messages into the public report.
+    fail(error, "owner_gate_failed");
   } finally {
+    // Independent rechecks still run after runtime or earlier recheck failure.
+    let inputsUnchanged = Boolean(binding && coordinatorCaptured);
+    if (binding) {
+      try { await binding.verify(); }
+      catch (error) {
+        inputsUnchanged = false;
+        fail(error, "backend_binding_recheck_failed", "binding_recheck");
+      }
+    }
+    for (const input of report.coordinator ?? []) {
+      try {
+        assert.equal(sha256(await readFile(resolve(root, input.path))), input.sha256,
+          "Owner coordinator source changed during validation");
+      } catch (error) {
+        inputsUnchanged = false;
+        fail(error, "coordinator_recheck_failed", "binding_recheck");
+      }
+    }
+    report.inputs_unchanged = inputsUnchanged;
     if (fixture) {
       try {
         report.cleanup = await fixture.verifyStopped();
       } catch (error) {
-        failure ??= error;
+        fail(error, "owned_cleanup_unconfirmed", "cleanup");
         report.cleanup = { completed: false, code: "owned_cleanup_unconfirmed" };
       }
     } else {
@@ -93,16 +127,25 @@ export async function nativeOwnerGate(name, run, { requireTest = false } = {}) {
         ? { completed: true, resources_started: false }
         : { completed: false, code: "fixture_startup_cleanup_unconfirmed" };
     }
-    report.result = failure ? "failed" : "passed";
+    if (failures.length) await privateFailures("original-and-following-failures");
+    report.result = failures.length ? "failed" : "passed";
     report.finished_at = new Date().toISOString();
-    await save();
+    try { await save(); }
+    catch (error) {
+      fail(error, "final_report_write_failed", "report");
+      report.result = "failed";
+      await privateFailures("final-report-failure");
+    }
     console.log(`Owner gate evidence: ${reportPath}`);
   }
-  if (failure) {
-    // Detailed failures are useful on the local console, but only the safe JSON
-    // above is eligible for CI upload. Keep paths/credentials out of the report.
-    console.error(failure);
-    throw Error(`${name} failed; see the owner-gate report and local fixture logs`);
+  if (failures.length) {
+    // Node prints cause/errors even when non-enumerable. Keep the
+    // terminal error safe while retaining exact ordered objects for callers and
+    // the explicit private serializer above, even when disk receipts fail.
+    console.error("owner_gate_failed; see the private local failure receipts");
+    const error = Error(`${name} failed; see the owner-gate report and local fixture logs`);
+    Object.defineProperty(error, "privateErrors", { value: [...failures] });
+    throw error;
   }
   return report;
 }
