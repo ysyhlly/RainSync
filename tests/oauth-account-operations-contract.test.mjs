@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { undoOAuthDisableFinalLoginGuard } from "./fixtures/oauth-disable-login-guard-inverse.mjs";
 
 const read = (path) => readFileSync(new URL(`../apps/server/src/${path}`, import.meta.url), "utf8");
 const http = read("platform_accounts/oauth.rs");
@@ -82,13 +83,15 @@ function renewalFlow(text) {
     "decrypt(&old).map_err(|_| credential_error())?", "encrypt(&token_envelope(next, p, &binding, &t))",
     ".map_err(|_| credential_error())?", "} else {\n        None\n    };",
     "UPDATE platform_oauth_accounts SET auto_renew=false", ".bind(s.account_id).bind(cipher).bind(next.revision)",
-    "sqlx::query(ACCOUNT)", ".fetch_one(&mut *tx)", "status_value(registry, p, Some(&row), &login)",
+    "sqlx::query(ACCOUNT)", ".fetch_one(&mut *tx)",
+    "maintenance::phase(guard_login_live(&mut tx, user.id, &login)).await?",
+    "status_value(registry, p, Some(&row), &login)",
     "maintenance::commit(tx).await?", "Ok(value)"]);
   count(operation, /\bdecrypt\(&old\)/g, 1);
   count(operation, /\bencrypt\(&token_envelope/g, 1);
-  // The baseline has no post-account-lock final live check or SQL live predicate.
-  // That existing difference is preserved deliberately, not repaired here.
-  assert.doesNotMatch(operation, /guard_login_live|playback_login_allowed|UPDATE platform_oauth_requests|configured\(/);
+  // The separately scoped bugfix adds a final fence; all preceding error order remains.
+  count(operation, /guard_login_live\(/g, 1);
+  assert.doesNotMatch(operation, /playback_login_allowed|UPDATE platform_oauth_requests|configured\(/);
 }
 function unlinkFlow(text) {
   const operation = fn(text, "unlink");
@@ -140,6 +143,9 @@ function restoredOperation(text, name, parent) {
   return `${wrapper.slice(0, wrapper.indexOf("{\n"))}{\n${restored}\n}`;
 }
 function originalModule(text, parent = http) {
+  // First undo the explicitly NON-equivalent login-expiry bugfix. The unchanged
+  // historical hash below still proves only the earlier extraction boundary.
+  text = undoOAuthDisableFinalLoginGuard(text);
   let restored = replaceOnce(parent, "mod account_operations;\n", "");
   for (const name of operations) restored = replaceOnce(restored, fn(restored, name), restoredOperation(text, name, parent));
   const projection = fn(text, "status_value")
@@ -159,10 +165,10 @@ function originalMaintenance(text) {
 
 test("three operations accept only request context, immutable Registry and renewal-only cipher callbacks", () => capabilities(core));
 test("status retains both normalization updates before read, final live fence and bounded commit", () => statusFlow(core));
-test("renewal disable retains conflict/enabled/overflow/cipher order and its original missing final live fence", () => renewalFlow(core));
+test("renewal disable retains conflict/enabled/overflow/cipher order before its new final live fence", () => renewalFlow(core));
 test("unlink revokes only OAuth account and pending requests before its final live fence and read", () => unlinkFlow(core));
 test("HTTP preserves extractors, delegates exactly once, borrows only key, and returns the original private response", () => httpContract(http));
-test("inverse boundary edits recover complete original OAuth module including all unmoved helpers and owners", () => originalModule(core));
+test("explicit behavior-fix inverse then historical boundary inverse recover the original OAuth module", () => originalModule(core));
 test("begin_db extraction recovers complete original maintenance module including 5-second budgets", () => originalMaintenance(maintenance));
 test("synthetic Rust tests close their lazy pool before operations; no live resources can be opened", () => {
   const tests = all.split("#[cfg(test)]")[1].replace(/^    /gm, "");
@@ -188,7 +194,7 @@ const negatives = [
   ["renewal decrypt error leaks", core, renewalFlow, "decrypt(&old).map_err(|_| credential_error())?", "decrypt(&old)?"],
   ["renewal encrypt error leaks", core, renewalFlow, "encrypt(&token_envelope(next, p, &binding, &t)).map_err(|_| credential_error())?", "encrypt(&token_envelope(next, p, &binding, &t))?"],
   ["renewal binding check removed", core, originalModule, '.get::<Option<String>, _>("config_binding")\n            .ok_or_else(credential_error)?', '.get::<Option<String>, _>("config_binding")\n            .unwrap_or_default()'],
-  ["renewal adds final live fence", core, renewalFlow, "    let next = AccountScope {", "    maintenance::phase(guard_login_live(&mut tx, user.id, &login)).await?;\n    let next = AccountScope {"],
+  ["renewal adds an extra early live fence", core, renewalFlow, "    let next = AccountScope {", "    maintenance::phase(guard_login_live(&mut tx, user.id, &login)).await?;\n    let next = AccountScope {"],
   ["renewal adds SQL live predicate", core, renewalFlow, 'token_encrypted=$2,revision=$3 WHERE id=$1"', 'token_encrypted=$2,revision=$3 WHERE id=$1 AND playback_login_allowed(user_id,$4)"'],
   ["renewal eagerly encrypts missing token", core, originalModule, "    } else {\n        None\n    };", "    } else {\n        Some(encrypt(&Value::Null).map_err(|_| credential_error())?)\n    };"],
   ["unlink misses pending-request retirement", core, unlinkFlow, "WHERE account_id=$1 AND status='pending'", "WHERE account_id=$1 AND status='complete'"],

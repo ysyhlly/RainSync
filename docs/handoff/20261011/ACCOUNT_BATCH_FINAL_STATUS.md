@@ -51,3 +51,18 @@ The full plan remains incomplete:
 - P08/P09 and previously denied dependent playback paths remain excluded. No user-computer/Codex operation, real DB/socket/provider/browser test, merge or deployment occurred in this batch.
 
 The prior b50b2e9 baseline-dependent bundle was independently restored and all 1,664 tracked files checked. Newer bundles require their own restore verification; a bundle verify alone is not that evidence.
+
+## Later, separately scoped OAuth behavior fix
+
+The historical extraction status above remains a record of the completed batch.
+A follow-on change now adds the missing final exact-login check to OAuth disable
+inside its transaction, after the final account read and before projection and
+COMMIT. This deliberately changes expired-login behavior; it is not another
+claim of extraction equivalence. The old hashes remain intact behind an
+explicit, narrowly checked behavior-fix inverse. See
+[the fix, guard placement and blocking DB regression](../../OAUTH_DISABLE_FINAL_LOGIN_GUARD_20261011.md).
+The dedicated PostgreSQL fixture is authored and ignored by default; real
+ORIGINAL/CANDIDATE execution is still outstanding. This does not reopen or
+complete any excluded native/playback or provider qualification.
+
+The executor-loss recovery and reconstructed OAuth behavior fix are tracked separately in [recovery and guard status](RECOVERY_AND_OAUTH_GUARD_STATUS.md). Do not treat the earlier local paths or unfinished validation sessions as presently available evidence.

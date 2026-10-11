@@ -117,6 +117,9 @@ pub(super) async fn set_renewal(
             .fetch_one(&mut *tx),
     )
     .await?;
+    // Account-lock waits and local token work can outlive this exact login.
+    // Keep existing error priority; an expired login rolls back this whole write.
+    maintenance::phase(guard_login_live(&mut tx, user.id, &login)).await?;
     let value = status_value(registry, p, Some(&row), &login);
     maintenance::commit(tx).await?;
     Ok(value)
@@ -390,3 +393,7 @@ mod tests {
         }
     }
 }
+
+// Explicitly ignored, separately authorized PostgreSQL regression only.
+#[cfg(test)]
+mod disable_login_db_tests;

@@ -45,6 +45,7 @@ const backendContractFiles = [
   'tests/bilibili-login-operations-contract.test.mjs',
   'tests/bilibili-account-operations-contract.test.mjs',
   'tests/bilibili-renewal-account-operations-contract.test.mjs',
+  'tests/oauth-disable-login-guard-contract.test.mjs',
 ];
 const backendContractCommand = `node --test ${backendContractFiles.join(' ')}`;
 const assertBackendContractCommand = command => assert.equal(command, backendContractCommand);
