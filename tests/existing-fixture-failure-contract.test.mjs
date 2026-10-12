@@ -318,6 +318,38 @@ test('actual gate keeps all combinations of hostile serialization, failed privat
 
 // Extract only the actual log projector, never execute the native coordinator.
 const workerFailureSource = await readFile(new URL('./worker-error-classification.mjs', import.meta.url), 'utf8');
+const resourceWrapperSource = await readFile(new URL('../apps/server/src/http_file_fallback.rs', import.meta.url), 'utf8');
+
+test('synthetic local and HTTP worker grants preserve the production no-upstream marker', () => {
+  const production = section(resourceWrapperSource, 'pub fn wrap_resource(', 'pub async fn seed(');
+  assert.ok(production.includes('Some("local" | "agent" | "http")'));
+  assert.ok(production.includes('resource.get("upstream_base").is_none()'));
+  assert.ok(production.includes('outer["upstream_closed"] = json!(true);'));
+  const seed = section(workerFailureSource, '      withPlaybackAdmission(', '      diagnostics.stage("wait_terminal",');
+  const check = (source) => {
+    const match = source.match(/\$\{json\((\{ encrypted: encrypt\(resource\)[^\n]*?\})\)\}/);
+    assert.ok(match, 'The actual session INSERT must publish the resource envelope');
+    for (const resource of [{kind: 'local', job_id: 'job', resource: 'fixture.mp4'},
+      {kind: 'http', job_id: 'job', url: 'http://fixture.invalid/media', headers: {}}]) {
+      let encrypted;
+      const actual = runInNewContext(`(${match[1]})`, {resource, encrypt: value => {
+        encrypted = value; return 'fixture-cipher';
+      }});
+      assert.equal(encrypted, resource);
+      assert.deepEqual(JSON.parse(JSON.stringify(actual)), {encrypted: 'fixture-cipher', upstream_closed: true});
+    }
+  };
+  check(seed);
+  for (const mutation of [seed.replace(', upstream_closed: true', ''),
+    seed.replace('upstream_closed: true', 'upstream_closed: false'),
+    seed.replace('upstream_closed: true', 'upstream_closed: null')])
+    assert.throws(() => check(mutation), assert.AssertionError);
+  for (const assertion of ['assert.equal(delivery.status, httpStatus);',
+    'assert.equal(readiness.status, httpStatus);', 'assert.equal(error.error.code, code);',
+    'assert.equal(error.error.retryable, false);', 'assert.equal(error.error.retry_after_ms, undefined);',
+    'assert.ok(redacted);', 'assert.equal(published, "0");'])
+    assert.ok(workerFailureSource.includes(assertion), assertion);
+});
 const workerDiagnosticFactory = compile(section(workerFailureSource, 'function createWorkerErrorDiagnostics(', '\nconst repo = '));
 const plainWorkerSummary = (diagnostics, report) => JSON.parse(JSON.stringify(diagnostics.summary(report)));
 
