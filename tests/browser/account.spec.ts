@@ -342,7 +342,14 @@ test("avatar failures retain the old version and a truncated committed response 
     mimeType: "image/png",
     buffer: image,
   });
+  const failedUpload = page.waitForResponse(
+    (response) =>
+      response.request().method() === "PUT" &&
+      new URL(response.url()).pathname === "/api/v1/users/me/avatar" &&
+      response.status() === 503,
+  );
   await page.getByRole("button", { name: "保存头像", exact: true }).click();
+  await failedUpload;
   await expect(page.getByRole("dialog").getByRole("alert")).toContainText(
     "编码失败",
   );
