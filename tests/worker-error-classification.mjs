@@ -244,10 +244,12 @@ try {
         estimated_output_bytes: 1048576,
       };
       if (kind !== undefined) spec.kind = kind;
+      // Match production publication for local/HTTP inputs without provider
+      // check-in; legacy reporting must not rewrite this active grant.
       withPlaybackAdmission(
         f,
         { client: admin, user: identity.id, room: room.id, session: id },
-        `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES(${quote(id)},${quote(identity.id)},${quote(room.id)},${quote(media)},0,${quote(sha(token))},${json({ encrypted: encrypt(resource) })},clock_timestamp()+interval '1 hour'); INSERT INTO media_jobs(id,session_id,status,spec) VALUES(${quote(id)},${quote(id)},'queued',${json(spec)})`,
+        `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES(${quote(id)},${quote(identity.id)},${quote(room.id)},${quote(media)},0,${quote(sha(token))},${json({ encrypted: encrypt(resource), upstream_closed: true })},clock_timestamp()+interval '1 hour'); INSERT INTO media_jobs(id,session_id,status,spec) VALUES(${quote(id)},${quote(id)},'queued',${json(spec)})`,
       );
       diagnostics.stage("wait_terminal", { wait_timeout_ms: 25000 });
       await f.waitForSql(

@@ -80,7 +80,12 @@ test("selection survives choosing a room and requires one explicit confirmation"
   await expect(confirm).toBeEnabled();
   expect(app.commands.filter((c) => c.type === "CHANGE_MEDIA")).toHaveLength(0);
   await confirm.click();
-  await expect(confirm).toHaveCount(0);
+  await expect(
+    page.getByRole("region", { name: "已选择的影片", exact: true }),
+  ).toHaveCount(0);
+  await expect
+    .poll(() => app.commands.filter((c) => c.type === "CHANGE_MEDIA"))
+    .toHaveLength(1);
   expect(app.commands.filter((c) => c.type === "CHANGE_MEDIA")).toHaveLength(1);
   expect(
     app.commands.find((c) => c.type === "CHANGE_MEDIA").payload.media_id,
