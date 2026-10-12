@@ -163,7 +163,7 @@ const section=(start,end)=>{
  return source.slice(from,to);
 };
 const helpers=section('const quote=','// This fixed set');
-const load=(scope={})=>runInNewContext(`${helpers}\n({authSelect,policySelect,boundaryDiagnosticSql,safeBoundaryDiagnostic,safeBoundaryFailureCode,captureBoundaryDiagnostic})`,{assert,setTimeout,clearTimeout,...scope},{timeout:1000});
+const load=(scope={})=>runInNewContext(`${helpers}\n({authSelect,policySelect,policyIndexWitnessSql,policyIndexWitnessMatches,boundaryDiagnosticSql,safeBoundaryDiagnostic,safeBoundaryFailureCode,captureBoundaryDiagnostic})`,{assert,setTimeout,clearTimeout,...scope},{timeout:1000});
 const plain=value=>JSON.parse(JSON.stringify(value));
 const backend_start='2026-10-12T03:00:00.000000Z';
 const marker='guest_policy_holder_'+'a'.repeat(32);
@@ -180,6 +180,99 @@ function fakeTimers(){
  return {setTimeout:(fn,ms)=>{const id=++serial;pending.set(id,{fn,ms});return id;},clearTimeout:id=>pending.delete(id),fire:ms=>{const entry=[...pending].find(([,v])=>v.ms===ms);assert.ok(entry,`missing ${ms} ms bound`);pending.delete(entry[0]);entry[1].fn();},pending};
 }
 
+test('policy witnesses bind the target primary-index OID and both granted and waiting lock modes',()=>{
+ const api=load(),sql=api.policyIndexWitnessSql(100,101);
+ assert.match(sql,/FROM pg_index i WHERE i\.indexrelid='public\.room_guest_access_pkey'::regclass AND i\.indrelid='public\.room_guest_access'::regclass AND i\.indisprimary/);
+ assert.match(sql,/l\.locktype='relation' AND l\.database=\(SELECT oid FROM pg_database WHERE datname=current_database\(\)\)/);
+ assert.match(sql,/l\.pid IN\(100,101\) AND l\.relation IN\(i\.indexrelid,i\.indrelid\)/);
+ // PostgreSQL serializes oid as JSON strings unless explicitly cast to a
+ // numeric SQL type; mock JSON numbers alone cannot catch this boundary.
+ assert.match(sql,/'index_oid',i\.indexrelid::bigint,'table_oid',i\.indrelid::bigint/);
+ assert.match(sql,/'relation_oid',l\.relation::bigint,'mode',l\.mode,'granted',l\.granted/);
+ assert.throws(()=>api.policyIndexWitnessSql(100,100));
+ assert.throws(()=>api.policyIndexWitnessSql('100; private',101));
+ const value=()=>({index_oid:300,table_oid:200,locks:[
+  {pid:100,relation_oid:300,mode:'AccessExclusiveLock',granted:true},
+  {pid:101,relation_oid:300,mode:'AccessShareLock',granted:false},
+  {pid:100,relation_oid:200,mode:'ShareLock',granted:true},
+  {pid:101,relation_oid:200,mode:'AccessShareLock',granted:true},
+ ]});
+ assert.equal(api.policyIndexWitnessMatches(value(),100,101),true);
+ for(const change of [
+  v=>v.index_oid=301,v=>v.table_oid=201,v=>v.index_oid=v.table_oid,v=>v.index_oid='300',
+  v=>v.locks[0].relation_oid=200,v=>v.locks[0].mode='ShareLock',v=>v.locks[0].granted=false,
+  v=>v.locks[1].pid=102,v=>v.locks[1].relation_oid=200,v=>v.locks[1].mode='RowShareLock',v=>v.locks[1].granted=true,
+  v=>v.locks[2].granted=false,v=>v.locks[3].granted=false,v=>v.locks=[],v=>v.locks=null,
+  v=>v.locks.push({pid:100,relation_oid:200,mode:'AccessExclusiveLock',granted:true}),
+ ]){const v=value();change(v);assert.equal(api.policyIndexWitnessMatches(v,100,101),false);}
+ assert.equal(api.policyIndexWitnessMatches(null,100,101),false);
+});
+
+test('the actual holder rolls back only the policy REINDEX and retains positive owned cleanup',async()=>{
+ const holderSource=section(' async function holder(', '\n const cases=');
+ for(const boundary of ['policy','trigger','principal']){
+  const writes=[],receipts=[],reads=[];
+  const child=new EventEmitter();child.pid=10;child.stdout=new EventEmitter();child.stderr=new EventEmitter();child.stdin=new EventEmitter();
+  let close;child.done=new Promise(done=>close=done);
+  child.stdin.write=sql=>{
+   writes.push(sql);const marker=sql.match(/\\echo (guest_policy_holder_[a-f0-9]+)_ready/)[1];
+   child.stdout.emit('data',Buffer.from(`${marker}_staged_admin=false\n${marker}_ready\n`));
+  };
+  child.stdin.end=sql=>{writes.push(sql);child.exitCode=0;child.emit('close',0,null);close();};
+  const scope={assert,Buffer,Error,AggregateError,randomUUID:()=> 'a'.repeat(32),
+   f:{sqlProcess:()=>child,sql:sql=>{reads.push(sql);return sql.startsWith('SELECT NOT EXISTS')?'t':JSON.stringify([{pid:100,datname:'test',backend_start}]);}},
+   fixed:(ok,code)=>assert.ok(ok,code),bounded:async value=>await value,cleanupBound:async value=>await value,
+   privateFile:async(...args)=>{receipts.push(args);return {sha256:'receipt'};},verifyPidAbsent:pid=>pid===10,
+  };
+  const makeHolder=runInNewContext(`${helpers}\n${holderSource}\nholder`,scope,{timeout:1000});
+  const id='00000000-0000-0000-0000-000000000001';
+  const block=await makeHolder({boundary,name:boundary},{guest:{id}},{id});
+  assert.equal(block.query,boundary==='policy'?load().policySelect:boundary==='trigger'?
+   'INSERT INTO room_guest_access(room_id,enabled,updated_by) VALUES($1,$2,$3) ON CONFLICT(room_id) DO UPDATE SET enabled=EXCLUDED.enabled,updated_by=EXCLUDED.updated_by,updated_at=clock_timestamp()':'SELECT admin FROM users WHERE id=$1 FOR SHARE');
+  assert.match(block.where,/blocked\.query=.* AND pg_blocking_pids\(blocked.pid\)=ARRAY\[100\]::integer\[\]/);
+  assert.ok(block.where.includes(`held.backend_start='${backend_start}'::timestamptz`));
+  if(boundary==='policy')assert.match(writes[0],/REINDEX INDEX public\.room_guest_access_pkey;/);
+  else assert.doesNotMatch(writes[0],/REINDEX/);
+  assert.doesNotMatch(writes[0],/CONCURRENTLY|LOCK TABLE room_guest_access|ANALYZE/);
+  const record=await block.release();assert.equal(await block.release(),record);
+  assert.equal(writes.length,2,'cleanup is idempotent');
+  assert.equal(writes[1],boundary==='policy'?'ROLLBACK;\n\\q\n':'COMMIT;\n\\q\n');
+  assert.equal(record.close_observed,true);assert.equal(record.exit_code,0);assert.equal(record.signal,null);
+  assert.equal(record.pid_absent,true);assert.equal(record.backend_absent,true);
+  assert.ok(reads.some(sql=>sql.includes('pg_stat_activity WHERE pid=100')));
+  assert.equal(receipts.length,3);assert.equal(receipts[0][2],writes[0]);
+ }
+});
+
+test('the actual policy witness rejects authentication and wrong index edges at either observation',async()=>{
+ const api=load(),witnessSource=section('   async function witness(suffix)', '\n   const first=');
+ const value=()=>({holder:{pid:100,datname:'test'},blocked:{pid:101,datname:'test',query:api.policySelect,wait_event_type:'Lock',wait_event:'relation',blocking_pids:[100]},policy_index:{index_oid:300,table_oid:200,locks:[
+  {pid:100,relation_oid:300,mode:'AccessExclusiveLock',granted:true},
+  {pid:101,relation_oid:300,mode:'AccessShareLock',granted:false},
+  {pid:100,relation_oid:200,mode:'ShareLock',granted:true},
+  {pid:101,relation_oid:200,mode:'AccessShareLock',granted:true},
+ ]}});
+ for(const suffix of ['initial','pre-release']){
+  let current=value();const receipts=[];
+  const witness=runInNewContext(`${witnessSource}\nwitness`,{
+   f:{sql:()=>JSON.stringify(current)},witnessSql:'catalog witness',block:{record:{holder_backend_pid:100},query:api.policySelect},blocked:101,
+   spec:{boundary:'policy',name:'policy'},fixed:(ok,code)=>{if(!ok)throw Error(code);},policyIndexWitnessMatches:api.policyIndexWitnessMatches,
+   privateFile:async(...args)=>{receipts.push(args);return {};},
+  },{timeout:1000});
+  assert.deepEqual(plain((await witness(suffix)).value),current);
+  assert.equal(receipts[0][0],`policy.${suffix}`);
+  for(const [change,code] of [
+   [v=>v.blocked.query=api.authSelect,'exact_pg_edge_failed'],
+   [v=>v.blocked.blocking_pids=[100,102],'exact_pg_edge_failed'],
+   [v=>v.blocked.wait_event='transactionid','policy_index_lock_failed'],
+   [v=>v.policy_index=null,'policy_index_lock_failed'],
+   [v=>v.policy_index.locks[1].relation_oid=200,'policy_index_lock_failed'],
+   [v=>v.policy_index.locks[1].granted=true,'policy_index_lock_failed'],
+  ]){current=value();change(current);await assert.rejects(witness(suffix),error=>error.message===code);}
+  assert.equal(receipts.length,1,'failed qualification cannot produce a passing witness receipt');
+ }
+});
+
 test('diagnostic SQL identifies the current owned holder and bounds read-only catalog output',()=>{
  const api=load(),sql=api.boundaryDiagnosticSql({pid:100,backendStart:backend_start,marker},backend_start);
  const identity=readFileSync(new URL('../apps/server/src/identity/request.rs',import.meta.url),'utf8');
@@ -191,6 +284,7 @@ test('diagnostic SQL identifies the current owned holder and bounds read-only ca
  assert.match(sql,/h\.pid=ANY\(pg_blocking_pids\(a\.pid\)\)/);
  for(const limit of [9,8,65,64])assert.ok(sql.includes(`LIMIT ${limit}`));
  assert.match(sql,/w\.blockers\[1:8\]/);
+ assert.ok(sql.includes("'room_guest_access_pkey'"));
  assert.ok(sql.includes(`CASE a.query WHEN '${api.authSelect}' THEN 'auth_select' WHEN '${api.policySelect}' THEN 'policy_select' ELSE 'other' END`));
  assert.doesNotMatch(sql,/'(?:query|cookie|token|body|selector|datname|application_name)'\s*,|to_jsonb\([ahw]\)|pg_get_/);
  assert.match(sql,/clock_timestamp\(\)>='2026-10-12T03:00:00\.000000Z'::timestamptz/);
@@ -215,6 +309,8 @@ test('the report projection excludes extra fields and reduces unrecognized strin
   const v=payload();v.waiters[0].query_class=query_class;
   assert.equal(api.safeBoundaryDiagnostic(v).waiters[0].query_class,query_class);
  }
+ const index=payload();index.locks[0].relation='room_guest_access_pkey';
+ assert.equal(api.safeBoundaryDiagnostic(index).locks[0].relation,'room_guest_access_pkey');
  for(const change of [v=>v.waiters=Array(9).fill(v.waiters[0]),v=>v.locks=Array(65).fill(v.locks[0]),v=>v.waiters[0].blocking_pids=Array(9).fill(100),v=>v.holder.backend_start=secret,v=>v.waiters[0].pid=secret,v=>v.database_deadline_reached=secret,v=>v.locks[0].granted=secret]){
   const v=payload();change(v);assert.throws(()=>api.safeBoundaryDiagnostic(v),/guest_diagnostic_invalid_result/);
  }
@@ -222,7 +318,7 @@ test('the report projection excludes extra fields and reduces unrecognized strin
 
 test('only exact allowlisted original failure codes become public',()=>{
  const api=load();
- for(const code of ['guest_sql_witness_deadline','expiry_reached_before_request','exact_pg_edge_failed','backend_identity_changed'])assert.equal(api.safeBoundaryFailureCode(Error(code)),code);
+ for(const code of ['guest_sql_witness_deadline','expiry_reached_before_request','exact_pg_edge_failed','backend_identity_changed','policy_index_lock_failed','policy_index_identity_changed'])assert.equal(api.safeBoundaryFailureCode(Error(code)),code);
  for(const error of [Error('private cookie path'),Error('guest_sql_witness_deadline: private detail'),undefined,null,false,{get message(){throw Error('private getter');}}])assert.equal(api.safeBoundaryFailureCode(error),'guest_boundary_failed');
  let reads=0;assert.equal(api.safeBoundaryFailureCode({get message(){return ++reads===1?'guest_sql_witness_deadline':'private second read';}}),'guest_sql_witness_deadline');assert.equal(reads,1);
 });
@@ -288,9 +384,9 @@ test('the actual boundary captures before release and preserves the original eve
  }
 });
 
-test('diagnostics leave exact SQL, identity, expiry, pending and cleanup requirements intact',()=>{
+test('index boundary and diagnostics preserve exact SQL, identity, expiry, pending and cleanup requirements',()=>{
  for(const exact of [
-  "'LOCK TABLE room_guest_access IN ACCESS EXCLUSIVE MODE'",
+  "'REINDEX INDEX public.room_guest_access_pkey'",
   "fixed(tuple.length===1,'holder_backend_not_unique')",
   'blocked.query=${quote(query)} AND pg_blocking_pids(blocked.pid)=ARRAY[${backend}]::integer[]',
   "pids.length===1&&Number.isInteger(pids[0])&&pids[0]>0&&pids[0]!==block.record.holder_backend_pid",
@@ -298,10 +394,23 @@ test('diagnostics leave exact SQL, identity, expiry, pending and cleanup require
   "fixed(first.value.clock<deadline,'first_witness_not_before_expiry')",
   "JSON.stringify(JSON.parse(f.sql(block.pidsSql)))===JSON.stringify([blocked])&&!requestSettled",
   'first.value.holder.backend_start===second.value.holder.backend_start&&first.value.blocked.backend_start===second.value.blocked.backend_start',
+  "value.blocked.wait_event==='relation'&&policyIndexWitnessMatches(value.policy_index,block.record.holder_backend_pid,blocked)",
+  'first.value.policy_index.index_oid===second.value.policy_index.index_oid&&first.value.policy_index.table_oid===second.value.policy_index.table_oid',
   "fixed(second.value.clock>=deadline,'database_clock_not_reached')",
   "fixed(bodyConsumed&&response.bodyUsed,'pending_http_body_not_consumed')",
   'if(primaryFailed)throw failure;',
  ])assert.ok(source.includes(exact),exact);
- assert.doesNotMatch(source,/REINDEX|pg_cancel_backend|pg_terminate_backend/);
+ inOrder(callback,[
+  "const s=await subject(spec.boundary==='trigger')",
+  "if(spec.boundary==='policy')f.sql('ANALYZE public.room_guest_access')",
+  "expires_at=clock_timestamp()+interval '3 seconds'",
+  'block=await holder(spec,s,actor)',
+  "const first=await witness('initial')",
+  "const second=await witness('pre-release')",
+  'active.holder_cleanup=await block.release()',
+ ]);
+ assert.match(source,/const until=Date\.now\(\)\+10000;while\(Date\.now\(\)<until\)/);
+ assert.match(source,/const query=spec\.boundary==='policy'\?policySelect:/);
+ assert.doesNotMatch(source,/LOCK TABLE room_guest_access|REINDEX (?:\([^)]*CONCURRENTLY|INDEX CONCURRENTLY)|pg_cancel_backend|pg_terminate_backend|plan_cache_mode/);
 });
 }
