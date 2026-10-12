@@ -399,8 +399,19 @@ await isolatedServer(
       await admin
         .getByRole("button", { name: "生成邀请", exact: true })
         .click();
+      await admin.getByText("高级选项：邀请数据", { exact: true }).click();
       const roomInvitation = JSON.parse(
-        await admin.getByLabel("完整房间邀请").inputValue(),
+        await admin.getByLabel("邀请 JSON", { exact: true }).inputValue(),
+      );
+      assert.match(
+        roomInvitation.room_id,
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      );
+      assert.match(roomInvitation.token, /^[0-9a-f]{64}$/i);
+      await expect(
+        admin.getByLabel("可分享的邀请链接", { exact: true }),
+      ).toHaveValue(
+        `${origin}/invite/${roomInvitation.room_id.toLowerCase()}#token=${roomInvitation.token}`,
       );
       await admin.getByRole("button", { name: "关闭弹窗" }).click();
       await viewer.getByRole("button", { name: "通过邀请加入" }).click();
@@ -408,6 +419,12 @@ await isolatedServer(
         .getByLabel("粘贴完整房间邀请")
         .fill(JSON.stringify(roomInvitation));
       await viewer.getByRole("button", { name: "解析邀请" }).click();
+      await expect(viewer.getByLabel("房间 ID", { exact: true })).toHaveValue(
+        roomInvitation.room_id.toLowerCase(),
+      );
+      await expect(viewer.getByLabel("邀请凭据", { exact: true })).toHaveValue(
+        roomInvitation.token,
+      );
       await viewer
         .getByRole("button", { name: "加入房间", exact: true })
         .click();
