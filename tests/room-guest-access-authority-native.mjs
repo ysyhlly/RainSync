@@ -14,6 +14,112 @@ const uuid=v=>{assert.match(v,/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i);re
 const policySelect='SELECT EXISTS(SELECT 1 FROM room_guest_access WHERE room_id=$1 AND enabled)';
 const policyWrite='INSERT INTO room_guest_access(room_id,enabled,updated_by) VALUES($1,$2,$3) ON CONFLICT(room_id) DO UPDATE SET enabled=EXCLUDED.enabled,updated_by=EXCLUDED.updated_by,updated_at=clock_timestamp()';
 const adminSelect='SELECT admin FROM users WHERE id=$1 FOR SHARE';
+// Diagnostic-only helpers. Never import this native entrypoint from a unit test.
+const authSelect='SELECT u.id,u.admin,s.csrf,u.principal_kind FROM sessions s JOIN users u ON u.id=s.user_id WHERE token_hash=$1 AND expires_at>clock_timestamp() AND playback_login_allowed(u.id,s.token_hash) AND NOT EXISTS(SELECT 1 FROM account_exits e WHERE e.user_id=u.id)';
+const boundaryFailureCodes=new Set([
+ 'guest_sql_witness_deadline','guest_boundary_deadline','owner_gate_timeout',
+ 'expiry_reached_before_request','unique_blocked_backend_failed','exact_pg_edge_failed',
+ 'request_settled_before_wait','first_witness_not_before_expiry','original_deadline_changed',
+ 'same_edge_no_longer_pending','backend_identity_changed','database_clock_not_reached',
+]);
+function safeBoundaryFailureCode(error){
+ try{const code=error?.message;return boundaryFailureCodes.has(code)?code:'guest_boundary_failed';}
+ catch{return 'guest_boundary_failed';}
+}
+const diagnosticRelations=['room_guest_access','sessions','users','guest_principals','account_exits','rooms','room_members','admin_settings'];
+const diagnosticModes=['AccessShareLock','RowShareLock','RowExclusiveLock','ShareUpdateExclusiveLock','ShareLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock'];
+const diagnosticWaitEvents=['relation','extend','frozenid','page','tuple','transactionid','virtualxid','spectoken','object','userlock','advisory','applytransaction'];
+function boundaryDiagnosticSql({pid,backendStart,marker},deadline){
+ assert.ok(Number.isInteger(pid)&&pid>0);
+ assert.match(marker,/^guest_policy_holder_[0-9a-f]{32}$/);
+ if(deadline!==undefined)assert.match(deadline,/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/);
+ const timestamp=alias=>`to_char(${alias}.backend_start AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+ // No session selector, SQL parameters, SQL text, database name, or arbitrary
+ // relation names enter the result. Only waiters blocked by this owned identity.
+ return `BEGIN READ ONLY;
+SET LOCAL statement_timeout='1s'; SET LOCAL lock_timeout='250ms';
+WITH owned_holder AS MATERIALIZED (
+ SELECT pid,backend_start FROM pg_stat_activity
+ WHERE pid=${pid} AND backend_start=${quote(backendStart)}::timestamptz
+ AND datname=current_database() AND application_name=${quote(marker)}
+), blocked AS MATERIALIZED (
+ SELECT a.pid,a.backend_start,a.wait_event_type,a.wait_event,pg_blocking_pids(a.pid) AS blockers,
+ CASE a.query WHEN ${quote(authSelect)} THEN 'auth_select' WHEN ${quote(policySelect)} THEN 'policy_select' ELSE 'other' END AS query_class
+ FROM pg_stat_activity a WHERE a.datname=current_database() AND a.wait_event_type='Lock'
+ AND EXISTS(SELECT 1 FROM owned_holder h WHERE h.pid=ANY(pg_blocking_pids(a.pid)))
+ ORDER BY a.pid LIMIT 9
+), selected_waiters AS MATERIALIZED (SELECT * FROM blocked ORDER BY pid LIMIT 8),
+ relevant_locks AS MATERIALIZED (
+ SELECT l.pid,CASE WHEN n.nspname='public' AND c.relname IN(${diagnosticRelations.map(quote).join(',')}) THEN c.relname ELSE 'other' END AS relation,l.mode,l.granted
+ FROM pg_locks l LEFT JOIN pg_class c ON c.oid=l.relation LEFT JOIN pg_namespace n ON n.oid=c.relnamespace
+ WHERE l.locktype='relation' AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
+ AND l.pid IN(SELECT pid FROM owned_holder UNION ALL SELECT pid FROM selected_waiters)
+ ORDER BY l.pid,l.relation,l.mode,l.granted LIMIT 65
+)
+SELECT jsonb_build_object(
+ 'database_deadline_reached',${deadline===undefined?'NULL':`clock_timestamp()>=${quote(deadline)}::timestamptz`},
+ 'holder',(SELECT jsonb_build_object('pid',h.pid,'backend_start',${timestamp('h')}) FROM owned_holder h),
+ 'waiters',COALESCE((SELECT jsonb_agg(jsonb_build_object('pid',w.pid,'backend_start',${timestamp('w')},'query_class',w.query_class,'blocking_pids',w.blockers[1:8],'blockers_truncated',cardinality(w.blockers)>8,'wait_event_type',w.wait_event_type,'wait_event',w.wait_event) ORDER BY w.pid) FROM selected_waiters w),'[]'::jsonb),
+ 'waiters_truncated',(SELECT count(*)>8 FROM blocked),
+ 'locks',COALESCE((SELECT jsonb_agg(to_jsonb(l)) FROM (SELECT * FROM relevant_locks LIMIT 64) l),'[]'::jsonb),
+ 'locks_truncated',(SELECT count(*)>64 FROM relevant_locks)
+)::text;
+ROLLBACK;`;
+}
+function safeBoundaryDiagnostic(value){
+ const valid=ok=>{if(!ok)throw Error('guest_diagnostic_invalid_result');};
+ const pid=value=>{valid(Number.isInteger(value)&&value>0);return value;};
+ const flag=value=>{valid(typeof value==='boolean');return value;};
+ const backend=value=>{valid(value&&typeof value==='object');valid(typeof value.backend_start==='string'&&/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(value.backend_start));return {pid:pid(value.pid),backend_start:value.backend_start};};
+ const list=(value,max)=>{valid(Array.isArray(value)&&value.length<=max);return value;};
+ const allowed=(value,choices)=>choices.includes(value)?value:'other';
+ valid(value&&typeof value==='object');
+ valid(value.database_deadline_reached===null||typeof value.database_deadline_reached==='boolean');
+ return {
+  database_deadline_reached:value.database_deadline_reached,
+  holder:value.holder===null?null:backend(value.holder),
+  waiters:list(value.waiters,8).map(w=>({...backend(w),query_class:allowed(w.query_class,['auth_select','policy_select']),blocking_pids:list(w.blocking_pids,8).map(pid),blockers_truncated:flag(w.blockers_truncated),wait_event_type:w.wait_event_type==='Lock'?'Lock':'other',wait_event:allowed(w.wait_event,diagnosticWaitEvents)})),
+  waiters_truncated:flag(value.waiters_truncated),
+  locks:list(value.locks,64).map(l=>({pid:pid(l.pid),relation:allowed(l.relation,diagnosticRelations),mode:allowed(l.mode,diagnosticModes),granted:flag(l.granted)})),
+  locks_truncated:flag(value.locks_truncated),
+ };
+}
+async function captureBoundaryDiagnostic(sqlProcess,sql){
+ // A dedicated owned psql has a wall-clock bound even if connection/query/exit
+ // stalls. The fixture remains responsible for its final positive cleanup.
+ return await new Promise(resolve=>{
+  let child,timer,cleanupTimer,stopping,finished=false,bytes=0,output='';
+  const finish=result=>{if(finished)return;finished=true;clearTimeout(timer);clearTimeout(cleanupTimer);resolve(result);};
+  const stop=code=>{
+   if(finished||stopping)return;stopping=code;
+   cleanupTimer=setTimeout(()=>finish({capture_code:'guest_diagnostic_cleanup_unconfirmed'}),500);
+   try{child.kill('SIGKILL');}catch{finish({capture_code:'guest_diagnostic_cleanup_unconfirmed'});}
+  };
+  try{
+   child=sqlProcess(undefined,{interactive:true});
+   child.done.catch(()=>{});
+   child.once('error',()=>stop('guest_diagnostic_query_failed'));
+   child.stdin.on('error',()=>stop('guest_diagnostic_query_failed'));
+   child.stdout.on('error',()=>stop('guest_diagnostic_query_failed'));
+   child.once('close',(code,term)=>{
+    if(stopping)return finish({capture_code:stopping});
+    if(code!==0||term)return finish({capture_code:'guest_diagnostic_query_failed'});
+    try{finish({capture_code:'guest_diagnostic_captured',...safeBoundaryDiagnostic(JSON.parse(output))});}
+    catch{finish({capture_code:'guest_diagnostic_invalid_result'});}
+   });
+   child.stdout.on('data',chunk=>{
+    if(stopping||finished)return;bytes+=chunk.length;
+    if(bytes>65536)return stop('guest_diagnostic_output_limit');
+    output+=chunk.toString();
+   });
+   timer=setTimeout(()=>stop('guest_diagnostic_timeout'),2000);
+   child.stdin.end(`\\set QUIET on\n${sql}\n\\q\n`);
+  }catch{
+   if(child)stop('guest_diagnostic_query_failed');
+   else finish({capture_code:'guest_diagnostic_unavailable'});
+  }
+ });
+}
 // This fixed set is independent of dynamic case lists: missing, duplicate, or unknown checks fail.
 const requiredChecks = [
   "get_put_ingress_precedence",
@@ -71,18 +177,18 @@ await nativeOwnerGate('room-guest-access-authority-native',async(f,{report,check
   const disabled=await subject();await global(false);await http('put_global_disabled_owner',disabled.owner.client.raw(path(disabled),{method:'PUT',body:{enabled:true}}),200);const disclosure=await http('get_global_disabled_disclosure',disabled.owner.client.raw(path(disabled),readOptions),200);fixed(disclosure.value.enabled===true&&disclosure.value.guests_enabled===false,'global_disabled_disclosure');await global(true);
  });
  async function holder(spec,s,actor){
-  const marker=`guest_policy_holder_${randomUUID().replaceAll('-','')}`,child=f.sqlProcess(undefined,{interactive:true});fixed(Number.isInteger(child.pid)&&child.pid>0,'holder_child_pid_invalid');const stdout=[],stderr=[];let output='',backend,releasePromise;const record={holder_child_pid:child.pid,holder_backend_pid:null,close_observed:false,exit_code:null,signal:null,pid_absent:false,backend_absent:false};
+  const marker=`guest_policy_holder_${randomUUID().replaceAll('-','')}`,child=f.sqlProcess(undefined,{interactive:true});fixed(Number.isInteger(child.pid)&&child.pid>0,'holder_child_pid_invalid');const stdout=[],stderr=[];let output='',backend,backendStart,releasePromise;const record={holder_child_pid:child.pid,holder_backend_pid:null,close_observed:false,exit_code:null,signal:null,pid_absent:false,backend_absent:false};
   child.once('close',(code,term)=>Object.assign(record,{close_observed:true,exit_code:code,signal:term}));child.stdin.on('error',()=>{});child.stderr.on('data',b=>stderr.push(Buffer.from(b)));
   const ready=new Promise((done,reject)=>{child.stdout.on('data',b=>{stdout.push(Buffer.from(b));output+=b.toString();if(output.includes(marker+'_ready'))done();});child.once('error',reject);child.done.then(()=>reject(Error('holder_closed_before_ready')),reject);});
   const lock=spec.boundary==='policy'?'LOCK TABLE room_guest_access IN ACCESS EXCLUSIVE MODE':spec.boundary==='trigger'?`SELECT user_id FROM guest_principals WHERE user_id=${uuid(s.guest.id)} FOR NO KEY UPDATE`:`UPDATE users SET admin=false WHERE id=${uuid(actor.id)}; SELECT ${quote(marker+'_staged_admin=')}||admin::text FROM users WHERE id=${uuid(actor.id)}`;
   const setup=`BEGIN; SET LOCAL application_name=${quote(marker)}; SET LOCAL statement_timeout='12s'; SET LOCAL idle_in_transaction_session_timeout='15s'; ${lock};\n\\echo ${marker}_ready\n`;
   child.stdin.write(setup);
   async function release(){if(!releasePromise)releasePromise=(async()=>{const errors=[];try{child.stdin.end('COMMIT;\n\\q\n');await cleanupBound(child.done);fixed(record.close_observed&&record.exit_code===0&&record.signal===null&&child.exitCode===0,'holder_positive_close_failed');record.pid_absent=verifyPidAbsent(child.pid);fixed(record.pid_absent,'holder_child_present');if(backend){record.backend_absent=f.sql(`SELECT NOT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=${backend})`)==='t';fixed(record.backend_absent,'holder_backend_present');}}catch(e){errors.push(e);}finally{try{record.private_setup_sql=await privateFile(spec.name,'holder-setup.private.sql',setup);}catch(e){errors.push(e);}try{record.stdout=await privateFile(spec.name,'holder.stdout.private.log',Buffer.concat(stdout));}catch(e){errors.push(e);}try{record.stderr=await privateFile(spec.name,'holder.stderr.private.log',Buffer.concat(stderr));}catch(e){errors.push(e);}}if(errors.length)throw new AggregateError(errors,'holder_cleanup_failed');return record;})();return releasePromise;}
-  try{await bounded(ready);const tuple=JSON.parse(f.sql(`SELECT COALESCE(jsonb_agg(jsonb_build_object('pid',pid,'datname',datname,'backend_start',backend_start) ORDER BY pid),'[]'::jsonb)::text FROM pg_stat_activity WHERE application_name=${quote(marker)} AND datname=current_database()`));fixed(tuple.length===1,'holder_backend_not_unique');backend=tuple[0].pid;fixed(Number.isInteger(backend)&&backend>0,'holder_backend_pid_invalid');record.holder_backend_pid=backend;if(spec.boundary==='principal')fixed(output.includes(marker+'_staged_admin=false'),'holder_real_demotion_not_observed');}catch(e){try{active.holder_cleanup=await release();}catch(c){throw new AggregateError([e,c],'holder_setup_and_cleanup_failed');}throw e;}
+  try{await bounded(ready);const tuple=JSON.parse(f.sql(`SELECT COALESCE(jsonb_agg(jsonb_build_object('pid',pid,'datname',datname,'backend_start',backend_start) ORDER BY pid),'[]'::jsonb)::text FROM pg_stat_activity WHERE application_name=${quote(marker)} AND datname=current_database()`));fixed(tuple.length===1,'holder_backend_not_unique');backend=tuple[0].pid;fixed(Number.isInteger(backend)&&backend>0,'holder_backend_pid_invalid');record.holder_backend_pid=backend;backendStart=tuple[0].backend_start;if(spec.boundary==='principal')fixed(output.includes(marker+'_staged_admin=false'),'holder_real_demotion_not_observed');}catch(e){try{active.holder_cleanup=await release();}catch(c){throw new AggregateError([e,c],'holder_setup_and_cleanup_failed');}throw e;}
   const query=spec.boundary==='policy'?policySelect:spec.boundary==='trigger'?policyWrite:adminSelect;
   const where=`blocked.datname=current_database() AND blocked.wait_event_type='Lock' AND blocked.query=${quote(query)} AND pg_blocking_pids(blocked.pid)=ARRAY[${backend}]::integer[] AND EXISTS(SELECT 1 FROM pg_stat_activity held WHERE held.pid=${backend} AND held.datname=blocked.datname AND held.application_name=${quote(marker)})`;
   const pidsSql=`SELECT COALESCE(jsonb_agg(blocked.pid ORDER BY blocked.pid),'[]'::jsonb)::text FROM pg_stat_activity blocked WHERE ${where}`;
-  return {release,record,where,pidsSql,query,witness:`SELECT EXISTS(SELECT 1 FROM pg_stat_activity blocked WHERE ${where})`};
+  return {release,record,where,pidsSql,query,diagnosticSql:deadline=>boundaryDiagnosticSql({pid:backend,backendStart,marker},deadline),witness:`SELECT EXISTS(SELECT 1 FROM pg_stat_activity blocked WHERE ${where})`};
  }
  const cases=[{name:'get_entry_only_natural_expiry_policy_select',boundary:'policy',expiry:true,status:200},{name:'put_trigger_natural_expiry_full_rollback',boundary:'trigger',expiry:true,status:401,code:'SESSION_EXPIRED'},{name:'put_admin_demotion_before_share',boundary:'principal',status:403,code:'FORBIDDEN'}];
  for(const spec of cases)await runCase(spec.name,async()=>{
@@ -96,7 +202,7 @@ await nativeOwnerGate('room-guest-access-authority-native',async(f,{report,check
    block=await holder(spec,s,actor);active.holder_child_pid=block.record.holder_child_pid;active.holder_backend_pid=block.record.holder_backend_pid;
    if(spec.boundary==='principal')fixed(f.sql(`SELECT admin FROM users WHERE id=${uuid(actor.id)}`)==='t','demotion_committed_too_soon');
    if(spec.expiry)fixed(f.sql(`SELECT expires_at=${quote(deadline)}::timestamptz AND clock_timestamp()<expires_at ${selector}`)==='t','expiry_reached_before_request');
-   pending=actor.client.raw(path(s),spec.boundary==='policy'?readOptions:{method:'PUT',body:{enabled:false}});pending.then(()=>requestSettled=true,()=>requestSettled=true);await waitSql(block.witness);const pids=JSON.parse(f.sql(block.pidsSql));fixed(pids.length===1&&Number.isInteger(pids[0])&&pids[0]>0&&pids[0]!==block.record.holder_backend_pid,'unique_blocked_backend_failed');const blocked=pids[0];active.blocked_backend_pid=blocked;
+   pending=actor.client.raw(path(s),spec.boundary==='policy'?readOptions:{method:'PUT',body:{enabled:false}});pending.then(()=>requestSettled=true,()=>requestSettled=true);await phase('request_started');await phase(spec.boundary==='policy'?'waiting_exact_policy_edge':'waiting_exact_top_level_sql_edge');await waitSql(block.witness);const pids=JSON.parse(f.sql(block.pidsSql));fixed(pids.length===1&&Number.isInteger(pids[0])&&pids[0]>0&&pids[0]!==block.record.holder_backend_pid,'unique_blocked_backend_failed');const blocked=pids[0];active.blocked_backend_pid=blocked;
    const witnessSql=`SELECT jsonb_build_object('clock',to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),'holder',(SELECT to_jsonb(x) FROM (SELECT pid,datname,application_name,backend_start,state,wait_event_type,wait_event,query FROM pg_stat_activity WHERE pid=${block.record.holder_backend_pid}) x),'blocked',(SELECT to_jsonb(x) FROM (SELECT pid,datname,application_name,backend_start,state,wait_event_type,wait_event,query,pg_blocking_pids(pid) AS blocking_pids FROM pg_stat_activity WHERE pid=${blocked}) x))::text`;
    async function witness(suffix){const raw=f.sql(witnessSql),value=JSON.parse(raw);fixed(value.holder?.pid===block.record.holder_backend_pid&&value.blocked?.pid===blocked&&value.holder.datname===value.blocked.datname&&value.blocked.query===block.query&&value.blocked.wait_event_type==='Lock'&&JSON.stringify(value.blocked.blocking_pids)===JSON.stringify([block.record.holder_backend_pid]),'exact_pg_edge_failed');return {value,receipt:await privateFile(spec.name+'.'+suffix,'witness.private.json',raw+'\n')};}
    const first=await witness('initial');active.initial_witness=first.receipt;fixed(!requestSettled,'request_settled_before_wait');await phase('qualified_exact_top_level_sql_edge');
@@ -113,6 +219,16 @@ await nativeOwnerGate('room-guest-access-authority-native',async(f,{report,check
    }
   }catch(e){
    failure=e;primaryFailed=true;let bytes;
+   // Observe before finally releases the owned holder; a diagnostic failure can
+   // neither replace the original error nor weaken any exact-edge assertion.
+   if(block){
+    active.boundary_diagnostic={schema_version:1,phase:active.phase,request_started:Boolean(pending),request_settled:requestSettled,capture_code:'guest_diagnostic_unavailable'};
+    try{
+     active.boundary_diagnostic.failure_code=safeBoundaryFailureCode(e);
+     Object.assign(active.boundary_diagnostic,await captureBoundaryDiagnostic((...args)=>f.sqlProcess(...args),block.diagnosticSql(deadline)));
+    }catch{/* Only the fixed unavailable code is public; retain the original. */}
+    active.boundary_diagnostic.request_settled_after_capture=requestSettled;
+   }
    try{bytes=JSON.stringify(privateFailureDetails(e))+'\n';}catch(error){evidenceErrors.push(error);bytes='{"code":"private_failure_serialization_failed"}\n';}
    try{active.private_boundary_first_failure=await privateFile(spec.name,'boundary-first-failure.private.json',bytes);}catch(error){evidenceErrors.push(error);}
   }

@@ -172,6 +172,44 @@ test("native gate rejects missing, duplicate, unknown, failed or reordered bound
   }
 });
 
+test("native mixed projection seed satisfies the platform placeholder identity contract", () => {
+  const native = readFileSync(new URL("./room-playlist-authority-native.mjs", import.meta.url), "utf8");
+  const schema = readFileSync(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8");
+  const migration = readFileSync(new URL("../migrations/0051_native_platform.sql", import.meta.url), "utf8");
+  const guard = between(migration, "CREATE FUNCTION protect_room_platform_media()", "CREATE FUNCTION protect_platform_placeholder()");
+  for (const fragment of [
+    "m.source_id IS NULL", "m.title='平台影片'", "m.resource='platform:'||m.id::text",
+    "m.metadata='{}'::jsonb", "m.duration_ms IS NULL", "RAISE EXCEPTION 'platform_placeholder_required'",
+    "BEFORE INSERT OR UPDATE ON room_platform_media",
+    "FOR EACH ROW EXECUTE FUNCTION protect_room_platform_media()",
+  ]) assert.ok(guard.includes(fragment), fragment);
+  // The three-column seed relies on these original nullable/default columns.
+  const mediaSchema = between(schema, "CREATE TABLE media_items (", "CREATE TABLE media_tracks (");
+  assert.match(mediaSchema, /source_id uuid REFERENCES sources\(id\),/);
+  assert.match(mediaSchema, /duration_ms double precision,/);
+  assert.match(mediaSchema, /metadata jsonb NOT NULL DEFAULT '\{\}',/);
+
+  const seed = native.match(/INSERT INTO media_items\(id,title,resource\) VALUES\([^;]+\);/);
+  assert.ok(seed, "The actual mixed projection must seed its platform placeholder");
+  const id = "11111111-1111-4111-8111-111111111111";
+  const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
+  const statements = [];
+  // Evaluate only this SQL template into a fake receiver; never import or run
+  // the native gate, PostgreSQL, HTTP, or sockets in the pure contract suite.
+  new Function("f", "native", "quote", `f.sql(\`${seed[0]}\`);`)(
+    { sql: (sql) => statements.push(sql) }, id, quote,
+  );
+  assert.equal(statements.length, 1);
+  const expected = `INSERT INTO media_items(id,title,resource) VALUES('${id}','平台影片','platform:${id}');`;
+  const verify = (sql) => assert.equal(sql, expected);
+  verify(statements[0]);
+  for (const invalid of [
+    statements[0].replace("'平台影片'", "'opaque platform row'"),
+    statements[0].replace(`'platform:${id}'`, "''"),
+    statements[0].replace(`'platform:${id}'`, "'platform:22222222-2222-4222-8222-222222222222'"),
+  ]) assert.throws(() => verify(invalid), assert.AssertionError);
+});
+
 test("native fixture witnesses actual wait edges and binds helper/cleanup evidence", () => {
   const native = readFileSync(new URL("./room-playlist-authority-native.mjs", import.meta.url), "utf8");
   assert.match(native, /await nativeOwnerGate\("room-playlist-authority-native"/);

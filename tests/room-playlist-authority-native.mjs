@@ -202,7 +202,7 @@ await nativeOwnerGate("room-playlist-authority-native", async (f, { report, chec
     const ids = [randomUUID(), randomUUID(), randomUUID()].sort();
     f.sql(`INSERT INTO private_libraries(id,name,owner_id,visibility) VALUES(${quote(library)},'playlist private',${quote(s.owner.id)},'private');
       UPDATE sources SET library_id=${quote(library)} WHERE id=(SELECT source_id FROM media_items WHERE id=${quote(hidden)});
-      INSERT INTO media_items(id,title,resource) VALUES(${quote(native)},'opaque platform row','');
+      INSERT INTO media_items(id,title,resource) VALUES(${quote(native)},'平台影片',${quote("platform:" + native)});
       INSERT INTO room_platform_media(media_id,room_id,provider,content_id,part,title,created_by) VALUES(${quote(native)},${quote(s.room.id)},'bilibili','BV1234567890',1,'platform queue title',${quote(s.owner.id)});
       INSERT INTO media_user_titles(media_id,user_id,title) VALUES(${quote(s.media)},${quote(viewer.id)},'viewer personal title');
       INSERT INTO playlist_items(id,room_id,media_id,sort_order) VALUES

@@ -315,3 +315,93 @@ test('actual gate keeps all combinations of hostile serialization, failed privat
   assert.equal(f.writes.filter(item => item.path.endsWith('.private.json')).length, 2);
   assert.doesNotMatch(f.logged.join('\n') + inspect(f.error) + JSON.stringify(f.report), /SECRET/);
 });
+
+// Extract only the actual log projector, never execute the native coordinator.
+const workerFailureSource = await readFile(new URL('./worker-error-classification.mjs', import.meta.url), 'utf8');
+const workerDiagnosticFactory = compile(section(workerFailureSource, 'function createWorkerErrorDiagnostics(', '\nconst repo = '));
+const plainWorkerSummary = (diagnostics, report) => JSON.parse(JSON.stringify(diagnostics.summary(report)));
+
+test('actual worker failure summary removes unknown labels, raw text and coercion hooks', () => {
+  const diagnostics = workerDiagnosticFactory(() => 10);
+  const secret = 'SECRET-token-http://fixture.invalid/private?credential=hidden';
+  const hostile = {toString() {throw Error(secret);}, toJSON() {throw Error(secret);}};
+  diagnostics.stage(secret, {status: secret, error: secret, code: secret, count: secret, body: secret});
+  diagnostics.observe({status: hostile, error: secret, code: secret, attempt: secret, http_status: secret,
+    retryable: secret, retry_after_present: secret, redacted: secret, url: secret, spec: hostile, sql: secret,
+    stack: secret, message: secret, cause: hostile, body: secret, token: secret});
+  const summary = plainWorkerSummary(diagnostics, {result: secret, active_check: secret,
+    failure: secret, cleanup_failure: secret, checks: [], cleanup: {completed: secret, worker_pid_absent: secret, origin_closed: secret}});
+  assert.equal(summary.result, 'other'); assert.equal(summary.active_check, 'other');
+  assert.equal(summary.active_stage, 'other'); assert.equal(summary.failure, 'other');
+  assert.equal(summary.cleanup_failure, 'other');
+  assert.deepEqual(summary.expected, {status: 'other', error: 'other', code: 'other', count: null});
+  assert.deepEqual(summary.actual, {status: 'other', error: 'other', code: 'other', attempt: null,
+    http_status: null, retryable: null, retry_after_present: null, redacted: null});
+  assert.doesNotMatch(JSON.stringify(summary), /SECRET|credential|fixture\.invalid|private|stack|message|token|spec|sql|body/);
+  const getter = Object.defineProperty({}, 'error', {get() {throw Error(secret);}});
+  diagnostics.observe(getter);
+  assert.deepEqual(plainWorkerSummary(diagnostics, {}).actual, {});
+});
+
+test('actual worker failure summary accepts only finite bounded numbers and real booleans', () => {
+  for (const value of [NaN, Infinity, -Infinity, -1, 1.5, 1_000_000_001, '1e3', '0x10', ' 3', true, {}]) {
+    const diagnostics = workerDiagnosticFactory(() => 0);
+    diagnostics.observe({attempt: value, count: value, wait_timeout_ms: value});
+    assert.deepEqual(plainWorkerSummary(diagnostics, {}).actual, {attempt: null, count: null, wait_timeout_ms: null});
+  }
+  for (const [http_status, expected] of [[99, null], [100, 100], [502, 502], [599, 599], [600, null]]) {
+    const diagnostics = workerDiagnosticFactory(() => 0);
+    diagnostics.observe({http_status, attempt: '3', count: '0', retryable: false, retry_after_present: true});
+    assert.deepEqual(plainWorkerSummary(diagnostics, {}).actual,
+      {attempt: 3, count: 0, http_status: expected, retryable: false, retry_after_present: true});
+  }
+});
+
+test('actual worker coordinator captures a sanitized terminal snapshot before its failing assertion', () => {
+  let now = 100;
+  const diagnostics = workerDiagnosticFactory(() => now);
+  const definition = section(workerFailureSource, '      diagnostics.stage("terminal_state",', '\n      diagnostics.stage("delivery_status",');
+  const actual = {status: 'failed', attempt: 2, error: 'SECRET-untrusted-job-error'};
+  const run = compile(`function terminal(){${definition}}`, {
+    diagnostics, reason: 'upstream_transport_retry_exhausted', attempts: 3,
+    f: {sql: () => JSON.stringify(actual)}, quote: () => 'fixture-id', id: 'fixture-id',
+  });
+  assert.throws(run, assert.AssertionError);
+  actual.error = 'changed after capture'; now = 110;
+  const summary = plainWorkerSummary(diagnostics, {result: 'failed', active_check: 'unavailable',
+    failure: 'assertion_failed', cleanup_failure: 'verification_failed', checks: [1, 2, 3, 4],
+    cleanup: {completed: true, worker_pid_absent: true, origin_closed: true}});
+  assert.equal(summary.active_check, 'unavailable'); assert.equal(summary.active_stage, 'terminal_state');
+  assert.equal(summary.stage_elapsed_ms, 10); assert.equal(summary.checks_recorded, 4);
+  assert.equal(summary.failure, 'assertion_failed'); assert.equal(summary.cleanup_failure, 'verification_failed');
+  assert.deepEqual(summary.expected, {status: 'failed', error: 'upstream_transport_retry_exhausted', attempt: 3});
+  assert.deepEqual(summary.actual, {status: 'failed', error: 'other', attempt: 2});
+  assert.doesNotMatch(JSON.stringify(summary), /SECRET|changed after capture/);
+});
+
+test('actual worker summary preserves unknown wait failures without claiming a deadline or a last probe', () => {
+  let now = 0;
+  const diagnostics = workerDiagnosticFactory(() => now);
+  diagnostics.stage('terminal_state'); diagnostics.observe({attempt: 3});
+  diagnostics.stage('wait_execution_reaped', {count: 0, wait_timeout_ms: 10000});
+  now = 10200;
+  const summary = plainWorkerSummary(diagnostics, {result: 'failed', active_check: 'unavailable',
+    failure: 'verification_failed', checks: [1, 2, 3, 4]});
+  assert.equal(summary.wait_outcome, 'unclassified_failure');
+  assert.equal(summary.stage_elapsed_ms, 10200); assert.equal(summary.actual, null);
+  assert.deepEqual(summary.expected, {count: 0, wait_timeout_ms: 10000});
+  assert.equal(summary.cleanup_completed, null); assert.equal(summary.worker_pid_absent, null);
+  assert.equal(summary.origin_closed, null);
+});
+
+test('worker diagnostic wiring keeps existing wait and retry contracts and logs only its projector', () => {
+  assert.match(workerFailureSource, /\["unavailable", 503, "upstream_transport_retry_exhausted", 502, 3\]/);
+  assert.match(workerFailureSource, /await f\.waitForSql\(\s*`SELECT status IN \('failed','succeeded'\)[\s\S]*?"t",\s*25000,/);
+  assert.match(workerFailureSource, /await f\.waitForSql\(\s*`SELECT count\(\*\) FROM media_executions[\s\S]*?"0",\s*\);/);
+  assert.match(workerFailureSource, /await f\.waitForSql\(\s*`SELECT count\(\*\) FROM cache_write_reservations[\s\S]*?"0",\s*\);/);
+  assert.match(workerFailureSource, /await delay\(250\);/);
+  const summaryLine = 'console.log("worker-error-classification summary: " + JSON.stringify(diagnostics.summary(report)));';
+  assert.equal(workerFailureSource.split(summaryLine).length, 2);
+  assert.ok(workerFailureSource.indexOf(summaryLine) < workerFailureSource.indexOf('await writeFile(path, JSON.stringify(report, null, 2))'));
+  assert.doesNotMatch(workerFailureSource, /console\.(?:log|error)\([^;]*(?:error\.(?:stack|message)|JSON\.stringify\(report\))/);
+});

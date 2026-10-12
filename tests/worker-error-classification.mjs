@@ -19,6 +19,95 @@ import { delay } from "./fixtures/server.mjs";
 import { verifyClosedPort, verifyPidAbsent } from "./fixtures/postgres.mjs";
 import { safeFailure } from "./fixtures/safe-failure.mjs";
 
+// Only fixed labels, bounded numbers and booleans may reach the CI log.
+// This helper is extracted by the memory-only coordinator contract tests.
+function createWorkerErrorDiagnostics(now = () => performance.now()) {
+  const checks = new Set([
+    "invalid.mp4", "denied-401", "denied-403", "missing", "unavailable",
+    "valid.mp4", "legacy-null-kind", "unknown-kind", "numeric-kind",
+    "boolean-kind", "array-kind", "object-kind", "public-prepare-denied-401",
+    "public-prepare-denied-403", "verify_binding",
+  ]);
+  const stages = new Set([
+    "setup", "case_setup", "wait_terminal", "terminal_state", "delivery_status",
+    "readiness_status", "delivery_error", "readiness_error", "error_redaction",
+    "no_published_output", "successful_output", "wait_execution_reaped",
+    "wait_reservation_released", "refused_kind_guards", "attempt_stable",
+    "stop_session", "public_prepare", "verify_binding",
+  ]);
+  const statuses = new Set(["queued", "running", "failed", "succeeded", "cancelled"]);
+  const reasons = new Set([
+    "media_input_invalid", "media_input_denied", "media_job_failed",
+    "upstream_transport_failed", "upstream_transport_retry_exhausted",
+    "media_job_retry_exhausted", "cache_capacity_exceeded", "cache_read_only",
+    "cache_permission_denied", "media_decoder_unavailable", "media_encoder_unavailable",
+    "source_changed", "source_version_required", "source_seek_unsupported",
+  ]);
+  const codes = new Set([...reasons].map((value) => value.toUpperCase()));
+  const failures = new Set(["assertion_failed", "deadline_or_abort", "verification_failed"]);
+  const read = (value, key) => {
+    try { return Object.getOwnPropertyDescriptor(value, key)?.value; }
+    catch { return undefined; }
+  };
+  const label = (value, values) => values.has(value) ? value : "other";
+  const integer = (value, max = 1_000_000_000) => {
+    if (typeof value === "string" && /^\d{1,10}$/.test(value)) value = Number(value);
+    return Number.isSafeInteger(value) && value >= 0 && value <= max ? value : null;
+  };
+  const boolean = (value) => typeof value === "boolean" ? value : null;
+  const project = (value) => {
+    const result = {};
+    for (const [key, values] of [["status", statuses], ["error", reasons], ["code", codes]]) {
+      const item = read(value, key);
+      if (item !== undefined) result[key] = item === null ? null : label(item, values);
+    }
+    for (const key of ["attempt", "count", "wait_timeout_ms"]) {
+      const item = read(value, key);
+      if (item !== undefined) result[key] = integer(item);
+    }
+    const status = read(value, "http_status");
+    if (status !== undefined) {
+      const number = integer(status, 599);
+      result.http_status = number !== null && number >= 100 ? number : null;
+    }
+    for (const key of ["retryable", "retry_after_present", "redacted"]) {
+      const item = read(value, key);
+      if (item !== undefined) result[key] = boolean(item);
+    }
+    return result;
+  };
+  let stage = "setup", started = now(), actual = null, expected = null;
+  return {
+    stage(value, wanted) {
+      stage = label(value, stages);
+      started = now();
+      actual = null;
+      expected = wanted === undefined ? null : project(wanted);
+    },
+    observe(value) { actual = project(value); },
+    summary(report) {
+      const failure = read(report, "failure"), cleanupFailure = read(report, "cleanup_failure");
+      const cleanup = read(report, "cleanup");
+      return {
+        schema_version: 1,
+        result: label(read(report, "result"), new Set(["running", "passed", "failed"])),
+        active_check: label(read(report, "active_check"), checks),
+        active_stage: stage,
+        stage_elapsed_ms: integer(Math.floor(now() - started)),
+        // Outer catch runs after owned-fixture teardown; elapsed is not proof of a timeout.
+        wait_outcome: stage.startsWith("wait_") && failure !== undefined ? "unclassified_failure" : null,
+        failure: failure === undefined ? null : label(failure, failures),
+        cleanup_failure: cleanupFailure === undefined ? null : label(cleanupFailure, failures),
+        checks_recorded: integer(read(read(report, "checks"), "length"), 14),
+        expected, actual,
+        cleanup_completed: boolean(read(cleanup, "completed")),
+        worker_pid_absent: boolean(read(cleanup, "worker_pid_absent")),
+        origin_closed: boolean(read(cleanup, "origin_closed")),
+      };
+    },
+  };
+}
+
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 assert.ok(process.env.W03_BACKEND_BINDING, "Use a frozen native backend");
 const binding = JSON.parse(await readFile(process.env.W03_BACKEND_BINDING));
@@ -62,6 +151,7 @@ const report = {
   result: "running",
   checks: [],
 };
+const diagnostics = createWorkerErrorDiagnostics();
 const quote = (v) => `'${String(v).replaceAll("'", "''")}'`;
 const json = (v) => `${quote(JSON.stringify(v))}::jsonb`;
 let fixture, origin, originPort, workerPid, roomSocket;
@@ -132,6 +222,7 @@ try {
       ["object-kind", 503, "media_job_failed", 502, 1, { private: secret }],
     ]) {
       report.active_check = label;
+      diagnostics.stage("case_setup");
       const requestsBefore = originRequests;
       const refusedKind = kind !== undefined && kind !== null;
       const id = randomUUID(),
@@ -158,26 +249,35 @@ try {
         { client: admin, user: identity.id, room: room.id, session: id },
         `INSERT INTO playback_sessions(id,user_id,room_id,media_id,generation,delivery_token_hash,resource,expires_at) VALUES(${quote(id)},${quote(identity.id)},${quote(room.id)},${quote(media)},0,${quote(sha(token))},${json({ encrypted: encrypt(resource) })},clock_timestamp()+interval '1 hour'); INSERT INTO media_jobs(id,session_id,status,spec) VALUES(${quote(id)},${quote(id)},'queued',${json(spec)})`,
       );
+      diagnostics.stage("wait_terminal", { wait_timeout_ms: 25000 });
       await f.waitForSql(
         `SELECT status IN ('failed','succeeded') FROM media_jobs WHERE id=${quote(id)}`,
         "t",
         25000,
       );
+      diagnostics.stage("terminal_state", {
+        status: reason ? "failed" : "succeeded", attempt: attempts, error: reason,
+      });
       const state = JSON.parse(
         f.sql(
           `SELECT json_build_object('status',status,'attempt',attempt,'error',error) FROM media_jobs WHERE id=${quote(id)}`,
         ),
       );
+      diagnostics.observe(state);
       assert.deepEqual(state, {
         status: reason ? "failed" : "succeeded",
         attempt: attempts,
         error: reason,
       });
+      diagnostics.stage("delivery_status", { http_status: httpStatus });
       const delivery = await fetch(
         `${f.workerOrigin}/media-delivery/${id}/index.m3u8?token=${token}`,
       );
+      diagnostics.observe({ http_status: delivery.status });
       assert.equal(delivery.status, httpStatus);
+      diagnostics.stage("readiness_status", { http_status: httpStatus });
       const readiness = await admin.raw(`/playback-sessions/${id}`);
+      diagnostics.observe({ http_status: readiness.status });
       assert.equal(readiness.status, httpStatus);
       if (reason) {
         const code =
@@ -185,36 +285,46 @@ try {
             ? "MEDIA_JOB_RETRY_EXHAUSTED"
             : reason.toUpperCase();
         for (const response of [delivery, readiness]) {
+          diagnostics.stage(response === delivery ? "delivery_error" : "readiness_error", {
+            code, retryable: false, retry_after_present: false,
+          });
           const error = await response.json();
+          diagnostics.observe({
+            code: error.error.code, retryable: error.error.retryable,
+            retry_after_present: error.error.retry_after_ms !== undefined,
+          });
           assert.equal(error.error.code, code);
           assert.equal(error.error.retryable, false);
           assert.equal(error.error.retry_after_ms, undefined);
           const wire = JSON.stringify(error);
-          assert.ok(
-            !wire.includes(secret) &&
-              !wire.includes(token) &&
-              !wire.includes(f.root),
-          );
+          diagnostics.stage("error_redaction", { redacted: true });
+          const redacted = !wire.includes(secret) && !wire.includes(token) && !wire.includes(f.root);
+          diagnostics.observe({ redacted });
+          assert.ok(redacted);
         }
-        assert.equal(
-          f.sql(
-            `SELECT count(*) FROM media_outputs WHERE job_id=${quote(id)} AND status='published'`,
-          ),
-          "0",
+        diagnostics.stage("no_published_output", { count: 0 });
+        const published = f.sql(
+          `SELECT count(*) FROM media_outputs WHERE job_id=${quote(id)} AND status='published'`,
         );
+        diagnostics.observe({ count: published });
+        assert.equal(published, "0");
       } else {
+        diagnostics.stage("successful_output");
         assert.ok((await delivery.text()).includes("#EXT-X-ENDLIST"));
         assert.equal((await readiness.json()).status, "ready");
       }
+      diagnostics.stage("wait_execution_reaped", { count: 0, wait_timeout_ms: 10000 });
       await f.waitForSql(
         `SELECT count(*) FROM media_executions WHERE job_id=${quote(id)} AND reaped_at IS NULL`,
         "0",
       );
+      diagnostics.stage("wait_reservation_released", { count: 0, wait_timeout_ms: 10000 });
       await f.waitForSql(
         `SELECT count(*) FROM cache_write_reservations WHERE job_id=${quote(id)}`,
         "0",
       );
       if (refusedKind) {
+        diagnostics.stage("refused_kind_guards");
         assert.equal(
           originRequests,
           requestsBefore,
@@ -245,11 +355,11 @@ try {
           );
         }
       }
+      diagnostics.stage("attempt_stable", { attempt: attempts });
       await delay(250);
-      assert.equal(
-        f.sql(`SELECT attempt FROM media_jobs WHERE id=${quote(id)}`),
-        String(attempts),
-      );
+      const stableAttempt = f.sql(`SELECT attempt FROM media_jobs WHERE id=${quote(id)}`);
+      diagnostics.observe({ attempt: stableAttempt });
+      assert.equal(stableAttempt, String(attempts));
       report.checks.push({
         name: label,
         ...state,
@@ -265,6 +375,7 @@ try {
             }
           : {}),
       });
+      diagnostics.stage("stop_session");
       await admin.request(`/playback-sessions/${id}`, "DELETE");
       console.log(
         `PASS: ${label} -> ${reason ?? "succeeded"}; attempt ${attempts}; matching HTTP/readiness; drained`,
@@ -297,6 +408,7 @@ try {
     let state = snapshot.state;
     for (const status of [401, 403]) {
       report.active_check = `public-prepare-denied-${status}`;
+      diagnostics.stage("public_prepare");
       const media = sourceMedia(f, {
         kind: "http",
         url: `http://127.0.0.1:${originPort}/${status}?fixture=${secret}`,
@@ -355,6 +467,7 @@ try {
     roomSocket.terminate();
     roomSocket = undefined;
     report.active_check = "verify_binding";
+    diagnostics.stage("verify_binding");
     await verifyBinding();
   });
   delete report.active_check;
@@ -381,6 +494,7 @@ try {
       report.cleanup_failure = safeFailure(error);
       process.exitCode = 1;
     }
+    console.log("worker-error-classification summary: " + JSON.stringify(diagnostics.summary(report)));
     const path = resolve(fixture.root, "report.json");
     await writeFile(path, JSON.stringify(report, null, 2));
     console.log(`${report.result}: ${path}`);

@@ -442,6 +442,7 @@ onBeforeUnmount(() => {
   .media-grid {
     grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
     gap: var(--space-5);
+    row-gap: var(--space-3);
   }
 }
 @media (max-width: 767px) {
