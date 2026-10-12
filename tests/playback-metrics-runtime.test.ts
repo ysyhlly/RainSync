@@ -439,6 +439,46 @@ test.each([1, 123, 2000])(
     }
   },
 );
+test.each([1, 123])(
+  "meter construction %i ms after intent capture does not miss its first 5s timer",
+  async (skew) => {
+    const s = setup({ versions: [2] });
+    const original = playbackMetrics.createPlaybackMetrics;
+    const factory = vi
+      .spyOn(playbackMetrics, "createPlaybackMetrics")
+      .mockImplementation((config) => {
+        vi.advanceTimersByTime(skew);
+        return original(config);
+      });
+    try {
+      await s.runtime.loadMedia();
+      expect(factory).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(4999 - skew);
+      expect(s.metrics()).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(s.metrics()).toHaveLength(1);
+      expect(s.metrics()[0][2]).toMatchObject({
+        elapsed_ms: 5000,
+        seq: 1,
+        meter_start_generation: 1,
+        totals: { startup_ms: 5000 - skew, unobserved_ms: skew },
+        startup_phases: {
+          preparation_ms: 0,
+          loading_ms: 5000 - skew,
+          unobserved_ms: skew,
+        },
+      });
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(s.metrics()).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(s.metrics()).toHaveLength(2);
+      expect(s.metrics()[1][2]).toMatchObject({ elapsed_ms: 10000, seq: 2 });
+    } finally {
+      factory.mockRestore();
+      s.cleanup();
+    }
+  },
+);
 test("same-meter fallback/plan replacement does not restart its intent-aligned sampling timer", async () => {
   const s = setup({ versions: [2, 2] });
   try {

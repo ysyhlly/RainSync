@@ -137,7 +137,10 @@ export function createPlaybackMetrics(config: PlaybackMetricsConfig) {
   let reliableAt = created;
   let attemptAt = created;
   let attachedAt: number | undefined;
-  let lastSampleAt = created;
+  // The owner schedules the first sample from the logical intent's t0.
+  // Construction latency stays unobserved, but must not delay that cadence.
+  // capture() advances this anchor to each actual emission thereafter.
+  let lastSampleAt = t0;
   let active = true;
   let seq = 0;
   let state = copyObservation(config.initial);
@@ -355,7 +358,7 @@ export function createPlaybackMetrics(config: PlaybackMetricsConfig) {
       observation: PlaybackMetricsObservation,
     ): PlaybackMetricsSnapshot | undefined {
       const at = accept(fence, observation);
-      if (at === undefined || at - lastSampleAt < PLAYBACK_METRICS_SAMPLE_MS)
+      if (at === undefined || at < lastSampleAt + PLAYBACK_METRICS_SAMPLE_MS)
         return;
       return capture(at, false);
     },

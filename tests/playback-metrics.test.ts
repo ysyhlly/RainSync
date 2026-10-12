@@ -83,6 +83,97 @@ test("5s snapshots are cumulative and absent first-frame evidence is never zero"
   conserved(b);
 });
 
+test.each([
+  [100.75, 101],
+  [100.75, 101.75],
+  [100.75, 223.75],
+  [3192.3, 3194.5],
+])(
+  "intent at %s ms and construction at %s ms retain the exact sample deadlines",
+  (t0, created) => {
+    const { meter, fence, at } = setup(t0, created);
+    at(created - 0.125);
+    expect(meter.sample(fence, playing)).toBeUndefined();
+    at(t0 + 4_999.75);
+    expect(meter.sample(fence, playing)).toBeUndefined();
+    at(t0 + 5_000);
+    for (const stale of [
+      { identity: {}, generation: fence.generation },
+      { identity: fence.identity, generation: fence.generation + 1 },
+    ])
+      expect(meter.sample(stale, playing)).toBeUndefined();
+    const first = meter.sample(fence, playing)!;
+    const unobserved = Math.floor(created) - Math.floor(t0);
+    expect(first).toMatchObject({
+      seq: 1,
+      elapsed_ms: 5_000,
+      observed_ms: 5_000 - unobserved,
+      totals: { startup_ms: 5_000 - unobserved, unobserved_ms: unobserved },
+      startup_phases: {
+        preparation_ms: 0,
+        loading_ms: 5_000 - unobserved,
+        unobserved_ms: unobserved,
+      },
+    });
+    expect(meter.sample(fence, playing)).toBeUndefined();
+    at(t0 + 9_999.75);
+    expect(meter.sample(fence, playing)).toBeUndefined();
+    at(t0 + 10_000);
+    const second = meter.sample(fence, playing)!;
+    expect(second).toMatchObject({ seq: 2, elapsed_ms: 10_000 });
+    conserved(first);
+    conserved(second);
+  },
+);
+
+test("a late first sample starts the next full cadence at its actual emission", () => {
+  const t0 = 100.75;
+  const emitted = t0 + 5_123;
+  const { meter, fence, at } = setup(t0, t0 + 0.25);
+  at(emitted);
+  const first = meter.sample(fence, playing)!;
+  expect(first).toMatchObject({ seq: 1, elapsed_ms: 5_123 });
+  expect(meter.sample(fence, playing)).toBeUndefined();
+  at(t0 + 10_000);
+  expect(meter.sample(fence, playing)).toBeUndefined();
+  at(emitted + 4_999.75);
+  expect(meter.sample(fence, playing)).toBeUndefined();
+  at(emitted + 5_000);
+  const second = meter.sample(fence, playing)!;
+  expect(second).toMatchObject({ seq: 2, elapsed_ms: 10_123 });
+  conserved(first);
+  conserved(second);
+});
+
+test("construction after missed deadlines emits once without a catch-up burst", () => {
+  const created = 20_100;
+  const { meter, fence, at } = setup(100, created);
+  const first = meter.sample(fence, playing)!;
+  expect(first).toMatchObject({
+    seq: 1,
+    elapsed_ms: 20_000,
+    observed_ms: 0,
+    totals: { startup_ms: 0, unobserved_ms: 20_000 },
+    startup_phases: {
+      preparation_ms: 0,
+      loading_ms: 0,
+      unobserved_ms: 20_000,
+    },
+  });
+  expect(meter.sample(fence, playing)).toBeUndefined();
+  at(created + 4_999);
+  expect(meter.sample(fence, playing)).toBeUndefined();
+  at(created + 5_000);
+  const second = meter.sample(fence, playing)!;
+  expect(second).toMatchObject({
+    seq: 2,
+    elapsed_ms: 25_000,
+    totals: { startup_ms: 5_000, unobserved_ms: 20_000 },
+  });
+  conserved(first);
+  conserved(second);
+});
+
 test("all states use mutually exclusive intervals, even with overlapping flags", () => {
   const { meter, fence, at } = setup();
   const steps: [number, PlaybackMetricsObservation][] = [
