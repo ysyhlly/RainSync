@@ -39,7 +39,7 @@
     "test:static-hls-public-prepare": "node tests/static-hls-public-prepare.mjs",
     "lint": "eslint apps/web/src packages --max-warnings 0",
     "test:frontend-bundle": "node --test tests/frontend-bundle-budget.test.mjs",
-    "test:owner-gate-contracts": "node --test tests/native-owner-gates.test.mjs tests/fixture-cleanup-report.test.mjs tests/owned-probe-input.test.mjs tests/source-change-diagnostics.test.mjs tests/media-stack-evidence.test.mjs",
+    "test:owner-gate-contracts": "python3 -B tests/compute-finish-wrapper-observation.test.py && node --test tests/compute-finish-receipt-observation.test.mjs tests/room-presence-diagnostics.test.mjs tests/nas-tuple-handoff-contract.test.mjs tests/native-owner-gates.test.mjs tests/fixture-cleanup-report.test.mjs tests/owned-probe-input.test.mjs tests/source-change-diagnostics.test.mjs tests/media-stack-evidence.test.mjs",
     "test:native-delivery-owner": "node tests/native-delivery-owner.mjs",
     "test:distributed-compute-retention-native": "node tests/distributed-compute-retention-native.mjs",
     "test:room-cleanup-native": "node tests/room-cleanup-native.mjs",

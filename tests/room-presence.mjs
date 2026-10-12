@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { writeFile, readFile, mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import WebSocket from "ws";
 import { isolatedServer, delay } from "./fixtures/server.mjs";
 
 let fixture;
+const beganAt = Date.now();
+const serverLogs = [];
 const report = {
   schema_version: 1,
   result: "running",
   checks: [],
+  socket_observations: [],
+  authorization_failures: [],
   scope:
     "Reported presence v1 on real isolated PostgreSQL and WebSockets; no sustained/device acceptance claim",
 };
@@ -58,8 +62,29 @@ try {
       });
       sockets.add(ws);
       const frames = [];
+      const observation = { socket: report.socket_observations.length + 1,
+        auto_pong: autoPong, events: [], ping_count: 0, close: null };
+      report.socket_observations.push(observation);
+      const event = value => {
+        if (observation.events.length >= 128) observation.events.shift();
+        observation.events.push({ elapsed_ms: Date.now() - beganAt, ...value });
+      };
+      ws.on("ping", () => { observation.ping_count++; event({ type: "PING" }); });
+      ws.on("close", code => {
+        observation.close = { elapsed_ms: Date.now() - beganAt, code };
+        event({ type: "CLOSE", code });
+      });
       ws.on("message", (bytes) => {
         const frame = JSON.parse(bytes);
+        const summary = { type: /^[A-Z_]{1,40}$/.test(frame.type) ? frame.type : "OTHER" };
+        if (frame.type === "ERROR") summary.code = /^[A-Z_]{1,64}$/.test(frame.error?.code) ? frame.error.code : "OTHER";
+        const presence = frame.type === "PRESENCE_SNAPSHOT" ? frame : frame.presence;
+        if (presence) {
+          summary.presence_seq = Number.isSafeInteger(presence.presence_seq) && presence.presence_seq >= 0 ? presence.presence_seq : null;
+          summary.connection_counts = (Array.isArray(presence.members) ? presence.members : []).slice(0, 64)
+            .map(member => Number.isSafeInteger(member?.connection_count) && member.connection_count >= 0 ? member.connection_count : null);
+        }
+        event(summary);
         if (frames.length >= 256) frames.shift();
         frames.push(frame);
       });
@@ -72,10 +97,14 @@ try {
       const next = async (type, predicate = () => true, timeout = 10000) => {
         const deadline = Date.now() + timeout;
         while (Date.now() < deadline) {
+          const unexpected = frames.find(frame => frame.type === "ERROR");
+          if (type !== "ERROR" && unexpected)
+            throw Error(`Unexpected witness ERROR:${unexpected.error?.code ?? "UNKNOWN"} while waiting for ${type}`);
           const index = frames.findIndex(
             (frame) => frame.type === type && predicate(frame),
           );
           if (index >= 0) return frames.splice(index, 1)[0];
+          if (observation.close) throw Error(`Witness closed (${observation.close.code}) while waiting for ${type}`);
           await delay(10);
         }
         throw Error(
@@ -358,10 +387,16 @@ try {
         "process restart establishes a fresh epoch and empty prior presence; admission adds no revision beyond the existing playback-clock startup update",
       );
       report.result = "passed";
+    } catch (error) {
+      // Fixed diagnostic columns only; never include query text or bind values.
+      try {
+        report.database_waits = JSON.parse(f.sql("SELECT COALESCE(json_agg(d),'[]'::json) FROM (SELECT pid,state,wait_event_type,wait_event,pg_blocking_pids(pid) AS blockers,round(extract(epoch FROM clock_timestamp()-query_start)*1000) AS age_ms FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() ORDER BY pid LIMIT 32) d"));
+      } catch { report.database_waits_unavailable = true; }
+      throw error;
     } finally {
       for (const ws of sockets) ws.terminate();
     }
-  });
+  }, { observeServerLog: (_stream, path) => serverLogs.push(path) });
 } catch (error) {
   report.result = "failed";
   report.failure = String(error.stack ?? error);
@@ -370,10 +405,39 @@ try {
   if (fixture) {
     report.cleanup = await fixture.verifyStopped();
     report.postgres = fixture.postgresDiagnostics();
+    for (const path of serverLogs) {
+      try {
+        const text = (await readFile(path, "utf8")).replace(/\x1b\[[0-9;]*m/g, "");
+        for (const line of text.split("\n")) {
+          const stage = /check_stage="?(membership|login|presence_snapshot|presence_decode|presence_recipient_changed)"?/.exec(line)?.[1];
+          if (!stage) continue;
+          report.authorization_failures.push({ stage,
+            kind: /failure_kind="?(outer_timeout|database|pool_timeout|pool_closed|io|protocol|other)"?/.exec(line)?.[1] ?? null,
+            sqlstate: /sqlstate="?([A-Z0-9]{5}|none)"?/.exec(line)?.[1] ?? null,
+            elapsed_ms: Number(/elapsed_ms=(\d+)/.exec(line)?.[1] ?? 0) });
+          if (report.authorization_failures.length > 64) report.authorization_failures.shift();
+        }
+      } catch { report.authorization_log_unavailable = true; }
+    }
     await writeFile(
       resolve(fixture.root, "report.json"),
       JSON.stringify(report, null, 2),
     );
+    if (process.env.RAINSYNC_ARTIFACT_DIR) {
+      const directory = resolve(process.env.RAINSYNC_ARTIFACT_DIR, "room-presence-safe", randomUUID());
+      await mkdir(directory, { recursive: true });
+      // Public CI gets only this bounded, selected diagnostic schema, not the
+      // private failure stack, Server logs, database, session or member IDs.
+      await writeFile(resolve(directory, "report.json"), JSON.stringify({
+        schema_version: 1, result: report.result, checks: report.checks,
+        expiry_ms: report.expiry_ms ?? null, socket_observations: report.socket_observations,
+        authorization_failures: report.authorization_failures,
+        database_waits: report.database_waits ?? [],
+        database_waits_unavailable: report.database_waits_unavailable ?? false,
+        authorization_log_unavailable: report.authorization_log_unavailable ?? false,
+        cleanup_completed: report.cleanup?.completed ?? false,
+      }, null, 2));
+    }
     console.log(`${report.result}: ${resolve(fixture.root, "report.json")}`);
     if (report.failure) console.error(report.failure);
   }

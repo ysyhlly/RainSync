@@ -238,17 +238,33 @@ impl Runtime {
                 if let Some((_, session_hash)) = recipient {
                     hashes.push(session_hash.to_owned());
                 }
+                let started = Instant::now();
                 let result = tokio::time::timeout(Duration::from_secs(2), database_checks::text(
                     &app.db,
                     sqlx::query_scalar("SELECT COALESCE(jsonb_agg(jsonb_build_object('user_id',user_id,'session_hash',token_hash)), '[]'::jsonb)::text FROM (SELECT s.user_id,s.token_hash FROM sessions s JOIN room_members m ON m.user_id=s.user_id WHERE m.room_id=$1 AND s.token_hash=ANY($2) AND s.expires_at>clock_timestamp() AND playback_login_allowed(s.user_id,s.token_hash) AND (guest_is_account(s.user_id) OR guest_room_allowed(s.user_id,$1)) FOR KEY SHARE OF s,m) admitted_presence")
                         .bind(self.room).bind(hashes),
                     1500,
                 )).await;
-                let Ok(Ok(value)) = result else {
-                    self.fence();
-                    return Err("service_unavailable");
+                let value = match result {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => {
+                        super::socket_check_failure("presence_snapshot", started, Some(&error));
+                        self.fence();
+                        return Err("service_unavailable");
+                    }
+                    Err(_) => {
+                        super::socket_check_failure("presence_snapshot", started, None);
+                        self.fence();
+                        return Err("service_unavailable");
+                    }
                 };
-                serde_json::from_str(&value).map_err(|_| "service_unavailable")?
+                serde_json::from_str(&value).map_err(|_| {
+                    tracing::warn!(
+                        check_stage = "presence_decode",
+                        "room presence check failed"
+                    );
+                    "service_unavailable"
+                })?
             };
             if let Some((user, session_hash)) = recipient
                 && !valid
@@ -259,6 +275,10 @@ impl Runtime {
                 // admission validates recipient and all subjects in one final
                 // bounded read, without another awaited query before send.
                 super::socket_access(app, self.room, user, session_hash).await?;
+                tracing::warn!(
+                    check_stage = "presence_recipient_changed",
+                    "room presence check failed"
+                );
                 return Err("service_unavailable");
             }
             let authorized = candidates
