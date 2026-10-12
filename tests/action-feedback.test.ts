@@ -1,3 +1,4 @@
+import { withNoticeOwner } from "./helpers/notice-owner";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { effectScope, reactive, ref } from "vue";
 import { mountSetup } from "./helpers/mount-setup";
@@ -70,6 +71,7 @@ function importPanel() {
       roomsApi: () => api,
       Notice: {},
       AppSelect: {},
+      MediaThumbnail: {},
     },
   );
   dispose.push(panel.unmount);
@@ -223,9 +225,10 @@ function notices() {
   });
   const action = ref("");
   const scope = effectScope();
+  const noticeOwner = withNoticeOwner(runtime);
   const [shell, fullscreen] = scope.run(() => [
-    useRoomNotice(runtime, action),
-    useRoomNotice(runtime),
+    useRoomNotice(noticeOwner, action),
+    useRoomNotice(noticeOwner),
   ])!;
   dispose.push(() => scope.stop());
   return { runtime, action, shell, fullscreen };

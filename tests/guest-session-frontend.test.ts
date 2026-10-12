@@ -15,6 +15,7 @@ import {
   safeRedirect,
 } from "../apps/web/src/app/navigation";
 import { RequestFailure } from "../apps/web/src/errors";
+import { clearInvitation } from "../apps/web/src/features/auth/invitation-intent";
 const room = "00000000-0000-4000-8000-000000000001",
   otherRoom = "00000000-0000-4000-8000-000000000002";
 const registered = {
@@ -58,9 +59,10 @@ function panel(enabled = true) {
   const replace = vi.fn();
   vi.stubGlobal("window", { location: { origin } });
   const p = mountSetup(
-    new URL("../apps/web/src/features/auth/LoginPage.vue", import.meta.url),
+    new URL("../apps/web/src/features/auth/LoginPanel.vue", import.meta.url),
     {
       useSession,
+      clearInvitation,
       useRegistrationPolicy,
       useAction,
       guestRoomPath,
@@ -265,7 +267,9 @@ it("permission denial refreshes policy, reports a safe failure, and does not reu
     token: validToken,
   });
   await p.c.submitGuest();
-  expect(p.c.error.value).toContain("非定向观看邀请");
+  expect(p.c.guestError.value).toContain("非定向观看邀请");
+  expect(p.c.error.value).toBe("");
+  expect(p.c.guestOpen.value).toBe(true);
   expect(p.s.api).toHaveBeenCalledTimes(2);
   expect(p.replace).not.toHaveBeenCalled();
 });
@@ -366,8 +370,10 @@ it("revoked guest policy reports current availability without exposing private s
   });
   p.c.guestInvite.value = JSON.stringify({ room_id: room, token: validToken });
   await p.c.submitGuest();
-  expect(p.c.error.value).toContain("暂时无法通过此邀请进入");
-  expect(p.c.error.value).not.toContain("private-server-detail");
+  expect(p.c.guestError.value).toContain("暂时无法通过此邀请进入");
+  expect(p.c.guestError.value).not.toContain("private-server-detail");
+  expect(p.c.error.value).toBe("");
+  expect(p.c.guestOpen.value).toBe(true);
 });
 
 it("old-guest cleanup preserves a registered account that appeared in another tab", async () => {
@@ -387,7 +393,7 @@ it("old-guest cleanup preserves a registered account that appeared in another ta
 
 it("renders explicit logout recovery separately from uncertain read-only recovery", () => {
   const page = readFileSync(
-    new URL("../apps/web/src/features/auth/LoginPage.vue", import.meta.url),
+    new URL("../apps/web/src/features/auth/LoginPanel.vue", import.meta.url),
     "utf8",
   );
   expect(page).toMatch(

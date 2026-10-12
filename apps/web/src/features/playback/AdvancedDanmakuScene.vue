@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, type DeepReadonly } from "vue";
 import AdvancedDanmakuNode from "./AdvancedDanmakuNode.vue";
 import type { DanmakuScene } from "./advanced-danmaku";
 const props = defineProps<{
-  scene: DanmakuScene;
+  scene: DeepReadonly<DanmakuScene>;
   elapsed: number;
   width: number;
   height: number;

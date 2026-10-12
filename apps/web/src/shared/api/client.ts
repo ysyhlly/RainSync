@@ -37,7 +37,7 @@ export function createApiClient(auth: AuthContext) {
       body:
         body === undefined ? undefined : binary ? body : JSON.stringify(body),
     });
-    const value = await response.json().catch(() => {
+    const value: unknown = await response.json().catch(() => {
       if (response.ok)
         throw new TypeError("服务器响应不完整，请确认结果后重试");
       return null;

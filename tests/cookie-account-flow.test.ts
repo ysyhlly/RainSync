@@ -121,3 +121,23 @@ it.each(["douyin", "youtube"] as const)(
     expect(flow.clearSecret).toHaveBeenCalledTimes(2);
   },
 );
+
+it("cookie flow uses the parser's DTO rather than trusting raw state", async () => {
+  const { createCookieAccountFlow } =
+    await import("../apps/web/src/features/account/cookie-account-flow");
+  const change = vi.fn();
+  const raw = { state: "connected" };
+  const validateStatus = vi.fn((_value: unknown) => ({ state: "revoked" }));
+  const flow = createCookieAccountFlow({
+    current: () => true,
+    hasInput: () => true,
+    validateInput: () => true,
+    validateStatus,
+    submit: async () => raw,
+    clearSecret: vi.fn(),
+    change,
+  });
+  await flow.submit("synthetic", null, true);
+  expect(validateStatus).toHaveBeenCalledWith(raw);
+  expect(change.mock.calls).toEqual([["submitting"], ["uncertain"]]);
+});

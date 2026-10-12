@@ -391,14 +391,14 @@ pub(crate) fn constrain_input_args(
 /// Metadata/probe children are scoped by the queue owner. Renew the same lease
 /// during preparation without ever reviving a deadline that already elapsed.
 pub async fn prepare(
-    app: &App,
+    db: &PgPool,
     claim: &Claim,
     output: &FsPath,
     execution: Uuid,
 ) -> AnyResult<advanced_media::Prepared> {
     let mut until = process::finalization_deadline(
         Duration::from_secs(3),
-        process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db, claim)),
+        process::confirmed_deadline(persistence::media_jobs::renew_remaining(db, claim)),
     )
     .await?
     .ok_or_else(|| anyhow::Error::new(process::LeaseInterrupted))?;
@@ -408,7 +408,7 @@ pub async fn prepare(
     loop {
         tokio::select! {biased;_=tokio::time::sleep_until(until)=>return Err(process::LeaseInterrupted.into()),result=&mut work=>return result,
             _=tokio::time::sleep_until(next)=>{
-                let renewal=tokio::select!{biased;_=tokio::time::sleep_until(until)=>return Err(process::LeaseInterrupted.into()),r=tokio::time::timeout(Duration::from_secs(3),process::confirmed_deadline(persistence::media_jobs::renew_remaining(&app.db,claim)))=>r};
+                let renewal=tokio::select!{biased;_=tokio::time::sleep_until(until)=>return Err(process::LeaseInterrupted.into()),r=tokio::time::timeout(Duration::from_secs(3),process::confirmed_deadline(persistence::media_jobs::renew_remaining(db,claim)))=>r};
                 if tokio::time::Instant::now()>=until{return Err(process::LeaseInterrupted.into());}
                 match renewal {Ok(Ok(Some(confirmed))) if confirmed>tokio::time::Instant::now()=>{until=confirmed;next=tokio::time::Instant::now()+Duration::from_secs(4)},Ok(Ok(_))=>return Err(process::LeaseInterrupted.into()),_=>next=tokio::time::Instant::now()+Duration::from_secs(1)}
             }

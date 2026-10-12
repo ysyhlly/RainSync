@@ -193,6 +193,8 @@ test("browser Back closes quota editing without a mutation or a trapped overlay"
     return route.fulfill({ json: { ok: true } });
   });
   await page.goto("/rooms");
+  // Wait for the real initial route, not the shared shell's loading heading.
+  await expect(page.getByLabel("搜索放映室", { exact: true })).toBeVisible();
   if (isMobile)
     await page
       .getByRole("navigation", { name: "移动导航", exact: true })

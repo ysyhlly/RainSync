@@ -1,7 +1,7 @@
 name: checks
 on: [push, pull_request]
 jobs:
-  checks:
+  core-checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +20,15 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Verify upgrade/recovery cleanup contracts
+        timeout-minutes: 3
+        env:
+          RAINSYNC_RECOVERY_SOURCE_ROOT: ${{ github.workspace }}
+          RAINSYNC_RECOVERY_PROBE_ROOT: ${{ runner.temp }}/rainsync-validation/upgrade-recovery-contracts
+        run: timeout --signal=TERM --kill-after=15s 150s npm run test:upgrade-recovery-contracts
+      - name: Verify CI layer contracts
+        timeout-minutes: 3
+        run: timeout --signal=TERM --kill-after=15s 150s npm run test:verification-contracts
       - name: Verify or install media validation prerequisites
         timeout-minutes: 20
         run: |
@@ -28,10 +37,15 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - name: Verify private catalog ingress with feature enabled
+        timeout-minutes: 3
+        env:
+          PRIVATE_LIBRARIES_ENABLED: "true"
+        run: |
+          timeout --signal=TERM --kill-after=15s 150s cargo test -p rainsync-server --bin rainsync-server --locked -- catalog::libraries::tests:: catalog::media_reads::private_admission_tests:: catalog::room_shares::tests:: catalog::private_sources::tests:: catalog::scan_pages::tests:: --test-threads=1
       - run: cargo run -p protocol --example export -- --check
-      - run: npm ci && npm run lint && npm test && npm run build
-      - name: Verify frontend bundle boundaries
-        run: npm run test:frontend-bundle
+      # Native integration and real-browser fixtures still need Node dependencies.
+      - run: npm ci
       - run: npm run test:backend-contracts
       - name: Verify deployment configuration contracts
         run: node --test tests/deployment-settings.test.mjs
@@ -62,7 +76,7 @@ jobs:
           timeout --signal=TERM --kill-after=15s 180s node tests/distributed-compute-retention.mjs
           timeout --signal=TERM --kill-after=15s 600s node tests/distributed-compute-hd.mjs
           # Settings and hierarchy use owned databases and synthetic records only.
-          for test in admin-settings scoped-guests-migration scoped-guests source-settings plugin-configuration-migration plugin-configuration-runtime nas-configuration-settings media-hierarchy-migration media-hierarchy-native private-library-lifecycle-migration private-library-settings-native private-library-expiry-native; do
+          for test in admin-settings scoped-guests-migration scoped-guests profile-identity-native account-exit-authority-native registration-invite-identity-native room-invitation-authority-native room-permissions-authority-native room-ownership-authority-native source-settings plugin-configuration-migration plugin-configuration-runtime nas-configuration-settings media-title-authority-native media-hierarchy-migration media-hierarchy-native private-library-lifecycle-migration private-library-settings-native private-library-expiry-native; do
             timeout --signal=TERM --kill-after=15s 180s node "tests/$test.mjs"
           done
       - name: Verify two-node control routing
@@ -76,11 +90,6 @@ jobs:
         run: |
           timeout --signal=TERM --kill-after=15s 240s node tests/remaining-library-lifecycle.mjs
           timeout --signal=TERM --kill-after=15s 240s node tests/source-resource-limits.mjs
-      - name: Verify recovery integrity and current upgrade baseline
-        timeout-minutes: 4
-        run: |
-          export RAINSYNC_NATIVE_POSTGRES_BIN="$(pg_config --bindir)"
-          timeout --signal=TERM --kill-after=15s 180s node --test tests/recovery-integrity.test.mjs tests/current-baseline-upgrade.test.mjs
       - run: npm run test:accounts
       - name: Verify avatars with the deployment image's FFmpeg
         run: |
@@ -88,11 +97,19 @@ jobs:
           npm run test:avatar-container
       - run: npm run test:chat
       - run: node tests/playlist-scan.mjs
-      - run: npx playwright install --with-deps chromium && npm run test:e2e
-      - name: Verify independent browser measurement driver
-        run: RAINSYNC_PLAYWRIGHT_MODULE="$PWD/node_modules/@playwright/test/index.mjs" node --test tests/acceptance-browser.test.mjs
+      # The independent mock-browser job has its own runner/browser installation.
+      - run: npx playwright install --with-deps chromium
       - run: npm run test:browser-real
       - run: node tests/playlist-real.mjs
+      - name: Retain upgrade/recovery cleanup contract summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-recovery-contracts-${{ github.sha }}-${{ github.run_attempt }}
+          # Only the safe terminal summary, never synthetic fixtures or raw logs.
+          path: ${{ runner.temp }}/rainsync-validation/upgrade-recovery-contracts/summary.json
+          if-no-files-found: warn
+          retention-days: 7
       - name: Retain readiness failure report
         if: failure()
         uses: actions/upload-artifact@v4
@@ -109,4 +126,259 @@ jobs:
           # Only the controlled fixture's safe report, never databases or logs.
           path: ${{ runner.temp }}/rainsync-validation/upstream-profile-admission/*/report.json
           if-no-files-found: ignore
+          retention-days: 7
+
+  # No Rust, PostgreSQL or native-integration dependency blocks these gates.
+  frontend-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolate frontend validation outputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/rainsync-frontend-validation"
+          echo "RAINSYNC_ARTIFACT_DIR=$RUNNER_TEMP/rainsync-frontend-validation" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci && npm run lint && npm test && npm run build
+      - name: Verify unknown response boundary types
+        run: npm run test:response-boundary-types
+      - name: Verify frontend bundle boundaries
+        run: npm run test:frontend-bundle
+
+  browser-mock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolate mock-browser validation outputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/rainsync-browser-mock"
+          echo "RAINSYNC_ARTIFACT_DIR=$RUNNER_TEMP/rainsync-browser-mock" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      # Playwright serves the current sources through Vite, not the built bundle.
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium && npm run test:e2e
+      - name: Verify independent browser measurement driver
+        run: RAINSYNC_PLAYWRIGHT_MODULE="$PWD/node_modules/@playwright/test/index.mjs" node --test tests/acceptance-browser.test.mjs
+      - name: Retain mock-browser failure screenshots and DOM context
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-mock-failure-${{ github.sha }}-${{ github.run_attempt }}
+          # Mock-browser fixtures use synthetic data. Do not upload traces,
+          # browser storage, network captures, or the entire results directory.
+          path: |
+            ${{ runner.temp }}/rainsync-browser-mock/playwright-results/**/test-failed-*.png
+            ${{ runner.temp }}/rainsync-browser-mock/playwright-results/**/error-context.md
+          if-no-files-found: warn
+          retention-days: 7
+
+  upgrade-recovery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Isolate upgrade/recovery outputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/rainsync-upgrade-recovery"
+          echo "RAINSYNC_ARTIFACT_DIR=$RUNNER_TEMP/rainsync-upgrade-recovery/artifacts" >> "$GITHUB_ENV"
+          echo "RAINSYNC_RUNTIME_ROOT=$RUNNER_TEMP/rainsync-upgrade-recovery/runtime" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Prepare owned PostgreSQL prerequisites
+        timeout-minutes: 20
+        run: |
+          bash tests/ci-media-prerequisites.sh
+          bash scripts/ci-media-prerequisites.sh
+      - name: Verify recovery integrity and current upgrade baseline
+        timeout-minutes: 4
+        run: |
+          export RAINSYNC_NATIVE_POSTGRES_BIN="$(pg_config --bindir)"
+          npm run test:upgrade-recovery
+      - name: Retain sanitized upgrade/recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-recovery-${{ github.sha }}-${{ github.run_attempt }}
+          # Raw receipts, databases, keys and child output are never uploaded.
+          path: |
+            ${{ runner.temp }}/rainsync-upgrade-recovery/artifacts/*/report.json
+            ${{ runner.temp }}/rainsync-upgrade-recovery/artifacts/*/manifest.json
+            ${{ runner.temp }}/rainsync-upgrade-recovery/artifacts/*/safe-fixtures/*.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  checks:
+    name: checks
+    runs-on: ubuntu-latest
+    needs: [core-checks, upgrade-recovery, frontend-checks, browser-mock]
+    if: always()
+    steps:
+      - name: Require all verification layers
+        shell: bash
+        env:
+          CORE_RESULT: ${{ needs.core-checks.result }}
+          RECOVERY_RESULT: ${{ needs.upgrade-recovery.result }}
+          FRONTEND_RESULT: ${{ needs.frontend-checks.result }}
+          BROWSER_RESULT: ${{ needs.browser-mock.result }}
+        run: |
+          test "$CORE_RESULT" = success
+          test "$RECOVERY_RESULT" = success
+          test "$FRONTEND_RESULT" = success
+          test "$BROWSER_RESULT" = success
+
+  # Independent of the broad checks job: a frontend or unrelated integration
+  # failure must not silently prevent these owner/commit contracts from running.
+  owner-gates:
+    runs-on: ubuntu-latest
+    # Five additional independent five-minute gates; per-fixture deadlines stay unchanged.
+    timeout-minutes: 75
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      RAINSYNC_BUILD_JOBS: 2
+      RAINSYNC_FIXTURE_CLEANUP_REPORT: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Isolate owner validation outputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/rainsync-owner-validation"
+          echo "RAINSYNC_ARTIFACT_DIR=$RUNNER_TEMP/rainsync-owner-validation/artifacts" >> "$GITHUB_ENV"
+          echo "RAINSYNC_RUNTIME_ROOT=$RUNNER_TEMP/rainsync-owner-validation/runtime" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rainsync-owner-validation/cargo-target" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install locked Node fixture dependencies
+        run: npm ci
+      - name: Verify owner gate orchestration contracts
+        run: npm run test:owner-gate-contracts
+      - name: Prepare owned native PostgreSQL prerequisites
+        id: prerequisites
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: |
+          bash tests/ci-media-prerequisites.sh
+          bash scripts/ci-media-prerequisites.sh
+          mkdir -p "$RAINSYNC_ARTIFACT_DIR" "$RAINSYNC_RUNTIME_ROOT"
+          echo "RAINSYNC_NATIVE_POSTGRES_BIN=$(pg_config --bindir)" >> "$GITHUB_ENV"
+      - name: Bind current production and ignored owner-test executables
+        id: binding
+        if: ${{ !cancelled() && steps.prerequisites.outcome == 'success' }}
+        timeout-minutes: 30
+        run: |
+          node scripts/bind-native-backend.mjs --owner-fixtures > "$RAINSYNC_ARTIFACT_DIR/binding-path.txt"
+          BINDING="$(tail -n 1 "$RAINSYNC_ARTIFACT_DIR/binding-path.txt")"
+          test -s "$BINDING"
+          echo "W03_BACKEND_BINDING=$BINDING" >> "$GITHUB_ENV"
+      - name: Verify actual native delivery owners and durable ACK recovery
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s npm run test:native-delivery-owner
+      - name: Verify full compute retention sweep with owned database and files
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s npm run test:distributed-compute-retention-native
+      - name: Verify native room cleanup and late owner receipts
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s npm run test:room-cleanup-native
+      - name: Verify committed source writes remain confirmed after cleanup failure
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s npm run test:source-change-commit
+      - name: Verify atomic room commands, replay and final authority fences
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s npm run test:room-command-transactions
+      - name: Verify actual NAS multi-page INDEX and ACK session lifecycle
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/nas-index-session-native.mjs
+      - name: Verify original cluster route and cache authority boundaries
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/cluster-route-resolution-native.mjs
+      - name: Verify actual cluster peer relay lifetime
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/cluster-peer-lifetime-native.mjs
+      - name: Verify actual cluster registration heartbeat and fencing lifetime
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/cluster-start-lifecycle-native.mjs
+      - name: Verify actual Server startup settings and failure order
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/app-startup-settings-native.mjs
+      - name: Verify complete compute placement normal HTTP contracts
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 7
+        run: timeout --signal=TERM --kill-after=45s 360s node tests/distributed-compute-placement-native.mjs
+      - name: Verify uploaded bytes and complete attempt transaction fences
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 14
+        run: timeout --signal=TERM --kill-after=45s 780s node tests/distributed-compute-attempt-upload-native.mjs
+      - name: Verify real compute verification children, detached ACK and pending shutdown
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          RAINSYNC_MEDIA_STACK_EVIDENCE: 1
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/compute-finish-owner-native.mjs
+      - name: Verify room-kick-authority-native
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/room-kick-authority-native.mjs
+      - name: Verify room-guest-access-authority-native
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/room-guest-access-authority-native.mjs
+      - name: Verify room-lifecycle-authority-native
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/room-lifecycle-authority-native.mjs
+      - name: Verify room-directory-authority-native
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/room-directory-authority-native.mjs
+      - name: Verify short-platform-account-authority-native
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/short-platform-account-authority-native.mjs
+      - name: Verify room-playlist-authority-native
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        timeout-minutes: 5
+        run: timeout --signal=TERM --kill-after=45s 240s node tests/room-playlist-authority-native.mjs
+      - name: Retain sanitized owner, transaction and source-commit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owner-gates-${{ github.sha }}-${{ github.run_attempt }}
+          # No fixture request documents, databases, credentials or raw logs.
+          path: |
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/owner-gates/**/report.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/compute-finish-owner/**/report.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/**/fixture-cleanup.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/source-change-commit/**/report.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/compute-retention-native-*/evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/nas-index-native-*/evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/nas-index-failure-*/evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/cluster-route-resolution-native-*/evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/cluster-peer-lifetime-native-*/evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/cluster-start-lifecycle-native-*/evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/app-startup-*/*/startup-evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/compute-placement-*/*/evidence.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/compute-placement-coordinator-*.json
+            ${{ runner.temp }}/rainsync-owner-validation/runtime/**/backend-binding.json
+          if-no-files-found: warn
           retention-days: 7

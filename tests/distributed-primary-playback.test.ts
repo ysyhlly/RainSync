@@ -1,3 +1,4 @@
+import { playbackTestContext } from "./helpers/playback-context";
 import {afterEach,expect,it,vi} from 'vitest';
 import {effectScope,reactive,ref} from 'vue';
 import {createPlaybackRuntime} from '../apps/web/src/features/playback/playback-runtime';
@@ -50,8 +51,20 @@ function setup(options:{defer?:boolean;wrong?:boolean}={}){
  });
  const session=reactive({user:{id:id(1)} as {id:string}|undefined,epoch:1,api});
  const state=ref({room_id:id(2),media_id:id(4),media_generation:4,playback_status:'paused',anchor_position_ms:5000,anchor_server_time_ms:0,playback_rate:1});
- const active=ref(true),error=ref(''),clock={ready:true,revision:1,now:()=>10000};
- const scope=effectScope();const runtime=scope.run(()=>createPlaybackRuntime({session:session as any,state:state as any,connected:ref(true),active,clock:clock as any,error,run:async fn=>{try{await fn()}catch(e){error.value=String(e)}}}))!;
+ const active = ref(true),
+   clock = { ready: true, revision: 1, now: () => 10000 };
+ const scope=effectScope();const runtime = scope.run(() =>
+   createPlaybackRuntime(
+     playbackTestContext({
+       session: session as any,
+       state: state as any,
+       connected: ref(true),
+       active,
+       clock: clock as any,
+     }),
+   ),
+ )!;
+  const error = runtime.playbackError;
  const element:any=Object.assign(new EventTarget(),{canPlayType:(v:string)=>v.includes('mpegurl')?'':'probably',pause:vi.fn(),play:vi.fn(async()=>{}),load:vi.fn(),removeAttribute:vi.fn(),getAttribute:()=>null,querySelectorAll:()=>[],error:null,buffered:{length:1,start:()=>0,end:()=>16},seekable:{length:1,start:()=>0,end:()=>16},currentTime:0,playbackRate:1,paused:true,seeking:false,readyState:4,duration:16});
  runtime.attach(element);return {runtime,state,active,session,element,api,error,clock,resolve:()=>resolve(last!),cleanup:()=>scope.stop()};
 }

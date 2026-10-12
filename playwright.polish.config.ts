@@ -2,7 +2,8 @@ import { defineConfig } from "@playwright/test";
 import base from "./playwright.config";
 
 // Never reuse a user server; missed mocks must not reach a live backend.
-export default defineConfig(base, {
+export default defineConfig({
+  ...base,
   workers: 2,
   use: { ...base.use, baseURL: "http://127.0.0.1:5198" },
   webServer: {

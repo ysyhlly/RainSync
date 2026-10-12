@@ -164,3 +164,33 @@ it("repeated checks are single-flight mutations and refresh waits for their outc
     api.mock.calls.filter(([path]) => path.endsWith("/check")),
   ).toHaveLength(1);
 });
+
+it.each(["identity", "abort"])(
+  "%s fences a malformed delayed check before its account parser runs",
+  async (retire) => {
+    const response = deferred<unknown>();
+    const api = vi.fn(async (path: string) =>
+      path.endsWith("/check") ? response.promise : status(),
+    );
+    const { session, account } = setup(api);
+    await account.refresh();
+    const controller = new AbortController();
+    const work = account.checkLogin(controller.signal);
+    const rejected = expect(work).rejects.toMatchObject({
+      name: "StaleIdentity",
+    });
+    await Promise.resolve();
+    if (retire === "identity") session.clear();
+    else controller.abort();
+    const touch = vi.fn(() => {
+      throw Error("retired check parsed");
+    });
+    response.resolve(Object.defineProperty({}, "account", { get: touch }));
+    await rejected;
+    expect(touch).not.toHaveBeenCalled();
+    expect(account.lastCheck).toBeUndefined();
+    expect(account.status).toEqual(
+      retire === "identity" ? undefined : status(),
+    );
+  },
+);

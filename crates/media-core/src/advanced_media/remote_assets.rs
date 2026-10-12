@@ -1,14 +1,13 @@
 //! Source-owner-declared HTTP siblings and version-bound NAS associations.
-use super::{
-    AssetCatalog, EXTERNAL_ASS_INDEX, EXTERNAL_PGS_INDEX, EXTERNAL_SSA_INDEX, MAX_ASSET_BYTES,
-    SubtitleKind,
+use super::asset_contract::{
+    AssetCatalog, AssetFile, EXTERNAL_ASS_INDEX, EXTERNAL_PGS_INDEX, EXTERNAL_SSA_INDEX,
+    HTTP_ASSET_SOURCE, MAX_ASSET_BYTES, SubtitleKind, digest,
 };
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub const REMOTE_ASSET_KIND: &str = "remote_asset_transcode_v1";
 pub const REMOTE_ASSET_QUEUE: &str = "remote_assets_v1";
-pub const HTTP_ASSET_SOURCE: &str = "http-source.mkv";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpAssetAssociation {
@@ -90,15 +89,6 @@ pub struct RemoteAssetCatalog {
 }
 pub fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-fn digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-pub fn http_version(value: &str) -> bool {
-    value.strip_prefix("http-v1:").is_some_and(digest)
 }
 pub fn strong_etag(value: &str) -> bool {
     value.len() >= 2
@@ -223,7 +213,7 @@ impl RemoteAssetCatalog {
         }
         Ok(())
     }
-    pub fn files(&self) -> Vec<&super::AssetFile> {
+    pub fn files(&self) -> Vec<&AssetFile> {
         self.catalog
             .subtitles
             .iter()

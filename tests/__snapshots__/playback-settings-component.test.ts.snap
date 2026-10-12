@@ -1,0 +1,117 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`Settings actual Pinia baseline: disposed retains hooks and busy/error/result settlement 1`] = `
+{
+  "events": [
+    "0:start:runPlayback",
+    "1:after:runPlayback",
+    "3:public settled",
+  ],
+  "scenario": "disposed",
+  "states": [
+    "0/0/0",
+    "0/0/0",
+    "0/0/0",
+    "0/0/1",
+    "0/0/1",
+    "0/0/1",
+    "0/0/1",
+    "0/0/1",
+    "0/0/1",
+    "0/0/1",
+    "0/0/1",
+    "0/0/1",
+    "0/0/1",
+  ],
+}
+`;
+
+exports[`Settings actual Pinia baseline: quality early return retains hooks and busy/error/result settlement 1`] = `
+{
+  "events": [
+    "0:start:runPlayback",
+    "0:busy:true",
+    "0:start:selectNativeQuality",
+    "1:after:selectNativeQuality",
+    "3:busy:false",
+    "4:after:runPlayback",
+  ],
+  "scenario": "quality early return",
+  "states": [
+    "1/0/0",
+    "1/0/0",
+    "1/0/0",
+    "0/0/0",
+    "0/0/0",
+    "0/0/0",
+    "0/0/0",
+    "0/0/0",
+    "0/0/0",
+    "0/0/0",
+    "0/0/0",
+    "0/0/0",
+    "0/0/0",
+  ],
+}
+`;
+
+exports[`Settings actual Pinia baseline: rejected retains hooks and busy/error/result settlement 1`] = `
+{
+  "events": [
+    "0:start:runPlayback",
+    "0:busy:true",
+    "0:start:loadMedia",
+    "2:error:loadMedia",
+    "5:notice:settings-load-rejected",
+    "5:busy:false",
+    "6:after:runPlayback",
+    "8:public settled",
+  ],
+  "scenario": "rejected",
+  "states": [
+    "1/0/0",
+    "1/0/0",
+    "1/0/0",
+    "1/0/0",
+    "1/0/0",
+    "0/1/0",
+    "0/1/0",
+    "0/1/0",
+    "0/1/1",
+    "0/1/1",
+    "0/1/1",
+    "0/1/1",
+    "0/1/1",
+  ],
+}
+`;
+
+exports[`Settings actual Pinia baseline: resolved retains hooks and busy/error/result settlement 1`] = `
+{
+  "events": [
+    "0:start:runPlayback",
+    "0:busy:true",
+    "0:start:loadMedia",
+    "2:after:loadMedia",
+    "4:busy:false",
+    "5:after:runPlayback",
+    "7:public settled",
+  ],
+  "scenario": "resolved",
+  "states": [
+    "1/0/0",
+    "1/0/0",
+    "1/0/0",
+    "1/0/0",
+    "0/0/0",
+    "0/0/0",
+    "0/0/0",
+    "0/0/1",
+    "0/0/1",
+    "0/0/1",
+    "0/0/1",
+    "0/0/1",
+    "0/0/1",
+  ],
+}
+`;

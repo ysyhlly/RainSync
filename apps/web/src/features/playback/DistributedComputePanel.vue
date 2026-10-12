@@ -259,9 +259,7 @@ onBeforeUnmount(() => {
   <details class="distributed-compute-panel surface-card surface-card--compact">
     <summary>NAS 本地计算与主播放器分片共享</summary>
     <p class="helper">
-      NAS
-      生成完整产物后，服务器独立校验编码、原片时间轴和音轨。选择合格产物会替换主播放器输入，继续跟随房间播放、暂停、速率与跳转；默认使用
-      HTTP。
+      可在 NAS 上预先生成兼容版本，校验通过后选择用于当前房间。
     </p>
     <p v-if="!loaded && !error" class="helper" role="status">
       正在读取 NAS 计算状态…
@@ -278,19 +276,22 @@ onBeforeUnmount(() => {
         label="计算配方"
         :disabled="busy"
     /></label>
-    <p class="helper">
-      720p、1080p 与 4K（2160p /
-      UHD）是输出尺寸上限，保留原片比例，不放大小尺寸原片。生成产物后，仍需手动选择用于房间主播放器。
-    </p>
-    <p class="helper">
-      可选配方不代表节点已具备能力：当前原片或副本所在的已授权节点必须实测并上报相应编码配方。尚未上报的旧节点不能执行
-      4K。
-    </p>
-    <p class="helper">
-      执行还受空闲任务槽、产物字节预算、源时长与执行超时限制。默认 1
-      个任务槽、64 MiB
-      产物上限不会随画质提高；高清长片可能超出预算，需要管理员另行配置。
-    </p>
+    <details class="compute-details">
+      <summary>了解计算条件与限制</summary>
+      <p class="helper">
+        720p、1080p 与 4K（2160p /
+        UHD）是输出尺寸上限，保留原片比例，不放大小尺寸原片。生成产物后，仍需手动选择用于房间主播放器。
+      </p>
+      <p class="helper">
+        可选配方不代表节点已具备能力：当前原片或副本所在的已授权节点必须实测并上报相应编码配方。尚未上报的旧节点不能执行
+        4K。
+      </p>
+      <p class="helper">
+        执行还受空闲任务槽、产物字节预算、源时长与执行超时限制。默认 1
+        个任务槽、64 MiB
+        产物上限不会随画质提高；高清长片可能超出预算，需要管理员另行配置。
+      </p>
+    </details>
     <label class="compute-field"
       >原片音轨
       <AppSelect

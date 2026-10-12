@@ -1,3 +1,4 @@
+import { withNoticeOwner } from "./helpers/notice-owner";
 import { readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +10,7 @@ import * as Vue from "vue";
 import type { MediaTrack } from "../packages/protocol";
 import { SubtitleLoadState } from "../apps/web/src/features/playback/subtitle-load-state";
 import { useRoomNotice } from "../apps/web/src/features/playback/room-notice";
+import { createPlaybackHostPort } from "../apps/web/src/features/playback/playback-host-port";
 import {
   describePlaybackPreparation,
   preparationFailure,
@@ -109,7 +111,8 @@ async function renderPlayer(
     name:
       | "PlaybackHost.vue"
       | "PlaybackInformation.vue"
-      | "PlaybackPreparation.vue",
+      | "PlaybackPreparation.vue"
+      | "PlaybackStartupDiagnostics.vue",
   ) {
     const filename = resolve(playerDirectory, name);
     if (components.has(filename)) return components.get(filename)!;
@@ -161,6 +164,11 @@ async function renderPlayer(
           return { __esModule: true, default: load("PlaybackInformation.vue") };
         case "./PlaybackPreparation.vue":
           return { __esModule: true, default: load("PlaybackPreparation.vue") };
+        case "./PlaybackStartupDiagnostics.vue":
+          return {
+            __esModule: true,
+            default: load("PlaybackStartupDiagnostics.vue"),
+          };
         case "./playback-preparation":
           return { describePlaybackPreparation };
         case "./PlaybackControls.vue":
@@ -184,15 +192,34 @@ async function renderPlayer(
     components.set(filename, module.exports.default);
     return module.exports.default;
   }
+  type HostContext = Parameters<typeof createPlaybackHostPort>[0];
+  const ownedNotice = withNoticeOwner(runtime);
+  const raw = runtime as unknown as Record<string, any>;
+  const required = (name: string) => () => { throw Error(`Unexpected ${name} in recovery SSR fixture`); };
+  const hostPort = createPlaybackHostPort({
+    timeline: Object.fromEntries(["room", "state", "connected", "connectionStopped", "roomActive", "currentTitle"].map(key => [key, Vue.toRef(raw, key)])) as HostContext["timeline"],
+    playback: Object.fromEntries(["waiting", "blocked", "dragging", "duration", "live", "nativePlatform", "platformDanmakuEnabled", "platformDanmakuCues", "subtitles", "subtitleIndex", "sessionId", "preparation", "loadingStage", "startupDiagnostics", "recoveryState", "recoveryLabel"].map(key => [key, Vue.toRef(raw, key)])) as HostContext["playback"],
+    notice: { error: Vue.toRef(raw, "error"), errorNotice: Vue.toRef(raw, "errorNotice") },
+    actions: {
+      can: permission => runtime.can(permission),
+      attach: runtime.attach,
+      enablePlayback: runtime.enablePlayback,
+      runPlayback: required("runPlayback"), loadMedia: required("loadMedia"),
+      cancelPreparation: required("cancelPreparation"), applySubtitles: required("applySubtitles"), send: required("send"),
+      dismissError: ownedNotice.dismissError,
+    },
+    playbackControls: raw.playbackControls, playbackSettings: raw.playbackSettings,
+  });
   const props = options.information
     ? {
+        information: hostPort.information,
         title: runtime.currentTitle,
         room: runtime.room.name,
         connected: runtime.connected,
         stopped: runtime.connectionStopped,
         owner: runtime.owner,
       }
-    : { full: options.full ?? true };
+    : { playback: hostPort, full: options.full ?? true };
   const app = Vue.createSSRApp(
     load(options.information ? "PlaybackInformation.vue" : "PlaybackHost.vue"),
     props,
@@ -584,20 +611,47 @@ it("a moderator with only pause permission is described as able to control playb
   );
 });
 
-
-it.each(["preparing", "queued", "transcoding", "cancelling", "cancelled", "failed"] as const)(
+it.each([
+  "preparing",
+  "queued",
+  "transcoding",
+  "cancelling",
+  "cancelled",
+  "failed",
+] as const)(
   "collapsed mini keeps the shared %s preparation feedback outside playback controls",
   async (phase) => {
     const runtime = fixture(labels.catchingUp);
-    runtime.preparation = { phase, failure: phase === "failed" ? { message: "处理失败", retryable: true } : undefined };
-    const html = await renderPlayer(runtime, { full: false, shortViewport: true });
+    runtime.preparation = {
+      phase,
+      failure:
+        phase === "failed"
+          ? { message: "处理失败", retryable: true }
+          : undefined,
+    };
+    const html = await renderPlayer(runtime, {
+      full: false,
+      shortViewport: true,
+    });
     const tree = elements(html);
-    const announcements = tree.filter((element) => ["status", "alert"].includes(element.attributes.role));
+    const announcements = tree.filter((element) =>
+      ["status", "alert"].includes(element.attributes.role),
+    );
     expect(announcements).toHaveLength(1);
-    expect(announcements[0].text).toContain(describePlaybackPreparation(runtime.preparation).label);
-    expect(announcements[0].ancestors.some((element) => hasClass(element, "player-caption"))).toBe(true);
-    const buttons = tree.filter((element) => element.tag === "button").map((element) => element.text);
-    expect(buttons.includes("取消准备")).toBe(["preparing", "queued", "transcoding"].includes(phase));
+    expect(announcements[0].text).toContain(
+      describePlaybackPreparation(runtime.preparation).label,
+    );
+    expect(
+      announcements[0].ancestors.some((element) =>
+        hasClass(element, "player-caption"),
+      ),
+    ).toBe(true);
+    const buttons = tree
+      .filter((element) => element.tag === "button")
+      .map((element) => element.text);
+    expect(buttons.includes("取消准备")).toBe(
+      ["preparing", "queued", "transcoding"].includes(phase),
+    );
     expect(html).toContain("mini-collapsed");
     expect(tree.filter((element) => element.tag === "video")).toHaveLength(1);
   },
@@ -613,7 +667,9 @@ it("only a connected empty room without an active task uses the compact return p
   runtime.preparation = { phase: "cancelling" };
   tree = elements(await renderPlayer(runtime, { full: false }));
   expect(hasClass(tree[0], "empty-room")).toBe(false);
-  expect(tree.some((element) => element.text.includes("正在取消播放准备"))).toBe(true);
+  expect(
+    tree.some((element) => element.text.includes("正在取消播放准备")),
+  ).toBe(true);
   runtime.preparation = { phase: "idle" };
   runtime.connected = false;
   tree = elements(await renderPlayer(runtime, { full: false }));

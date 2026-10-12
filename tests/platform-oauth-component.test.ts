@@ -7,6 +7,7 @@ import {
   platformOAuthApi,
   oauthPrerequisiteLabels,
   type OAuthLogin,
+  type OAuthStatus,
 } from "../apps/web/src/features/account/platform-oauth.api";
 import {
   createOAuthFlow,
@@ -51,7 +52,7 @@ async function settle() {
 }
 /** Run the real SFC setup/lifecycle with Vue's in-memory renderer. No browser,
  * DOM package, listener or real account endpoint is used. */
-function mountPanel(api: any) {
+function mountPanel(api: any, provider: "douyin" | "tiktok" = "douyin") {
   setActivePinia(createPinia());
   const session = useSession();
   session.accept({
@@ -78,7 +79,7 @@ function mountPanel(api: any) {
       AppDialog: {},
       Notice: {},
     },
-    { provider: "douyin" },
+    { provider },
   );
 }
 afterEach(() => {
@@ -297,3 +298,255 @@ it.each(["close", "identity", "provider", "unmount"])(
     if (ending !== "unmount") panel.unmount();
   },
 );
+
+function deferredReceipt() {
+  let resolve!: (value: unknown) => void;
+  const promise = new Promise<unknown>((yes) => (resolve = yes));
+  return { promise, resolve };
+}
+function connected(provider: "douyin" | "tiktok" = "douyin"): OAuthStatus {
+  return {
+    ...status,
+    provider,
+    authorization_kind: "official_oauth",
+    authorization_mode: "web",
+    playback_session: false,
+    id,
+    revision: "90071992547409931234567890",
+    state: "connected",
+    scopes: [provider === "douyin" ? "user_info" : "user.info.basic"],
+    access_expires_at: 1000,
+    refresh_expires_at: 2000,
+    auto_renew: true,
+    renewal_state: "scheduled",
+  };
+}
+for (const operation of ["refresh", "disable", "unlink"] as const) {
+  it.each(["epoch", "user", "csrf", "provider", "origin", "abort", "unmount"])(
+    `component ${operation} fences poisoned success before parsing after %s`,
+    async (ending) => {
+      const pending = deferredReceipt();
+      const api = vi
+        .fn()
+        .mockResolvedValueOnce(connected())
+        .mockReturnValue(pending.promise);
+      const panel = mountPanel(api);
+      await settle();
+      panel.controls.unlinkOpen.value = true;
+      const work = panel.controls[operation]();
+      if (ending === "epoch") ++useSession().epoch;
+      if (ending === "user")
+        useSession().user!.id = "00000000-0000-0000-0000-000000000002";
+      if (ending === "csrf") useSession().user!.csrf = "new-csrf";
+      if (ending === "provider") panel.setProps({ provider: "tiktok" });
+      if (ending === "origin")
+        vi.stubGlobal("location", { origin: "https://other.example" });
+      if (ending === "abort") panel.controls.controller.abort();
+      if (ending === "unmount") panel.unmount();
+      await settle();
+      const oldStatus = panel.controls.status.value;
+      const oldError = panel.controls.error.value;
+      const oldDialog = panel.controls.unlinkOpen.value;
+      const getter = vi.fn(() => {
+        throw Error("late receipt must not be inspected");
+      });
+      pending.resolve(Object.defineProperty({}, "provider", { get: getter }));
+      await work;
+      expect(getter).not.toHaveBeenCalled();
+      expect(panel.controls.status.value).toBe(oldStatus);
+      expect(panel.controls.error.value).toBe(oldError);
+      expect(panel.controls.unlinkOpen.value).toBe(oldDialog);
+      expect(api).toHaveBeenCalledTimes(2);
+      if (ending === "unmount" || ending === "abort")
+        expect(api.mock.calls[1][3].aborted).toBe(true);
+      if (ending !== "unmount") panel.unmount();
+    },
+  );
+  it.each([null, [], { state: "connected" }])(
+    `component current invalid ${operation} keeps the last snapshot and reports the original error`,
+    async (receipt) => {
+      const pending = deferredReceipt();
+      const api = vi
+        .fn()
+        .mockResolvedValueOnce(connected())
+        .mockReturnValue(pending.promise);
+      const panel = mountPanel(api);
+      await settle();
+      panel.controls.unlinkOpen.value = true;
+      const work = panel.controls[operation]();
+      if (operation !== "refresh") await panel.controls[operation]();
+      pending.resolve(receipt);
+      await work;
+      expect(panel.controls.status.value).toEqual(connected());
+      expect(panel.controls.unlinkOpen.value).toBe(true);
+      expect(panel.controls.busy.value).toBe(false);
+      expect(panel.controls.error.value).toBe(
+        {
+          refresh: "无法确认开放平台授权状态，请刷新重试",
+          disable: "停止自动续期的结果未确认，请刷新状态",
+          unlink: "解除开放平台授权的结果未确认，请刷新状态",
+        }[operation],
+      );
+      expect(api).toHaveBeenCalledTimes(2);
+      panel.unmount();
+    },
+  );
+}
+it("component refresh serial rejects a superseded poisoned receipt before parsing", async () => {
+  const pending = deferredReceipt();
+  const newer = { ...connected(), revision: "90071992547409931234567891" };
+  const api = vi
+    .fn()
+    .mockResolvedValueOnce(connected())
+    .mockReturnValueOnce(pending.promise)
+    .mockResolvedValueOnce(newer);
+  const panel = mountPanel(api);
+  await settle();
+  const first = panel.controls.refresh();
+  await panel.controls.refresh();
+  const getter = vi.fn(() => {
+    throw Error("superseded receipt");
+  });
+  pending.resolve(Object.defineProperty({}, "provider", { get: getter }));
+  await first;
+  expect(getter).not.toHaveBeenCalled();
+  expect(panel.controls.status.value).toEqual(newer);
+  expect(panel.controls.error.value).toBe("");
+  panel.unmount();
+});
+it.each(["douyin", "tiktok"] as const)(
+  "component %s commits only whitelisted status and unchanged revision-bound writes",
+  async (provider) => {
+    const initial = connected(provider);
+    const disabled = {
+      ...initial,
+      auto_renew: false,
+      renewal_state: "disabled",
+    };
+    const unlinked = { ...disabled, state: "revoked" };
+    const extra = { secret: { token: "private" } };
+    const api = vi
+      .fn()
+      .mockResolvedValueOnce({ ...initial, ...extra })
+      .mockResolvedValueOnce({ ...disabled, ...extra })
+      .mockResolvedValueOnce({ ...unlinked, ...extra });
+    const panel = mountPanel(api, provider);
+    await settle();
+    expect(panel.controls.status.value).toEqual(initial);
+    await panel.controls.disable();
+    expect(panel.controls.status.value).toEqual(disabled);
+    panel.controls.unlinkOpen.value = true;
+    await panel.controls.unlink();
+    expect(panel.controls.status.value).toEqual(unlinked);
+    expect(panel.controls.unlinkOpen.value).toBe(false);
+    expect(api.mock.calls[1]).toEqual([
+      `/platform-accounts/${provider}/oauth/renewal`,
+      "PUT",
+      { expected_revision: initial.revision, enabled: false },
+      expect.any(AbortSignal),
+    ]);
+    expect(api.mock.calls[2]).toEqual([
+      `/platform-accounts/${provider}/oauth`,
+      "DELETE",
+      { expected_revision: initial.revision },
+      expect.any(AbortSignal),
+    ]);
+    panel.unmount();
+  },
+);
+it("component ignores successful cancellation payloads, even malformed ones, without adding a request", async () => {
+  vi.useFakeTimers();
+  const getter = vi.fn(() => {
+    throw Error("unused cancellation receipt");
+  });
+  const api = vi.fn(async (path: string, method: string) => {
+    if (path.endsWith("/oauth")) return status;
+    if (method === "DELETE")
+      return Object.defineProperty({}, "provider", { get: getter });
+    return login();
+  });
+  const panel = mountPanel(api);
+  await settle();
+  await panel.controls.show();
+  panel.controls.consent.value = true;
+  await panel.controls.begin();
+  await Promise.all([panel.controls.close(), panel.controls.close()]);
+  expect(panel.controls.open.value).toBe(false);
+  expect(panel.controls.state.value).toEqual({ phase: "idle" });
+  expect(panel.controls.error.value).toBe("");
+  expect(getter).not.toHaveBeenCalled();
+  expect(
+    api.mock.calls.filter(([, method]) => method === "DELETE"),
+  ).toHaveLength(1);
+  const count = api.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(api).toHaveBeenCalledTimes(count);
+  panel.unmount();
+});
+
+it.each(["confirmed", "invalid"] as const)(
+  "TikTok polling %s clears rendered capability and only a valid confirmation refreshes status",
+  async (outcome) => {
+    vi.useFakeTimers();
+    const qrLogin: OAuthLogin = {
+      ...login(),
+      provider: "tiktok",
+      mode: "qr",
+      authorization_url: null,
+      qr_payload: `aweme://authorize?client_ticket=${state}`,
+    };
+    const terminal = { ...qrLogin, status: "confirmed", qr_payload: null };
+    const api = vi.fn(async (path: string, method: string) => {
+      if (path.endsWith("/oauth")) return connected("tiktok");
+      if (path.endsWith("/poll"))
+        return outcome === "confirmed" ? terminal : Object.assign([], terminal);
+      if (method === "DELETE") return undefined;
+      return { ...qrLogin, secret: { token: "private" } };
+    });
+    const panel = mountPanel(api, "tiktok");
+    await settle();
+    await panel.controls.show();
+    panel.controls.consent.value = true;
+    await panel.controls.begin();
+    await settle();
+    expect(panel.controls.state.value.login).toEqual(qrLogin);
+    expect(panel.controls.image.value).toBe("fixture:image");
+    await vi.advanceTimersByTimeAsync(3000);
+    await settle();
+    expect(panel.controls.state.value).toEqual({
+      phase: outcome === "confirmed" ? "confirmed" : "uncertain",
+    });
+    expect(panel.controls.image.value).toBe("");
+    expect(
+      api.mock.calls.filter(([path]) => path.endsWith("/oauth")),
+    ).toHaveLength(outcome === "confirmed" ? 3 : 2);
+    const count = api.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(api).toHaveBeenCalledTimes(count);
+    await panel.controls.close();
+    panel.unmount();
+  },
+);
+it("component cancellation rejection keeps the original uncertain-stop message without retry", async () => {
+  vi.useFakeTimers();
+  const api = vi.fn(async (path: string, method: string) => {
+    if (path.endsWith("/oauth")) return status;
+    if (method === "DELETE") throw Error("lost cancellation receipt");
+    return login();
+  });
+  const panel = mountPanel(api);
+  await settle();
+  await panel.controls.show();
+  panel.controls.consent.value = true;
+  await panel.controls.begin();
+  await panel.controls.close();
+  expect(panel.controls.open.value).toBe(false);
+  expect(panel.controls.state.value).toEqual({ phase: "idle" });
+  expect(panel.controls.error.value).toBe(
+    "停止授权尚未确认，请刷新状态。到期后此授权请求会失效",
+  );
+  const count = api.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(api).toHaveBeenCalledTimes(count);
+  panel.unmount();
+});

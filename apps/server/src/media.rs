@@ -23,66 +23,20 @@ fn upstream_track_title(stream: &Value) -> Value {
 
 pub async fn sources(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>> {
     admin(&auth(&app, &h, false).await?)?;
-    let rows = sqlx::query("SELECT s.id,s.name,s.kind,s.library_id,s.access_policy_revision,CASE WHEN s.kind NOT IN ('jellyfin','emby') THEN NULL ELSE jsonb_build_object('state',CASE WHEN a.state='allowed' AND a.valid_until<=clock_timestamp() THEN 'unknown' ELSE COALESCE(a.state,'unknown') END,'reason',CASE WHEN a.state='allowed' AND a.valid_until<=clock_timestamp() THEN 'upstream_policy_expired' ELSE COALESCE(a.reason,'upstream_policy_unknown') END) END AS account_policy FROM sources s LEFT JOIN source_account_policies a ON a.source_id=s.id AND a.source_revision=s.access_policy_revision WHERE s.deleted_at IS NULL ORDER BY s.name")
-        .fetch_all(&app.db)
-        .await?;
-    Ok(Json(Value::Array(rows.iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"name":r.get::<String,_>("name"),"kind":r.get::<String,_>("kind"),"library_id":r.get::<Uuid,_>("library_id"),"access_policy_revision":r.get::<i64,_>("access_policy_revision"),"account_policy":r.get::<Option<Value>,_>("account_policy")})).collect())))
+    Ok(Json(catalog::sources::list(&app.db).await?))
 }
-#[derive(Deserialize)]
-pub struct Source {
-    name: String,
-    kind: String,
-    config: SourceConfig,
-}
+pub use catalog::sources::Source;
 pub async fn add_source(
     State(app): State<App>,
     h: HeaderMap,
     Json(body): Json<Source>,
 ) -> Result<Json<Value>> {
     admin(&auth(&app, &h, true).await?)?;
-    if !["local", "http", "jellyfin", "emby", "agent"].contains(&body.kind.as_str())
-        || body.name.is_empty()
-    {
-        return Err(err(StatusCode::BAD_REQUEST, "invalid_source"));
-    }
-    if !matches!(body.kind.as_str(), "http" | "jellyfin" | "emby")
-        && body.config.access_policy.is_some()
-    {
-        return Err(err(StatusCode::BAD_REQUEST, "invalid_source"));
-    }
-    if body.kind == "local" {
-        let root = std::env::var("MEDIA_ROOT").unwrap_or("/media".into());
-        let allowed = std::path::Path::new(&root)
-            .canonicalize()
-            .map_err(|_| err(StatusCode::BAD_REQUEST, "media_root_unavailable"))?;
-        let candidate = std::path::Path::new(&body.config.root)
-            .canonicalize()
-            .map_err(|_| err(StatusCode::BAD_REQUEST, "source_root_unavailable"))?;
-        if !candidate.starts_with(allowed) {
-            return Err(err(StatusCode::FORBIDDEN, "outside_media_root"));
-        }
-    }
-    if ["http", "jellyfin", "emby"].contains(&body.kind.as_str()) {
-        providers::access_policy::SourceAccess::new(
-            &body.config.url,
-            body.config.access_policy.as_ref(),
-        )
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_source_url"))?;
-    }
-    providers::validate_source_headers(&body.config.headers)
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid_source"))?;
-    let id = Uuid::new_v4();
-    let policy_revision = i64::from(body.config.access_policy.is_some());
-    let encrypted = app.encrypt(&serde_json::to_value(&body.config).unwrap())?;
-    sqlx::query("INSERT INTO sources(id,name,kind,config_encrypted,access_policy_revision) VALUES($1,$2,$3,$4,$5)")
-        .bind(id)
-        .bind(body.name)
-        .bind(body.kind)
-        .bind(encrypted)
-        .bind(policy_revision)
-        .execute(&app.db)
-        .await?;
-    Ok(Json(json!({"id":id})))
+    let context = catalog::SourceWriteContext {
+        db: &app.db,
+        encrypt: &|value| app.encrypt(value),
+    };
+    Ok(Json(catalog::sources::add(context, body).await?))
 }
 pub async fn remove_source(
     State(app): State<App>,
@@ -91,60 +45,9 @@ pub async fn remove_source(
 ) -> Result<Json<Value>> {
     let user = auth(&app, &h, true).await?;
     admin(&user)?;
-    let mut tx = app.db.begin().await?;
-    let login = admin_settings::lock_admin(&mut tx, &user, &h, true).await?;
-    let row = sqlx::query("SELECT kind,library_id FROM sources WHERE id=$1 FOR UPDATE")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let Some(row) = row else {
-        // A lost successful response can be retried without recreating state.
-        admin_settings::finish(tx, &user, &login).await?;
-        return Ok(Json(json!({"ok":true,"id":id})));
-    };
-    if row.get::<Uuid, _>("library_id") != Uuid::from_u128(1)
-        || !matches!(
-            row.get::<String, _>("kind").as_str(),
-            "local" | "http" | "jellyfin" | "emby"
-        )
-    {
-        // Detaching a private item would erase its library permission scope.
-        // Agent sources must remain bound to device revocation and indexing.
-        return Err(err(StatusCode::CONFLICT, "source_managed_elsewhere"));
-    }
-    // Source admission holds FOR SHARE through publication. This source lock
-    // orders removal after existing grants and prevents any new grant.
-    let in_use: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playback_sessions p JOIN media_items m ON m.id=p.media_id WHERE m.source_id=$1 AND NOT p.stopped AND p.expires_at>clock_timestamp()) OR EXISTS(SELECT 1 FROM upstream_reservations WHERE source_id=$1 AND state IN('preparing','active'))")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-    if in_use {
-        return Err(err(StatusCode::CONFLICT, "source_in_use"));
-    }
-    // Keep media IDs referenced by room history, playlists and old sessions.
-    // Availability and source generation fence previews and stale selections.
-    sqlx::query("UPDATE media_items SET available=false,source_id=NULL WHERE source_id=$1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    for table in [
-        "s3_index_scan_seen",
-        "s3_index_scan_cursors",
-        "s3_index_scans",
-    ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE source_id=$1"))
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    // Scan and account-policy rows cascade; retained policy snapshots still
-    // permit bounded cleanup of already closing upstream reservations.
-    sqlx::query("DELETE FROM sources WHERE id=$1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    admin_settings::finish(tx, &user, &login).await?;
-    Ok(Json(json!({"ok":true,"id":id})))
+    Ok(Json(
+        catalog::sources::remove(&app.db, &user, &h, id).await?,
+    ))
 }
 pub async fn scan(
     State(app): State<App>,
@@ -152,103 +55,25 @@ pub async fn scan(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>> {
     admin(&auth(&app, &h, true).await?)?;
-    let mut tx = app.db.begin().await?;
-    let row = sqlx::query(
-        "SELECT kind,config_encrypted FROM sources WHERE id=$1 AND deleted_at IS NULL FOR SHARE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| err(StatusCode::NOT_FOUND, "source_not_found"))?;
-    if row.get::<String, _>("kind") == "s3" {
-        tx.commit().await?;
-        let status: Option<String> =
-            sqlx::query_scalar("SELECT status FROM s3_index_scans WHERE source_id=$1")
-                .bind(id)
-                .fetch_optional(&app.db)
-                .await?;
-        let restart = status.as_deref().is_none_or(|v| v == "completed");
-        let mut value = private_library::scan_source_page(&app, id, restart).await?;
-        value["count"] = value["item_count"].clone();
-        return Ok(Json(value));
+    let context = catalog::SourceReadContext {
+        db: &app.db,
+        decrypt: &|value| app.decrypt(value),
+    };
+    Ok(Json(
+        catalog::scans::scan(&context, id, &ScanLocalProbe).await?,
+    ))
+}
+
+struct ScanLocalProbe;
+
+impl catalog::scans::LocalProbe for ScanLocalProbe {
+    fn probe<'a>(
+        &'a self,
+        root: &'a str,
+        resource: &'a str,
+    ) -> impl std::future::Future<Output = Result<(Value, String)>> + Send + 'a {
+        playback_capabilities::probe_local(root, resource)
     }
-    let config: SourceConfig =
-        serde_json::from_value(app.decrypt(&row.get::<String, _>("config_encrypted"))?)
-            .map_err(anyhow::Error::from)?;
-    let generation = Uuid::new_v4();
-    sqlx::query("INSERT INTO source_scans(source_id,generation) VALUES($1,$2) ON CONFLICT(source_id) DO UPDATE SET generation=EXCLUDED.generation")
-        .bind(id).bind(generation).execute(&mut *tx).await?;
-    tx.commit().await?;
-    let kind: String = row.get("kind");
-    let encrypted: String = row.get("config_encrypted");
-    let items = providers::list_items_guarded(&kind, &config, || async {
-        let mut tx = app.db.begin().await?;
-        guard_scan_config(&mut tx, id, &kind, &encrypted)
-            .await
-            .map_err(|_| anyhow::anyhow!("source_scan_superseded"))?;
-        let current: Option<Uuid> =
-            sqlx::query_scalar("SELECT generation FROM source_scans WHERE source_id=$1")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        anyhow::ensure!(current == Some(generation), "source_scan_superseded");
-        Ok(tx)
-    })
-    .await
-    .map_err(|_| err(StatusCode::BAD_GATEWAY, "source_scan_failed"))?;
-    let count = items.len();
-    let resources: Vec<String> = items.iter().map(|i| i.resource.clone()).collect();
-    let mut batch = Vec::with_capacity(32);
-    for mut item in items {
-        if row.get::<String, _>("kind") == "local"
-            && let Ok((meta, version)) =
-                playback_capabilities::probe_local(&config.root, &item.resource).await
-        {
-            item.duration_ms = meta["format"]["duration"]
-                .as_str()
-                .and_then(|v| v.parse::<f64>().ok())
-                .filter(|v| v.is_finite() && *v >= 0.0)
-                .map(|v| v * 1000.0);
-            item.metadata = meta;
-            item.metadata["preview_file_version"] = json!(version);
-            let mut sidecars = serde_json::Map::new();
-            for (i, ext) in ["srt", "vtt"].iter().enumerate() {
-                let relative = std::path::Path::new(&item.resource)
-                    .with_extension(ext)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if media_core::safe_local_path(std::path::Path::new(&config.root), &relative)
-                    .is_ok()
-                {
-                    sidecars.insert((100000 + i).to_string(), json!(relative));
-                }
-            }
-            item.metadata["sidecars"] = Value::Object(sidecars);
-        }
-        if row.get::<String, _>("kind") != "local" {
-            item.metadata["preview_scan"] = json!(generation);
-        }
-        batch.push(item);
-        if batch.len() == 32 {
-            save_scan_batch(&app, id, generation, &kind, &encrypted, &mut batch).await?;
-        }
-    }
-    save_scan_batch(&app, id, generation, &kind, &encrypted, &mut batch).await?;
-    let mut tx = app.db.begin().await?;
-    guard_scan_config(&mut tx, id, &kind, &encrypted).await?;
-    guard_scan(&mut tx, id, generation).await?;
-    sqlx::query(
-        "UPDATE media_items SET available=false WHERE source_id=$1 AND NOT(resource=ANY($2))",
-    )
-    .bind(id)
-    .bind(&resources)
-    .execute(&mut *tx)
-    .await?;
-    if row.get::<String, _>("kind") == "http" {
-        sqlx::query("UPDATE media_items SET library_source_generation=library_source_generation+1 WHERE source_id=$1 AND available").bind(id).execute(&mut *tx).await?;
-    }
-    tx.commit().await?;
-    Ok(Json(json!({"count":count})))
 }
 fn metadata_is_hls(metadata: &Value) -> bool {
     if let Some(transport) = metadata["rainsync_http_transport"].as_str() {
@@ -286,83 +111,16 @@ fn declared_http_transport(headers: &HeaderMap) -> Option<&'static str> {
     (token && (matches!(kind, "video" | "audio") || mime == "application/mp4"))
         .then_some("progressive")
 }
-async fn guard_scan_config(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    id: Uuid,
-    kind: &str,
-    encrypted: &str,
-) -> Result<()> {
-    let row = sqlx::query(
-        "SELECT kind,config_encrypted FROM sources WHERE id=$1 AND deleted_at IS NULL FOR SHARE",
-    )
-    .bind(id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if !row.is_some_and(|row| {
-        row.get::<String, _>("kind") == kind
-            && row.get::<String, _>("config_encrypted") == encrypted
-    }) {
-        return Err(err(StatusCode::CONFLICT, "source_scan_failed"));
-    }
-    Ok(())
-}
-async fn guard_scan(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    id: Uuid,
-    generation: Uuid,
-) -> Result<()> {
-    // Lock source authority before the scan row, matching source removal's
-    // lock order. A delayed provider response cannot recreate removed media.
-    sqlx::query("SELECT id FROM sources WHERE id=$1 AND deleted_at IS NULL FOR SHARE")
-        .bind(id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "source_not_found"))?;
-    let current: Uuid =
-        sqlx::query_scalar("SELECT generation FROM source_scans WHERE source_id=$1 FOR UPDATE")
-            .bind(id)
-            .fetch_one(&mut **tx)
-            .await?;
-    if current != generation {
-        return Err(err(StatusCode::CONFLICT, "source_scan_failed"));
-    }
-    Ok(())
-}
-async fn save_scan_batch(
-    app: &App,
-    id: Uuid,
-    generation: Uuid,
-    kind: &str,
-    encrypted: &str,
-    batch: &mut Vec<providers::Item>,
-) -> Result<()> {
-    let mut tx = app.db.begin().await?;
-    guard_scan_config(&mut tx, id, kind, encrypted).await?;
-    guard_scan(&mut tx, id, generation).await?;
-    for item in batch.drain(..) {
-        sqlx::query("INSERT INTO media_items(id,source_id,title,resource,duration_ms,metadata) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(source_id,resource) DO UPDATE SET title=EXCLUDED.title,duration_ms=EXCLUDED.duration_ms,metadata=EXCLUDED.metadata,available=true").bind(Uuid::new_v4()).bind(id).bind(item.title).bind(item.resource).bind(item.duration_ms).bind(item.metadata).execute(&mut *tx).await?;
-    }
-    tx.commit().await?;
-    Ok(())
-}
-#[derive(Deserialize)]
-pub struct LibraryQuery {
-    after: Option<Uuid>,
-    limit: Option<i64>,
-    #[serde(default)]
-    search: String,
-}
+pub use catalog::media_reads::LibraryQuery;
 pub async fn library(
     State(app): State<App>,
     h: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<LibraryQuery>,
 ) -> Result<Response> {
     let user = auth(&app, &h, false).await?;
-    let rows=sqlx::query(&format!("{} WHERE {} AND ($2::uuid IS NULL OR m.id>$2) AND strpos(lower(COALESCE(u.title,m.shared_title,m.title)),lower($3))>0 ORDER BY m.id LIMIT $4", media_titles::SELECT, media_titles::BROWSE))
-        .bind(user.id).bind(query.after).bind(query.search).bind(query.limit.unwrap_or(100).clamp(1,200)).fetch_all(&app.db).await?;
-    Ok(responses::ok_json(Value::Array(
-        rows.iter().map(media_titles::media).collect(),
-    )))
+    Ok(responses::ok_json(
+        catalog::media_reads::list(&app.db, user.id, query).await?,
+    ))
 }
 pub async fn playback(
     State(app): State<App>,
@@ -591,34 +349,19 @@ pub(crate) async fn prepare_playback(
     private_library::authorize_media(app, u.id, media, "play", Some(body.room_id)).await?;
     let row=sqlx::query("SELECT m.source_id,m.resource,m.duration_ms,m.metadata,m.s3_object_identity,m.source_version,s.kind,s.config_encrypted,s.access_policy_revision FROM media_items m JOIN sources s ON s.id=m.source_id WHERE m.id=$1 AND m.available").bind(media).fetch_optional(&app.db).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "media_not_found"))?;
     let storage_kind: String = row.get("kind");
-    if body.finite_hls_version.is_some() && storage_kind != "http" {
-        return Err(err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "finite_hls_source_unsupported",
-        ));
-    }
-    let kind = if storage_kind == "s3" {
-        "http".to_owned()
-    } else {
-        storage_kind.clone()
-    };
-    if body.local_hls_ladder.is_some() && (kind != "local" || !cfg!(target_os = "linux")) {
-        return Err(err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "local_hls_ladder_source_required",
-        ));
-    }
-    if body.advanced_playback.is_some()
-        && (!matches!(kind.as_str(), "local" | "http" | "agent") || !cfg!(target_os = "linux"))
-    {
-        return Err(err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "advanced_local_source_required",
-        ));
-    }
-    if body.candidate_report.is_some() && !matches!(kind.as_str(), "local" | "agent" | "http") {
-        return Err(err(StatusCode::CONFLICT, "stale_capability_report"));
-    }
+    let source_route = playback::selection::source_route(
+        playback::facts::SourceFacts {
+            storage_kind: &storage_kind,
+            linux: cfg!(target_os = "linux"),
+        },
+        playback::selection::SourceIntent {
+            finite_hls: body.finite_hls_version.is_some(),
+            ladder: body.local_hls_ladder.is_some(),
+            advanced: body.advanced_playback.is_some(),
+            candidate_report: body.candidate_report.is_some(),
+        },
+    )?;
+    let kind = source_route.kind().to_owned();
     let config: SourceConfig =
         serde_json::from_value(app.decrypt(&row.get::<String, _>("config_encrypted"))?)
             .map_err(anyhow::Error::from)?;
@@ -759,7 +502,7 @@ pub(crate) async fn prepare_playback(
     } else {
         row.get("duration_ms")
     };
-    let mut position_ms = protocol::bounded_position(body.position_ms, duration);
+    let position_ms = protocol::bounded_position(body.position_ms, duration);
     let mut transport = "progressive";
     let requested_mode = body.mode.as_deref().unwrap_or("auto");
     let mut mode = requested_mode;
@@ -993,7 +736,6 @@ pub(crate) async fn prepare_playback(
     }
     let id = reservation.session;
     let t = token();
-    let mut timeline = 0.0;
     let direct_transport_only = kind == "http"
         && requested_mode == "direct"
         && http_file.is_none()
@@ -1303,166 +1045,60 @@ pub(crate) async fn prepare_playback(
         }
         validation?;
     }
-    let streams = meta["streams"].as_array();
-    let audio_tracks = streams
-        .map(|rows| {
-            rows.iter()
-                .filter(|s| s["codec_type"] == "audio")
-                .filter_map(|s| {
-                    Some(protocol::MediaTrack {
-                        index: playback_plan::stream_index(s)?,
-                        label: s["tags"]["title"].as_str().unwrap_or("Audio").into(),
-                        language: s["tags"]["language"].as_str().unwrap_or("und").into(),
-                        url: None,
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if let Some(index) = body.audio_index
-        && audio_tracks.iter().filter(|t| t.index == index).count() != 1
-    {
-        return Err(err(StatusCode::BAD_REQUEST, "invalid_audio_track"));
-    }
-    let mut subtitle_tracks = streams
-        .map(|rows| {
-            rows.iter()
-                .filter(|s| {
-                    s["codec_type"] == "subtitle"
-                        && matches!(
-                            s["codec_name"].as_str(),
-                            Some("subrip" | "webvtt" | "mov_text")
-                        )
-                })
-                .filter_map(|s| {
-                    let index = playback_plan::stream_index(s)?;
-                    Some(protocol::MediaTrack {
-                        index,
-                        label: s["tags"]["title"].as_str().unwrap_or("Subtitle").into(),
-                        language: s["tags"]["language"].as_str().unwrap_or("und").into(),
-                        url: Some(format!(
-                            "/media-delivery/{id}/subtitle-{index}.vtt?token={t}"
-                        )),
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if let Some(files) = meta["sidecars"].as_object() {
-        for (index, path) in files {
-            if let Ok(index) = index.parse::<u32>() {
-                subtitle_tracks.push(protocol::MediaTrack {
-                    index,
-                    label: path.as_str().unwrap_or("Subtitle").into(),
-                    language: "und".into(),
-                    url: Some(format!(
-                        "/media-delivery/{id}/subtitle-{index}.vtt?token={t}"
-                    )),
-                })
-            }
-        }
+    let playback::projection::TrackInventory {
+        audio_tracks,
+        mut subtitle_tracks,
+    } = playback::projection::tracks(&meta, body.audio_index)?;
+    for track in &mut subtitle_tracks {
+        track.url = Some(format!(
+            "/media-delivery/{id}/subtitle-{}.vtt?token={t}",
+            track.index
+        ));
     }
     resource["subtitle_files"] = meta["sidecars"].clone();
     resource["subtitle_indices"] =
         json!(subtitle_tracks.iter().map(|t| t.index).collect::<Vec<_>>());
-    // A progressive file exposes the original/default track to the browser.
-    // Honor an explicit track selection through the local HLS mapping path.
-    if body.audio_index.is_some()
-        && mode == "direct"
-        && matches!(kind.as_str(), "local" | "http" | "agent")
-    {
-        mode =
-            media_core::compatible_mode(&meta, true).map_err(playback_capabilities::probe_error)?;
-    }
-    if let Some(selection) = &selected {
-        mode = &selection.candidate.delivery_mode;
-        transport = &selection.candidate.transport;
-        if let Some(version) = &selection.source_version {
-            resource["source_version"] = json!(version);
-        }
-    } else if upstream_profile.is_some() {
-        mode = "transcode";
-        transport = "hls";
-    } else if let Some(caps) = &body.capabilities {
-        let (selected_mode, selected_transport) =
-            caps.negotiate(mode, transport).ok_or_else(|| {
-                err(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "device_has_no_compatible_playback_transport",
-                )
-            })?;
-        if selected_mode != mode && matches!(kind.as_str(), "jellyfin" | "emby") {
-            return Err(err(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "upstream_device_profile_required",
-            ));
-        }
-        mode = selected_mode;
-        transport = selected_transport;
-    }
-    position_ms = protocol::bounded_position(position_ms, duration);
-    let local_job = matches!(kind.as_str(), "local" | "http" | "agent") && mode != "direct";
-    if reservation.static_hls.is_some() && (local_job || body.audio_index.is_some()) {
-        return Err(err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "static_hls_native_transport_unavailable",
-        ));
-    }
-    let ladder_recipe = if body.local_hls_ladder.is_some() {
-        local_hls_ladder::require_local(&kind, local_fact_version.as_deref())?;
-        if !local_job || mode != "transcode" || selected.is_none() {
-            return Err(err(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "local_hls_ladder_source_unsupported",
-            ));
-        }
-        Some(if let Some(request) = &body.advanced_playback {
-            local_hls_ladder::recipe_with_advanced(&meta, body.audio_index, position_ms, request)?
-        } else {
-            local_hls_ladder::recipe(&meta, body.audio_index, position_ms)?
-        })
-    } else {
-        None
+    let intent = playback::route::Intent {
+        requested_mode,
+        requested_position_ms: body.position_ms,
+        audio_index: body.audio_index,
+        capabilities: body.capabilities.as_ref(),
+        advanced_playback: body.advanced_playback.as_ref(),
+        local_hls_ladder: body.local_hls_ladder.as_ref(),
+        static_hls: reservation.static_hls.is_some(),
     };
+    let route = playback::route::select(
+        playback::route::RouteFacts {
+            source: source_route,
+            metadata: &meta,
+            current_metadata,
+            probed,
+            local_fact_version: local_fact_version.as_deref(),
+            source_version: source_version.as_deref(),
+            selected: selected.as_ref(),
+            upstream_profile: upstream_profile.is_some(),
+            mode,
+            transport,
+            position_ms,
+            duration_ms: duration,
+        },
+        intent,
+    )?;
+    mode = &route.delivery().mode;
+    transport = &route.delivery().transport;
+    let timeline = route.delivery().timeline_origin_ms;
+    let local_job = route.generated();
+    let ladder_recipe = route.ladder_recipe();
+    if let Some(version) = selected.as_ref().and_then(|s| s.source_version.as_ref()) {
+        resource["source_version"] = json!(version);
+    }
     if ladder_recipe.is_some() {
         resource["local_hls_ladder_version"] = json!(1);
         if body.advanced_playback.is_some() {
             resource["advanced_hls_ladder_version"] = json!(1);
         }
-    } else if let Some(request) = &body.advanced_playback {
-        advanced_playback::require_local(
-            &kind,
-            local_fact_version.as_deref().or(source_version.as_deref()),
-        )?;
-        advanced_playback::analyze(&meta, body.audio_index, position_ms, request)?;
-        if !local_job || mode != "transcode" || selected.is_none() {
-            return Err(err(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "unsupported_video_or_hdr",
-            ));
-        }
-    } else {
-        playback_plan::require_legacy_job_mapping(
-            &kind,
-            local_job,
-            &meta,
-            body.audio_index,
-            current_metadata && probed && (kind != "local" || local_fact_version.is_some()),
-        )?;
     }
     if local_job {
-        if selected.is_none()
-            && mode == "remux"
-            && (position_ms > 0.0 || media_core::hls_needs_video_transform(&meta))
-        {
-            mode = "transcode";
-        }
-        // A concrete remux was probed as stream-copy, so it must not silently
-        // become the nonzero exact-decode recipe in hls_args. No measured
-        // keyframe origin exists for that route; request a new compatible plan.
-        timeline = playback_plan::local_timeline_origin(position_ms, mode)
-            .ok_or_else(|| err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported_timeline"))?;
-        transport = "hls";
         resource["job_id"] = json!(id);
         if body.advanced_playback.is_some() && body.local_hls_ladder.is_none() {
             resource["advanced_owned_session_id"] = json!(id);
@@ -1473,96 +1109,35 @@ pub(crate) async fn prepare_playback(
     resource["timeline_origin_ms"] = json!(timeline);
     resource["plan_facts_version"] = json!(1);
     let hls_supported = body.capabilities.as_ref().is_none_or(|c| c.supports_hls());
-    let decoder_fallback_modes = if selected.is_some()
-        || upstream_profile.is_some()
-        || body.advanced_playback.is_some()
-        || body.local_hls_ladder.is_some()
-    {
-        vec![]
-    } else if let Some(info) = &negotiated_info {
-        playback_plan::upstream_fallbacks(info, mode, hls_supported, &config.url)
-    } else if matches!(kind.as_str(), "local" | "http" | "agent") {
-        playback_plan::legacy_mapped_fallbacks(
-            &meta,
-            body.audio_index,
-            mode,
-            position_ms,
-            current_metadata && (kind != "agent" || probed),
-            hls_supported,
-        )
-    } else {
-        playback_plan::local_fallbacks(&meta, mode, position_ms, current_metadata, hls_supported)
-    };
-    let selected_audio_track = if body.advanced_playback.is_some() || ladder_recipe.is_some() {
-        media_core::motion_video::selected_audio_index(&meta, body.audio_index)
-            .map_err(playback_capabilities::probe_error)?
-    } else if matches!(kind.as_str(), "jellyfin" | "emby") {
-        negotiated_info
-            .as_ref()
-            .and_then(|info| playback_plan::upstream_audio(info, body.audio_index, mode))
-    } else {
-        playback_plan::mapped_audio(&meta, body.audio_index, mode, current_metadata)
-    };
-    let subtitle_mode = if body
-        .advanced_playback
-        .as_ref()
-        .is_some_and(|request| request.subtitle_stream_index.is_some())
-    {
-        // Burned pixels cannot be switched off by the browser VTT selector.
+    let playback::projection::PlanFacts {
+        decoder_fallback_modes,
+        selected_audio_track,
+        subtitle_mode,
+        selected_output,
+        selected_candidate_id,
+        decision_reason,
+    } = playback::projection::plan_facts(
+        playback::projection::ProjectionFacts {
+            source: source_route,
+            metadata: &meta,
+            current_metadata,
+            probed,
+            selected: selected.as_ref(),
+            upstream_profile: upstream_profile.is_some(),
+            negotiated_info: negotiated_info.as_ref(),
+            upstream_base: &config.url,
+            has_external_subtitle: subtitle_tracks.iter().any(|track| track.url.is_some()),
+            server_requested_audio_sample_rate_48000: resource["upstream_profile_route_provenance"]
+                ["server_requested_audio_sample_rate"]
+                == 48_000,
+        },
+        intent,
+        &route,
+    )?;
+    if subtitle_mode == protocol::SubtitleDeliveryMode::BurnedIn {
         subtitle_tracks.clear();
         resource["subtitle_indices"] = json!([]);
-        protocol::SubtitleDeliveryMode::BurnedIn
-    } else if subtitle_tracks.iter().any(|track| track.url.is_some()) {
-        protocol::SubtitleDeliveryMode::ExternalVtt
-    } else {
-        protocol::SubtitleDeliveryMode::None
-    };
-    // A master has multiple configurations; a scalar selected_output would
-    // misrepresent the currently decoded ABR rung. Exact recipe facts are separate.
-    let selected_output = if ladder_recipe.is_some() {
-        None
-    } else if let Some(request) = &body.advanced_playback {
-        selected
-            .as_ref()
-            .map(|selection| {
-                playback_capabilities::selected_advanced_output(
-                    selection,
-                    &meta,
-                    body.audio_index,
-                    body.position_ms,
-                    request,
-                )
-            })
-            .transpose()?
-    } else if kind == "agent" {
-        selected
-            .as_ref()
-            .map(|selection| {
-                playback_capabilities::selected_agent_output(
-                    selection,
-                    &meta,
-                    body.audio_index,
-                    body.position_ms,
-                    current_metadata && probed,
-                )
-            })
-            .transpose()?
-            .flatten()
-    } else if current_metadata && matches!(kind.as_str(), "local" | "http") {
-        selected
-            .as_ref()
-            .map(|selection| {
-                playback_capabilities::selected_output(
-                    selection,
-                    &meta,
-                    body.audio_index,
-                    body.position_ms,
-                )
-            })
-            .transpose()?
-    } else {
-        None
-    };
+    }
     if let Some(facts) = &selected_output {
         resource["selected_output"] = serde_json::to_value(facts).map_err(anyhow::Error::from)?;
     }
@@ -1610,29 +1185,8 @@ pub(crate) async fn prepare_playback(
         playback_metrics_version: None,
         playback_metrics: None,
         observation_seq: body.observation_version.map(|_| 0),
-        decision_reason: Some(if ladder_recipe.is_some() {
-            "local_hls_ladder_constrained_recipe".into()
-        } else if body.advanced_playback.is_some() {
-            "advanced_local_constrained_recipe".into()
-        } else if resource["upstream_profile_route_provenance"]["server_requested_audio_sample_rate"]
-            == 48_000
-        {
-            "emby_server_requested_audio_sample_rate_48000".into()
-        } else {
-            playback_plan::decision_reason(
-                &kind,
-                requested_mode,
-                mode,
-                current_metadata,
-                probed,
-                selected.as_ref().map(|s| s.candidate.id.as_str()),
-            )
-        }),
-        selected_candidate_id: if ladder_recipe.is_some() {
-            None
-        } else {
-            selected.as_ref().map(|s| s.candidate.id.clone())
-        },
+        decision_reason: Some(decision_reason),
+        selected_candidate_id,
         selected_output,
         subtitle_mode: Some(subtitle_mode),
         seekable_media_ranges_ms: None,

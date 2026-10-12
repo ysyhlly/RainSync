@@ -84,14 +84,14 @@ test("password verification callers retain their distinct worker-failure mapping
     "PasswordHash::new",
     "verify_password",
   ]);
-  const retirement = source("account_exit");
+  const retirement = source("identity/account_exit");
   inOrder(retirement, [
     "let expected = stored.clone()",
     "password_verification_worker(",
     ".await",
     ".unwrap_or(false)",
     'StatusCode::UNAUTHORIZED, "invalid_credentials"',
-    "let mut tx = app.db.begin()",
+    "let mut tx = db.begin()",
     'current.get::<String, _>("password_hash") != expected',
   ]);
 });
@@ -183,26 +183,41 @@ test("presence conversion preserves checked acquisition and publish timing", () 
 
 test("permission updates discard epochs and commit authority before notification; kick remains separate", () => {
   const permissions = source("room_permissions");
+  const operations = source("room_permission_operations");
   assert.equal(
     (
-      permissions.match(
-        /finish_permissions_change\(&app, tx, authority, room, target\)/g,
+      operations.match(
+        /finish_permissions_change\(tx, authority, room, target\)/g,
       ) ?? []
     ).length,
     2,
   );
-  const finish = section(
-    permissions,
-    "async fn finish_permissions_change(",
-    "pub async fn kick(",
-  );
+  const finish = operations.slice(operations.indexOf("async fn finish_permissions_change("));
+  assert.ok(finish.startsWith("async fn finish_permissions_change("));
   inOrder(finish, [
     "DELETE FROM control_epochs",
     "authority.commit(tx).await?",
+  ]);
+  for (const [name, end] of [
+    ["set_permissions", "pub async fn revoke_permissions("],
+    ["revoke_permissions", "pub async fn kick("],
+  ]) {
+    const adapter = section(permissions, `pub async fn ${name}(`, end);
+    inOrder(adapter, [
+      `super::permission_operations::${name}(`,
+      ".await?;",
+      "broadcast_timeline(",
+      '"ROOM_PERMISSIONS_CHANGED"',
+    ]);
+  }
+  const kick = source("room_kick_operations");
+  assert.ok(kick.includes("commit_controller(tx, h).await?"));
+  assert.ok(!kick.includes("finish_permissions_change("));
+  const kickAdapter = permissions.slice(permissions.indexOf("pub async fn kick("));
+  inOrder(kickAdapter, [
+    "super::kick_operations::kick(",
+    ".await?;",
     "broadcast_timeline(",
     '"ROOM_PERMISSIONS_CHANGED"',
   ]);
-  const kick = permissions.slice(permissions.indexOf("pub async fn kick("));
-  assert.ok(kick.includes("commit_controller(tx, &h).await?"));
-  assert.ok(!kick.includes("finish_permissions_change("));
 });

@@ -1,3 +1,4 @@
+import { playbackTestContext } from "../../../../../tests/helpers/playback-context";
 import { afterEach, expect, it, vi } from "vitest";
 import { effectScope, ref } from "vue";
 import { createPlaybackRuntime } from "./playback-runtime";
@@ -175,28 +176,22 @@ function setup(
     playback_rate: 1,
   });
   const connected = ref(true),
-    active = ref(true),
-    error = ref("");
+active = ref(true);
   const clock = { ready: true, revision: 1, now: () => 10000 };
   const scope = effectScope();
   const runtime = scope.run(() =>
-    createPlaybackRuntime({
-      session: session as any,
-      state: state as any,
-      connected,
-      active,
-      clock: clock as any,
-      error,
-      staticHlsFallback: options.optIn !== false,
-      run: async (action) => {
-        try {
-          await action();
-        } catch (e) {
-          error.value = String(e);
-        }
-      },
-    }),
+    createPlaybackRuntime(
+      playbackTestContext({
+        session: session as any,
+        state: state as any,
+        connected,
+        active,
+        clock: clock as any,
+        staticHlsFallback: options.optIn !== false,
+      }),
+    ),
   )!;
+  const error = runtime.playbackError;
   const element: any = Object.assign(new EventTarget(), {
     canPlayType: (type: string) =>
       type.includes("mpegurl") && options.native === false ? "" : "probably",

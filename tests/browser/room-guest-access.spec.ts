@@ -27,7 +27,9 @@ test("room guest permission requires explicit save and explains global gate and 
   await expect(dialog).toContainText("实例的游客模式尚未开启");
   await expect(dialog).toContainText("重新开启不会恢复旧会话");
   await toggle.check();
-  await dialog.getByRole("button", { name: "关闭弹窗", exact: true }).click();
+  await dialog
+    .getByRole("button", { name: "关闭游客访问", exact: true })
+    .click();
   await expect(page.locator("dialog[open]")).toHaveCount(1);
   expect(writes).toEqual([]);
   await page.getByRole("button", { name: "游客访问", exact: true }).click();
@@ -91,7 +93,9 @@ test("room guest read failure cannot save and pending writes lock the rendered c
   await expect(dialog.getByRole("alert")).toContainText("游客设置暂时无法读取");
   await expect(toggle).toBeDisabled();
   await expect(save).toBeDisabled();
-  await dialog.getByRole("button", { name: "关闭弹窗", exact: true }).click();
+  await dialog
+    .getByRole("button", { name: "关闭游客访问", exact: true })
+    .click();
   await expect(page.locator("dialog[open]")).toHaveCount(1);
   failRead = false;
   await page.getByRole("button", { name: "游客访问", exact: true }).click();

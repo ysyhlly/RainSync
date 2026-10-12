@@ -107,7 +107,9 @@ test("disabled private library feature has no creation control", async ({
 }) => {
   const f = await fixture(page, false);
   await page.goto("/libraries");
-  await expect(page.getByText(/私人库创建与分享未开启/)).toBeVisible();
+  await expect(
+    page.getByText("私人媒体库功能尚未开启，请联系管理员。", { exact: true }),
+  ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "创建", exact: true }),
   ).toHaveCount(0);

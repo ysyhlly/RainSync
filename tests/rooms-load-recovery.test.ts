@@ -15,6 +15,7 @@ async function page() {
     useRouter: () => ({ push: vi.fn() }),
     useSession: () => ({ user: { id: "owner" } }),
     useRoomRuntime: () => ({ room: null, enter: vi.fn() }),
+    useMediaCatalog: () => ({ roomRecord: () => undefined }),
     roomsApi: () => ({ list }),
     createRoomSubmission: () => vi.fn(),
     useAction,
@@ -66,7 +67,7 @@ it("keeps the latest list failure independent from a newer invitation validation
   p.controls.pasted.value = "invalid JSON";
   p.controls.parse();
   const validation = p.controls.error.value;
-  expect(validation).toContain("请粘贴完整房间邀请JSON");
+  expect(validation).toContain("完整房间邀请链接或邀请内容");
   p.list.mockRejectedValue(new Error("重试加载失败"));
   await p.controls.reload();
   expect(p.controls.loadError.value).toBe("重试加载失败");

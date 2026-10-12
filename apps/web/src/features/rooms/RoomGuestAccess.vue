@@ -71,6 +71,8 @@ async function save() {
   <AppDialog
     v-model="open"
     title="游客访问"
+    drawer
+    close-label="关闭游客访问"
     :busy="busy"
     @update:model-value="
       (value) => {
@@ -78,10 +80,8 @@ async function save() {
       }
     "
   >
-    <p>
-      游客必须持有此房间的有效观看邀请，每次会话最多 2
-      小时。游客可观看当前影片和聊天，无法控制播放、管理房间或浏览媒体库。
-    </p>
+    <p>游客凭有效观看邀请进入，每次最多 2 小时，可观看和聊天。</p>
+    <p v-if="!loaded" role="status">正在读取游客设置…</p>
     <p v-if="loaded && !globalEnabled" class="helper">
       实例的游客模式尚未开启。房主可以保存房间设置，管理员开启实例开关后才会生效。
     </p>

@@ -9,6 +9,7 @@
 //! Errors and Debug implementations omit URLs and headers.
 
 mod course_http;
+mod cover_http;
 mod live_http;
 mod oauth_http;
 mod other_live_http;

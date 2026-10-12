@@ -122,39 +122,15 @@ pub async fn is_guest(app: &App, user: Uuid) -> Result<bool> {
         .await?)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Access {
-    enabled: bool,
-}
+pub use rooms::guest_access_operations::Access;
 
 pub async fn access(
     State(app): State<App>,
     h: HeaderMap,
     Path(room): Path<Uuid>,
 ) -> Result<Response> {
-    let user = auth(&app, &h, false).await?;
-    let owner: Option<Uuid> = sqlx::query_scalar("SELECT owner_id FROM rooms WHERE id=$1")
-        .bind(room)
-        .fetch_optional(&app.db)
-        .await?;
-    if owner.is_none() {
-        return Err(err(StatusCode::NOT_FOUND, "not_found"));
-    }
-    if !user.admin && owner != Some(user.id) {
-        return Err(err(StatusCode::FORBIDDEN, "forbidden"));
-    }
-    let enabled: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM room_guest_access WHERE room_id=$1 AND enabled)",
-    )
-    .bind(room)
-    .fetch_one(&app.db)
-    .await?;
-    let global:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM admin_settings WHERE singleton AND COALESCE(guests_enabled,false))").fetch_one(&app.db).await?;
-    Ok(responses::private_json(
-        StatusCode::OK,
-        json!({"enabled":enabled,"guests_enabled":global,"session_ttl_seconds":7200,"invite_required":true}),
-    ))
+    let value = rooms::guest_access_operations::access(app.identity_context(), &h, room).await?;
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 
 pub async fn set_access(
@@ -163,15 +139,9 @@ pub async fn set_access(
     Path(room): Path<Uuid>,
     Json(body): Json<Access>,
 ) -> Result<Response> {
-    let (mut tx, authority, actor) =
-        rooms::permissions_runtime::owner_authority(&app, &h, room).await?;
-    sqlx::query("INSERT INTO room_guest_access(room_id,enabled,updated_by) VALUES($1,$2,$3) ON CONFLICT(room_id) DO UPDATE SET enabled=EXCLUDED.enabled,updated_by=EXCLUDED.updated_by,updated_at=clock_timestamp()")
-        .bind(room).bind(body.enabled).bind(actor).execute(&mut *tx).await?;
-    authority.commit(tx).await?;
-    Ok(responses::private_json(
-        StatusCode::OK,
-        json!({"enabled":body.enabled}),
-    ))
+    let value =
+        rooms::guest_access_operations::set_access(app.identity_context(), &h, room, body).await?;
+    Ok(responses::private_json(StatusCode::OK, value))
 }
 
 /// Room-owned cleanup is bounded and can be retried after a lease/lock failure.

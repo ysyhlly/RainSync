@@ -1,0 +1,40 @@
+09fa8e74a2f0b5c7551a97dd10c1816e9b11db2b test: bind full compute retention sweep to owned PostgreSQL and files
+f69c7bf49326a0c0c61ee4188efdbd457ff805e8 refactor: isolate the complete compute retention sweep behind a narrow context
+415c14ae0f9e03accbf7da48d78357e862e081e5 fix: retain private upgrade verification output and exit evidence
+6e0d89be61b0e99d50176c024c62761994c1e7b2 refactor: remove migrated room-command compatibility entrypoints
+2f5a0d8a2771baf8f1e42d713acc8bbddbf294ba test(compute): baseline manifest validation in owned PostgreSQL
+c2be0ef6d0da6213365441df48d7cb88f5a043a0 refactor(compute): isolate complete manifest and file validation
+884ea81ba22960deaf1817bd891bfb75a9956046 refactor(plugins): call the scoped request identity boundary
+a5cfe85cece9ee33fc033a32f13af4eb341af791 test(worker): baseline owned settlement retries and SQL outcomes
+451fe3ab6853050d46f5d8c1a31508f5a19f0773 test(worker): capture settlement diagnostic events without changing state
+f508653ad5d9b6860903aa4a1d60e725250048c1 feat(worker): observe settlement call retries and blocking ages
+d094ba5c290cce95bee5b08c54eff0b38bc3f4f4 test(nas): retain exact initial delivery authorization observations
+15bbdf1c29d6fd1b07a7f6b243ecac00ab299d09 test(nas): bind real transfer admission and disposal baseline
+6026b31a077a4f90da713406fea63f05c64fc8fd test(p2p): preserve scoped native baseline and payload failure
+85174624704e1118e400875f8c280e697df705c2 refactor(nas): isolate complete transfer admission with existing owners
+9a3fa5eea90320df1aa7f8c84dd5306f8bbeb137 refactor(server): use scoped identity for administrator settings requests
+ae80909da50855e2b231cf1afe91d8c3499d2729 refactor(web): require owner snapshots for error presentation and dismissal
+a929bbc6b88dd877e4d158ba4b938d7ccc2e68b9 test(nas): baseline complete multi-page index sessions
+3ac4dd03a36519b59286aa96136f200f5cfb493e refactor(nas): isolate complete connected session lifetime
+7e08694bf65b9b9791ab9e3302aefb8c762df860 test(nas): retain initial admission and owned cleanup evidence
+1586c9549d78e3f7d04e69fa2cbf284c221fd52f refactor(cluster): isolate complete route peer and startup lifetimes
+66be6870dc14da794708d801ac28cff93e87d91e refactor(server): assemble complete application through explicit dependencies
+1abbd24dfc7fa6f2579e8119494e87c5e5832cda fix(p2p): recheck post-lock authority and serialize signal quotas
+a26cd5b0981d4079a92f594a1b5c0af19c130b1f refactor(p2p): own complete peer requests through borrowed identity context
+e0e74a80650c76c377e9e1b050d1edda8ef55ccf ci: require five additional native operation contracts
+644c4e3bff36e90b78e2653394494008a0587b86 test: capture complete compute claim database contracts
+3f070d99d3e6c1dddf6e88cbe2b0a5d363401375 refactor: isolate complete compute placement operation
+98cedbed0987ed167535071533c92259700d28d9 ci: require compute placement database contracts
+a70448c803f54e1059260cc48e03843c7aae2c8f refactor: retire source settings identity adapters
+89682d1e19267159adf1e7a71793a54936bbf6f5 feat(observability): diagnose native delivery acknowledgement waits
+e67730767b33ad4b20dbd27d7b28e2e99d58f0e5 refactor(catalog): own title admission and narrow media reads
+3a18184e596bbc0d6201d4e89bd7ad4eaba24cb3 refactor(identity): own profile operations and shared projection
+1fad32f86591706bd1d3e67578a16ad17cfe4f4a refactor(identity): own complete account retirement operation
+ba8f85b3a4f7780b2126b3567ba52a06e8ff5a75 refactor(identity): own administrator registration invites
+d2a9879e54c32a520f4240025977986b4955208d refactor(catalog): own committed source revision retirement
+1beb39c3a4c7d44056ebacf3abf0832f431f46ea test(compute): characterize retention partial failure recovery
+49762ae1e710a1ba7cb5a3b7dfec3e9db615b57a refactor(rooms): own complete invitation operations
+9027571afc5fbf9a624128d807549f49507dfadd refactor(compute): own complete attempt execution operations
+387551065afc0179439bfa709a7031b7d0cbbc47 refactor(rooms): own complete permission operations
+a0806af6ca4cb03792fd2cb2587552429e5b1e70 refactor(rooms): own complete ownership operations
+990cf8a75b65c102279539fbce683c52196f4c67 test(metrics): verify native ACK timeout and sparse retry recovery

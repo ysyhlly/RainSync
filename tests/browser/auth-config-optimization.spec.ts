@@ -13,7 +13,20 @@ test("authentication links preserve the original path, query and hash", async ({
   expect(new URL(page.url()).searchParams.get("redirect")).toBe(target);
   await page.getByRole("link", { name: "使用邀请码注册" }).click();
   expect(new URL(page.url()).searchParams.get("redirect")).toBe(target);
-  await page.getByRole("link", { name: "返回登录" }).click();
+  const backToLogin = page.getByRole("link", { name: "返回登录", exact: true });
+  await expect(backToLogin).toBeVisible();
+  // Both controls must have their own hit area, especially on narrow screens.
+  const backBounds = await backToLogin.boundingBox();
+  const themeBounds = await page.getByRole("combobox", { name: "界面主题", exact: true }).boundingBox();
+  expect(backBounds).not.toBeNull();
+  expect(themeBounds).not.toBeNull();
+  expect(
+    backBounds!.x + backBounds!.width <= themeBounds!.x ||
+      themeBounds!.x + themeBounds!.width <= backBounds!.x ||
+      backBounds!.y + backBounds!.height <= themeBounds!.y ||
+      themeBounds!.y + themeBounds!.height <= backBounds!.y,
+  ).toBe(true);
+  await backToLogin.click();
   expect(new URL(page.url()).searchParams.get("redirect")).toBe(target);
   await page.getByLabel("登录账号", { exact: true }).fill("owner");
   await page.getByLabel("密码", { exact: true }).fill("synthetic-password");

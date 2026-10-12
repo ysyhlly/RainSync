@@ -7,41 +7,14 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { performance } from "node:perf_hooks";
 
-// Required local fixture configuration; no machine-specific defaults.
-const runtime = (() => {
-  const required = (name, pattern, description) => {
-    const value = process.env[name];
-    assert.ok(
-      typeof value === "string" && value.length <= 4096 &&
-        !/[\x00-\x1f\x7f]/.test(value) && pattern.test(value),
-      `Set ${name} to ${description}`,
-    );
-    return value;
-  };
-  const absolutePath = (name) => required(
-    name,
-    /^(?:\/[^\x00-\x1f\x7f:]+|[A-Za-z]:[\\/][^\x00-\x1f\x7f:]+)$/,
-    "an absolute local fixture path without control characters",
-  );
-  const imageReference = (name) => required(
-    name,
-    /^(?:sha256:[0-9a-f]{64}|(?=.{1,255}$)(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[0-9]+)?\/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(?:@sha256:[0-9a-f]{64})?)$/,
-    "a valid local Docker image reference",
-  );
-  return Object.freeze({
-    image: imageReference("RAINSYNC_NATIVE_TEST_IMAGE"),
-    registry: absolutePath("RAINSYNC_OWNER_TEST_REGISTRY"),
-    cargoConfig: absolutePath("RAINSYNC_OWNER_TEST_CARGO_CONFIG"),
-    postgresImage: imageReference("RAINSYNC_SQL_POSTGRES_IMAGE"),
-  });
-})();
-// End required fixture configuration.
+import { staticHlsPrerequisites } from "../scripts/check-static-hls-prerequisites.mjs";
+let runtime;
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const runId = randomUUID();
 const database = `rainsync_pending_${runId.replaceAll("-", "")}`;
-const evidence = join(root, ".runtime", "0044-pending-native", runId);
-const target = join(root, ".runtime", "0044-pending-native-target");
+const evidence = join(process.env.RAINSYNC_ARTIFACT_DIR ?? join(root, ".runtime"), "static-hls-pending-native", runId);
+const target = join(process.env.RAINSYNC_RUNTIME_ROOT ?? join(root, ".runtime"), "static-hls-pending-native-target", runId);
 mkdirSync(evidence, { recursive: true });
 mkdirSync(target, { recursive: true });
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -177,6 +150,8 @@ async function retire(id, kind, { requireSuccess = true } = {}) {
   }
 }
 try {
+  runtime = await staticHlsPrerequisites({ postgres: true });
+  report.prerequisites = runtime.summary;
   report.sourceCommit = (
     await command("git", ["rev-parse", "HEAD"])
   ).stdout.trim();
@@ -199,6 +174,8 @@ try {
           [
             "Cargo.toml",
             "Cargo.lock",
+            "scripts/check-static-hls-prerequisites.mjs",
+            "scripts/native-owner-binding.mjs",
             "tests/static-hls-pending-native.mjs",
             "tests/sql/static_hls_pending_custody.sql",
           ].includes(path),
@@ -209,16 +186,7 @@ try {
     path,
     sha256: hash(readFileSync(join(root, path))),
   }));
-  const image = JSON.parse(
-    (
-      await command("docker", [
-        "image",
-        "inspect",
-        runtime.image,
-      ])
-    ).stdout,
-  )[0];
-  assert.equal(image.Os, "linux");
+  const image = { Id: runtime.imageId };
   report.nativeImageId = image.Id;
   const registry = runtime.registry;
   const config = runtime.cargoConfig;
@@ -268,16 +236,7 @@ try {
   report.binary = { path: binary, sha256: hash(readFileSync(binary)) };
   copyFileSync(binary, join(evidence, "verify_static_hls_pending"));
   report.binary.frozenPath = join(evidence, "verify_static_hls_pending");
-  const pgImage = JSON.parse(
-    (
-      await command("docker", [
-        "image",
-        "inspect",
-        runtime.postgresImage,
-      ])
-    ).stdout,
-  )[0];
-  assert.equal(pgImage.Config.StopSignal, "SIGINT");
+  const pgImage = { Id: runtime.postgresImageId };
   report.postgresImageId = pgImage.Id;
   postgres = await create([
     "--name",
@@ -317,6 +276,7 @@ try {
   }
   assert.ok(ready, "final TCP PG never became ready");
   report.postgresVersion = (await sql("SHOW server_version;")).stdout.trim();
+  assert.match(report.postgresVersion, /^17(?:\.|$)/, "The actual PostgreSQL server must be version 17");
   for (const { path } of report.inputs.filter(({ path }) =>
     /^migrations\//.test(path),
   ))
@@ -383,7 +343,7 @@ try {
   report.passed = true;
 } catch (error) {
   report.passed = false;
-  report.error = error.stack;
+  report.error = "static_hls_gate_failed";
   console.error(error.message);
   process.exitCode = 1;
 } finally {

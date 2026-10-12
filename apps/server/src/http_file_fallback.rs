@@ -937,6 +937,8 @@ mod tests {
         App {
             control_cluster: None,
             platform_http: providers::platform::http::PlatformHttp::new(),
+            bilibili_signing_keys: Arc::new(Default::default()),
+            native_delivery_owners: Arc::new(Default::default()),
             live_playback: crate::native_live::LiveStore::default(),
             other_live_playback: crate::native_other_live::LiveStore::default(),
             other_live_enabled: false,

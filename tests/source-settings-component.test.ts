@@ -478,6 +478,187 @@ it("keeps failed saves editable and retains their draft", async () => {
   p.unmount();
 });
 
+it("reads the current revision before retrying an unconfirmed write", async () => {
+  const value = fixture();
+  let failed = false;
+  const api = vi.fn(async (_path: string, method = "GET") => {
+    if (method !== "PATCH") return value;
+    if (!failed) {
+      failed = true;
+      throw Error("连接暂时不可用");
+    }
+    return saved(value, { name: "重试名称" });
+  });
+  const p = panel(value, api),
+    c = p.controls;
+  await ready(p);
+  c.draft.value.name = "重试名称";
+  await c.save();
+  await c.save();
+  expect(api.mock.calls.map(([, method]) => method ?? "GET")).toEqual([
+    "GET",
+    "PATCH",
+    "GET",
+    "PATCH",
+  ]);
+  expect(
+    mutationCalls(api).map(([, , body]: any[]) => body.expected_revision),
+  ).toEqual(["7", "7"]);
+  expect(p.onSaved).toHaveBeenCalledTimes(1);
+  p.unmount();
+});
+
+it("reconciles a previously committed failure without replaying against the new revision", async () => {
+  const value = fixture("emby");
+  const committed = saved(value, { name: "已提交名称" });
+  let reads = 0,
+    writes = 0;
+  let finishRead!: (value: SourceSettings) => void;
+  const reread = new Promise<SourceSettings>((resolve) => {
+    finishRead = resolve;
+  });
+  const api = vi.fn(async (_path: string, method = "GET") => {
+    if (method !== "PATCH") return ++reads === 1 ? value : reread;
+    if (++writes === 1) throw Error("保存回执丢失");
+    return saved(committed, { revision: "9", name: "更新中的名称" });
+  });
+  const p = panel(value, api),
+    c = p.controls;
+  await ready(p);
+  c.draft.value.name = "已提交名称";
+  c.draft.value.tokenMode = "replace";
+  c.draft.value.token = "submitted-secret";
+  await c.save();
+  const retry = c.save();
+  c.draft.value.name = "更新中的名称";
+  c.draft.value.token = "newer-secret";
+  finishRead(committed);
+  await retry;
+  expect(mutationCalls(api)).toHaveLength(1);
+  expect(c.detail.value.revision).toBe("8");
+  expect(c.baseline.value.name).toBe("已提交名称");
+  expect(c.draft.value.name).toBe("更新中的名称");
+  expect(c.draft.value.token).toBe("newer-secret");
+  expect(c.message.value).toContain("请核对后再保存");
+  expect(p.onSaved).not.toHaveBeenCalled();
+  await c.save();
+  expect(mutationCalls(api)[1][2]).toEqual({
+    expected_revision: "8",
+    name: "更新中的名称",
+    config: { token: "newer-secret" },
+  });
+  expect(p.onSaved).toHaveBeenCalledTimes(1);
+  p.unmount();
+});
+
+it("does not replay after a failed or malformed revision refresh", async () => {
+  const value = fixture();
+  let reads = 0;
+  const api = vi.fn(async (_path: string, method = "GET") => {
+    if (method === "PATCH") throw Error("保存回执丢失");
+    if (++reads === 1) return value;
+    if (reads === 2) throw Error("读取失败");
+    return { ...value, id: "wrong-source" };
+  });
+  const p = panel(value, api),
+    c = p.controls;
+  await ready(p);
+  c.draft.value.name = "保留修改";
+  await c.save();
+  await c.save();
+  expect(c.error.value).toBe("读取失败");
+  await c.save();
+  expect(c.error.value).toContain("响应不完整");
+  expect(mutationCalls(api)).toHaveLength(1);
+  expect(c.detail.value.revision).toBe("7");
+  expect(c.draft.value.name).toBe("保留修改");
+  expect(c.refreshBeforeSave.value).toBe(true);
+  p.unmount();
+});
+
+it("ignores an old retry read after identity changes", async () => {
+  const value = fixture("emby");
+  let reads = 0;
+  let finishRead!: (value: SourceSettings) => void;
+  const reread = new Promise<SourceSettings>((resolve) => {
+    finishRead = resolve;
+  });
+  const api = vi.fn(async (_path: string, method = "GET") => {
+    if (method === "PATCH") throw Error("保存回执丢失");
+    return ++reads === 1 ? value : reread;
+  });
+  const p = panel(value, api),
+    c = p.controls;
+  await ready(p);
+  c.draft.value.tokenMode = "replace";
+  c.draft.value.token = "unsaved-secret";
+  await c.save();
+  const retry = c.save();
+  p.session.clear();
+  finishRead(saved(value));
+  await retry;
+  expect(mutationCalls(api)).toHaveLength(1);
+  expect(c.open.value).toBe(false);
+  expect(c.detail.value).toBeUndefined();
+  expect(c.draft.value.token).toBe("");
+  expect(p.onSaved).not.toHaveBeenCalled();
+  p.unmount();
+});
+
+it("keeps a reconciled clean draft open without inventing a save receipt", async () => {
+  const value = fixture();
+  const committed = saved(value, { name: "已保存名称" });
+  let reads = 0;
+  const api = vi.fn(async (_path: string, method = "GET") => {
+    if (method === "PATCH") throw Error("保存回执丢失");
+    return ++reads === 1 ? value : committed;
+  });
+  const p = panel(value, api),
+    c = p.controls;
+  await ready(p);
+  c.draft.value.name = committed.name;
+  await c.save();
+  await c.save();
+  expect(c.detail.value.revision).toBe("8");
+  expect(c.dirty.value).toBe(false);
+  expect(c.open.value).toBe(true);
+  expect(p.onSaved).not.toHaveBeenCalled();
+  await c.save();
+  expect(mutationCalls(api)).toHaveLength(1);
+  p.unmount();
+});
+
+it("ignores an old retry read after a different source is selected", async () => {
+  const first = fixture();
+  const second = { ...fixture(), id: "source-two", name: "第二片源" };
+  let reads = 0;
+  let finishRead!: (value: SourceSettings) => void;
+  const reread = new Promise<SourceSettings>((resolve) => {
+    finishRead = resolve;
+  });
+  const api = vi.fn(async (path: string, method = "GET") => {
+    if (method === "PATCH") throw Error("保存回执丢失");
+    if (path.endsWith("source-two")) return second;
+    return ++reads === 1 ? first : reread;
+  });
+  const p = panel(first, api),
+    c = p.controls;
+  await ready(p);
+  c.draft.value.name = "第一片源修改";
+  await c.save();
+  const retry = c.save();
+  p.setProps({ source: second });
+  await nextTick();
+  await ready(p);
+  finishRead(saved(first));
+  await retry;
+  expect(mutationCalls(api)).toHaveLength(1);
+  expect(c.detail.value.id).toBe(second.id);
+  expect(c.draft.value.name).toBe(second.name);
+  expect(p.onSaved).not.toHaveBeenCalled();
+  p.unmount();
+});
+
 it("preserves conflicting edits and requires explicit discard before reloading", async () => {
   const value = fixture();
   const api = vi.fn(async (_path: string, method = "GET") => {

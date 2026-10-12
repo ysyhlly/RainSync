@@ -11,11 +11,11 @@ await mkdir(root, { recursive: true });
 const db = isolatedPostgres({ root, name: 'compute-retention' });
 const report = { result: 'running', checks: [] };
 try {
-  const source = await readFile('apps/server/src/distributed_compute.rs', 'utf8');
+  const source = await readFile('apps/server/src/distributed_compute/retention.rs', 'utf8');
   const queries = [...source.matchAll(/sqlx::query\(\s*"(DELETE FROM (?:distributed_compute_attempts|distributed_compute_jobs|room_p2p_signals)[^"]+)"/g)].map(match => match[1]);
   const find = table => { const matches = queries.filter(sql => sql.startsWith(`DELETE FROM ${table} `)); assert.equal(matches.length, 1); return matches[0]; };
   const attempts = find('distributed_compute_attempts'), jobs = find('distributed_compute_jobs'), signals = find('room_p2p_signals');
-  assert.ok(source.indexOf(signals) < source.indexOf('tokio::fs::read_dir(&root)'), 'signaling cleanup precedes filesystem failures');
+  assert.ok(source.indexOf(signals) < source.indexOf('tokio::fs::read_dir(root)'), 'signaling cleanup precedes filesystem failures');
   await db.start();
   // The binding FK deliberately uses the production NO ACTION deletion mode.
   db.sql(`CREATE TABLE distributed_compute_jobs(id integer PRIMARY KEY, expires_at timestamptz NOT NULL);

@@ -1,3 +1,4 @@
+import { playbackTestContext } from "./helpers/playback-context";
 vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
   const { default: Hls } = await import("hls.js");
   return {
@@ -7,7 +8,7 @@ vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
   };
 });
 import { afterEach, expect, it, vi } from "vitest";
-import { effectScope, ref } from "vue";
+import { effectScope, ref, watch } from "vue";
 import { createPlaybackRuntime } from "../apps/web/src/features/playback/playback-runtime";
 import { RequestFailure } from "../apps/web/src/errors";
 import { PLAYBACK_METRICS_MAX_ELAPSED_MS } from "../apps/web/src/features/playback/playback-metrics";
@@ -20,8 +21,107 @@ const faults = vi.hoisted(() => ({
   construct: false,
   observe: false,
   dispose: false,
+  onObserve: undefined as (() => void) | undefined,
 }));
 const meterStarts = vi.hoisted(() => [] as number[]);
+// Passthrough probes observe real owner operations without replacing their
+// algorithms. They are inactive outside the automatic VOD caller traces.
+const vodTrace = vi.hoisted(() => ({
+  visit: undefined as ((event: string, deadline?: unknown) => void) | undefined,
+  recovery: undefined as (() => void) | undefined,
+  synchronization: undefined as any,
+  generated: undefined as any,
+}));
+vi.mock(
+  "../apps/web/src/features/playback/playback-synchronization",
+  async (original) => {
+    const actual = await original<any>();
+    return {
+      ...actual,
+      createPlaybackSynchronization: (...args: any[]) => {
+        const owner = actual.createPlaybackSynchronization(...args);
+        vodTrace.synchronization = owner;
+        for (const key of ["pendingUserSeek", "pendingForce"]) {
+          const getter = Object.getOwnPropertyDescriptor(owner, key)!.get!;
+          Object.defineProperty(owner, key, {
+            configurable: true,
+            get() {
+              vodTrace.visit?.(key);
+              return getter.call(owner);
+            },
+          });
+        }
+        return owner;
+      },
+    };
+  },
+);
+vi.mock(
+  "../apps/web/src/features/playback/vod-tick-policy",
+  async (original) => {
+    const actual = await original<any>();
+    return {
+      ...actual,
+      createVodTickPolicy: (ctx: any) => {
+        vodTrace.generated = ctx;
+        return actual.createVodTickPolicy(ctx);
+      },
+    };
+  },
+);
+vi.mock(
+  "../apps/web/src/features/playback/media-data-deadline",
+  async (original) => {
+    const actual = await original<any>();
+    return {
+      ...actual,
+      createMediaDataDeadline: (...args: any[]) => {
+        const deadline = actual.createMediaDataDeadline(...args);
+        for (const key of ["sync", "stop"]) {
+          const method = deadline[key];
+          deadline[key] = () => {
+            vodTrace.visit?.(`data ${key}`, deadline);
+            return method();
+          };
+        }
+        return deadline;
+      },
+    };
+  },
+);
+vi.mock(
+  "../apps/web/src/features/playback/first-frame-deadline",
+  async (original) => {
+    const actual = await original<any>();
+    return {
+      ...actual,
+      createFirstFrameDeadline: (...args: any[]) => {
+        const deadline = actual.createFirstFrameDeadline(...args);
+        for (const key of ["sync", "stop"]) {
+          const method = deadline[key];
+          deadline[key] = () => {
+            vodTrace.visit?.(`frame ${key}`, deadline);
+            return method();
+          };
+        }
+        return deadline;
+      },
+    };
+  },
+);
+vi.mock(
+  "../apps/web/src/features/playback/playback-recovery-state",
+  async (original) => {
+    const actual = await original<any>();
+    return {
+      ...actual,
+      evaluatePlaybackRecovery: (...args: any[]) => {
+        vodTrace.recovery?.();
+        return actual.evaluatePlaybackRecovery(...args);
+      },
+    };
+  },
+);
 const hls = vi.hoisted(() => ({
   supported: false,
   start: vi.fn(),
@@ -63,6 +163,7 @@ vi.mock(
           dispose = meter.dispose;
         meter.observe = (...input: any[]) => {
           if (faults.observe) throw new Error("telemetry observe");
+          faults.onObserve?.();
           return observe(...input);
         };
         meter.dispose = (...input: any[]) => {
@@ -76,7 +177,10 @@ vi.mock(
 );
 afterEach(() => {
   faults.construct = faults.observe = faults.dispose = false;
+  faults.onObserve = undefined;
   meterStarts.length = 0;
+  vodTrace.visit = vodTrace.recovery = undefined;
+  vodTrace.synchronization = vodTrace.generated = undefined;
   hls.supported = false;
   hls.start.mockClear();
   hls.load.mockReset();
@@ -99,10 +203,8 @@ function setup(
     ranges?: [number, number][];
     rebuild?: boolean;
     observationSeq?: number;
-    clearsError?: boolean;
     hls?: boolean;
     fileFallback?: boolean;
-    captureErrors?: boolean;
     candidateId?: string;
     deferAttach?: boolean;
   } = {},
@@ -183,32 +285,23 @@ function setup(
   );
   const session = { user: { id: "user" }, epoch: 1, api };
   const connected = ref(true),
-    error = ref(""),
     active = ref(true);
   const clock = { ready: true, revision: 0, time: 0, now: () => clock.time };
   const checkClock = vi.fn();
   const scope = effectScope();
   const runtime = scope.run(() =>
-    createPlaybackRuntime({
-      session: session as any,
-      state: state as any,
-      connected,
-      active,
-      clock: clock as any,
-      checkClock,
-      error,
-      run: async (action) => {
-        if (options.clearsError) error.value = "";
-        try {
-          await action();
-        } catch (failure) {
-          if (!options.captureErrors) throw failure;
-          error.value =
-            failure instanceof Error ? failure.message : String(failure);
-        }
-      },
-    }),
+    createPlaybackRuntime(
+      playbackTestContext({
+        session: session as any,
+        state: state as any,
+        connected,
+        active,
+        clock: clock as any,
+        checkClock,
+      }),
+    ),
   )!;
+  const error = runtime.playbackError;
   const ranges = intervals(options.ranges ?? [[0, 120]]);
   const el: any = Object.assign(new EventTarget(), {
     src: "",
@@ -1423,7 +1516,6 @@ it.each(["NOT_FOUND", "METHOD_NOT_ALLOWED"] as const)(
     const s = setup({
       fileFallback: true,
       observationSeq: 0,
-      captureErrors: true,
     });
     const original = s.api.getMockImplementation()!;
     s.api.mockImplementation(async (path, method, body) => {
@@ -1557,7 +1649,6 @@ it("an identity replacement cannot resume a deferred old file continuation", asy
   const s = setup({
     fileFallback: true,
     observationSeq: 0,
-    captureErrors: true,
   });
   try {
     await s.prepare();
@@ -1587,7 +1678,6 @@ it("a newer media intent cancels a claimed file continuation and ignores its lat
   const s = setup({
     fileFallback: true,
     observationSeq: 0,
-    captureErrors: true,
   });
   let release!: () => void;
   const held = new Promise<void>((resolve) => {
@@ -2273,7 +2363,6 @@ it("telemetry failures cannot block apply, Stop session deletion or key cancella
 it("rate rejection and renewed support preserve unrelated visible errors", async () => {
   const s = setup({
     rate: 1.5,
-    clearsError: true,
     acceptRate: (rate, actual) => (rate === 1 ? 1 : actual),
   });
   try {
@@ -2615,3 +2704,2262 @@ it("clearing the current media closes the old session without requiring clock ca
     s.cleanup();
   }
 });
+
+it("clock recalibration keeps one pending play across automatic and gesture entry points", async () => {
+  const s = setup();
+  try {
+    await s.prepare();
+    s.state.value.playback_status = "playing";
+    let reject!: (reason: Error) => void;
+    s.el.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, fail) => {
+          reject = fail;
+        }),
+    );
+    const playing = s.runtime.applyState();
+    s.invalidate();
+    s.clock.ready = true;
+    s.runtime.onClockReady();
+    await s.runtime.enablePlayback();
+    expect(s.el.play).toHaveBeenCalledTimes(1);
+    reject(new DOMException("retired clock result", "NotAllowedError"));
+    await playing;
+    expect(s.runtime.blocked.value).toBe(false);
+    await s.runtime.enablePlayback();
+    expect(s.el.play).toHaveBeenCalledTimes(2);
+    expect(s.el.paused).toBe(false);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("a later PAUSE still wins when the old play settles during clock recalibration", async () => {
+  const s = setup();
+  try {
+    await s.prepare();
+    s.state.value.playback_status = "playing";
+    let resolve!: () => void;
+    s.el.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((done) => {
+          resolve = () => {
+            s.el.paused = false;
+            done();
+          };
+        }),
+    );
+    const playing = s.runtime.applyState();
+    s.state.value.playback_status = "paused";
+    s.invalidate();
+    s.el.pause.mockClear();
+    resolve();
+    await playing;
+    expect(s.el.pause).toHaveBeenCalledOnce();
+    expect(s.el.paused).toBe(true);
+    expect(s.runtime.blocked.value).toBe(false);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it.each(["blocked", "waiting"] as const)(
+  "VOD correction reads %s changes from the same tick's synchronous rate event",
+  async (field) => {
+    let rateEvent: (() => void) | undefined;
+    const s = setup({
+      acceptRate: (requested) => {
+        rateEvent?.();
+        return requested;
+      },
+    });
+    try {
+      await s.prepare();
+      s.playing();
+      s.state.value.anchor_position_ms = 10400;
+      s.state.value.playback_rate = 1.25;
+      rateEvent = () => {
+        s.runtime[field].value = true;
+      };
+      s.writes.mockClear();
+      s.seeks.mockClear();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(s.runtime[field].value).toBe(true);
+      expect(s.el.playbackRate).toBe(1.25);
+      expect(s.writes.mock.calls).toEqual([[1.25]]);
+      expect(s.seeks).not.toHaveBeenCalled();
+      expect(s.el.play).not.toHaveBeenCalled();
+      expect(s.runtime.video.value).toBe(s.el);
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(s.error.value).toBe("");
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it("local audio operations preserve playback status and use the owner's current element", async () => {
+  const s = setup({ deferAttach: true });
+  try {
+    s.runtime.setLocalVolume(0.25);
+    s.runtime.setLocalMuted(true);
+    expect(s.el.volume).toBeUndefined();
+    expect(s.el.muted).toBeUndefined();
+    s.runtime.attach(s.el);
+    await s.prepare();
+    s.error.value = "keep this playback notice";
+    s.runtime.playbackBusy.value = true;
+    s.connected.value = false;
+    s.active.value = false;
+    s.runtime.setLocalVolume(0.35);
+    s.runtime.setLocalMuted(true);
+    expect(s.el.volume).toBe(0.35);
+    expect(s.el.muted).toBe(true);
+    expect(s.error.value).toBe("keep this playback notice");
+    expect(s.runtime.playbackBusy.value).toBe(true);
+    expect(s.runtime.video.value).toBe(s.el);
+    expect(playbackPosts(s)).toHaveLength(1);
+    expect(s.el.play).not.toHaveBeenCalled();
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("a retired correction must not publish rate rejection into its replacement", async () => {
+  let replace: (() => void) | undefined;
+  const s = setup({
+    acceptRate: (requested, actual) => {
+      if (replace && requested === 1.5) {
+        const action = replace;
+        replace = undefined;
+        action();
+        return actual;
+      }
+      return requested;
+    },
+  });
+  let replacement: Promise<unknown> | undefined;
+  try {
+    await s.prepare();
+    s.playing();
+    s.state.value.playback_rate = 1.5;
+    replace = () => {
+      replacement = s.runtime.runPlayback(s.runtime.loadMedia);
+    };
+    // Synchronous advance observes the original rate effect before the newer
+    // request can settle, preserving the exact owner transition under test.
+    vi.advanceTimersByTime(500);
+    const observed = {
+      notice: s.error.value,
+      phase: s.runtime.preparation.value.phase,
+      generation: s.runtime.preparation.value.generation,
+      session: s.runtime.sessionId.value,
+      busy: s.runtime.playbackBusy.value,
+      rate: s.el.playbackRate,
+    };
+    await replacement;
+    expect(observed.generation).toBe(2);
+    expect(observed.phase).toBe("preparing");
+    expect(observed.notice).toBe("");
+  } finally {
+    s.cleanup();
+  }
+});
+
+it.each(["identity", "media", "room"])(
+  "a rate setter retired by %s replacement cannot publish its rejection or seek",
+  async (replacement) => {
+    let retire: (() => void) | undefined;
+    const s = setup({
+      acceptRate: (requested, actual) => {
+        if (retire && requested === 1.5) {
+          const action = retire;
+          retire = undefined;
+          action();
+          return actual;
+        }
+        return requested;
+      },
+    });
+    try {
+      await s.prepare();
+      s.playing();
+      s.state.value.playback_rate = 1.5;
+      s.state.value.anchor_position_ms = 50000;
+      retire = () => {
+        if (replacement === "identity") ++s.session.epoch;
+        else if (replacement === "media") ++s.state.value.media_generation;
+        else s.state.value.room_id = "replacement-room";
+      };
+      s.seeks.mockClear();
+      vi.advanceTimersByTime(500);
+      expect(s.error.value).toBe("");
+      expect(s.seeks).not.toHaveBeenCalled();
+      expect(s.el.play).not.toHaveBeenCalled();
+      expect(s.runtime.video.value).toBe(s.el);
+      expect(playbackPosts(s)).toHaveLength(1);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it("staged settings during a current rate setter preserve readback and correction", async () => {
+  let stage: (() => void) | undefined;
+  const s = setup({
+    acceptRate: (requested) => {
+      stage?.();
+      stage = undefined;
+      return requested;
+    },
+  });
+  try {
+    await s.prepare();
+    s.playing();
+    s.state.value.playback_rate = 1.5;
+    s.state.value.anchor_position_ms = 10400;
+    stage = () => {
+      s.runtime.mode.value = "transcode";
+    };
+    s.writes.mockClear();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(s.runtime.mode.value).toBe("transcode");
+    expect(s.el.playbackRate).toBeGreaterThan(1.5);
+    expect(s.writes.mock.calls[0]).toEqual([1.5]);
+    expect(s.error.value).toBe("");
+    expect(playbackPosts(s)).toHaveLength(1);
+    expect(s.runtime.video.value).toBe(s.el);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it("a retired hard-seek restoration stops before seeking the successor element", async () => {
+  let reload: (() => void) | undefined;
+  const s = setup({
+    rate: 1.5,
+    acceptRate: (requested) => {
+      if (reload && requested === 1.5) {
+        const action = reload;
+        reload = undefined;
+        action();
+      }
+      return requested;
+    },
+  });
+  let replacement: Promise<unknown> | undefined;
+  try {
+    await s.prepare();
+    s.playing();
+    s.state.value.anchor_position_ms = 10500;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(s.el.playbackRate).toBeGreaterThan(1.5);
+    s.state.value.anchor_position_ms = 50000;
+    reload = () => {
+      replacement = s.runtime.runPlayback(s.runtime.loadMedia);
+    };
+    s.seeks.mockClear();
+    vi.advanceTimersByTime(500);
+    expect(s.runtime.preparation.value).toMatchObject({
+      phase: "preparing",
+      generation: 2,
+    });
+    expect(s.seeks).not.toHaveBeenCalled();
+    expect(s.error.value).toBe("");
+    expect(s.runtime.video.value).toBe(s.el);
+    await replacement;
+  } finally {
+    s.cleanup();
+  }
+});
+
+it.each(["hidden", "disconnected"])(
+  "restores the base while %s after a current fine correction",
+  async (condition) => {
+    const s = setup({ rate: 1.5 });
+    try {
+      await s.prepare();
+      s.playing();
+      s.state.value.anchor_position_ms = 10500;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(s.el.playbackRate).toBeGreaterThan(1.5);
+      if (condition === "hidden") s.document.visibilityState = "hidden";
+      else s.connected.value = false;
+      s.writes.mockClear();
+      s.seeks.mockClear();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(s.el.playbackRate).toBe(1.5);
+      expect(s.writes.mock.calls).toEqual([[1.5]]);
+      expect(s.seeks).not.toHaveBeenCalled();
+      expect(s.error.value).toBe("");
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(s.runtime.video.value).toBe(s.el);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it.each(["native reload", "native to MSE", "MSE reload"] as const)(
+  "%s keeps the same rate rejection proof on the permanent element",
+  async (path) => {
+    const s = setup({
+      hls: true,
+      acceptRate: (requested, actual) => (requested === 1 ? 1 : actual),
+    });
+    try {
+      hls.supported = path !== "native reload";
+      if (path === "MSE reload") s.el.canPlayType = () => "";
+      await s.prepare();
+      s.playing();
+      s.state.value.anchor_position_ms = 10400;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(s.writes).toHaveBeenCalledOnce();
+      expect(s.el.playbackRate).toBe(1);
+      if (path === "MSE reload") {
+        hls.errorHandler?.(undefined, {
+          fatal: true,
+          response: { code: 409 },
+        });
+      } else {
+        s.el.error = { code: path === "native to MSE" ? 3 : 2 };
+        s.el.onerror();
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      s.runtime.waiting.value = false;
+      s.playing();
+      s.el.currentTime = 10;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(s.writes).toHaveBeenCalledOnce();
+      expect(s.el.playbackRate).toBe(1);
+      expect(s.runtime.sessionId.value).toBe("session-1");
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(s.runtime.video.value).toBe(s.el);
+      expect(s.error.value).toBe("");
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it("gesture port characterization: play lookup follows blocked and metrics callbacks in the original call turn", async () => {
+  const s = setup();
+  const effects: string[] = [];
+  let release!: () => void;
+  const played = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const original = vi.fn(() => Promise.resolve());
+  const replacement = vi.fn(function (this: unknown) {
+    expect(this).toBe(s.el);
+    effects.push("play call");
+    s.el.paused = false;
+    return played;
+  });
+  let selected = original;
+  let stop: (() => void) | undefined;
+  try {
+    await s.prepare();
+    s.state.value.playback_status = "playing";
+    s.runtime.blocked.value = true;
+    Object.defineProperty(s.el, "play", {
+      configurable: true,
+      get: () => {
+        effects.push("play lookup");
+        return selected;
+      },
+    });
+    stop = watch(
+      s.runtime.blocked,
+      (blocked) => {
+        if (!blocked) effects.push("blocked cleared");
+      },
+      { flush: "sync" },
+    );
+    let observeOnce = true;
+    faults.onObserve = () => {
+      if (!observeOnce) return;
+      observeOnce = false;
+      expect(s.runtime.blocked.value).toBe(false);
+      effects.push("metrics");
+      selected = replacement;
+    };
+    const gesture = s.runtime.enablePlayback();
+    effects.push("caller returned");
+    expect(effects).toEqual([
+      "blocked cleared",
+      "metrics",
+      "play lookup",
+      "play call",
+      "caller returned",
+    ]);
+    expect(original).not.toHaveBeenCalled();
+    expect(replacement).toHaveBeenCalledOnce();
+    release();
+    await gesture;
+    expect(replacement).toHaveBeenCalledOnce();
+    expect(s.runtime.video.value).toBe(s.el);
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    release();
+    stop?.();
+    faults.onObserve = undefined;
+    s.cleanup();
+  }
+});
+
+for (const source of ["function", "getter"] as const) {
+  it.each(["AbortError", "NotAllowedError", "Error"] as const)(
+    `gesture port characterization: a synchronous ${source} %s preserves classification and exact claim release`,
+    async (name) => {
+      const s = setup();
+      try {
+        await s.prepare();
+        s.state.value.playback_status = "playing";
+        s.runtime.blocked.value = true;
+        const failure =
+          name === "Error"
+            ? new Error("synchronous play failure")
+            : new DOMException("synchronous play failure", name);
+        const called = vi.fn(() => {
+          throw failure;
+        });
+        const lookup = vi.fn(() => {
+          if (source === "getter") throw failure;
+          return called;
+        });
+        Object.defineProperty(s.el, "play", {
+          configurable: true,
+          get: lookup,
+        });
+        const gesture = s.runtime.enablePlayback();
+        expect(lookup).toHaveBeenCalledOnce();
+        expect(called).toHaveBeenCalledTimes(source === "function" ? 1 : 0);
+        expect(s.runtime.blocked.value).toBe(name === "NotAllowedError");
+        if (name === "AbortError") {
+          await expect(gesture).resolves.toBeUndefined();
+          expect(s.error.value).toBe(playInterrupted);
+        } else await expect(gesture).rejects.toBe(failure);
+        const retry = vi.fn(function (this: unknown) {
+          expect(this).toBe(s.el);
+          s.el.paused = false;
+          return Promise.resolve();
+        });
+        Object.defineProperty(s.el, "play", {
+          configurable: true,
+          value: retry,
+        });
+        await s.runtime.enablePlayback();
+        expect(retry).toHaveBeenCalledOnce();
+        expect(s.runtime.blocked.value).toBe(false);
+        expect(s.error.value).toBe("");
+        expect(playbackPosts(s)).toHaveLength(1);
+      } finally {
+        s.cleanup();
+      }
+    },
+  );
+}
+
+it("gesture port characterization: the original element receives latest PAUSE before stale clock rejection", async () => {
+  const s = setup();
+  let release!: () => void;
+  try {
+    await s.prepare();
+    s.state.value.playback_status = "playing";
+    s.runtime.blocked.value = true;
+    s.el.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = () => {
+            s.el.paused = false;
+            resolve();
+          };
+        }),
+    );
+    const gesture = s.runtime.enablePlayback();
+    expect(s.el.play).toHaveBeenCalledOnce();
+    expect(s.runtime.blocked.value).toBe(false);
+    s.state.value.playback_status = "paused";
+    s.invalidate();
+    s.el.pause.mockClear();
+    release();
+    await gesture;
+    expect(s.el.pause).toHaveBeenCalledOnce();
+    expect(s.el.paused).toBe(true);
+    expect(s.runtime.video.value).toBe(s.el);
+    expect(s.error.value).toBe("");
+    expect(playbackPosts(s)).toHaveLength(1);
+  } finally {
+    release?.();
+    s.cleanup();
+  }
+});
+
+it("gesture port characterization: an old settlement cannot release a successor's pending claim", async () => {
+  const s = setup();
+  let rejectOld!: (failure: Error) => void, releaseCurrent!: () => void;
+  try {
+    await s.prepare();
+    s.state.value.playback_status = "playing";
+    s.el.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectOld = reject;
+        }),
+    );
+    s.el.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseCurrent = () => {
+            s.el.paused = false;
+            resolve();
+          };
+        }),
+    );
+    const oldGesture = s.runtime.enablePlayback();
+    await s.runtime.loadMedia();
+    const currentGesture = s.runtime.enablePlayback();
+    expect(s.el.play).toHaveBeenCalledTimes(2);
+    expect(s.runtime.sessionId.value).toBe("session-2");
+    s.el.pause.mockClear();
+    rejectOld(new DOMException("old gesture denied", "NotAllowedError"));
+    await oldGesture;
+    expect(s.el.pause).not.toHaveBeenCalled();
+    expect(s.runtime.blocked.value).toBe(false);
+    expect(s.error.value).toBe("");
+    await s.runtime.enablePlayback();
+    expect(s.el.play).toHaveBeenCalledTimes(2);
+    releaseCurrent();
+    await currentGesture;
+    expect(s.runtime.video.value).toBe(s.el);
+    expect(playbackPosts(s)).toHaveLength(2);
+  } finally {
+    releaseCurrent?.();
+    s.cleanup();
+  }
+});
+
+async function captureVodPlan(s: ReturnType<typeof setup>) {
+  let plan: any;
+  const original = s.api.getMockImplementation()!;
+  s.api.mockImplementation(async (path, method, body) => {
+    const result = await original(path, method, body);
+    if (isPlaybackPost(path) && method === "POST") plan = result;
+    return result;
+  });
+  await s.prepare();
+  return plan;
+}
+
+it("automatic VOD characterization: missing metadata never reads the selected timeline, profile or ranges", async () => {
+  const s = setup();
+  try {
+    const plan = await captureVodPlan(s);
+    const reads: string[] = [];
+    for (const field of [
+      "timeline_origin_ms",
+      "rebuild_on_seek",
+      "upstream_profile",
+    ]) {
+      const value = plan[field];
+      Object.defineProperty(plan, field, {
+        configurable: true,
+        get: () => {
+          reads.push(field);
+          return value;
+        },
+      });
+    }
+    const ranges = s.el.seekable;
+    Object.defineProperty(s.el, "seekable", {
+      configurable: true,
+      get: () => {
+        reads.push("ranges");
+        return ranges;
+      },
+    });
+    s.el.readyState = 0;
+    vodTrace.visit = (event) => reads.push(event);
+    const applying = s.runtime.applyState(true, true);
+    const beforeReturn = [...reads];
+    vodTrace.visit = undefined;
+    await applying;
+    expect(beforeReturn).toEqual([]);
+    expect(s.seeks).not.toHaveBeenCalled();
+    expect(s.el.play).not.toHaveBeenCalled();
+  } finally {
+    s.cleanup();
+  }
+});
+
+it.each([
+  [false, false],
+  [false, true],
+  [true, false],
+  [true, true],
+])(
+  "automatic VOD characterization: force %s and user seek %s retain pending-flag short circuits",
+  async (force, userSeek) => {
+    const s = setup();
+    try {
+      await s.prepare();
+      const effects: string[] = [];
+      vodTrace.visit = (event) => {
+        if (event.startsWith("pending")) effects.push(event);
+      };
+      const applying = s.runtime.applyState(force, userSeek);
+      const beforeReturn = [...effects];
+      vodTrace.visit = undefined;
+      await applying;
+      expect(beforeReturn).toEqual([
+        ...(!userSeek ? ["pendingUserSeek"] : []),
+        ...(!force ? ["pendingForce"] : []),
+      ]);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it.each([false, true])(
+  "automatic VOD characterization: user-seek abort observes cleared facts and %s reset changes later deadline reads",
+  async (resetDuringAbort) => {
+    const s = setup({ rebuild: true, ranges: [[0, 10]] });
+    let waiting: Promise<void> | undefined;
+    let release: ((value: unknown) => void) | undefined;
+    try {
+      await s.prepare();
+      s.state.value.anchor_position_ms = 15000;
+      const effects: string[] = [];
+      const original = s.api.getMockImplementation()!;
+      (s.api as any).mockImplementation(
+        (
+          path: string,
+          method?: string,
+          body?: unknown,
+          signal?: AbortSignal,
+        ) => {
+          if (method !== "GET") return original(path, method, body);
+          signal!.addEventListener(
+            "abort",
+            () => {
+              const facts = vodTrace.generated;
+              effects.push(
+                `abort:${facts.generationPending}:${facts.generationFailed}:${facts.generatedEnd}:${facts.recovering}`,
+              );
+              if (resetDuringAbort) {
+                effects.push("reset started");
+                void s.runtime.reset();
+                effects.push("reset returned");
+              }
+            },
+            { once: true },
+          );
+          return new Promise((resolve) => {
+            release = resolve;
+          });
+        },
+      );
+      waiting = s.runtime.applyState(true);
+      expect(vodTrace.generated.generationPending).toBe(true);
+      s.state.value.anchor_position_ms = 10000;
+      vodTrace.visit = (event) => {
+        if (event.startsWith("data ") || event.startsWith("frame "))
+          effects.push(event);
+      };
+      const seeking = s.runtime.applyState(true, true);
+      const beforeReturn = [...effects];
+      vodTrace.visit = undefined;
+      await seeking;
+      expect(beforeReturn).toEqual(
+        resetDuringAbort
+          ? [
+              "abort:true:false:undefined:false",
+              "reset started",
+              "data sync",
+              "frame sync",
+              "frame stop",
+              "data stop",
+              "reset returned",
+            ]
+          : ["abort:true:false:undefined:false", "data sync", "frame sync"],
+      );
+      expect(vodTrace.generated.generationPending).toBe(false);
+      release!({
+        session_id: "session-1",
+        plan_generation: 1,
+        status: "ready",
+        complete: true,
+        available_until_ms: 120000,
+      });
+      await waiting;
+      expect(s.runtime.sessionId.value).toBe(
+        resetDuringAbort ? null : "session-1",
+      );
+      expect(s.seeks).not.toHaveBeenCalled();
+    } finally {
+      vodTrace.visit = undefined;
+      release?.({
+        session_id: "session-1",
+        plan_generation: 1,
+        status: "ready",
+        complete: true,
+      });
+      await s.runtime.reset();
+      await waiting?.catch(() => {});
+      s.cleanup();
+    }
+  },
+);
+
+it.each(["fresh", "fallback", "staged fallback"] as const)(
+  "automatic VOD characterization: negative relative %s resolves the request owner at the original call point",
+  async (mode) => {
+    const s = setup({ rebuild: true });
+    try {
+      const plan = await captureVodPlan(s);
+      plan.timeline_origin_ms = 10000;
+      let profileReads = 0;
+      Object.defineProperty(plan, "upstream_profile", {
+        configurable: true,
+        get: () => {
+          ++profileReads;
+          return undefined;
+        },
+      });
+      s.state.value.anchor_position_ms = 5000;
+      if (mode === "staged fallback") s.runtime.mode.value = "remux";
+      await s.runtime.applyState(true, mode === "fresh");
+      expect(profileReads).toBe(1);
+      expect(playbackPosts(s)).toHaveLength(mode === "staged fallback" ? 1 : 2);
+      expect(meterStarts).toHaveLength(mode === "fresh" ? 2 : 1);
+      if (mode !== "staged fallback") {
+        const first = playbackPosts(s)[0][2];
+        const next = playbackPosts(s)[1][2];
+        expect(next.plan_generation).toBe(2);
+        expect(next.idempotency_key).not.toBe(first.idempotency_key);
+        expect(next.playback_metrics.meter_start_generation).toBe(
+          mode === "fresh" ? 2 : 1,
+        );
+        expect(next.playback_metrics.startup_origin).toBe(
+          mode === "fresh" ? "automatic_load" : "user_intent",
+        );
+      }
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it("automatic VOD characterization: nonnegative relative seek does not inspect the upstream profile", async () => {
+  const s = setup({
+    rebuild: true,
+    ranges: [
+      [0, 10],
+      [20, 30],
+    ],
+  });
+  try {
+    const plan = await captureVodPlan(s);
+    const profile = vi.fn(() => {
+      throw new Error("profile must stay lazy");
+    });
+    Object.defineProperty(plan, "upstream_profile", {
+      configurable: true,
+      get: profile,
+    });
+    s.state.value.anchor_position_ms = 15000;
+    await s.runtime.applyState(true, true);
+    expect(profile).not.toHaveBeenCalled();
+    expect(playbackPosts(s)).toHaveLength(2);
+  } finally {
+    s.cleanup();
+  }
+});
+
+it.each([false, true])(
+  "automatic VOD characterization: delayed generated readiness keeps the old SID and %s HLS source after replacement",
+  async (mse) => {
+    hls.supported = mse;
+    const s = setup({ hls: mse, rebuild: true, ranges: [[0, 10]] });
+    let old: Promise<void> | undefined;
+    let release: ((value: unknown) => void) | undefined;
+    try {
+      if (mse) s.el.canPlayType = () => "";
+      await s.prepare();
+      s.state.value.anchor_position_ms = 15000;
+      const original = s.api.getMockImplementation()!;
+      let signal: AbortSignal | undefined;
+      (s.api as any).mockImplementation(
+        (
+          path: string,
+          method?: string,
+          body?: unknown,
+          incoming?: AbortSignal,
+        ) => {
+          if (
+            method === "GET" &&
+            path.startsWith("/playback-sessions/session-1?")
+          ) {
+            expect(path).toContain("/playback-sessions/session-1");
+            expect(
+              new URL(path, "http://localhost").searchParams.get(
+                "plan_generation",
+              ),
+            ).toBe("1");
+            signal = incoming;
+            return new Promise((resolve) => {
+              release = resolve;
+            });
+          }
+          return original(path, method, body);
+        },
+      );
+      old = s.runtime.applyState(true);
+      expect(signal?.aborted).toBe(false);
+      // The replacement receives its own immediate readiness response. The
+      // delayed old operation must retain its original SID and source authority.
+      s.el.seekable = s.el.buffered = intervals([[0, 40]]);
+      await s.runtime.loadMedia();
+      expect(signal?.aborted).toBe(true);
+      const loads = s.el.load.mock.calls.length;
+      const starts = hls.start.mock.calls.length;
+      const source = s.el.src;
+      release!({
+        session_id: "session-1",
+        plan_generation: 1,
+        status: "ready",
+        complete: true,
+        available_until_ms: 120000,
+      });
+      await old;
+      expect(s.runtime.sessionId.value).toBe("session-2");
+      expect(s.el.load).toHaveBeenCalledTimes(loads);
+      expect(hls.start).toHaveBeenCalledTimes(starts);
+      expect(s.el.src).toBe(source);
+      expect(s.runtime.video.value).toBe(s.el);
+    } finally {
+      release?.({
+        session_id: "session-1",
+        plan_generation: 1,
+        status: "ready",
+        complete: true,
+      });
+      await s.runtime.reset();
+      await old?.catch(() => {});
+      s.cleanup();
+    }
+  },
+);
+
+it.each([false, true])(
+  "automatic VOD characterization: %s unusable clock queues runtime reconciliation while empty ranges only queue synchronization",
+  async (unusableClock) => {
+    const s = setup({ ranges: [] });
+    try {
+      await s.prepare();
+      s.state.value.playback_status = "playing";
+      s.state.value.anchor_position_ms = 20000;
+      if (unusableClock) s.clock.ready = false;
+      await s.runtime.applyState(true);
+      const plays = s.el.play.mock.calls.length;
+      s.el.seekable = s.el.buffered = intervals([[0, 40]]);
+      s.clock.ready = true;
+      s.runtime.onClockReady();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(s.seeks.mock.calls).toEqual(unusableClock ? [[20]] : []);
+      expect(s.el.play.mock.calls.length).toBe(
+        unusableClock ? plays + 1 : plays,
+      );
+      if (!unusableClock) {
+        await vi.advanceTimersByTimeAsync(500);
+        expect(s.seeks.mock.calls).toEqual([[20]]);
+      }
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it.each(["target", "unrelated"] as const)(
+  "automatic VOD characterization: available recovery clears only the %s notice at the original point",
+  async (notice) => {
+    const s = setup({
+      ranges: [
+        [0, 10],
+        [20, 30],
+      ],
+    });
+    try {
+      await s.prepare();
+      s.state.value.anchor_position_ms = 15000;
+      const effects: string[] = [];
+      const stop = watch(s.error, (value) => effects.push(`notice:${value}`), {
+        flush: "sync",
+      });
+      const seeking = s.runtime.applyState(true, true);
+      effects.push("caller returned");
+      await seeking;
+      expect(effects).toEqual([
+        "notice:目标进度尚不可定位，请稍后重试或重新加载",
+        "caller returned",
+      ]);
+      if (notice === "unrelated")
+        s.error.value = "independent presentation notice";
+      effects.length = 0;
+      s.el.seekable = s.el.buffered = intervals([[0, 30]]);
+      const applying = s.runtime.applyState(true);
+      effects.push("caller returned");
+      await applying;
+      expect(effects).toEqual(
+        notice === "target"
+          ? ["notice:", "caller returned"]
+          : ["caller returned"],
+      );
+      expect(s.error.value).toBe(
+        notice === "target" ? "" : "independent presentation notice",
+      );
+      expect(s.el.currentTime).toBe(15);
+      stop();
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it.each([false, true])(
+  "automatic VOD characterization: user seek clears %s failed generated facts before syncing deadlines",
+  async (failed) => {
+    const s = setup({ rebuild: true, ranges: [[0, 10]] });
+    try {
+      await s.prepare();
+      s.state.value.anchor_position_ms = 15000;
+      if (failed) {
+        const original = s.api.getMockImplementation()!;
+        s.api.mockImplementation((path, method, body) =>
+          method === "GET"
+            ? Promise.reject(new Error("synthetic generated failure"))
+            : original(path, method, body),
+        );
+        await expect(s.runtime.applyState(true)).rejects.toThrow(
+          "synthetic generated failure",
+        );
+        expect(vodTrace.generated.generationFailed).toBe(true);
+      } else {
+        await s.runtime.applyState(true);
+        expect(vodTrace.generated.generatedEnd).toBe(120);
+        expect(vodTrace.generated.recovering).toBe(true);
+      }
+      s.state.value.anchor_position_ms = 10000;
+      const facts: unknown[] = [];
+      vodTrace.visit = (event) => {
+        if (event === "data sync")
+          facts.push([
+            vodTrace.generated.generationPending,
+            vodTrace.generated.generationFailed,
+            vodTrace.generated.generatedEnd,
+            vodTrace.generated.recovering,
+          ]);
+      };
+      const applying = s.runtime.applyState(true, true);
+      vodTrace.visit = undefined;
+      await applying;
+      expect(facts).toEqual([[false, false, undefined, false]]);
+    } finally {
+      s.cleanup();
+    }
+  },
+);
+
+it("automatic VOD characterization: recovery hole clears recovering before waiting and the synchronous notice", async () => {
+  const s = setup({
+    hls: true,
+    ranges: [
+      [0, 10],
+      [20, 30],
+    ],
+  });
+  try {
+    await s.prepare();
+    s.playing();
+    s.state.value.anchor_position_ms = 15000;
+    s.el.error = { code: 2 };
+    s.el.onerror();
+    expect(vodTrace.generated.recovering).toBe(true);
+    const effects: string[] = [];
+    const stopWaiting = watch(
+      s.runtime.waiting,
+      (value) => {
+        effects.push(
+          `waiting:${value}:recovering:${vodTrace.generated.recovering}`,
+        );
+      },
+      { flush: "sync" },
+    );
+    const stopError = watch(
+      s.error,
+      () => {
+        effects.push(
+          `notice:waiting:${s.runtime.waiting.value}:recovering:${vodTrace.generated.recovering}`,
+        );
+      },
+      { flush: "sync" },
+    );
+    const applying = s.runtime.applyState(true);
+    effects.push("caller returned");
+    await applying;
+    expect(effects).toEqual([
+      "waiting:false:recovering:false",
+      "notice:waiting:false:recovering:false",
+      "caller returned",
+    ]);
+    expect(s.seeks).not.toHaveBeenCalled();
+    stopWaiting();
+    stopError();
+  } finally {
+    s.cleanup();
+  }
+});
+
+// Exact traces from accepted 3dbc580 production. Each event carries the last
+// caller microtask sentinel it followed; ticks retains the final sentinel too.
+// This keeps synchronous watcher effects distinct from applyState's finally.
+const vodSettlementTraces: Record<string, string> = {
+  "fresh resolve":
+    "0:recovery | 0:recovery | 0:caller returned | 10:recovery | 10:recovery | 17:prepare | 30:recovery | 31:caller resolved | ticks:32",
+  "fresh reject":
+    "0:recovery | 0:recovery | 0:caller returned | 10:recovery | 10:recovery | 17:prepare | 26:recovery | 28:recovery | 29:caller rejected | ticks:30",
+  "fresh throw":
+    "0:recovery | 0:recovery | 0:caller returned | 10:recovery | 10:recovery | 17:prepare | 24:recovery | 26:recovery | 27:caller rejected | ticks:28",
+  "fresh deferred resolve":
+    "0:recovery | 0:recovery | 0:caller returned | 10:recovery | 10:recovery | 17:prepare | 18:release | 31:recovery | 32:caller resolved | ticks:33",
+  "fresh deferred reject":
+    "0:recovery | 0:recovery | 0:caller returned | 10:recovery | 10:recovery | 17:prepare | 18:release | 26:recovery | 28:recovery | 29:caller rejected | ticks:30",
+  "fallback resolve":
+    "0:recovery | 0:recovery | 0:caller returned | 10:recovery | 10:recovery | 17:prepare | 31:recovery | 32:caller resolved | ticks:33",
+  "fallback reject":
+    "0:recovery | 0:recovery | 0:caller returned | 10:recovery | 10:recovery | 17:prepare | 26:recovery | 29:recovery | 30:caller rejected | ticks:31",
+  "fallback throw":
+    "0:recovery | 0:recovery | 0:caller returned | 10:recovery | 10:recovery | 17:prepare | 24:recovery | 27:recovery | 28:caller rejected | ticks:29",
+  "fallback deferred resolve":
+    "0:recovery | 0:recovery | 0:caller returned | 10:recovery | 10:recovery | 17:prepare | 18:release | 32:recovery | 33:caller resolved | ticks:34",
+  "fallback deferred reject":
+    "0:recovery | 0:recovery | 0:caller returned | 10:recovery | 10:recovery | 17:prepare | 18:release | 26:recovery | 29:recovery | 30:caller rejected | ticks:31",
+  "generated resolve":
+    "0:recovery | 0:readiness | 0:caller returned | 5:recovery | 6:caller resolved | ticks:7",
+  "generated reject":
+    "0:recovery | 0:readiness | 0:caller returned | 2:recovery | 4:recovery | 5:caller rejected | ticks:6",
+  "generated throw":
+    "0:recovery | 0:readiness | 0:caller returned | 1:recovery | 3:recovery | 4:caller rejected | ticks:5",
+  "generated deferred resolve":
+    "0:recovery | 0:readiness | 0:caller returned | 3:release | 9:recovery | 10:caller resolved | ticks:11",
+  "generated deferred reject":
+    "0:recovery | 0:readiness | 0:caller returned | 3:release | 5:recovery | 7:recovery | 8:caller rejected | ticks:9",
+  "fresh undefined":
+    "0:ranges change admission | 0:recovery | 0:caller returned | 1:recovery | 2:caller resolved | ticks:3",
+  "fresh synchronous throw":
+    "0:caller returned | 0:recovery | 1:caller rejected | ticks:2",
+  "fallback early resolve":
+    "0:caller returned | 1:recovery | 2:caller resolved | ticks:3",
+  "generated early resolve":
+    "0:ranges change admission | 0:caller returned | 1:recovery | 2:caller resolved | ticks:3",
+  "play undefined":
+    "0:play lookup | 0:play | 0:caller returned | 1:recovery | 2:caller resolved | ticks:3",
+  "play resolve":
+    "0:play lookup | 0:play | 0:caller returned | 1:recovery | 2:caller resolved | ticks:3",
+  "play NotAllowedError":
+    "0:play lookup | 0:play | 0:caller returned | 0:recovery | 1:recovery | 2:caller resolved | ticks:3",
+  "play AbortError":
+    "0:play lookup | 0:play | 0:caller returned | 0:recovery | 1:recovery | 2:caller resolved | ticks:3",
+  "play Error":
+    "0:play lookup | 0:play | 0:caller returned | 1:recovery | 2:caller rejected | ticks:3",
+  "play getter AbortError":
+    "0:play lookup | 0:recovery | 0:caller returned | 0:recovery | 1:caller resolved | ticks:2",
+  "play getter Error":
+    "0:play lookup | 0:caller returned | 0:recovery | 1:caller rejected | ticks:2",
+};
+function summarizeVodTrace(effects: string[]) {
+  let tick = 0;
+  const events: string[] = [];
+  for (const event of effects) {
+    if (event.startsWith("microtask ")) tick = Number(event.slice(10));
+    else events.push(`${tick}:${event}`);
+  }
+  events.push(`ticks:${tick}`);
+  return events.join(" | ");
+}
+
+async function traceVodAction(
+  action: () => Promise<void>,
+  effects: string[],
+  release?: () => boolean,
+) {
+  vodTrace.recovery = () => effects.push("recovery");
+  const applying = action();
+  effects.push("caller returned");
+  let settled = false;
+  let failure: unknown;
+  const result = applying.then(
+    () => {
+      effects.push("caller resolved");
+      settled = true;
+    },
+    (error) => {
+      effects.push("caller rejected");
+      failure = error;
+      settled = true;
+    },
+  );
+  let released = false;
+  for (let tick = 1; tick <= 80 && !settled; ++tick) {
+    await Promise.resolve();
+    effects.push(`microtask ${tick}`);
+    if (!released && tick >= 3 && release) released = release();
+  }
+  expect(settled, effects.join(", ")).toBe(true);
+  await result;
+  vodTrace.recovery = undefined;
+  return failure;
+}
+
+for (const path of ["fresh", "fallback", "generated"] as const) {
+  it.each([
+    "resolve",
+    "reject",
+    "throw",
+    "deferred resolve",
+    "deferred reject",
+  ] as const)(
+    `automatic VOD characterization: ${path} %s retains request and recovery settlement timing`,
+    async (mode) => {
+      const s = setup({
+        rebuild: true,
+        ranges: path === "generated" ? [[0, 10]] : [[0, 120]],
+      });
+      const effects: string[] = [];
+      let release: (() => void) | undefined;
+      try {
+        const plan = await captureVodPlan(s);
+        if (path !== "generated") plan.timeline_origin_ms = 10000;
+        s.state.value.anchor_position_ms = path === "generated" ? 15000 : 5000;
+        const original = s.api.getMockImplementation()!;
+        const failure = new RequestFailure({
+          error: {
+            code: "FORBIDDEN",
+            message: "synthetic policy request rejected",
+            retryable: false,
+          },
+        });
+        s.api.mockImplementation((url, method, body) => {
+          const selected =
+            path === "generated"
+              ? method === "GET"
+              : isPlaybackPost(url) && method === "POST";
+          if (!selected) return original(url, method, body);
+          effects.push(path === "generated" ? "readiness" : "prepare");
+          if (mode === "throw") throw failure;
+          if (mode === "reject") return Promise.reject(failure);
+          if (mode.startsWith("deferred"))
+            return new Promise((resolve, reject) => {
+              release = () => {
+                effects.push("release");
+                if (mode === "deferred reject") reject(failure);
+                else resolve(original(url, method, body));
+              };
+            });
+          return original(url, method, body);
+        });
+        const result = await traceVodAction(
+          () => s.runtime.applyState(true, path === "fresh"),
+          effects,
+          mode.startsWith("deferred")
+            ? () => {
+                if (!release) return false;
+                release();
+                return true;
+              }
+            : undefined,
+        );
+        expect(result).toBe(
+          mode.includes("reject") || mode === "throw" ? failure : undefined,
+        );
+        // This exact caller trace is recorded on the accepted production
+        // baseline before the four-await policy is extracted.
+        expect(summarizeVodTrace(effects)).toBe(
+          vodSettlementTraces[`${path} ${mode}`],
+        );
+      } finally {
+        vodTrace.recovery = undefined;
+        release?.();
+        s.cleanup();
+      }
+    },
+  );
+}
+
+it.each([
+  "fresh undefined",
+  "fresh synchronous throw",
+  "fallback early resolve",
+  "generated early resolve",
+] as const)(
+  "automatic VOD characterization: %s preserves the original await boundary",
+  async (mode) => {
+    const s = setup({ rebuild: true, ranges: [[0, 10]] });
+    const effects: string[] = [];
+    try {
+      const plan = await captureVodPlan(s);
+      const fresh = mode.startsWith("fresh");
+      if (mode !== "generated early resolve") plan.timeline_origin_ms = 20000;
+      s.state.value.anchor_position_ms = 15000;
+      if (mode === "fresh synchronous throw") {
+        s.runtime.mode.value = "finite_hls";
+        s.runtime.distributedIntent.value = {} as any;
+      }
+      if (mode === "fallback early resolve") s.runtime.mode.value = "remux";
+      if (mode === "fresh undefined" || mode === "generated early resolve") {
+        const ranges = s.el.seekable;
+        let changed = false;
+        Object.defineProperty(s.el, "seekable", {
+          configurable: true,
+          get: () => {
+            if (!changed) {
+              changed = true;
+              effects.push("ranges change admission");
+              if (mode === "fresh undefined") s.active.value = false;
+              else s.clock.ready = false;
+            }
+            return ranges;
+          },
+        });
+      }
+      const result = await traceVodAction(
+        () => s.runtime.applyState(true, fresh),
+        effects,
+      );
+      if (mode === "fresh synchronous throw")
+        expect(String(result)).toContain("不能同时使用");
+      else expect(result).toBeUndefined();
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(summarizeVodTrace(effects)).toBe(vodSettlementTraces[mode]);
+    } finally {
+      vodTrace.recovery = undefined;
+      s.cleanup();
+    }
+  },
+);
+
+it.each([
+  "undefined",
+  "resolve",
+  "NotAllowedError",
+  "AbortError",
+  "Error",
+  "getter AbortError",
+  "getter Error",
+] as const)(
+  "automatic VOD characterization: play %s preserves lazy lookup, publication and exact-token release",
+  async (mode) => {
+    const s = setup();
+    const effects: string[] = [];
+    try {
+      await s.prepare();
+      s.state.value.playback_status = "playing";
+      const name = mode.replace("getter ", "");
+      const failure = new DOMException("synthetic VOD play failure", name);
+      const play = function (this: unknown) {
+        expect(this).toBe(s.el);
+        effects.push("play");
+        if (mode === "undefined") return undefined;
+        if (mode === "resolve") return Promise.resolve();
+        return Promise.reject(failure);
+      };
+      Object.defineProperty(s.el, "play", {
+        configurable: true,
+        get: () => {
+          effects.push("play lookup");
+          if (mode.startsWith("getter")) throw failure;
+          return play;
+        },
+      });
+      const result = await traceVodAction(
+        () => s.runtime.applyState(),
+        effects,
+      );
+      expect(result).toBe(name === "Error" ? failure : undefined);
+      expect(vodTrace.synchronization.pendingPlay).toBe(false);
+      expect(vodTrace.synchronization.playFailed).toBe(
+        name === "AbortError" || name === "Error",
+      );
+      expect(s.runtime.blocked.value).toBe(mode === "NotAllowedError");
+      expect(s.error.value).toBe(name === "AbortError" ? playInterrupted : "");
+      expect(summarizeVodTrace(effects)).toBe(
+        vodSettlementTraces[`play ${mode}`],
+      );
+    } finally {
+      vodTrace.recovery = undefined;
+      s.cleanup();
+    }
+  },
+);
+
+it("automatic VOD characterization: fallback reads the intent adopted by a reentrant range getter", async () => {
+  const s = setup({ rebuild: true });
+  let replacement: Promise<void> | undefined;
+  try {
+    const plan = await captureVodPlan(s);
+    plan.timeline_origin_ms = 10000;
+    s.state.value.anchor_position_ms = 5000;
+    const ranges = s.el.seekable;
+    let changed = false;
+    Object.defineProperty(s.el, "seekable", {
+      configurable: true,
+      get: () => {
+        if (!changed) {
+          changed = true;
+          s.clock.ready = false;
+          s.runtime.mode.value = "remux";
+          replacement = s.runtime.loadMedia();
+        }
+        return ranges;
+      },
+    });
+    await s.runtime.applyState(true);
+    await replacement;
+    // The actual baseline allows this reentrant old invocation to request a
+    // fallback of the newly adopted intent. This move must not bind the old
+    // intent or claim to introduce stronger pre-await retirement.
+    expect(s.runtime.preparation.value.generation).toBe(3);
+    expect(meterStarts).toHaveLength(2);
+    expect(playbackPosts(s)).toHaveLength(1);
+    s.clock.ready = true;
+    s.runtime.onClockReady();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(playbackPosts(s)).toHaveLength(2);
+    const next = playbackPosts(s)[1][2];
+    expect(next.plan_generation).toBe(3);
+    expect(next.mode).toBe("remux");
+    expect(next.playback_metrics.meter_start_generation).toBe(2);
+    expect(s.runtime.sessionId.value).toBe("session-3");
+  } finally {
+    await replacement;
+    s.cleanup();
+  }
+});
+// Original-runtime generated/source recovery characterization. These calls and
+// observations run against the accepted production source before an owner move.
+function grFacts() {
+  const facts = vodTrace.generated;
+  return [
+    facts.generationPending,
+    facts.generationFailed,
+    facts.generatedEnd ?? null,
+    facts.recovering,
+  ];
+}
+function grRecord(name: string, trace: unknown[]) {
+  expect(trace, name).toEqual(grObservedBaseline[name]);
+}
+function grReady(generation: number, complete = true) {
+  return {
+    session_id: `session-${generation}`,
+    plan_generation: generation,
+    status: "ready",
+    complete,
+    available_until_ms: 120000,
+  };
+}
+function grTraceFacts(trace: unknown[], event: string) {
+  trace.push([event, ...grFacts()]);
+}
+
+it.each([false, true])(
+  "generated source owner baseline: old finally retains a genuinely pending successor (MSE=%s)",
+  async (mse) => {
+    const s = setup({ hls: mse, rebuild: true, ranges: [[0, 10]] });
+    const releases = new Map<string, (value: unknown) => void>();
+    const signals = new Map<string, AbortSignal>();
+    let old: Promise<void> | undefined, successor: Promise<void> | undefined;
+    const trace: unknown[] = [];
+    let hold = "session-1";
+    try {
+      hls.supported = mse;
+      if (mse) s.el.canPlayType = () => "";
+      await s.prepare();
+      const original = s.api.getMockImplementation()!;
+      (s.api as any).mockImplementation(
+        (
+          path: string,
+          method?: string,
+          body?: unknown,
+          signal?: AbortSignal,
+        ) => {
+          if (
+            method === "GET" &&
+            path.startsWith(`/playback-sessions/${hold}?`)
+          ) {
+            const sid = path.split("/")[2].split("?")[0];
+            trace.push([
+              "GET",
+              sid,
+              new URL(path, "http://localhost").searchParams.get(
+                "plan_generation",
+              ),
+            ]);
+            signals.set(sid, signal!);
+            return new Promise((resolve) => releases.set(sid, resolve));
+          }
+          return original(path, method, body);
+        },
+      );
+      s.state.value.anchor_position_ms = 15000;
+      const oldDeadlines = new Map<string, unknown>();
+      vodTrace.visit = (event, deadline) => {
+        if (event === "data sync" || event === "frame sync")
+          oldDeadlines.set(event, deadline);
+      };
+      old = s.runtime.applyState(true);
+      vodTrace.visit = undefined;
+      grTraceFacts(trace, "old pending");
+      hold = "none";
+      s.el.seekable = s.el.buffered = intervals([[0, 120]]);
+      await s.runtime.loadMedia();
+      expect(signals.get("session-1")!.aborted).toBe(true);
+      hold = "session-2";
+      s.el.seekable = s.el.buffered = intervals([[0, 10]]);
+      const successorDeadlines = new Map<string, unknown>();
+      vodTrace.visit = (event, deadline) => {
+        if (event === "data sync" || event === "frame sync")
+          successorDeadlines.set(event, deadline);
+      };
+      successor = s.runtime.applyState(true);
+      vodTrace.visit = undefined;
+      expect(successorDeadlines.size).toBe(2);
+      expect(oldDeadlines.size).toBe(2);
+      for (const [event, deadline] of successorDeadlines)
+        expect(deadline).not.toBe(oldDeadlines.get(event));
+      grTraceFacts(trace, "successor pending");
+      expect(signals.get("session-2")!.aborted).toBe(false);
+      const source = s.el.src,
+        loads = s.el.load.mock.calls.length,
+        starts = hls.start.mock.calls.length;
+      vodTrace.visit = (event, deadline) => {
+        if (event === "data sync" || event === "frame sync") {
+          trace.push([
+            "exact current handle",
+            event,
+            deadline === successorDeadlines.get(event),
+            deadline === oldDeadlines.get(event),
+          ]);
+          expect(deadline).toBe(successorDeadlines.get(event));
+          grTraceFacts(trace, `old finally ${event}`);
+        }
+      };
+      releases.get("session-1")!(grReady(1));
+      await old;
+      vodTrace.visit = undefined;
+      grTraceFacts(trace, "old settled");
+      expect(s.runtime.sessionId.value).toBe("session-2");
+      expect(s.el.src).toBe(source);
+      expect(s.el.load).toHaveBeenCalledTimes(loads);
+      expect(hls.start).toHaveBeenCalledTimes(starts);
+      expect(s.runtime.video.value).toBe(s.el);
+      const reads = s.api.mock.calls.filter(
+        ([, method]) => method === "GET",
+      ).length;
+      await s.runtime.applyState(true);
+      expect(
+        s.api.mock.calls.filter(([, method]) => method === "GET"),
+      ).toHaveLength(reads);
+      grTraceFacts(trace, "second apply still pending");
+      releases.get("session-2")!(grReady(2));
+      await successor;
+      grTraceFacts(trace, "successor settled");
+      trace.push([
+        "posts",
+        playbackPosts(s).length,
+        "SID",
+        s.runtime.sessionId.value,
+      ]);
+      grRecord(`successor:${mse}`, trace);
+    } finally {
+      vodTrace.visit = undefined;
+      for (const [sid, release] of releases)
+        release(grReady(Number(sid.split("-")[1])));
+      await s.runtime.reset();
+      await Promise.all([old?.catch(() => {}), successor?.catch(() => {})]);
+      s.cleanup();
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  },
+);
+
+it.each(["complete", "failed", "pending"] as const)(
+  "generated source owner baseline: clock invalidation observes naturally reached %s facts",
+  async (kind) => {
+    const s = setup({ rebuild: true, ranges: [[0, 10]] });
+    let pending: Promise<void> | undefined,
+      release: ((value: unknown) => void) | undefined;
+    const trace: unknown[] = [];
+    try {
+      await s.prepare();
+      s.state.value.anchor_position_ms = 15000;
+      const original = s.api.getMockImplementation()!;
+      (s.api as any).mockImplementation(
+        (
+          path: string,
+          method?: string,
+          body?: unknown,
+          signal?: AbortSignal,
+        ) => {
+          if (method !== "GET") return original(path, method, body);
+          if (kind === "failed")
+            return Promise.reject(new Error("baseline generated rejection"));
+          if (kind === "pending") {
+            signal!.addEventListener(
+              "abort",
+              () => grTraceFacts(trace, "abort listener"),
+              { once: true },
+            );
+            return new Promise((resolve) => {
+              release = resolve;
+            });
+          }
+          return original(path, method, body);
+        },
+      );
+      pending = s.runtime.applyState(true);
+      if (kind === "failed")
+        await expect(pending).rejects.toThrow("baseline generated rejection");
+      else if (kind === "complete") await pending;
+      grTraceFacts(trace, "before clock");
+      vodTrace.visit = (event) => {
+        if (event === "data sync" || event === "frame sync")
+          grTraceFacts(trace, event);
+      };
+      s.invalidate();
+      grTraceFacts(trace, "after clock");
+      vodTrace.visit = undefined;
+      if (release) {
+        release(grReady(1));
+        await pending;
+        grTraceFacts(trace, "old settled");
+      }
+      trace.push([
+        "posts",
+        playbackPosts(s).length,
+        "SID",
+        s.runtime.sessionId.value,
+      ]);
+      grRecord(`clock:${kind}`, trace);
+    } finally {
+      vodTrace.visit = undefined;
+      release?.(grReady(1));
+      await s.runtime.reset();
+      await pending?.catch(() => {});
+      s.cleanup();
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  },
+);
+
+for (const transition of [
+  "reset",
+  "native recovery",
+  "native to MSE",
+] as const) {
+  it.each([false, true])(
+    `generated source owner baseline: ${transition} keeps abort-first ordering with nested reset=%s`,
+    async (nestedReset) => {
+      const s = setup({
+        hls: transition !== "reset",
+        rebuild: true,
+        ranges: [[0, 10]],
+      });
+      let pending: Promise<void> | undefined,
+        release: ((value: unknown) => void) | undefined;
+      let reset: Promise<void> | undefined,
+        innerReset: Promise<void> | undefined;
+      const trace: unknown[] = [];
+      try {
+        hls.supported = transition === "native to MSE";
+        await s.prepare();
+        s.state.value.anchor_position_ms = 15000;
+        const original = s.api.getMockImplementation()!;
+        (s.api as any).mockImplementation(
+          (
+            path: string,
+            method?: string,
+            body?: unknown,
+            signal?: AbortSignal,
+          ) => {
+            if (method !== "GET") return original(path, method, body);
+            signal!.addEventListener(
+              "abort",
+              () => {
+                grTraceFacts(trace, "abort listener");
+                if (nestedReset) {
+                  grTraceFacts(trace, "nested reset before");
+                  innerReset = s.runtime.reset();
+                  grTraceFacts(trace, "nested reset returned");
+                }
+              },
+              { once: true },
+            );
+            return new Promise((resolve) => {
+              release = resolve;
+            });
+          },
+        );
+        pending = s.runtime.applyState(true);
+        grTraceFacts(trace, "before transition");
+        vodTrace.visit = (event) => {
+          if (event.startsWith("data ") || event.startsWith("frame "))
+            grTraceFacts(trace, event);
+        };
+        if (transition === "reset") reset = s.runtime.reset();
+        else {
+          s.el.error = { code: transition === "native recovery" ? 2 : 3 };
+          s.el.onerror();
+        }
+        grTraceFacts(trace, "transition returned");
+        vodTrace.visit = undefined;
+        await reset;
+        await innerReset;
+        release!(grReady(1));
+        await pending;
+        grTraceFacts(trace, "old settled");
+        trace.push([
+          "posts",
+          playbackPosts(s).length,
+          "SID",
+          s.runtime.sessionId.value,
+          "source",
+          s.el.src,
+          "loads",
+          s.el.load.mock.calls.length,
+          "hls loads",
+          hls.load.mock.calls.length,
+        ]);
+        grRecord(`abort:${transition}:${nestedReset}`, trace);
+      } finally {
+        vodTrace.visit = undefined;
+        release?.(grReady(1));
+        await s.runtime.reset();
+        await pending?.catch(() => {});
+        s.cleanup();
+        expect(vi.getTimerCount()).toBe(0);
+      }
+    },
+  );
+}
+
+it.each(["pause throw", "data sync throw", "pause reset"] as const)(
+  "generated source owner baseline: pre-try %s preserves existing cleanup and settlement",
+  async (kind) => {
+    const s = setup({ rebuild: true, ranges: [[0, 10]] });
+    const trace: unknown[] = [];
+    const failure = new Error(`baseline ${kind}`);
+    let innerReset: Promise<void> | undefined;
+    let armed = true;
+    try {
+      await s.prepare();
+      s.playing();
+      s.state.value.anchor_position_ms = 15000;
+      const originalPause = s.el.pause.getMockImplementation()!;
+      s.el.pause.mockImplementation(() => {
+        grTraceFacts(trace, "pause");
+        if (armed && kind.startsWith("pause")) {
+          armed = false;
+          if (kind === "pause throw") throw failure;
+          innerReset = s.runtime.reset();
+          grTraceFacts(trace, "pause reset returned");
+        }
+        return originalPause();
+      });
+      vodTrace.visit = (event) => {
+        if (event.startsWith("data ") || event.startsWith("frame "))
+          grTraceFacts(trace, event);
+        if (armed && kind === "data sync throw" && event === "data sync") {
+          armed = false;
+          throw failure;
+        }
+      };
+      vodTrace.recovery = () => grTraceFacts(trace, "recovery evaluation");
+      const reads = s.api.mock.calls.filter(
+        ([, method]) => method === "GET",
+      ).length;
+      const result = s.runtime.applyState(true);
+      grTraceFacts(trace, "caller returned");
+      let settled = false,
+        caught: unknown;
+      const observed = result.then(
+        () => {
+          grTraceFacts(trace, "caller resolved");
+          settled = true;
+        },
+        (error) => {
+          caught = error;
+          grTraceFacts(trace, "caller rejected");
+          settled = true;
+        },
+      );
+      for (let tick = 1; tick <= 30 && !settled; tick++) {
+        await Promise.resolve();
+        trace.push(["tick", tick]);
+      }
+      await observed;
+      await innerReset;
+      vodTrace.visit = vodTrace.recovery = undefined;
+      expect(settled).toBe(true);
+      expect(caught).toBe(kind === "pause reset" ? undefined : failure);
+      trace.push([
+        "new readiness reads",
+        s.api.mock.calls.filter(([, method]) => method === "GET").length -
+          reads,
+      ]);
+      grTraceFacts(trace, "after settlement");
+      grRecord(`prefix:${kind}`, trace);
+    } finally {
+      vodTrace.visit = vodTrace.recovery = undefined;
+      s.el.pause.mockImplementation(() => {
+        s.el.paused = true;
+      });
+      await s.runtime.reset();
+      s.cleanup();
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  },
+);
+
+it.each(["data", "frame"] as const)(
+  "generated source owner baseline: real %s expiry clears recovery before waiting and notice",
+  async (kind) => {
+    const s = setup({ hls: true });
+    const trace: unknown[] = [];
+    const stops: (() => void)[] = [];
+    try {
+      s.el.readyState = kind === "data" ? 1 : 2;
+      if (kind === "frame") {
+        s.el.requestVideoFrameCallback = vi.fn(() => 1);
+        s.el.cancelVideoFrameCallback = vi.fn();
+        s.state.value.playback_status = "playing";
+      }
+      await s.runtime.loadMedia();
+      await vi.advanceTimersByTimeAsync(15000);
+      s.el.error = { code: 2 };
+      s.el.onerror();
+      s.el.seekable = s.el.buffered = intervals([[0, 1]]);
+      grTraceFacts(trace, "recovered at 15000");
+      stops.push(
+        watch(
+          s.runtime.waiting,
+          (value) => {
+            grTraceFacts(trace, `waiting:${value}`);
+            trace.push([
+              "phase at waiting",
+              s.runtime.preparation.value.phase,
+              "notice",
+              s.error.value,
+            ]);
+          },
+          { flush: "sync" },
+        ),
+      );
+      stops.push(
+        watch(
+          s.error,
+          (value) => {
+            grTraceFacts(trace, `notice:${value}`);
+            trace.push([
+              "waiting at notice",
+              s.runtime.waiting.value,
+              "phase",
+              s.runtime.preparation.value.phase,
+            ]);
+          },
+          { flush: "sync" },
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(4999);
+      grTraceFacts(trace, "at 19999");
+      expect(s.error.value).toBe("");
+      await vi.advanceTimersByTimeAsync(1);
+      grTraceFacts(trace, "at 20000");
+      expect(s.error.value).toBe(
+        kind === "data"
+          ? mediaDataTimeout
+          : "播放首帧等待超时，尚未确认画面呈现，请重新加载播放",
+      );
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(s.runtime.sessionId.value).toBe("session-1");
+      expect(s.runtime.video.value).toBe(s.el);
+      grRecord(`timeout:${kind}`, trace);
+    } finally {
+      for (const stop of stops) stop();
+      await s.runtime.reset();
+      s.cleanup();
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  },
+);
+
+it.each([false, true])(
+  "generated source owner baseline: real media terminal entry preserves failure ordering (MSE=%s)",
+  async (mse) => {
+    const s = setup({ hls: true });
+    const trace: unknown[] = [];
+    const stops: (() => void)[] = [];
+    try {
+      hls.supported = mse;
+      if (mse) s.el.canPlayType = () => "";
+      await s.prepare();
+      if (mse)
+        hls.errorHandler!(undefined, { fatal: true, response: { code: 409 } });
+      else {
+        s.el.error = { code: 2 };
+        s.el.onerror();
+        s.el.onerror();
+        s.el.onerror();
+      }
+      grTraceFacts(trace, "before terminal");
+      stops.push(
+        watch(
+          s.runtime.waiting,
+          (value) => {
+            grTraceFacts(trace, `waiting:${value}`);
+            trace.push([
+              "phase at waiting",
+              s.runtime.preparation.value.phase,
+              "notice",
+              s.error.value,
+            ]);
+          },
+          { flush: "sync" },
+        ),
+      );
+      stops.push(
+        watch(
+          s.error,
+          (value) => {
+            grTraceFacts(trace, `notice:${value}`);
+            trace.push([
+              "waiting at notice",
+              s.runtime.waiting.value,
+              "phase",
+              s.runtime.preparation.value.phase,
+            ]);
+          },
+          { flush: "sync" },
+        ),
+      );
+      if (mse)
+        hls.errorHandler!(undefined, {
+          fatal: true,
+          details: "synthetic terminal",
+        });
+      else s.el.onerror();
+      grTraceFacts(trace, "terminal returned");
+      expect(playbackPosts(s)).toHaveLength(1);
+      expect(s.runtime.sessionId.value).toBe("session-1");
+      expect(s.runtime.video.value).toBe(s.el);
+      grRecord(`terminal:${mse}`, trace);
+    } finally {
+      for (const stop of stops) stop();
+      await s.runtime.reset();
+      s.cleanup();
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  },
+);
+
+for (const transition of [
+  "reset",
+  "native recovery",
+  "native to MSE",
+] as const) {
+  it.each(["complete", "failed"] as const)(
+    `generated source owner baseline: ${transition} clears naturally reached %s facts`,
+    async (kind) => {
+      const s = setup({
+        hls: transition !== "reset",
+        rebuild: true,
+        ranges: [[0, 10]],
+      });
+      const trace: unknown[] = [];
+      try {
+        hls.supported = transition === "native to MSE";
+        await s.prepare();
+        s.state.value.anchor_position_ms = 15000;
+        if (kind === "failed") {
+          const original = s.api.getMockImplementation()!;
+          s.api.mockImplementation((path, method, body) =>
+            method === "GET"
+              ? Promise.reject(new Error("baseline generated rejection"))
+              : original(path, method, body),
+          );
+          await expect(s.runtime.applyState(true)).rejects.toThrow(
+            "baseline generated rejection",
+          );
+        } else await s.runtime.applyState(true);
+        grTraceFacts(trace, "before transition");
+        vodTrace.visit = (event) => {
+          if (event.startsWith("data ") || event.startsWith("frame "))
+            grTraceFacts(trace, event);
+        };
+        let reset: Promise<void> | undefined;
+        if (transition === "reset") reset = s.runtime.reset();
+        else {
+          s.el.error = { code: transition === "native recovery" ? 2 : 3 };
+          s.el.onerror();
+        }
+        grTraceFacts(trace, "transition returned");
+        vodTrace.visit = undefined;
+        await reset;
+        expect(playbackPosts(s)).toHaveLength(1);
+        grRecord(`facts:${transition}:${kind}`, trace);
+      } finally {
+        vodTrace.visit = undefined;
+        await s.runtime.reset();
+        s.cleanup();
+        expect(vi.getTimerCount()).toBe(0);
+      }
+    },
+  );
+}
+
+it("generated source owner baseline: clock abort reentry reads deadline handles only after nested reset", async () => {
+  const s = setup({ rebuild: true, ranges: [[0, 10]] });
+  let pending: Promise<void> | undefined, reset: Promise<void> | undefined;
+  let release: ((value: unknown) => void) | undefined;
+  const trace: unknown[] = [];
+  try {
+    await s.prepare();
+    s.state.value.anchor_position_ms = 15000;
+    const original = s.api.getMockImplementation()!;
+    (s.api as any).mockImplementation(
+      (path: string, method?: string, body?: unknown, signal?: AbortSignal) => {
+        if (method !== "GET") return original(path, method, body);
+        signal!.addEventListener(
+          "abort",
+          () => {
+            grTraceFacts(trace, "abort listener");
+            reset = s.runtime.reset();
+            grTraceFacts(trace, "nested reset returned");
+          },
+          { once: true },
+        );
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      },
+    );
+    pending = s.runtime.applyState(true);
+    vodTrace.visit = (event) => {
+      if (event.startsWith("data ") || event.startsWith("frame "))
+        grTraceFacts(trace, event);
+    };
+    s.invalidate();
+    grTraceFacts(trace, "clock returned");
+    vodTrace.visit = undefined;
+    await reset;
+    release!(grReady(1));
+    await pending;
+    grTraceFacts(trace, "old settled");
+    expect(s.runtime.sessionId.value).toBe(null);
+    expect(playbackPosts(s)).toHaveLength(1);
+    grRecord("clock:abort reset", trace);
+  } finally {
+    vodTrace.visit = undefined;
+    release?.(grReady(1));
+    await s.runtime.reset();
+    await pending?.catch(() => {});
+    s.cleanup();
+    expect(vi.getTimerCount()).toBe(0);
+  }
+});
+
+// Recorded from probe-03 against exact 5501c9d before candidate code existed.
+const grObservedBaseline: Record<string, unknown[]> = {
+  "successor:false": [
+    ["GET", "session-1", "1"],
+    ["old pending", true, false, null, false],
+    ["GET", "session-2", "2"],
+    ["successor pending", true, false, null, false],
+    ["exact current handle", "data sync", true, false],
+    ["old finally data sync", true, false, null, false],
+    ["exact current handle", "frame sync", true, false],
+    ["old finally frame sync", true, false, null, false],
+    ["old settled", true, false, null, false],
+    ["second apply still pending", true, false, null, false],
+    ["successor settled", false, false, 120, true],
+    ["posts", 2, "SID", "session-2"],
+  ],
+  "successor:true": [
+    ["GET", "session-1", "1"],
+    ["old pending", true, false, null, false],
+    ["GET", "session-2", "2"],
+    ["successor pending", true, false, null, false],
+    ["exact current handle", "data sync", true, false],
+    ["old finally data sync", true, false, null, false],
+    ["exact current handle", "frame sync", true, false],
+    ["old finally frame sync", true, false, null, false],
+    ["old settled", true, false, null, false],
+    ["second apply still pending", true, false, null, false],
+    ["successor settled", false, false, 120, true],
+    ["posts", 2, "SID", "session-2"],
+  ],
+  "clock:complete": [
+    ["before clock", false, false, 120, true],
+    ["data sync", false, false, 120, true],
+    ["frame sync", false, false, 120, true],
+    ["after clock", false, false, 120, true],
+    ["posts", 1, "SID", "session-1"],
+  ],
+  "clock:failed": [
+    ["before clock", false, true, null, false],
+    ["data sync", false, false, null, false],
+    ["frame sync", false, false, null, false],
+    ["after clock", false, false, null, false],
+    ["posts", 1, "SID", "session-1"],
+  ],
+  "clock:pending": [
+    ["before clock", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["data sync", false, false, null, false],
+    ["frame sync", false, false, null, false],
+    ["after clock", false, false, null, false],
+    ["old settled", false, false, null, false],
+    ["posts", 1, "SID", "session-1"],
+  ],
+  "abort:reset:false": [
+    ["before transition", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["frame stop", true, false, null, false],
+    ["data stop", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["transition returned", false, false, null, false],
+    ["old settled", false, false, null, false],
+    ["posts", 1, "SID", null, "source", "", "loads", 2, "hls loads", 0],
+  ],
+  "abort:reset:true": [
+    ["before transition", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["frame stop", true, false, null, false],
+    ["data stop", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["nested reset before", true, false, null, false],
+    ["nested reset returned", false, false, null, false],
+    ["transition returned", false, false, null, false],
+    ["old settled", false, false, null, false],
+    ["posts", 1, "SID", null, "source", "", "loads", 3, "hls loads", 0],
+  ],
+  "abort:native recovery:false": [
+    ["before transition", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["transition returned", false, false, null, true],
+    ["old settled", false, false, null, true],
+    [
+      "posts",
+      1,
+      "SID",
+      "session-1",
+      "source",
+      "http://localhost/authorized.mp4?recovery=1#t=15",
+      "loads",
+      2,
+      "hls loads",
+      0,
+    ],
+  ],
+  "abort:native recovery:true": [
+    ["before transition", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["nested reset before", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["frame stop", true, false, null, false],
+    ["data stop", true, false, null, false],
+    ["nested reset returned", false, false, null, false],
+    ["transition returned", false, false, null, true],
+    ["old settled", false, false, null, true],
+    ["posts", 1, "SID", null, "source", "", "loads", 2, "hls loads", 0],
+  ],
+  "abort:native to MSE:false": [
+    ["before transition", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["transition returned", false, false, null, true],
+    ["old settled", false, false, null, true],
+    ["posts", 1, "SID", "session-1", "source", "", "loads", 2, "hls loads", 1],
+  ],
+  "abort:native to MSE:true": [
+    ["before transition", true, false, null, false],
+    ["abort listener", true, false, null, false],
+    ["nested reset before", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["frame stop", true, false, null, false],
+    ["data stop", true, false, null, false],
+    ["nested reset returned", false, false, null, false],
+    ["transition returned", false, false, null, true],
+    ["old settled", false, false, null, true],
+    ["posts", 1, "SID", null, "source", "", "loads", 3, "hls loads", 0],
+  ],
+  "prefix:pause throw": [
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["recovery evaluation", true, false, null, false],
+    ["pause", true, false, null, false],
+    ["caller returned", true, false, null, false],
+    ["tick", 1],
+    ["recovery evaluation", true, false, null, false],
+    ["tick", 2],
+    ["caller rejected", true, false, null, false],
+    ["tick", 3],
+    ["new readiness reads", 0],
+    ["after settlement", true, false, null, false],
+  ],
+  "prefix:data sync throw": [
+    ["data sync", true, false, null, false],
+    ["caller returned", true, false, null, false],
+    ["tick", 1],
+    ["recovery evaluation", true, false, null, false],
+    ["tick", 2],
+    ["caller rejected", true, false, null, false],
+    ["tick", 3],
+    ["new readiness reads", 0],
+    ["after settlement", true, false, null, false],
+  ],
+  "prefix:pause reset": [
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["recovery evaluation", true, false, null, false],
+    ["pause", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["recovery evaluation", true, false, null, false],
+    ["frame stop", true, false, null, false],
+    ["data stop", true, false, null, false],
+    ["pause", false, false, null, false],
+    ["pause reset returned", false, false, null, false],
+    ["caller returned", false, false, null, false],
+    ["tick", 1],
+    ["tick", 2],
+    ["recovery evaluation", false, false, null, false],
+    ["tick", 3],
+    ["caller resolved", false, false, null, false],
+    ["tick", 4],
+    ["new readiness reads", 0],
+    ["after settlement", false, false, null, false],
+  ],
+  "timeout:data": [
+    ["recovered at 15000", false, false, null, true],
+    ["at 19999", false, false, null, true],
+    ["waiting:false", false, false, null, false],
+    ["phase at waiting", "ready", "notice", ""],
+    [
+      "notice:媒体数据加载超时，请检查连接或重新加载播放",
+      false,
+      false,
+      null,
+      false,
+    ],
+    ["waiting at notice", false, "phase", "failed"],
+    ["at 20000", false, false, null, false],
+  ],
+  "timeout:frame": [
+    ["recovered at 15000", false, false, null, true],
+    ["at 19999", false, false, null, true],
+    ["waiting:false", false, false, null, false],
+    ["phase at waiting", "ready", "notice", ""],
+    [
+      "notice:播放首帧等待超时，尚未确认画面呈现，请重新加载播放",
+      false,
+      false,
+      null,
+      false,
+    ],
+    ["waiting at notice", false, "phase", "failed"],
+    ["at 20000", false, false, null, false],
+  ],
+  "terminal:false": [
+    ["before terminal", false, false, null, true],
+    ["notice:媒体加载中断，请检查连接后重新加载", false, false, null, false],
+    ["waiting at notice", true, "phase", "ready"],
+    ["waiting:false", false, false, null, false],
+    [
+      "phase at waiting",
+      "failed",
+      "notice",
+      "媒体加载中断，请检查连接后重新加载",
+    ],
+    ["terminal returned", false, false, null, false],
+  ],
+  "terminal:true": [
+    ["before terminal", false, false, null, true],
+    ["notice:媒体加载失败：synthetic terminal", false, false, null, false],
+    ["waiting at notice", true, "phase", "ready"],
+    ["waiting:false", false, false, null, false],
+    [
+      "phase at waiting",
+      "failed",
+      "notice",
+      "媒体加载失败：synthetic terminal",
+    ],
+    ["terminal returned", false, false, null, false],
+  ],
+  "facts:reset:complete": [
+    ["before transition", false, false, 120, true],
+    ["data sync", false, false, 120, true],
+    ["frame sync", false, false, 120, true],
+    ["frame stop", false, false, 120, true],
+    ["data stop", false, false, 120, true],
+    ["transition returned", false, false, null, false],
+  ],
+  "facts:reset:failed": [
+    ["before transition", false, true, null, false],
+    ["frame stop", false, true, null, false],
+    ["data stop", false, true, null, false],
+    ["transition returned", false, false, null, false],
+  ],
+  "facts:native recovery:complete": [
+    ["before transition", false, false, 120, true],
+    ["transition returned", false, false, null, true],
+  ],
+  "facts:native recovery:failed": [
+    ["before transition", false, true, null, false],
+    ["data sync", false, false, null, true],
+    ["frame sync", false, false, null, true],
+    ["transition returned", false, false, null, true],
+  ],
+  "facts:native to MSE:complete": [
+    ["before transition", false, false, 120, true],
+    ["transition returned", false, false, null, true],
+  ],
+  "facts:native to MSE:failed": [
+    ["before transition", false, true, null, false],
+    ["data sync", false, false, null, true],
+    ["frame sync", false, false, null, true],
+    ["transition returned", false, false, null, true],
+  ],
+  "clock:abort reset": [
+    ["abort listener", true, false, null, false],
+    ["data sync", true, false, null, false],
+    ["frame sync", true, false, null, false],
+    ["frame stop", true, false, null, false],
+    ["data stop", true, false, null, false],
+    ["nested reset returned", false, false, null, false],
+    ["clock returned", false, false, null, false],
+    ["old settled", false, false, null, false],
+  ],
+};

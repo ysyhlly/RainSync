@@ -218,7 +218,7 @@ async function load() {
   if (!detail.value) error.value = "";
   try {
     const value = checkedSettings(
-      await session.api<AdminSettingsSnapshot>(
+      await session.api<unknown>(
         "/admin/settings",
         "GET",
         undefined,
@@ -289,7 +289,7 @@ async function save(allowAccessChange = false) {
     navigationMessage.value =
       "";
   try {
-    const result = await session.api<AdminSettingsSnapshot>(
+    const result = await session.api<unknown>(
       "/admin/settings",
       "PATCH",
       {

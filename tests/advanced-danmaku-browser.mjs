@@ -80,7 +80,7 @@ import PlatformDanmaku from "/@fs/${root}/apps/web/src/features/playback/Platfor
 import {createPlatformTextRuntime} from "/@fs/${root}/apps/web/src/features/playback/platform-text-runtime.ts";
 const video=shallowRef(),canSeek=ref(false),seek=ref(null),scope=effectScope();
 const session={epoch:0,api:async (path,method,body,signal)=>{const r=await fetch('/api/v1'+path,{signal});if(!r.ok)throw Error('fixture_api_failed');return r.json();}};
-const runtime=scope.run(()=>createPlatformTextRuntime({video,session}));
+const runtime=scope.run(()=>createPlatformTextRuntime({video,api:session.api,identity:{current:()=>({userId:undefined,epoch:session.epoch}),invalidate:()=>{},subscribeInvalidation:()=>()=>{}}}));
 const plan={session_id:'00000000-0000-4000-8000-000000000001',native_platform:{version:1},playback_url:'/api/v1/platform-delivery/00000000-0000-4000-8000-000000000001/manifest.mpd?token='+'a'.repeat(64)};
 createApp({setup(){onMounted(async()=>{if(video.value.readyState<1)await new Promise(r=>video.value.addEventListener('loadedmetadata',r,{once:true}));await runtime.bind(plan);await runtime.setPlatformDanmaku(true);});
 return ()=>h('main',[h('div',{class:'stage'},[h('video',{ref:video,src:'/__danmaku_test/clip.mp4',preload:'auto',muted:true}),h(PlatformDanmaku,{video:video.value,cues:runtime.platformDanmakuCues.value,enabled:runtime.platformDanmakuEnabled.value,canSeek:canSeek.value,onSeek:at=>{seek.value=at;if(canSeek.value)video.value.currentTime=at/1000;}})]),h('button',{onClick:()=>runtime.setPlatformDanmaku(false)},'关闭弹幕')]);}}).mount('#app');

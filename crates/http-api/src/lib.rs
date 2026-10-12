@@ -135,6 +135,70 @@ mod tests {
     use axum::{Router, routing::get};
     use tower::ServiceExt;
 
+    async fn assert_guest_restricted_forbidden(middleware_passes: usize) {
+        let supplied_id = Uuid::new_v4();
+        let mut router = Router::new().route(
+            "/",
+            get(|| async {
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "guest_restricted",
+                        "debug": "private-guest-detail"
+                    })),
+                )
+            }),
+        );
+        for _ in 0..middleware_passes {
+            router = router.layer(axum::middleware::from_fn(errors));
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("x-request-id", supplied_id.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let request_id =
+            Uuid::parse_str(response.headers()["x-request-id"].to_str().unwrap()).unwrap();
+        assert_ne!(request_id, supplied_id);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // GuestRestricted is not a public ErrorCode. The existing 403 fallback
+        // must remain FORBIDDEN, including a second gateway normalization pass.
+        assert_eq!(
+            value,
+            serde_json::json!({"error": {
+                "code": "FORBIDDEN",
+                "message": "没有执行此操作的权限",
+                "retryable": false,
+                "request_id": request_id
+            }})
+        );
+        assert!(value["error"].get("retry_after_ms").is_none());
+        let decoded: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.error.code, ErrorCode::Forbidden);
+        assert_eq!(decoded.error.request_id, request_id);
+        assert!(!decoded.error.retryable);
+        assert_eq!(decoded.error.retry_after_ms, None);
+    }
+
+    #[tokio::test]
+    async fn guest_restricted_uses_forbidden_after_one_error_middleware_pass() {
+        assert_guest_restricted_forbidden(1).await;
+    }
+
+    #[tokio::test]
+    async fn guest_restricted_uses_forbidden_after_two_error_middleware_passes() {
+        assert_guest_restricted_forbidden(2).await;
+    }
+
     #[tokio::test]
     async fn dedicated_codes_survive_two_actual_error_middleware_passes() {
         for (reason, expected) in [

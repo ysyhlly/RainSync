@@ -155,7 +155,7 @@ it("same-generation close and reopen destroys old URL, requires a fresh plan, an
       control_epoch: null,
     });
     expect(element.src).toBe("");
-    expect(runtime.sessionId).toBeNull();
+    expect(runtime.playbackHost.sessionId).toBeNull();
     expect(element.pause).toHaveBeenCalled();
     staleMetadata();
     await runtime.loadMedia();
@@ -194,7 +194,7 @@ it("same-generation close and reopen destroys old URL, requires a fresh plan, an
     await vi.advanceTimersByTimeAsync(0);
     expect(runtime.state?.media_generation).toBe(1);
     expect(runtime.state?.playback_status).toBe("paused");
-    expect(runtime.sessionId).toBe("session-2");
+    expect(runtime.playbackHost.sessionId).toBe("session-2");
     expect(element.play).not.toHaveBeenCalled();
     runtime.send("PLAY");
     expect(JSON.parse(socket.send.mock.calls.at(-1)[0]).control_epoch).toBe(

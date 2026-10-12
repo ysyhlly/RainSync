@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { effectScope, reactive, shallowRef } from "vue";
 import { createPlatformTextRuntime } from "../apps/web/src/features/playback/platform-text-runtime";
 import type { PlaybackPlan } from "../packages/protocol";
-import type { useSession } from "../apps/web/src/features/auth/session.store";
+import { createPlaybackIdentityPort } from "../apps/web/src/app/viewing-runtime";
 const sessionId = "00000000-0000-4000-8000-000000000001";
 const plan = {
   session_id: sessionId,
@@ -67,7 +67,11 @@ function setup(
   scopes.push(scope);
   const runtime = scope.run(() =>
     createPlatformTextRuntime({
-      session: session as unknown as ReturnType<typeof useSession>,
+      identity: createPlaybackIdentityPort(
+        () => ({ userId: undefined, epoch: session.epoch }),
+        session.invalidate,
+      ),
+      api: session.api,
       video,
       preferenceScope,
     }),

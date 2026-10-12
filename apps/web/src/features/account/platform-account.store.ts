@@ -54,8 +54,8 @@ export const usePlatformAccount = defineStore("platform-account", () => {
       busyMessage: "平台账号操作尚未确认，请稍后刷新状态",
     });
   }
-  function accept(value: PlatformAccountStatus) {
-    value = validatePlatformAccountStatus(value);
+  function accept(response: unknown) {
+    const value = validatePlatformAccountStatus(response);
     const old = status.value;
     status.value = value;
     if (
@@ -78,8 +78,8 @@ export const usePlatformAccount = defineStore("platform-account", () => {
     if (!observed) return Promise.reject(new StaleIdentity());
     return biliWork.mutate(
       (signal) => api.check(observed.revision, signal),
-      (value) => {
-        value = validatePlatformAccountCheck(value);
+      (response) => {
+        const value = validatePlatformAccountCheck(response);
         if (
           value.account.id !== observed.id ||
           (value.verification !== "invalid" &&
@@ -101,11 +101,8 @@ export const usePlatformAccount = defineStore("platform-account", () => {
       external,
     );
   }
-  function acceptShort(
-    provider: ShortPlatformProvider,
-    value: ShortPlatformAccountStatus,
-  ) {
-    value = validateShortAccountStatus(value, provider);
+  function acceptShort(provider: ShortPlatformProvider, response: unknown) {
+    const value = validateShortAccountStatus(response, provider);
     const previous = shortStatuses.value[provider];
     shortStatuses.value = { ...shortStatuses.value, [provider]: value };
     if (
@@ -130,7 +127,7 @@ export const usePlatformAccount = defineStore("platform-account", () => {
   function mutateShort(
     provider: ShortPlatformProvider,
     expectedRevision: string | null,
-    action: (signal: AbortSignal) => Promise<ShortPlatformAccountStatus>,
+    action: (signal: AbortSignal) => Promise<unknown>,
     external?: AbortSignal,
   ) {
     return shortWork[provider].mutate(

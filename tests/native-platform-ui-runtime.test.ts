@@ -1,3 +1,4 @@
+import { playbackTestContext } from "./helpers/playback-context";
 vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
   const { default: Hls } = await import("hls.js");
   return {
@@ -9,16 +10,57 @@ vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
 import { afterEach, expect, it, vi } from "vitest";
 import { effectScope, ref } from "vue";
 import { createPlaybackRuntime } from "../apps/web/src/features/playback/playback-runtime";
+import { PlaybackCancelled } from "../apps/web/src/playback-request";
 import type { NativePlatformProvider } from "../packages/protocol";
+const recoveryTrace = vi.hoisted(() => ({
+  visit: undefined as (() => void) | undefined,
+}));
+vi.mock("../apps/web/src/features/playback/playback-recovery-state", async (original) => {
+  const actual = await original<typeof import("../apps/web/src/features/playback/playback-recovery-state")>();
+  return {
+    ...actual,
+    evaluatePlaybackRecovery: (...args: Parameters<typeof actual.evaluatePlaybackRecovery>) => {
+      recoveryTrace.visit?.();
+      return actual.evaluatePlaybackRecovery(...args);
+    },
+  };
+});
 const dashboards = vi.hoisted(() => [] as any[]);
 const hlsPlayers = vi.hoisted(() => [] as any[]);
 const browserCapabilities = vi.hoisted(() => ({ mse: true }));
+const dashPreload = vi.hoisted(() => vi.fn(async () => ({})));
+const dashDriverLoad = vi.hoisted(() => ({
+  before: undefined as (() => Promise<void>) | undefined,
+  calls: 0,
+}));
+vi.mock("../apps/web/src/features/playback/dash-driver-loader", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../apps/web/src/features/playback/dash-driver-loader")>();
+  return { loadDashDriver: async () => {
+    ++dashDriverLoad.calls;
+    await dashDriverLoad.before?.();
+    return actual.loadDashDriver();
+  } };
+});
+
+vi.mock("../packages/player-core/dash/loader", () => ({ loadDashJs: dashPreload }));
 vi.mock("../packages/player-core/dash", async (importOriginal) => ({
   ...(await importOriginal<any>()),
   createDashPlayback: (options: any) => {
     const controller = {
       options,
-      load: vi.fn(async () => true),
+      load: vi.fn(async () => {
+        options.onStatus?.({
+          status: "loading",
+          readyState: options.video.readyState,
+        });
+        await dashPreload();
+        options.onSourceAttached?.();
+        options.onStatus?.({
+          status: "loading_media",
+          readyState: options.video.readyState,
+        });
+        return true;
+      }),
       destroy: vi.fn(),
     };
     dashboards.push(controller);
@@ -60,10 +102,15 @@ const media: any = {
   },
 };
 afterEach(() => {
+  recoveryTrace.visit = undefined;
   vi.useRealTimers();
   vi.unstubAllGlobals();
   dashboards.length = 0;
   hlsPlayers.length = 0;
+  dashPreload.mockReset();
+  dashPreload.mockResolvedValue({});
+  dashDriverLoad.before = undefined;
+  dashDriverLoad.calls = 0;
 });
 function nativePlan(
   body: any,
@@ -112,9 +159,25 @@ function setup(
     live?: boolean;
     nativeHls?: boolean;
     compatibilityFailure?: boolean;
+    metricClock?: boolean;
+    metricFrame?: boolean;
+    metricsVersion?: 1 | 2 | false;
+    badMetricsReceipt?: boolean;
   } = {},
 ) {
-  vi.useFakeTimers();
+  vi.useFakeTimers(
+    options.metricClock
+      ? {
+          toFake: [
+            "setTimeout",
+            "clearTimeout",
+            "setInterval",
+            "clearInterval",
+            "performance",
+          ],
+        }
+      : undefined,
+  );
   browserCapabilities.mse = options.mse ?? true;
   vi.stubGlobal("navigator", {});
   vi.stubGlobal("location", {
@@ -199,6 +262,15 @@ function setup(
           selected_height: 1080,
           options: [{ max_height: "p1080", height: 1080 }],
         };
+      if (options.metricsVersion && body.playback_metrics)
+        Object.assign(plan, {
+          playback_metrics_version: options.metricsVersion,
+          playback_metrics: {
+            ...body.playback_metrics,
+            metrics_seq: 0,
+            closed: false,
+          },
+        });
       return plan;
     }
     if (
@@ -221,8 +293,9 @@ function setup(
       events.push("native-post");
       bodies.push(JSON.stringify(body));
       if (options.lost && bodies.length === 1) throw TypeError("lost");
-      if (options.defer) return new Promise((r) => (resolve = r));
-      const plan = nativePlan(body, provider, options.transport);
+      const plan = options.defer
+        ? await new Promise<any>((r) => (resolve = r))
+        : nativePlan(body, provider, options.transport);
       if (options.live)
         Object.assign(plan, {
           transport: "hls",
@@ -249,8 +322,25 @@ function setup(
       }
       if (options.ownAccount)
         plan.native_platform.credential_mode = "own_account";
+      if (options.metricsVersion && body.playback_metrics)
+        Object.assign(plan, {
+          playback_metrics_version: options.metricsVersion,
+          playback_metrics: {
+            ...body.playback_metrics,
+            metrics_seq: 0,
+            closed: false,
+          },
+        });
       return plan;
     }
+    if (path.endsWith("/metrics") && method === "POST")
+      return {
+        session_id: path.split("/")[2],
+        meter_start_generation:
+          body.meter_start_generation + (options.badMetricsReceipt ? 1 : 0),
+        metrics_seq: body.seq,
+        closed: body.final,
+      };
     if (method === "DELETE") events.push(path);
     return {};
   });
@@ -272,38 +362,32 @@ function setup(
     account = ref(0),
     shortAccounts = ref({ douyin: 0, tiktok: 0 }),
     youtubeAccount = ref(0),
-    shortIds = ref({ douyin: id(9), tiktok: id(10) }),
-    error = ref("");
+    shortIds = ref({ douyin: id(9), tiktok: id(10) });
   const clock = { ready: true, revision: 1, now: () => 10000 };
   const ended = vi.fn();
   const scope = effectScope();
   const runtime = scope.run(() =>
-    createPlaybackRuntime({
-      session: session as any,
-      ended,
-      state,
-      connected,
-      active,
-      clock: clock as any,
-      error,
-      resolveMedia: async () =>
-        options.deferMedia
-          ? new Promise((r) => (resolveMedia = r))
-          : selectedMedia,
-      platformAccountChange: account,
-      shortPlatformAccountChanges: shortAccounts,
-      shortPlatformAccountIds: options.ownAccount ? shortIds : undefined,
-      youtubePlatformAccountChange: youtubeAccount,
-      youtubePlatformAccountId: options.ownAccount ? ref(id(11)) : undefined,
-      run: async (action) => {
-        try {
-          await action();
-        } catch (e) {
-          error.value = String(e);
-        }
-      },
-    }),
+    createPlaybackRuntime(
+      playbackTestContext({
+        session: session as any,
+        ended,
+        state,
+        connected,
+        active,
+        clock: clock as any,
+        resolveMedia: async () =>
+          options.deferMedia
+            ? new Promise((r) => (resolveMedia = r))
+            : selectedMedia,
+        platformAccountChange: account,
+        shortPlatformAccountChanges: shortAccounts,
+        shortPlatformAccountIds: options.ownAccount ? shortIds : undefined,
+        youtubePlatformAccountChange: youtubeAccount,
+        youtubePlatformAccountId: options.ownAccount ? ref(id(11)) : undefined,
+      }),
+    ),
   )!;
+  const error = runtime.playbackError;
   const element: any = Object.assign(new EventTarget(), {
     canPlayType: (type: string) =>
       type.includes("mpegurl") && options.nativeHls !== undefined
@@ -331,10 +415,24 @@ function setup(
     seeking: false,
     readyState: 0,
   });
+  const frameCallbacks: ((at: number, metadata: any) => void)[] = [];
+  const pendingFrames = new Set<number>();
+  if (options.metricFrame)
+    Object.assign(element, {
+      requestVideoFrameCallback: (
+        callback: (typeof frameCallbacks)[number],
+      ) => {
+        frameCallbacks.push(callback);
+        pendingFrames.add(frameCallbacks.length);
+        return frameCallbacks.length;
+      },
+      cancelVideoFrameCallback: (id: number) => pendingFrames.delete(id),
+    });
   runtime.attach(element);
   return {
     runtime,
     element,
+    selectedMedia,
     session,
     state,
     active,
@@ -350,12 +448,463 @@ function setup(
     ended,
     resolve: (value: any) => resolve(value),
     resolveMedia: () => resolveMedia(selectedMedia),
+    frame: (presentationTime = performance.now()) => {
+      element.paused = false;
+      element.readyState = 4;
+      for (const frame of [...pendingFrames]) {
+        pendingFrames.delete(frame);
+        frameCallbacks[frame - 1](performance.now(), { presentationTime });
+      }
+    },
+    frameCallbacks,
+    metrics: () =>
+      api.mock.calls.filter(
+        ([path, method]) => path.endsWith("/metrics") && method === "POST",
+      ),
     cleanup: () => scope.stop(),
   };
 }
 async function settle() {
   for (let i = 0; i < 50; i++) await Promise.resolve();
 }
+it("Bilibili negotiates the existing v2 protocol and sends the same local meter's phases and presented-frame receipt", async () => {
+  const f = setup({
+    defer: true,
+    metricClock: true,
+    metricFrame: true,
+    metricsVersion: 2,
+  });
+  try {
+    f.state.value.playback_status = "playing";
+    const loading = f.runtime.loadMedia();
+    await settle();
+    const request = JSON.parse(f.bodies[0]);
+    expect(request).toMatchObject({
+      playback_metrics_version: 1,
+      playback_metrics_supported_versions: [1, 2],
+      playback_metrics: {
+        meter_start_generation: 1,
+        startup_origin: "user_intent",
+      },
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    f.resolve(nativePlan(request));
+    await loading;
+    dashboards[0].options.onReady?.();
+    expect(f.runtime.startupDiagnostics.value?.first_frame).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1000);
+    f.frame(1950);
+    await vi.advanceTimersByTimeAsync(3000);
+    const [path, method, packet] = f.metrics()[0];
+    expect(path).toBe(`/playback-sessions/${id(21)}/metrics`);
+    expect(method).toBe("POST");
+    expect(packet).toMatchObject({
+      version: 2,
+      plan_generation: 1,
+      media_generation: 7,
+      meter_start_generation: 1,
+      first_frame_plan_generation: 1,
+      startup_origin: "user_intent",
+      seq: 1,
+      startup_phases: {
+        preparation_ms: 1000,
+        loading_ms: 1000,
+        unobserved_ms: 0,
+      },
+      first_frame: {
+        elapsed_ms: 1950,
+        confirmed_elapsed_ms: 2000,
+        evidence: "video_frame_callback",
+      },
+    });
+    expect(packet.startup_phases).toEqual(
+      f.runtime.startupDiagnostics.value!.startup_phases,
+    );
+    expect(packet.first_frame).toEqual(
+      f.runtime.startupDiagnostics.value!.first_frame,
+    );
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(f.metrics()[1][2]).toMatchObject({
+      seq: 2,
+      startup_phases: packet.startup_phases,
+      first_frame: packet.first_frame,
+    });
+  } finally {
+    f.cleanup();
+  }
+});
+it("Bilibili compatibility reuses preparation negotiation and sends its actual attached-source meter", async () => {
+  const f = setup({
+    metricClock: true,
+    metricFrame: true,
+    metricsVersion: 2,
+    mse: false,
+    nativeHls: true,
+  });
+  try {
+    f.state.value.playback_status = "playing";
+    f.runtime.nativePlaybackMode.value = "compatibility";
+    await f.runtime.loadMedia();
+    const requests = f.bodies.map((body) => JSON.parse(body));
+    expect(requests.length).toBeGreaterThanOrEqual(2);
+    expect(requests[0].native_platform.compatibility).toEqual({
+      version: 1,
+      mode: "hls_avc_aac",
+    });
+    expect(
+      requests.every(
+        (request) =>
+          request.playback_metrics_supported_versions?.join() === "1,2",
+      ),
+    ).toBe(true);
+    expect(
+      new Set(
+        requests.map(
+          (request) => request.playback_metrics.meter_start_generation,
+        ),
+      ),
+    ).toEqual(new Set([1]));
+    await vi.advanceTimersByTimeAsync(1000);
+    f.frame(950);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(f.metrics()[0][2]).toMatchObject({
+      version: 2,
+      plan_generation: 1,
+      meter_start_generation: 1,
+      first_frame_plan_generation: 1,
+      startup_phases: { preparation_ms: 0, loading_ms: 1000, unobserved_ms: 0 },
+      first_frame: {
+        evidence: "video_frame_callback",
+        elapsed_ms: 950,
+        confirmed_elapsed_ms: 1000,
+      },
+    });
+    expect(f.metrics()[0][2].startup_phases).toEqual(
+      f.runtime.startupDiagnostics.value!.startup_phases,
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+it("an older Bilibili response without a grant keeps local startup evidence and sends no metrics", async () => {
+  const f = setup({
+    metricClock: true,
+    metricFrame: true,
+    metricsVersion: false,
+  });
+  try {
+    f.state.value.playback_status = "playing";
+    await f.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(1000);
+    f.frame(950);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(f.runtime.startupDiagnostics.value).toMatchObject({
+      startup_phases: { preparation_ms: 0, loading_ms: 1000, unobserved_ms: 0 },
+      first_frame: { evidence: "video_frame_callback" },
+    });
+    expect(f.metrics()).toHaveLength(0);
+  } finally {
+    f.cleanup();
+  }
+});
+it("a negotiated v1 Bilibili grant keeps its legacy wire shape while retaining local startup phases", async () => {
+  const f = setup({ metricClock: true, metricFrame: true, metricsVersion: 1 });
+  try {
+    f.state.value.playback_status = "playing";
+    await f.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(1000);
+    f.frame(950);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(f.metrics()[0][2]).toMatchObject({
+      version: 1,
+      first_frame: { evidence: "video_frame_callback" },
+    });
+    expect(f.metrics()[0][2]).not.toHaveProperty("startup_phases");
+    expect(f.metrics()[0][2]).not.toHaveProperty("first_frame_plan_generation");
+    expect(f.runtime.startupDiagnostics.value!.startup_phases.loading_ms).toBe(
+      1000,
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+it.each([
+  "user",
+  "epoch",
+  "room",
+  "media_generation",
+  "media_id",
+  "reset",
+] as const)(
+  "Bilibili %s replacement rejects stale frame/grant evidence before the API sender",
+  async (cause) => {
+    const f = setup({
+      metricClock: true,
+      metricFrame: true,
+      metricsVersion: 2,
+    });
+    try {
+      f.state.value.playback_status = "playing";
+      await f.runtime.loadMedia();
+      const staleFrame = f.frameCallbacks[0];
+      f.clock.ready = false;
+      if (cause === "user") f.session.user = { id: id(7) };
+      else if (cause === "epoch") f.session.epoch++;
+      else if (cause === "room")
+        f.state.value = { ...f.state.value, room_id: id(8) };
+      else if (cause === "media_generation")
+        f.state.value = { ...f.state.value, media_generation: 8 };
+      else if (cause === "media_id")
+        f.state.value = { ...f.state.value, media_id: id(8) };
+      else await f.runtime.reset();
+      const beforeStaleCallback = f.metrics().length;
+      if (cause === "reset")
+        expect(f.metrics()[0][2]).toMatchObject({ final: true });
+      await vi.advanceTimersByTimeAsync(1000);
+      staleFrame(performance.now(), { presentationTime: 950 });
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(f.metrics()).toHaveLength(beforeStaleCallback);
+      if (cause !== "reset") expect(beforeStaleCallback).toBe(0);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+it("an invalid Bilibili metrics receipt stops optional sending while keeping local playback evidence", async () => {
+  const f = setup({
+    metricClock: true,
+    metricFrame: true,
+    metricsVersion: 2,
+    badMetricsReceipt: true,
+  });
+  try {
+    f.state.value.playback_status = "playing";
+    await f.runtime.loadMedia();
+    await vi.advanceTimersByTimeAsync(1000);
+    f.frame(950);
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(f.metrics()).toHaveLength(1);
+    expect(f.runtime.startupDiagnostics.value?.first_frame?.evidence).toBe(
+      "video_frame_callback",
+    );
+    expect(f.runtime.preparation.value.phase).toBe("ready");
+  } finally {
+    f.cleanup();
+  }
+});
+it("downloads the DASH library during Bilibili server preparation without mounting a player", async () => {
+  const f = setup({ defer: true });
+  try {
+    const loading = f.runtime.loadMedia();
+    await settle();
+    expect(f.events).toContain("native-post");
+    expect(dashPreload).toHaveBeenCalledOnce();
+    expect(dashboards).toHaveLength(0);
+    expect(f.runtime.loadingStage.value).toBe("preparing");
+    f.resolve(nativePlan(JSON.parse(f.bodies[0])));
+    await loading;
+    expect(dashboards).toHaveLength(1);
+    expect(f.runtime.loadingStage.value).toBe("loading_media");
+  } finally {
+    f.cleanup();
+  }
+});
+it.each([
+  { provider: "douyin" as const },
+  {
+    provider: "youtube" as const,
+    mse: false,
+    transport: "progressive" as const,
+  },
+  { mse: false, nativeHls: true },
+  { live: true, nativeHls: true },
+])("does not preload DASH for a non-DASH native branch %j", async (options) => {
+  const f = setup(options);
+  try {
+    await f.runtime.loadMedia();
+    expect(dashPreload).not.toHaveBeenCalled();
+    expect(dashboards).toHaveLength(0);
+  } finally {
+    f.cleanup();
+  }
+});
+it("a rejected background preload remains retryable and never replaces the playback error", async () => {
+  dashPreload.mockRejectedValueOnce(
+    new Error("SDK chunk temporarily unavailable"),
+  );
+  const f = setup();
+  try {
+    await f.runtime.loadMedia();
+    expect(dashPreload).toHaveBeenCalledTimes(2);
+    expect(f.runtime.preparation.value.phase).toBe("ready");
+    expect(f.error.value).toBe("");
+  } finally {
+    f.cleanup();
+  }
+});
+it.each(["reset", "identity", "media", "account"])(
+  "late SDK resolution cannot revive a retired %s attachment",
+  async (cause) => {
+    let release!: (value: {}) => void;
+    const pending = new Promise<{}>((resolve) => {
+      release = resolve;
+    });
+    dashPreload.mockReturnValue(pending);
+    const f = setup();
+    try {
+      const loading = f.runtime.loadMedia();
+      await settle();
+      expect(f.runtime.loadingStage.value).toBe("initializing");
+      if (cause === "reset") await f.runtime.reset();
+      else if (cause === "identity") f.session.epoch++;
+      else if (cause === "media")
+        f.state.value = { ...f.state.value, media_generation: 8 };
+      else {
+        f.clock.ready = false;
+        f.account.value++;
+      }
+      const stage = f.runtime.loadingStage.value;
+      release({});
+      await loading;
+      expect(f.runtime.loadingStage.value).toBe(stage);
+      expect(f.runtime.startupDiagnostics.value).toBeUndefined();
+      if (cause === "reset") expect(f.runtime.sessionId.value).toBeNull();
+    } finally {
+      release({});
+      f.cleanup();
+    }
+  },
+);
+it("DASH readiness is not presentation and a late same-source frame clears only its timeout", async () => {
+  const f = setup({ metricClock: true });
+  try {
+    f.state.value.playback_status = "playing";
+    await f.runtime.loadMedia();
+    f.element.readyState = 4;
+    f.element.dispatchEvent(new Event("loadeddata"));
+    dashboards[0].options.onStatus({ status: "ready", readyState: 4 });
+    expect(f.runtime.loadingStage.value).toBe("waiting_frame");
+    expect(f.runtime.startupDiagnostics.value?.first_frame).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "FIRST_FRAME_TIMEOUT",
+    );
+    expect(f.error.value).toContain("播放首帧等待超时");
+    expect(f.runtime.loadingStage.value).toBe("failed");
+    f.element.paused = false;
+    f.element.dispatchEvent(new Event("playing"));
+    f.element.currentTime = 0.1;
+    f.element.dispatchEvent(new Event("timeupdate"));
+    expect(f.runtime.preparation.value.phase).toBe("ready");
+    expect(f.error.value).toBe("");
+    expect(f.runtime.loadingStage.value).toBe("playing");
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(f.runtime.startupDiagnostics.value?.first_frame?.evidence).toBe(
+      "playing_time_advance",
+    );
+    expect(
+      f.runtime.startupDiagnostics.value?.startup_phases.loading_ms,
+    ).toBeGreaterThan(0);
+    expect(JSON.stringify(f.runtime.startupDiagnostics.value)).not.toContain(
+      "token",
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+it("a real media failure after startup timeout remains terminal despite late progress", async () => {
+  const f = setup({ metricClock: true });
+  try {
+    f.state.value.playback_status = "playing";
+    await f.runtime.loadMedia();
+    f.element.readyState = 4;
+    f.element.dispatchEvent(new Event("loadeddata"));
+    await vi.advanceTimersByTimeAsync(20_000);
+    dashboards[0].options.onError({
+      message: "媒体加载失败",
+      code: "DASH_PLAYBACK_ERROR",
+    });
+    f.element.paused = false;
+    f.element.dispatchEvent(new Event("playing"));
+    f.element.currentTime = 1;
+    f.element.dispatchEvent(new Event("timeupdate"));
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "DASH_PLAYBACK_ERROR",
+    );
+    expect(f.error.value).toBe("媒体加载失败");
+    expect(f.runtime.loadingStage.value).toBe("failed");
+  } finally {
+    f.cleanup();
+  }
+});
+it("late presentation clears the first-frame timeout while preserving another notice", async () => {
+  const f = setup({ metricClock: true });
+  try {
+    f.state.value.playback_status = "playing";
+    await f.runtime.loadMedia();
+    f.element.readyState = 4;
+    f.element.dispatchEvent(new Event("loadeddata"));
+    await vi.advanceTimersByTimeAsync(20_000);
+    f.error.value = "另一个房间操作失败";
+    f.element.paused = false;
+    f.element.dispatchEvent(new Event("playing"));
+    f.element.currentTime = 1;
+    f.element.dispatchEvent(new Event("timeupdate"));
+    expect(f.runtime.preparation.value.failure).toBeUndefined();
+    expect(f.error.value).toBe("另一个房间操作失败");
+  } finally {
+    f.cleanup();
+  }
+});
+it("a presented frame cannot leave local synchronization waiting indefinitely", async () => {
+  const f = setup({ metricClock: true });
+  try {
+    await f.runtime.loadMedia();
+    f.element.readyState = 4;
+    f.element.dispatchEvent(new Event("loadeddata"));
+    f.element.paused = false;
+    f.element.dispatchEvent(new Event("playing"));
+    f.element.currentTime = 1;
+    f.element.dispatchEvent(new Event("timeupdate"));
+    expect(f.runtime.loadingStage.value).toBe("playing");
+    await vi.advanceTimersByTimeAsync(20_500);
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "PLAYBACK_RECOVERY_TIMEOUT",
+    );
+    expect(f.runtime.recoveryState.value).toBe("failed");
+    expect(f.state.value.playback_status).toBe("paused");
+  } finally {
+    f.cleanup();
+  }
+});
+it("confirmed convergence retires only the local synchronization timeout", async () => {
+  const f = setup({ metricClock: true });
+  try {
+    await f.runtime.loadMedia();
+    f.element.readyState = 4;
+    f.element.dispatchEvent(new Event("loadeddata"));
+    f.element.paused = false;
+    f.element.dispatchEvent(new Event("playing"));
+    f.element.currentTime = 1;
+    f.element.dispatchEvent(new Event("timeupdate"));
+    await vi.advanceTimersByTimeAsync(20_500);
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "PLAYBACK_RECOVERY_TIMEOUT",
+    );
+    const ranges = { length: 1, start: () => 0, end: () => 100 };
+    f.element.seekable = f.element.buffered = ranges;
+    f.element.paused = true;
+    f.element.currentTime = 5;
+    await f.runtime.applyState(true);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(f.runtime.recoveryState.value).toBe("idle");
+    expect(f.runtime.preparation.value.failure).toBeUndefined();
+    expect(f.runtime.loadingStage.value).toBe("playing");
+    expect(f.error.value).toBe("");
+  } finally {
+    f.cleanup();
+  }
+});
 it("HLS-only Bilibili browser uses the dedicated pending compatibility route and actual attempt", async () => {
   const f = setup({ mse: false, nativeHls: true, quality: true });
   try {
@@ -552,9 +1101,18 @@ it.each(["bilibili", "youtube"] as const)(
         "http_file_fallback_version",
         "static_hls_fallback_version",
         "upstream_profile_report",
-        "playback_metrics_version",
       ])
         expect(body).not.toHaveProperty(field);
+      if (provider === "bilibili")
+        expect(body).toMatchObject({
+          playback_metrics_version: 1,
+          playback_metrics_supported_versions: [1, 2],
+          playback_metrics: {
+            meter_start_generation: body.plan_generation,
+            startup_origin: "user_intent",
+          },
+        });
+      else expect(body).not.toHaveProperty("playback_metrics_version");
       expect(f.api.mock.calls.some(([p]) => p === "/playback-candidates")).toBe(
         false,
       );
@@ -1624,3 +2182,967 @@ it("native probe rejects a response past its absolute deadline even before a del
     f.cleanup();
   }
 });
+
+
+it.each(["reset", "identity", "media", "dispose"])(
+  "late DASH driver-module resolution cannot create an adapter after %s",
+  async (cause) => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    dashDriverLoad.before = () => pending;
+    const f = setup();
+    try {
+      const loading = f.runtime.loadMedia();
+      await settle();
+      expect(dashDriverLoad.calls).toBe(1);
+      expect(dashboards).toHaveLength(0);
+      if (cause === "reset") await f.runtime.reset();
+      else if (cause === "identity") ++f.session.epoch;
+      else if (cause === "media") f.state.value.media_generation++;
+      else f.cleanup();
+      release();
+      await loading;
+      expect(dashboards).toHaveLength(0);
+      expect(f.element.src).toBe("");
+    } finally {
+      release();
+      f.cleanup();
+    }
+  },
+);
+it.each(["data", "frame"])(
+  "the DASH driver-module wait consumes the original %s budget",
+  async (kind) => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    dashDriverLoad.before = () => pending;
+    const f = setup({ metricClock: true });
+    try {
+      if (kind === "frame") {
+        f.state.value.playback_status = "playing";
+        f.element.readyState = 4;
+      }
+      const loading = f.runtime.loadMedia();
+      await settle();
+      expect(dashDriverLoad.calls).toBe(1);
+      expect(dashboards).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(19000);
+      expect(f.runtime.preparation.value.failure).toBeUndefined();
+      release();
+      await loading;
+      expect(dashboards).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(f.runtime.preparation.value.failure?.code).toBe(
+        kind === "frame" ? "FIRST_FRAME_TIMEOUT" : "MEDIA_DATA_TIMEOUT",
+      );
+    } finally {
+      release();
+      f.cleanup();
+    }
+  },
+);
+it("a failed DASH driver import keeps the safe library failure category and an explicit retry", async () => {
+  dashDriverLoad.before = async () => { throw Error("private module URL"); };
+  const f = setup();
+  try {
+    await f.runtime.loadMedia();
+    expect(dashboards).toHaveLength(0);
+    expect(f.runtime.preparation.value.failure?.code).toBe("DASH_LIBRARY_LOAD_FAILED");
+    expect(f.error.value).toBe("DASH 播放器加载失败，请重试");
+    expect(f.error.value).not.toContain("private module URL");
+    dashDriverLoad.before = undefined;
+    await f.runtime.runPlayback(() => f.runtime.loadMedia());
+    expect(dashboards).toHaveLength(1);
+    expect(f.bodies).toHaveLength(2);
+    expect(f.error.value).toBe("");
+  } finally { f.cleanup(); }
+});
+it("staged settings during the DASH module wait preserve the already granted attachment", async () => {
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  dashDriverLoad.before = () => pending;
+  const f = setup();
+  try {
+    const loading = f.runtime.loadMedia();
+    await settle();
+    expect(dashDriverLoad.calls).toBe(1);
+    f.runtime.nativePlaybackMode.value = "compatibility";
+    release();
+    await loading;
+    expect(dashboards).toHaveLength(1);
+    expect(dashboards[0].options.video).toBe(f.element);
+    expect(f.bodies).toHaveLength(1);
+    expect(f.error.value).toBe("");
+  } finally {
+    release();
+    f.cleanup();
+  }
+});
+
+
+it.each([
+  [false, "resolve"],
+  [false, "reject"],
+  [true, "resolve"],
+  [true, "reject"],
+] as const)(
+  "a retired %s live play %s cannot release or block the successor policy's play",
+  async (fromLive, settlement) => {
+    const options = { live: fromLive };
+    const f = setup(options);
+    const call = f.api.getMockImplementation()!;
+    f.api.mockImplementation(async (path, method, body) => {
+      const result = await call(path, method, body);
+      return path === "/playback-sessions/native-platform" && method === "POST"
+        ? { ...result, media_generation: body.media_generation }
+        : result;
+    });
+    const live = {
+      version: 1,
+      broadcast_id: "12:34:1700000000",
+      sync_mode: "live_edge_control",
+    };
+    let settleOld!: () => void, rejectNew!: (failure: Error) => void;
+    try {
+      f.state.value.playback_rate = fromLive ? 1 : 1.25;
+      await f.runtime.loadMedia();
+      f.element.readyState = 4;
+      f.element.seekable = { length: 1, start: () => 0, end: () => 120 };
+      f.element.play
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((resolve, reject) => {
+              settleOld = () =>
+                settlement === "reject"
+                  ? reject(
+                      new DOMException("retired autoplay", "NotAllowedError"),
+                    )
+                  : resolve();
+            }),
+        )
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              rejectNew = reject;
+            }),
+        );
+      f.state.value.playback_status = "playing";
+      const oldPlaying = f.runtime.applyState();
+      expect(f.element.play).toHaveBeenCalledTimes(1);
+      const oldSession = f.runtime.sessionId.value;
+
+      options.live = !fromLive;
+      f.selectedMedia.platform = options.live
+        ? {
+            version: 3,
+            provider: "bilibili",
+            part: 1,
+            content_id: `live:12:${live.broadcast_id}`,
+            resource: {
+              kind: "bilibili_live",
+              room_id: "12",
+              uid: "34",
+              broadcast_id: live.broadcast_id,
+            },
+          }
+        : { ...media.platform };
+      f.state.value = {
+        ...f.state.value,
+        media_generation: f.state.value.media_generation + 1,
+        playback_status: "paused",
+        playback_rate: options.live ? 1 : 1.5,
+        live: options.live ? live : undefined,
+        anchor_position_ms: options.live ? 0 : 5000,
+        duration_ms: options.live ? null : 100000,
+      };
+      await f.runtime.loadMedia();
+      expect(f.runtime.sessionId.value).not.toBe(oldSession);
+      expect(f.runtime.live.value).toBe(!fromLive);
+      expect(f.runtime.video.value).toBe(f.element);
+      f.state.value.playback_status = "playing";
+      const newPlaying = f.runtime.applyState();
+      expect(f.element.play).toHaveBeenCalledTimes(2);
+      expect(f.element.playbackRate).toBe(options.live ? 1 : 1.5);
+      f.element.pause.mockClear();
+      settleOld();
+      await oldPlaying;
+      expect(f.element.pause).not.toHaveBeenCalled();
+      expect(f.runtime.blocked.value).toBe(false);
+      expect(f.error.value).toBe("");
+      // An old finally must not free the successor's in-flight claim, including
+      // the explicit gesture entry point shared by both policies.
+      await f.runtime.enablePlayback();
+      expect(f.element.play).toHaveBeenCalledTimes(2);
+      rejectNew(new DOMException("current autoplay", "NotAllowedError"));
+      await newPlaying;
+      expect(f.runtime.blocked.value).toBe(true);
+      expect(f.bodies).toHaveLength(2);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+it("live periodic convergence keeps paused time local and resumes only at the decoder edge", async () => {
+  const f = setup({ live: true });
+  try {
+    f.clock.ready = false;
+    await f.runtime.loadMedia();
+    f.element.readyState = 2;
+    f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+    f.element.currentTime = 102;
+    f.runtime.position.value = 999;
+    f.runtime.duration.value = 999;
+    f.element.pause.mockClear();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(f.runtime.position.value).toBe(0);
+    expect(f.runtime.duration.value).toBe(0);
+    expect(f.element.currentTime).toBe(102);
+    expect(f.element.pause).toHaveBeenCalledOnce();
+    expect(f.element.play).not.toHaveBeenCalled();
+    f.state.value.playback_status = "playing";
+    await vi.advanceTimersByTimeAsync(500);
+    expect(f.element.currentTime).toBe(127);
+    expect(f.element.play).toHaveBeenCalledOnce();
+    expect(f.clock.ready).toBe(false);
+    expect(f.runtime.video.value).toBe(f.element);
+    expect(f.bodies).toHaveLength(1);
+    expect(f.ended).not.toHaveBeenCalled();
+  } finally {
+    f.cleanup();
+  }
+});
+
+it.each(["broadcast", "media"] as const)(
+  "live periodic convergence rejects a changed %s identity before classifying ended media",
+  async (identity) => {
+    const f = setup({ live: true });
+    try {
+      await f.runtime.loadMedia();
+      f.element.readyState = 2;
+      f.element.ended = true;
+      if (identity === "broadcast")
+        f.state.value.live = {
+          ...f.state.value.live,
+          broadcast_id: "12:34:1700000001",
+        };
+      else f.state.value.media_generation++;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(f.runtime.preparation.value.failure?.code).toBe(
+        "NATIVE_LIVE_STATE_CHANGED",
+      );
+      expect(f.element.play).not.toHaveBeenCalled();
+      expect(f.bodies).toHaveLength(1);
+      expect(f.ended).not.toHaveBeenCalled();
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+it("live periodic convergence preserves a terminal episode without repeating its failure", async () => {
+  const f = setup({ live: true });
+  try {
+    await f.runtime.loadMedia();
+    f.element.readyState = 2;
+    f.element.ended = true;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "NATIVE_LIVE_NOT_BROADCASTING",
+    );
+    f.error.value = "independent current notice";
+    f.element.pause.mockClear();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.error.value).toBe("independent current notice");
+    expect(f.element.pause).not.toHaveBeenCalled();
+    expect(f.element.play).not.toHaveBeenCalled();
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "NATIVE_LIVE_NOT_BROADCASTING",
+    );
+    expect(f.bodies).toHaveLength(1);
+    expect(f.ended).not.toHaveBeenCalled();
+  } finally {
+    f.cleanup();
+  }
+});
+
+it("gesture port characterization: live room status is read after a synchronous rate effect", async () => {
+  const f = setup({ live: true });
+  try {
+    f.clock.ready = false;
+    await f.runtime.loadMedia();
+    f.element.readyState = 2;
+    f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+    f.element.currentTime = 102;
+    f.state.value.playback_status = "playing";
+    f.state.value.playback_rate = 1.25;
+    let rate = 1,
+      pauseOnce = true;
+    Object.defineProperty(f.element, "playbackRate", {
+      configurable: true,
+      get: () => rate,
+      set: (value: number) => {
+        rate = value;
+        if (pauseOnce) {
+          pauseOnce = false;
+          f.state.value.playback_status = "paused";
+        }
+      },
+    });
+    f.element.play.mockClear();
+    f.element.play.mockImplementation(async () => {
+      f.element.paused = false;
+    });
+    await f.runtime.enablePlayback();
+    expect(rate).toBe(1.25);
+    expect(f.state.value.playback_status).toBe("paused");
+    expect(f.element.currentTime).toBe(102);
+    expect(f.element.play).not.toHaveBeenCalled();
+    f.state.value.playback_status = "playing";
+    await f.runtime.enablePlayback();
+    expect(f.element.currentTime).toBe(127);
+    expect(f.element.play).toHaveBeenCalledOnce();
+    expect(f.runtime.video.value).toBe(f.element);
+    expect(f.bodies).toHaveLength(1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+it("gesture port characterization: live edge assignment precedes the late play-property lookup", async () => {
+  const f = setup({ live: true });
+  const effects: string[] = [];
+  try {
+    await f.runtime.loadMedia();
+    f.element.readyState = 2;
+    f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+    f.state.value.playback_status = "playing";
+    f.runtime.blocked.value = true;
+    let position = 102;
+    Object.defineProperty(f.element, "currentTime", {
+      configurable: true,
+      get: () => position,
+      set: function (this: unknown, value: number) {
+        expect(this).toBe(f.element);
+        effects.push(`seek ${value}`);
+        position = value;
+      },
+    });
+    f.element.play.mockImplementation(async () => {
+      f.element.paused = false;
+    });
+    const original = f.element.play;
+    Object.defineProperty(f.element, "play", {
+      configurable: true,
+      get: () => {
+        effects.push("play lookup");
+        expect(f.runtime.blocked.value).toBe(false);
+        expect(position).toBe(127);
+        return original;
+      },
+    });
+    const gesture = f.runtime.enablePlayback();
+    effects.push("caller returned");
+    expect(effects.slice(0, 3)).toEqual([
+      "seek 127",
+      "play lookup",
+      "caller returned",
+    ]);
+    await gesture;
+    expect(effects).toEqual([
+      "seek 127",
+      "play lookup",
+      "caller returned",
+      "seek 127",
+    ]);
+    expect(original).toHaveBeenCalledOnce();
+    expect(f.runtime.video.value).toBe(f.element);
+    expect(f.bodies).toHaveLength(1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+it("gesture port characterization: a changed live broadcast retires a late gesture denial", async () => {
+  const f = setup({ live: true });
+  let reject!: (failure: Error) => void;
+  try {
+    await f.runtime.loadMedia();
+    f.element.readyState = 2;
+    f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+    f.state.value.playback_status = "playing";
+    f.runtime.blocked.value = true;
+    f.element.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, no) => {
+          reject = no;
+        }),
+    );
+    const gesture = f.runtime.enablePlayback();
+    expect(f.element.play).toHaveBeenCalledOnce();
+    f.state.value.live = {
+      ...f.state.value.live,
+      broadcast_id: "12:34:1700000001",
+    };
+    const notice = f.error.value;
+    f.element.pause.mockClear();
+    reject(new DOMException("old live gesture", "NotAllowedError"));
+    await gesture;
+    expect(f.runtime.blocked.value).toBe(false);
+    expect(f.error.value).toBe(notice);
+    expect(f.element.pause).not.toHaveBeenCalled();
+    expect(f.bodies).toHaveLength(1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+it("gesture port characterization: an absent element does not move failed-plan admission after clock evaluation", async () => {
+  const f = setup({ provider: "youtube", mse: true, nativeHls: false });
+  try {
+    f.runtime.nativePlaybackMode.value = "compatibility";
+    await f.runtime.loadMedia();
+    hlsPlayers[0].handlers.get("error")!(null, {
+      fatal: true,
+      type: "mediaError",
+      details: "decode-failed",
+    });
+    await settle();
+    expect(f.runtime.preparation.value.phase).toBe("failed");
+    const notice = f.error.value;
+    // Fixture-only absence isolates the failed-plan versus clock read order.
+    f.runtime.video.value = undefined;
+    const clockRead = vi.fn(() => false);
+    Object.defineProperty(f.clock, "ready", {
+      configurable: true,
+      get: clockRead,
+    });
+    await expect(f.runtime.enablePlayback()).resolves.toBeUndefined();
+    expect(clockRead).not.toHaveBeenCalled();
+    expect(f.error.value).toBe(notice);
+    expect(f.element.play).not.toHaveBeenCalled();
+  } finally {
+    f.runtime.video.value = f.element;
+    f.cleanup();
+  }
+});
+
+it("gesture port characterization: terminal live state short-circuits the physical ended getter", async () => {
+  const f = setup({ live: true });
+  try {
+    await f.runtime.loadMedia();
+    f.element.ended = true;
+    f.element.onended();
+    await settle();
+    expect(f.runtime.preparation.value.failure?.code).toBe(
+      "NATIVE_LIVE_NOT_BROADCASTING",
+    );
+    const notice = f.error.value;
+    const endedRead = vi.fn(() => {
+      throw new Error("terminal episode must short-circuit ended");
+    });
+    Object.defineProperty(f.element, "ended", {
+      configurable: true,
+      get: endedRead,
+    });
+    await expect(f.runtime.enablePlayback()).resolves.toBeUndefined();
+    expect(endedRead).not.toHaveBeenCalled();
+    expect(f.error.value).toBe(notice);
+    expect(f.element.play).not.toHaveBeenCalled();
+    expect(f.bodies).toHaveLength(1);
+  } finally {
+    Object.defineProperty(f.element, "ended", {
+      configurable: true,
+      writable: true,
+      value: true,
+    });
+    f.cleanup();
+  }
+});
+
+async function traceAutomaticSettlement(
+  f: ReturnType<typeof setup>,
+  effects: string[],
+  release?: () => void,
+) {
+  recoveryTrace.visit = () => effects.push("recovery");
+  const applying = f.runtime.applyState();
+  effects.push("caller returned");
+  let failure: unknown;
+  const settled = applying.then(
+    () => {
+      effects.push("caller resolved");
+    },
+    (error: unknown) => {
+      failure = error;
+      effects.push("caller rejected");
+    },
+  );
+  const sentinels = (async () => {
+    for (let tick = 1; tick <= 6; tick++) {
+      await Promise.resolve();
+      effects.push(`microtask ${tick}`);
+      if (tick === 1 && release) {
+        effects.push("release");
+        release();
+      }
+    }
+  })();
+  await Promise.all([settled, sentinels]);
+  recoveryTrace.visit = undefined;
+  return failure;
+}
+
+const automaticSettlementModes = [
+  "paused",
+  "resolve",
+  "reject",
+  "method throw",
+  "getter throw",
+  "deferred resolve",
+  "deferred reject",
+] as const;
+for (const live of [true, false]) {
+  it.each(automaticSettlementModes)(
+    `automatic live characterization: ${live ? "live" : "VOD"} %s preserves pre-await effects and recovery settlement`,
+    async (mode) => {
+      const f = setup({ live });
+      const effects: string[] = [];
+      const failure = new Error("synthetic media failure");
+      let release: (() => void) | undefined;
+      try {
+        await f.runtime.loadMedia();
+        f.clock.ready = !live;
+        f.element.readyState = 2;
+        f.element.seekable = { length: 1, start: () => 0, end: () => 120 };
+        f.state.value.playback_status =
+          mode === "paused" ? "paused" : "playing";
+        let position = 15;
+        Object.defineProperty(f.element, "currentTime", {
+          configurable: true,
+          get: () => position,
+          set: (value: number) => {
+            position = value;
+            effects.push(`seek ${value}`);
+          },
+        });
+        f.element.pause.mockImplementation(() => {
+          effects.push("pause");
+          f.element.paused = true;
+        });
+        const play = function (this: unknown) {
+          expect(this).toBe(f.element);
+          effects.push("play");
+          if (mode === "method throw") throw failure;
+          if (mode === "reject") return Promise.reject(failure);
+          if (mode.startsWith("deferred"))
+            return new Promise<void>((resolve, reject) => {
+              release = () => {
+                if (mode === "deferred reject") reject(failure);
+                else {
+                  f.element.paused = false;
+                  resolve();
+                }
+              };
+            });
+          f.element.paused = false;
+          return Promise.resolve();
+        };
+        Object.defineProperty(f.element, "play", {
+          configurable: true,
+          get: () => {
+            effects.push("play lookup");
+            if (mode === "getter throw") throw failure;
+            return play;
+          },
+        });
+        const result = await traceAutomaticSettlement(
+          f,
+          effects,
+          mode.startsWith("deferred") ? () => release!() : undefined,
+        );
+        const rejected =
+          !live &&
+          [
+            "reject",
+            "method throw",
+            "getter throw",
+            "deferred reject",
+          ].includes(mode);
+        expect(result).toBe(rejected ? failure : undefined);
+        const prefix =
+          mode === "paused"
+            ? ["pause", ...(!live ? ["seek 5"] : [])]
+            : [
+                ...(live ? ["seek 117"] : []),
+                "play lookup",
+                ...(mode === "getter throw" ? [] : ["play"]),
+              ];
+        const outcome = rejected ? "caller rejected" : "caller resolved";
+        const tail = mode.startsWith("deferred")
+          ? [
+              "microtask 1",
+              "release",
+              "microtask 2",
+              "recovery",
+              "microtask 3",
+              outcome,
+              "microtask 4",
+              "microtask 5",
+              "microtask 6",
+            ]
+          : mode === "resolve" || mode === "reject"
+            ? [
+                "microtask 1",
+                "recovery",
+                "microtask 2",
+                outcome,
+                "microtask 3",
+                "microtask 4",
+                "microtask 5",
+                "microtask 6",
+              ]
+            : [
+                "recovery",
+                "microtask 1",
+                outcome,
+                "microtask 2",
+                "microtask 3",
+                "microtask 4",
+                "microtask 5",
+                "microtask 6",
+              ];
+        // Live interruption publication triggers its existing synchronous recovery
+        // watcher before the later applyState finally evaluation.
+        if (live && (mode === "method throw" || mode === "getter throw"))
+          prefix.push("recovery");
+        if (live && mode === "reject") tail.unshift("recovery");
+        if (live && mode === "deferred reject") tail.splice(2, 0, "recovery");
+        expect([...effects]).toEqual([...prefix, "caller returned", ...tail]);
+        expect(f.runtime.video.value).toBe(f.element);
+        expect(f.bodies).toHaveLength(1);
+        if (mode.includes("throw") || mode.includes("reject")) {
+          expect(f.runtime.blocked.value).toBe(false);
+          if (live) expect(f.error.value).toContain("中断");
+        }
+      } finally {
+        recoveryTrace.visit = undefined;
+        release?.();
+        f.cleanup();
+      }
+    },
+  );
+}
+
+it.each([false, true])(
+  "automatic live characterization: prefix getter %s cancellation retains the rejected-promise boundary",
+  async (cancelled) => {
+    const f = setup({ live: true });
+    const effects: string[] = [];
+    const failure = cancelled
+      ? new PlaybackCancelled()
+      : new Error("synthetic prefix getter");
+    let armed = true;
+    try {
+      await f.runtime.loadMedia();
+      Object.defineProperty(f.active, "value", {
+        configurable: true,
+        get: () => {
+          if (armed) {
+            armed = false;
+            effects.push("prefix getter throws");
+            throw failure;
+          }
+          return true;
+        },
+      });
+      const result = await traceAutomaticSettlement(f, effects);
+      expect(result).toBe(cancelled ? undefined : failure);
+      expect(effects).toEqual([
+        "prefix getter throws",
+        "caller returned",
+        "recovery",
+        "microtask 1",
+        cancelled ? "caller resolved" : "caller rejected",
+        "microtask 2",
+        "microtask 3",
+        "microtask 4",
+        "microtask 5",
+        "microtask 6",
+      ]);
+      expect(f.element.play).not.toHaveBeenCalled();
+    } finally {
+      recoveryTrace.visit = undefined;
+      delete (f.active as any).value;
+      f.cleanup();
+    }
+  },
+);
+
+it.each(["missing plan", "inactive", "failed plan"] as const)(
+  "automatic live characterization: %s early return retains recovery-finally timing",
+  async (mode) => {
+    const f = setup({ live: true });
+    const effects: string[] = [];
+    try {
+      if (mode !== "missing plan") await f.runtime.loadMedia();
+      if (mode === "inactive") {
+        f.active.value = false;
+        await settle();
+      }
+      if (mode === "failed plan") {
+        f.element.error = { code: 3 };
+        f.element.onerror();
+        expect(f.runtime.preparation.value.failure).toBeDefined();
+      }
+      const result = await traceAutomaticSettlement(f, effects);
+      expect(result).toBeUndefined();
+      expect(effects).toEqual([
+        "caller returned",
+        "recovery",
+        "microtask 1",
+        "caller resolved",
+        "microtask 2",
+        "microtask 3",
+        "microtask 4",
+        "microtask 5",
+        "microtask 6",
+      ]);
+      expect(f.element.play).not.toHaveBeenCalled();
+    } finally {
+      recoveryTrace.visit = undefined;
+      f.cleanup();
+    }
+  },
+);
+
+it.each([
+  "disconnected",
+  "hidden",
+  "metadata",
+  "user seek",
+  "paused hidden",
+] as const)(
+  "automatic live characterization: %s retains rate and short-circuit media admission order",
+  async (condition) => {
+    const f = setup({ live: true });
+    const effects: string[] = [];
+    let afterRate = false;
+    try {
+      await f.runtime.loadMedia();
+      f.clock.ready = false;
+      f.state.value.playback_status =
+        condition === "paused hidden" ? "paused" : "playing";
+      f.state.value.playback_rate = 1.25;
+      if (condition === "disconnected") f.connected.value = false;
+      vi.stubGlobal(
+        "document",
+        Object.assign(new EventTarget(), {
+          get visibilityState() {
+            return "visible";
+          },
+        }),
+      );
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => {
+          if (afterRate) effects.push("foreground");
+          return condition.includes("hidden") ? "hidden" : "visible";
+        },
+      });
+      let rate = 1;
+      Object.defineProperty(f.element, "playbackRate", {
+        configurable: true,
+        get: () => rate,
+        set: (value: number) => {
+          rate = value;
+          afterRate = true;
+          effects.push("rate");
+        },
+      });
+      Object.defineProperty(f.element, "readyState", {
+        configurable: true,
+        get: () => {
+          if (afterRate) effects.push("metadata");
+          return condition === "metadata" ? 0 : 2;
+        },
+      });
+      f.element.pause.mockImplementation(() => {
+        effects.push("pause");
+      });
+      const applying = f.runtime.applyState(false, condition === "user seek");
+      const beforeReturn = [...effects];
+      afterRate = false;
+      await applying;
+      expect(beforeReturn).toEqual(
+        condition === "disconnected"
+          ? ["rate"]
+          : condition === "hidden"
+            ? ["rate", "foreground"]
+            : condition === "paused hidden"
+              ? ["rate", "pause"]
+              : ["rate", "foreground", "metadata"],
+      );
+      expect(f.element.play).not.toHaveBeenCalled();
+      expect(f.element.currentTime).toBe(0);
+      expect(f.element.playbackRate).toBe(1.25);
+      expect(f.runtime.video.value).toBe(f.element);
+      expect(f.bodies).toHaveLength(1);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+it("automatic live characterization: latest PAUSE keeps its original-element right during clock invalidation", async () => {
+  const f = setup({ live: true });
+  let release!: () => void;
+  try {
+    await f.runtime.loadMedia();
+    f.element.readyState = 2;
+    f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+    f.state.value.playback_status = "playing";
+    f.element.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = () => {
+            f.element.paused = false;
+            resolve();
+          };
+        }),
+    );
+    f.element.pause.mockImplementation(() => {
+      f.element.paused = true;
+    });
+    const applying = f.runtime.applyState();
+    expect(f.element.play).toHaveBeenCalledOnce();
+    f.state.value.playback_status = "paused";
+    f.connected.value = false;
+    f.clock.revision++;
+    f.runtime.onClockInvalidated();
+    f.element.pause.mockClear();
+    release();
+    await applying;
+    expect(f.element.pause).toHaveBeenCalledOnce();
+    expect(f.element.paused).toBe(true);
+    expect(f.runtime.blocked.value).toBe(false);
+    expect(f.error.value).toBe("");
+    expect(f.bodies).toHaveLength(1);
+  } finally {
+    release?.();
+    f.cleanup();
+  }
+});
+
+it.each(["identity", "room", "reload"] as const)(
+  "automatic live characterization: late %s settlement cannot pause, block or free a successor gesture",
+  async (cause) => {
+    const f = setup({ live: true });
+    let rejectOld!: (failure: Error) => void, releaseCurrent!: () => void;
+    try {
+      await f.runtime.loadMedia();
+      f.element.readyState = 2;
+      f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+      f.state.value.playback_status = "playing";
+      f.element.play.mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectOld = reject;
+          }),
+      );
+      const applying = f.runtime.applyState();
+      expect(f.element.play).toHaveBeenCalledOnce();
+      if (cause === "identity") f.session.epoch++;
+      if (cause === "room") f.state.value.room_id = id(55);
+      await f.runtime.loadMedia();
+      f.element.play.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseCurrent = () => {
+              f.element.paused = false;
+              resolve();
+            };
+          }),
+      );
+      const gesture = f.runtime.enablePlayback();
+      expect(f.element.play).toHaveBeenCalledTimes(2);
+      f.element.pause.mockClear();
+      rejectOld(new DOMException("old live permission", "NotAllowedError"));
+      await applying;
+      expect(f.element.pause).not.toHaveBeenCalled();
+      expect(f.runtime.blocked.value).toBe(false);
+      expect(f.error.value).toBe("");
+      await f.runtime.applyState();
+      expect(f.element.play).toHaveBeenCalledTimes(2);
+      releaseCurrent();
+      await gesture;
+      expect(f.element.play).toHaveBeenCalledTimes(2);
+      expect(f.runtime.video.value).toBe(f.element);
+      expect(f.bodies).toHaveLength(2);
+    } finally {
+      rejectOld?.(new Error("cleanup"));
+      releaseCurrent?.();
+      f.cleanup();
+    }
+  },
+);
+
+it.each(["staged settings", "Reload"] as const)(
+  "automatic live characterization: %s during the edge write preserves the existing private invocation limit",
+  async (change) => {
+    const f = setup({ live: true });
+    const effects: string[] = [];
+    let loading: Promise<void> | undefined;
+    let once = true,
+      position = 102;
+    const sessionsAtPlay: (string | null)[] = [];
+    try {
+      await f.runtime.loadMedia();
+      f.element.readyState = 2;
+      f.element.seekable = { length: 1, start: () => 100, end: () => 130 };
+      f.state.value.playback_status = "playing";
+      Object.defineProperty(f.element, "currentTime", {
+        configurable: true,
+        get: () => position,
+        set: (value: number) => {
+          position = value;
+          effects.push("edge write");
+          if (once) {
+            once = false;
+            if (change === "Reload") loading = f.runtime.loadMedia();
+            else f.runtime.nativePlaybackMode.value = "compatibility";
+            effects.push(change);
+          }
+        },
+      });
+      f.element.play.mockImplementationOnce(function (this: unknown) {
+        expect(this).toBe(f.element);
+        effects.push("play");
+        sessionsAtPlay.push(f.runtime.sessionId.value);
+        f.element.paused = false;
+        return Promise.resolve();
+      });
+      const applying = f.runtime.applyState();
+      effects.push("caller returned");
+      expect([...effects]).toEqual([
+        "edge write",
+        change,
+        "play",
+        "caller returned",
+      ]);
+      // This records existing behavior, not a reusable/retired driver promise:
+      // edge-write reentrancy does not add a second pre-play admission check.
+      expect(sessionsAtPlay).toEqual([change === "Reload" ? null : id(21)]);
+      await applying;
+      await loading;
+      expect(f.element.play).toHaveBeenCalledOnce();
+      expect(f.runtime.blocked.value).toBe(false);
+      expect(f.error.value).toBe("");
+      expect(f.runtime.video.value).toBe(f.element);
+      expect(f.bodies).toHaveLength(change === "Reload" ? 2 : 1);
+    } finally {
+      await loading;
+      f.cleanup();
+    }
+  },
+);

@@ -157,7 +157,10 @@ test("focus refresh removes an unavailable current source and returns to allowed
   await expect(
     page.getByRole("navigation", { name: "媒体库目录" }).getByRole("button"),
   ).toHaveText(["全部片源"]);
-  await expect(page.getByText("共 0 部影片", { exact: true })).toBeVisible();
+  await expect(page.locator(".hierarchy-count")).toBeVisible();
+  await expect(page.locator(".hierarchy-count")).toHaveText(
+    "所有可访问片源共 0 部影片",
+  );
   expect(app.calls.at(-1)?.searchParams.has("node")).toBe(false);
   expect(app.calls.at(-1)?.searchParams.has("after")).toBe(false);
   expect(app.errors).toEqual([]);

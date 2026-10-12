@@ -36,7 +36,10 @@ pub(super) fn authority_expired(error: &Error) -> bool {
     error.0 == StatusCode::UNAUTHORIZED && error.1 == "session_expired"
 }
 pub(super) async fn begin(app: &App) -> Result<Transaction<'_, Postgres>> {
-    let mut tx = tokio::time::timeout(Duration::from_secs(5), app.db.begin())
+    begin_db(&app.db).await
+}
+pub(super) async fn begin_db(db: &sqlx::PgPool) -> Result<Transaction<'_, Postgres>> {
+    let mut tx = tokio::time::timeout(Duration::from_secs(5), db.begin())
         .await
         .map_err(|_| {
             err(

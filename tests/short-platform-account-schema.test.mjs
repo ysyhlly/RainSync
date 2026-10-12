@@ -36,7 +36,7 @@ test("0053 source authority matches exact user/provider/account/revision and liv
 });
 
 test("short account routes use bounded JSON and retain existing Bilibili routes", async () => {
-  const main = await read("apps/server/src/main.rs");
+  const main = await read("apps/server/src/bootstrap/routes.rs");
   assert.match(main, /"\/api\/v1\/platform-accounts\/\{provider\}"[\s\S]*?short_status[\s\S]*?unlink_short[\s\S]*?max\(1024\)/);
   assert.match(main, /"\/api\/v1\/platform-accounts\/\{provider\}\/credential"[\s\S]*?import_short_credential[\s\S]*?max\(16 \* 1024\)/);
   assert.match(main, /"\/api\/v1\/platform-accounts\/bilibili"[\s\S]*?platform_accounts::status[\s\S]*?platform_accounts::unlink/);

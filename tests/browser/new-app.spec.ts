@@ -90,7 +90,10 @@ test("beige tokens, media ratio, dialogs and required widths remain usable", asy
   page,
 }, info) => {
   await appFixture(page);
+  // Beige tokens belong to the explicit light preference, including on dark OSes.
+  await page.addInitScript(() => localStorage.setItem("rainsync.theme", "light"));
   await page.goto(appBase + "/rooms");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   await page.getByRole("button", { name: "创建房间", exact: true }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await page.keyboard.press("Escape");
@@ -131,7 +134,7 @@ test("beige tokens, media ratio, dialogs and required widths remain usable", asy
         .trim()
         .toUpperCase(),
     ),
-  ).toBe("#D7BDA5");
+  ).toBe("#79553D");
   await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
   expect(
     await page.evaluate(
@@ -160,8 +163,11 @@ test("a late room lookup after navigating away cannot open a room in the backgro
     .getByRole("link", { name: "媒体库", exact: true })
     .filter({ visible: true })
     .click();
+  await expect(page).toHaveURL(/\/library$/);
   await expect(
-    page.getByRole("heading", { name: "媒体库", exact: true }),
+    page
+      .locator(".library-page")
+      .getByRole("heading", { name: "媒体库", exact: true }),
   ).toBeVisible();
   release();
   await expect(page.locator(".mini-player")).not.toBeVisible();

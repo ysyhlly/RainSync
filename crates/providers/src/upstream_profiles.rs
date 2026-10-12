@@ -3,7 +3,7 @@
 //! This evidence describes request bounds, never measured encoder output.
 //! Metadata comes only from the authenticated, bounded single-item GET. The
 //! reservation owner must checkpoint every returned SID before `validate_route`.
-use super::{PlaybackOptions, SourceConfig, upstream_common, upstream_headers};
+use super::{PlaybackOptions, SourceConfig, UpstreamKind, upstream_common};
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,7 +15,7 @@ pub const EMBY_PROFILE_ID: &str = "emby_avc_sdr_720p_rates_v2";
 pub const EMBY_PROFILE_VERSION: u8 = 2;
 pub const EMBY_AUDIO_RATES: [u32; 2] = [44_100, 48_000];
 pub fn profile_identity(kind: &str) -> (u8, &'static str) {
-    if kind == "emby" {
+    if UpstreamKind::parse(kind) == Some(UpstreamKind::Emby) {
         (EMBY_PROFILE_VERSION, EMBY_PROFILE_ID)
     } else {
         (PROFILE_VERSION, PROFILE_ID)
@@ -23,9 +23,9 @@ pub fn profile_identity(kind: &str) -> (u8, &'static str) {
 }
 pub fn validate_profile_metadata(kind: &str, metadata: &UpstreamProfileMetadata) -> Result<()> {
     validate_metadata_proof(metadata)?;
-    ensure!(matches!(kind, "emby" | "jellyfin"), "invalid_upstream_kind");
+    let kind = UpstreamKind::parse(kind).ok_or_else(|| anyhow::anyhow!("invalid_upstream_kind"))?;
     ensure!(
-        kind != "emby"
+        kind != UpstreamKind::Emby
             || metadata
                 .audio
                 .as_ref()
@@ -153,13 +153,11 @@ pub async fn metadata(
     audio_index: Option<u32>,
     device_id: &str,
 ) -> Result<UpstreamProfileMetadata> {
-    ensure!(matches!(kind, "jellyfin" | "emby"), "invalid_upstream_kind");
-    let headers = upstream_headers(kind, config, device_id)
-        .map_err(|_| anyhow::anyhow!("upstream_metadata_identity_invalid"))?;
-    let value = upstream_common::item_metadata(config, item, &headers).await?;
-    let metadata = normalize_metadata(&value, item, audio_index)?;
-    validate_profile_metadata(kind, &metadata)?;
-    Ok(metadata)
+    let kind =
+        crate::UpstreamKind::parse(kind).ok_or_else(|| anyhow::anyhow!("invalid_upstream_kind"))?;
+    crate::capabilities::UpstreamProbe::new(kind, config)
+        .profile_metadata(item, audio_index, device_id)
+        .await
 }
 
 fn text(value: &Value, key: &str, required: bool) -> Result<Option<String>> {
@@ -383,8 +381,8 @@ pub(super) fn request(
     options: &PlaybackOptions,
     metadata: &UpstreamProfileMetadata,
 ) -> Result<Value> {
-    ensure!(matches!(kind, "jellyfin" | "emby"), "invalid_upstream_kind");
-    validate_profile_metadata(kind, metadata)?;
+    let kind = UpstreamKind::parse(kind).ok_or_else(|| anyhow::anyhow!("invalid_upstream_kind"))?;
+    validate_profile_metadata(kind.as_str(), metadata)?;
     ensure!(
         options.hls && options.force_transcode,
         "upstream_profile_explicit_transcode_required"
@@ -430,7 +428,7 @@ pub(super) fn request(
     ];
     // Jellyfin renamed this condition; do not apply its spelling to Emby.
     video_conditions.push(condition(
-        if kind == "jellyfin" {
+        if kind == UpstreamKind::Jellyfin {
             "VideoRangeType"
         } else {
             "VideoRange"
@@ -443,7 +441,7 @@ pub(super) fn request(
         "AudioCodec":"aac","Context":"Streaming","MaxAudioChannels":"2",
         "EnableAudioVbrEncoding":false,"AllowInterlacedVideoStreamCopy":false
     });
-    if kind == "emby" {
+    if kind == UpstreamKind::Emby {
         transcoding["MaxWidth"] = json!(1280);
         transcoding["MaxHeight"] = json!(720);
     }
@@ -505,7 +503,7 @@ fn query_exact(query: &BTreeMap<String, String>, key: &str, expected: &str) -> R
 }
 
 fn item_master_path_matches(
-    kind: &str,
+    kind: UpstreamKind,
     config: &SourceConfig,
     item: &str,
     url: &reqwest::Url,
@@ -517,7 +515,7 @@ fn item_master_path_matches(
     // Jellyfin serializes metadata IDs as compact GUIDs but its HLS route uses
     // Guid's hyphenated format. Admit only these two exact GUID spellings, not
     // arbitrary hyphen removal, percent decoding or another item/base path.
-    if kind != "jellyfin"
+    if kind != UpstreamKind::Jellyfin
         || !((item.len() == 32 && item.bytes().all(|b| b.is_ascii_hexdigit()))
             || (item.len() == 36
                 && item.bytes().enumerate().all(|(i, b)| {
@@ -622,8 +620,8 @@ pub fn validate_route(
     metadata: &UpstreamProfileMetadata,
     info: &Value,
 ) -> Result<UpstreamProfileRoute> {
-    ensure!(matches!(kind, "jellyfin" | "emby"), "invalid_upstream_kind");
-    validate_profile_metadata(kind, metadata)?;
+    let kind = UpstreamKind::parse(kind).ok_or_else(|| anyhow::anyhow!("invalid_upstream_kind"))?;
+    validate_profile_metadata(kind.as_str(), metadata)?;
     ensure!(
         info.get("ErrorCode").is_none_or(Value::is_null),
         "upstream_profile_route_unavailable"
@@ -720,7 +718,8 @@ pub fn validate_route(
     }
     query_number(&query, "maxwidth", 1280.0)?;
     query_number(&query, "maxheight", 720.0)?;
-    let frame_rate_field = if kind == "emby" && query.contains_key("h264-maxframerate") {
+    let frame_rate_field = if kind == UpstreamKind::Emby && query.contains_key("h264-maxframerate")
+    {
         ensure!(
             !query.contains_key("maxframerate"),
             "upstream_profile_route_ambiguous"
@@ -761,7 +760,7 @@ pub fn validate_route(
     }
     // Version-specific namespaces are validated independently. A missing value
     // stays unsupported; it is never added to the returned URL by RainSync.
-    if kind == "jellyfin" {
+    if kind == UpstreamKind::Jellyfin {
         ensure!(
             !query.contains_key("level")
                 && !query.contains_key("profile")
@@ -818,14 +817,14 @@ pub fn validate_route(
                 .any(|key| key != "audiosamplerate" && key.contains("samplerate")),
             "upstream_profile_route_ambiguous"
         );
-        if kind == "emby" && !query.contains_key("audiosamplerate") {
+        if kind == UpstreamKind::Emby && !query.contains_key("audiosamplerate") {
             server_requested_audio_sample_rate = Some(48_000);
         } else {
             let rate = query
                 .get("audiosamplerate")
                 .and_then(|value| value.parse::<u32>().ok())
                 .filter(|rate| {
-                    if kind == "emby" {
+                    if kind == UpstreamKind::Emby {
                         EMBY_AUDIO_RATES.contains(rate)
                     } else {
                         *rate == 48_000
@@ -869,7 +868,7 @@ pub fn validate_route(
     // A selected, malformed or duplicate index still fails above/in route_query.
     // Do not assume the same omission semantics for other providers.
     ensure!(
-        kind == "jellyfin"
+        kind == UpstreamKind::Jellyfin
             || !query
                 .get("subtitlemethod")
                 .is_some_and(|value| value.eq_ignore_ascii_case("encode")),
@@ -879,16 +878,16 @@ pub fn validate_route(
         url,
         media_source_id: metadata.media_source_id.clone(),
         audio_index,
-        evidence: evidence(kind, metadata),
+        evidence: evidence(kind.as_str(), metadata),
         provenance: UpstreamProfileRouteProvenance {
-            schema_version: if kind == "emby" { 2 } else { 1 },
+            schema_version: if kind == UpstreamKind::Emby { 2 } else { 1 },
             semantics: "requested_configuration_not_measured_output".into(),
             frame_rate_field: frame_rate_field.into(),
             provider_audio_sample_rate,
             server_requested_audio_sample_rate,
-            allowed_audio_sample_rates: (kind == "emby" && metadata.audio.is_some())
+            allowed_audio_sample_rates: (kind == UpstreamKind::Emby && metadata.audio.is_some())
                 .then(|| EMBY_AUDIO_RATES.to_vec()),
-            source_audio_sample_rate: if kind == "emby" {
+            source_audio_sample_rate: if kind == UpstreamKind::Emby {
                 metadata.audio.as_ref().map(|audio| audio.sample_rate)
             } else {
                 None
@@ -915,7 +914,7 @@ pub fn complete_route(
     route.url = super::bind_playback_identity(route.url, sid, device_id)?;
     if route.provenance.server_requested_audio_sample_rate == Some(48_000) {
         ensure!(
-            kind == "emby" && metadata.audio.is_some(),
+            UpstreamKind::parse(kind) == Some(UpstreamKind::Emby) && metadata.audio.is_some(),
             "upstream_profile_route_mismatch"
         );
         let original = route.url.query().unwrap_or_default();

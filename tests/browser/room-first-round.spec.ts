@@ -143,27 +143,36 @@ test("editing or failing invitation parsing cannot submit credentials from an ea
   await page.goto("/rooms");
   await page.getByRole("button", { name: "通过邀请加入", exact: true }).click();
   const pasted = page.getByLabel("粘贴完整房间邀请");
-  await pasted.fill(
-    JSON.stringify({ room_id: "old-room", token: "old-token" }),
-  );
+  const previousInvite = {
+    room_id: "11111111-1111-4111-8111-111111111111",
+    token: "a".repeat(64),
+  };
+  await pasted.fill(JSON.stringify(previousInvite));
   await page.getByRole("button", { name: "解析邀请", exact: true }).click();
-  await expect(page.getByLabel("房间 ID")).toHaveValue("old-room");
-  await expect(page.getByLabel("邀请 token")).toHaveValue("old-token");
+  await expect(page.getByLabel("房间 ID")).toHaveValue(previousInvite.room_id);
+  await expect(page.getByLabel("邀请凭据")).toHaveValue(previousInvite.token);
+  await expect(
+    page.getByRole("button", { name: "加入房间", exact: true }),
+  ).toBeEnabled();
   await pasted.fill('{"room_id":');
   await expect(page.getByLabel("房间 ID")).toHaveValue("");
-  await expect(page.getByLabel("邀请 token")).toHaveValue("");
+  await expect(page.getByLabel("邀请凭据")).toHaveValue("");
   await expect(
     page.getByRole("button", { name: "加入房间", exact: true }),
   ).toBeDisabled();
   await page.getByRole("button", { name: "解析邀请", exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("请粘贴完整房间邀请JSON");
+  await expect(page.getByRole("alert")).toContainText(
+    "请粘贴本站的完整房间邀请链接或邀请内容。",
+  );
   expect(joins).toEqual([]);
   await pasted.fill("null");
   await page.getByRole("button", { name: "解析邀请", exact: true }).click();
-  await expect(page.getByLabel("邀请 token")).toHaveValue("");
+  await expect(page.getByLabel("房间 ID")).toHaveValue("");
+  await expect(page.getByLabel("邀请凭据")).toHaveValue("");
   await expect(
     page.getByRole("button", { name: "加入房间", exact: true }),
   ).toBeDisabled();
+  expect(joins).toEqual([]);
 });
 
 test("a collapsed player retains local mute and full-screen controls name their next action", async ({

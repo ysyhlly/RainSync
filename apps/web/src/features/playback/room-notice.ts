@@ -1,12 +1,19 @@
-import { computed, watch, type Ref } from "vue";
+import { computed, watch, type DeepReadonly, type Ref } from "vue";
 import {
   playbackFailureOwnsNotice,
   type PlaybackPreparationState,
 } from "./playback-preparation";
 
+export type RuntimeErrorNotice = Readonly<{
+  owner: "room" | "playback";
+  revision: number;
+  message: string;
+}>;
 type RoomNoticeRuntime = {
-  error: string;
-  preparation?: PlaybackPreparationState;
+  readonly errorNotice: RuntimeErrorNotice | undefined;
+  readonly preparation?: DeepReadonly<PlaybackPreparationState>;
+  readonly error: string;
+  readonly dismissError: (notice: RuntimeErrorNotice | undefined) => void;
 };
 
 /** One presentation of the current error, not a new error store or queue. */
@@ -17,7 +24,7 @@ export function useRoomNotice(
   let runtimeRevision = 0;
   let actionRevision = 0;
   watch(
-    () => runtime.error,
+    () => runtime.errorNotice,
     () => ++runtimeRevision,
     { flush: "sync" },
   );
@@ -30,12 +37,14 @@ export function useRoomNotice(
     if (!message) return;
     if (
       source === "runtime" &&
+      (!runtime.errorNotice || runtime.errorNotice.owner === "playback") &&
       runtime.preparation?.phase === "failed" &&
       playbackFailureOwnsNotice(runtime.preparation.failure, message)
     )
       return;
 
     const revision = source === "action" ? actionRevision : runtimeRevision;
+    const runtimeNotice = runtime.errorNotice;
     return {
       source,
       message,
@@ -46,8 +55,9 @@ export function useRoomNotice(
         if (source === "action") {
           if (actionRevision === revision && actionError?.value === message)
             actionError.value = "";
-        } else if (runtimeRevision === revision && runtime.error === message)
-          runtime.error = "";
+        } else if (runtimeRevision === revision && runtime.error === message) {
+          runtime.dismissError(runtimeNotice);
+        }
       },
     };
   });

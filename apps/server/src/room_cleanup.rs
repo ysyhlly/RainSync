@@ -8,6 +8,15 @@ async fn finish(app: &App, task: &Task) -> anyhow::Result<Option<(protocol::Room
         None => None,
     };
     let mut tx = app.db.begin().await?;
+    // A blocked room/receipt transaction must not monopolize the one durable
+    // reconciler and strand unrelated closing rooms. This budget is shorter
+    // than the cleanup claim lease; timing out never supplies disposal proof.
+    sqlx::query("SET LOCAL lock_timeout='2s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout='3s'")
+        .execute(&mut *tx)
+        .await?;
     let room =
         sqlx::query("SELECT lifecycle,lifecycle_epoch FROM rooms WHERE id=$1 FOR NO KEY UPDATE")
             .bind(task.room)
@@ -18,7 +27,7 @@ async fn finish(app: &App, task: &Task) -> anyhow::Result<Option<(protocol::Room
     {
         return Ok(None);
     }
-    let owns: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM room_cleanup_tasks WHERE room_id=$1 AND lifecycle_epoch=$2 AND lease_owner=$3 AND completed_at IS NULL)")
+    let owns: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM room_cleanup_tasks WHERE room_id=$1 AND lifecycle_epoch=$2 AND lease_owner=$3 AND lease_until>clock_timestamp() AND completed_at IS NULL)")
         .bind(task.room).bind(task.epoch).bind(task.owner).fetch_one(&mut *tx).await?;
     if !owns {
         return Ok(None);
@@ -91,28 +100,46 @@ pub async fn run(app: App) {
     loop {
         match persistence::room_cleanup::claim(&app.db).await {
             Ok(Some(task)) => {
-                if let Err(error) = reconcile(&app, &task).await {
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), reconcile(&app, &task))
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("room_cleanup_timeout")));
+                if let Err(error) = result {
                     // Only bounded, known reason codes enter the observable API.
-                    let reason = match error.to_string().as_str() {
-                        "legacy_agent_drain_unconfirmed" => "legacy_agent_drain_unconfirmed",
-                        "playback_preparation_drain_unconfirmed" => {
+                    let database_code =
+                        error
+                            .downcast_ref::<sqlx::Error>()
+                            .and_then(|error| match error {
+                                sqlx::Error::Database(database) => database.code(),
+                                _ => None,
+                            });
+                    let reason = match (database_code.as_deref(), error.to_string().as_str()) {
+                        (Some("55P03"), _) => "room_cleanup_locked",
+                        (Some("57014"), _) => "room_cleanup_timeout",
+                        (_, "legacy_agent_drain_unconfirmed") => "legacy_agent_drain_unconfirmed",
+                        (_, "playback_preparation_drain_unconfirmed") => {
                             "playback_preparation_drain_unconfirmed"
                         }
-                        "media_execution_drain_unconfirmed" => "media_execution_drain_unconfirmed",
-                        "distributed_compute_drain_unconfirmed" => {
+                        (_, "media_execution_drain_unconfirmed") => {
+                            "media_execution_drain_unconfirmed"
+                        }
+                        (_, "distributed_compute_drain_unconfirmed") => {
                             "distributed_compute_drain_unconfirmed"
                         }
-                        "static_hls_capture_drain_unconfirmed" => {
+                        (_, "static_hls_capture_drain_unconfirmed") => {
                             "static_hls_capture_drain_unconfirmed"
                         }
-                        "agent_transfer_drain_unconfirmed" => "agent_transfer_drain_unconfirmed",
-                        "upstream_cleanup_failed" => "upstream_cleanup_failed",
-                        "legacy_upstream_cleanup_unconfirmed" => {
+                        (_, "agent_transfer_drain_unconfirmed") => {
+                            "agent_transfer_drain_unconfirmed"
+                        }
+                        (_, "upstream_cleanup_failed") => "upstream_cleanup_failed",
+                        (_, "legacy_upstream_cleanup_unconfirmed") => {
                             "legacy_upstream_cleanup_unconfirmed"
                         }
-                        "upstream_cleanup_pending" => "upstream_cleanup_pending",
-                        "upstream_operation_unconfirmed" => "upstream_operation_unconfirmed",
-                        "playback_revocation_pending" => "playback_revocation_pending",
+                        (_, "upstream_cleanup_pending") => "upstream_cleanup_pending",
+                        (_, "upstream_operation_unconfirmed") => "upstream_operation_unconfirmed",
+                        (_, "playback_revocation_pending") => "playback_revocation_pending",
+                        (_, "room_cleanup_timeout") => "room_cleanup_timeout",
                         _ => "room_cleanup_retry",
                     };
                     let _ = persistence::room_cleanup::retry(&app.db, &task, reason).await;

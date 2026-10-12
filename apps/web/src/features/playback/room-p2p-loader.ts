@@ -6,9 +6,9 @@ import type {
   LoaderConfiguration,
   LoaderCallbacks,
 } from "hls.js";
-import { RoomP2PTransport } from "./room-p2p";
+import type { RoomP2PTransport } from "./room-p2p";
 export function createP2PFragmentLoader(
-  transport: RoomP2PTransport,
+  transport: Pick<RoomP2PTransport, "has" | "load">,
   bufferSeconds: () => number,
   HlsLibrary: typeof Hls,
 ) {

@@ -2,39 +2,51 @@ import type { OAuthLogin, OAuthStatus } from "./platform-oauth.api";
 import type { ShortPlatformProvider } from "./platform-account.api";
 import { RequestFailure } from "../../errors";
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isOneOf<T extends string>(
+  value: unknown,
+  choices: readonly T[],
+): value is T {
+  return (
+    typeof value === "string" && choices.some((choice) => value === choice)
+  );
+}
 export function validateOAuthStatus(
-  v: OAuthStatus,
+  v: unknown,
   provider: ShortPlatformProvider,
 ): OAuthStatus {
-  const stamp = (x: number | null) =>
-    x === null || (Number.isSafeInteger(x) && x > 0);
+  const stamp = (x: unknown): x is number | null =>
+    x === null || (typeof x === "number" && Number.isSafeInteger(x) && x > 0);
   const scopes = provider === "douyin" ? ["user_info"] : ["user.info.basic"];
   if (
-    !v ||
+    !isRecord(v) ||
     v.provider !== provider ||
-    (v.id !== null && !uuid.test(v.id)) ||
-    (v.revision !== null && !/^[1-9]\d*$/.test(v.revision)) ||
+    (v.id !== null && (typeof v.id !== "string" || !uuid.test(v.id))) ||
+    (v.revision !== null &&
+      (typeof v.revision !== "string" || !/^[1-9]\d*$/.test(v.revision))) ||
     (v.id === null) !== (v.revision === null) ||
-    !["connected", "expired", "revoked"].includes(v.state) ||
+    !isOneOf(v.state, ["connected", "expired", "revoked"] as const) ||
     typeof v.available !== "boolean" ||
     !Array.isArray(v.missing_prerequisites) ||
     v.missing_prerequisites.some((x) => typeof x !== "string") ||
     v.authorization_kind !== "official_oauth" ||
     v.playback_session !== false ||
-    !["web", "qr"].includes(v.authorization_mode) ||
+    !isOneOf(v.authorization_mode, ["web", "qr"] as const) ||
     !Array.isArray(v.scopes) ||
-    v.scopes.some((s) => !scopes.includes(s)) ||
+    v.scopes.some((s) => typeof s !== "string" || !scopes.includes(s)) ||
     typeof v.auto_renew !== "boolean" ||
-    ![
+    !isOneOf(v.renewal_state, [
       "disabled",
       "scheduled",
       "running",
       "uncertain",
       "reauthorization_required",
-    ].includes(v.renewal_state) ||
-    ![v.access_expires_at, v.refresh_expires_at, v.next_refresh_at].every(
-      stamp,
-    ) ||
+    ] as const) ||
+    !stamp(v.access_expires_at) ||
+    !stamp(v.refresh_expires_at) ||
+    !stamp(v.next_refresh_at) ||
     (v.available && v.missing_prerequisites.length !== 0) ||
     (v.state === "connected" &&
       (!v.id ||
@@ -44,7 +56,7 @@ export function validateOAuthStatus(
   )
     throw Error("开放平台状态响应不完整");
   return {
-    provider: v.provider,
+    provider,
     id: v.id,
     revision: v.revision,
     state: v.state,
@@ -62,21 +74,29 @@ export function validateOAuthStatus(
   };
 }
 export function validateOAuthLogin(
-  v: OAuthLogin,
+  v: unknown,
   provider: ShortPlatformProvider,
   id: string,
 ): OAuthLogin {
   if (
-    !v ||
+    !isRecord(v) ||
     v.id !== id ||
     !uuid.test(id) ||
     v.provider !== provider ||
-    !["pending", "confirmed", "expired", "failed"].includes(v.status) ||
-    !["web", "qr"].includes(v.mode) ||
-    ![v.expires_at, v.next_poll_at, v.server_time].every(
-      Number.isSafeInteger,
-    ) ||
-    ![null, "waiting", "scanned"].includes(v.stage) ||
+    !isOneOf(v.status, [
+      "pending",
+      "confirmed",
+      "expired",
+      "failed",
+    ] as const) ||
+    !isOneOf(v.mode, ["web", "qr"] as const) ||
+    typeof v.expires_at !== "number" ||
+    !Number.isSafeInteger(v.expires_at) ||
+    typeof v.next_poll_at !== "number" ||
+    !Number.isSafeInteger(v.next_poll_at) ||
+    typeof v.server_time !== "number" ||
+    !Number.isSafeInteger(v.server_time) ||
+    (v.stage !== null && !isOneOf(v.stage, ["waiting", "scanned"] as const)) ||
     (v.authorization_url !== null && typeof v.authorization_url !== "string") ||
     (v.qr_payload !== null && typeof v.qr_payload !== "string")
   )
@@ -128,7 +148,18 @@ export function validateOAuthLogin(
     }
   } else if (v.authorization_url !== null || v.qr_payload !== null)
     throw Error("已关闭的授权仍包含登录凭据");
-  return v;
+  return {
+    id: v.id,
+    provider,
+    status: v.status,
+    mode: v.mode,
+    stage: v.stage,
+    authorization_url: v.authorization_url,
+    qr_payload: v.qr_payload,
+    expires_at: v.expires_at,
+    next_poll_at: v.next_poll_at,
+    server_time: v.server_time,
+  };
 }
 export interface OAuthFlowState {
   phase:
@@ -146,9 +177,9 @@ export interface OAuthFlowState {
 export function createOAuthFlow(options: {
   provider: ShortPlatformProvider;
   current: () => boolean;
-  start: (id: string, signal: AbortSignal) => Promise<OAuthLogin>;
-  read: (id: string, signal: AbortSignal) => Promise<OAuthLogin>;
-  poll: (id: string, signal: AbortSignal) => Promise<OAuthLogin>;
+  start: (id: string, signal: AbortSignal) => Promise<unknown>;
+  read: (id: string, signal: AbortSignal) => Promise<unknown>;
+  poll: (id: string, signal: AbortSignal) => Promise<unknown>;
   cancel: (id: string) => Promise<unknown>;
   change: (state: OAuthFlowState) => void;
   confirmed: () => void;
@@ -198,9 +229,9 @@ export function createOAuthFlow(options: {
       publish({ phase: "uncertain" });
     }
   }
-  function apply(value: OAuthLogin) {
+  function apply(receipt: unknown) {
     if (!current()) return;
-    validateOAuthLogin(value, options.provider, id);
+    const value = validateOAuthLogin(receipt, options.provider, id);
     observed = true;
     if (value.status !== "pending") {
       publish({ phase: value.status });

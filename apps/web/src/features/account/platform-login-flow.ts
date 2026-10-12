@@ -20,8 +20,8 @@ export interface PlatformLoginFlowState {
 /** Login capability is held in this exact origin/session closure, never persisted. */
 export function createPlatformLoginFlow(options: {
   current: () => boolean;
-  start: (key: string, signal: AbortSignal) => Promise<PlatformLogin>;
-  poll: (id: string, signal: AbortSignal) => Promise<PlatformLogin>;
+  start: (key: string, signal: AbortSignal) => Promise<unknown>;
+  poll: (id: string, signal: AbortSignal) => Promise<unknown>;
   cancel: (id: string) => Promise<unknown>;
   change: (state: PlatformLoginFlowState) => void;
   confirmed: () => void;
@@ -77,20 +77,50 @@ export function createPlatformLoginFlow(options: {
     };
     tick();
   }
-  function validate(value: PlatformLogin, fromPoll: boolean) {
-    if (!value || typeof value !== "object")
+  function validate(raw: unknown, fromPoll: boolean): PlatformLogin {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
       throw new LoginResponseFailure("Invalid login response");
-    if ((key && value.id !== key) || (loginId && value.id !== loginId))
+    const record = raw as Record<string, unknown>;
+    const id = record.id;
+    if ((key && id !== key) || (loginId && id !== loginId))
       throw new LoginResponseFailure("Invalid login binding");
+    // Read only declared DTO fields, once. No raw object survives validation or
+    // reaches the polling timer closure. Stage is the existing server vocabulary.
+    const {
+      provider,
+      status,
+      stage,
+      qr_payload,
+      expires_at,
+      server_time,
+      next_poll_at,
+    } = record;
     if (
-      value.provider !== "bilibili" ||
-      !/^[0-9a-f-]{36}$/i.test(value.id) ||
-      !["pending", "confirmed", "expired", "failed"].includes(value.status) ||
-      ![value.expires_at, value.server_time, value.next_poll_at].every(
-        Number.isSafeInteger,
-      )
+      provider !== "bilibili" ||
+      typeof id !== "string" ||
+      !/^[0-9a-f-]{36}$/i.test(id) ||
+      (status !== "pending" &&
+        status !== "confirmed" &&
+        status !== "expired" &&
+        status !== "failed") ||
+      (stage !== null && stage !== "waiting" && stage !== "scanned") ||
+      (qr_payload !== null && typeof qr_payload !== "string") ||
+      typeof expires_at !== "number" ||
+      typeof server_time !== "number" ||
+      typeof next_poll_at !== "number" ||
+      ![expires_at, server_time, next_poll_at].every(Number.isSafeInteger)
     )
       throw new LoginResponseFailure("Invalid login response");
+    const value: PlatformLogin = {
+      id,
+      provider,
+      status,
+      stage,
+      qr_payload,
+      expires_at,
+      server_time,
+      next_poll_at,
+    };
     if (value.status === "pending") {
       // Poll responses deliberately omit the capability. Only this exact
       // login's validated start response can supply its immutable local QR.
@@ -238,14 +268,14 @@ export function createPlatformLoginFlow(options: {
       countdown();
     } else publish(state);
   }
-  function apply(value: PlatformLogin, generation: number, fromPoll = false) {
+  function apply(raw: unknown, generation: number, fromPoll = false) {
     if (!current(generation)) return;
     // A resumed tab may process a settled request before its overdue timer.
     if (loginDeadline !== undefined && now() >= loginDeadline) {
       expire();
       return;
     }
-    validate(value, fromPoll);
+    const value = validate(raw, fromPoll);
     loginId = value.id;
     if (value.status !== "pending") {
       finished = true;

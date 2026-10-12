@@ -1,3 +1,5 @@
+import type { DeepReadonly } from "vue";
+
 /** Finite display model shared by the worker and renderer. Upstream text never
  * becomes HTML, CSS, a URL, or a JavaScript function in the document realm. */
 export type Percent = { percent: number };
@@ -256,7 +258,7 @@ export function easing(name: string, t: number): number {
   throw new UnsupportedDanmaku("高级弹幕插值类型暂不支持");
 }
 export function sampleSceneNode(
-  node: SceneNode,
+  node: DeepReadonly<SceneNode>,
   elapsed: number,
   width: number,
   height: number,

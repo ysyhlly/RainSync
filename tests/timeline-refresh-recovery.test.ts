@@ -3,6 +3,7 @@ import { nextTick, reactive } from "vue";
 import { mountSetup } from "./helpers/mount-setup";
 import * as timeline from "../apps/web/src/features/rooms/timeline-chat";
 import * as viewState from "../apps/web/src/features/rooms/timeline-view-state";
+import { useTransientMessage } from "../apps/web/src/shared/use-transient-message";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => {
@@ -31,7 +32,7 @@ function fixture() {
     connected: true,
     roomActive: true,
     state: { media_id: "movie", media_generation: 1 },
-    position: 0,
+    playbackControls: { position: 0 },
     messages: [] as { id: string; body: string; deleted?: boolean }[],
     lastChatDeletion: undefined as string | undefined,
   });
@@ -47,6 +48,7 @@ function fixture() {
       useSession: () => ({ epoch: 1, api }),
       ...timeline,
       ...viewState,
+      useTransientMessage,
     },
     { visible: true },
   );

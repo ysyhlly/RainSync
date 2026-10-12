@@ -87,6 +87,8 @@ await isolatedMediaStack("nas-missing-root-receipts", async (f) => {
     sockets = new Set(),
     logs = [],
     requests = new Set();
+  let primaryFailure;
+  const logStates = [];
   let launch = 0,
     agent,
     releaseLock;
@@ -99,6 +101,11 @@ await isolatedMediaStack("nas-missing-root-receipts", async (f) => {
       resolve(f.root, `receipt-agent-${++launch}.log`),
     );
     logs.push(log);
+    const logState = { path: resolve(f.root, `receipt-agent-${launch}.log`), finished: false, closed: false, failed: false };
+    logStates.push(logState);
+    log.on("finish", () => logState.finished = true);
+    log.on("close", () => logState.closed = true);
+    log.on("error", () => logState.failed = true);
     const child = spawn(binary, [], {
       env: {
         ...f.env,
@@ -118,9 +125,9 @@ await isolatedMediaStack("nas-missing-root-receipts", async (f) => {
     agentProcesses.push(record);
     child.done = new Promise((done, reject) => {
       child.once("error", reject);
-      child.once("close", (code) => {
+      child.once("close", (code, signal) => {
         children.delete(child);
-        Object.assign(record, { closed: true, exit_code: code });
+        Object.assign(record, { closed: true, exit_code: code, signal: signal ?? null });
         done(code);
       });
     });
@@ -248,6 +255,77 @@ await isolatedMediaStack("nas-missing-root-receipts", async (f) => {
     const mapped = await makeSession(
       "persisted NAS receipt with missing mount",
     );
+    // Test-only observation of the actual Worker delivery_response load gate.
+    // Never writes authority or includes delivery tokens/encrypted resources.
+    const diagnosticFailures = [];
+    async function observeInitialDelivery(phase) {
+      const path = resolve(f.root, `initial-delivery-${phase}.private.json`);
+      try {
+        const projection = f.sql(`WITH target AS (
+          SELECT '${mapped.session}'::uuid AS id, '${hash(mapped.token)}'::text AS expected_token_hash
+        ) SELECT json_build_object(
+          'phase','${phase}', 'observed_at',clock_timestamp(),
+          'session_exists',p.id IS NOT NULL, 'session_id',p.id,
+          'token_match',p.delivery_token_hash=t.expected_token_hash,
+          'stopped',p.stopped, 'expires_at',p.expires_at,
+          'unexpired',p.expires_at>now(), 'user_id',p.user_id, 'room_id',p.room_id,
+          'lifecycle',r.lifecycle, 'room_epoch',r.lifecycle_epoch,
+          'session_epoch',p.lifecycle_epoch, 'epoch_match',r.lifecycle_epoch=p.lifecycle_epoch,
+          'session_generation',p.generation,
+          'snapshot_generation',snap.state->>'media_generation',
+          'generation_match',(snap.state->>'media_generation')::bigint=p.generation,
+          'snapshot_exists',snap.room_id IS NOT NULL,
+          'media_id',p.media_id, 'media_exists',mi.id IS NOT NULL,
+          'media_available',mi.available, 'indexed_source_version',mi.source_version,
+          'source_id',src.id, 'source_kind',src.kind, 'source_deleted',src.deleted_at IS NOT NULL,
+          'agent_revoked',a.revoked, 'library_id',src.library_id,
+          'login_binding_present',p.auth_login_hash IS NOT NULL,
+          'login_hash',p.auth_login_hash,
+          'login_row_exists',login.token_hash IS NOT NULL,
+          'login_expires_at',login.expires_at,
+          'membership_exists',m.user_id IS NOT NULL,
+          'membership_epoch',m.membership_epoch,
+          'session_membership_epoch',p.auth_membership_epoch,
+          'login_allowed',playback_login_allowed(p.user_id,p.auth_login_hash),
+          'origin_allowed',playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch),
+          'library_media_allowed',library_media_allowed(p.user_id,p.media_id,'play',p.room_id),
+          'library_session_allowed',playback_library_session_allowed(p.id),
+          'source_allowed_2',playback_source_allowed(p.media_id,p.resource),
+          'source_allowed_3',playback_source_allowed(p.media_id,p.resource,p.id),
+          'worker_load_allowed',COALESCE(r.lifecycle='active' AND r.lifecycle_epoch=p.lifecycle_epoch
+            AND p.id=t.id AND p.delivery_token_hash=t.expected_token_hash AND p.expires_at>now()
+            AND NOT p.stopped AND playback_source_allowed(p.media_id,p.resource,p.id)
+            AND (snap.state->>'media_generation')::bigint=p.generation AND m.user_id IS NOT NULL,false)
+        ) FROM target t LEFT JOIN playback_sessions p ON p.id=t.id
+        LEFT JOIN rooms r ON r.id=p.room_id LEFT JOIN room_snapshots snap ON snap.room_id=p.room_id
+        LEFT JOIN room_members m ON m.room_id=p.room_id AND m.user_id=p.user_id
+        LEFT JOIN media_items mi ON mi.id=p.media_id LEFT JOIN sources src ON src.id=mi.source_id
+        LEFT JOIN agents a ON a.id=src.id
+        LEFT JOIN sessions login ON login.token_hash=p.auth_login_hash AND login.user_id=p.user_id`);
+        await writeFile(path, JSON.stringify(JSON.parse(projection), null, 2) + "\n", { flag: "wx", mode: 0o600 });
+        // Read-only approximation of additional admission inputs, not held-lock proof.
+        const admission = f.sql(`SELECT json_build_object(
+          'phase','${phase}','observed_at',clock_timestamp(),'session_id',p.id,
+          'source_revision',src.access_policy_revision,
+          'requested_revision',COALESCE((p.resource->>'source_policy_revision')::bigint,0),
+          'revision_match',src.access_policy_revision=COALESCE((p.resource->>'source_policy_revision')::bigint,0),
+          'account_policy_allowed',source_account_policy_allowed(src.id,COALESCE((p.resource->>'source_policy_revision')::bigint,0),(p.resource->>'account_policy_generation')::bigint),
+          'source_kind',src.kind,'login_binding_present',p.auth_login_hash IS NOT NULL,
+          'login_allowed',playback_login_allowed(p.user_id,p.auth_login_hash),
+          'origin_allowed',playback_origin_allowed(p.user_id,p.room_id,p.auth_login_hash,p.auth_membership_epoch),
+          'execution_rows',(SELECT COALESCE(json_agg(json_build_object('id',e.id,'kind',e.kind,'created_at',e.created_at,'reaped_at',e.reaped_at) ORDER BY e.id),'[]'::json) FROM media_executions e WHERE e.session_id=p.id),
+          'transfer_rows',(SELECT COALESCE(json_agg(json_build_object('id',t.id,'status',t.status,'created_at',t.created_at,'updated_at',t.updated_at,'finished_at',t.finished_at,'lease_until',t.lease_until,'agent_drained_at',t.agent_drained_at) ORDER BY t.id),'[]'::json) FROM agent_transfer_runs t WHERE t.session_id=p.id)
+        ) FROM playback_sessions p LEFT JOIN media_items mi ON mi.id=p.media_id LEFT JOIN sources src ON src.id=mi.source_id WHERE p.id='${mapped.session}'`);
+        await writeFile(resolve(f.root, `initial-admission-${phase}.private.json`), JSON.stringify(JSON.parse(admission), null, 2) + "\n", { flag: "wx", mode: 0o600 });
+      } catch (error) {
+        diagnosticFailures.push(phase);
+        // Retain original diagnostic failure privately; keep the original HTTP
+        // request and status assertion running even if observation failed.
+        await writeFile(path + ".failure", error?.stack ?? String(error), { flag: "wx", mode: 0o600 })
+          .catch(() => { diagnosticFailures.push(`${phase}_failure_write`); });
+      }
+    }
+    await observeInitialDelivery("before");
     const stream = { response: null, aborted: false };
     const req = request(
       `${f.workerOrigin}/media-delivery/${mapped.session}/source?token=${mapped.token}`,
@@ -264,7 +342,32 @@ await isolatedMediaStack("nas-missing-root-receipts", async (f) => {
     requests.add(req);
     req.end();
     await until(() => stream.response, "real NAS response");
+    await observeInitialDelivery("after");
+    if (stream.response.statusCode !== 200) {
+      try {
+        const response = stream.response;
+        const bytes = await new Promise((done, fail) => {
+          const chunks = []; let timer;
+          const finish = error => { clearTimeout(timer); response.off("data", data); response.off("end", end); response.off("error", errorEvent); response.off("aborted", aborted); error ? fail(error) : done(Buffer.concat(chunks)); };
+          const data = chunk => chunks.push(Buffer.from(chunk));
+          const end = () => finish();
+          const errorEvent = () => finish(Error("diagnostic_http_body_error"));
+          const aborted = () => finish(Error("diagnostic_http_body_aborted"));
+          timer = setTimeout(() => { finish(Error("diagnostic_http_body_unconfirmed")); response.destroy(); }, 5000);
+          response.on("data", data); response.once("end", end); response.once("error", errorEvent); response.once("aborted", aborted); response.resume();
+        });
+        // Never serialize credentials even if a future error unexpectedly echoes them.
+        assert.ok(!bytes.includes(Buffer.from(mapped.token)) && !bytes.includes(Buffer.from(ownerToken)), "Diagnostic response must not echo credentials");
+        const path = resolve(f.root, "initial-delivery-http-error.private.body");
+        await writeFile(path, bytes, { flag: "wx", mode: 0o600 });
+        await writeFile(resolve(f.root, "initial-delivery-http-error.private.json"), JSON.stringify({ status: response.statusCode, content_type: response.headers["content-type"] ?? null, request_id: response.headers["x-request-id"] ?? null, body_path: path, body_bytes: bytes.length, body_sha256: hash(bytes) }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+      } catch {
+        diagnosticFailures.push("non200_http_capture");
+        await writeFile(resolve(f.root, "initial-delivery-http-error.private.failure"), "non200_http_capture_failed\n", { flag: "wx", mode: 0o600 }).catch(() => diagnosticFailures.push("non200_failure_write"));
+      }
+    }
     assert.equal(stream.response.statusCode, 200);
+    assert.deepEqual(diagnosticFailures, [], "Initial delivery diagnostic capture must succeed");
     await until(
       async () => (await openFiles()) > 0,
       "real NAS descriptor retained",
@@ -675,13 +778,31 @@ await isolatedMediaStack("nas-missing-root-receipts", async (f) => {
       await new Promise((done) => http.close(done));
     }
     console.log(`PASS: ${checks.join("; ")}`);
+  } catch (error) {
+    primaryFailure = error;
+    throw error;
   } finally {
-    if (releaseLock) await releaseLock();
-    for (const socket of sockets) socket.terminate();
-    for (const req of requests) req.destroy();
-    for (const child of children) child.kill();
-    await Promise.all([...children].map((child) => child.done));
-    for (const log of logs) await new Promise((done) => log.end(done));
+    const cleanupFailures = [];
+    const observe = async (phase, action) => { try { await action(); } catch { cleanupFailures.push(phase); } };
+    await observe("release_lock", async () => { if (releaseLock) await releaseLock(); });
+    await observe("socket_request_close", async () => { for (const socket of sockets) socket.terminate(); for (const req of requests) req.destroy(); });
+    await observe("owned_agent_close", async () => { for (const child of children) child.kill(); await Promise.all([...children].map(child => child.done)); });
+    for (let index = 0; index < logs.length; index++) await observe("owned_agent_log_close", () => new Promise((done, fail) => {
+      const log = logs[index], state = logStates[index]; let timer;
+      const finish = error => { clearTimeout(timer); log.off("finish", check); log.off("close", check); log.off("error", errorEvent); error ? fail(error) : done(); };
+      const check = () => { if (state.failed) finish(Error("log_failed")); else if (state.finished && state.closed) finish(); };
+      const errorEvent = () => finish(Error("log_failed"));
+      if (state.failed) return fail(Error("log_failed"));
+      if (state.finished && state.closed) return done();
+      timer = setTimeout(() => { state.failed = true; finish(Error("log_close_unconfirmed")); }, 5000);
+      log.on("finish", check); log.on("close", check); log.on("error", errorEvent);
+      if (!log.writableEnded && !log.destroyed) log.end(error => { if (error) { state.failed = true; errorEvent(); } });
+      check();
+    }));
+    for (const record of agentProcesses) record.pid_absent = record.pid !== null && verifyPidAbsent(record.pid);
+    if (agentProcesses.some(record => !record.closed || !record.pid_absent)) cleanupFailures.push("owned_agent_pid_unconfirmed");
+    await observe("local_cleanup_receipt", () => writeFile(resolve(f.root, "nas-local-owned-cleanup.private.json"), JSON.stringify({ primary_failed: primaryFailure !== undefined, cleanup_failures: cleanupFailures, agents: agentProcesses, logs: logStates, scope: "Only this fixture direct receipt Agents and log streams; Worker remains owned by media-stack and its opt-in evidence report; no descendant claim" }, null, 2) + "\n", { flag: "wx", mode: 0o600 }));
+    if (cleanupFailures.length) { process.exitCode = 1; if (!primaryFailure) throw Error("nas_local_cleanup_observation_failed"); }
   }
 });
 const cleanup = await fixture.verifyStopped();

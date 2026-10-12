@@ -23,11 +23,21 @@ impl Gate {
         match self {
             Self::Commit => {
                 let now = state.anchor_server_time_ms;
-                persistence::commit(&db, &command, user, &user.to_string(), now, None).await?;
+                persistence::room_commands::commit(
+                    &db,
+                    &command,
+                    user,
+                    &user.to_string(),
+                    now,
+                    None,
+                )
+                .await?;
             }
             Self::Replay => {
                 ensure!(
-                    persistence::previous(&db, state.room_id, &command, user).await? == Some(state)
+                    persistence::room_commands::previous(&db, state.room_id, &command, user)
+                        .await?
+                        == Some(state)
                 );
             }
             Self::Epoch => {

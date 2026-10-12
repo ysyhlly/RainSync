@@ -111,7 +111,7 @@ it("page scope disposal and AbortError suppression stay local to the page runner
 
 it("room preserves existing errors only on request and keeps playback cancellation silent", async () => {
   const room = roomAction().action;
-  room.error = "existing room error";
+  room.roomError = "existing room error";
   await room.run(async () => {}, true);
   expect(room.error).toBe("existing room error");
   await room.run(async () => {

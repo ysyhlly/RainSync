@@ -1,14 +1,15 @@
+import { responseRecord, responseMember } from "../../shared/api/response";
 import { createCookieAccountFlow } from "./cookie-account-flow";
 import type { YoutubePlatformAccountStatus } from "./platform-account.api";
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function validateYoutubeAccountStatus(
-  value: YoutubePlatformAccountStatus,
+  value: unknown,
 ): YoutubePlatformAccountStatus {
   if (
-    !value ||
+    !responseRecord(value) ||
     value.provider !== "youtube" ||
-    !["connected", "expired", "revoked"].includes(value.state) ||
+    !responseMember(value.state, ["connected", "expired", "revoked"]) ||
     (value.id !== null &&
       (typeof value.id !== "string" || !uuid.test(value.id))) ||
     (value.revision !== null &&
@@ -17,12 +18,13 @@ export function validateYoutubeAccountStatus(
     (value.id === null) !== (value.revision === null) ||
     value.login_method !== "netscape_cookie_import" ||
     value.qr_available !== false ||
-    !["unverified", "none"].includes(value.verification) ||
+    !responseMember(value.verification, ["unverified", "none"]) ||
     (value.state === "connected" &&
       (!value.id || value.verification !== "unverified")) ||
     (value.state !== "connected" && value.verification !== "none") ||
     (value.credential_expires_at !== null &&
-      (!Number.isSafeInteger(value.credential_expires_at) ||
+      (typeof value.credential_expires_at !== "number" ||
+        !Number.isSafeInteger(value.credential_expires_at) ||
         value.credential_expires_at <= 0)) ||
     typeof value.account_import_available !== "boolean" ||
     value.availability_reason !==
@@ -39,7 +41,9 @@ export function validateYoutubeAccountStatus(
     verification: value.verification,
     credential_expires_at: value.credential_expires_at,
     account_import_available: value.account_import_available,
-    availability_reason: value.availability_reason,
+    availability_reason: value.account_import_available
+      ? null
+      : "server_opt_in_required",
   };
 }
 
@@ -61,7 +65,7 @@ export function createYoutubeAccountFlow(options: {
     cookieFile: string,
     revision: string | null,
     signal: AbortSignal,
-  ) => Promise<YoutubePlatformAccountStatus>;
+  ) => Promise<unknown>;
   clearSecret: () => void;
   change: (phase: YoutubeAccountPhase) => void;
 }) {

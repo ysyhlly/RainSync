@@ -52,123 +52,226 @@ export function containsPlaybackPosition(
   );
 }
 
+type RateProof = {
+  base?: number;
+  accepted: boolean;
+  rejected: boolean;
+  fine: "unknown" | "checking" | "supported" | "unsupported";
+  pendingRate?: number;
+  appliedRate?: number;
+  stableReads: number;
+};
+const emptyRateProof = (): RateProof => ({
+  accepted: false,
+  rejected: false,
+  fine: "unknown",
+  stableReads: 0,
+});
+/** Undefined is retirement, never evidence that the browser rejected a rate. */
+export type PlaybackRateResult = boolean | undefined;
+export type PlaybackRateReceipt = Readonly<{
+  result: PlaybackRateResult;
+  current: () => boolean;
+}>;
+
 /** Property readback is behavioral evidence, not decoder/hardware capability. */
 export class PlaybackRateSupport {
-  private base: number | undefined;
-  private accepted = false;
-  private rejected = false;
-  private fine: "unknown" | "checking" | "supported" | "unsupported" =
-    "unknown";
-  private pendingRate: number | undefined;
-  private appliedRate: number | undefined;
-  private stableReads = 0;
+  private proof = emptyRateProof();
 
   constructor(
     private readonly element: Pick<HTMLVideoElement, "playbackRate">,
   ) {}
 
+  private supported(proof: RateProof) {
+    return proof.accepted && !proof.rejected;
+  }
   get baseSupported() {
-    return this.accepted && !this.rejected;
+    return this.supported(this.proof);
   }
   get fineSupported() {
-    return this.fine === "supported";
+    return this.proof.fine === "supported";
   }
   get fineUnsupported() {
-    return this.fine === "unsupported";
+    return this.proof.fine === "unsupported";
   }
   reset() {
-    this.base = undefined;
-    this.accepted = this.rejected = false;
-    this.fine = "unknown";
-    this.pendingRate = undefined;
-    this.appliedRate = undefined;
-    this.stableReads = 0;
+    // An in-flight getter/setter may reset this same tracker synchronously.
+    // Its older stack retains only the detached record, never successor proof.
+    this.proof = emptyRateProof();
   }
-  private matches(rate: number) {
-    const observed = this.element.playbackRate;
-    return Number.isFinite(observed) && Math.abs(observed - rate) <= 0.0001;
-  }
-  private writeAndRead(rate: number) {
+  private readMatches(rate: number, current: () => boolean) {
+    if (!current()) return undefined;
+    let matches: boolean | null = null;
     try {
-      if (!Number.isFinite(rate) || rate <= 0) return false;
-      if (!this.matches(rate)) this.element.playbackRate = rate;
-      return this.matches(rate);
+      const observed = this.element.playbackRate;
+      matches =
+        Number.isFinite(observed) && Math.abs(observed - rate) <= 0.0001;
     } catch {
-      return false;
+      // Null represents an actual getter exception, separately from retirement.
     }
+    return current() ? matches : undefined;
   }
-  private verifyAppliedRate() {
-    if (!this.baseSupported || this.appliedRate === undefined)
-      return this.baseSupported;
-    let matches = false;
-    try {
-      matches = this.matches(this.appliedRate);
-    } catch {
-      /* A delayed setter/readback failure is still a rejected property rate. */
+  private writeAndRead(
+    rate: number,
+    current: () => boolean,
+  ): PlaybackRateResult {
+    if (!current()) return undefined;
+    if (!Number.isFinite(rate) || rate <= 0) return false;
+    const before = this.readMatches(rate, current);
+    if (before === undefined) return undefined;
+    if (before === null) return false;
+    if (!before) {
+      let failed = false;
+      try {
+        this.element.playbackRate = rate;
+      } catch {
+        failed = true;
+      }
+      if (!current()) return undefined;
+      if (failed) return false;
     }
+    const after = this.readMatches(rate, current);
+    return after === null ? false : after;
+  }
+  private verifyAppliedRate(
+    proof: RateProof,
+    current: () => boolean,
+  ): PlaybackRateResult {
+    if (!current()) return undefined;
+    if (!this.supported(proof) || proof.appliedRate === undefined)
+      return this.supported(proof);
+    const matches = this.readMatches(proof.appliedRate, current);
+    if (matches === undefined) return undefined;
     if (matches) return true;
-    if (this.appliedRate !== this.base) {
-      this.rejectFine();
-      return this.baseSupported;
+    if (proof.appliedRate !== proof.base) {
+      if (this.rejectFine(proof, current) === undefined) return undefined;
+      return this.supported(proof);
     }
-    this.accepted = false;
-    this.rejected = true;
+    proof.accepted = false;
+    proof.rejected = true;
     return false;
   }
+  /** Each invocation returns its own immutable continuation qualification. */
+  operation(qualify: () => boolean = () => true) {
+    let proof = this.proof;
+    const bind = (selected: RateProof) => () =>
+      this.proof === selected && qualify();
+    return {
+      capture: () => bind(proof),
+      ensureBase: (rate: number): PlaybackRateReceipt => {
+        const previous = proof,
+          previousCurrent = bind(previous);
+        if (!previousCurrent())
+          return { result: undefined, current: previousCurrent };
+        const changed = !Object.is(previous.base, rate);
+        const selected = changed
+          ? { ...emptyRateProof(), base: rate }
+          : previous;
+        // Adopt only this invocation's own new record. A reentrant call may
+        // advance the handle, but cannot retarget this captured selected record.
+        if (changed) proof = this.proof = selected;
+        const current = bind(selected);
+        let result: PlaybackRateResult;
+        if (!changed) result = this.verifyAppliedRate(selected, current);
+        else {
+          const accepted =
+            rate >= MIN_ROOM_RATE &&
+            rate <= MAX_ROOM_RATE &&
+            this.writeAndRead(rate, current);
+          if (accepted !== undefined) {
+            selected.accepted = accepted;
+            selected.rejected = !accepted;
+            if (accepted) selected.appliedRate = rate;
+            result = this.supported(selected);
+          }
+        }
+        return { result, current };
+      },
+      restoreBase: (): PlaybackRateReceipt => {
+        const selected = proof,
+          current = bind(selected);
+        return { result: this.restoreBaseFor(selected, current), current };
+      },
+      applyCorrection: (rate: number): PlaybackRateReceipt => {
+        const selected = proof,
+          current = bind(selected);
+        return {
+          result: this.applyCorrectionFor(selected, current, rate),
+          current,
+        };
+      },
+    };
+  }
   ensureBase(rate: number) {
-    if (Object.is(this.base, rate)) return this.verifyAppliedRate();
-    this.reset();
-    this.base = rate;
-    this.accepted =
-      rate >= MIN_ROOM_RATE && rate <= MAX_ROOM_RATE && this.writeAndRead(rate);
-    this.rejected = !this.accepted;
-    if (this.accepted) this.appliedRate = rate;
-    return this.baseSupported;
+    return this.operation().ensureBase(rate).result;
   }
   restoreBase() {
-    if (!this.baseSupported || this.base === undefined) return false;
-    this.pendingRate = undefined;
-    this.stableReads = 0;
-    if (this.fine === "checking") this.fine = "unknown";
-    this.accepted = this.writeAndRead(this.base);
-    this.rejected = !this.accepted;
-    if (this.accepted) this.appliedRate = this.base;
-    return this.baseSupported;
+    return this.operation().restoreBase().result;
   }
   applyCorrection(rate: number) {
-    if (!this.verifyAppliedRate() || this.base === undefined) return false;
-    if (this.fineUnsupported) return false;
+    return this.operation().applyCorrection(rate).result;
+  }
+  private restoreBaseFor(
+    proof: RateProof,
+    current: () => boolean,
+  ): PlaybackRateResult {
+    if (!current()) return undefined;
+    if (!this.supported(proof) || proof.base === undefined) return false;
+    proof.pendingRate = undefined;
+    proof.stableReads = 0;
+    if (proof.fine === "checking") proof.fine = "unknown";
+    const accepted = this.writeAndRead(proof.base, current);
+    if (accepted === undefined) return undefined;
+    proof.accepted = accepted;
+    proof.rejected = !accepted;
+    if (accepted) proof.appliedRate = proof.base;
+    return this.supported(proof);
+  }
+  private applyCorrectionFor(
+    proof: RateProof,
+    current: () => boolean,
+    rate: number,
+  ): PlaybackRateResult {
+    const verified = this.verifyAppliedRate(proof, current);
+    if (verified === undefined) return undefined;
+    if (!verified || proof.base === undefined) return false;
+    if (proof.fine === "unsupported") return false;
     // Corrections are bounded relative to the user's room rate.
     const bounded = Math.max(
-      this.base * 0.95,
-      Math.min(this.base * 1.05, rate),
+      proof.base * 0.95,
+      Math.min(proof.base * 1.05, rate),
     );
-    if (!Number.isFinite(bounded)) return this.rejectFine();
-    if (Math.abs(bounded - this.base) <= 0.0001) return this.restoreBase();
-    if (this.fine === "checking" && this.pendingRate !== undefined) {
-      try {
-        if (!this.matches(this.pendingRate)) return this.rejectFine();
-      } catch {
-        return this.rejectFine();
-      }
-      if (++this.stableReads >= 3) {
-        this.fine = "supported";
-        this.pendingRate = undefined;
+    if (!Number.isFinite(bounded)) return this.rejectFine(proof, current);
+    if (Math.abs(bounded - proof.base) <= 0.0001)
+      return this.restoreBaseFor(proof, current);
+    if (proof.fine === "checking" && proof.pendingRate !== undefined) {
+      const matches = this.readMatches(proof.pendingRate, current);
+      if (matches === undefined) return undefined;
+      if (!matches) return this.rejectFine(proof, current);
+      if (++proof.stableReads >= 3) {
+        proof.fine = "supported";
+        proof.pendingRate = undefined;
       }
       return true;
     }
-    if (!this.writeAndRead(bounded)) return this.rejectFine();
-    this.appliedRate = bounded;
-    if (!this.fineSupported) {
-      this.fine = "checking";
-      this.pendingRate = bounded;
-      this.stableReads = 1;
+    const accepted = this.writeAndRead(bounded, current);
+    if (accepted === undefined) return undefined;
+    if (!accepted) return this.rejectFine(proof, current);
+    proof.appliedRate = bounded;
+    if (proof.fine !== "supported") {
+      proof.fine = "checking";
+      proof.pendingRate = bounded;
+      proof.stableReads = 1;
     }
     return true;
   }
-  private rejectFine() {
-    this.fine = "unsupported";
-    this.restoreBase();
+  private rejectFine(
+    proof: RateProof,
+    current: () => boolean,
+  ): PlaybackRateResult {
+    if (!current()) return undefined;
+    proof.fine = "unsupported";
+    if (this.restoreBaseFor(proof, current) === undefined) return undefined;
     return false;
   }
 }
@@ -198,7 +301,8 @@ export class VideoAdapter implements PlayerAdapter {
     this.video.currentTime = seconds;
   }
   setRate(rate: number) {
-    if (!this.rates.ensureBase(rate)) throw new RangeError("不支持此速率");
+    if (this.rates.ensureBase(rate) === false)
+      throw new RangeError("不支持此速率");
   }
   getPosition() {
     return this.video.currentTime;

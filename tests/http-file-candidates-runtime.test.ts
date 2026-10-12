@@ -1,3 +1,4 @@
+import { playbackTestContext } from "./helpers/playback-context";
 vi.mock("../apps/web/src/features/playback/browser-mse", async () => {
   const { default: Hls } = await import("hls.js");
   return {
@@ -32,6 +33,7 @@ vi.mock("../packages/player-core", async (original) => {
 const hls = vi.hoisted(() => ({
   supported: true,
   handlers: [] as ((event: unknown, data: any) => void)[],
+  instances: [] as any[],
   loaded: vi.fn(),
   started: vi.fn(),
   destroyed: vi.fn(),
@@ -42,7 +44,12 @@ vi.mock("hls.js", () => ({
     static isSupported = () => hls.supported;
     static isMSESupported = () => hls.supported;
     static getMediaSource = () => ({ isTypeSupported: () => true });
-    config = {};
+    config: Record<string, any>;
+    destroyed = false;
+    constructor(config: Record<string, any>) {
+      this.config = config;
+      hls.instances.push(this);
+    }
     loadSource(url: string) {
       hls.loaded(url);
     }
@@ -52,6 +59,7 @@ vi.mock("hls.js", () => ({
     }
     stopLoad() {}
     destroy() {
+      this.destroyed = true;
       hls.destroyed();
     }
     on(_event: unknown, handler: (event: unknown, data: any) => void) {
@@ -66,6 +74,7 @@ afterEach(() => {
   vi.clearAllMocks();
   reportFault.value = "";
   hls.handlers.length = 0;
+  hls.instances.length = 0;
   hls.supported = true;
 });
 const gate = <T = void>() => {
@@ -220,29 +229,23 @@ function setup(
     anchor_server_time_ms: 0,
     playback_rate: 1,
   });
-  const error = ref("");
+
   const active = ref(true),
     connected = ref(true);
   const clock = { ready: true, revision: 1, now: () => 0 };
   const scope = effectScope();
   const runtime = scope.run(() =>
-    createPlaybackRuntime({
-      session: session as any,
-      state: state as any,
-      clock: clock as any,
-      connected,
-      active,
-      error,
-      run: async (action) => {
-        try {
-          await action();
-        } catch (failure) {
-          error.value =
-            failure instanceof Error ? failure.message : String(failure);
-        }
-      },
-    }),
+    createPlaybackRuntime(
+      playbackTestContext({
+        session: session as any,
+        state: state as any,
+        clock: clock as any,
+        connected,
+        active,
+      }),
+    ),
   )!;
+  const error = runtime.playbackError;
   runtime.attach(el);
   return {
     api,
@@ -846,6 +849,8 @@ it("native→MSE and same-plan range recovery retain the snapshot and finite rou
   try {
     await s.runtime.loadMedia();
     await s.decode();
+    // A prepared grant can precede its deferred SDK/driver attachment.
+    await vi.waitFor(() => expect(s.el.src).toBe("/authorized-2"));
     expect(s.prepares()[1][2].candidate_report.excluded_candidates).toEqual([
       "direct",
     ]);
@@ -1576,3 +1581,153 @@ for (const legacy of ["empty", "404"]) {
     }
   });
 }
+
+
+it("deferred old SID cleanup cannot use a replacement login", async () => {
+  const s = setup();
+  const calls: {
+    path: string;
+    method: string | undefined;
+    epoch: number;
+    user: string;
+  }[] = [];
+  try {
+    await s.runtime.loadMedia();
+    expect(s.prepares()).toHaveLength(1);
+    expect(s.runtime.sessionId.value).toBe("session-1");
+    const original = s.api.getMockImplementation()!;
+    s.api.mockImplementation(async (path, method, body) => {
+      calls.push({
+        path,
+        method,
+        epoch: s.session.epoch,
+        user: s.session.user.id,
+      });
+      return original(path, method, body);
+    });
+    // Final observations defer grant cleanup. Identity can change before that
+    // barrier settles; its old SID must not be sent through the new login.
+    const stopping = s.runtime.reset();
+    ++s.session.epoch;
+    s.session.user.id = "replacement-viewer";
+    await stopping;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.runtime.sessionId.value).toBeNull();
+    expect(
+      calls.filter(
+        (call) =>
+          call.method === "DELETE" &&
+          call.path === "/playback-sessions/session-1" &&
+          (call.epoch !== 1 || call.user !== "user"),
+      ),
+    ).toHaveLength(0);
+  } finally {
+    s.cleanup();
+    await vi.advanceTimersByTimeAsync(0);
+  }
+});
+
+
+it("draft playback settings keep the current HLS attachment active until explicit reload", async () => {
+  const candidates = candidateSet("draft-settings", true);
+  candidates.candidates.shift();
+  const s = setup({ candidates });
+  s.el.canPlayType.mockImplementation((mime: string) =>
+    mime.includes("mpegurl") ? "" : "probably",
+  );
+  try {
+    await s.runtime.loadMedia();
+    const old = hls.instances.at(-1)!,
+      oldError = hls.handlers.at(-1)!,
+      element = s.runtime.video.value;
+    expect(s.runtime.sessionId.value).toBe("session-1");
+    expect(hls.instances).toHaveLength(1);
+    s.runtime.mode.value = "transcode";
+    expect(s.prepares()).toHaveLength(1);
+    // The baseline default XHR loader had no custom hook for ordinary HLS.
+    // A driver-owned request hook must retain that active grant while editing.
+    expect(() => old.config.xhrSetup?.({}, "/authorized-1/segment.ts")).not.toThrow();
+    oldError(undefined, {
+      fatal: true,
+      type: "networkError",
+      details: "draft-observation",
+      response: { code: 503 },
+    });
+    expect(s.error.value).toContain("draft-observation");
+    expect(s.prepares()).toHaveLength(1);
+    await s.runtime.loadMedia();
+    expect(s.prepares()).toHaveLength(2);
+    expect(hls.instances).toHaveLength(2);
+    expect(old.destroyed).toBe(true);
+    expect(hls.instances.at(-1)).not.toBe(old);
+    expect(s.runtime.video.value).toBe(element);
+    const currentError = s.error.value;
+    oldError(undefined, {
+      fatal: true,
+      type: "mediaError",
+      details: "late-old-attachment",
+    });
+    expect(s.error.value).toBe(currentError);
+    expect(s.prepares()).toHaveLength(2);
+    if (old.config.xhrSetup)
+      expect(() => old.config.xhrSetup({}, "/authorized-1/segment.ts")).toThrow(
+        "PLAYBACK_ATTACHMENT_RETIRED",
+      );
+  } finally {
+    s.cleanup();
+    await vi.advanceTimersByTimeAsync(0);
+  }
+});
+
+it("draft playback settings keep the native attachment active until explicit reload", async () => {
+  const s = setup();
+  try {
+    await s.runtime.loadMedia();
+    const oldError = s.el.onerror,
+      element = s.runtime.video.value;
+    s.runtime.mode.value = "transcode";
+    s.el.error = { code: 2 };
+    oldError();
+    expect(s.prepares()).toHaveLength(1);
+    expect(s.runtime.sessionId.value).toBe("session-1");
+    expect(s.error.value).toContain("媒体加载中断");
+    await s.runtime.loadMedia();
+    expect(s.el.src).toBe("/authorized-2");
+    expect(s.runtime.video.value).toBe(element);
+    const currentError = s.error.value;
+    s.el.error = { code: 3 };
+    oldError();
+    expect(s.error.value).toBe(currentError);
+    expect(s.prepares()).toHaveLength(2);
+  } finally {
+    s.cleanup();
+    await vi.advanceTimersByTimeAsync(0);
+  }
+});
+
+it("same-grant native recovery retires the prior source callback without changing the video", async () => {
+  const candidates = candidateSet("native-source-owner", true);
+  candidates.candidates.shift();
+  const s = setup({ candidates });
+  try {
+    await s.runtime.loadMedia();
+    const oldError = s.el.onerror,
+      element = s.runtime.video.value;
+    s.el.error = { code: 2 };
+    oldError();
+    expect(s.el.src).toContain("recovery=1");
+    expect(s.el.onerror).not.toBe(oldError);
+    expect(s.runtime.video.value).toBe(element);
+    expect(s.prepares()).toHaveLength(1);
+    const source = s.el.src;
+    s.el.error = { code: 3 };
+    oldError();
+    expect(s.el.src).toBe(source);
+    expect(hls.loaded).not.toHaveBeenCalled();
+    expect(s.error.value).toBe("");
+    expect(s.prepares()).toHaveLength(1);
+  } finally {
+    s.cleanup();
+    await vi.advanceTimersByTimeAsync(0);
+  }
+});

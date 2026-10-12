@@ -1,0 +1,35 @@
+{
+  "source_head": "990cf8a75b65c102279539fbce683c52196f4c67",
+  "backups": [
+    {
+      "filename": "RainSync-refactor-stage-20261009.zip",
+      "bytes": 181094484,
+      "sha256": "8c2b788983f55b1be8b761f0c19d84667003ddbd71fede55b69e09d66a6006c4",
+      "source_head": "990cf8a75b65c102279539fbce683c52196f4c67",
+      "library_file_id": "libfile_e83a8d325cd0819194edc3d201495c80",
+      "last_confirmed_library_version": 24,
+      "new_library_version": null,
+      "saved_to_library": false,
+      "location": "retained in selected RainSync cloud environment; not uploaded to public Git"
+    },
+    {
+      "filename": "RainSync-code-recovery-p22-finite-1266.zip",
+      "bytes": 7322131,
+      "sha256": "55159397f9902b33318245c14877863ebf7f31cf25f9b48b4e7cae17e87de480",
+      "source_head": "990cf8a75b65c102279539fbce683c52196f4c67",
+      "library_file_id": "libfile_d2d35c80963c8191926e45a677b30d13",
+      "last_confirmed_library_version": 3,
+      "new_library_version": null,
+      "saved_to_library": false,
+      "location": "retained in selected RainSync cloud environment; not uploaded to public Git"
+    },
+    {
+      "filename": "RainSync-testing-only-handoff-1300.zip",
+      "bytes": 12659892,
+      "sha256": "987189bb573c404ed542c7528967f310643ff8eda3ae65d89e425c8899a8baf3",
+      "kind": "private supplemental evidence, not standalone code recovery",
+      "saved_to_library": false,
+      "location": "retained in selected RainSync cloud environment; not uploaded to public Git"
+    }
+  ]
+}

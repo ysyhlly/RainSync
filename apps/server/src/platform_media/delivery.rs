@@ -5,9 +5,10 @@ use axum::{
     extract::Query,
     http::Method,
 };
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use providers::platform::http::MediaResponse;
 use sqlx::postgres::PgRow;
+pub(crate) mod owner;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -526,23 +527,26 @@ pub async fn track(
         .ok_or_else(invalid)?;
     let deadline = Deadline::now() + Duration::from_millis(until as u64);
     check(&app, &authority).await?;
-    let upstream = app
-        .platform_http
-        .media_request_for(
-            &grant.sealed.binding.provider,
-            &track.url,
-            method.clone(),
-            requested.as_ref().map(|(raw, _)| raw.as_str()),
+    let (upstream, owned_body) = owner::start(
+        &app,
+        &authority,
+        grant.sealed.binding.room_id,
+        app.platform_http,
+        owner::Request {
+            provider: grant.sealed.binding.provider.clone(),
+            target: track.url.clone(),
+            method: method.clone(),
+            range: requested.as_ref().map(|(raw, _)| raw.clone()),
             deadline,
-        )
-        .await
-        .map_err(provider_error)?;
+        },
+    )
+    .await?;
     check(&app, &authority).await?;
-    let status = upstream.status();
-    let expected = response_facts(status, upstream.headers(), requested.map(|(_, r)| r))?;
-    enforce_representation_facts(status, upstream.headers(), track)?;
+    let status = upstream.status;
+    let expected = response_facts(status, &upstream.headers, requested.map(|(_, r)| r))?;
+    enforce_representation_facts(status, &upstream.headers, track)?;
     let mut output_headers =
-        delivery_headers(&grant.sealed.binding.provider, upstream.headers(), track)?;
+        delivery_headers(&grant.sealed.binding.provider, &upstream.headers, track)?;
     if grant.sealed.binding.version == 4 {
         hide_course_entity_metadata(&mut output_headers);
     }
@@ -552,7 +556,7 @@ pub async fn track(
         let state = StreamState {
             app: app.clone(),
             authority,
-            upstream,
+            upstream: owned_body,
             remaining: expected,
         };
         Body::from_stream(stream::try_unfold(state, |mut state| async move {
@@ -560,12 +564,12 @@ pub async fn track(
                 .await
                 .map_err(|_| stream_error())?;
             let result={
-                let pending=state.upstream.next_chunk();tokio::pin!(pending);
+                let pending=state.upstream.next();tokio::pin!(pending);
                 loop {tokio::select! {
                     result=&mut pending=>break result,
                     _=tokio::time::sleep(Duration::from_secs(1))=>check(&state.app,&state.authority).await.map_err(|_|stream_error())?,
                 }}
-            }.map_err(|_|stream_error())?;
+            }.transpose().map_err(|_|stream_error())?;
             check(&state.app, &state.authority)
                 .await
                 .map_err(|_| stream_error())?;
@@ -577,7 +581,7 @@ pub async fn track(
                         }
                         *remaining -= chunk.len() as u64;
                     }
-                    Ok(Some((Bytes::from(chunk), state)))
+                    Ok(Some((chunk, state)))
                 }
                 None => {
                     if state.remaining.is_some_and(|v| v != 0) {
@@ -639,7 +643,7 @@ fn hide_course_entity_metadata(headers: &mut HeaderMap) {
 struct StreamState {
     app: App,
     authority: Authority,
-    upstream: MediaResponse,
+    upstream: owner::OwnedBody,
     remaining: Option<u64>,
 }
 

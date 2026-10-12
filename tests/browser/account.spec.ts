@@ -342,7 +342,14 @@ test("avatar failures retain the old version and a truncated committed response 
     mimeType: "image/png",
     buffer: image,
   });
+  const failedUpload = page.waitForResponse(
+    (response) =>
+      response.request().method() === "PUT" &&
+      new URL(response.url()).pathname === "/api/v1/users/me/avatar" &&
+      response.status() === 503,
+  );
   await page.getByRole("button", { name: "保存头像", exact: true }).click();
+  await failedUpload;
   await expect(page.getByRole("dialog").getByRole("alert")).toContainText(
     "编码失败",
   );
@@ -351,7 +358,17 @@ test("avatar failures retain the old version and a truncated committed response 
     "src",
     /v=old/,
   );
+  expect(attempts).toBe(1);
+  // Canvas export is asynchronous; establish the committed upload before
+  // checking recovery from its deliberately truncated response.
+  const committedUpload = page.waitForResponse(
+    (response) =>
+      response.request().method() === "PUT" &&
+      new URL(response.url()).pathname === "/api/v1/users/me/avatar" &&
+      response.status() === 200,
+  );
   await page.getByRole("button", { name: "保存头像", exact: true }).click();
+  await committedUpload;
   await expect(page.getByText("头像已保存", { exact: true })).toBeVisible();
   expect(attempts).toBe(2);
   await expect(page.locator(".avatar-panel img")).toHaveAttribute(

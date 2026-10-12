@@ -103,12 +103,10 @@ test("play stays in-room and does not mistake a socket send for confirmed playba
       action: { type: "CHANGE_MEDIA" },
     }),
   );
-  await expect(picker.locator('[data-media-id="movie-1"]')).toContainText(
-    "已切换为当前影片",
-  );
+  await expect(picker).toBeHidden();
   await expect(
-    picker.getByRole("button", { name: "立即播放 测试影片 2", exact: true }),
-  ).toBeEnabled();
+    page.getByRole("button", { name: "选择影片", exact: true }),
+  ).toBeFocused();
   expect(app.errors).toEqual([]);
 });
 

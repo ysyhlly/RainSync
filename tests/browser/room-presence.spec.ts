@@ -66,7 +66,7 @@ test("reported connections have explicit coverage and sequence gaps leave playba
 }, info) => {
   const f = await reportedFixture(page);
   await page.goto("/rooms/room");
-  const panel = page.getByRole("region", { name: "已上报在线状态的连接" });
+  const panel = page.getByRole("region", { name: "房间在线情况" });
   await expect(panel.getByText("2 个连接")).toBeVisible();
   await expect(panel.getByText("放映用户（你）")).toBeVisible();
   await expect(panel).toContainText("其他成员状态未知");
@@ -89,10 +89,10 @@ test("reported connections have explicit coverage and sequence gaps leave playba
       { user_id: "viewer", connection_count: 2 },
     ],
   });
-  await expect(panel).toContainText("2 位成员已上报在线状态");
+  await expect(panel).toContainText("2 位成员在线");
   await expect(panel).toContainText("观看成员");
   f.send({ type: "PRESENCE_SNAPSHOT", ...f.presence("process-a", 101, 1) });
-  await expect(panel).toContainText("1 位成员已上报在线状态");
+  await expect(panel).toContainText("1 位成员在线");
   await expect(panel).not.toContainText("观看成员");
   f.send({ type: "PRESENCE_SNAPSHOT", ...f.presence("process-a", 99, 8) });
   f.send({ type: "PRESENCE_SNAPSHOT", ...f.presence("process-a", 101, 8) });
@@ -122,7 +122,7 @@ test("unknown epoch reconnects, retired epoch cannot overwrite, revoked membersh
 }) => {
   const f = await reportedFixture(page);
   await page.goto("/rooms/room");
-  const panel = page.getByRole("region", { name: "已上报在线状态的连接" });
+  const panel = page.getByRole("region", { name: "房间在线情况" });
   await expect(panel.getByText("2 个连接")).toBeVisible();
   f.send({ type: "PRESENCE_SNAPSHOT", ...f.presence("process-b", 999, 8) });
   await expect(panel.getByText("3 个连接")).toBeVisible();
@@ -151,7 +151,7 @@ test("server without negotiated fields is unavailable and never inferred offline
 }) => {
   const app = await appFixture(page);
   await page.goto("/rooms/room");
-  const panel = page.getByRole("region", { name: "已上报在线状态的连接" });
+  const panel = page.getByRole("region", { name: "房间在线情况" });
   await expect(panel).toContainText("在线状态不可用");
   app.socket()!.send(
     JSON.stringify({

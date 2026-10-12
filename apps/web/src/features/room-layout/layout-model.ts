@@ -94,7 +94,7 @@ export const WIDGET_DEFINITIONS: Readonly<
     description: "查看和管理房间的待播影片",
     minW: 6,
     minH: 14,
-    defaultW: 12,
+    defaultW: 18,
     defaultH: 14,
     removable: true,
   },
@@ -105,7 +105,7 @@ export const WIDGET_DEFINITIONS: Readonly<
     minW: 4,
     minH: 14,
     defaultW: 6,
-    defaultH: 24,
+    defaultH: 14,
     removable: true,
   },
 };
@@ -171,8 +171,8 @@ export function createDefaultLayout(
         item("player", 0, 8, 18, 54),
         item("media-info", 0, 64, 18, 8),
         item("chat", 18, 0, 6, 62),
-        item("queue", 0, 74, 12, 14),
-        item("members", 18, 64, 6, 24),
+        item("queue", 0, 74, 18, 14),
+        item("members", 18, 64, 6, 14),
       ],
     };
   }

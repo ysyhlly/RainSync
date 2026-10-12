@@ -1,5 +1,25 @@
 use super::*;
 
+// Compatibility entry points only borrow ports and return the same core future.
+// They add no awaited layer, snapshot, normalization or cache/resource owner.
+pub fn check_output_capacity(
+    app: &App,
+) -> impl std::future::Future<Output = anyhow::Result<()>> + '_ {
+    check_output_capacity_at(&app.cache)
+}
+pub fn reserve_output<'a>(
+    app: &'a App,
+    claim: &'a persistence::media_jobs::Claim,
+) -> impl std::future::Future<Output = anyhow::Result<()>> + 'a {
+    reserve_output_at(&app.db, &app.cache, claim)
+}
+pub fn ensure_capacity(app: &App) -> impl std::future::Future<Output = anyhow::Result<()>> + '_ {
+    ensure_capacity_at(&app.db, &app.cache)
+}
+pub fn monitor(app: &App) -> impl std::future::Future<Output = anyhow::Error> + '_ {
+    monitor_at(&app.db, &app.cache)
+}
+
 /// Apply only at cache-write sites, never to source reads or process spawning.
 pub fn write_error(error: std::io::Error) -> anyhow::Error {
     use persistence::media_jobs::JobFailure;
@@ -14,8 +34,8 @@ pub fn write_error(error: std::io::Error) -> anyhow::Error {
 /// Completion must not trust the encoder exit code alone: some muxer write
 /// failures can occur between periodic checks. Do not evict files here, since
 /// freeing space would hide the failure we are trying to classify.
-pub async fn check_output_capacity(app: &App) -> anyhow::Result<()> {
-    let root = app.cache.clone();
+pub(crate) async fn check_output_capacity_at(cache: &std::path::Path) -> anyhow::Result<()> {
+    let root = cache.to_path_buf();
     media_core::child_process::blocking(move || -> anyhow::Result<()> {
         let max = std::env::var("CACHE_MAX_BYTES")
             .ok()
@@ -35,8 +55,9 @@ pub async fn check_output_capacity(app: &App) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn reserve_output(
-    app: &App,
+pub(crate) async fn reserve_output_at(
+    db: &PgPool,
+    cache: &std::path::Path,
     claim: &persistence::media_jobs::Claim,
 ) -> anyhow::Result<()> {
     use persistence::cache_budget::{self, Admission};
@@ -91,16 +112,16 @@ pub async fn reserve_output(
         .and_then(|v| v.checked_add(asset_bytes))
         .ok_or_else(|| anyhow::anyhow!("advanced_media_cache_bound"))?;
     for _ in 0..4 {
-        let revision = cache_budget::snapshot(&app.db).await?;
-        let root = app.cache.clone();
+        let revision = cache_budget::snapshot(db).await?;
+        let root = cache.to_path_buf();
         let headroom =
             media_core::child_process::blocking(move || reservation_headroom(&root)).await??;
-        match cache_budget::reserve(&app.db, claim, revision, bytes, headroom).await? {
+        match cache_budget::reserve(db, claim, revision, bytes, headroom).await? {
             Admission::Reserved => return Ok(()),
             Admission::Changed => continue,
             Admission::Full => {
-                let held = cache_budget::reserved_bytes(&app.db).await?;
-                ensure_headroom(app, bytes.saturating_add(held)).await?;
+                let held = cache_budget::reserved_bytes(db).await?;
+                ensure_headroom(db, cache, bytes.saturating_add(held)).await?;
             }
             Admission::Stale => return Err(process::LeaseInterrupted.into()),
         }
@@ -146,13 +167,13 @@ fn size(path: &std::path::Path) -> std::io::Result<u64> {
     }
     Ok(bytes)
 }
-pub async fn ensure_capacity(app: &App) -> anyhow::Result<()> {
-    ensure_headroom(app, 0).await
+pub(crate) async fn ensure_capacity_at(db: &PgPool, cache: &std::path::Path) -> anyhow::Result<()> {
+    ensure_headroom(db, cache, 0).await
 }
 
-async fn ensure_headroom(app: &App, needed: u64) -> anyhow::Result<()> {
-    persistence::cache::cleanup(&app.db).await?;
-    let root = app.cache.canonicalize()?;
+async fn ensure_headroom(db: &PgPool, cache: &std::path::Path, needed: u64) -> anyhow::Result<()> {
+    persistence::cache::cleanup(db).await?;
+    let root = cache.canonicalize()?;
     let scan_root = root.clone();
     let (mut total, candidates) =
         media_core::child_process::blocking(move || -> anyhow::Result<_> {
@@ -166,12 +187,12 @@ async fn ensure_headroom(app: &App, needed: u64) -> anyhow::Result<()> {
         .await??;
     sqlx::query("INSERT INTO cache_entries(id,cache_key,path) SELECT v,v::text,v::text FROM unnest($1::uuid[]) AS v ON CONFLICT DO NOTHING")
         .bind(&candidates)
-        .execute(&app.db)
+        .execute(db)
         .await?;
     let candidates =
         sqlx::query("SELECT id,state='evicting' AS pending FROM cache_entries WHERE id=ANY($1) OR state='evicting' ORDER BY last_used,id")
             .bind(&candidates)
-            .fetch_all(&app.db)
+            .fetch_all(db)
             .await?;
     let max = std::env::var("CACHE_MAX_BYTES")
         .ok()
@@ -194,7 +215,7 @@ async fn ensure_headroom(app: &App, needed: u64) -> anyhow::Result<()> {
         {
             continue;
         }
-        let Some(owner) = persistence::cache::claim_eviction(&app.db, id).await? else {
+        let Some(owner) = persistence::cache::claim_eviction(db, id).await? else {
             continue;
         };
         let root = root.clone();
@@ -218,7 +239,7 @@ async fn ensure_headroom(app: &App, needed: u64) -> anyhow::Result<()> {
         .await?;
         match removed {
             Ok(bytes) => {
-                persistence::cache::finish_eviction(&app.db, id, owner).await?;
+                persistence::cache::finish_eviction(db, id, owner).await?;
                 total = total.saturating_sub(bytes);
             }
             Err(_) => {
@@ -228,7 +249,7 @@ async fn ensure_headroom(app: &App, needed: u64) -> anyhow::Result<()> {
             }
         }
     }
-    check_output_capacity(app).await?;
+    check_output_capacity_at(cache).await?;
     let root = root.clone();
     media_core::child_process::blocking(move || -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -244,10 +265,10 @@ async fn ensure_headroom(app: &App, needed: u64) -> anyhow::Result<()> {
 
 /// Cache traversal is independent of lease renewal. Slow scans cannot consume
 /// the renewal deadline; only a confirmed capacity error stops the encoder.
-pub async fn monitor(app: &App) -> anyhow::Error {
+pub(crate) async fn monitor_at(db: &PgPool, cache: &std::path::Path) -> anyhow::Error {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        if let Err(error) = ensure_capacity(app).await {
+        if let Err(error) = ensure_capacity_at(db, cache).await {
             if error.is::<persistence::media_jobs::JobFailure>() {
                 return error;
             }

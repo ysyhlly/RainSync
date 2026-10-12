@@ -4,7 +4,7 @@ import { ref } from "vue";
 import { useRoomRuntime } from "../apps/web/src/features/rooms/room-runtime";
 import { useSession } from "../apps/web/src/features/auth/session.store";
 import { RequestFailure } from "../apps/web/src/errors";
-import type { Clock } from "../packages/sync-engine";
+import type { RoomTimelinePort } from "../apps/web/src/features/playback/playback-runtime-types";
 
 const playback = vi.hoisted(() => ({
   ctx: undefined as any,
@@ -18,12 +18,33 @@ vi.mock("../apps/web/src/features/playback/playback-runtime", () => ({
   createPlaybackRuntime: (ctx: any) => {
     playback.ctx = ctx;
     return {
+      // RoomPage action registration requires these unused capabilities.
+      useDistributedOutput: () => { throw Error("Unexpected useDistributedOutput in room-clock-recovery.test.ts"); },
+      useOriginalSource: () => { throw Error("Unexpected useOriginalSource in room-clock-recovery.test.ts"); },
+      startPeerSharing: () => { throw Error("Unexpected startPeerSharing in room-clock-recovery.test.ts"); },
+      stopPeerSharing: () => { throw Error("Unexpected stopPeerSharing in room-clock-recovery.test.ts"); },
+      // Host action registration requires these unused capabilities.
+      attach: () => { throw Error("Unexpected attach in room-clock-recovery.test.ts"); },
+      enablePlayback: () => { throw Error("Unexpected enablePlayback in room-clock-recovery.test.ts"); },
+      cancelPreparation: () => { throw Error("Unexpected cancelPreparation in room-clock-recovery.test.ts"); },
+      playbackError: ref(""),
+      playbackBusy: ref(false),
+      // Existing Settings actions are required by composition, but this room
+      // fixture must never execute them. Keep unexpected calls observable.
+      applySubtitles: () => { throw Error("Unexpected applySubtitles in room-clock-recovery.test.ts"); },
+      selectNativeQuality: () => { throw Error("Unexpected selectNativeQuality in room-clock-recovery.test.ts"); },
+      selectLadderQuality: () => { throw Error("Unexpected selectLadderQuality in room-clock-recovery.test.ts"); },
+      selectPlatformSubtitle: () => { throw Error("Unexpected selectPlatformSubtitle in room-clock-recovery.test.ts"); },
+      setPlatformDanmaku: () => { throw Error("Unexpected setPlatformDanmaku in room-clock-recovery.test.ts"); },
+      setPlatformLiveDanmaku: () => { throw Error("Unexpected setPlatformLiveDanmaku in room-clock-recovery.test.ts"); },
+      runPlayback: async (action: () => Promise<unknown>) => { await action(); },
       video: ref(),
       position: ref(0),
       waiting: ref(false),
       blocked: ref(false),
       dragging: ref(false),
       applyState: playback.apply,
+      applyRoomState: (...args: Parameters<typeof playback.apply>) => playback.apply(...args),
       loadMedia: vi.fn(),
       reset: playback.reset,
       mediaChanged: playback.changed,
@@ -117,7 +138,7 @@ async function setup() {
   };
   const pageshow = (persisted: boolean) =>
     window.dispatchEvent(Object.assign(new Event("pageshow"), { persisted }));
-  const clock: Clock = playback.ctx.clock;
+  const clock: RoomTimelinePort["clock"] = playback.ctx.timeline.clock;
   return {
     runtime,
     session,
@@ -131,7 +152,7 @@ async function setup() {
     visible,
     pageshow,
     document,
-    check: playback.ctx.checkClock,
+    check: playback.ctx.timeline.checkClock,
   };
 }
 
@@ -181,7 +202,7 @@ it("fences each hidden-to-visible round and leaves harmless visibility events al
     s.visible("visible");
     const firstWake = s.requests().at(-1);
     expect(s.clock.ready).toBe(false);
-    expect(s.clock.offset).toBe(0);
+    expect(s.clock.now()).toBe(performance.now());
     s.reply(socket, old);
     expect(s.clock.ready).toBe(false);
     s.visible("hidden");
@@ -395,7 +416,7 @@ it("remote seek preserves an existing authentication error", async () => {
     const socket = s.sockets[0];
     socket.onopen();
     s.snapshot();
-    s.runtime.error = "登录已失效，请重新登录";
+    s.runtime.roomError = "登录已失效，请重新登录";
     s.frame(socket, {
       type: "EVENT",
       action: { type: "SEEK" },

@@ -43,6 +43,7 @@ const selectedSource = ref<Source>(),
   message = ref(""),
   invalidField = ref(""),
   conflict = ref(false),
+  refreshBeforeSave = ref(false),
   unavailable = ref(false),
   advancedOpen = ref(false),
   discardOpen = ref(false),
@@ -79,6 +80,7 @@ function clearDraft() {
   baseline.value = settingsDraft();
   error.value = message.value = invalidField.value = "";
   conflict.value =
+    refreshBeforeSave.value =
     unavailable.value =
     advancedOpen.value =
     discardOpen.value =
@@ -321,6 +323,36 @@ async function save() {
   }
   saving.value = true;
   try {
+    if (refreshBeforeSave.value) {
+      // A failed response does not establish whether its write committed.
+      // Read current authority before retrying, without discarding edits made
+      // during the failed request or this read. A changed revision requires a
+      // separate reviewed save, especially for credentials hidden by the API.
+      const latest = await session.api<SourceSettings>(
+        `${apiBase.value}/${original.id}`,
+      );
+      if (!alive || generation !== current) return;
+      if (
+        latest.id !== original.id ||
+        latest.kind !== original.kind ||
+        !latest.revision
+      )
+        throw Error("片源设置响应不完整，请重新加载。");
+      const refreshed = settingsDraft(latest);
+      draft.value = reconcileSettingsDraft(
+        draft.value,
+        baseline.value,
+        refreshed,
+      );
+      baseline.value = refreshed;
+      detail.value = latest;
+      refreshBeforeSave.value = false;
+      if (latest.revision !== original.revision) {
+        message.value =
+          "已读取最新设置。上次保存结果尚未确认，你的修改已保留，请核对后再保存；已保存的凭据不会显示。";
+        return;
+      }
+    }
     const result = await session.api<SourceSettingsSaved>(
       `${apiBase.value}/${original.id}`,
       "PATCH",
@@ -345,7 +377,10 @@ async function save() {
     if (!dirty.value) dismiss();
     else message.value = "本次设置已保存，新的修改尚未保存。";
   } catch (cause) {
-    if (alive && generation === current) reportFailure(cause);
+    if (alive && generation === current) {
+      refreshBeforeSave.value = true;
+      reportFailure(cause);
+    }
   } finally {
     if (alive && generation === current) saving.value = false;
   }

@@ -126,7 +126,18 @@ const sourceFiles = candidate
   : [
       "Cargo.lock",
       "apps/server/src/main.rs",
+      "apps/server/src/bootstrap/mod.rs",
+      "apps/server/src/bootstrap/config.rs",
+      "apps/server/src/bootstrap/routes.rs",
+      "apps/server/src/bootstrap/lifecycle.rs",
+      "apps/server/src/identity/mod.rs",
+      "apps/server/src/identity/request.rs",
+      "apps/server/src/identity/admin.rs",
+      "apps/server/src/error.rs",
+      "crates/persistence/src/lib.rs",
+      "crates/persistence/src/room_commands.rs",
       "apps/server/src/rooms.rs",
+      "apps/server/src/room_directory_operations.rs",
       "apps/server/src/metrics.rs",
       "tests/control-load.mjs",
     ];

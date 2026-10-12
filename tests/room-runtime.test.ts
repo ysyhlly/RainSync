@@ -968,7 +968,7 @@ it("a recovered lifecycle poll clears its own diagnostic without clearing a play
     await runtime.enter({ id: "a", name: "A", owner_id: "user" });
     sockets[0].onopen();
     sockets[0].onmessage({ data: JSON.stringify({ type: "SNAPSHOT", state, lifecycle: "closing" }) });
-    runtime.error = "existing playback diagnostic";
+    runtime.roomError = "existing playback diagnostic";
     await vi.advanceTimersByTimeAsync(5_000);
     expect(runtime.cleanupError).toContain("将自动重试");
     failing = false;

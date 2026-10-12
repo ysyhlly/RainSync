@@ -41,34 +41,47 @@ pub async fn blocker(
     tx: &mut Transaction<'_, Postgres>,
     task: &Task,
 ) -> Result<Option<&'static str>> {
-    let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM agent_transfer_runs t WHERE t.legacy_unconfirmed AND (t.possible_room_cutoff IS NULL OR t.possible_room_cutoff >= (SELECT cleanup_birth_ordinal FROM rooms WHERE id=$1))) AS legacy_agents,EXISTS(SELECT 1 FROM playback_preparations WHERE room_id=$1 AND lifecycle_epoch<$2 AND drained_at IS NULL) AS preparations,EXISTS(SELECT 1 FROM media_executions e JOIN playback_sessions p ON p.id=e.session_id WHERE p.room_id=$1 AND p.lifecycle_epoch<$2 AND e.reaped_at IS NULL) AS executions,EXISTS(SELECT 1 FROM static_hls_captures c JOIN playback_requests request ON request.session_id=c.session_id LEFT JOIN playback_sessions p ON p.id=c.session_id WHERE (CASE WHEN c.publication_phase='pending_parent' THEN request.room_id ELSE p.room_id END)=$1 AND c.disposed_at IS NULL) AS static_hls_captures,EXISTS(SELECT 1 FROM agent_transfer_runs t JOIN playback_sessions p ON p.id=t.session_id WHERE p.room_id=$1 AND p.lifecycle_epoch<$2 AND t.agent_drained_at IS NULL) AS agent_transfers,EXISTS(SELECT 1 FROM upstream_reservations WHERE room_id=$1 AND lifecycle_epoch<$2 AND state<>'closed') AS upstream,EXISTS(SELECT 1 FROM upstream_reservations WHERE room_id=$1 AND lifecycle_epoch<$2 AND state<>'closed' AND (negotiation='unknown' OR io_uncertain)) AS upstream_unknown,EXISTS(SELECT 1 FROM upstream_reservations WHERE room_id=$1 AND lifecycle_epoch<$2 AND state='cleanup_failed') AS upstream_failed,EXISTS(SELECT 1 FROM playback_sessions p WHERE p.room_id=$1 AND p.lifecycle_epoch<$2 AND NOT(p.resource @> '{\"upstream_closed\":true}'::jsonb) AND NOT EXISTS(SELECT 1 FROM upstream_reservations u WHERE u.id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations o WHERE o.session_id=p.id)) AS legacy_upstream,EXISTS(SELECT 1 FROM playback_sessions WHERE room_id=$1 AND lifecycle_epoch<$2 AND NOT stopped) AS sessions,EXISTS(SELECT 1 FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id WHERE p.room_id=$1 AND p.lifecycle_epoch<$2 AND j.status IN('queued','running')) AS jobs")
+    Ok(blockers(tx, task).await?.first().copied())
+}
+
+/// Read all outstanding owner receipts, in the same order used by completion.
+/// These are diagnostics only; an empty list is not a lifecycle transition.
+pub async fn blockers(
+    tx: &mut Transaction<'_, Postgres>,
+    task: &Task,
+) -> Result<Vec<&'static str>> {
+    let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM agent_transfer_runs t WHERE t.legacy_unconfirmed AND (t.possible_room_cutoff IS NULL OR t.possible_room_cutoff >= (SELECT cleanup_birth_ordinal FROM rooms WHERE id=$1))) AS legacy_agents,EXISTS(SELECT 1 FROM playback_preparations WHERE room_id=$1 AND lifecycle_epoch<$2 AND drained_at IS NULL) AS preparations,EXISTS(SELECT 1 FROM media_executions e JOIN playback_sessions p ON p.id=e.session_id WHERE p.room_id=$1 AND p.lifecycle_epoch<$2 AND e.reaped_at IS NULL) AS executions,EXISTS(SELECT 1 FROM static_hls_captures c JOIN playback_requests request ON request.session_id=c.session_id LEFT JOIN playback_sessions p ON p.id=c.session_id WHERE (CASE WHEN c.publication_phase='pending_parent' THEN request.room_id ELSE p.room_id END)=$1 AND c.disposed_at IS NULL) AS static_hls_captures,EXISTS(SELECT 1 FROM agent_transfer_runs t JOIN playback_sessions p ON p.id=t.session_id WHERE p.room_id=$1 AND p.lifecycle_epoch<$2 AND t.agent_drained_at IS NULL) AS agent_transfers,EXISTS(SELECT 1 FROM upstream_reservations WHERE room_id=$1 AND lifecycle_epoch<$2 AND state<>'closed') AS upstream,EXISTS(SELECT 1 FROM upstream_reservations WHERE room_id=$1 AND lifecycle_epoch<$2 AND state<>'closed' AND (negotiation='unknown' OR io_uncertain)) AS upstream_unknown,EXISTS(SELECT 1 FROM upstream_reservations WHERE room_id=$1 AND lifecycle_epoch<$2 AND state='cleanup_failed') AS upstream_failed,EXISTS(SELECT 1 FROM playback_sessions p WHERE p.room_id=$1 AND p.lifecycle_epoch<$2 AND p.static_hls_capture_id IS NULL AND NOT static_hls_is_child_session(p.id) AND NOT (p.resource ? 'native_platform_context') AND NOT(p.resource @> '{\"upstream_closed\":true}'::jsonb) AND NOT EXISTS(SELECT 1 FROM upstream_reservations u WHERE u.id=p.id) AND NOT EXISTS(SELECT 1 FROM playback_observations o WHERE o.session_id=p.id)) AS legacy_upstream,EXISTS(SELECT 1 FROM playback_sessions WHERE room_id=$1 AND lifecycle_epoch<$2 AND NOT stopped) AS sessions,EXISTS(SELECT 1 FROM media_jobs j JOIN playback_sessions p ON p.id=j.session_id WHERE p.room_id=$1 AND p.lifecycle_epoch<$2 AND j.status IN('queued','running')) AS jobs")
         .bind(task.room).bind(task.epoch).fetch_one(&mut **tx).await?;
     // An old transfer remains uncertain for every room that could have existed
     // before its offer. The transactional birth watermark excludes only rooms
     // created causally later; it never supplies a receipt or clears the flag.
-    Ok(if row.get::<bool, _>("legacy_agents") {
-        Some("legacy_agent_drain_unconfirmed")
-    } else if row.get::<bool, _>("preparations") {
-        Some("playback_preparation_drain_unconfirmed")
-    } else if row.get::<bool, _>("executions") {
-        Some("media_execution_drain_unconfirmed")
-    } else if row.get::<bool, _>("static_hls_captures") {
-        Some("static_hls_capture_drain_unconfirmed")
-    } else if row.get::<bool, _>("agent_transfers") {
-        Some("agent_transfer_drain_unconfirmed")
-    } else if row.get::<bool, _>("upstream_unknown") {
-        Some("upstream_operation_unconfirmed")
-    } else if row.get::<bool, _>("upstream_failed") {
-        Some("upstream_cleanup_failed")
-    } else if row.get::<bool, _>("legacy_upstream") {
-        Some("legacy_upstream_cleanup_unconfirmed")
-    } else if row.get::<bool, _>("upstream") {
-        Some("upstream_cleanup_pending")
-    } else if row.get::<bool, _>("sessions") || row.get::<bool, _>("jobs") {
-        Some("playback_revocation_pending")
-    } else {
-        None
-    })
+    // Native platform and static-HLS sessions have separate, explicitly tracked
+    // owners. The legacy upstream owner never handles them, so waiting for its
+    // receipt would permanently block close even after their real owners drain.
+    // Their preparation/execution/capture/distributed barriers remain above.
+    let mut reasons = Vec::new();
+    for (field, reason) in [
+        ("legacy_agents", "legacy_agent_drain_unconfirmed"),
+        ("preparations", "playback_preparation_drain_unconfirmed"),
+        ("executions", "media_execution_drain_unconfirmed"),
+        (
+            "static_hls_captures",
+            "static_hls_capture_drain_unconfirmed",
+        ),
+        ("agent_transfers", "agent_transfer_drain_unconfirmed"),
+        ("upstream_unknown", "upstream_operation_unconfirmed"),
+        ("upstream_failed", "upstream_cleanup_failed"),
+        ("legacy_upstream", "legacy_upstream_cleanup_unconfirmed"),
+        ("upstream", "upstream_cleanup_pending"),
+    ] {
+        if row.get::<bool, _>(field) {
+            reasons.push(reason);
+        }
+    }
+    if row.get::<bool, _>("sessions") || row.get::<bool, _>("jobs") {
+        reasons.push("playback_revocation_pending");
+    }
+    Ok(reasons)
 }
 
 /// Retain uncertainty indefinitely. Only positive receipts age out, and never

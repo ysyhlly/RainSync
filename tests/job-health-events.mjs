@@ -38,7 +38,7 @@ assert.ok(helper, "Central binding freezes the actual new helper executable");
 assert.equal(resolve(helper.path), resolve(target, "examples", "verify_job_health_events"));
 for (const path of ["crates/media-core/src/job_health.rs", "crates/persistence/src/media_jobs.rs",
   "crates/persistence/examples/verify_job_health_events.rs", "apps/server/src/playback_requests.rs",
-  "apps/server/src/media.rs", "apps/server/src/room_lifecycle.rs", "crates/persistence/src/lib.rs"])
+  "apps/server/src/media.rs", "apps/server/src/room_lifecycle.rs", "apps/server/src/room_lifecycle_operations.rs", "crates/persistence/src/lib.rs"])
   assert.ok(binding.source.some((item) => item.path === path), `Bound producer/helper source ${path}`);
 const coordinator = await Promise.all(["tests/job-health-events.mjs", "tests/fixtures/server.mjs",
   "tests/fixtures/media-stack.mjs", "tests/fixtures/postgres.mjs", "tests/fixtures/source-grant.mjs", "tests/fixtures/playback-admission.mjs"]

@@ -31,7 +31,7 @@ await isolatedServer("room-cleanup-migration",async f=>{
   assert.equal((await admin.request(`/rooms/${empty.id}/lifecycle`)).lifecycle,"closing");
   // Execute the exact production sweep statements against old terminal and
   // expired active records; age/status cannot create a receipt or erase gate.
-  const main=await readFile("apps/server/src/main.rs","utf8");
+  const main=await readFile("apps/server/src/bootstrap/lifecycle.rs","utf8");
   const sweep=[...main.matchAll(/"((?:UPDATE agent_transfer_runs SET status='failed'|DELETE FROM agent_transfer_runs)[^"\n]*)"/g)].map(match=>match[1]);
   assert.equal(sweep.length,2);
   for(const query of sweep) f.sql(query);

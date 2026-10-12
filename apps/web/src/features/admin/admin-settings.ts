@@ -1,3 +1,5 @@
+import { responseRecord, responseMember } from "../../shared/api/response";
+
 export const adminSettingFields = [
   {
     key: "playback_session_limit",
@@ -134,22 +136,24 @@ export function invalidSetting(
     );
   })?.key;
 }
-/** Validate the bounded response before displaying values or using its revision. */
-export function checkedSettings(
-  value: AdminSettingsSnapshot,
-): AdminSettingsSnapshot {
-  const invalid = () => {
+/** Keep the existing bounded settings rules at the unknown response boundary. */
+function assertSettings(
+  value: unknown,
+): asserts value is AdminSettingsSnapshot {
+  const invalid: () => never = () => {
     throw new Error("设置响应不完整，请刷新后重试。");
   };
   if (
-    !value ||
+    !responseRecord(value) ||
     typeof value.revision !== "string" ||
     !/^[1-9]\d*$/.test(value.revision) ||
     BigInt(value.revision) > 9223372036854775807n ||
-    !value.values ||
-    !value.defaults ||
-    !value.overrides ||
-    !value.bounds ||
+    !responseRecord(value.values) ||
+    !responseRecord(value.defaults) ||
+    !responseRecord(value.overrides) ||
+    !responseRecord(value.bounds) ||
+    typeof value.bounds.min !== "number" ||
+    typeof value.bounds.max !== "number" ||
     !Number.isSafeInteger(value.bounds.min) ||
     !Number.isSafeInteger(value.bounds.max) ||
     value.bounds.min < 1 ||
@@ -163,9 +167,10 @@ export function checkedSettings(
       ...(value.overrides[key] === null ? [] : [value.overrides[key]]),
     ]) {
       if (
+        typeof number !== "number" ||
         !Number.isSafeInteger(number) ||
-        number! < value.bounds.min ||
-        number! > value.bounds.max
+        number < value.bounds.min ||
+        number > value.bounds.max
       )
         invalid();
     }
@@ -174,16 +179,22 @@ export function checkedSettings(
   }
   for (const object of [value.values, value.defaults]) {
     if (
-      !["closed", "invite_only", "open"].includes(object.registration_mode) ||
+      !responseMember(object.registration_mode, [
+        "closed",
+        "invite_only",
+        "open",
+      ]) ||
       typeof object.guests_enabled !== "boolean"
     )
       invalid();
   }
   if (
     value.overrides.registration_mode !== null &&
-    !["closed", "invite_only", "open"].includes(
-      value.overrides.registration_mode,
-    )
+    !responseMember(value.overrides.registration_mode, [
+      "closed",
+      "invite_only",
+      "open",
+    ])
   )
     invalid();
   if (
@@ -197,24 +208,85 @@ export function checkedSettings(
   }
   const deployment = value.deployment;
   if (
-    !deployment ||
+    !responseRecord(deployment) ||
     [
       deployment.private_libraries_enabled,
       deployment.nas_compute_enabled,
       deployment.p2p_enabled,
       deployment.other_live_enabled,
     ].some((flag) => typeof flag !== "boolean") ||
-    !deployment.preview ||
+    !responseRecord(deployment.preview) ||
     [
       deployment.preview.concurrency,
       deployment.preview.timeout_seconds,
       deployment.preview.cache_bytes,
       deployment.preview.queue_limit,
       deployment.preview.input_bytes,
-    ].some((number) => !Number.isSafeInteger(number) || number < 0)
+    ].some(
+      (number) =>
+        typeof number !== "number" ||
+        !Number.isSafeInteger(number) ||
+        number < 0,
+    )
   )
     invalid();
-  return value;
+  if (
+    value.updated_at !== null &&
+    (typeof value.updated_at !== "number" ||
+      !Number.isSafeInteger(value.updated_at))
+  )
+    invalid();
+}
+
+/** Parse before displaying values or using a revision; discard unknown fields. */
+export function checkedSettings(value: unknown): AdminSettingsSnapshot {
+  assertSettings(value);
+  return {
+    revision: value.revision,
+    values: {
+      playback_session_limit: value.values.playback_session_limit,
+      media_queue_limit: value.values.media_queue_limit,
+      registration_validate_per_minute:
+        value.values.registration_validate_per_minute,
+      registration_per_ten_minutes: value.values.registration_per_ten_minutes,
+      registration_mode: value.values.registration_mode,
+      guests_enabled: value.values.guests_enabled,
+    },
+    defaults: {
+      playback_session_limit: value.defaults.playback_session_limit,
+      media_queue_limit: value.defaults.media_queue_limit,
+      registration_validate_per_minute:
+        value.defaults.registration_validate_per_minute,
+      registration_per_ten_minutes: value.defaults.registration_per_ten_minutes,
+      registration_mode: value.defaults.registration_mode,
+      guests_enabled: value.defaults.guests_enabled,
+    },
+    overrides: {
+      playback_session_limit: value.overrides.playback_session_limit,
+      media_queue_limit: value.overrides.media_queue_limit,
+      registration_validate_per_minute:
+        value.overrides.registration_validate_per_minute,
+      registration_per_ten_minutes:
+        value.overrides.registration_per_ten_minutes,
+      registration_mode: value.overrides.registration_mode,
+      guests_enabled: value.overrides.guests_enabled,
+    },
+    bounds: { min: value.bounds.min, max: value.bounds.max },
+    deployment: {
+      private_libraries_enabled: value.deployment.private_libraries_enabled,
+      nas_compute_enabled: value.deployment.nas_compute_enabled,
+      p2p_enabled: value.deployment.p2p_enabled,
+      other_live_enabled: value.deployment.other_live_enabled,
+      preview: {
+        concurrency: value.deployment.preview.concurrency,
+        timeout_seconds: value.deployment.preview.timeout_seconds,
+        cache_bytes: value.deployment.preview.cache_bytes,
+        queue_limit: value.deployment.preview.queue_limit,
+        input_bytes: value.deployment.preview.input_bytes,
+      },
+    },
+    updated_at: value.updated_at,
+  };
 }
 export function olderSettings(
   value: AdminSettingsSnapshot,

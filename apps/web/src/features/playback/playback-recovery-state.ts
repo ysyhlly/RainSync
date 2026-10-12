@@ -1,5 +1,5 @@
 import type { PlaybackPlan, RoomState } from "../../../../../packages/protocol";
-import type { PlaybackRateSupport } from "../../../../../packages/player-core";
+import type { PlaybackRateFacts } from "./playback-synchronization";
 import {
   availablePlaybackRanges,
   containsPlaybackPosition,
@@ -23,7 +23,7 @@ export interface RecoverySnapshot {
   pending: boolean;
   previous: PlaybackRecoveryState;
   terminalEnd: boolean;
-  rates: PlaybackRateSupport | undefined;
+  rates: PlaybackRateFacts | undefined;
   confirmedBaseRate: number | undefined;
   rejectedBaseRate: number | undefined;
   generatedEnd: number | undefined;

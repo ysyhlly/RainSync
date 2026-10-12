@@ -9,12 +9,12 @@ import {
   mkdtemp,
   readFile,
   readdir,
-  rm,
   writeFile,
 } from "node:fs/promises";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { isolatedPostgres } from "./fixtures/postgres.mjs";
+import { finishRecoveryFixture } from "./fixtures/upgrade-recovery-evidence.mjs";
 import {
   backup,
   restore,
@@ -128,6 +128,7 @@ test(
       })),
       application_acceptance: false,
     };
+    let primaryFailed = false, primaryError;
     try {
       await fixture.start();
       fixture.sql(
@@ -238,21 +239,14 @@ test(
       report.result = "passed";
       report.scope =
         "synthetic populated schema/checksum upgrade 0086→0088 and separate original/candidate encrypted restore; no executable or real deployment acceptance";
+    } catch (error) {
+      primaryFailed = true;
+      primaryError = error;
     } finally {
-      await fixture.stop();
-      await fixture.verifyStopped();
-      if (process.env.RAINSYNC_ARTIFACT_DIR) {
-        await mkdir(process.env.RAINSYNC_ARTIFACT_DIR, { recursive: true });
-        await writeFile(
-          resolve(
-            process.env.RAINSYNC_ARTIFACT_DIR,
-            `current-baseline-upgrade-${randomUUID()}.json`,
-          ),
-          JSON.stringify(report, null, 2) + "\n",
-          { mode: 0o600 },
-        );
-      }
-      await rm(root, { recursive: true, force: true });
+      await finishRecoveryFixture({
+        name: "current-baseline-upgrade", root, fixture, report,
+        primaryFailed, primaryError,
+      });
     }
   },
 );

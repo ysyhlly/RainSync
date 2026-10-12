@@ -20,6 +20,7 @@ import {
 } from "./platform-import";
 import Notice from "../../shared/ui/Notice.vue";
 import AppSelect from "../../shared/ui/AppSelect.vue";
+import MediaThumbnail from "../library/MediaThumbnail.vue";
 import type { NativePlatformProvider } from "../../shared/api/types";
 import type { NativePlatformCredentialMode } from "../../../../../packages/protocol";
 const r = useRoomRuntime(),
@@ -72,6 +73,7 @@ function invalidate() {
   selected.value = [];
   outcomes.value = [];
   error.value = "";
+  failedCovers.value = new Set();
 }
 function clear() {
   invalidate();
@@ -257,17 +259,53 @@ function selectAll() {
       .slice(0, 20)
       .map((item) => item.key) ?? [];
 }
+const failedCovers = ref(new Set<string>());
+async function retryMetadata(key: string) {
+  const item = preview.value?.items.find((item) => item.key === key);
+  if (!item || busy.value || !canControl.value || !r.room) return;
+  const request = work.begin(),
+    room = r.room.id;
+  phase.value = "preview";
+  error.value = "";
+  try {
+    const value = await api.previewPlatform(
+      room,
+      item.url,
+      item.provider,
+      false,
+      request.signal,
+    );
+    if (!work.current(request) || !preview.value) return;
+    const updated = value.items.find(
+      (candidate) =>
+        candidate.key === key &&
+        candidate.url === item.url &&
+        candidate.part === item.part,
+    );
+    if (!updated) throw Error("未能确认同一视频的信息，请重新预览");
+    preview.value = {
+      ...preview.value,
+      items: preview.value.items.map((candidate) =>
+        candidate.key === key ? updated : candidate,
+      ),
+    };
+    failedCovers.value.delete(key);
+  } catch (failure) {
+    if (work.current(request))
+      error.value =
+        failure instanceof Error ? failure.message : "视频信息暂不可用，请重试";
+  } finally {
+    if (work.current(request)) phase.value = "idle";
+  }
+}
 </script>
 <template>
   <section v-if="r.roomActive" class="panel platform-import">
-    <h2>平台视频同步观看</h2>
-    <p class="helper">
-      可粘贴完整链接、官方短链接或分享文字，一次最多 20
-      条。先预览，再选择导入到此房间。
-    </p>
+    <h2>导入平台视频</h2>
+    <p class="helper">粘贴链接或分享文字，预览后选择导入。每次最多 20 条。</p>
     <form @submit.prevent="previewVideos()">
       <label
-        >无链接的视频编号所属平台<AppSelect
+        >视频平台<AppSelect
           v-model="provider"
           :options="platformProviderOptions"
           label="视频平台"
@@ -289,13 +327,17 @@ function selectAll() {
           :disabled="busy || !canControl"
         />预览合集、播放列表或视频分 P</label
       >
-      <p class="helper">
-        支持 Bilibili 分 P、UP 合集/列表、整季番剧与课程、YouTube PL 播放列表、
-        TikTok collection 与创作者 playlist、抖音 collection。每页最多 20 条，
-        由你明确翻页和选择；平台的登录、签名或访问限制可能阻止展开。
-      </p>
+      <details class="import-details">
+        <summary>支持的合集与预览限制</summary>
+        <p class="helper">
+          支持 Bilibili 分 P、UP 合集/列表、整季番剧与课程、YouTube PL
+          播放列表、 TikTok collection 与创作者 playlist、抖音
+          collection。每页最多 20 条，
+          由你明确翻页和选择；平台的登录、签名或访问限制可能阻止展开。
+        </p>
+      </details>
       <label
-        >使用自己的对应平台会话<AppSelect
+        >播放账号<AppSelect
           v-model="credentialMode"
           label="使用的平台会话"
           :disabled="busy || !canControl"
@@ -304,27 +346,26 @@ function selectAll() {
             { value: 'own_or_anonymous', label: '自己的对应平台会话或匿名' },
           ]"
       /></label>
-      <p class="helper">
-        默认匿名；YouTube 播放列表和 Bilibili
-        番剧/课程预览可使用自己的对应平台会话。
-        翻页绑定同一会话与合集，所选单集仍逐条验证完整观看权限。
-      </p>
+      <p class="helper">默认匿名；需登录时可选择自己的平台账号。</p>
       <button class="primary" :disabled="busy || !url.trim() || !canControl">
         {{ busy ? workLabel : "预览可导入条目" }}
       </button>
     </form>
-    <p class="helper">
-      短链接仅跟随对应平台的有限官方跳转；解析可用性取决于服务端配置和平台限制。每位观众仍使用自己的平台会话或匿名观看。
-    </p>
-    <p class="helper">
-      YouTube
-      账号导入需服务管理员显式启用；已保存会话仍未验证，私有、付费、年龄限制和
-      DRM 内容不受支持。
-    </p>
-    <p class="helper">
-      Bilibili 番剧与课程仅支持平台明确允许的完整、无 DRM 播放；
-      合集元数据不能替代每位观众独立的完整观看权限。
-    </p>
+    <details class="import-details">
+      <summary>平台账号与观看权限说明</summary>
+      <p class="helper">
+        短链接仅跟随对应平台的有限官方跳转；解析可用性取决于服务端配置和平台限制。每位观众仍使用自己的平台会话或匿名观看。
+      </p>
+      <p class="helper">
+        YouTube
+        账号导入需服务管理员显式启用；已保存会话仍未验证，私有、付费、年龄限制和
+        DRM 内容不受支持。
+      </p>
+      <p class="helper">
+        Bilibili 番剧与课程仅支持平台明确允许的完整、无 DRM 播放；
+        合集元数据不能替代每位观众独立的完整观看权限。
+      </p>
+    </details>
     <p v-if="!r.can('queue')" class="helper">由房主导入并选择播放。</p>
     <p v-if="busy" class="helper" role="status">{{ workLabel }}</p>
     <button v-if="busy" @click="cancelWork">停止等待</button>
@@ -382,15 +423,55 @@ function selectAll() {
                   !!outcomeByKey.get(item.key)?.media ||
                   (selected.length >= 20 && !selected.includes(item.key))
                 "
+              /><img
+                v-if="item.cover_data_url && !failedCovers.has(item.key)"
+                class="import-preview-cover"
+                :src="item.cover_data_url"
+                :alt="item.title || '视频预览封面'"
+                @error="failedCovers.add(item.key)"
               /><span
-                >{{ item.title || item.url
+                >{{
+                  item.title ||
+                  `${platformProviderLabels[item.provider]} 视频 · 标题暂未获取`
                 }}<small
                   >{{ platformProviderLabels[item.provider]
                   }}{{ platformEpisodeLabel(item) }}</small
                 ></span
               ></label
             >
+            <p v-if="item.metadata_error" class="helper" role="status">
+              视频信息：{{ platformImportFailureMessage(item.metadata_error) }}
+            </p>
+            <p
+              v-if="!item.cover_data_url || failedCovers.has(item.key)"
+              class="helper"
+            >
+              {{
+                failedCovers.has(item.key)
+                  ? "预览封面加载失败"
+                  : item.cover_unavailable_reason
+                    ? "平台封面暂不可用，可重试视频信息"
+                    : "此条目暂未提供预览封面"
+              }}
+            </p>
+            <button
+              v-if="
+                item.metadata_error?.retryable ||
+                item.cover_unavailable_reason ||
+                failedCovers.has(item.key)
+              "
+              :disabled="busy || !canControl"
+              class="text-button"
+              @click="retryMetadata(item.key)"
+            >
+              重试视频信息
+            </button>
             <template v-if="outcomeByKey.get(item.key)?.media">
+              <MediaThumbnail
+                small
+                :cover="outcomeByKey.get(item.key)!.media!.cover"
+                :alt="outcomeByKey.get(item.key)!.media!.title"
+              />
               <p role="status">
                 已导入：{{ outcomeByKey.get(item.key)!.media!.title }}
               </p>
@@ -477,6 +558,8 @@ textarea {
   display: flex;
   align-items: flex-start;
   gap: 0.6rem;
+  flex-direction: row;
+  min-width: 0;
 }
 .import-check input {
   width: auto;
@@ -484,7 +567,22 @@ textarea {
   margin-top: 0.25rem;
 }
 .import-check span {
+  min-width: 0;
   overflow-wrap: anywhere;
+}
+.import-details {
+  margin-block: var(--space-3);
+}
+.import-details summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+.import-preview-cover {
+  width: 96px;
+  height: 54px;
+  object-fit: cover;
+  border-radius: var(--radius-small);
+  flex: 0 0 auto;
 }
 .import-check small {
   display: block;

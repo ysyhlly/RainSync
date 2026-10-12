@@ -1,4 +1,9 @@
 use super::*;
+use crate::playback::facts::{CandidateBinding as Binding, CandidateFacts, CandidateScope};
+pub use crate::playback::selection::CandidateSelection as Selection;
+#[cfg(test)]
+use crate::playback::selection::playable;
+use crate::playback::selection::{self, CandidateIntent};
 use playback_requests::http_file_fallback::{self as http_file, Authority, CandidateExpectation};
 use protocol::{PlaybackCandidate, PlaybackCandidateRequest, PlaybackCandidateSet};
 use providers::SourceConfig;
@@ -19,45 +24,21 @@ struct HttpBinding {
     candidates: Vec<PlaybackCandidate>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Binding {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    advanced_assets_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    local_hls_ladder: Option<protocol::LocalHlsLadderRequest>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    advanced_playback: Option<protocol::AdvancedPlaybackRequest>,
-    purpose: String,
+fn binding_scope<'a>(
     user: Uuid,
-    room: Uuid,
-    generation: u32,
-    lifecycle_epoch: i64,
+    body: &'a protocol::PlaybackRequest,
     media: Uuid,
-    source_version: String,
-    audio_index: Option<u32>,
-    expires: u64,
-    candidates: Vec<PlaybackCandidate>,
-}
-
-impl Binding {
-    fn matches(
-        &self,
-        user: Uuid,
-        body: &protocol::PlaybackRequest,
-        media: Uuid,
-        epoch: i64,
-        now: u64,
-    ) -> bool {
-        self.purpose == "actual_media_capabilities_v1"
-            && self.user == user
-            && self.room == body.room_id
-            && self.generation == body.media_generation
-            && self.lifecycle_epoch == epoch
-            && self.media == media
-            && self.audio_index == body.audio_index
-            && self.advanced_playback == body.advanced_playback
-            && self.local_hls_ladder == body.local_hls_ladder
-            && self.expires >= now
+    epoch: i64,
+) -> CandidateScope<'a> {
+    CandidateScope {
+        user,
+        room: body.room_id,
+        generation: body.media_generation,
+        lifecycle_epoch: epoch,
+        media,
+        audio_index: body.audio_index,
+        advanced_playback: body.advanced_playback.as_ref(),
+        local_hls_ladder: body.local_hls_ladder.as_ref(),
     }
 }
 
@@ -746,44 +727,6 @@ pub fn selected_agent_output(
     }
 }
 
-pub struct Selection {
-    pub candidate: PlaybackCandidate,
-    pub source_version: Option<String>,
-}
-
-fn playable(
-    candidate: &PlaybackCandidate,
-    result: &protocol::PlaybackCandidateResult,
-    caps: &protocol::PlaybackCapabilities,
-) -> bool {
-    if candidate.video.dolby_vision.is_some() && result.dolby_vision_supported != Some(true) {
-        return false;
-    }
-    let progressive = matches!(
-        result.progressive,
-        protocol::MediaTypeSupport::Maybe | protocol::MediaTypeSupport::Probably
-    );
-    let file = result.file_decoding.as_ref().map(|v| v.supported);
-    let mse = result.mse_decoding.as_ref().map(|v| v.supported);
-    // Actual passthrough configurations require the concrete decoding API. If
-    // unavailable, only the fixed conservative output recipe may use MIME hints.
-    let fallback = candidate.id == "transcode_720p"
-        || matches!(
-            candidate.id.as_str(),
-            "hls_ladder_low" | "hls_ladder_medium" | "hls_ladder_high"
-        );
-    let file_ok = progressive && (file == Some(true) || (fallback && file.is_none()));
-    let mse_ok =
-        result.mse_supported == Some(true) && (mse == Some(true) || (fallback && mse.is_none()));
-    if candidate.transport == "progressive" {
-        file_ok
-    } else {
-        // The exact lower-level codec probe can succeed even when the legacy
-        // High/Level-4 AVC sample failed. Never gate it on that unrelated sample.
-        (caps.native_hls && file_ok) || mse_ok
-    }
-}
-
 pub fn select(
     app: &App,
     user: Uuid,
@@ -807,7 +750,7 @@ pub fn select(
             .map_err(|_| err(StatusCode::CONFLICT, "stale_capability_report"))?,
     )
     .map_err(|_| err(StatusCode::CONFLICT, "stale_capability_report"))?;
-    if !binding.matches(user, body, media, epoch, seconds()) {
+    if !binding.matches(binding_scope(user, body, media, epoch), seconds()) {
         return Err(err(StatusCode::CONFLICT, "stale_capability_report"));
     }
     if binding.advanced_assets_sha256
@@ -851,68 +794,25 @@ fn select_candidates(
         .candidate_report
         .as_ref()
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    let caps = body
+    let capabilities = body
         .capabilities
         .as_ref()
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    let mut seen = std::collections::HashSet::new();
-    for result in &report.results {
-        if !seen.insert(&result.candidate_id)
-            || !candidates.iter().any(|c| c.id == result.candidate_id)
-        {
-            return Err(err(StatusCode::BAD_REQUEST, "invalid_request"));
-        }
-    }
-    if body.local_hls_ladder.is_some()
-        && (!report.excluded_candidates.is_empty()
-            || candidates.is_empty()
-            || candidates.len() > 3
-            || !candidates.iter().all(|candidate| {
-                report
-                    .results
-                    .iter()
-                    .find(|r| r.candidate_id == candidate.id)
-                    .is_some_and(|result| playable(candidate, result, caps))
-            }))
-    {
-        return Err(err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "device_has_no_compatible_playback_transport",
-        ));
-    }
-    for candidate in candidates {
-        if report.excluded_candidates.contains(&candidate.id) {
-            continue;
-        }
-        let requested = body.mode.as_deref().unwrap_or("auto");
-        if requested != "auto"
-            && candidate.delivery_mode != requested
-            && !(requested == "remux" && candidate.delivery_mode == "audio_transcode")
-        {
-            continue;
-        }
-        if candidate.delivery_mode != "direct"
-            && candidate.delivery_mode != "transcode"
-            && body.position_ms > 0.0
-        {
-            continue;
-        }
-        if report
-            .results
-            .iter()
-            .find(|r| r.candidate_id == candidate.id)
-            .is_some_and(|r| playable(&candidate, r, caps))
-        {
-            return Ok(Some(Selection {
-                candidate,
-                source_version,
-            }));
-        }
-    }
-    Err(err(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "device_has_no_compatible_playback_transport",
-    ))
+    selection::select_candidate(
+        CandidateIntent {
+            requested_mode: body.mode.as_deref().unwrap_or("auto"),
+            position_ms: body.position_ms,
+            ladder: body.local_hls_ladder.is_some(),
+            report,
+            capabilities,
+        },
+        CandidateFacts {
+            candidates,
+            source_version,
+        },
+    )
+    .map(Some)
+    .map_err(Into::into)
 }
 
 /// Bind ffprobe facts to a held local file and the current authorized path.
@@ -1297,9 +1197,9 @@ mod tests {
             expires: 10,
             candidates,
         };
-        assert!(binding.matches(Uuid::nil(), &body, Uuid::nil(), 1, 10));
+        assert!(binding.matches(binding_scope(Uuid::nil(), &body, Uuid::nil(), 1), 10));
         body.local_hls_ladder = None;
-        assert!(!binding.matches(Uuid::nil(), &body, Uuid::nil(), 1, 10));
+        assert!(!binding.matches(binding_scope(Uuid::nil(), &body, Uuid::nil(), 1), 10));
     }
 
     #[test]
@@ -1327,11 +1227,11 @@ mod tests {
             candidates: vec![],
             advanced_playback: body.advanced_playback.clone(),
         };
-        assert!(binding.matches(user, &body, media, 9, 30));
-        assert!(!binding.matches(user, &body, media, 9, 31));
-        assert!(!binding.matches(Uuid::new_v4(), &body, media, 9, 1));
-        assert!(!binding.matches(user, &body, Uuid::new_v4(), 9, 1));
-        assert!(!binding.matches(user, &body, media, 10, 1));
+        assert!(binding.matches(binding_scope(user, &body, media, 9), 30));
+        assert!(!binding.matches(binding_scope(user, &body, media, 9), 31));
+        assert!(!binding.matches(binding_scope(Uuid::new_v4(), &body, media, 9), 1));
+        assert!(!binding.matches(binding_scope(user, &body, Uuid::new_v4(), 9), 1));
+        assert!(!binding.matches(binding_scope(user, &body, media, 10), 1));
         for value in [
             None,
             Some(protocol::AdvancedPlaybackRequest {
@@ -1346,7 +1246,7 @@ mod tests {
             }),
         ] {
             body.advanced_playback = value;
-            assert!(!binding.matches(user, &body, media, 9, 1));
+            assert!(!binding.matches(binding_scope(user, &body, media, 9), 1));
         }
         let mut legacy = serde_json::to_value(&binding).unwrap();
         legacy.as_object_mut().unwrap().remove("advanced_playback");

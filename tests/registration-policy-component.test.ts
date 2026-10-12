@@ -24,6 +24,7 @@ import {
   safeRedirect,
 } from "../apps/web/src/app/navigation";
 import { RequestFailure } from "../apps/web/src/errors";
+import { clearInvitation } from "../apps/web/src/features/auth/invitation-intent";
 const dispose: (() => void)[] = [];
 afterEach(() => {
   dispose.splice(0).forEach((fn) => fn());
@@ -54,6 +55,7 @@ function panel(
     new URL(`../apps/web/src/features/auth/${file}.vue`, import.meta.url),
     {
       guestRoomPath,
+      clearInvitation,
       parseGuestInvitation,
       validateNickname,
       RegistrationConfirmationRequired,
@@ -284,7 +286,7 @@ it("login remains available when public policy fails and registration link keeps
     vi.fn(async () => {
       throw Error("unavailable");
     }),
-    "LoginPage",
+    "LoginPanel",
   );
   await ready(p);
   expect(p.c.registration.value).toEqual(

@@ -32,7 +32,7 @@ test("0054 changes only account/source provider allowlists, preserving every aut
   );
 });
 test("YouTube has bounded dedicated routes independent of short providers", async () => {
-  const source = await read("apps/server/src/main.rs");
+  const source = await read("apps/server/src/bootstrap/routes.rs");
   assert.match(
     source,
     /"\/api\/v1\/platform-accounts\/youtube"[\s\S]*?youtube_status[\s\S]*?unlink_youtube[\s\S]*?max\(1024\)/,

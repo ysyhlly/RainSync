@@ -169,10 +169,7 @@ onBeforeUnmount(() => {
 <template>
   <section class="panel platform-account-panel">
     <h3>YouTube 账号会话</h3>
-    <p>
-      每位观众只能使用自己导入的 YouTube
-      会话。会话不会共享给房主或其他观众，视频权限仍由平台决定。
-    </p>
+    <p>导入自己的 YouTube 会话，用于自己的观影请求。</p>
     <p role="status">
       {{
         status?.state === "connected"
@@ -184,10 +181,17 @@ onBeforeUnmount(() => {
               : "正在读取状态…"
       }}
     </p>
-    <p class="helper">
-      此路径仅支持原有公开或不公开的普通视频；登录不会启用私人、付费、年龄限制或
-      DRM 视频，也不会自动续期。
-    </p>
+    <details class="helper">
+      <summary>了解更多</summary>
+      <p>
+        每位观众只能使用自己导入的 YouTube
+        会话。会话不会共享给房主或其他观众，视频权限仍由平台决定。
+      </p>
+      <p>
+        此路径仅支持原有公开或不公开的普通视频；登录不会启用私人、付费、年龄限制或
+        DRM 视频，也不会自动续期。
+      </p>
+    </details>
     <p
       v-if="status && !status.account_import_available"
       class="helper"

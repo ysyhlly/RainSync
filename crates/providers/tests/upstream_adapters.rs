@@ -655,3 +655,43 @@ async fn library_scan_keeps_explicit_series_fields_without_host_paths() {
         task.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn guarded_browse_reacquires_the_current_fence_before_each_page() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Fence(Arc<AtomicUsize>);
+    impl Drop for Fence {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    for kind in ["jellyfin", "emby"] {
+        let (base, task) = upstream(vec![(
+            200,
+            json!({"TotalRecordCount":2,"Items":[{"Id":"one"}]}),
+        )])
+        .await;
+        let config = config(&base);
+        let guards = AtomicUsize::new(0);
+        let released = Arc::new(AtomicUsize::new(0));
+        let result = providers::list_items_guarded(kind, &config, || {
+            let page = guards.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(if page == 0 {
+                Ok(Fence(released.clone()))
+            } else {
+                assert_eq!(released.load(Ordering::SeqCst), 1);
+                Err(anyhow::anyhow!("source_changed"))
+            })
+        })
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), "source_changed");
+        assert_eq!(guards.load(Ordering::SeqCst), 2);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        let requests = task.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("StartIndex=0"));
+    }
+}

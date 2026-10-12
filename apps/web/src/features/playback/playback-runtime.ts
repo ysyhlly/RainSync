@@ -1,26 +1,37 @@
 import { evaluatePlaybackRecovery } from "./playback-recovery-state";
-import { createPlaybackMaintenance } from "./playback-maintenance";
+import { createPlaybackSynchronization } from "./playback-synchronization";
+import { createPlaybackSourceRecoveryState } from "./playback-source-recovery-state";
+import { createPlaybackGesture } from "./playback-gesture";
+import { createLiveReconciliation } from "./live-reconciliation";
+import { createVodReconciliation } from "./vod-reconciliation";
+import { createVodTickPolicy } from "./vod-tick-policy";
+import { createPlaybackMediaIO } from "./drivers/media-io";
+import { createLiveTickPolicy } from "./live-tick-policy";
+import { createPlaybackSessionController, checkCandidateLifetime } from "./playback-session-controller";
 export type { PlaybackRecoveryState } from "./playback-runtime-types";
 import { createLiveWindowRecovery } from "./live-window-recovery";
 import { discoverPlaybackCandidates } from "./playback-candidate-discovery";
 import type {
   PlaybackRuntimeContext,
-  MetricIntent,
+  PlaybackIntent,
   CandidateDiscovery,
   StaticChildState,
   PlaybackContinuation,
   PlaybackRecoveryState,
+  PlaybackLoadingStage,
 } from "./playback-runtime-types";
 import { createMediaDataDeadline } from "./media-data-deadline";
 import { createPlaybackMetricRuntime } from "./playback-metric-runtime";
+import { createPlaybackScope, type PlaybackObservationScope } from "./playback-scope";
 import { bestEffort, freezeCandidateSnapshot } from "./playback-runtime-utils";
 import {
   finiteHlsRequestParameters,
   validateFiniteHlsChoice,
 } from "./finite-hls-intent";
 import { computed, ref, nextTick, onScopeDispose, watch } from "vue";
-import type Hls from "hls.js";
-import { loadHlsLibrary } from "./hls-library";
+import type { HlsDriver } from "./drivers/hls-driver";
+import { createNativeDriver, type NativeDriver, type NativeDriverOptions } from "./drivers/native-driver";
+import { loadHlsDriver } from "./hls-driver-loader";
 import { getPlaybackMediaSource, supportsHlsPlayback } from "./browser-mse";
 import {
   liveRoomMatchesPlan,
@@ -29,33 +40,28 @@ import {
   validNativeLiveBinding,
   validNativeLiveDeliveryUrl,
 } from "./native-live";
-import { createDashPlayback } from "../../../../../packages/player-core/dash";
+import type { DashDriver, DashPlaybackError } from "./drivers/dash-driver";
+import { loadDashDriver } from "./dash-driver-loader";
+import { loadDashJs } from "../../../../../packages/player-core/dash/loader";
 import {
   nativePlatformRequest,
-  validNativePlatformPlan,
   validNativeCompatibilityDeliveryUrl,
   nativePlatformPlaybackChoice,
   type NativePlatformPlaybackMode,
 } from "./native-platform-intent";
 import {
   advancedPlaybackRequest,
-  matchesAdvancedPlaybackPlan,
-  sameAdvancedPlaybackRequest,
   needsDolbyVisionToneMap,
 } from "./advanced-playback-intent";
 import {
   localHlsLadderRequest,
-  matchesLocalHlsLadderPlan,
-  sameLocalHlsLadderRequest,
   bindLocalHlsLevels,
   hasHlsLadder,
 } from "./local-hls-ladder-intent";
-import { RoomP2PTransport, type PeerStats } from "./room-p2p";
-import { createP2PFragmentLoader } from "./room-p2p-loader";
+import type { RoomP2PTransport, PeerStats } from "./room-p2p";
 import {
   validDistributedIntent,
   sameDistributedIntent,
-  matchesDistributedPlaybackPlan,
 } from "./distributed-playback-intent";
 import { createPlatformTextRuntime } from "./platform-text-runtime";
 import {
@@ -70,18 +76,12 @@ import {
 } from "../rooms/platform-import";
 import {
   detectCapabilities,
-  PlaybackPlanGenerations,
-  matchesPlanGeneration,
-  PlaybackRateSupport,
   availablePlaybackRanges,
-  containsPlaybackPosition,
-  hasUsablePlaybackTimeline,
 } from "../../../../../packages/player-core";
-import { Corrector, target } from "../../../../../packages/sync-engine";
+import { target } from "../../../../../packages/sync-engine";
 import type {
   PlaybackPlan,
   PlaybackRequest,
-  PlaybackReadiness,
   PlaybackMetricsReceipt,
   NativePlatformMaxHeight,
   NativePlatformQualityOption,
@@ -94,18 +94,18 @@ import type {
   DistributedComputePlaybackFacts,
   UpstreamMeasuredOutput,
 } from "../../../../../packages/protocol";
-import { RequestFailure, isUnsupportedTimelineResponse } from "../../errors";
+import { RequestFailure } from "../../errors";
 import { StaleIdentity } from "../../shared/api/client";
+import { actionErrorMessage } from "../../shared/action-error";
 import {
   PlaybackCancelled,
-  PlaybackViewerOriginRequired,
-  PlaybackRequests,
   waitPlaybackReady,
 } from "../../playback-request";
 import { bindPlaybackObservations } from "./observation-binding";
 import {
   createPlaybackMetrics,
   type PlaybackMetricsOrigin,
+  type PlaybackMetricsSnapshot,
 } from "./playback-metrics";
 import {
   summarizePlaybackPlan,
@@ -133,12 +133,61 @@ import {
   type StaticHlsAvailability,
 } from "./static-hls-availability";
 
-const CANDIDATE_LIFETIME_MS = 5 * 60 * 1000;
 const candidateError = "播放候选无法安全使用，请重新加载播放";
-const candidateExpiredError = "播放候选已失效，请重新加载播放";
 
 export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
-  const { session, state, connected, clock, error, run } = ctx;
+  const { identity: viewer, api, timeline, commands = {} } = ctx;
+  const { state, connected, clock } = timeline;
+  const error = ref(""), busy = ref(false);
+  let actionSerial = 0, disposed = false;
+  const pendingActions = new Set<object>();
+  function invalidateActions() {
+    ++actionSerial;
+    pendingActions.clear();
+    busy.value = false;
+    error.value = "";
+  }
+  async function run(
+    action: () => Promise<unknown>,
+    options: { preserveError?: boolean; busy?: boolean } = {},
+  ) {
+    if (disposed) return;
+    const serial = ++actionSerial,
+      epoch = viewer.current().epoch,
+      room = state.value?.room_id,
+      token = {};
+    const tracksBusy = options.busy !== false;
+    if (tracksBusy) {
+      pendingActions.add(token);
+      busy.value = true;
+    }
+    if (!options.preserveError) error.value = "";
+    try {
+      await action();
+    } catch (failure) {
+      if (
+        !disposed &&
+        serial === actionSerial &&
+        epoch === viewer.current().epoch &&
+        room === state.value?.room_id &&
+        !(failure instanceof PlaybackCancelled) &&
+        !(failure instanceof StaleIdentity)
+      )
+        error.value = actionErrorMessage(failure);
+    } finally {
+      if (tracksBusy) {
+        pendingActions.delete(token);
+        if (!disposed) busy.value = pendingActions.size > 0;
+      }
+    }
+  }
+  const stopIdentityActions = viewer.subscribeInvalidation(invalidateActions);
+  watch(() => state.value?.room_id, invalidateActions, { flush: "sync" });
+  onScopeDispose(() => {
+    disposed = true;
+    stopIdentityActions();
+    invalidateActions();
+  });
   const accountRevision = (provider?: NativePlatformProvider) =>
     provider === "bilibili"
       ? (ctx.platformAccountChange?.value ?? 0)
@@ -152,7 +201,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     provider === "douyin" ||
     provider === "tiktok" ||
     provider === "youtube";
-  const roomIsActive = () => ctx.active?.value !== false;
+  const roomIsActive = () => timeline.active?.value !== false;
+  let mediaIO: ReturnType<typeof createPlaybackMediaIO>;
   const video = ref<HTMLVideoElement>(),
     waiting = ref(false),
     blocked = ref(false),
@@ -171,8 +221,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   const liveWindowScope = () =>
     roomIsActive() && validNativeLiveBinding(state.value?.live)
       ? JSON.stringify([
-          session.user?.id,
-          session.epoch,
+          viewer.current().userId,
+          viewer.current().epoch,
           state.value?.room_id,
           state.value?.media_id,
           state.value?.media_generation,
@@ -184,7 +234,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         ])
       : undefined;
   const liveRecovery = createLiveWindowRecovery({
-    intent: () => metricIntent,
+    intent: () => readIntent(),
     terminalEnd: () => terminalEnd,
     scope: liveWindowScope,
     currentPlan: (p) => currentPlan(p),
@@ -211,13 +261,14 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     probeExpiredNativeLiveWindow,
   } = liveRecovery;
   const platformText = createPlatformTextRuntime({
-    session,
+    identity: viewer,
+    api,
     video,
     preferenceScope: () =>
       roomIsActive() && state.value?.media_id
         ? JSON.stringify([
-            session.user?.id,
-            session.epoch,
+            viewer.current().userId,
+            viewer.current().epoch,
             state.value.room_id,
             state.value.media_id,
             state.value.media_generation,
@@ -252,8 +303,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   let qualityContext: string | undefined;
   const qualityScope = () =>
     JSON.stringify([
-      session.user?.id,
-      session.epoch,
+      viewer.current().userId,
+      viewer.current().epoch,
       state.value?.room_id,
       state.value?.media_id,
       state.value?.media_generation,
@@ -268,7 +319,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       qualityContext = undefined;
     }
   }
-  let dash: ReturnType<typeof createDashPlayback> | undefined,
+  let dash: DashDriver | undefined,
     nativeRefresh: ReturnType<typeof setTimeout> | undefined;
   let failedCompatibilityPlan: PlaybackPlan | undefined;
   const tracks = ref<PlaybackPlan["audio_tracks"]>([]),
@@ -305,7 +356,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     ladderLevelMap = undefined;
   }
   function selectLadderQuality(value: string) {
-    const p = plan;
+    const currentIntent = readIntent();
+    const p = readPlan();
     if (
       !p ||
       !hasHlsLadder(p) ||
@@ -313,19 +365,19 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       !hls ||
       !ladderManual.value ||
       !ladderLevelMap ||
-      !metricIntent ||
-      !candidateIntentCurrent(metricIntent)
+      !currentIntent ||
+      !candidateIntentCurrent(currentIntent)
     )
       return;
     const level = value === "auto" ? -1 : ladderLevelMap.get(value);
     if (level === undefined) return;
     ladderQuality.value = value;
-    hls.loadLevel = level;
+    hls.setLevel(level);
   }
   const advancedScope = () =>
     [
-      session.epoch,
-      session.user?.id,
+      viewer.current().epoch,
+      viewer.current().userId,
       state.value?.room_id,
       state.value?.media_id,
       state.value?.media_generation,
@@ -355,7 +407,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     confirm_current_network: boolean;
     upload_allowed: boolean;
   }) {
-    const p = plan;
+    const p = readPlan();
     if (
       !p ||
       !currentPlan(p) ||
@@ -400,10 +452,14 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     await beginLoad("user_intent");
   }
   const duration = ref(0),
-    position = ref(0),
-    sessionId = ref<string | null>(null);
+    position = ref(0);
   const recoveryState = ref<PlaybackRecoveryState>("idle");
   const preparation = ref<PlaybackPreparationState>({ phase: "idle" });
+  const loadingStage = ref<PlaybackLoadingStage>("idle");
+  const startupDiagnostics = ref<PlaybackMetricsSnapshot>();
+  let sourcePresented = false;
+  let recoveryWaitAt: number | undefined;
+  const recoveryTimeoutError = "本机同步等待超时，请重新加载播放以跟上房间进度";
   function failLocalPlayback(message: string, code?: string, notice = message) {
     // A terminal transport/decoder failure owns its error. Loading deadlines
     // must not replace it after the SDK has already detached the source.
@@ -422,18 +478,19 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         ownsNotice: (value) => value === notice,
       },
     };
+    loadingStage.value = "failed";
   }
   function failNativeCompatibility(p: PlaybackPlan, message: string) {
-    if (plan !== p || !p.native_platform?.compatibility) return;
+    if (readPlan() !== p || !p.native_platform?.compatibility) return;
     failedCompatibilityPlan = p;
     clearTimeout(nativeRefresh);
     nativeRefresh = undefined;
-    invalidatePlayActions();
+    synchronization.invalidatePlayActions();
     video.value?.pause();
     hls?.stopLoad();
     firstFrameDeadline?.stop();
     mediaDataLoad?.stop();
-    recoveringHls = false;
+    sourceRecovery.endRecovery();
     waiting.value = false;
     error.value = message;
     failLocalPlayback(message, "NATIVE_PLATFORM_DELIVERY_INVALID");
@@ -457,19 +514,14 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         return "";
     }
   });
-  let recoveryPending = false,
-    confirmedBaseRate: number | undefined,
-    rejectedBaseRate: number | undefined;
-  let hls: Hls | undefined,
-    plan: PlaybackPlan | undefined,
+  let recoveryPending = false;
+  let native: NativeDriver | undefined,
+    hls: HlsDriver | undefined,
     loadSerial = 0,
     clockAction: "load" | "apply" | undefined;
-  let recoveringHls = false,
-    terminalEnd = false,
-    capabilityProbe: AbortController | undefined,
-    generationWait: AbortController | undefined,
-    generationWaitFailed = false,
-    generatedEnd: number | undefined;
+  const sourceRecovery = createPlaybackSourceRecoveryState();
+  let terminalEnd = false,
+    capabilityProbe: AbortController | undefined;
   let mediaDataLoad:
     | { sourceChanged: () => void; sync: () => void; stop: () => void }
     | undefined;
@@ -478,19 +530,6 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   const firstFrameTimeoutError =
     "播放首帧等待超时，尚未确认画面呈现，请重新加载播放";
   const mediaDataTimeoutError = "媒体数据加载超时，请检查连接或重新加载播放";
-  const corrector = new Corrector();
-  let rates: PlaybackRateSupport | undefined,
-    applySerial = 0,
-    pendingUserSeek = false,
-    pendingForce = false,
-    seekSerial = 0;
-  let pendingPlay: object | undefined;
-  let playFailed = false;
-  function invalidatePlayActions() {
-    ++applySerial;
-    pendingPlay = undefined;
-    playFailed = false;
-  }
   const playFailureIs = (failure: unknown, name: string) =>
     !!failure &&
     typeof failure === "object" &&
@@ -498,7 +537,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     failure.name === name;
   const clockRevision = () => clock.revision ?? 0;
   const clockUsable = () => {
-    ctx.checkClock?.();
+    timeline.checkClock?.();
     return (live.value || clock.ready) && connected.value && foreground();
   };
   const unsupportedRateError =
@@ -508,14 +547,13 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     if (!error.value) error.value = playInterruptedError;
   }
   function reportUnsupportedRate() {
-    rejectedBaseRate = state.value?.playback_rate;
     if (!error.value || error.value === unsupportedRateError)
       error.value = unsupportedRateError;
   }
   function runAutomaticApply(force = false, userSeek = false) {
     const previousError = error.value;
     return run(async () => {
-      // The room's action runner clears errors for user actions. Automatic
+      // Playback's action runner clears its errors for user actions. Automatic
       // convergence must preserve unrelated authentication/media failures.
       if (
         previousError &&
@@ -526,56 +564,170 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       await applyState(force, userSeek);
     });
   }
-  function baseRate() {
-    const rate = state.value?.playback_rate;
-    if (rate === undefined || !rates) return false;
-    const supported = rates.ensureBase(rate);
-    if (!supported) reportUnsupportedRate();
-    else {
-      confirmedBaseRate = rate;
-      rejectedBaseRate = undefined;
+  /** Apply an accepted room projection within playback's own status scope.
+   * Explicit seeks retain busy feedback; normal projection convergence does not. */
+  function applyRoomState(force = false, userSeek = false) {
+    return run(() => applyState(force, userSeek), {
+      preserveError: true,
+      busy: force && userSeek,
+    });
+  }
+  const synchronization = createPlaybackSynchronization<PlaybackPlan>({
+    element: () => video.value,
+    currentPlan: (p) => currentPlan(p),
+    active: roomIsActive,
+    status: () => state.value?.playback_status,
+    rate: () => state.value?.playback_rate,
+    captureRateScope: () => {
+      const serial = loadSerial,
+        plan = readPlan(),
+        intent = readIntent(),
+        element = video.value,
+        identity = viewer.current(),
+        room = state.value?.room_id,
+        media = state.value?.media_id,
+        generation = state.value?.media_generation,
+        active = roomIsActive(),
+        wasDisposed = disposed;
+      // Compare supersession only. Clock recovery, staged settings and an SDK
+      // that is not ready must retain their existing base-restoration rights.
+      return () =>
+        serial === loadSerial &&
+        plan === readPlan() &&
+        intent === readIntent() &&
+        element === video.value &&
+        identity.userId === viewer.current().userId &&
+        identity.epoch === viewer.current().epoch &&
+        room === state.value?.room_id &&
+        media === state.value?.media_id &&
+        generation === state.value?.media_generation &&
+        active === roomIsActive() &&
+        wasDisposed === disposed;
+    },
+    clockUsable,
+    clockRevision,
+    rateRejected: reportUnsupportedRate,
+    rateSupported: () => {
       if (error.value === unsupportedRateError) error.value = "";
-    }
-    return supported;
-  }
-  function restoreBaseRate() {
-    if (baseRate() && !rates!.restoreBase()) reportUnsupportedRate();
-  }
+    },
+  });
+  const tickVod = createVodTickPolicy({
+    synchronization,
+    position,
+    dragging,
+    waiting,
+    blocked,
+    get generationPending() {
+      return sourceRecovery.pending;
+    },
+    get generationFailed() {
+      return sourceRecovery.failed;
+    },
+    get recovering() {
+      return sourceRecovery.recovering;
+    },
+    get generatedEnd() {
+      return sourceRecovery.end;
+    },
+    now: () => clock.now(),
+    apply: (force, userSeek) => {
+      void runAutomaticApply(force, userSeek);
+    },
+    completed: () => {
+      void completed();
+    },
+  });
+  const tickLive = createLiveTickPolicy({
+    synchronization,
+    position,
+    duration,
+    get terminalEnd() {
+      return terminalEnd;
+    },
+    get needsEdge() {
+      return liveNeedsEdge;
+    },
+    matches: liveRoomMatchesPlan,
+    fail: failNativeLive,
+    apply: () => {
+      void runAutomaticApply();
+    },
+  });
   function queueApply(force = false, userSeek = false) {
-    pendingForce ||= force;
-    pendingUserSeek ||= userSeek;
+    synchronization.queueApply(force, userSeek);
     clockAction ??= "apply";
   }
-  let planGenerations = new PlaybackPlanGenerations();
-  const currentPlan = (p: PlaybackPlan) =>
-    plan === p &&
-    planGenerations.current(p) &&
-    (!p.native_platform?.live ||
-      (!!state.value && liveRoomMatchesPlan(state.value, p)));
-  let playbackRequests: PlaybackRequests | undefined;
-  let playbackUser: string | undefined;
-  let playbackEpoch: number | undefined;
   let observations: ReturnType<typeof bindPlaybackObservations> | undefined;
   let staticChildState: StaticChildState | undefined;
   let staticBinding: StaticHlsPlanBinding | undefined;
-  let metricIntent: MetricIntent | undefined;
+  const sessionController = createPlaybackSessionController({
+    identity: viewer,
+    api,
+    timeline: { state, active: timeline.active },
+    storage: () => sessionStorage,
+    origin: () => location.origin,
+    intentCurrent: (intent) => candidateIntentCurrent(intent),
+    retryStaticChild: (binding) => staticChildState?.retry(binding),
+    prepared: (value) => {
+      preparation.value = applyPreparationSnapshot(preparation.value, {
+        generation: value.plan_generation!, sessionId: value.session_id,
+        deliveryMode: value.delivery_mode, phase: "preparing",
+      });
+    },
+    readiness: (value) => {
+      const snapshot = preparationReadinessSnapshot(value, preparation.value.deliveryMode);
+      if (snapshot) preparation.value = applyPreparationSnapshot(preparation.value, snapshot);
+    },
+  });
+  const {
+    plan: readPlan,
+    intent: readIntent,
+    sessionId,
+    currentPlan,
+    allocateIdempotencyKey,
+    nextPlan,
+    readReadiness,
+    stop: stopSessionRequests,
+  } = sessionController;
+  let activeObservation: PlaybackObservationScope | undefined;
+  function observationFor(intent: PlaybackIntent) {
+    return readIntent() === intent && activeObservation?.owner === intent.owner
+      ? activeObservation
+      : undefined;
+  }
+  function observationCurrent(scope: PlaybackObservationScope) {
+    const currentIntent = readIntent();
+    return (
+      activeObservation === scope &&
+      !!currentIntent &&
+      currentIntent.owner === scope.owner &&
+      intentCurrent(currentIntent)
+    );
+  }
+  function advanceIntentObservation(intent: PlaybackIntent) {
+    const scope = observationFor(intent);
+    if (scope) advanceObservationSource(scope);
+  }
   let pendingLoad:
     | {
-        metrics: MetricIntent;
-        intent: ReturnType<PlaybackPlanGenerations["next"]>;
+        playbackIntent: PlaybackIntent;
+        planIntent: ReturnType<typeof sessionController.nextPlan>;
         failed: string[];
         preparing: boolean;
         continuation?: PlaybackContinuation;
       }
     | undefined;
-  const metricRuntime = createPlaybackMetricRuntime<MetricIntent>({
-    intent: () => metricIntent,
-    currentIntent: (m) => metricCurrent(m),
+  const metricRuntime = createPlaybackMetricRuntime({
+    scope: () => activeObservation,
+    currentScope: observationCurrent,
     currentPlan,
     video,
     state: () => metricState(),
+    snapshot: (value) => {
+      startupDiagnostics.value = value;
+    },
     send: (binding, body, signal) =>
-      session.api<PlaybackMetricsReceipt>(
+      api<PlaybackMetricsReceipt>(
         `/playback-sessions/${binding.sessionId}/metrics`,
         "POST",
         body,
@@ -585,59 +737,95 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   const {
     sender: metricSender,
     observeMetrics,
-    advanceMetricAttempt,
+    advanceObservationSource,
     bindMetricSource,
-    attachMetricSource,
+    attachMetricSource: recordMetricSource,
     bindMetricGrant,
     sampleMetrics,
   } = metricRuntime;
+  const attachMetricSource = () => {
+    recordMetricSource();
+    if (!sourcePresented && !preparation.value.failure)
+      loadingStage.value = "loading_media";
+  };
   const foreground = () =>
     typeof document === "undefined" || document.visibilityState !== "hidden";
   function refreshRecovery() {
+    const currentSession = readPlan(), currentIntent = readIntent();
+    const ownTimeout =
+      preparation.value.failure?.code === "PLAYBACK_RECOVERY_TIMEOUT";
     const next = evaluatePlaybackRecovery({
       state: state.value,
       element: video.value,
-      plan,
-      rates,
+      plan: currentSession,
+      rates: synchronization.rateFacts,
       active: roomIsActive(),
       foreground: foreground(),
       clockReady: clock.ready,
       now: () => clock.now(),
       connected: connected.value,
-      error: error.value,
+      error:
+        ownTimeout && error.value === recoveryTimeoutError ? "" : error.value,
       blocked: blocked.value,
       waiting: waiting.value,
       ownsPlan:
-        !!plan &&
-        currentPlan(plan) &&
-        !!metricIntent &&
-        metricCurrent(metricIntent),
-      ownsLoad: !!pendingLoad && metricCurrent(pendingLoad.metrics),
-      pending: recoveryPending,
+        !!currentSession &&
+        currentPlan(currentSession) &&
+        !!currentIntent &&
+        intentCurrent(currentIntent),
+      ownsLoad: !!pendingLoad && intentCurrent(pendingLoad.playbackIntent),
+      pending: recoveryPending || ownTimeout,
       previous: recoveryState.value,
       terminalEnd,
-      rejectedBaseRate,
-      confirmedBaseRate,
-      generatedEnd,
-      generationWait: !!generationWait,
-      generationWaitFailed,
-      recoveringHls,
-      pendingForce,
-      pendingUserSeek,
-      pendingPlay: !!pendingPlay,
+      rejectedBaseRate: synchronization.rejectedBaseRate,
+      confirmedBaseRate: synchronization.confirmedBaseRate,
+      generatedEnd: sourceRecovery.end,
+      generationWait: sourceRecovery.pending,
+      generationWaitFailed: sourceRecovery.failed,
+      recoveringHls: sourceRecovery.recovering,
+      pendingForce: synchronization.pendingForce,
+      pendingUserSeek: synchronization.pendingUserSeek,
+      pendingPlay: synchronization.pendingPlay,
       unsupportedRateError,
     });
+    const at = performance.now();
+    const recovering = next.state === "waiting" || next.state === "catching_up";
+    if (!sourcePresented || !recovering || !Number.isFinite(at)) {
+      recoveryWaitAt = undefined;
+    } else {
+      recoveryWaitAt ??= at;
+      if (ownTimeout || at - recoveryWaitAt >= 20_000) {
+        if (!ownTimeout) {
+          failLocalPlayback(recoveryTimeoutError, "PLAYBACK_RECOVERY_TIMEOUT");
+          if (!error.value) error.value = recoveryTimeoutError;
+        }
+        recoveryPending = false;
+        recoveryState.value = "failed";
+        return;
+      }
+    }
+    // Timeout is local uncertainty. Confirmed room convergence may retire
+    // exactly its own notice, while other media/authentication failures stay.
+    if (ownTimeout && next.state === "idle") {
+      if (error.value === recoveryTimeoutError) error.value = "";
+      preparation.value = {
+        ...preparation.value,
+        phase: "ready",
+        failure: undefined,
+      };
+      loadingStage.value = "playing";
+    }
     recoveryPending = next.pending;
     recoveryState.value = next.state;
   }
   // Only actions update the status; rendering never samples the clock or writes
   // a rate. Ordinary drift does not reopen an already completed recovery.
   const updateRecovery = () => bestEffort(refreshRecovery);
-  const metricCurrent = (m: MetricIntent) =>
-    metricIntent === m &&
+  const intentCurrent = (m: PlaybackIntent) =>
+    readIntent() === m &&
     roomIsActive() &&
-    session.user?.id === m.user &&
-    session.epoch === m.epoch &&
+    viewer.current().userId === m.user &&
+    viewer.current().epoch === m.epoch &&
     (!usesPlatformAccount(m.nativeProvider) ||
       m.nativeCredentialMode === "anonymous" ||
       accountRevision(m.nativeProvider) === m.accountChange) &&
@@ -645,8 +833,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     state.value?.media_generation === m.media &&
     state.value?.media_id === m.mediaId &&
     (!m.element || video.value === m.element);
-  const candidateIntentCurrent = (m: MetricIntent) =>
-    metricCurrent(m) &&
+  const candidateIntentCurrent = (m: PlaybackIntent) =>
+    intentCurrent(m) &&
     !m.inputsInvalidated &&
     sameDistributedIntent(distributedIntent.value, m.distributed) &&
     mode.value === m.mode &&
@@ -660,31 +848,17 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     nativePlaybackMode.value === m.nativePlaybackMode &&
     (!usesPlatformAccount(m.nativeProvider) ||
       nativeCredentialMode.value === m.nativeCredentialMode);
-  function invalidateCandidates(m: MetricIntent) {
+  function invalidateCandidates(m: PlaybackIntent) {
     m.inputsInvalidated = true;
     m.candidateDiscovery?.probe.abort();
     m.candidateDiscovery = undefined;
     m.concreteCandidates = undefined;
   }
-  function checkCandidateLifetime(snapshot: CandidateDiscovery) {
-    const startedAt =
-      snapshot.upstream?.startedAt ?? snapshot.concrete?.startedAt;
-    if (startedAt === undefined) return;
-    const elapsed = performance.now() - startedAt;
-    // This conservative local limit never authorizes a binding. The server's
-    // original authority-clock expiry and current fences still decide prepare.
-    if (
-      !Number.isFinite(elapsed) ||
-      elapsed < 0 ||
-      elapsed >= CANDIDATE_LIFETIME_MS
-    )
-      throw new Error(candidateExpiredError);
-  }
   const metricState = () => ({
     foreground: foreground(),
     expectedPlaying: state.value?.playback_status === "playing",
     autoplayBlocked: blocked.value,
-    buffering: !!generationWait || recoveringHls,
+    buffering: sourceRecovery.pending || sourceRecovery.recovering,
   });
   const metricRead = metricRuntime.read;
   function visibilityChanged() {
@@ -693,23 +867,27 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     observeMetrics();
     updateRecovery();
   }
-  function finishMetrics() {
+  function finishIntent() {
     staticChildState?.close();
     staticChildState = undefined;
     staticBinding = undefined;
-    const m = metricIntent;
-    metricRuntime.offerFinalIntent();
+    const m = readIntent();
+    metricRuntime.offerFinalScope();
     if (m) invalidateCandidates(m);
-    metricIntent = undefined;
+    sessionController.clearIntent();
+    activeObservation = undefined;
+    startupDiagnostics.value = undefined;
+    loadingStage.value = "idle";
     pendingLoad = undefined;
     metricRuntime.stopSource();
+    metricRuntime.stopMetrics();
     bestEffort(() => metricSender.unbind(true));
   }
   // Accepted intent/visibility edges remain separate from observation-v1 flags.
   watch(
     () => [
-      session.epoch,
-      session.user?.id,
+      viewer.current().epoch,
+      viewer.current().userId,
       roomIsActive(),
       state.value?.room_id,
       state.value?.media_id,
@@ -717,7 +895,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       state.value?.playback_status,
     ],
     () => {
-      if (metricIntent && !metricCurrent(metricIntent)) finishMetrics();
+      const intent = readIntent();
+      if (intent && !intentCurrent(intent)) finishIntent();
       else observeMetrics();
     },
     { flush: "sync" },
@@ -733,7 +912,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       nativePlaybackMode.value,
     ],
     () => {
-      if (metricIntent) invalidateCandidates(metricIntent);
+      const intent = readIntent();
+      if (intent) invalidateCandidates(intent);
     },
     { flush: "sync" },
   );
@@ -758,12 +938,12 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     p: PlaybackPlan,
     code = "NATIVE_LIVE_NOT_BROADCASTING",
   ) {
-    if (plan !== p || !p.native_platform?.live) return;
+    if (readPlan() !== p || !p.native_platform?.live) return;
     terminalEnd = true;
     liveRecovery.retire();
     clearTimeout(nativeRefresh);
     nativeRefresh = undefined;
-    invalidatePlayActions();
+    synchronization.invalidatePlayActions();
     firstFrameDeadline?.stop();
     mediaDataLoad?.stop();
     video.value?.pause();
@@ -776,11 +956,11 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     if (preparation.value.failure) preparation.value.failure.retryable = false;
   }
   async function completed() {
-    const p = plan,
+    const p = readPlan(),
       el = video.value,
       s = state.value;
     if (p?.native_platform?.live) {
-      if (el?.ended && plan === p) failNativeLive(p);
+      if (el?.ended && readPlan() === p) failNativeLive(p);
       return;
     }
     if (
@@ -826,7 +1006,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         recoveryPending = false;
         updateRecovery();
         bestEffort(() => observations?.completed());
-        ctx.ended?.(el.currentTime * 1000 + p.timeline_origin_ms);
+        commands.ended?.(el.currentTime * 1000 + p.timeline_origin_ms);
       }
     } catch (failure) {
       if (currentPlan(p))
@@ -836,219 +1016,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       checkingEnd = false;
     }
   }
-  function requests() {
-    const user = session.user!.id;
-    const epoch = session.epoch;
-    if (!playbackRequests || playbackUser !== user || playbackEpoch !== epoch) {
-      playbackUser = user;
-      playbackEpoch = epoch;
-      playbackRequests = new PlaybackRequests(
-        (body, signal) => {
-          if (session.epoch !== epoch) throw new StaleIdentity();
-          const provider = metricIntent?.nativeProvider;
-          if (Object.hasOwn(body, "static_hls_fallback")) {
-            const metrics = metricIntent;
-            // Lost-response replay keeps the frozen child after parent detach,
-            // but a replacement source, input, Stop or logout closes its fence.
-            if (!metrics || !candidateIntentCurrent(metrics))
-              throw new PlaybackCancelled();
-            const replay = staticChildState?.retry({
-              room_id: body.room_id,
-              media_id: metrics.mediaId,
-              media_generation: body.media_generation,
-              viewer_id: body.viewer_id ?? "",
-              plan_generation: body.plan_generation ?? 0,
-            });
-            if (!replay || JSON.stringify(body) !== replay.body)
-              throw new PlaybackCancelled();
-          }
-          if (body.upstream_profile_report) {
-            const snapshot = metricIntent?.concreteCandidates;
-            if (
-              !snapshot?.upstream ||
-              !candidateIntentCurrent(metricIntent!) ||
-              snapshot.upstream.report.binding !==
-                body.upstream_profile_report.binding
-            )
-              throw new PlaybackCancelled();
-            checkCandidateLifetime(snapshot);
-          }
-          if (body.local_hls_ladder) {
-            const metrics = metricIntent,
-              snapshot = metrics?.concreteCandidates;
-            if (
-              !metrics ||
-              !candidateIntentCurrent(metrics) ||
-              !snapshot?.concrete ||
-              !sameLocalHlsLadderRequest(
-                metrics.ladder,
-                body.local_hls_ladder,
-              ) ||
-              snapshot.report?.binding !== body.candidate_report?.binding
-            )
-              throw new PlaybackCancelled();
-            checkCandidateLifetime(snapshot);
-          }
-          if (body.advanced_playback) {
-            const metrics = metricIntent;
-            const snapshot = metrics?.concreteCandidates;
-            if (
-              !metrics ||
-              !candidateIntentCurrent(metrics) ||
-              !snapshot?.concrete ||
-              !sameAdvancedPlaybackRequest(
-                metrics.advanced,
-                body.advanced_playback,
-              ) ||
-              snapshot.report?.binding !== body.candidate_report?.binding
-            )
-              throw new PlaybackCancelled();
-            checkCandidateLifetime(snapshot);
-          }
-          return session
-            .api<PlaybackPlan>(
-              body.distributed_compute
-                ? "/playback-sessions/distributed-compute"
-                : body.native_platform
-                  ? body.native_platform.compatibility
-                    ? "/playback-sessions/native-platform-compatibility"
-                    : "/playback-sessions/native-platform"
-                  : body.local_hls_ladder
-                    ? "/playback-sessions/local-hls-ladder"
-                    : body.advanced_playback
-                      ? "/playback-sessions/advanced-local"
-                      : body.upstream_profile_report
-                        ? "/playback-sessions/upstream-profile"
-                        : body.http_file_fallback
-                          ? "/playback-sessions/http-file-continuation"
-                          : "/playback-sessions",
-              "POST",
-              body.upstream_profile_report ? structuredClone(body) : body,
-              signal,
-            )
-            .then((result) => {
-              // Check before readiness arithmetic, subtitle binding, seeking or
-              // observations can consume an unproven/nonfinite scalar origin.
-              if (
-                body.native_platform
-                  ? !provider ||
-                    !validNativePlatformPlan(
-                      body,
-                      result,
-                      location.origin,
-                      provider,
-                      state.value?.live?.broadcast_id,
-                      metricIntent?.nativeCourse === true,
-                    )
-                  : !!result.native_platform ||
-                    result.transport === "dash" ||
-                    !hasUsablePlaybackTimeline(result)
-              )
-                throw new RequestFailure({
-                  error: { code: "UNSUPPORTED_TIMELINE" },
-                });
-              if (!matchesDistributedPlaybackPlan(body, result))
-                throw new RequestFailure({
-                  error: { code: "STALE_CAPABILITY_REPORT" },
-                });
-              if (
-                !matchesLocalHlsLadderPlan(
-                  body.local_hls_ladder,
-                  result,
-                  location.origin,
-                  metricIntent?.concreteCandidates?.concrete?.candidates
-                    .local_hls_ladder,
-                )
-              )
-                throw new RequestFailure({
-                  error: { code: "STALE_CAPABILITY_REPORT" },
-                });
-              if (!matchesAdvancedPlaybackPlan(body.advanced_playback, result))
-                throw new RequestFailure({
-                  error: { code: "STALE_CAPABILITY_REPORT" },
-                });
-              if (
-                !signal.aborted &&
-                roomIsActive() &&
-                matchesPlanGeneration(
-                  body.plan_generation,
-                  result.plan_generation,
-                ) &&
-                result.plan_generation !== undefined
-              )
-                preparation.value = applyPreparationSnapshot(
-                  preparation.value,
-                  {
-                    generation: result.plan_generation,
-                    sessionId: result.session_id,
-                    deliveryMode: result.delivery_mode,
-                    phase: "preparing",
-                  },
-                );
-              return result;
-            });
-        },
-        (key, signal) => {
-          if (session.epoch !== epoch) throw new StaleIdentity();
-          return session.api(
-            "/playback-requests/" + key,
-            "DELETE",
-            undefined,
-            signal,
-          );
-        },
-        sessionStorage,
-        `rainsync:playback:${user}`,
-        readReadiness,
-        () => (state.value?.playback_status === "playing" ? 4000 : 0),
-      );
-    }
-    return playbackRequests;
-  }
-  async function readReadiness(
-    id: string,
-    signal: AbortSignal,
-    relativePosition = 0,
-    planGeneration?: number,
-    currentRelativePosition?: () => number,
-  ): Promise<PlaybackReadiness> {
-    let readiness = await session.api<PlaybackReadiness>(
-      `/playback-sessions/${id}?relative_position_ms=${encodeURIComponent(relativePosition)}${planGeneration === undefined ? "" : `&plan_generation=${planGeneration}`}`,
-      "GET",
-      undefined,
-      signal,
-    );
-    if (
-      readiness.session_id !== id ||
-      !matchesPlanGeneration(planGeneration, readiness.plan_generation)
-    )
-      throw new RequestFailure({ error: { code: "STALE_PLAYBACK_PLAN" } });
-    // A running EVENT prefix needs one whole segment ahead of the room clock.
-    // Network time can consume that lead. Recheck the current target after the
-    // response, not only the position sent in the request. Complete/legacy
-    // responses and a paused room still need no forward lead.
-    if (
-      state.value?.playback_status === "playing" &&
-      readiness.status === "ready" &&
-      readiness.complete === false &&
-      readiness.available_until_ms != null &&
-      Number.isFinite(readiness.available_until_ms) &&
-      readiness.available_until_ms -
-        (currentRelativePosition?.() ?? relativePosition) <
-        4_000
-    ) {
-      readiness = { ...readiness, status: "preparing" };
-    }
-    const snapshot = preparationReadinessSnapshot(
-      readiness,
-      preparation.value.deliveryMode,
-    );
-    if (!signal.aborted && roomIsActive() && snapshot)
-      preparation.value = applyPreparationSnapshot(preparation.value, snapshot);
-    return readiness;
-  }
   function detachPlayback(
-    preserveCandidates?: MetricIntent,
+    preserveCandidates?: PlaybackIntent,
     child?: PlaybackContinuation["staticChild"],
   ) {
     upstreamObserver?.stop();
@@ -1066,7 +1035,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     recoveryState.value = "idle";
     terminalEnd = false;
     liveNeedsEdge = true;
-    invalidatePlayActions();
+    synchronization.invalidatePlayActions();
     // Grant teardown alone (including automatic fallback) never ends its meter.
     metricRuntime.stopSource();
     bestEffort(() => metricSender.unbind(true));
@@ -1083,15 +1052,12 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       capabilityProbe?.abort();
       capabilityProbe = undefined;
     }
-    generationWait?.abort();
-    generationWait = undefined;
-    generationWaitFailed = false;
-    generatedEnd = undefined;
-    recoveringHls = false;
-    const old = plan;
-    plan = undefined;
+    sourceRecovery.retireSource();
+    const detachedSession = sessionController.retirePlan();
+    const old = detachedSession?.plan;
     playbackSummary.value = undefined;
-    sessionId.value = null;
+    native?.destroy();
+    native = undefined;
     if (video.value) {
       video.value.onerror = null;
       video.value.onended = null;
@@ -1125,16 +1091,10 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     }
     // Capture and cancel this operation before the first asynchronous wait.
     // A late session DELETE must never call stop() on a newer preparation.
-    const previous = playbackRequests;
+    const previous = sessionController.captureRequests();
     const deletePrevious = async () => {
-      if (old)
-        await session
-          .api(
-            `/playback-sessions/${old.session_id}`,
-            "DELETE",
-            finalObservation,
-            AbortSignal.timeout(5000),
-          )
+      if (detachedSession)
+        await detachedSession.stop(finalObservation)
           .catch((failure) => {
             if (!(failure instanceof StaleIdentity))
               console.warn("Playback grant cleanup could not be confirmed");
@@ -1142,7 +1102,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     };
     return { old, finalObservation, previous, deletePrevious };
   }
-  async function stopPlayback(preserveCandidates?: MetricIntent) {
+  async function stopPlayback(preserveCandidates?: PlaybackIntent) {
     const { finalObservation, previous, deletePrevious } =
       detachPlayback(preserveCandidates);
     // The final sample and Stop commit together before key cancellation can
@@ -1151,8 +1111,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     const cancellation = (
       previous
         ? previous.stop(beforeCleanup)
-        : session.user
-          ? requests().stop(beforeCleanup)
+        : viewer.current().userId
+          ? stopSessionRequests(beforeCleanup)
           : Promise.resolve()
     ).catch((e) => {
       if (!(e instanceof StaleIdentity)) throw e;
@@ -1189,27 +1149,30 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     });
     platformText.retire();
     const t0 = performance.now();
-    finishMetrics();
+    finishIntent();
     // A source/account refresh immediately retires the owned platform decoder,
     // even while room clock calibration or key cleanup is pending.
     clearTimeout(nativeRefresh);
     nativeRefresh = undefined;
     dash?.destroy();
     dash = undefined;
+    const previousPlan = readPlan();
     if (
-      plan?.native_platform &&
-      (plan.transport === "progressive" ||
-        !!plan.native_platform.live ||
-        !!plan.native_platform.compatibility) &&
+      previousPlan?.native_platform &&
+      (previousPlan.transport === "progressive" ||
+        !!previousPlan.native_platform.live ||
+        !!previousPlan.native_platform.compatibility) &&
       video.value
     ) {
       // Retire the owned MP4 immediately, even if room-clock calibration delays
       // the replacement request. All stored handlers are fenced by the new intent.
+      native?.destroy();
+      native = undefined;
       video.value.onerror = null;
       video.value.onended = null;
       video.value.onloadedmetadata = null;
       video.value.onloadeddata = null;
-      if (plan.native_platform.live || plan.native_platform.compatibility) {
+      if (previousPlan.native_platform.live || previousPlan.native_platform.compatibility) {
         hls?.destroy();
         hls = undefined;
       }
@@ -1221,65 +1184,71 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     nativeProvider.value = undefined;
     ++loadSerial;
     clearNativeQuality();
-    const intent = planGenerations.next();
+    const intent = nextPlan();
     preparation.value = {
       phase: "preparing",
       generation: intent.plan_generation,
     };
-    const identity = {};
-    const m: MetricIntent = {
-      t0,
-      identity,
-      fence: { identity, generation: 1 },
-      startGeneration: intent.plan_generation,
-      origin,
-      user: session.user?.id,
-      epoch: session.epoch,
-      room: s.room_id,
-      media: s.media_generation,
-      mediaId: s.media_id,
-      mode: mode.value,
-      audio: audioIndex.value,
-      advanced,
-      ladder,
-      staticHlsFallback: staticHlsFallbackEnabled.value,
-      distributed: distributedIntent.value
-        ? freezeCandidateSnapshot(structuredClone(distributedIntent.value))
-        : undefined,
-      failedCandidates: [],
-      element: video.value,
-      disabled: false,
-      originRecoveryUsed,
-      accountChange: ctx.platformAccountChange?.value ?? 0,
-      nativeCredentialMode: nativeCredentialMode.value,
-      nativeQualityMaxHeight: nativeQualityMaxHeight.value,
-      nativePlaybackMode: nativePlaybackMode.value,
-    };
-    metricIntent = m;
-    rates?.reset();
-    confirmedBaseRate = rejectedBaseRate = undefined;
-    corrector.reset();
-    m.meter = bestEffort(() =>
+    sourcePresented = false;
+    recoveryWaitAt = undefined;
+    loadingStage.value = "preparing";
+    const scope = createPlaybackScope<
+      Omit<PlaybackIntent, "owner" | "origin" | "initialPlanGeneration">
+    >(
+      {
+        user: viewer.current().userId,
+        epoch: viewer.current().epoch,
+        room: s.room_id,
+        media: s.media_generation,
+        mediaId: s.media_id,
+        mode: mode.value,
+        audio: audioIndex.value,
+        advanced,
+        ladder,
+        staticHlsFallback: staticHlsFallbackEnabled.value,
+        distributed: distributedIntent.value
+          ? freezeCandidateSnapshot(structuredClone(distributedIntent.value))
+          : undefined,
+        failedCandidates: [],
+        element: video.value,
+        originRecoveryUsed,
+        accountChange: ctx.platformAccountChange?.value ?? 0,
+        nativeCredentialMode: nativeCredentialMode.value,
+        nativeQualityMaxHeight: nativeQualityMaxHeight.value,
+        nativePlaybackMode: nativePlaybackMode.value,
+      },
+      { t0, startGeneration: intent.plan_generation, origin },
+    );
+    const m: PlaybackIntent = scope.intent;
+    const observation = scope.observation;
+    sessionController.adoptIntent(m);
+    activeObservation = observation;
+    synchronization.resetRates();
+    synchronization.resetCorrection();
+    observation.meter = bestEffort(() =>
       createPlaybackMetrics({
-        t0: m.t0,
-        startupOrigin: origin,
-        fence: m.fence,
-        current: () => (metricCurrent(m) ? m.fence : undefined),
+        t0: observation.t0,
+        startupOrigin: observation.origin,
+        fence: observation.fence,
+        current: () =>
+          observationCurrent(observation) ? observation.fence : undefined,
         initial: metricRead(),
       }),
     );
+    metricRuntime.startMetrics();
     return loadAttempt([], intent, m);
   }
   async function loadMedia() {
     await beginLoad("user_intent");
   }
   async function selectNativeQuality(value: string | undefined) {
-    const p = plan;
+    const currentIntent = readIntent();
+    const p = readPlan();
     if (
       !p?.native_platform?.quality ||
       !currentPlan(p) ||
-      !metricIntent ||
-      !candidateIntentCurrent(metricIntent) ||
+      !currentIntent ||
+      !candidateIntentCurrent(currentIntent) ||
       qualityContext !== qualityScope() ||
       (value !== "auto" &&
         !nativeQualityOptions.value.some(
@@ -1297,7 +1266,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     failed: string[] = [],
     continuation?: PlaybackContinuation,
   ) {
-    const m = metricIntent;
+    const m = readIntent();
     if (!m || !candidateIntentCurrent(m)) return;
     if (m.distributed)
       throw new Error("此 NAS 产物解码失败，请使用 HTTP 重新加载或选择原片源");
@@ -1306,18 +1275,18 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       m.failedCandidates = [...new Set([...m.failedCandidates, ...failed])];
       failed = [...m.failedCandidates];
     }
-    const intent = planGenerations.next();
-    advanceMetricAttempt(m);
+    const intent = nextPlan();
+    advanceIntentObservation(m);
     await loadAttempt(failed, intent, m, continuation);
   }
   function discoverCandidates(
-    metrics: MetricIntent,
+    playbackIntent: PlaybackIntent,
     element: HTMLVideoElement,
   ): Promise<CandidateDiscovery> {
     return discoverPlaybackCandidates(
       {
-        context: ctx,
-        session,
+        staticHlsFallback: ctx.staticHlsFallback,
+        api,
         state,
         video,
         clock,
@@ -1331,17 +1300,20 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           capabilityProbe = value;
         },
       },
-      metrics,
+      playbackIntent,
       element,
     );
   }
   async function loadAttempt(
     failedCandidates: string[],
-    intent: ReturnType<PlaybackPlanGenerations["next"]>,
-    metrics: MetricIntent,
+    intent: ReturnType<typeof sessionController.nextPlan>,
+    playbackIntent: PlaybackIntent,
     continuation?: PlaybackContinuation,
   ): Promise<void> {
-    if (!candidateIntentCurrent(metrics)) return;
+    if (!candidateIntentCurrent(playbackIntent)) return;
+    loadingStage.value = "preparing";
+    sourcePresented = false;
+    recoveryWaitAt = undefined;
     if (preparation.value.generation !== intent.plan_generation)
       preparation.value = {
         phase: "preparing",
@@ -1349,8 +1321,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       };
     const s = state.value!;
     const pending = {
-      metrics,
-      intent,
+      playbackIntent,
+      planIntent: intent,
       failed: failedCandidates,
       continuation,
       preparing: false,
@@ -1362,7 +1334,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     const serial = ++loadSerial;
     try {
       if (!continuation) {
-        const stopped = stopPlayback(metrics);
+        const stopped = stopPlayback(playbackIntent);
         recoveryPending = true;
         updateRecovery();
         await stopped;
@@ -1370,12 +1342,12 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       await nextTick();
       if (
         serial !== loadSerial ||
-        !candidateIntentCurrent(metrics) ||
+        !candidateIntentCurrent(playbackIntent) ||
         !roomIsActive() ||
         !video.value ||
         (continuation &&
           !continuation.staticChild &&
-          plan !== continuation.parent)
+          readPlan() !== continuation.parent)
       )
         return;
       recoveryPending = true;
@@ -1385,13 +1357,13 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         return;
       }
       const element = video.value;
-      metrics.element = element;
-      const identity = session.epoch;
+      playbackIntent.element = element;
+      const identity = viewer.current().epoch;
       waiting.value = true;
       const media = ctx.resolveMedia
         ? await ctx.resolveMedia(s.room_id, s.media_id!)
         : undefined;
-      if (serial !== loadSerial || !candidateIntentCurrent(metrics)) return;
+      if (serial !== loadSerial || !candidateIntentCurrent(playbackIntent)) return;
       const platform = media?.kind === "native_platform";
       nativePlatform.value = platform;
       if (
@@ -1417,62 +1389,62 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           error: { code: "NATIVE_LIVE_STATE_CHANGED" },
         });
       nativeProvider.value = platform ? media!.platform!.provider : undefined;
-      metrics.nativeProvider = nativeProvider.value;
+      playbackIntent.nativeProvider = nativeProvider.value;
       if (qualityContext !== qualityScope()) {
         clearNativeQuality(true);
         qualityContext = qualityScope();
-        metrics.nativeQualityMaxHeight = "auto";
+        playbackIntent.nativeQualityMaxHeight = "auto";
       }
-      if (usesPlatformAccount(metrics.nativeProvider))
-        metrics.accountChange = accountRevision(metrics.nativeProvider);
+      if (usesPlatformAccount(playbackIntent.nativeProvider))
+        playbackIntent.accountChange = accountRevision(playbackIntent.nativeProvider);
       const nativeCapabilities = platform
         ? detectCapabilities(element, getPlaybackMediaSource())
         : undefined;
-      metrics.nativeCourse = platform && media?.platform?.version === 4;
+      playbackIntent.nativeCourse = platform && media?.platform?.version === 4;
       if (platform) {
         // Finite-mode preference is hidden for Live and cannot leak a transform
         // intent into its separate edge/control contract.
         const choice = nativePlatformPlaybackChoice(
-          liveMetadata ? "native" : metrics.nativePlaybackMode,
-          metrics.nativeProvider!,
+          liveMetadata ? "native" : playbackIntent.nativePlaybackMode,
+          playbackIntent.nativeProvider!,
           nativeCapabilities!,
           !!liveMetadata,
         );
         if (
           choice === "unsupported" &&
-          (metrics.nativePlaybackMode === "compatibility" ||
-            metrics.nativePlaybackMode === "adaptive")
+          (playbackIntent.nativePlaybackMode === "compatibility" ||
+            playbackIntent.nativePlaybackMode === "adaptive")
         )
           throw new RequestFailure({
             error: { code: "NATIVE_PLATFORM_DEVICE_UNSUPPORTED" },
           });
-        metrics.nativeCompatibility = choice === "compatibility";
+        playbackIntent.nativeCompatibility = choice === "compatibility";
       }
       const discovered: CandidateDiscovery = platform
         ? {
             capabilities: {
               progressive_h264_aac:
-                metrics.nativeProvider !== "bilibili" &&
+                playbackIntent.nativeProvider !== "bilibili" &&
                 nativeCapabilities!.progressive_h264_aac,
               native_hls:
-                (!!liveMetadata || !!metrics.nativeCompatibility) &&
+                (!!liveMetadata || !!playbackIntent.nativeCompatibility) &&
                 nativeCapabilities!.native_hls,
               mse_h264_aac:
                 (liveMetadata ||
-                  metrics.nativeCompatibility ||
-                  metrics.nativeProvider === "bilibili" ||
-                  metrics.nativeProvider === "youtube") &&
+                  playbackIntent.nativeCompatibility ||
+                  playbackIntent.nativeProvider === "bilibili" ||
+                  playbackIntent.nativeProvider === "youtube") &&
                 nativeCapabilities!.mse_h264_aac,
             },
           }
-        : metrics.distributed
+        : playbackIntent.distributed
           ? {
               capabilities: detectCapabilities(
                 element,
                 getPlaybackMediaSource(),
               ),
             }
-          : metrics.mode === "finite_hls"
+          : playbackIntent.mode === "finite_hls"
             ? {
                 capabilities: detectCapabilities(
                   element,
@@ -1481,15 +1453,15 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
               }
             : continuation
               ? { capabilities: continuation.capabilities }
-              : await discoverCandidates(metrics, element);
-      if (serial !== loadSerial || !candidateIntentCurrent(metrics)) return;
+              : await discoverCandidates(playbackIntent, element);
+      if (serial !== loadSerial || !candidateIntentCurrent(playbackIntent)) return;
       if (
         !platform &&
-        !metrics.distributed &&
-        !metrics.advanced &&
-        !metrics.ladder &&
+        !playbackIntent.distributed &&
+        !playbackIntent.advanced &&
+        !playbackIntent.ladder &&
         !continuation &&
-        metrics.mode === "auto" &&
+        playbackIntent.mode === "auto" &&
         needsDolbyVisionToneMap(
           advancedCapabilities.value,
           discovered.concrete?.candidates,
@@ -1501,28 +1473,28 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         await beginLoad("user_intent");
         return;
       }
-      validateFiniteHlsChoice(metrics.mode, {
-        advanced: metrics.advanced,
-        ladder: metrics.ladder,
-        distributed: metrics.distributed,
+      validateFiniteHlsChoice(playbackIntent.mode, {
+        advanced: playbackIntent.advanced,
+        ladder: playbackIntent.ladder,
+        distributed: playbackIntent.distributed,
         continuation,
       });
       const finiteParameters =
-        !platform && metrics.mode === "finite_hls"
+        !platform && playbackIntent.mode === "finite_hls"
           ? finiteHlsRequestParameters(
-              metrics.mode,
+              playbackIntent.mode,
               media?.kind,
               discovered.capabilities,
             )
           : undefined;
       const staticRoot =
         !platform &&
-        !metrics.distributed &&
-        !metrics.advanced &&
-        !metrics.ladder &&
+        !playbackIntent.distributed &&
+        !playbackIntent.advanced &&
+        !playbackIntent.ladder &&
         !continuation &&
         ctx.staticHlsFallback === true &&
-        metrics.staticHlsFallback &&
+        playbackIntent.staticHlsFallback &&
         staticHlsOfferCurrent(
           discovered.staticHls?.availability,
           discovered.staticHls?.observedAt,
@@ -1532,14 +1504,14 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           discovered.capabilities.mse_h264_aac) &&
         !discovered.concrete &&
         !discovered.upstream &&
-        ["auto", "direct"].includes(metrics.mode);
+        ["auto", "direct"].includes(playbackIntent.mode);
       const staticReplay = continuation?.staticChild;
       if (
         staticReplay &&
         !staticReplay.state.retry({
-          room_id: metrics.room,
-          media_id: metrics.mediaId,
-          media_generation: metrics.media,
+          room_id: playbackIntent.room,
+          media_id: playbackIntent.mediaId,
+          media_generation: playbackIntent.media,
           viewer_id: intent.viewer_id,
           plan_generation: intent.plan_generation,
         })
@@ -1550,7 +1522,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
             ...structuredClone(discovered.report),
             excluded_candidates: [
               ...(discovered.concrete
-                ? metrics.failedCandidates
+                ? playbackIntent.failedCandidates
                 : failedCandidates),
             ],
           }
@@ -1566,8 +1538,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       // for an old identity, element or media after a newer load/reset wins.
       if (
         serial !== loadSerial ||
-        !candidateIntentCurrent(metrics) ||
-        session.epoch !== identity ||
+        !candidateIntentCurrent(playbackIntent) ||
+        viewer.current().epoch !== identity ||
         !roomIsActive() ||
         video.value !== element ||
         state.value?.room_id !== s.room_id ||
@@ -1580,60 +1552,68 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         return;
       }
       checkCandidateLifetime(discovered);
+      const observation = observationFor(playbackIntent);
       const request: PlaybackRequest = platform
         ? nativePlatformRequest({
             ...intent,
-            idempotency_key: requests().allocateIdempotencyKey(),
+            idempotency_key: allocateIdempotencyKey(),
             room_id: s.room_id,
             media_generation: s.media_generation,
             position_ms: target(state.value ?? s, clock.now()),
-            credential_mode: metrics.nativeCredentialMode,
-            provider: metrics.nativeProvider,
+            credential_mode: playbackIntent.nativeCredentialMode,
+            provider: playbackIntent.nativeProvider,
             media_id: s.media_id!,
-            max_height: metrics.nativeQualityMaxHeight,
+            max_height: playbackIntent.nativeQualityMaxHeight,
             account_id:
-              metrics.nativeProvider === "douyin" ||
-              metrics.nativeProvider === "tiktok"
-                ? ctx.shortPlatformAccountIds?.value[metrics.nativeProvider]
-                : metrics.nativeProvider === "youtube"
+              playbackIntent.nativeProvider === "douyin" ||
+              playbackIntent.nativeProvider === "tiktok"
+                ? ctx.shortPlatformAccountIds?.value[playbackIntent.nativeProvider]
+                : playbackIntent.nativeProvider === "youtube"
                   ? ctx.youtubePlatformAccountId?.value
                   : undefined,
             mse_h264_aac: capabilities.mse_h264_aac,
             progressive_h264_aac: capabilities.progressive_h264_aac,
             native_hls: capabilities.native_hls,
             live: !!liveMetadata,
-            compatibility: metrics.nativeCompatibility,
+            compatibility: playbackIntent.nativeCompatibility,
             compatibility_ladder:
-              metrics.nativeCompatibility &&
-              metrics.nativePlaybackMode === "adaptive",
-            course: metrics.nativeCourse,
+              playbackIntent.nativeCompatibility &&
+              playbackIntent.nativePlaybackMode === "adaptive",
+            course: playbackIntent.nativeCourse,
+            playback_metrics:
+              observation?.meter && !observation.disabled
+                ? freezeCandidateSnapshot({
+                    meter_start_generation: playbackIntent.initialPlanGeneration,
+                    startup_origin: playbackIntent.origin,
+                  })
+                : undefined,
           })
         : staticReplay
           ? staticReplay.intent.request
           : {
               ...intent,
-              idempotency_key: requests().allocateIdempotencyKey(),
+              idempotency_key: allocateIdempotencyKey(),
               room_id: s.room_id,
               media_generation: s.media_generation,
-              mode: metrics.distributed
+              mode: playbackIntent.distributed
                 ? "auto"
-                : continuation || metrics.advanced || metrics.ladder
+                : continuation || playbackIntent.advanced || playbackIntent.ladder
                   ? "transcode"
-                  : (finiteParameters?.mode ?? metrics.mode),
+                  : (finiteParameters?.mode ?? playbackIntent.mode),
               ...(finiteParameters?.finite_hls_version === 1
                 ? { finite_hls_version: 1 }
                 : {}),
               audio_index: continuation
                 ? (continuation.parent.selected_audio_track ?? null)
-                : (metrics.audio ?? null),
+                : (playbackIntent.audio ?? null),
               position_ms: target(state.value ?? s, clock.now()),
               capabilities,
-              ...(metrics.distributed
-                ? { distributed_compute: metrics.distributed }
+              ...(playbackIntent.distributed
+                ? { distributed_compute: playbackIntent.distributed }
                 : {}),
-              ...(metrics.ladder ? { local_hls_ladder: metrics.ladder } : {}),
-              ...(metrics.advanced
-                ? { advanced_playback: metrics.advanced }
+              ...(playbackIntent.ladder ? { local_hls_ladder: playbackIntent.ladder } : {}),
+              ...(playbackIntent.advanced
+                ? { advanced_playback: playbackIntent.advanced }
                 : {}),
               ...(!staticRoot && candidateReport
                 ? { candidate_report: candidateReport }
@@ -1646,10 +1626,10 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
                   }
                 : {}),
               observation_version: 1,
-              ...(metrics.distributed ||
+              ...(playbackIntent.distributed ||
               finiteParameters ||
-              metrics.advanced ||
-              metrics.ladder
+              playbackIntent.advanced ||
+              playbackIntent.ladder
                 ? {}
                 : staticRoot
                   ? { static_hls_fallback_version: 1 }
@@ -1659,12 +1639,12 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
                 1, 2,
               ]),
               playback_metrics: freezeCandidateSnapshot({
-                meter_start_generation: metrics.startGeneration,
-                startup_origin: metrics.origin,
+                meter_start_generation: playbackIntent.initialPlanGeneration,
+                startup_origin: playbackIntent.origin,
               }),
             };
       waiting.value = true;
-      const requestedSeek = seekSerial;
+      const requestedSeek = synchronization.seekRevision;
       const currentPosition = () => {
         if (!clockUsable() || revision !== clockRevision()) {
           // Keep the already claimed file/version and request key through a
@@ -1681,17 +1661,29 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       // recovery. A new key at that generation would violate high-water.
       pending.preparing = !!(
         platform ||
-        metrics.distributed ||
+        playbackIntent.distributed ||
         !!finiteParameters ||
         staticReplay ||
         discovered.concrete ||
         discovered.upstream
       );
+      if (
+        platform &&
+        playbackIntent.nativeProvider === "bilibili" &&
+        !liveMetadata &&
+        !playbackIntent.nativeCompatibility &&
+        capabilities.mse_h264_aac
+      ) {
+        // This resource can only use DASH on this branch. Overlap the static
+        // SDK download with server preparation, never with media authorization.
+        // The shared loader owns no attachment, identity or room mutation.
+        void loadDashJs().catch(() => {});
+      }
       let p: PlaybackPlan;
       if (continuation?.staticChild) {
-        if (plan !== continuation.parent) throw new PlaybackCancelled();
+        if (readPlan() !== continuation.parent) throw new PlaybackCancelled();
         const detached = detachPlayback(undefined, continuation.staticChild);
-        const preparing = requests().prepareStaticHlsChild(
+        const preparing = sessionController.prepareStaticHlsChild(
           continuation.staticChild.intent,
           detached.deletePrevious,
           currentPosition,
@@ -1704,7 +1696,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         // No await between detaching the old element and handing its cleanup
         // ownership to the request manager. Stop can then cancel the child key
         // immediately while the parent final DELETE is still pending.
-        if (plan !== continuation.parent) throw new PlaybackCancelled();
+        if (readPlan() !== continuation.parent) throw new PlaybackCancelled();
         const detached = detachPlayback();
         request.http_file_fallback = {
           parent_session_id: continuation.parent.session_id,
@@ -1712,7 +1704,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
             ? { final_observation: detached.finalObservation }
             : {}),
         };
-        const preparing = requests().prepareContinuation(
+        const preparing = sessionController.prepareContinuation(
           request,
           detached.deletePrevious,
           currentPosition,
@@ -1720,22 +1712,24 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         recoveryPending = true;
         updateRecovery();
         p = await preparing;
-      } else p = await requests().prepare(request, currentPosition);
+      } else p = await sessionController.prepare(request, currentPosition);
       if (
         serial !== loadSerial ||
-        !candidateIntentCurrent(metrics) ||
+        !candidateIntentCurrent(playbackIntent) ||
         !roomIsActive() ||
-        session.epoch !== identity ||
+        viewer.current().epoch !== identity ||
         video.value !== element ||
         state.value?.room_id !== s.room_id ||
         state.value?.media_generation !== s.media_generation ||
-        !planGenerations.current(p)
+        !sessionController.planGenerationCurrent(p)
       ) {
-        await session.api(`/playback-sessions/${p.session_id}`, "DELETE");
+        await sessionController.captureSessionStop(p, {
+          userId: playbackIntent.user, epoch: playbackIntent.epoch,
+        })();
         return;
       }
-      if (platform && p.media_id !== metrics.mediaId) {
-        await requests().stop();
+      if (platform && p.media_id !== playbackIntent.mediaId) {
+        await stopSessionRequests();
         throw Error("平台媒体响应身份不一致，请重新加载");
       }
       const grantedAt = performance.now();
@@ -1750,14 +1744,14 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
             discovered.upstream.candidates.profile!.audio_rate_contract
               ?.source_sample_rate)
       ) {
-        await requests().stop();
+        await stopSessionRequests();
         throw new Error(candidateError);
       }
       if (discovered.upstream && !supportsHlsPlayback()) {
-        await requests().stop();
+        await stopSessionRequests();
         throw new Error(candidateError);
       }
-      plan = p;
+      sessionController.adoptPlan(p, playbackIntent);
       distributedFacts.value = p.distributed_compute;
       advancedFacts.value = p.advanced_playback;
       ladderFacts.value = p.local_hls_ladder;
@@ -1781,6 +1775,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         sessionId: p.session_id,
         deliveryMode: p.delivery_mode,
       });
+      loadingStage.value = "initializing";
       playbackSummary.value = p.native_platform
         ? {
             mode: p.native_platform.live
@@ -1803,11 +1798,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       pendingLoad = undefined;
       // A new plan request has consumed the latest explicit target. Its own
       // metadata reconcile must not replay a pre-load seek as another rebuild.
-      if (requestedSeek === seekSerial) {
-        pendingUserSeek = false;
-        pendingForce = false;
-      }
-      sessionId.value = p.session_id;
+      synchronization.preparedSeek(requestedSeek);
+      sessionController.publishSession(p);
       tracks.value = p.audio_tracks;
       subtitles.value = p.subtitle_tracks;
       if (!p.subtitle_tracks.some((t) => t.index === subtitleIndex.value))
@@ -1839,8 +1831,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         return binding;
       };
       if (p.observation_version === 1) {
-        const user = session.user!.id;
-        const epoch = session.epoch;
+        const user = viewer.current().userId!;
+        const epoch = viewer.current().epoch;
         observations = bestEffort(() =>
           bindPlaybackObservations({
             element: el,
@@ -1850,18 +1842,18 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
               roomIsActive() &&
               serial === loadSerial &&
               video.value === el &&
-              session.user?.id === user &&
-              session.epoch === epoch &&
+              viewer.current().userId === user &&
+              viewer.current().epoch === epoch &&
               state.value?.room_id === s.room_id &&
               state.value?.media_generation === p.media_generation,
             finalCurrent: () =>
-              plan === p &&
+              readPlan() === p &&
               video.value === el &&
-              session.user?.id === user &&
-              session.epoch === epoch,
+              viewer.current().userId === user &&
+              viewer.current().epoch === epoch,
             send: async (body, signal) => {
-              if (session.epoch !== epoch) throw new StaleIdentity();
-              await session.api(
+              if (viewer.current().epoch !== epoch) throw new StaleIdentity();
+              await api(
                 `/playback-sessions/${p.session_id}/observations`,
                 "POST",
                 body,
@@ -1875,7 +1867,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       }
       endAttempt = -Infinity;
       el.onended = () => {
-        if (serial !== loadSerial || !currentPlan(p) || !metricCurrent(metrics))
+        if (serial !== loadSerial || !currentPlan(p) || !intentCurrent(playbackIntent))
           return;
         void completed();
       };
@@ -1884,20 +1876,41 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       firstFrameDeadline = createFirstFrameDeadline({
         element: el,
         current: () =>
-          serial === loadSerial && currentPlan(p) && metricCurrent(metrics),
+          serial === loadSerial && currentPlan(p) && intentCurrent(playbackIntent),
         suspended: () =>
-          !!generationWait ||
-          generationWaitFailed ||
+          sourceRecovery.pending ||
+          sourceRecovery.failed ||
           blocked.value ||
           !foreground() ||
           state.value?.playback_status !== "playing",
         eligible: () =>
-          !generationWait &&
-          !generationWaitFailed &&
+          !sourceRecovery.pending &&
+          !sourceRecovery.failed &&
           !blocked.value &&
           foreground(),
+        presented: () => {
+          if (
+            serial !== loadSerial ||
+            !currentPlan(p) ||
+            !intentCurrent(playbackIntent)
+          )
+            return;
+          sourcePresented = true;
+          const failed = preparation.value.failure;
+          if (failed?.code === "FIRST_FRAME_TIMEOUT") {
+            preparation.value = {
+              ...preparation.value,
+              phase: "ready",
+              failure: undefined,
+            };
+            if (error.value === firstFrameTimeoutError) error.value = "";
+          }
+          if (!preparation.value.failure) loadingStage.value = "playing";
+          waiting.value = false;
+          updateRecovery();
+        },
         timeout: () => {
-          recoveringHls = false;
+          sourceRecovery.endRecovery();
           waiting.value = false;
           failLocalPlayback(firstFrameTimeoutError, "FIRST_FRAME_TIMEOUT");
           if (!error.value) error.value = firstFrameTimeoutError;
@@ -1914,15 +1927,15 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           serial === loadSerial &&
           currentPlan(p) &&
           roomIsActive() &&
-          session.user?.id === metrics.user &&
-          session.epoch === metrics.epoch &&
-          state.value?.room_id === metrics.room &&
-          state.value?.media_generation === metrics.media &&
+          viewer.current().userId === playbackIntent.user &&
+          viewer.current().epoch === playbackIntent.epoch &&
+          state.value?.room_id === playbackIntent.room &&
+          state.value?.media_generation === playbackIntent.media &&
           state.value?.media_id === dataMediaId &&
           video.value === el,
         suspended: () =>
-          !!generationWait ||
-          generationWaitFailed ||
+          sourceRecovery.pending ||
+          sourceRecovery.failed ||
           blocked.value ||
           !foreground(),
         ready: () => {
@@ -1933,6 +1946,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
               failure: undefined,
             };
           if (error.value === mediaDataTimeoutError) error.value = "";
+          if (!sourcePresented && !preparation.value.failure)
+            loadingStage.value = "waiting_frame";
         },
         clearBlockedFailure: () => {
           if (!blocked.value || error.value !== mediaDataTimeoutError)
@@ -1941,18 +1956,18 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           return true;
         },
         timeout: () => {
-          recoveringHls = false;
+          sourceRecovery.endRecovery();
           waiting.value = false;
           failLocalPlayback(mediaDataTimeoutError, "MEDIA_DATA_TIMEOUT");
           if (!error.value) error.value = mediaDataTimeoutError;
         },
       });
-      const Hls = p.transport === "hls" ? await loadHlsLibrary() : undefined;
+      const Hls = p.transport === "hls" ? await loadHlsDriver() : undefined;
       if (
         serial !== loadSerial ||
         !roomIsActive() ||
         !currentPlan(p) ||
-        !candidateIntentCurrent(metrics) ||
+        !candidateIntentCurrent(playbackIntent) ||
         video.value !== el
       )
         return;
@@ -1979,7 +1994,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         serial === loadSerial &&
         currentPlan(p) &&
         roomIsActive() &&
-        candidateIntentCurrent(metrics) &&
+        candidateIntentCurrent(playbackIntent) &&
         video.value === el &&
         connected.value &&
         clockUsable() &&
@@ -1994,14 +2009,13 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           return false;
         const sample = bestEffort(() => observations?.captureFinal());
         let proposed: StaticHlsChildIntent | undefined;
-        const manager = requests();
-        const childIntent = planGenerations.nextWhen((intent) => {
+        const childIntent = sessionController.nextPlanWhen((intent) => {
           const proposal = childState!.propose({
             current: binding,
             failure: { binding, event },
             child: {
               ...intent,
-              idempotency_key: manager.allocateIdempotencyKey(),
+              idempotency_key: allocateIdempotencyKey(),
             },
             position_ms: target(state.value!, clock.now()),
             final_observation: sample ? { binding, sample } : null,
@@ -2011,7 +2025,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           return true;
         });
         if (!childIntent || !proposed) return false;
-        advanceMetricAttempt(metrics);
+        advanceIntentObservation(playbackIntent);
         const next: PlaybackContinuation = {
           parent: p,
           capabilities: proposed.request.capabilities,
@@ -2021,7 +2035,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
             finalObservation: sample,
           },
         };
-        void run(() => loadAttempt([], childIntent, metrics, next));
+        void run(() => loadAttempt([], childIntent, playbackIntent, next));
         return true;
       };
       const retryDecode = () => {
@@ -2030,7 +2044,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           serial !== loadSerial ||
           !currentPlan(p) ||
           !roomIsActive() ||
-          !candidateIntentCurrent(metrics) ||
+          !candidateIntentCurrent(playbackIntent) ||
           !!p.upstream_profile ||
           hasHlsLadder(p) ||
           !!p.native_platform ||
@@ -2064,12 +2078,32 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         void run(() => fallbackLoad([...failedCandidates, candidate]));
         return true;
       };
+      const attachNative = (
+        options: Pick<NativeDriverOptions, "source" | "error" | "requireSource"> & {
+          scope?: () => boolean;
+          load?: boolean;
+        },
+      ) => {
+        native?.destroy();
+        const attached = createNativeDriver({
+          ...options,
+          element: el,
+          current: () =>
+            serial === loadSerial && currentPlan(p) &&
+            intentCurrent(playbackIntent) && roomIsActive() &&
+            video.value === el && native === attached &&
+            (options.scope?.() ?? true),
+          attached: attachMetricSource,
+        });
+        native = attached;
+        attached.attach(options.load);
+      };
       const recover = () => {
         if (
           serial !== loadSerial ||
           !roomIsActive() ||
           !currentPlan(p) ||
-          !metricCurrent(metrics) ||
+          !intentCurrent(playbackIntent) ||
           !state.value ||
           recoveries >= 3 ||
           !clockUsable() ||
@@ -2077,13 +2111,9 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         )
           return false;
         recoveries++;
-        generationWait?.abort();
-        generationWait = undefined;
-        generationWaitFailed = false;
-        generatedEnd = undefined;
-        recoveringHls = true;
+        sourceRecovery.restartSourceRecovery();
         waiting.value = true;
-        invalidatePlayActions();
+        synchronization.invalidatePlayActions();
         firstFrameDeadline?.detachSource();
         mediaDataLoad?.sourceChanged();
         const position = playbackPosition();
@@ -2099,10 +2129,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
             attachHls();
             hls!.startLoad(position);
           } else {
-            hls.config.startPosition = position;
-            hls.loadSource(p.playback_url);
-            hls.startLoad(position);
-            attachMetricSource();
+            if (hls.reload(position)) attachMetricSource();
           }
         } else {
           // Native media errors do not expose the failing HTTP status. Retry the
@@ -2111,55 +2138,39 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           bindMetricSource(p, el, true);
           url.searchParams.set("recovery", String(recoveries));
           url.hash = `t=${position}`;
-          bindNativeError(bindAttachment({}));
-          el.src = url.href;
-          el.load();
-          attachMetricSource();
+          bindNativeSource(bindAttachment({}), url.href, true);
         }
         firstFrameDeadline?.attachSource();
         return true;
       };
-      const bindNativeError = (binding: StaticHlsPlanBinding) => {
-        el.onerror = () => {
-          // load() during teardown and queued events from a previous resource are
-          // not failures of this plan. A real media error belongs to the active URL.
+      const bindNativeSource = (binding: StaticHlsPlanBinding, source: string, load = false) => {
+        attachNative({
+          source, load,
+          scope: () => staticBinding === binding,
+          error: ({ code }) => {
           if (
-            serial !== loadSerial ||
-            !roomIsActive() ||
-            !currentPlan(p) ||
-            video.value !== el ||
-            staticBinding !== binding ||
-            !metricCurrent(metrics) ||
-            !el.getAttribute("src") ||
-            !el.error ||
-            el.error.code === 1
-          )
-            return;
-          if (
-            el.error.code === 3 &&
+            code === 3 &&
             retryStaticDecode(binding, {
               kind: "native",
-              code: el.error.code,
+              code: code,
             })
           )
             return;
           if (p.transport === "hls" && !mse) {
             if (
-              (el.error.code === 3 || el.error.code === 4) &&
+              (code === 3 || code === 4) &&
               Hls?.isSupported()
             ) {
               // A native decoder/parser failure can be transport-specific. Try MSE
               // once, with this same authorized plan and the current room position.
               mse = true;
-              generationWait?.abort();
-              generationWait = undefined;
-              generationWaitFailed = false;
-              generatedEnd = undefined;
-              recoveringHls = true;
+              sourceRecovery.restartSourceRecovery();
               waiting.value = true;
-              invalidatePlayActions();
+              synchronization.invalidatePlayActions();
               firstFrameDeadline?.detachSource();
               mediaDataLoad?.sourceChanged();
+              native?.destroy();
+              native = undefined;
               el.pause();
               metricRuntime.stopSource(false);
               el.removeAttribute("src");
@@ -2173,12 +2184,12 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           }
           // HTML code 4 mixes format, delivery and support failures. It cannot
           // justify a fresh grant, including the legacy one-hop HTTP continuation.
-          if (el.error.code === 3 && retryDecode()) return;
-          recoveringHls = false;
+          if (code === 3 && retryDecode()) return;
+          sourceRecovery.endRecovery();
           error.value =
-            el.error.code === 2
+            code === 2
               ? "媒体加载中断，请检查连接后重新加载"
-              : el.error.code === 4
+              : code === 4
                 ? "媒体加载或格式支持状态未知，请检查连接后重新加载"
                 : "无法播放此格式，可切换兼容转码后重载";
           if (p.native_platform?.compatibility) {
@@ -2187,7 +2198,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
           }
           failLocalPlayback(error.value);
           waiting.value = false;
-        };
+          },
+        });
       };
       if (
         p.upstream_profile &&
@@ -2206,8 +2218,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         : undefined;
       if (p.distributed_compute && Hls?.isSupported()) {
         const f = p.distributed_compute;
-        const peer = new RoomP2PTransport(
-          session.api,
+        const peer = new Hls.RoomP2PTransport(
+          api,
           s.room_id,
           f.job_id,
           updatePeerStats,
@@ -2236,282 +2248,194 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         return 0;
       };
       const attachHls = () => {
-        if (
-          !Hls ||
-          serial !== loadSerial ||
-          !currentPlan(p) ||
-          video.value !== el
-        )
+        if (!Hls || serial !== loadSerial || !currentPlan(p) || video.value !== el)
           return;
-        hls = new Hls({
+        const attachedHls = Hls.create({
+          element: el,
+          url: p.playback_url,
           startPosition: p.native_platform?.live ? -1 : playbackPosition(),
-          ...(p.distributed_compute && primaryPeer
+          current: () =>
+            serial === loadSerial &&
+            currentPlan(p) &&
+            intentCurrent(playbackIntent) &&
+            roomIsActive() &&
+            hls === attachedHls &&
+            video.value === el,
+          live: !!p.native_platform?.live,
+          fragments:
+            p.distributed_compute && primaryPeer
+              ? { transport: primaryPeer, bufferSeconds: primaryBufferSeconds }
+              : undefined,
+          validateRequest: p.native_platform?.live
+            ? (url) =>
+                validNativeLiveDeliveryUrl(
+                  url,
+                  p.session_id,
+                  location.origin,
+                  false,
+                  p.native_platform!.live!.version,
+                )
+            : p.native_platform?.compatibility
+              ? (url) => validNativeCompatibilityDeliveryUrl(url, p, location.origin)
+              : undefined,
+          attached: attachMetricSource,
+          captions: p.native_platform?.live
+            ? (track, cues) => platformText.ingestLiveInbandCaptions(track, cues)
+            : undefined,
+          ...(hasHlsLadder(p)
             ? {
-                fLoader: createP2PFragmentLoader(
-                  primaryPeer,
-                  primaryBufferSeconds,
-                  Hls,
-                ),
-              }
-            : {}),
-          ...(p.native_platform?.live
-            ? {
-                enableCEA708Captions: true,
-                enableWebVTT: false,
-                enableIMSC1: false,
-                renderTextTracksNatively: false,
-              }
-            : {}),
-          ...(p.native_platform?.live
-            ? {
-                xhrSetup: (_xhr: XMLHttpRequest, url: string) => {
+                manifest: (levels) => {
+                  if (!candidateIntentCurrent(playbackIntent)) return;
+                  const mapping = bindLocalHlsLevels(p, levels, location.origin);
+                  if (!mapping) {
+                    attachedHls.destroy();
+                    if (hls === attachedHls) hls = undefined;
+                    ladderManual.value = false;
+                    ladderLevelMap = undefined;
+                    waiting.value = false;
+                    error.value =
+                      "服务器 HLS 清晰度列表与已授权方案不一致，请重新加载";
+                    failLocalPlayback(error.value);
+                    return;
+                  }
+                  ladderLevelMap = mapping;
+                  ladderManual.value = true;
                   if (
-                    !validNativeLiveDeliveryUrl(
-                      url,
-                      p.session_id,
-                      location.origin,
-                      false,
-                      p.native_platform!.live!.version,
-                    )
+                    ladderQuality.value !== "auto" &&
+                    !mapping.has(ladderQuality.value)
                   )
-                    throw new Error("NATIVE_PLATFORM_DELIVERY_INVALID");
+                    ladderQuality.value = "auto";
+                  attachedHls.setLevel(
+                    ladderQuality.value === "auto"
+                      ? -1
+                      : mapping.get(ladderQuality.value)!,
+                  );
+                },
+                level: (level) => {
+                  if (candidateIntentCurrent(playbackIntent) && ladderLevelMap)
+                    ladderSelected.value = [...ladderLevelMap].find(
+                      ([, index]) => index === level,
+                    )?.[0];
                 },
               }
             : {}),
-          ...(p.native_platform?.compatibility
-            ? {
-                xhrSetup: (_xhr: XMLHttpRequest, url: string) => {
-                  if (
-                    !validNativeCompatibilityDeliveryUrl(
-                      url,
-                      p,
-                      location.origin,
-                    )
-                  )
-                    throw new Error("NATIVE_PLATFORM_DELIVERY_INVALID");
-                },
+          error: (data) => {
+            if (
+              serial === loadSerial &&
+              currentPlan(p) &&
+              intentCurrent(playbackIntent) &&
+              roomIsActive() &&
+              hls === attachedHls &&
+              staticBinding === binding &&
+              (data.fatal ||
+                (!!p.native_platform &&
+                  [401, 403, 409, 410].includes(data.response?.code ?? 0)))
+            ) {
+              if (p.native_platform?.live) {
+                const code = data.liveCode ?? "NATIVE_PLATFORM_DELIVERY_INVALID";
+                if (
+                  code === "NATIVE_LIVE_WINDOW_EXPIRED" &&
+                  recoverExpiredLiveWindow(p)
+                )
+                  return;
+                failNativeLive(p, code);
+                return;
               }
-            : {}),
-          maxBufferLength: 20,
-          maxMaxBufferLength: 60,
-          backBufferLength: 30,
-        });
-        const attachedHls = hls;
-        const binding = bindAttachment(attachedHls);
-        if (p.native_platform?.live) {
-          // Only decoder-observed CEA captions; no extra subtitle URI fetches.
-          attachedHls.on(Hls.Events.CUES_PARSED, (_, data) => {
-            if (
-              data.type !== "captions" ||
-              serial !== loadSerial ||
-              !currentPlan(p) ||
-              !roomIsActive() ||
-              hls !== attachedHls ||
-              video.value !== el
-            )
-              return;
-            platformText.ingestLiveInbandCaptions(data.track, data.cues);
-          });
-        }
-
-        if (hasHlsLadder(p)) {
-          const current = () =>
-            serial === loadSerial &&
-            currentPlan(p) &&
-            metricCurrent(metrics) &&
-            candidateIntentCurrent(metrics) &&
-            roomIsActive() &&
-            hls === attachedHls &&
-            video.value === el;
-          attachedHls.on(Hls.Events.MANIFEST_PARSED, () => {
-            if (!current()) return;
-            const mapping = bindLocalHlsLevels(
-              p,
-              attachedHls.levels,
-              location.origin,
-            );
-            if (!mapping) {
-              attachedHls.destroy();
-              if (hls === attachedHls) hls = undefined;
-              ladderManual.value = false;
-              ladderLevelMap = undefined;
-              waiting.value = false;
-              error.value =
-                "服务器 HLS 清晰度列表与已授权方案不一致，请重新加载";
-              failLocalPlayback(error.value);
-              return;
-            }
-            ladderLevelMap = mapping;
-            ladderManual.value = true;
-            if (
-              ladderQuality.value !== "auto" &&
-              !mapping.has(ladderQuality.value)
-            )
-              ladderQuality.value = "auto";
-            attachedHls.loadLevel =
-              ladderQuality.value === "auto"
-                ? -1
-                : mapping.get(ladderQuality.value)!;
-          });
-          attachedHls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
-            if (!current() || !ladderLevelMap) return;
-            ladderSelected.value = [...ladderLevelMap].find(
-              ([, index]) => index === data.level,
-            )?.[0];
-          });
-        }
-        hls.loadSource(p.playback_url);
-        hls.attachMedia(el);
-        attachMetricSource();
-        hls.on(Hls.Events.ERROR, (_, data) => {
-          if (
-            serial === loadSerial &&
-            currentPlan(p) &&
-            metricCurrent(metrics) &&
-            roomIsActive() &&
-            hls === attachedHls &&
-            staticBinding === binding &&
-            (data.fatal ||
-              (!!p.native_platform &&
-                [401, 403, 409, 410].includes(data.response?.code ?? 0)))
-          ) {
-            if (p.native_platform?.live) {
-              let code = "NATIVE_PLATFORM_DELIVERY_INVALID";
-              const body = bestEffort(() =>
-                data.networkDetails && "responseText" in data.networkDetails
-                  ? data.networkDetails.responseText
-                  : undefined,
-              );
-              if (typeof body === "string" && body.length <= 16384) {
-                try {
-                  const reported = JSON.parse(body)?.error?.code;
-                  if (
-                    [
-                      "NATIVE_LIVE_WINDOW_EXPIRED",
-                      "NATIVE_LIVE_BROADCAST_CHANGED",
-                      "NATIVE_LIVE_NOT_BROADCASTING",
-                      "NATIVE_LIVE_PLAYLIST_CHANGED",
-                      "NATIVE_LIVE_STATE_CHANGED",
-                      "NATIVE_LIVE_RATE_LIMITED",
-                      "NATIVE_LIVE_CAPACITY",
-                      "NATIVE_PLATFORM_URL_EXPIRED",
-                      "ROOM_NOT_ACTIVE",
-                      "STALE_MEDIA",
-                    ].includes(reported)
-                  )
-                    code = reported;
-                } catch {
-                  /* Upstream/raw responses never enter the UI. */
-                }
+              if (p.native_platform?.compatibility) {
+                failNativeCompatibility(
+                  p,
+                  "平台兼容转码播放失败，请保持此方式并重新加载；平台授权和片源有效期仍适用",
+                );
+                return;
+              }
+              if (data.unsupportedTimeline) {
+                firstFrameDeadline?.stop();
+                sourceRecovery.endRecovery();
+                waiting.value = false;
+                error.value = new RequestFailure({
+                  error: { code: "UNSUPPORTED_TIMELINE" },
+                }).message;
+                preparation.value = {
+                  ...preparation.value,
+                  phase: "failed",
+                  failure: preparationFailure(
+                    new RequestFailure({
+                      error: { code: "UNSUPPORTED_TIMELINE" },
+                    }),
+                  ),
+                };
+                return;
               }
               if (
-                code === "NATIVE_LIVE_WINDOW_EXPIRED" &&
-                recoverExpiredLiveWindow(p)
+                retryStaticDecode(binding, {
+                  kind: "hls",
+                  fatal: data.fatal,
+                  type: data.type,
+                  details: data.details,
+                  response: data.response,
+                  media_error_code: data.media_error_code,
+                  error_name: data.error_name,
+                })
               )
                 return;
-              failNativeLive(p, code);
-              return;
-            }
-            if (p.native_platform?.compatibility) {
-              failNativeCompatibility(
-                p,
-                "平台兼容转码播放失败，请保持此方式并重新加载；平台授权和片源有效期仍适用",
+              if (data.response?.code === 409 && recover()) return;
+              if (
+                sameSidRecovery?.recover({
+                  plan: p,
+                  current:
+                    serial === loadSerial &&
+                    currentPlan(p) &&
+                    roomIsActive() &&
+                    intentCurrent(playbackIntent) &&
+                    candidateIntentCurrent(playbackIntent) &&
+                    video.value === el &&
+                    hls === attachedHls,
+                  fatal: data.fatal,
+                  type: data.type,
+                  recoverMediaError: () => attachedHls.recoverMediaError(),
+                })
+              ) {
+                sourceRecovery.beginRecovery();
+                waiting.value = true;
+                return;
+              }
+              if (
+                sameSidRecovery?.recoverNetwork({
+                  plan: p,
+                  current:
+                    serial === loadSerial &&
+                    currentPlan(p) &&
+                    roomIsActive() &&
+                    intentCurrent(playbackIntent) &&
+                    candidateIntentCurrent(playbackIntent) &&
+                    video.value === el &&
+                    hls === attachedHls,
+                  fatal: data.fatal,
+                  type: data.type,
+                  details: data.details,
+                  status: data.response?.code,
+                  startLoad: () => attachedHls.startLoad(-1),
+                })
+              ) {
+                sourceRecovery.beginRecovery();
+                waiting.value = true;
+                return;
+              }
+              if (data.type === "mediaError" && retryDecode()) return;
+              sourceRecovery.endRecovery();
+              error.value = "媒体加载失败：" + data.details;
+              failLocalPlayback(
+                "媒体加载失败，请检查连接或重新发起播放。",
+                undefined,
+                error.value,
               );
-              return;
-            }
-            if (
-              isUnsupportedTimelineResponse(
-                data.response?.code,
-                bestEffort(() =>
-                  data.networkDetails && "responseText" in data.networkDetails
-                    ? data.networkDetails.responseText
-                    : undefined,
-                ),
-              )
-            ) {
-              firstFrameDeadline?.stop();
-              recoveringHls = false;
               waiting.value = false;
-              error.value = new RequestFailure({
-                error: { code: "UNSUPPORTED_TIMELINE" },
-              }).message;
-              preparation.value = {
-                ...preparation.value,
-                phase: "failed",
-                failure: preparationFailure(
-                  new RequestFailure({
-                    error: { code: "UNSUPPORTED_TIMELINE" },
-                  }),
-                ),
-              };
-              return;
             }
-            if (
-              retryStaticDecode(binding, {
-                kind: "hls",
-                fatal: data.fatal,
-                type: data.type,
-                details: data.details,
-                response: data.response,
-                media_error_code: el.error?.code,
-                error_name: data.error?.name,
-              })
-            )
-              return;
-            if (data.response?.code === 409 && recover()) return;
-            if (
-              sameSidRecovery?.recover({
-                plan: p,
-                current:
-                  serial === loadSerial &&
-                  currentPlan(p) &&
-                  roomIsActive() &&
-                  metricCurrent(metrics) &&
-                  candidateIntentCurrent(metrics) &&
-                  video.value === el &&
-                  hls === attachedHls,
-                fatal: data.fatal,
-                type: data.type,
-                recoverMediaError: () => attachedHls.recoverMediaError(),
-              })
-            ) {
-              recoveringHls = true;
-              waiting.value = true;
-              return;
-            }
-            if (
-              sameSidRecovery?.recoverNetwork({
-                plan: p,
-                current:
-                  serial === loadSerial &&
-                  currentPlan(p) &&
-                  roomIsActive() &&
-                  metricCurrent(metrics) &&
-                  candidateIntentCurrent(metrics) &&
-                  video.value === el &&
-                  hls === attachedHls,
-                fatal: data.fatal,
-                type: data.type,
-                details: data.details,
-                status: data.response?.code,
-                startLoad: () => attachedHls.startLoad(-1),
-              })
-            ) {
-              recoveringHls = true;
-              waiting.value = true;
-              return;
-            }
-            if (data.type === "mediaError" && retryDecode()) return;
-            recoveringHls = false;
-            error.value = "媒体加载失败：" + data.details;
-            failLocalPlayback(
-              "媒体加载失败，请检查连接或重新发起播放。",
-              undefined,
-              error.value,
-            );
-            waiting.value = false;
-          }
+          },
         });
+        hls = attachedHls;
+        const binding = bindAttachment(attachedHls);
+        attachedHls.attach();
       };
       bindMetricSource(p, el);
       if (p.upstream_profile) {
@@ -2523,8 +2447,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
             serial === loadSerial &&
             currentPlan(p) &&
             roomIsActive() &&
-            metricCurrent(metrics) &&
-            candidateIntentCurrent(metrics) &&
+            intentCurrent(playbackIntent) &&
+            candidateIntentCurrent(playbackIntent) &&
             video.value === el,
           facts: (facts) => {
             upstreamMeasuredOutput.value = facts;
@@ -2535,7 +2459,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       }
       // Metadata drives room reconciliation; SDK readiness does not prove a frame.
       el.onloadedmetadata = () => {
-        if (serial !== loadSerial || !currentPlan(p) || !metricCurrent(metrics))
+        if (serial !== loadSerial || !currentPlan(p) || !intentCurrent(playbackIntent))
           return;
         applySubtitles();
         duration.value = p.native_platform?.live
@@ -2550,7 +2474,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         const current = () =>
           serial === loadSerial &&
           currentPlan(p) &&
-          metricCurrent(metrics) &&
+          intentCurrent(playbackIntent) &&
           roomIsActive() &&
           video.value === el;
         if (binding.compatibility) {
@@ -2571,69 +2495,97 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
             });
           if (mse) attachHls();
           else {
-            bindNativeError(bindAttachment({}));
-            el.src = p.playback_url;
-            attachMetricSource();
+            bindNativeSource(bindAttachment({}), p.playback_url);
           }
           mediaDataLoad.sourceChanged();
           firstFrameDeadline.attachSource();
         } else if (binding.live) {
           if (mse) attachHls();
           else {
-            el.onerror = () => {
-              if (!current() || !el.error || el.error.code === 1) return;
-              if (el.error.code === 2) {
-                void probeExpiredNativeLiveWindow(p);
-                return;
-              }
-              failNativeLive(p, "NATIVE_PLATFORM_DELIVERY_INVALID");
-            };
-            el.src = p.playback_url;
-            attachMetricSource();
+            attachNative({
+              source: p.playback_url,
+              requireSource: false,
+              error: ({ code }) => {
+                if (code === 2) {
+                  void probeExpiredNativeLiveWindow(p);
+                  return;
+                }
+                failNativeLive(p, "NATIVE_PLATFORM_DELIVERY_INVALID");
+              },
+            });
           }
           mediaDataLoad.sourceChanged();
           firstFrameDeadline.attachSource();
         } else if (p.transport === "dash") {
-          const attached = createDashPlayback({
+          const reportFailure = (failure: DashPlaybackError) => {
+            if (!current()) return;
+            waiting.value = false;
+            error.value = failure.message;
+            failLocalPlayback(failure.message, failure.code);
+          };
+          // Loading the driver consumes the same already-started media/frame
+          // budget as the SDK; module resolution cannot reset or own either.
+          mediaDataLoad.sourceChanged();
+          firstFrameDeadline.attachSource();
+          let module: Awaited<ReturnType<typeof loadDashDriver>>;
+          try {
+            module = await loadDashDriver();
+          } catch {
+            reportFailure({
+              code: "DASH_LIBRARY_LOAD_FAILED",
+              message: "DASH 播放器加载失败，请重试",
+            });
+            return;
+          }
+          if (!current()) return;
+          const attached = module.createDashDriver({
             video: el,
             sessionId: p.session_id,
             playbackUrl: p.playback_url,
-            current,
-            onError: (failure) => {
-              if (!current()) return;
-              waiting.value = false;
-              error.value = failure.message;
-              failLocalPlayback(failure.message, failure.code);
+            current: () => current() && dash === attached,
+            onSourceAttached: () => {
+              if (current()) attachMetricSource();
             },
+            onStatus: (snapshot) => {
+              if (!current() || sourcePresented) return;
+              if (snapshot.status === "loading")
+                loadingStage.value = "initializing";
+              else if (snapshot.status === "failed")
+                loadingStage.value = "failed";
+              else if (
+                [
+                  "loading_media",
+                  "ready",
+                  "waiting",
+                  "playing",
+                  "paused",
+                  "seeking",
+                ].includes(snapshot.status)
+              )
+                loadingStage.value =
+                  snapshot.readyState >= 2 ? "waiting_frame" : "loading_media";
+            },
+            onError: reportFailure,
           });
           dash = attached;
-          mediaDataLoad.sourceChanged();
-          firstFrameDeadline.attachSource();
-          attachMetricSource();
           if (!(await attached.load()) || !current()) return;
         } else {
           // A native MP4 is a dedicated platform grant, not the generic
           // progressive route. Never offer decoder/worker fallback or mutate
           // its token-bearing URL with generic recovery parameters.
-          el.onerror = () => {
-            if (
-              !current() ||
-              !el.getAttribute("src") ||
-              !el.error ||
-              el.error.code === 1
-            )
-              return;
+          attachNative({
+            source: p.playback_url,
+            error: ({ code }) => {
             waiting.value = false;
             error.value =
-              el.error.code === 2
+              code === 2
                 ? "平台视频加载中断，请检查连接后重新加载"
-                : el.error.code === 4
+                : code === 4
                   ? "平台视频加载或格式支持状态未知，请检查连接后重新加载"
                   : "浏览器无法播放此平台视频格式，请重新加载或选择其他视频";
             failLocalPlayback(error.value, "NATIVE_PLATFORM_MEDIA_FAILED");
-          };
-          el.src = p.playback_url;
-          attachMetricSource();
+            },
+          });
           mediaDataLoad.sourceChanged();
           firstFrameDeadline.attachSource();
         }
@@ -2654,9 +2606,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       } else {
         if (mse) attachHls();
         else {
-          bindNativeError(bindAttachment({}));
-          el.src = p.playback_url;
-          attachMetricSource();
+          bindNativeSource(bindAttachment({}), p.playback_url);
         }
         mediaDataLoad.sourceChanged();
         firstFrameDeadline.attachSource();
@@ -2664,22 +2614,19 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     } catch (e) {
       if (
         serial !== loadSerial ||
-        !candidateIntentCurrent(metrics) ||
+        !candidateIntentCurrent(playbackIntent) ||
         e instanceof PlaybackCancelled
       )
         return;
       waiting.value = false;
       pendingLoad = undefined;
+      // Only the controller's qualified pre-mutation rejection may rotate.
+      // This starts a new logical meter/intent; old packets and keys stay owned.
       if (
         !continuation &&
-        !metrics.originRecoveryUsed &&
-        e instanceof PlaybackViewerOriginRequired
-      ) {
-        // Explicitly pre-mutation, first-attempt rejection only. This starts a
-        // new logical meter/intent; no metrics packet or old key is relabeled.
-        planGenerations = new PlaybackPlanGenerations();
-        return beginLoad(metrics.origin, true);
-      }
+        sessionController.rotateViewerOrigin(e, playbackIntent)
+      )
+        return beginLoad(playbackIntent.origin, true);
       if (
         continuation &&
         e instanceof RequestFailure &&
@@ -2700,6 +2647,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         phase: "failed",
         failure: preparationFailure(e),
       };
+      loadingStage.value = "failed";
       throw e;
     }
   }
@@ -2714,15 +2662,15 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     }
   }
   async function waitForGenerated(p: PlaybackPlan) {
-    if (generationWait || generationWaitFailed) return;
+    if (sourceRecovery.pending || sourceRecovery.failed) return;
     if (!clockUsable()) {
       queueApply();
       return;
     }
     const revision = clockRevision();
-    const controller = new AbortController();
-    generationWait = controller;
-    invalidatePlayActions();
+    const nativeSource = native;
+    const controller = sourceRecovery.beginWait();
+    synchronization.invalidatePlayActions();
     mediaDataLoad?.sync();
     firstFrameDeadline?.sync();
     observeMetrics();
@@ -2761,28 +2709,26 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         return;
       }
       if (ready.complete && ready.available_until_ms != null)
-        generatedEnd = ready.available_until_ms / 1000;
+        sourceRecovery.completeAt(ready.available_until_ms / 1000);
       const position = Math.min(
-        generatedEnd ?? Infinity,
+        sourceRecovery.end ?? Infinity,
         Math.max(
           0,
           (target(state.value!, clock.now()) - p.timeline_origin_ms) / 1000,
         ),
       );
-      recoveringHls = true;
+      sourceRecovery.beginRecovery();
       if (hls) {
         // Retain the growing EVENT attempt and wait for an actual local interval.
         hls.startLoad(position);
-      } else if (video.value) {
+      } else if (video.value && nativeSource && native === nativeSource) {
         bindMetricSource(p, video.value, true);
         const url = new URL(p.playback_url, location.href);
         url.hash = `t=${position}`;
-        invalidatePlayActions();
+        synchronization.invalidatePlayActions();
         firstFrameDeadline?.detachSource();
         mediaDataLoad?.sourceChanged();
-        video.value.src = url.href;
-        video.value.load();
-        attachMetricSource();
+        nativeSource.reload(url.href);
         firstFrameDeadline?.attachSource();
       }
     } catch (e) {
@@ -2792,7 +2738,7 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         queueApply();
         return;
       }
-      generationWaitFailed = true;
+      sourceRecovery.failWait();
       waiting.value = false;
       preparation.value = {
         ...preparation.value,
@@ -2801,45 +2747,11 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       };
       throw e;
     } finally {
-      if (generationWait === controller) generationWait = undefined;
+      sourceRecovery.finishWait(controller);
       mediaDataLoad?.sync();
       firstFrameDeadline?.sync();
       observeMetrics();
     }
-  }
-  function actionCurrent(
-    p: PlaybackPlan,
-    el: HTMLVideoElement,
-    revision: number,
-    serial: number,
-  ) {
-    return (
-      clockUsable() &&
-      revision === clockRevision() &&
-      serial === applySerial &&
-      currentPlan(p) &&
-      roomIsActive() &&
-      video.value === el
-    );
-  }
-  function afterPlay(
-    p: PlaybackPlan,
-    el: HTMLVideoElement,
-    revision: number,
-    serial: number,
-  ) {
-    // A play promise may settle after a newer PAUSE. Enforce the latest state,
-    // but never pause a replacement grant or pause merely for clock recovery.
-    if (
-      currentPlan(p) &&
-      video.value === el &&
-      state.value?.playback_status !== "playing"
-    )
-      el.pause();
-    return (
-      actionCurrent(p, el, revision, serial) &&
-      state.value?.playback_status === "playing"
-    );
   }
   async function applyState(force = false, userSeek = false) {
     try {
@@ -2851,254 +2763,228 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       updateRecovery();
     }
   }
-  async function reconcileState(force = false, userSeek = false) {
-    if (userSeek) ++seekSerial;
-    pendingUserSeek ||= userSeek;
-    const serial = ++applySerial;
-    observeMetrics();
-    if (!roomIsActive()) return;
-    const s = state.value,
-      el = video.value;
-    if (!s || !el || !plan) return;
-    const p = plan;
-    if (failedCompatibilityPlan === p) return;
-    if (!currentPlan(p)) {
-      if (p.native_platform?.live)
-        failNativeLive(p, "NATIVE_LIVE_STATE_CHANGED");
-      return;
-    }
-    if (p.native_platform?.live) {
-      const directive = nativeLiveDirective({
-        room: s,
-        plan: p,
-        active: roomIsActive(),
-        connected: connected.value,
-        ended: el.ended || terminalEnd,
-      });
-      corrector.reset();
-      if (directive === "stale") {
-        failNativeLive(p, "NATIVE_LIVE_STATE_CHANGED");
-        return;
+  const reconcileLive = createLiveReconciliation({
+    synchronization,
+    blocked,
+    foreground,
+    clockRevision,
+    isPermissionDenied: (failure) => playFailureIs(failure, "NotAllowedError"),
+    interrupt: reportPlayInterruption,
+  });
+  function reconcileState(force = false, userSeek = false): Promise<void> {
+    try {
+      const serial = synchronization.beginApply(userSeek);
+      observeMetrics();
+      if (!roomIsActive()) return Promise.resolve();
+      const s = state.value,
+        el = video.value;
+      const p = readPlan();
+      if (!s || !el || !p) return Promise.resolve();
+      if (failedCompatibilityPlan === p) return Promise.resolve();
+      if (!currentPlan(p)) {
+        if (p.native_platform?.live)
+          failNativeLive(p, "NATIVE_LIVE_STATE_CHANGED");
+        return Promise.resolve();
       }
-      if (directive === "offline") {
-        if (!terminalEnd) failNativeLive(p);
-        return;
-      }
-      if (!baseRate()) return;
-      restoreBaseRate();
-      if (directive === "pause") {
-        el.pause();
-        liveNeedsEdge = true;
-        return;
-      }
-      if (directive === "wait" || !foreground() || el.readyState < 1) return;
-      if (userSeek) return; // Room-wide seeks are never broadcast timeline claims.
-      if (el.paused) liveNeedsEdge = true;
-      if (force || liveNeedsEdge) {
-        const edge = nativeLiveEdge(
-          availablePlaybackRanges(el),
-          hls?.liveSyncPosition ?? undefined,
+      if (p.native_platform?.live) {
+        return reconcileLive(
+          {
+            directive: () =>
+              nativeLiveDirective({
+                room: s,
+                plan: p,
+                active: roomIsActive(),
+                connected: connected.value,
+                ended: el.ended || terminalEnd,
+              }),
+            get terminal() {
+              return terminalEnd;
+            },
+            get readyState() {
+              return el.readyState;
+            },
+            get paused() {
+              return el.paused;
+            },
+            get needsEdge() {
+              return liveNeedsEdge;
+            },
+            failChanged: () => failNativeLive(p, "NATIVE_LIVE_STATE_CHANGED"),
+            failOffline: () => failNativeLive(p),
+            pause: () => el.pause(),
+            requireEdge: () => {
+              liveNeedsEdge = true;
+            },
+            edge: () =>
+              nativeLiveEdge(
+                availablePlaybackRanges(el),
+                hls?.liveSyncPosition ?? undefined,
+              ),
+            align: (edge: number) => {
+              el.currentTime = edge;
+              liveNeedsEdge = false;
+            },
+            play: () => el.play(),
+            afterPlay: (revision: number) =>
+              synchronization.afterPlay(p, el, revision, serial),
+          },
+          force,
+          userSeek,
         );
-        if (edge !== undefined) {
-          el.currentTime = edge;
-          liveNeedsEdge = false;
-        }
       }
-      pendingForce = pendingUserSeek = false;
-      if (el.paused && !blocked.value && !pendingPlay && !playFailed) {
-        const playing = {};
-        pendingPlay = playing;
-        const revision = clockRevision();
-        try {
-          await el.play();
-          if (!afterPlay(p, el, revision, serial)) return;
-          blocked.value = false;
-        } catch (failure) {
-          if (!afterPlay(p, el, revision, serial)) return;
-          if (playFailureIs(failure, "NotAllowedError")) blocked.value = true;
-          else {
-            playFailed = true;
-            reportPlayInterruption();
-          }
-        } finally {
-          if (pendingPlay === playing) pendingPlay = undefined;
-        }
-      }
-      return;
+      return reconcileVod(s, el, p, serial, force, userSeek);
+    } catch (failure) {
+      return Promise.reject(failure);
     }
-    if (s.playback_status !== "playing") {
-      el.pause();
-      restoreBaseRate();
-    }
-    if (!clockUsable()) {
-      restoreBaseRate();
-      queueApply(force, userSeek);
-      return;
-    }
-    if (el.readyState < 1) return;
-    userSeek ||= pendingUserSeek;
-    force ||= pendingForce;
-    pendingUserSeek = false;
-    pendingForce = false;
-    if (el.ended && s.playback_status === "playing" && !userSeek) {
-      void completed();
-      return;
-    }
-    if (!baseRate()) return;
-    const revision = clockRevision();
-    if (userSeek) {
-      generationWaitFailed = false;
-      generatedEnd = undefined;
-      recoveringHls = false;
-      generationWait?.abort();
-      generationWait = undefined;
-      mediaDataLoad?.sync();
-      firstFrameDeadline?.sync();
-    }
-    if (generationWait || generationWaitFailed) return;
-    const relative = (target(s, clock.now()) - p.timeline_origin_ms) / 1000;
-    const expected = Math.min(generatedEnd ?? Infinity, Math.max(0, relative));
-    const ranges = availablePlaybackRanges(el);
-    const seekable = containsPlaybackPosition(ranges, expected);
-    const end = ranges.length
-      ? Math.max(...ranges.map(([, end]) => end))
-      : undefined;
-    if (
-      force &&
-      p.rebuild_on_seek &&
-      (relative < -0.5 || (userSeek && !seekable))
-    ) {
-      // A fresh authoritative target before this upstream timeline is a new
-      // seek intent, not a decoder retry of the previous profile or SID.
-      const profileTimelineSeek = relative < -0.5 && !!p.upstream_profile;
-      if (userSeek || profileTimelineSeek) await beginLoad("automatic_load");
-      else await fallbackLoad();
-      return;
-    }
-    if (recoveringHls && !seekable) {
-      if (end !== undefined && expected <= end) {
-        recoveringHls = false;
+  }
+  const reconcileVod = createVodReconciliation({
+    capture: (
+      s: NonNullable<typeof state.value>,
+      el: HTMLVideoElement,
+      p: PlaybackPlan,
+      serial: number,
+    ) => ({
+      state: s,
+      plan: {
+        get timeline_origin_ms() {
+          return p.timeline_origin_ms;
+        },
+        get rebuild_on_seek() {
+          return p.rebuild_on_seek;
+        },
+        get hasUpstreamProfile() {
+          return !!p.upstream_profile;
+        },
+      },
+      media: {
+        get readyState() {
+          return el.readyState;
+        },
+        get ended() {
+          return el.ended;
+        },
+        get paused() {
+          return el.paused;
+        },
+        get currentTime() {
+          return el.currentTime;
+        },
+        ranges: () => availablePlaybackRanges(el),
+        pause: () => el.pause(),
+        seek: (position: number) => {
+          el.currentTime = position;
+        },
+        play: () => el.play(),
+        afterPlay: (revision: number) =>
+          synchronization.afterPlay(p, el, revision, serial),
+      },
+      waitForGenerated: () => waitForGenerated(p),
+    }),
+    synchronization,
+    blocked,
+    clockUsable,
+    clockRevision,
+    now: () => clock.now(),
+    queueApply,
+    completed,
+    prepare: () => beginLoad("automatic_load"),
+    fallback: () => fallbackLoad(),
+    generated: {
+      get pending() {
+        return sourceRecovery.pending;
+      },
+      get failed() {
+        return sourceRecovery.failed;
+      },
+      get end() {
+        return sourceRecovery.end;
+      },
+      get recovering() {
+        return sourceRecovery.recovering;
+      },
+      resetSeek: () => {
+        sourceRecovery.resetSeek();
+        mediaDataLoad?.sync();
+        firstFrameDeadline?.sync();
+      },
+      rejectHole: () => {
+        sourceRecovery.endRecovery();
         waiting.value = false;
         error.value = "目标进度尚不可定位，请稍后重试或重新加载";
-      }
-      return;
-    }
-    if (
-      p.rebuild_on_seek &&
-      !userSeek &&
-      !recoveringHls &&
-      generatedEnd === undefined &&
-      !seekable &&
-      (end === undefined || expected > end + 0.1)
-    ) {
-      await waitForGenerated(p);
-      return;
-    }
-    // Neither a finite duration nor a later interval authorizes a seek into a
-    // hole. Generated holes stay on the finite recovery/reload path.
-    if (!seekable && Math.abs(el.currentTime - expected) > 0.15) {
-      restoreBaseRate();
-      error.value = "目标进度尚不可定位，请稍后重试或重新加载";
-      // Initial playback may need play() to expose any local intervals. Keep
-      // the metadata seek pending, and never assign an unavailable position.
-      if (!ranges.length && force && !userSeek) pendingForce = true;
-      if (userSeek || ranges.length) return;
-    }
-    if (recoveringHls) recoveringHls = false;
-    if (seekable && error.value === "目标进度尚不可定位，请稍后重试或重新加载")
-      error.value = "";
-    if (force || s.playback_status !== "playing") {
-      if (seekable && Math.abs(el.currentTime - expected) > 0.15)
-        el.currentTime = expected;
-    }
-    if (s.playback_status === "playing") {
-      if (el.paused && !blocked.value && !pendingPlay && !playFailed) {
-        const playing = {};
-        pendingPlay = playing;
-        try {
-          await el.play();
-          if (!afterPlay(p, el, revision, serial)) return;
-          blocked.value = false;
-          if (error.value === playInterruptedError) error.value = "";
-          observeMetrics();
-        } catch (failure) {
-          if (!afterPlay(p, el, revision, serial)) return;
-          if (playFailureIs(failure, "NotAllowedError")) {
-            blocked.value = true;
-            observeMetrics();
-          } else {
-            // Stop periodic play retries without claiming a gesture denial or
-            // suspending the independent media-data deadline.
-            playFailed = true;
-            if (playFailureIs(failure, "AbortError")) {
-              reportPlayInterruption();
-              return;
-            }
-            throw failure;
-          }
-        } finally {
-          if (pendingPlay === playing) pendingPlay = undefined;
-        }
-      }
-    }
-  }
-  async function enablePlayback() {
-    if (!roomIsActive()) return;
-    const p = plan,
-      el = video.value;
-    if (p && failedCompatibilityPlan === p) return;
-    if (!clockUsable()) {
-      queueApply();
-      return;
-    }
-    if (p && el && currentPlan(p) && baseRate() && !pendingPlay) {
-      if (p.native_platform?.live) {
-        if (terminalEnd || el.ended) {
-          if (!terminalEnd) failNativeLive(p);
-          return;
-        }
-        if (state.value?.playback_status !== "playing") return;
-        const edge = nativeLiveEdge(
-          availablePlaybackRanges(el),
-          hls?.liveSyncPosition ?? undefined,
-        );
-        liveNeedsEdge = edge === undefined;
-        if (edge !== undefined) el.currentTime = edge;
-      }
-      const serial = ++applySerial,
-        revision = clockRevision();
-      const playing = {};
-      pendingPlay = playing;
-      playFailed = false;
-      // An explicit gesture resumes loading even while play() waits for data.
-      // Only a new permission denial may restore the gesture gate.
-      blocked.value = false;
-      observeMetrics();
-      try {
-        await el.play();
-      } catch (failure) {
-        if (!afterPlay(p, el, revision, serial)) return;
-        if (playFailureIs(failure, "NotAllowedError")) {
-          blocked.value = true;
-          observeMetrics();
-        } else {
-          playFailed = true;
-          if (playFailureIs(failure, "AbortError")) {
-            reportPlayInterruption();
-            return;
-          }
-        }
-        throw failure;
-      } finally {
-        if (pendingPlay === playing) pendingPlay = undefined;
-      }
-      if (!afterPlay(p, el, revision, serial)) return;
-      blocked.value = false;
+      },
+      clearRecovery: () => {
+        sourceRecovery.endRecovery();
+      },
+    },
+    notice: {
+      unavailable: () => {
+        error.value = "目标进度尚不可定位，请稍后重试或重新加载";
+      },
+      clearUnavailable: () => {
+        if (error.value === "目标进度尚不可定位，请稍后重试或重新加载")
+          error.value = "";
+      },
+      clearInterruption: () => {
+        if (error.value === playInterruptedError) error.value = "";
+      },
+    },
+    observe: observeMetrics,
+    playFailureIs,
+    interrupt: reportPlayInterruption,
+  });
+  const enablePlayback = createPlaybackGesture({
+    active: roomIsActive,
+    capture: () => {
+      const p = readPlan(),
+        el = video.value;
+      return {
+        get failed() {
+          return !!p && failedCompatibilityPlan === p;
+        },
+        current: () => {
+          if (!p || !el || !currentPlan(p)) return;
+          return {
+            get live() {
+              return !!p.native_platform?.live;
+            },
+            get ended() {
+              return el.ended;
+            },
+            get terminal() {
+              return terminalEnd;
+            },
+            get playing() {
+              return state.value?.playback_status === "playing";
+            },
+            edge: () => nativeLiveEdge(
+              availablePlaybackRanges(el),
+              hls?.liveSyncPosition ?? undefined,
+            ),
+            align: (edge: number | undefined) => {
+              liveNeedsEdge = edge === undefined;
+              if (edge !== undefined) el.currentTime = edge;
+            },
+            failLive: () => failNativeLive(p),
+            play: () => el.play(),
+            afterPlay: (revision: number, serial: number) =>
+              synchronization.afterPlay(p, el, revision, serial),
+          };
+        },
+      };
+    },
+    clockUsable,
+    clockRevision,
+    queueApply,
+    synchronization,
+    blocked,
+    isFailure: playFailureIs,
+    interrupt: reportPlayInterruption,
+    clearInterruption: () => {
       if (error.value === playInterruptedError) error.value = "";
-      observeMetrics();
-      await applyState(true);
-    }
-  }
+    },
+    observe: observeMetrics,
+    reconcile: () => applyState(true),
+  });
   function tick() {
     try {
       tickPlayback();
@@ -3111,93 +2997,23 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     if (!roomIsActive()) return;
     const s = state.value,
       el = video.value;
-    if (!s || !el || !plan) return;
-    if (failedCompatibilityPlan === plan) return;
-    if (plan.native_platform?.live) {
-      position.value = duration.value = 0;
-      corrector.reset();
-      if (!liveRoomMatchesPlan(s, plan)) {
-        failNativeLive(plan, "NATIVE_LIVE_STATE_CHANGED");
-        return;
-      }
-      if (el.ended) {
-        if (!terminalEnd) failNativeLive(plan);
-        return;
-      }
-      if (
-        !terminalEnd &&
-        (s.playback_status !== "playing" || el.paused || liveNeedsEdge)
-      )
-        void runAutomaticApply();
+    const p = readPlan();
+    if (!s || !el || !p) return;
+    if (failedCompatibilityPlan === p) return;
+    if (p.native_platform?.live) {
+      tickLive(s, el, p);
       return;
     }
-    if (!dragging.value)
-      position.value = el.currentTime + plan.timeline_origin_ms / 1000;
-    if (!usable || s.playback_status !== "playing") {
-      corrector.reset();
-      restoreBaseRate();
-      return;
-    }
-    if (!baseRate()) return;
-    if (el.ended) {
-      void completed();
-      return;
-    }
-    if (generationWait || generationWaitFailed) return;
-    if (recoveringHls) {
-      void runAutomaticApply(true);
-      return;
-    }
-    const expected = Math.min(
-      generatedEnd ?? Infinity,
-      (target(s, clock.now()) - plan.timeline_origin_ms) / 1000,
-    );
-    const ranges = availablePlaybackRanges(el);
-    if (!containsPlaybackPosition(ranges, expected)) {
-      restoreBaseRate();
-      corrector.reset();
-      if (plan.rebuild_on_seek) void runAutomaticApply(true);
-      return;
-    }
-    if (
-      !blocked.value &&
-      !pendingPlay &&
-      !playFailed &&
-      (el.paused || pendingForce || pendingUserSeek)
-    ) {
-      void runAutomaticApply(pendingForce, pendingUserSeek);
-      return;
-    }
-    const drift = (expected - el.currentTime) * 1000;
-    const pausedCorrection =
-      waiting.value || el.seeking || blocked.value || el.readyState < 2;
-    const adjustment = corrector.step(
-      rates!.fineUnsupported && Math.abs(drift) <= 500 ? 0 : drift,
-      s.playback_rate,
-      performance.now(),
-      pausedCorrection,
-    );
-    if (pausedCorrection || adjustment.seek) restoreBaseRate();
-    else if (!rates!.fineUnsupported) rates!.applyCorrection(adjustment.rate);
-    if (!rates!.baseSupported) {
-      reportUnsupportedRate();
-      corrector.reset();
-      return;
-    }
-    if (adjustment.seek) el.currentTime = expected;
+    tickVod(s, mediaIO, p, usable);
   }
   function onClockInvalidated() {
-    ++applySerial;
-    corrector.reset();
-    restoreBaseRate();
-    generationWait?.abort();
-    generationWait = undefined;
-    generationWaitFailed = false;
+    synchronization.invalidateClock();
+    sourceRecovery.invalidateClock();
     mediaDataLoad?.sync();
     firstFrameDeadline?.sync();
     queueApply();
     if (pendingLoad && !pendingLoad.preparing) clockAction = "load";
-    recoveryPending = !!plan || !!pendingLoad;
+    recoveryPending = !!readPlan() || !!pendingLoad;
     updateRecovery();
   }
   function onClockReady() {
@@ -3211,17 +3027,21 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
         void run(() =>
           loadAttempt(
             pending.failed,
-            pending.intent,
-            pending.metrics,
+            pending.planIntent,
+            pending.playbackIntent,
             pending.continuation,
           ),
         );
-      else void runAutomaticApply(pendingForce, pendingUserSeek);
+      else
+        void runAutomaticApply(
+          synchronization.pendingForce,
+          synchronization.pendingUserSeek,
+        );
     }
   }
   function mediaChanged() {
     distributedIntent.value = undefined;
-    corrector.reset();
+    synchronization.resetCorrection();
     audioIndex.value = undefined;
     subtitleIndex.value = undefined;
     clearAdvancedPlayback();
@@ -3232,15 +3052,16 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   }
   async function reset() {
     distributedIntent.value = undefined;
-    finishMetrics();
+    finishIntent();
     ++loadSerial;
     preparation.value = { phase: "idle" };
+    sourcePresented = false;
+    recoveryWaitAt = undefined;
+    loadingStage.value = "idle";
     clockAction = undefined;
-    pendingUserSeek = false;
-    pendingForce = false;
-    corrector.reset();
-    rates?.reset();
-    confirmedBaseRate = rejectedBaseRate = undefined;
+    synchronization.clearPendingApply();
+    synchronization.resetCorrection();
+    synchronization.resetRates();
     dragging.value = false;
     tracks.value = [];
     subtitles.value = [];
@@ -3288,18 +3109,24 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
   function resetClockAction() {
     clockAction = undefined;
   }
+  function setLocalVolume(volume: number) {
+    if (video.value) video.value.volume = volume;
+  }
+  function setLocalMuted(muted: boolean) {
+    if (video.value) video.value.muted = muted;
+  }
   function attach(element: HTMLVideoElement) {
     if (video.value === element) return;
     if (video.value) throw new Error("播放器已绑定；需先显式停止");
+    mediaIO = createPlaybackMediaIO(element);
     video.value = element;
-    rates = new PlaybackRateSupport(element);
-    confirmedBaseRate = rejectedBaseRate = undefined;
+    synchronization.attachRateElement(mediaIO.rate);
     if (
-      !plan &&
+      !readPlan() &&
       pendingLoad &&
       !pendingLoad.preparing &&
       roomIsActive() &&
-      candidateIntentCurrent(pendingLoad.metrics)
+      candidateIntentCurrent(pendingLoad.playbackIntent)
     ) {
       // Late host attachment replays the original deferred generation/meter.
       // A previous pre-POST attempt is fenced by loadSerial, not a new intent.
@@ -3321,8 +3148,8 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       state.value?.media_id,
       state.value?.media_generation,
       state.value?.playback_status,
-      session.user?.id,
-      session.epoch,
+      viewer.current().userId,
+      viewer.current().epoch,
       connected.value,
       waiting.value,
       blocked.value,
@@ -3382,17 +3209,11 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
       },
       { flush: "sync" },
     );
-  const maintenance = createPlaybackMaintenance({
+  const maintenance = sessionController.startMaintenance({
     tick,
     observe: () => observations?.progress(),
     sample: sampleMetrics,
     visibilityChanged,
-    plan: () => plan,
-    active: roomIsActive,
-    currentPlan,
-    epoch: () => session.epoch,
-    renew: (current) =>
-      session.api(`/playback-sessions/${current.session_id}`, "POST"),
     reload: () => {
       void run(() => beginLoad("automatic_load") ?? Promise.resolve());
     },
@@ -3409,7 +3230,12 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     bestEffort(() => metricSender.stop());
   });
   return {
+    playbackError: error,
+    playbackBusy: busy,
+    runPlayback: run,
     video,
+    setLocalVolume,
+    setLocalMuted,
     distributedIntent,
     distributedFacts,
     peerStats,
@@ -3469,12 +3295,15 @@ export function createPlaybackRuntime(ctx: PlaybackRuntimeContext) {
     position,
     sessionId,
     preparation,
+    loadingStage,
+    startupDiagnostics,
     cancelPreparation,
     recoveryState,
     playbackSummary,
     recoveryLabel,
     loadMedia,
     applyState,
+    applyRoomState,
     enablePlayback,
     applySubtitles,
     reset,

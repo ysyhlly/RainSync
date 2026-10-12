@@ -1,3 +1,4 @@
+import { responseRecord, responseMember } from "../../shared/api/response";
 import { createCookieAccountFlow } from "./cookie-account-flow";
 import type {
   ShortPlatformAccountStatus,
@@ -6,13 +7,13 @@ import type {
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function validateShortAccountStatus(
-  value: ShortPlatformAccountStatus,
+  value: unknown,
   provider: ShortPlatformProvider,
 ): ShortPlatformAccountStatus {
   if (
-    !value ||
+    !responseRecord(value) ||
     value.provider !== provider ||
-    !["connected", "expired", "revoked"].includes(value.state) ||
+    !responseMember(value.state, ["connected", "expired", "revoked"]) ||
     (value.id !== null &&
       (typeof value.id !== "string" || !uuid.test(value.id))) ||
     (value.revision !== null &&
@@ -20,9 +21,10 @@ export function validateShortAccountStatus(
     (value.id === null) !== (value.revision === null) ||
     value.login_method !== "cookie_import" ||
     value.qr_available !== false ||
-    !["unverified", "none"].includes(value.verification) ||
+    !responseMember(value.verification, ["unverified", "none"]) ||
     (value.credential_expires_at !== null &&
-      (!Number.isSafeInteger(value.credential_expires_at) ||
+      (typeof value.credential_expires_at !== "number" ||
+        !Number.isSafeInteger(value.credential_expires_at) ||
         value.credential_expires_at <= 0)) ||
     (value.state === "connected" &&
       (!value.id || !value.revision || value.verification !== "unverified")) ||
@@ -31,7 +33,7 @@ export function validateShortAccountStatus(
     throw Error("平台账号状态响应不完整");
   return {
     id: value.id,
-    provider: value.provider,
+    provider,
     revision: value.revision,
     state: value.state,
     login_method: value.login_method,
@@ -113,7 +115,7 @@ export function createShortAccountFlow(options: {
     cookie: string,
     revision: string | null,
     signal: AbortSignal,
-  ) => Promise<ShortPlatformAccountStatus>;
+  ) => Promise<unknown>;
   clearSecret: () => void;
   change: (state: ShortAccountFlowState) => void;
 }) {

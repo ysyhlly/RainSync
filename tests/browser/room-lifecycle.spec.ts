@@ -13,7 +13,19 @@ test("close requires confirmation, preserves readonly history, and explicit reop
     lifecycle_epoch,
     owner_id: app.room.owner_id,
     state: app.state,
-    cleanup: null,
+    cleanup:
+      lifecycle === "active"
+        ? null
+        : {
+            attempts: 0,
+            completed: lifecycle === "closed" || lifecycle === "archived",
+            phase: lifecycle === "closing" ? "queued" : "completed",
+            blockers: [],
+            last_error: null,
+            elapsed_ms: 0,
+            lease_active: false,
+            retryable: lifecycle === "closing",
+          },
   });
   await page.route("**/api/v1/rooms/room/lifecycle", (route) =>
     route.fulfill({ json: view() }),
@@ -80,7 +92,7 @@ test("close requires confirmation, preserves readonly history, and explicit reop
   const count = app.preparations();
   await page
     .getByRole("dialog", { name: "房间管理", exact: true })
-    .getByRole("button", { name: "关闭弹窗" })
+    .getByRole("button", { name: "关闭房间管理" })
     .click();
   await expect(page.getByText("保留的聊天记录", { exact: true })).toBeVisible();
   await expect(page.getByLabel("聊天消息", { exact: true })).toBeDisabled();

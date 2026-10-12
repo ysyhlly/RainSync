@@ -4,6 +4,7 @@ use crate::*;
 use providers::platform::imports::{self, Provider};
 use std::collections::HashSet;
 use tokio::time::{Duration, Instant};
+mod metadata;
 mod pagination;
 
 #[derive(Deserialize)]
@@ -76,7 +77,10 @@ fn import_failure(error: providers::platform::bilibili::Error) -> Value {
         providers::platform::bilibili::Error::Deadline => "platform_import_deadline",
         providers::platform::bilibili::Error::Transport
         | providers::platform::bilibili::Error::Status(_) => "platform_import_unavailable",
-        providers::platform::bilibili::Error::Api(_) => "platform_import_platform_restricted",
+        providers::platform::bilibili::Error::Api(_)
+        | providers::platform::bilibili::Error::Restricted(_) => {
+            "platform_import_platform_restricted"
+        }
         providers::platform::bilibili::Error::TooLarge => "platform_import_limit",
         _ => "platform_import_invalid",
     };
@@ -322,7 +326,12 @@ pub async fn preview(
                 truncated |= limited;
                 for reference in references {
                     if seen.insert(reference.key()) {
-                        items.push(reference_dto(&reference));
+                        let mut item = reference_dto(&reference);
+                        if !body.collection {
+                            metadata::enrich(app.platform_http, &reference, &mut item, deadline)
+                                .await;
+                        }
+                        items.push(item);
                     }
                 }
             }

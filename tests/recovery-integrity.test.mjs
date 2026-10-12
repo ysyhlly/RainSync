@@ -30,6 +30,7 @@ import {
   readTransaction,
 } from "../deploy/postgres-recovery.mjs";
 import { isolatedPostgres } from "./fixtures/postgres.mjs";
+import { finishRecoveryFixture } from "./fixtures/upgrade-recovery-evidence.mjs";
 import { safeFailure } from "./fixtures/safe-failure.mjs";
 
 const execute = promisify(execFile);
@@ -73,13 +74,17 @@ const native = {
 async function fixtureRun(run) {
   const root = await mkdtemp(resolve(tmpdir(), "rainsync-recovery-integrity-"));
   const fixture = isolatedPostgres({ root, name: "recovery-integrity" });
+  let primaryFailed = false, primaryError;
   try {
     await fixture.start();
     await run(fixture, root);
+  } catch (error) {
+    primaryFailed = true;
+    primaryError = error;
   } finally {
-    await fixture.stop();
-    await fixture.verifyStopped();
-    await rm(root, { recursive: true, force: true });
+    await finishRecoveryFixture({
+      name: "recovery-integrity", root, fixture, primaryFailed, primaryError,
+    });
   }
 }
 

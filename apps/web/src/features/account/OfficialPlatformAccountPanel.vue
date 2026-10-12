@@ -41,6 +41,7 @@ function snapshot() {
     origin = location.origin;
   return () =>
     alive &&
+    !controller.signal.aborted &&
     epoch === session.epoch &&
     user === session.user?.id &&
     csrf === session.user?.csrf &&
@@ -51,13 +52,11 @@ async function refresh() {
   const current = snapshot(),
     generation = ++serial;
   try {
-    const value = validateOAuthStatus(
-      await platformOAuthApi(session.api, props.provider).status(
-        controller.signal,
-      ),
-      props.provider,
+    const receipt = await platformOAuthApi(session.api, props.provider).status(
+      controller.signal,
     );
-    if (current() && generation === serial) status.value = value;
+    if (!current() || generation !== serial) return;
+    status.value = validateOAuthStatus(receipt, props.provider);
   } catch {
     if (current() && generation === serial)
       error.value = "无法确认开放平台授权状态，请刷新重试";
@@ -133,14 +132,12 @@ async function disable() {
   busy.value = true;
   error.value = "";
   try {
-    const v = validateOAuthStatus(
-      await platformOAuthApi(session.api, props.provider).disableRenewal(
-        status.value.revision,
-        controller.signal,
-      ),
+    const receipt = await platformOAuthApi(
+      session.api,
       props.provider,
-    );
-    if (current()) status.value = v;
+    ).disableRenewal(status.value.revision, controller.signal);
+    if (!current()) return;
+    status.value = validateOAuthStatus(receipt, props.provider);
   } catch {
     if (current()) error.value = "停止自动续期的结果未确认，请刷新状态";
   } finally {
@@ -153,17 +150,13 @@ async function unlink() {
   busy.value = true;
   error.value = "";
   try {
-    const v = validateOAuthStatus(
-      await platformOAuthApi(session.api, props.provider).unlink(
-        status.value.revision,
-        controller.signal,
-      ),
-      props.provider,
+    const receipt = await platformOAuthApi(session.api, props.provider).unlink(
+      status.value.revision,
+      controller.signal,
     );
-    if (current()) {
-      status.value = v;
-      unlinkOpen.value = false;
-    }
+    if (!current()) return;
+    status.value = validateOAuthStatus(receipt, props.provider);
+    unlinkOpen.value = false;
   } catch {
     if (current()) error.value = "解除开放平台授权的结果未确认，请刷新状态";
   } finally {
@@ -218,10 +211,14 @@ onBeforeUnmount(() => {
 <template>
   <section class="platform-oauth-panel">
     <h3>{{ label }} 官方开放平台授权</h3>
-    <p class="helper">
-      此授权只保存已批准的开放平台用户资料接口令牌，不会生成网页播放
-      Cookie，也不会增加视频、会员或地区访问权限
-    </p>
+    <p class="helper">授权平台资料接口，不增加视频播放权限。</p>
+    <details class="helper">
+      <summary>了解授权范围</summary>
+      <p>
+        此授权只保存已批准的开放平台用户资料接口令牌，不会生成网页播放
+        Cookie，也不会增加视频、会员或地区访问权限
+      </p>
+    </details>
     <p v-if="status && !status.available" role="status">
       服务器尚未配置可用的开放平台应用。仅安装手机 App 无法完成这项授权
     </p>

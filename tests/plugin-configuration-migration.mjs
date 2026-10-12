@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isolatedPostgres } from "./fixtures/postgres.mjs";
+import { finishOwnedFixture } from "./fixtures/server.mjs";
 
 assert.ok(
   process.env.RAINSYNC_ARTIFACT_DIR,
@@ -15,6 +16,7 @@ const root = resolve(
 );
 await mkdir(root, { recursive: true });
 const db = isolatedPostgres({ root, name: "plugin-configuration-migration" });
+let primaryFailed = false, primaryError;
 try {
   await db.start();
   const actor = randomUUID(),
@@ -73,7 +75,18 @@ try {
   console.log(
     "Plugin 0073→0084 migration preserves existing records and audit; erased tombstones and reinstall constraints passed",
   );
+} catch (error) {
+  primaryFailed = true;
+  primaryError = error;
 } finally {
-  await db.stop();
-  await db.verifyStopped();
+  await finishOwnedFixture({
+    primaryFailed, primaryError,
+    cleanup: () => db.stop(),
+    verifyStopped: () => db.verifyStopped(),
+    save: (report) => writeFile(
+      resolve(root, "fixture-cleanup.json"),
+      JSON.stringify(report, null, 2) + "\n",
+      { mode: 0o600, flag: "wx" },
+    ),
+  });
 }

@@ -1,11 +1,11 @@
 import { StaleIdentity } from "../../shared/api/client";
 
-/** One provider's request lifecycle. Status validation and publishing stay local. */
+/** One provider's request lifecycle. Unknown receipts are parsed locally, after the stale-response fence. */
 export function createAccountRequestSlot<Status>(options: {
   epoch: () => number;
   cached: (force: boolean) => Status | undefined;
-  read: (signal: AbortSignal) => Promise<Status>;
-  accept: (value: Status) => Status;
+  read: (signal: AbortSignal) => Promise<unknown>;
+  accept: (value: unknown) => Status;
   timeoutMs: number;
   busyMessage: string;
 }) {
@@ -56,8 +56,8 @@ export function createAccountRequestSlot<Status>(options: {
   }
 
   function mutate<Result>(
-    action: (signal: AbortSignal) => Promise<Result>,
-    publish: (value: Result) => Result,
+    action: (signal: AbortSignal) => Promise<unknown>,
+    publish: (value: unknown) => Result,
     external?: AbortSignal,
     validate?: () => void,
   ): Promise<Result> {

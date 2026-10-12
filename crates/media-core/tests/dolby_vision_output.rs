@@ -82,7 +82,9 @@ async fn real_rpu_native_candidates_and_sdr_output() {
                 .unwrap()
                 .version;
         let input = OwnedLocalInput::open(&root, name, &version).unwrap();
-        input.verify_dolby_vision_rpu(&meta).await.unwrap();
+        media_core::inspection::verify_dolby_vision_rpu(&input, &meta)
+            .await
+            .unwrap();
         for start in [0.0, 1.0] {
             let directory =
                 std::env::temp_dir().join(format!("rainsync-dovi-{}", uuid::Uuid::new_v4()));

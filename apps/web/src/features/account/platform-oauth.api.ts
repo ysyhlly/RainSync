@@ -34,6 +34,8 @@ export interface OAuthLogin {
   next_poll_at: number;
   server_time: number;
 }
+// Transport receipts stay unknown until the caller passes its current-request
+// fence and validates the complete DTO. Unconsumed cancellation stays opaque.
 export const platformOAuthApi = (
   api: ApiClient,
   provider: ShortPlatformProvider,
@@ -42,14 +44,14 @@ export const platformOAuthApi = (
   const path = `/platform-accounts/${provider}/oauth`;
   return {
     status: (signal?: AbortSignal) =>
-      api<OAuthStatus>(path, "GET", undefined, signal),
+      api<unknown>(path, "GET", undefined, signal),
     start: (
       id: string,
       revision: string | null,
       renew: boolean,
       signal?: AbortSignal,
     ) =>
-      api<OAuthLogin>(
+      api<unknown>(
         `${path}/login`,
         "POST",
         {
@@ -61,35 +63,35 @@ export const platformOAuthApi = (
         signal,
       ),
     read: (id: string, signal?: AbortSignal) =>
-      api<OAuthLogin>(
+      api<unknown>(
         `${path}/login/${encodeURIComponent(id)}`,
         "GET",
         undefined,
         signal,
       ),
     poll: (id: string, signal?: AbortSignal) =>
-      api<OAuthLogin>(
+      api<unknown>(
         `${path}/login/${encodeURIComponent(id)}/poll`,
         "POST",
         undefined,
         signal,
       ),
     cancel: (id: string) =>
-      api<OAuthLogin>(
+      api<unknown>(
         `${path}/login/${encodeURIComponent(id)}`,
         "DELETE",
         undefined,
         AbortSignal.timeout(10000),
       ),
     disableRenewal: (revision: string | null, signal?: AbortSignal) =>
-      api<OAuthStatus>(
+      api<unknown>(
         `${path}/renewal`,
         "PUT",
         { expected_revision: revision, enabled: false },
         signal,
       ),
     unlink: (revision: string | null, signal?: AbortSignal) =>
-      api<OAuthStatus>(path, "DELETE", { expected_revision: revision }, signal),
+      api<unknown>(path, "DELETE", { expected_revision: revision }, signal),
   };
 };
 export const oauthPrerequisiteLabels: Record<string, string> = {

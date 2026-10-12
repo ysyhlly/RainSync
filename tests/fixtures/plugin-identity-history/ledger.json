@@ -1,0 +1,267 @@
+{
+  "schema_version": 1,
+  "preparation_commit": "fd65ac08948ae47a2b8557a304dfe4502f7c5347",
+  "canonical_source_commit": "fd65ac08948ae47a2b8557a304dfe4502f7c5347",
+  "canonical_plugin_blob": "8d28af85ce0a995d323307b5096c5b778484f607",
+  "canonical_source_sha256": "6522397b6fca68eab077e3ff9d51e60fcc8fdf121a2d071d5236707a77089e16",
+  "canonical_source_file": "H3.plugins.rs.txt",
+  "historical_inputs_are_not_deployment_proof": true,
+  "canonical": [
+    {
+      "id": "metadata.duration-badge",
+      "version": "1.0.0",
+      "artifact_digest": "e1a0375faf6224d349a4e34753cb316cc36c51784c3317730d301a526d572674"
+    },
+    {
+      "id": "metadata.duration-badge",
+      "version": "1.1.0",
+      "artifact_digest": "68d99aa06af5314143bd35da49fc781ba0ddc0a5fc3b0812636b5774bea37532"
+    },
+    {
+      "id": "metadata.title-label",
+      "version": "1.0.0",
+      "artifact_digest": "17328d7f21af07f28fd0a0596fb5174bec7c90cdb93d65b9d3ab52dae2a0ff63"
+    },
+    {
+      "id": "metadata.title-label",
+      "version": "1.1.0",
+      "artifact_digest": "ac5972556afc0dd927683b49097336e9a42078755313591682e384e9d74a29bb"
+    }
+  ],
+  "sources": [
+    {
+      "name": "H1",
+      "source_commit": "64ea86a009905bc0256baa5287bd82671b55b88c",
+      "git_blob": "7c6e6620e80a799d80597f66a8ccce534e24fd87",
+      "file": "H1.plugins.rs.txt",
+      "lf_bytes": 15984,
+      "lf_sha256": "8f5904ed46c00dc442c8988a4df2b549d808f7aed0c414158284dcd67103c492",
+      "crlf_sha256": "9664dc5b284187f564a1b28b10b36f5e80b6fd65734080e75110da23853ad366"
+    },
+    {
+      "name": "H2",
+      "source_commit": "bc0f9f1d8683ee27be581661d0e9dde36088fe55",
+      "git_blob": "8373c780780c3d50ee9f7a12adb3f17f45135ca0",
+      "file": "H2.plugins.rs.txt",
+      "lf_bytes": 18687,
+      "lf_sha256": "a7fe2931bc41222837dd6e76e8bd549ae3c58f5762ccd2a9baff36327e41e2c3",
+      "crlf_sha256": "5152968651c788520197da51211b387f1669e9d058c4dc7770dd701b94a6e01e"
+    },
+    {
+      "name": "H3",
+      "source_commit": "6bc9fd2759dcf4bd2c7279a09cae0ffa3742047b",
+      "git_blob": "8d28af85ce0a995d323307b5096c5b778484f607",
+      "file": "H3.plugins.rs.txt",
+      "lf_bytes": 19190,
+      "lf_sha256": "6522397b6fca68eab077e3ff9d51e60fcc8fdf121a2d071d5236707a77089e16",
+      "crlf_sha256": "876b11f9b81b76bd46a6a0b4c2a6148e5c83ffdce40224455fb9b3b97d39e34c"
+    }
+  ],
+  "aliases": [
+    {
+      "source": "H1",
+      "line_ending": "LF",
+      "id": "metadata.duration-badge",
+      "version": "1.0.0",
+      "artifact_digest": "b98212889d3c0a234741b228092e423746ec3f2f0464b13bba1e0766d9bd0a2b"
+    },
+    {
+      "source": "H1",
+      "line_ending": "LF",
+      "id": "metadata.duration-badge",
+      "version": "1.1.0",
+      "artifact_digest": "51ccfb81a72ab10635849b106eb8e12d7c90a3e2bf9a71cc936f1cf0b355ddf3"
+    },
+    {
+      "source": "H1",
+      "line_ending": "LF",
+      "id": "metadata.title-label",
+      "version": "1.0.0",
+      "artifact_digest": "3aa96eedae16147b793e55158bc096fb155996ed11e7c9dd6e0461e18395d4a1"
+    },
+    {
+      "source": "H1",
+      "line_ending": "LF",
+      "id": "metadata.title-label",
+      "version": "1.1.0",
+      "artifact_digest": "7d5c608fdbe43f12cc274b74be95815ac155ea5835d33bd2336652dcf94103c6"
+    },
+    {
+      "source": "H1",
+      "line_ending": "CRLF",
+      "id": "metadata.duration-badge",
+      "version": "1.0.0",
+      "artifact_digest": "042269184f9a2aadc034db3737209e9140d31e109e60ba97f4270c6f8c1e5402"
+    },
+    {
+      "source": "H1",
+      "line_ending": "CRLF",
+      "id": "metadata.duration-badge",
+      "version": "1.1.0",
+      "artifact_digest": "94fb0daa214e3da44890c0465ecc057d69541b10f35e4a6fc2381c108a8ffe75"
+    },
+    {
+      "source": "H1",
+      "line_ending": "CRLF",
+      "id": "metadata.title-label",
+      "version": "1.0.0",
+      "artifact_digest": "70aa65b8469e9288c5c1a736ea3456475609582e91189a8f73904a6940f8d837"
+    },
+    {
+      "source": "H1",
+      "line_ending": "CRLF",
+      "id": "metadata.title-label",
+      "version": "1.1.0",
+      "artifact_digest": "70f9de42f5c5e6eb3a5a61957fe51f1573d96ab68ab684ec29d9ecad1cd451d6"
+    },
+    {
+      "source": "H2",
+      "line_ending": "LF",
+      "id": "metadata.duration-badge",
+      "version": "1.0.0",
+      "artifact_digest": "e3119aa83b547fe3b8e0b09d369dd6e53f426e3e582edf0cbc663a449a46286c"
+    },
+    {
+      "source": "H2",
+      "line_ending": "LF",
+      "id": "metadata.duration-badge",
+      "version": "1.1.0",
+      "artifact_digest": "7b6f5a559b241edd99b798a60cc2eb476b6b0cc1dac69ddaa3e6a3b3e3932302"
+    },
+    {
+      "source": "H2",
+      "line_ending": "LF",
+      "id": "metadata.title-label",
+      "version": "1.0.0",
+      "artifact_digest": "086b9729963ee2584e8f5db03445cf5662674dbf6eee3d07c6e143c20d17a39a"
+    },
+    {
+      "source": "H2",
+      "line_ending": "LF",
+      "id": "metadata.title-label",
+      "version": "1.1.0",
+      "artifact_digest": "e7c4d4f3d70cc615c15eb5a44dfe19ef37d99fafd848a79fd25b9cee17190582"
+    },
+    {
+      "source": "H2",
+      "line_ending": "CRLF",
+      "id": "metadata.duration-badge",
+      "version": "1.0.0",
+      "artifact_digest": "2a66827139e298f41b94f7c641cf15f55da755e1b3399dfae19d0756a999d951"
+    },
+    {
+      "source": "H2",
+      "line_ending": "CRLF",
+      "id": "metadata.duration-badge",
+      "version": "1.1.0",
+      "artifact_digest": "15642b560934d9a93ac57fa2b719eeedab0caca4d68edc9fa0693dc8499f5b32"
+    },
+    {
+      "source": "H2",
+      "line_ending": "CRLF",
+      "id": "metadata.title-label",
+      "version": "1.0.0",
+      "artifact_digest": "954c8ddfc1218b6fd6ce709e03f23af5e489d7eeb8a5f59770e3be757a070de1"
+    },
+    {
+      "source": "H2",
+      "line_ending": "CRLF",
+      "id": "metadata.title-label",
+      "version": "1.1.0",
+      "artifact_digest": "6bcae614ab79d946a540e4ba07784b624874679d9cf1c354da266f191e1de257"
+    },
+    {
+      "source": "H3",
+      "line_ending": "LF",
+      "id": "metadata.duration-badge",
+      "version": "1.0.0",
+      "artifact_digest": "e1a0375faf6224d349a4e34753cb316cc36c51784c3317730d301a526d572674"
+    },
+    {
+      "source": "H3",
+      "line_ending": "LF",
+      "id": "metadata.duration-badge",
+      "version": "1.1.0",
+      "artifact_digest": "68d99aa06af5314143bd35da49fc781ba0ddc0a5fc3b0812636b5774bea37532"
+    },
+    {
+      "source": "H3",
+      "line_ending": "LF",
+      "id": "metadata.title-label",
+      "version": "1.0.0",
+      "artifact_digest": "17328d7f21af07f28fd0a0596fb5174bec7c90cdb93d65b9d3ab52dae2a0ff63"
+    },
+    {
+      "source": "H3",
+      "line_ending": "LF",
+      "id": "metadata.title-label",
+      "version": "1.1.0",
+      "artifact_digest": "ac5972556afc0dd927683b49097336e9a42078755313591682e384e9d74a29bb"
+    },
+    {
+      "source": "H3",
+      "line_ending": "CRLF",
+      "id": "metadata.duration-badge",
+      "version": "1.0.0",
+      "artifact_digest": "3441af37913e885c5ddb6bd7dbc7414abb8df2636ac4de25583100ee8f528b4f"
+    },
+    {
+      "source": "H3",
+      "line_ending": "CRLF",
+      "id": "metadata.duration-badge",
+      "version": "1.1.0",
+      "artifact_digest": "54ca42ed9200722642f52568628c635d70ab0e8d9a06d3025ca29a9481750fee"
+    },
+    {
+      "source": "H3",
+      "line_ending": "CRLF",
+      "id": "metadata.title-label",
+      "version": "1.0.0",
+      "artifact_digest": "7fb2e08b5877923809b9242bb464af63f4e66cf1cec6d6c2433adf375511401b"
+    },
+    {
+      "source": "H3",
+      "line_ending": "CRLF",
+      "id": "metadata.title-label",
+      "version": "1.1.0",
+      "artifact_digest": "256b1513b1d75ce45a2f22cdcc098f5b56ecd19d386285b30c9eddf48b913de2"
+    }
+  ],
+  "retained_assertion_revisions": [
+    {
+      "path": "tests/plugin-configuration-migration.mjs",
+      "before_sha256": "38e500b95fe0f60460af1a9542dc9e71acd49faa2db9c5e984790452cade00a9",
+      "after_sha256": "544ee19baa9993afdcee7f013a13374491a12acbd6ddcf5dff438fb4b29d008c",
+      "reason": "Approved test-only finishOwnedFixture cleanup receipt patch; all original SQL, assertions and success text retained byte-for-byte.",
+      "source_review": {
+        "path": "/workspace/shared/refactor-evidence/review/plugin-migration-cleanup-source-review.json",
+        "sha256": "38e7a99a3aaee92d90af156b340787acf76d792a4f989ed7c501e0796f4d9f12",
+        "bytes": 3226
+      },
+      "cleanup_patch": {
+        "path": "/workspace/shared/refactor-evidence/combined-backend-proposal-20261009T0715/plugin-migration-cleanup.proposed.patch",
+        "sha256": "ce3fe32ad80e1aab641d177ffe03244e99795e85ce384b3cfd70368df1d84bb6",
+        "bytes": 1388
+      },
+      "runtime_requirement": "Same-run original command exit0 and PG-only fixture-cleanup.json both required; no historical runtime acceptance.",
+      "whole_original_try_body_sha256": "80b9ef0a916afbb5bb2d60db0a8c1af79b517c2c093d3326948766f17656a52d",
+      "body_slice": "From literal try { through the final success console.log and newline, excluding the closing brace before finally/catch."
+    }
+  ],
+  "retained_assertion_sources": {
+    "tests/plugin-configuration-runtime.mjs": "2c1379d61a0e7ae781d887511a08ca3826b0aca5abc9da29a4dccbe7e40bbf2d",
+    "tests/plugin-configuration-migration.mjs": "544ee19baa9993afdcee7f013a13374491a12acbd6ddcf5dff438fb4b29d008c",
+    "tests/plugin-configuration-lifecycle.test.ts": "58453399dc47940ded3651abfa85de9948bdc6040841fb6d16248b812abdd98b",
+    "tests/timeline-plugin-runtime.mjs": "4b0ff2152c32781955029418ccfb109c915060714ba5375539899adce2b0dced",
+    "tests/remaining-library-lifecycle.mjs": "d29c004b180e5713b0a057cd4059cbafa54a14056c6060519b7f9e236ace6fc8",
+    "tests/browser/plugin-configuration.spec.ts": "837b2f8b0b2ac36ae8ad4f939829337b5bc083055904db22742c4dfe2be842ce",
+    "tests/admin-mutation-receipts.test.ts": "d4e7ffc2a527efee4d4288fa310ce2a1026804e02fd236c9c17d2dc839518511",
+    "tests/admin-management-feedback.test.ts": "216256790c46d36e203bcdda5d094c772467927441345f2652348b88423a1491",
+    "tests/fixtures/server.mjs": "fb85078ffe5e462c175905692b60f07b26947c4b653ae079fa5766a5fdc61c94",
+    "tests/fixtures/postgres.mjs": "5ec210ab8dfbf2fb8de7e24b5fdf1c473d563805f05de1e80363704bd666e636",
+    "deploy/owned-process.mjs": "3ba8009299af5991e211444981b7566c36055d1b6673e560e4f3632a1205339b",
+    "migrations/0073_declarative_plugins.sql": "2e7d74521caf2d0387e87f365a9e1d7a12248a334c97e82e1d0758e0c50cf39a",
+    "migrations/0084_declarative_plugin_removal.sql": "5ae3ab6215bd112832b9fed37dc019d8a68fbc03560d3c1c5119d17ef2508d91"
+  },
+  "existing_plugins_rust_tests_sha256": "784291e59407156681e78a3a2d5ebf09e3cb14ec9ddda51f7418ba3b7db4004c"
+}

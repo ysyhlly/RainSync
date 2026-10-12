@@ -3,7 +3,43 @@ import {
   validNativeLiveBinding,
   validNativeLiveDeliveryUrl,
 } from "./native-live";
-import type { PlaybackPlan } from "../../../../../packages/protocol";
+import type { DeepReadonly } from "vue";
+import type {
+  PlaybackPlan,
+  NativePlatformPlaybackBinding,
+  NativePlatformLiveBinding,
+  NativePlatformCompatibilityBinding,
+  NativePlatformCompatibilityOutput,
+} from "../../../../../packages/protocol";
+
+/** Readonly view of the original grant. Do not clone or normalize it: existing
+ * URL/live validation must still inspect the original runtime values. */
+export type PlatformTextGrant = Readonly<
+  Pick<
+    PlaybackPlan,
+    | "session_id"
+    | "media_id"
+    | "media_generation"
+    | "playback_url"
+    | "transport"
+    | "delivery_mode"
+    | "rebuild_on_seek"
+    | "timeline_origin_ms"
+  >
+> & {
+  readonly native_platform?: Readonly<
+    Pick<NativePlatformPlaybackBinding, "provider" | "credential_mode">
+  > & {
+    readonly live?: Readonly<NativePlatformLiveBinding>;
+    readonly compatibility?: Readonly<
+      Pick<NativePlatformCompatibilityBinding, "mode">
+    > & {
+      readonly output?: Readonly<
+        Pick<NativePlatformCompatibilityOutput, "attempt">
+      >;
+    };
+  };
+};
 export type PlatformTextStatus =
   | "idle"
   | "loading"
@@ -62,7 +98,7 @@ const availability = (value: unknown): value is PlatformTextStatus =>
 /** Never derive a fetch URL from upstream metadata. The exact same-origin
  * immutable grant supplies the session and opaque token only. */
 export function platformTextBase(
-  plan: PlaybackPlan,
+  plan: PlatformTextGrant,
   origin: string,
 ): string | undefined {
   try {
@@ -129,7 +165,7 @@ export function platformTextBase(
 /** Other live providers may expose decoder-observed in-band captions while
  * their remote subtitle/chat API remains unsupported. Validate the exact grant
  * before observing any text; do not synthesize a server text endpoint. */
-export function platformInbandLive(plan: PlaybackPlan, origin: string) {
+export function platformInbandLive(plan: PlatformTextGrant, origin: string) {
   try {
     const live = plan.native_platform?.live;
     if (
@@ -440,7 +476,7 @@ export function parsePlatformVtt(
   });
 }
 export function visiblePlatformDanmaku(
-  cues: readonly PlatformDanmakuCue[],
+  cues: DeepReadonly<PlatformDanmakuCue[]>,
   timeMs: number,
 ) {
   if (!Number.isFinite(timeMs) || timeMs < 0) return [];

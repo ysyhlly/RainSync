@@ -879,7 +879,7 @@ pub(crate) async fn response(
 /// finite capture and the exact currently owned job; UUID/marker alone is not a
 /// recipe capability. Ordinary owned HTTP jobs keep their existing argv.
 pub(crate) async fn constrain_finite_job(
-    app: &App,
+    db: &PgPool,
     claim: &persistence::media_jobs::Claim,
     args: &mut Vec<String>,
 ) -> anyhow::Result<()> {
@@ -887,7 +887,7 @@ pub(crate) async fn constrain_finite_job(
         return Ok(());
     }
     let row=sqlx::query("SELECT h.finite_hls_version,h.finite_hls_evidence,h.runtime_id FROM owned_http_representations h JOIN media_jobs j ON j.session_id=h.session_id WHERE j.id=$1 AND j.owner_id=$2 AND j.attempt=$3 AND j.status='running' AND h.state='ready' AND j.spec=h.frozen_spec AND owned_http_job_allowed(j.id)")
-        .bind(claim.id).bind(claim.owner).bind(claim.attempt).fetch_optional(&app.db).await?.ok_or_else(||anyhow::anyhow!("owned_http_original_job_required"))?;
+        .bind(claim.id).bind(claim.owner).bind(claim.attempt).fetch_optional(db).await?.ok_or_else(||anyhow::anyhow!("owned_http_original_job_required"))?;
     if row.get::<Option<i16>, _>("finite_hls_version").is_none() {
         return Ok(());
     }

@@ -371,6 +371,7 @@ try {
       [
         "migrations/0079_room_creation_idempotency.sql",
         "apps/server/src/rooms.rs",
+        "apps/server/src/room_directory_operations.rs",
         "apps/web/src/features/rooms/room-creation.ts",
         "tests/room-creation-idempotency.mjs",
       ].map(async (path) => ({

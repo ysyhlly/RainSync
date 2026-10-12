@@ -4,6 +4,7 @@ use super::*;
 use axum::http::HeaderValue;
 use providers::platform::oauth::{self as provider, Config, Provider, QrState, Tokens, Transport};
 use sha2::{Digest, Sha256};
+mod account_operations;
 const ACCOUNT: &str = "SELECT *,floor(extract(epoch FROM access_expires_at)*1000)::bigint AS access_ms,floor(extract(epoch FROM refresh_expires_at)*1000)::bigint AS refresh_ms,floor(extract(epoch FROM next_refresh_at)*1000)::bigint AS next_refresh_ms,access_expires_at>clock_timestamp() AS access_live,refresh_expires_at>clock_timestamp() AS refresh_live FROM platform_oauth_accounts WHERE user_id=$1 AND provider=$2";
 const REQUEST: &str = "SELECT *,floor(extract(epoch FROM expires_at)*1000)::bigint AS expires_ms,floor(extract(epoch FROM next_poll_at)*1000)::bigint AS poll_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms,expires_at>clock_timestamp() AS live,COALESCE(operation_expires_at>clock_timestamp(),false) AS operation_live,next_poll_at<=clock_timestamp() AS poll_ready FROM platform_oauth_requests WHERE id=$1";
 fn parse_provider(value: &str) -> Result<Provider> {
@@ -132,26 +133,6 @@ async fn terminal(tx: &mut Transaction<'_, Postgres>, id: Uuid, state: &str) -> 
     super::maintenance::phase(sqlx::query("UPDATE platform_oauth_requests SET status=$2,secret_encrypted=NULL,operation_nonce=NULL,operation_expires_at=NULL,updated_at=clock_timestamp() WHERE id=$1 AND status='pending'").bind(id).bind(state).execute(&mut **tx)).await?;
     Ok(())
 }
-fn status_value(app: &App, p: Provider, row: Option<&PgRow>, login: &str) -> Value {
-    let config = app.platform_oauth.config(p);
-    let connected = row.is_some_and(|r| {
-        r.get::<String, _>("state") == "connected"
-            && r.get::<Option<bool>, _>("access_live") == Some(true)
-            && config.is_some_and(|c| {
-                r.get::<Option<String>, _>("config_binding").as_deref() == Some(c.binding())
-            })
-    });
-    let renewal_owned = row.is_some_and(|r| {
-        r.get::<Option<String>, _>("consent_login_hash").as_deref() == Some(login)
-    });
-    json!({"provider":p.name(),"id":row.map(|r|r.get::<Uuid,_>("id")),"revision":row.map(|r|r.get::<i64,_>("revision").to_string()),
-        "state":if connected{"connected"}else if row.is_some_and(|r|r.get::<String,_>("state")!="revoked"){"expired"}else{"revoked"},
-        "available":config.is_some(),"missing_prerequisites":app.platform_oauth.missing(p),"authorization_kind":"official_oauth","playback_session":false,
-        "authorization_mode":if config.is_some_and(Config::qr_enabled){"qr"}else{"web"},"scopes":row.map(|r|r.get::<Vec<String>,_>("granted_scopes")).unwrap_or_default(),
-        "access_expires_at":row.and_then(|r|r.get::<Option<i64>,_>("access_ms")),"refresh_expires_at":row.and_then(|r|r.get::<Option<i64>,_>("refresh_ms")),
-        "auto_renew":renewal_owned&&row.is_some_and(|r|r.get("auto_renew")),"renewal_state":if renewal_owned{row.map(|r|r.get::<String,_>("renewal_state")).unwrap_or_else(||"disabled".to_owned())}else{"disabled".to_owned()},
-        "next_refresh_at":if renewal_owned{row.and_then(|r|r.get::<Option<i64>,_>("next_refresh_ms"))}else{None}})
-}
 fn login_value(app: &App, row: &PgRow, stage: Option<&str>) -> Result<Value> {
     let pending = row.get::<String, _>("status") == "pending" && row.get::<bool, _>("live");
     let values = if pending && row.get::<Option<String>, _>("secret_encrypted").is_some() {
@@ -170,26 +151,9 @@ pub async fn status(
     Path(raw): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response> {
-    let p = parse_provider(&raw)?;
-    let user = auth(&app, &headers, false).await?;
-    let login = login_hash(&headers)?;
-    let mut tx = super::maintenance::begin(&app).await?;
-    super::maintenance::phase(guard_login(&mut tx, user.id, &login)).await?;
-    // Expired refresh authority is discarded; OAuth and playback rows are separate.
-    super::maintenance::phase(sqlx::query("UPDATE platform_oauth_accounts SET state='expired',token_encrypted=NULL,auto_renew=false,consent_login_hash=NULL,renewal_state='reauthorization_required',operation_nonce=NULL,operation_expires_at=NULL,revision=revision+1 WHERE user_id=$1 AND provider=$2 AND token_encrypted IS NOT NULL AND config_binding IS DISTINCT FROM $3")
-        .bind(user.id).bind(p.name()).bind(app.platform_oauth.config(p).map(Config::binding)).execute(&mut *tx)).await?;
-    super::maintenance::phase(sqlx::query("UPDATE platform_oauth_accounts SET state='expired',token_encrypted=NULL,auto_renew=false,consent_login_hash=NULL,renewal_state='reauthorization_required',operation_nonce=NULL,operation_expires_at=NULL,revision=revision+1,updated_at=clock_timestamp() WHERE user_id=$1 AND provider=$2 AND token_encrypted IS NOT NULL AND refresh_expires_at<=clock_timestamp()")
-        .bind(user.id).bind(p.name()).execute(&mut *tx)).await?;
-    let row = super::maintenance::phase(
-        sqlx::query(ACCOUNT)
-            .bind(user.id)
-            .bind(p.name())
-            .fetch_optional(&mut *tx),
-    )
-    .await?;
-    super::maintenance::phase(guard_login_live(&mut tx, user.id, &login)).await?;
-    let value = status_value(&app, p, row.as_ref(), &login);
-    super::maintenance::commit(tx).await?;
+    let value =
+        account_operations::status(app.identity_context(), &app.platform_oauth, raw, headers)
+            .await?;
     Ok(responses::private_json(StatusCode::OK, value))
 }
 #[derive(Deserialize)]
@@ -844,54 +808,19 @@ pub async fn set_renewal(
     headers: HeaderMap,
     Json(body): Json<Preference>,
 ) -> Result<Response> {
-    let p = parse_provider(&raw)?;
-    let user = auth(&app, &headers, true).await?;
-    let login = login_hash(&headers)?;
-    let expected = expected_revision(&body.expected_revision)?;
-    let mut tx = super::maintenance::begin(&app).await?;
-    super::maintenance::phase(guard_login(&mut tx, user.id, &login)).await?;
-    let (account, inserted) = lock_account(&mut tx, user.id, p).await?;
-    let s = scope(&account);
-    if !revision_matches(expected, s.revision, inserted) {
-        return Err(err(StatusCode::CONFLICT, "platform_account_changed"));
-    }
-    if body.enabled {
-        return Err(err(
-            StatusCode::CONFLICT,
-            "platform_renewal_new_consented_oauth_required",
-        ));
-    }
-    let next = AccountScope {
-        revision: s.revision.checked_add(1).ok_or_else(credential_error)?,
-        ..s
-    };
-    let cipher = if let Some(old) = account.get::<Option<String>, _>("token_encrypted") {
-        let binding = account
-            .get::<Option<String>, _>("config_binding")
-            .ok_or_else(credential_error)?;
-        let t = token_from(
-            s,
-            p,
-            &binding,
-            app.decrypt(&old).map_err(|_| credential_error())?,
-        )?;
-        Some(
-            app.encrypt(&token_envelope(next, p, &binding, &t))
-                .map_err(|_| credential_error())?,
-        )
-    } else {
-        None
-    };
-    super::maintenance::phase(sqlx::query("UPDATE platform_oauth_accounts SET auto_renew=false,consent_login_hash=NULL,renewal_state='disabled',operation_nonce=NULL,operation_expires_at=NULL,next_refresh_at=NULL,token_encrypted=$2,revision=$3 WHERE id=$1").bind(s.account_id).bind(cipher).bind(next.revision).execute(&mut *tx)).await?;
-    let row = super::maintenance::phase(
-        sqlx::query(ACCOUNT)
-            .bind(user.id)
-            .bind(p.name())
-            .fetch_one(&mut *tx),
+    let key = app.key.as_ref();
+    let decrypt = |value: &str| crate::decrypt_value(key, value);
+    let encrypt = |value: &Value| crate::encrypt_value(key, value);
+    let value = account_operations::set_renewal(
+        app.identity_context(),
+        &app.platform_oauth,
+        &decrypt,
+        &encrypt,
+        raw,
+        headers,
+        body,
     )
     .await?;
-    let value = status_value(&app, p, Some(&row), &login);
-    super::maintenance::commit(tx).await?;
     Ok(responses::private_json(StatusCode::OK, value))
 }
 pub async fn unlink(
@@ -900,30 +829,14 @@ pub async fn unlink(
     headers: HeaderMap,
     Json(body): Json<UnlinkCredential>,
 ) -> Result<Response> {
-    let p = parse_provider(&raw)?;
-    let user = auth(&app, &headers, true).await?;
-    let login = login_hash(&headers)?;
-    let expected = expected_revision(&body.expected_revision)?;
-    let mut tx = super::maintenance::begin(&app).await?;
-    super::maintenance::phase(guard_login(&mut tx, user.id, &login)).await?;
-    let (account, inserted) = lock_account(&mut tx, user.id, p).await?;
-    let s = scope(&account);
-    if !revision_matches(expected, s.revision, inserted) {
-        return Err(err(StatusCode::CONFLICT, "platform_account_changed"));
-    }
-    super::maintenance::phase(sqlx::query("UPDATE platform_oauth_accounts SET state='revoked',token_encrypted=NULL,auto_renew=false,consent_login_hash=NULL,renewal_state='disabled',operation_nonce=NULL,operation_expires_at=NULL,next_refresh_at=NULL,revision=revision+1,granted_scopes='{}',access_expires_at=NULL,refresh_expires_at=NULL,config_binding=NULL WHERE id=$1")
-        .bind(s.account_id).execute(&mut *tx)).await?;
-    super::maintenance::phase(sqlx::query("UPDATE platform_oauth_requests SET status='failed',secret_encrypted=NULL,operation_nonce=NULL,operation_expires_at=NULL WHERE account_id=$1 AND status='pending'").bind(s.account_id).execute(&mut *tx)).await?;
-    super::maintenance::phase(guard_login_live(&mut tx, user.id, &login)).await?;
-    let row = super::maintenance::phase(
-        sqlx::query(ACCOUNT)
-            .bind(user.id)
-            .bind(p.name())
-            .fetch_one(&mut *tx),
+    let value = account_operations::unlink(
+        app.identity_context(),
+        &app.platform_oauth,
+        raw,
+        headers,
+        body,
     )
     .await?;
-    let value = status_value(&app, p, Some(&row), &login);
-    super::maintenance::commit(tx).await?;
     Ok(responses::private_json(StatusCode::OK, value))
 }
 /// Bounded background pass; opt-in, originating login, configuration, exact
