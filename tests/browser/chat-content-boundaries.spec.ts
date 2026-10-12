@@ -288,9 +288,9 @@ test("older timeline pages remain reachable beyond 2000 while live polling leave
     panel.getByRole("button", { name: "加载更早评论", exact: true }),
   ).toHaveCount(0);
   rows.push(timelineMessage(2101));
-  await expect(panel.getByRole("status")).toContainText("有新评论", {
-    timeout: 15000,
-  });
+  await expect(
+    panel.getByRole("status").filter({ hasText: "有新评论" }),
+  ).toContainText("有新评论", { timeout: 15000 });
   await expect(log.locator("article").first()).toContainText("时间轴记录 0");
   await expect(log).not.toContainText("时间轴记录 2101");
   await panel

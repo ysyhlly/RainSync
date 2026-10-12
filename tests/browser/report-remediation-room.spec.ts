@@ -494,6 +494,7 @@ for (const width of [560, 600, 630])
 test("L9: defaults give queue the player width and shorter members while saved custom geometry survives reload", async ({
   page,
 }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
   const app = await roomFixture(page);
   await enter(page);
   expect((await geometry(widget(page, "player"))).w).toBe(18);
@@ -523,6 +524,23 @@ test("L9: defaults give queue the player width and shorter members while saved c
     customWidth,
     0,
   );
+  expect(app.errors).toEqual([]);
+});
+test("L9: narrow defaults stay single-column with their own member height", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const app = await roomFixture(page);
+  await enter(page);
+  expect((await geometry(widget(page, "player"))).w).toBe(1);
+  expect((await geometry(widget(page, "queue"))).w).toBe(1);
+  expect((await geometry(widget(page, "members"))).h).toBe(20);
+  const playerBox = await widget(page, "player").boundingBox();
+  const queueBox = await widget(page, "queue").boundingBox();
+  expect(queueBox!.width).toBeCloseTo(playerBox!.width, 0);
+  expect(queueBox!.x).toBeCloseTo(playerBox!.x, 0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth))
+    .toBeLessThanOrEqual(1);
   expect(app.errors).toEqual([]);
 });
 test("L13: guest access shares drawer presentation and has its own accessible close name", async ({

@@ -235,14 +235,16 @@ test("M4/L1/L2: empty auth forms use Chinese local errors, preserve logo positio
     "请填写登录账号。",
   );
   await expect(page.getByLabel("登录账号", { exact: true })).toBeFocused();
-  const logoBefore = await page
-    .getByRole("link", { name: "RainSync", exact: true })
-    .boundingBox();
+  const logo = page.getByRole("link", { name: "RainSync", exact: true });
+  const documentY = () => logo.evaluate((element) =>
+    element.getBoundingClientRect().y + window.scrollY,
+  );
+  const logoBefore = await documentY();
   await page.locator("details.guest-entry summary").click();
-  const logoAfter = await page
-    .getByRole("link", { name: "RainSync", exact: true })
-    .boundingBox();
-  expect(Math.abs(logoBefore!.y - logoAfter!.y)).toBeLessThan(1);
+  // Native focus/scrolling may move the viewport; it must not move the logo
+  // in the document layout when the later guest disclosure expands.
+  await expect.poll(async () => Math.abs(logoBefore - await documentY()))
+    .toBeLessThan(1);
   await expect(page.locator(".guest-chevron")).toBeVisible();
   await page
     .getByRole("button", { name: "作为受限访客进入", exact: true })

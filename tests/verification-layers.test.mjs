@@ -132,6 +132,15 @@ test('actual checks shell accepts only four successful layers with Actions fail-
       assert.equal(result.status === 0, values.every(value => value === 'success'), values.join('/'));
     }
 });
+// The only conditional in the independent browser job may retain evidence;
+// all executable validation steps must remain unconditional and fail closed.
+const browserFailureArtifactStep = "      - name: Retain mock-browser failure screenshots and DOM context\n        if: failure()\n        uses: actions/upload-artifact@v4\n        with:\n          name: browser-mock-failure-${{ github.sha }}-${{ github.run_attempt }}\n          # Mock-browser fixtures use synthetic data. Do not upload traces,\n          # browser storage, network captures, or the entire results directory.\n          path: |\n            ${{ runner.temp }}/rainsync-browser-mock/playwright-results/**/test-failed-*.png\n            ${{ runner.temp }}/rainsync-browser-mock/playwright-results/**/error-context.md\n          if-no-files-found: warn\n          retention-days: 7\n";
+function browserGateWithoutEvidence(job) {
+  assert.equal(job.split(browserFailureArtifactStep).length, 2, 'one exact safe evidence step');
+  const gate = job.replace(browserFailureArtifactStep, '');
+  assert.doesNotMatch(gate, /(?:needs|if|continue-on-error|paths-ignore|paths|strategy):/);
+  return gate;
+}
 test('frontend and mock-browser gates move exactly once into independent strict jobs', async () => {
   const workflow = await fs.readFile(resolve(repo, '.github/workflows/ci.yml'), 'utf8');
   const frontend = workflowJob(workflow, 'frontend-checks'), browser = workflowJob(workflow, 'browser-mock');
@@ -146,7 +155,7 @@ test('frontend and mock-browser gates move exactly once into independent strict 
     assert.equal(commands.filter(value => value === command).length, 1, `one gate: ${command}`);
     assert.ok(runScripts(job).some(script => script.split(' && ').includes(command)), `owner: ${command}`);
   }
-  for (const job of [frontend, browser]) {
+  for (const job of [frontend, browserGateWithoutEvidence(browser)]) {
     assert.match(job, /^    runs-on: ubuntu-latest$/m);
     assert.match(job, /uses: actions\/checkout@v4/);
     assert.match(job, /uses: actions\/setup-node@v4\n        with:\n          node-version: 24\n          cache: npm/);
@@ -176,6 +185,18 @@ test('frontend and mock-browser gates move exactly once into independent strict 
   assert.equal(runScripts(workflowJob(workflow, 'owner-gates')).filter(command => command === 'npm ci').length, 1);
   assert.equal(commands.filter(command => command === 'npm ci').length, 4);
   assert.equal(commands.filter(command => command === 'npx playwright install --with-deps chromium').length, 2);
+});
+for (const [name, mutate] of [
+  ['conditional test skip', job => job.replace('      - run: npm ci', '      - if: false\n        run: npm ci')],
+  ['continued test failure', job => job.replace('      - run: npm ci', '      - continue-on-error: true\n        run: npm ci')],
+  ['broad artifact upload', job => job.replace('playwright-results/**/test-failed-*.png', 'playwright-results/**')],
+  ['different evidence condition', job => job.replace('        if: failure()', '        if: false')],
+]) test(`browser evidence exception rejects ${name}`, async () => {
+  const workflow = await fs.readFile(resolve(repo, '.github/workflows/ci.yml'), 'utf8');
+  const browser = workflowJob(workflow, 'browser-mock');
+  const changed = mutate(browser);
+  assert.notEqual(changed, browser, 'mutation must target the real job');
+  assert.throws(() => browserGateWithoutEvidence(changed), assert.AssertionError);
 });
 test('routing owns each new entry once and leaves owner and unrelated native chains independent', async () => {
   const workflow = await fs.readFile(resolve(repo, '.github/workflows/ci.yml'), 'utf8');

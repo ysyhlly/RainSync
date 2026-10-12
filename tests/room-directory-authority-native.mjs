@@ -564,13 +564,13 @@ await nativeOwnerGate(
           "blank_name",
           () => post(actor.client, " \n\t ", randomUUID()),
           400,
-          "INVALID_REQUEST",
+          "INVALID_NAME",
         ],
         [
           "unicode_121",
           () => post(actor.client, "界".repeat(121), randomUUID()),
           400,
-          "INVALID_REQUEST",
+          "INVALID_NAME",
         ],
         [
           "untrimmed_payload_conflict",

@@ -231,3 +231,25 @@ test("frame failure and both cleanup failures remain observable together", async
   assert.equal(f.socket().terminateCalls, 1);
   assert.equal(f.socket().closeEvents, 0);
 });
+
+// Keep the native oracle aligned with the existing public error mapping.
+// These are source contracts only; they do not execute a database case.
+for (const name of ["blank_name", "unicode_121"]) {
+  test(`directory ${name} expects the public INVALID_NAME code`, () => {
+    const start = source.indexOf(`          "${name}",`);
+    assert.ok(start >= 0);
+    const end = source.indexOf("\n        ],", start);
+    assert.ok(end > start);
+    const entry = source.slice(start, end);
+    assert.match(entry, /400,\s*"INVALID_NAME"/);
+    assert.doesNotMatch(entry, /"INVALID_REQUEST"/);
+    const production = readFileSync(
+      new URL("../apps/server/src/room_directory_operations.rs", import.meta.url), "utf8",
+    );
+    assert.match(production, /"invalid_name"/);
+    const errors = readFileSync(
+      new URL("../crates/protocol/src/errors.rs", import.meta.url), "utf8",
+    );
+    assert.match(errors, /InvalidName/);
+  });
+}

@@ -467,8 +467,9 @@ try {
     await until(
       () =>
         prepares.length === 2 &&
-        runtime.sessionId.value === prepares[1].response.session_id,
-      "automatic decode fallback rebind",
+        runtime.sessionId.value === prepares[1].response.session_id &&
+        !runtime.playbackBusy.value,
+      "automatic decode fallback source attachment",
       15000,
     );
     const fallback = prepares[1];
@@ -491,6 +492,8 @@ try {
       ),
     );
     assert.notEqual(fallback.response.session_id, original.response.session_id);
+    assert.equal(runtime.playbackError.value, "", "fallback must attach without an error");
+    assert.equal(video.el.src, fallback.response.playback_url, "fallback source is attached");
     video.frame();
     await until(
       () =>

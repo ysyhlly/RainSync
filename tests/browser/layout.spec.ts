@@ -140,7 +140,10 @@ test("beige semantic text contrast, keyboard focus and reduced motion are measur
   page,
 }) => {
   await setup(page);
+  // Pin the beige palette without moving focus before the keyboard checks.
+  await page.addInitScript(() => localStorage.setItem("rainsync.theme", "light"));
   await page.goto(appBase + "/rooms");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   await expect(
     page.getByRole("heading", { name: "放映室", exact: true }),
   ).toBeVisible();

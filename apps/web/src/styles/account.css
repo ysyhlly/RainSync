@@ -202,7 +202,8 @@
 }
 @media (max-width: 767px) {
   .registration-page {
-    padding-top: 24px;
+    /* Reserve the public theme selector's own row above the auth links. */
+    padding-top: 72px;
     gap: 24px;
   }
   .registration-panel {

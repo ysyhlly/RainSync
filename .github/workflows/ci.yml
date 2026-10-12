@@ -164,6 +164,18 @@ jobs:
       - run: npx playwright install --with-deps chromium && npm run test:e2e
       - name: Verify independent browser measurement driver
         run: RAINSYNC_PLAYWRIGHT_MODULE="$PWD/node_modules/@playwright/test/index.mjs" node --test tests/acceptance-browser.test.mjs
+      - name: Retain mock-browser failure screenshots and DOM context
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-mock-failure-${{ github.sha }}-${{ github.run_attempt }}
+          # Mock-browser fixtures use synthetic data. Do not upload traces,
+          # browser storage, network captures, or the entire results directory.
+          path: |
+            ${{ runner.temp }}/rainsync-browser-mock/playwright-results/**/test-failed-*.png
+            ${{ runner.temp }}/rainsync-browser-mock/playwright-results/**/error-context.md
+          if-no-files-found: warn
+          retention-days: 7
 
   upgrade-recovery:
     runs-on: ubuntu-latest
@@ -355,6 +367,7 @@ jobs:
           # No fixture request documents, databases, credentials or raw logs.
           path: |
             ${{ runner.temp }}/rainsync-owner-validation/artifacts/owner-gates/**/report.json
+            ${{ runner.temp }}/rainsync-owner-validation/artifacts/compute-finish-owner/**/report.json
             ${{ runner.temp }}/rainsync-owner-validation/artifacts/**/fixture-cleanup.json
             ${{ runner.temp }}/rainsync-owner-validation/artifacts/source-change-commit/**/report.json
             ${{ runner.temp }}/rainsync-owner-validation/artifacts/compute-retention-native-*/evidence.json

@@ -23,6 +23,8 @@ test("room, library, invitation and settings are usable", async ({
   let controlSocket: WebSocketRoute;
   let connectionCount = 0;
   const commands: Record<string, unknown>[] = [];
+  const roomId = "33333333-3333-4333-8333-333333333333";
+  const invitationToken = "a".repeat(64);
   const firstEpoch = "11111111-1111-4111-8111-111111111111";
   const nextEpoch = "22222222-2222-4222-8222-222222222222";
   const libraryMedia = [
@@ -57,13 +59,13 @@ test("room, library, invitation and settings are usable", async ({
     if (path.endsWith("/auth/me"))
       body = { id: "owner", username: "雨声", admin: true, csrf: "test" };
     else if (path === "/api/v1/rooms")
-      body = [{ id: "room", name: "周末放映室", owner_id: "owner" }];
+      body = [{ id: roomId, name: "周末放映室", owner_id: "owner" }];
     else if (path === "/api/v1/media") body = libraryMedia;
     else if (path.endsWith("/invites"))
       body =
         route.request().method() === "GET"
           ? []
-          : { room_id: "room", token: "invitation-test-token" };
+          : { room_id: roomId, token: invitationToken };
     await route.fulfill({ json: body });
   });
   await page.routeWebSocket("**/api/v1/ws", (ws) => {
@@ -80,7 +82,7 @@ test("room, library, invitation and settings are usable", async ({
               expires_at_ms: Date.now() + 86400000,
             },
             state: {
-              room_id: "room",
+              room_id: roomId,
               revision: 0,
               media_id: null,
               media_generation: 0,
@@ -166,8 +168,8 @@ test("room, library, invitation and settings are usable", async ({
   await roomPanel(page, "待播");
   await page.getByRole("button", { name: "邀请", exact: true }).click();
   await page.getByRole("button", { name: "生成邀请", exact: true }).click();
-  await expect(page.getByLabel("完整房间邀请")).toHaveValue(
-    /invitation-test-token/,
+  await expect(page.getByLabel("可分享的邀请链接", { exact: true })).toHaveValue(
+    new URL(`/invite/${roomId}#token=${invitationToken}`, page.url()).href,
   );
   await page.screenshot({
     path: info.outputPath(`${info.project.name}-room.png`),

@@ -111,7 +111,12 @@ async function retry() {
   }
 }
 watch(
-  () => [r.room?.id, r.room?.lifecycle, r.room?.lifecycle_epoch, session.epoch],
+  [
+    () => r.room?.id,
+    () => r.room?.lifecycle,
+    () => r.room?.lifecycle_epoch,
+    () => session.epoch,
+  ],
   () => {
     reset();
     void refresh();
