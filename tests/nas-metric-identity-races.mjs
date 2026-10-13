@@ -192,13 +192,13 @@ try {
         });
         assert.equal(
           f.sql(
-            "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'nas_metrics_activity_%' OR tgname LIKE 'nas_metrics_replace_%'",
+            "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'nas_metrics_activity_%' OR tgname LIKE 'nas_metrics_replace_%' OR tgname LIKE 'nas_metrics_helper_%'",
           ),
           "0",
         );
         assert.equal(
           f.sql(
-            "SELECT count(*) FROM pg_proc WHERE proname LIKE 'nas_metrics_activity_%' OR proname LIKE 'nas_metrics_replace_%'",
+            "SELECT count(*) FROM pg_proc WHERE proname LIKE 'nas_metrics_activity_%' OR proname LIKE 'nas_metrics_replace_%' OR proname LIKE 'nas_metrics_helper_%'",
           ),
           "0",
         );

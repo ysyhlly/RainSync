@@ -190,27 +190,59 @@ function assertNotStarted(value) {
   assert.equal(value.server_verification_id,null);assert.equal(value.server_verification_owner_epoch,null);
   assert.equal(value.server_verification_started_at,null);assert.equal(value.server_verification_reaped_at,null);
 }
-async function mediaReceipts(path, serverPid, job, generation, requireComplete = true, expectedSegments) {
+async function mediaReceipts(path, serverPid, job, generation, requireComplete = true, expectedSegments, observation) {
   const records = [];
   for (const name of await readdir(path)) if (name.endsWith('.json')) {
     const value = JSON.parse(await readFile(resolve(path, name), 'utf8'));
     if (value.parent_pid === serverPid && value.output_bindings.some(b => b.job_id === job && b.output_generation === generation))
       records.push(value);
   }
+  if (observation) {
+    observation.observed_at = new Date().toISOString();
+    // Persist only the wrapper's proof fields, never arbitrary file content.
+    observation.receipts = records.map(r => Object.fromEntries([
+      'invocation', 'tool', 'wrapper_pid', 'parent_pid', 'child_pid',
+      'spawn_observed', 'close_observed', 'exit_code', 'signal', 'pid_absent',
+      'spawn_error', 'observer_error', 'observer_error_phase', 'observer_error_type',
+      'observer_error_errno', 'child_executable', 'child_executable_sha256',
+      'child_parent_pid', 'child_start_ticks', 'received_signals',
+    ].filter(key => Object.hasOwn(r, key)).map(key => [key, r[key]])));
+    observation.count = records.length;
+    observation.tools = { ffmpeg: records.filter(r => r.tool === 'ffmpeg').length,
+      ffprobe: records.filter(r => r.tool === 'ffprobe').length };
+    observation.expected_count = Number.isInteger(expectedSegments) ? 3 + 2 * expectedSegments : null;
+    observation.wait_reason = 'validating';
+  }
   if (!requireComplete) return records;
-  if (!records.some(r => r.tool === 'ffmpeg') || !records.some(r => r.tool === 'ffprobe')) return null;
+  // A failed early tool can prevent later tools from spawning. Surface that
+  // failure before waiting for the complete set; retain the partial receipts.
+  for (const r of records) {
+    if (r.spawn_error || r.observer_error) {
+      if (observation) observation.wait_reason = 'terminal_observer_error';
+      assert.equal(r.spawn_error, false, 'Real media child spawn failed');
+      assert.equal(r.observer_error, false, 'Real media child observation failed');
+    }
+    if (r.close_observed && (r.exit_code !== 0 || r.signal !== null || r.received_signals.length)) {
+      if (observation) observation.wait_reason = 'terminal_child_failure';
+      assert.equal(r.exit_code, 0, 'Real media child failed');
+      assert.equal(r.signal, null, 'Real media child was signalled');
+      assert.deepEqual(r.received_signals, [], 'Expected natural media-tool completion');
+    }
+  }
+  const pending = reason => { if (observation) observation.wait_reason = reason; return null; };
+  if (!records.some(r => r.tool === 'ffmpeg') || !records.some(r => r.tool === 'ffprobe')) return pending('missing_tool_kind');
   assert.ok(Number.isInteger(expectedSegments) && expectedSegments>0,'Actual manifest segment count required');
   const expectedTotal=3+2*expectedSegments;
-  if(records.length<expectedTotal) return null;
+  if(records.length<expectedTotal) return pending('missing_children');
   assert.equal(records.length,expectedTotal,'Exactly every required check_output child observed');
   assert.equal(records.filter(r=>r.tool==='ffmpeg').length,1);
   assert.equal(records.filter(r=>r.tool==='ffprobe').length,2+2*expectedSegments);
-  if (records.some(r => !r.close_observed)) return null;
+  if (records.some(r => !r.close_observed)) return pending('child_close_pending');
   // A wrapper writes its real child's close receipt just before its own exit.
   // Continue observation until the actual wrapper also no longer exists.
-  if (records.some(r => !verifyPidAbsent(r.wrapper_pid))) return null;
+  if (records.some(r => !verifyPidAbsent(r.wrapper_pid))) return pending('wrapper_close_pending');
   for (const r of records) {
-    assert.equal(r.spawn_observed, true); assert.equal(r.spawn_error, false);assert.equal(r.observer_error,false);
+    assert.equal(r.spawn_observed, true); assert.equal(r.close_observed, true); assert.equal(r.spawn_error, false);assert.equal(r.observer_error,false);
     assert.equal(r.child_parent_pid,r.wrapper_pid);assert.match(r.child_start_ticks,/^[0-9]+$/);
     const realPath=await realpath(`/usr/bin/${r.tool}`);
     assert.equal(r.child_executable,realPath);
@@ -222,6 +254,7 @@ async function mediaReceipts(path, serverPid, job, generation, requireComplete =
     assert.equal(verifyPidAbsent(r.wrapper_pid), true, 'Server wrapper process also closed');
     r.coordinator_child_pid_absent = true; r.coordinator_wrapper_pid_absent = true;
   }
+  if (observation) observation.wait_reason = 'complete';
   return records.sort((a,b)=>a.invocation.localeCompare(b.invocation));
 }
 function installAckGate(f, id, captured, mode) {
@@ -416,7 +449,13 @@ try {
             item.stage='ack_fault'; liveGate=true; installAckGate(f,job.id,captured,mode);
             pendingManual=manualFinish(f.origin,captured); item.manual_http=pendingManual.record;
             await until(signal,() => { const state=ackState(f,job.id); return state.attempts>=2 ? state : null; },'real failed ACK UPDATE attempts');
-            item.server_media_processes=await until(signal,() => mediaReceipts(receiptsPath,item.server_pid,job.id,generation,true,segmentNames.length),'natural real ffmpeg and ffprobe close');
+            item.server_media_observation = {};
+            try {
+              item.server_media_processes=await until(signal,() => mediaReceipts(receiptsPath,item.server_pid,job.id,generation,true,segmentNames.length,item.server_media_observation),'natural real ffmpeg and ffprobe close');
+            } finally {
+              // Save partial evidence even when validation or the bounded wait fails.
+              await save();
+            }
             if(name==='ack_error_http_disconnect') {
               const beforeDuplicate=verificationState(f,job.id);
               const reply=await finishRequest(f,captured,captured.document,signal,409,'COMPUTE_VERIFICATION_ALREADY_OWNED');

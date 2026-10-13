@@ -125,6 +125,35 @@ fn socket_error(reason: &str, command_id: Option<Uuid>) -> Value {
     json!({"type":"ERROR", "command_id":command_id, "error":error})
 }
 
+// Only bounded categories are logged: no query, bind values, identities or raw
+// database error text. The caller still fails closed with the original reason.
+fn socket_check_failure(
+    check_stage: &'static str,
+    started: std::time::Instant,
+    error: Option<&sqlx::Error>,
+) {
+    let failure_kind = match error {
+        None => "outer_timeout",
+        Some(sqlx::Error::Database(_)) => "database",
+        Some(sqlx::Error::PoolTimedOut) => "pool_timeout",
+        Some(sqlx::Error::PoolClosed) => "pool_closed",
+        Some(sqlx::Error::Io(_)) => "io",
+        Some(sqlx::Error::Protocol(_)) => "protocol",
+        Some(_) => "other",
+    };
+    let sqlstate = error
+        .and_then(sqlx::Error::as_database_error)
+        .and_then(|error| error.code())
+        .filter(|code| code.len() == 5 && code.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+    tracing::warn!(
+        check_stage,
+        failure_kind,
+        sqlstate = sqlstate.as_deref().unwrap_or("none"),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "room authorization check failed"
+    );
+}
+
 async fn socket_membership(
     app: &App,
     room: Uuid,
@@ -134,6 +163,7 @@ async fn socket_membership(
     // new frame. Release the read before any network write; a slow connection
     // never holds a database/room lock while sending. Previously admitted bytes
     // may already be in transport buffers and cannot be recalled.
+    let started = std::time::Instant::now();
     match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         database_checks::boolean(
@@ -150,7 +180,14 @@ async fn socket_membership(
     {
         Ok(Ok(true)) => Ok(()),
         Ok(Ok(false)) => Err("not_a_member"),
-        _ => Err("service_unavailable"),
+        Ok(Err(error)) => {
+            socket_check_failure("membership", started, Some(&error));
+            Err("service_unavailable")
+        }
+        Err(_) => {
+            socket_check_failure("membership", started, None);
+            Err("service_unavailable")
+        }
     }
 }
 
@@ -163,6 +200,7 @@ async fn socket_access(
     socket_membership(app, room, user).await?;
     // Login authority is independent of optional presence negotiation. Legacy
     // sockets must not keep sending or receiving for the heartbeat interval.
+    let started = std::time::Instant::now();
     match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         database_checks::boolean(
@@ -177,7 +215,14 @@ async fn socket_access(
     {
         Ok(Ok(true)) => Ok(()),
         Ok(Ok(false)) => Err("session_expired"),
-        _ => Err("service_unavailable"),
+        Ok(Err(error)) => {
+            socket_check_failure("login", started, Some(&error));
+            Err("service_unavailable")
+        }
+        Err(_) => {
+            socket_check_failure("login", started, None);
+            Err("service_unavailable")
+        }
     }
 }
 
