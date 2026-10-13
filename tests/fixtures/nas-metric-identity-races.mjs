@@ -170,7 +170,8 @@ export async function queuedMetricIdentityRaces({
         dispatch = randomUUID();
         f.sql(`INSERT INTO agent_transfers(id,agent_id,token_hash,request,expires_at) VALUES (${quote(dispatch)},${quote(identity.id)},${quote(digest(randomBytes(32)))},'{}',clock_timestamp()+interval '1 minute')`);
         await held.query(`SELECT id FROM agents WHERE id=${quote(identity.id)} FOR UPDATE`);
-        const target = JSON.parse(await held.query(`SELECT json_build_object('database',(SELECT oid FROM pg_database WHERE datname=current_database()),'relation','agents'::regclass::oid,'page',split_part(trim(both '()' from ctid::text),',',1)::bigint,'tuple',split_part(trim(both '()' from ctid::text),',',2)::integer,'xid',pg_current_xact_id()::text) FROM agents WHERE id=${quote(identity.id)}`));
+        // PostgreSQL serializes oid as JSON text; cast to bigint for numeric lock tags.
+        const target = JSON.parse(await held.query(`SELECT json_build_object('database',(SELECT oid::bigint FROM pg_database WHERE datname=current_database()),'relation','agents'::regclass::oid::bigint,'page',split_part(trim(both '()' from ctid::text),',',1)::bigint,'tuple',split_part(trim(both '()' from ctid::text),',',2)::integer,'xid',pg_current_xact_id()::text) FROM agents WHERE id=${quote(identity.id)}`));
         holderXid = target.xid;
         assert.match(holderXid, /^[0-9]+$/);
         for (const key of ['database','relation','page','tuple']) assert.ok(Number.isSafeInteger(target[key]) && target[key] >= 0);

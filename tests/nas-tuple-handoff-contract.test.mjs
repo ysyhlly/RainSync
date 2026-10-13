@@ -77,7 +77,10 @@ async function runFixture(options = {}, code = connectionDefinition) {
     }
     if (sql.startsWith("SELECT json_build_object(")) {
       queries.targetTuple = { role, sql };
-      return JSON.stringify({ ...tuple, ...options.tuple });
+      return JSON.stringify({ ...tuple,
+        database: sql.includes("SELECT oid::bigint FROM pg_database") ? tuple.database : String(tuple.database),
+        relation: sql.includes("'agents'::regclass::oid::bigint") ? tuple.relation : String(tuple.relation),
+        ...options.tuple });
     }
     if (sql.startsWith("SELECT COALESCE(json_agg(a.pid)")) {
       const key = role === "helperGate" ? "replacement" : "receiver";
@@ -192,7 +195,7 @@ function evidenceContract(run) {
   assert.equal(q.committed.role, "helperGate", "activity is observed from an independent transaction");
   contains(q.committed.sql, [`id='${ids.target}'`, `advanced_assets_connection='${ids.connection}'::uuid`, "AND NOT revoked", `last_seen IS DISTINCT FROM '${seen}'::timestamptz`]);
   assert.equal(q.holder.sql, `SELECT id FROM agents WHERE id='${ids.target}' FOR UPDATE`);
-  contains(q.targetTuple.sql, ["'database',(SELECT oid FROM pg_database WHERE datname=current_database())", "'relation','agents'::regclass::oid", "'page',split_part(trim(both '()' from ctid::text),',',1)::bigint", "'tuple',split_part(trim(both '()' from ctid::text),',',2)::integer", "'xid',pg_current_xact_id()::text", `WHERE id='${ids.target}'`]);
+  contains(q.targetTuple.sql, ["'database',(SELECT oid::bigint FROM pg_database WHERE datname=current_database())", "'relation','agents'::regclass::oid::bigint", "'page',split_part(trim(both '()' from ctid::text),',',1)::bigint", "'tuple',split_part(trim(both '()' from ctid::text),',',2)::integer", "'xid',pg_current_xact_id()::text", `WHERE id='${ids.target}'`]);
   const targetTuple = Object.entries(tuple).filter(([key]) => key !== "xid").map(([key, value]) => `l.${key}=${value}`);
   assert.equal(q.replacement.role, "helperGate");
   contains(q.replacement.sql, ["a.datname=current_database()", `a.query='${replacementQuery}'`, "l.locktype='tuple'", "l.mode='ExclusiveLock'", "AND l.granted", ...targetTuple, "x.pid=a.pid", "x.locktype='transactionid'", "x.mode='ShareLock'", "NOT x.granted", `x.transactionid='${tuple.xid}'::xid`, `${pids.holder}=ANY(pg_blocking_pids(a.pid))`]);
@@ -282,6 +285,19 @@ test("physical tuple and holder transaction identifiers must be valid before rep
   for (const invalid of [{ xid: "" }, { xid: "1 OR true" }, { database: -1 }, { relation: 1.5 }, { page: null }, { tuple: Number.MAX_SAFE_INTEGER + 1 }]) {
     const run = await runFixture({ tuple: invalid });
     assert.ok(run.error, JSON.stringify(invalid));
+    assert.equal(run.events.some(e => e.kind === "connect" && e.role === "replacement"), false);
+    releasedBeforeCleanup(run);
+  }
+});
+
+test("PostgreSQL OID JSON text requires explicit numeric casts before lock-tag validation", async () => {
+  evidenceContract(await runFixture());
+  for (const [before, after] of [
+    ["SELECT oid::bigint FROM pg_database", "SELECT oid FROM pg_database"],
+    ["'agents'::regclass::oid::bigint", "'agents'::regclass::oid"],
+  ]) {
+    const run = await runFixture({}, mutate(before, after));
+    assert.ok(run.error, "uncast OID is JSON text, not a safe integer");
     assert.equal(run.events.some(e => e.kind === "connect" && e.role === "replacement"), false);
     releasedBeforeCleanup(run);
   }
