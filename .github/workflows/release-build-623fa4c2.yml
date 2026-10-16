@@ -1,0 +1,179 @@
+name: Build RainSync release 623fa4c2
+
+on:
+  push:
+    branches:
+      - codex/release-build-623fa4c2-20261016
+    paths:
+      - .github/workflows/release-build-623fa4c2.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rainsync-release-build-623fa4c2
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.0
+    steps:
+      - name: Check out the exact release source
+        uses: actions/checkout@v4
+        with:
+          ref: 623fa4c2ff6221c046fb3151cc6fac1fabdd8859
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
+
+      - name: Verify source and compatible build environment
+        id: metadata
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          source_tree_sha="$(git rev-parse 'HEAD^{tree}')"
+          test "$source_sha" = "623fa4c2ff6221c046fb3151cc6fac1fabdd8859"
+          test "$(uname -m)" = "x86_64"
+          rust_flags="${RUSTFLAGS:-} ${CARGO_ENCODED_RUSTFLAGS:-} ${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS:-}"
+          if [[ "$rust_flags" == *target-cpu=native* || "$rust_flags" == *target-feature=native* ]]; then
+            echo 'Unsupported native-specific Rust flags found in runner environment' >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import pathlib, re, sys
+          pattern = re.compile(r'target-cpu\s*=\s*"?native|target-feature\s*=.*native')
+          for path in (pathlib.Path(".cargo/config"), pathlib.Path(".cargo/config.toml")):
+              if path.is_file() and pattern.search(path.read_text()):
+                  print(f"Unsupported native-specific Rust flags found in {path}", file=sys.stderr)
+                  raise SystemExit(1)
+          PY
+          printf 'rust_flags=%s\n' "$rust_flags" >> "$GITHUB_OUTPUT"
+          printf 'rustc_wrapper=%s\n' "${RUSTC_WRAPPER:-}" >> "$GITHUB_OUTPUT"
+          glibc_version="$(ldd --version | sed -n '1s/.* //p')"
+          python3 - "$glibc_version" <<'PY'
+          import sys
+          version = tuple(int(part) for part in sys.argv[1].split('.'))
+          if version > (2, 36):
+              raise SystemExit(f"runner glibc {sys.argv[1]} exceeds production glibc 2.36")
+          PY
+          printf 'source_sha=%s\n' "$source_sha" >> "$GITHUB_OUTPUT"
+          printf 'source_tree_sha=%s\n' "$source_tree_sha" >> "$GITHUB_OUTPUT"
+          printf 'glibc_version=%s\n' "$glibc_version" >> "$GITHUB_OUTPUT"
+          printf 'rust_target=%s\n' "$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
+          printf 'cargo_config=%s\n' "$(if test -f .cargo/config.toml; then sha256sum .cargo/config.toml; elif test -f .cargo/config; then sha256sum .cargo/config; else printf 'absent'; fi)" >> "$GITHUB_OUTPUT"
+
+      - name: Build server and web assets
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --package rainsync-server -j 2
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Package and checksum release outputs
+        env:
+          SOURCE_SHA: ${{ steps.metadata.outputs.source_sha }}
+          SOURCE_TREE_SHA: ${{ steps.metadata.outputs.source_tree_sha }}
+          GLIBC_VERSION: ${{ steps.metadata.outputs.glibc_version }}
+          RUST_TARGET: ${{ steps.metadata.outputs.rust_target }}
+          RUST_FLAGS: ${{ steps.metadata.outputs.rust_flags }}
+          RUSTC_WRAPPER_VALUE: ${{ steps.metadata.outputs.rustc_wrapper }}
+          CARGO_CONFIG: ${{ steps.metadata.outputs.cargo_config }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          mkdir -p payload/server payload/web artifact
+          install -m 0755 target/release/rainsync-server payload/server/rainsync-server
+          test -s payload/server/rainsync-server
+          test -s apps/web/dist/index.html
+          cp -a apps/web/dist/. payload/web/
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, platform, stat
+          files = {}
+          for path in sorted(pathlib.Path("payload").rglob("*")):
+              if path.is_file():
+                  data = path.read_bytes()
+                  files[path.relative_to("payload").as_posix()] = {
+                      "sha256": hashlib.sha256(data).hexdigest(),
+                      "size": len(data),
+                      "mode": format(stat.S_IMODE(path.stat().st_mode), "04o")
+                  }
+          manifest = {
+              "sourceSha": os.environ["SOURCE_SHA"],
+              "sourceTreeSha": os.environ["SOURCE_TREE_SHA"],
+              "workflowRunId": os.environ["RUN_ID"],
+              "workflowRunAttempt": os.environ["RUN_ATTEMPT"],
+              "runnerImage": "ubuntu-22.04",
+              "architecture": platform.machine(),
+              "rustTarget": os.environ["RUST_TARGET"],
+              "glibc": os.environ["GLIBC_VERSION"],
+              "rustc": __import__("subprocess").check_output(["rustc", "--version", "--verbose"], text=True).strip(),
+              "cargo": __import__("subprocess").check_output(["cargo", "--version", "--verbose"], text=True).strip(),
+              "node": __import__("subprocess").check_output(["node", "--version"], text=True).strip(),
+              "npm": __import__("subprocess").check_output(["npm", "--version"], text=True).strip(),
+              "rustEnvironment": {
+                  "RUSTUP_TOOLCHAIN": os.environ.get("RUSTUP_TOOLCHAIN", ""),
+                  "RUSTFLAGS": os.environ.get("RUSTFLAGS", ""),
+                  "CARGO_ENCODED_RUSTFLAGS": os.environ.get("CARGO_ENCODED_RUSTFLAGS", ""),
+                  "auditedCombinedFlags": os.environ.get("RUST_FLAGS", ""),
+                  "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": os.environ.get("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS", ""),
+                  "RUSTC_WRAPPER": os.environ.get("RUSTC_WRAPPER", ""),
+                  "CARGO_BUILD_TARGET": os.environ.get("CARGO_BUILD_TARGET", ""),
+                  "repositoryCargoConfigSha256": os.environ["CARGO_CONFIG"]
+              },
+              "files": files,
+              "commands": [
+                  "cargo build --release --locked --package rainsync-server -j 2",
+                  "npm ci --no-audit --no-fund",
+                  "npm run build"
+              ]
+          }
+          with open("payload/manifest.json", "w") as output:
+              json.dump(manifest, output, indent=2)
+              output.write("\n")
+          PY
+          (cd payload && find . -type f ! -path './SHA256SUMS' -print0 | sort -z | xargs -0 sha256sum) > payload/SHA256SUMS
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -cf artifact/release-build.tar -C payload .
+          gzip -n -9 artifact/release-build.tar
+          (cd artifact && sha256sum release-build.tar.gz > release-build.tar.gz.sha256)
+
+      - name: Upload immutable build artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rainsync-release-623fa4c2-${{ github.run_id }}
+          path: |
+            artifact/release-build.tar.gz
+            artifact/release-build.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Record uploaded artifact digest
+        env:
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          SOURCE_SHA: ${{ steps.metadata.outputs.source_sha }}
+          SOURCE_TREE_SHA: ${{ steps.metadata.outputs.source_tree_sha }}
+          RUST_TARGET: ${{ steps.metadata.outputs.rust_target }}
+          RUST_FLAGS: ${{ steps.metadata.outputs.rust_flags }}
+          RUSTC_WRAPPER_VALUE: ${{ steps.metadata.outputs.rustc_wrapper }}
+        run: |
+          {
+            printf 'Source commit: `%s`\n' "$SOURCE_SHA"
+            printf 'Source tree: `%s`\n' "$SOURCE_TREE_SHA"
+            printf 'Rust target: `%s`\n' "$RUST_TARGET"
+            printf 'Rust flags: `%s`\n' "$RUST_FLAGS"
+            printf 'RUSTC_WRAPPER: `%s`\n' "$RUSTC_WRAPPER_VALUE"
+            printf 'Uploaded Actions artifact digest: `%s`\n' "$ARTIFACT_DIGEST"
+          } >> "$GITHUB_STEP_SUMMARY"
